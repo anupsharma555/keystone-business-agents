@@ -665,6 +665,88 @@ records an audit event, and rejects stale rows when `mirror_checksum` no longer 
 Never mirror secrets, OAuth tokens, full inbound email bodies, PHI, raw private notes, or
 unapproved outbound-send instructions.
 
+## Automation Controller
+
+Use `scripts/run_keystone_automation.py` for any scheduled or repeated operator job. It
+adds a health preflight, exclusive lock file, bounded item counts, stage-specific live
+flags, JSON audit summary, redacted child errors, and pending-approval backlog checks.
+Global flags such as `--json`, `--lock-file`, and `--no-health-preflight` go before
+the subcommand.
+
+First scheduled job should be weekly Opportunity Scout dry-run with local audit storage:
+
+```bash
+.venv/bin/python scripts/run_keystone_automation.py --json \
+  weekly-opportunity \
+  --stage dry-run \
+  --max-opportunities 3 \
+  --database-url sqlite:///.keystone/state/keystone_agents.db
+```
+
+This saves local SQLite audit rows and approval queue items only. It does not use live
+search, live model execution, Gmail, or live Slack. By default it blocks if pending
+approval items already exist; review, expire, archive, or explicitly pass
+`--allow-pending-approvals` before accumulating more queue items.
+
+After several clean dry-runs, enable live research/model calls without Gmail writes:
+
+```bash
+.venv/bin/python scripts/run_keystone_automation.py --json \
+  weekly-opportunity \
+  --stage live-research \
+  --confirm-live \
+  --live-sdk \
+  --max-opportunities 3 \
+  --database-url sqlite:///.keystone/state/keystone_agents.db
+```
+
+Optional live Slack approval notification requires both `--notify-slack` and
+`--live-slack`. Slack approval notifications do not approve, send, schedule, or
+publish anything.
+
+Gmail automation remains staged and scoped. Start with label previews only:
+
+```bash
+.venv/bin/python scripts/run_keystone_automation.py --json \
+  gmail-triage \
+  --stage label-preview \
+  --confirm-live \
+  --label-filter "Keystone/Triage" \
+  --gmail-query "newer_than:1d" \
+  --max-messages 1
+```
+
+Apply labels only after at least two reviewed successful previews:
+
+```bash
+.venv/bin/python scripts/run_keystone_automation.py --json \
+  gmail-triage \
+  --stage label-apply \
+  --confirm-live \
+  --apply-labels-approved \
+  --successful-preview-count 2 \
+  --label-filter "Keystone/Triage" \
+  --gmail-query "newer_than:1d" \
+  --max-messages 1
+```
+
+Gmail draft creation is a final gated stage. It requires a target Gmail query, one
+message maximum, operator confirmation, and the existing local
+`approved_for_send/send` approval record for the selected Gmail message:
+
+```bash
+.venv/bin/python scripts/run_keystone_automation.py --json \
+  gmail-triage \
+  --stage draft-create \
+  --confirm-live \
+  --draft-create-approved \
+  --label-filter "Keystone/Triage" \
+  --gmail-query "rfc822msgid:<message-id@example.com>" \
+  --max-messages 1
+```
+
+Sending remains manual and outside Keystone v1.
+
 ## Live Gmail Draft-Only
 
 Default state:

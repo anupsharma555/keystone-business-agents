@@ -9,12 +9,17 @@ description = "OpenAI Agents SDK business agents for Keystone Neuroinformatics L
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "aiohttp>=3.13.4",
   "openai-agents>=0.14.5",
+  "orjson>=3.11.6",
   "pydantic>=2.7,<3",
-  "python-dotenv",
+  "PyJWT>=2.12.0",
+  "python-dotenv>=1.2.2",
+  "python-multipart>=0.0.27",
   "requests",
   "rich",
   "trafilatura>=2.0,<3",
+  "urllib3>=2.7.0",
 ]
 
 [project.scripts]
@@ -59,6 +64,7 @@ exclude_also = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["artifacts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

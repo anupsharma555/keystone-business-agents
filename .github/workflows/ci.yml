@@ -34,3 +34,6 @@ jobs:
 
       - name: Run pytest
         run: python -m pytest
+
+      - name: Run dependency audit
+        run: python -m pip_audit --skip-editable --progress-spinner off

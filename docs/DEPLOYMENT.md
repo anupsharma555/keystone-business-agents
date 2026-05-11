@@ -386,6 +386,35 @@ Safe dry-run periodic check:
   --markdown
 ```
 
+For repeated operator jobs, prefer the automation controller over direct script
+invocation. The first supported stage is weekly Opportunity Scout dry-run with
+SQLite audit rows and no external writes:
+
+```bash
+.venv/bin/python scripts/run_keystone_automation.py --json \
+  weekly-opportunity \
+  --stage dry-run \
+  --max-opportunities 3 \
+  --database-url sqlite:///.keystone/state/keystone_agents.db
+```
+
+After clean dry-runs and approval-queue review, the controller can run live
+research/model synthesis while still avoiding Gmail writes:
+
+```bash
+.venv/bin/python scripts/run_keystone_automation.py --json \
+  weekly-opportunity \
+  --stage live-research \
+  --confirm-live \
+  --live-sdk \
+  --max-opportunities 3 \
+  --database-url sqlite:///.keystone/state/keystone_agents.db
+```
+
+The controller adds health preflight, a lock file, bounded item counts, pending
+approval backlog checks, redacted child errors, and a JSON summary with
+`send_enabled=false` and `email_sent=false`.
+
 A human operator can repeat that command at a chosen cadence, then review:
 
 ```bash
@@ -395,8 +424,9 @@ sqlite3 keystone_agents.db \
 ```
 
 Scheduled live Gmail processing is not enabled by default. Do not create cron,
-launchd, Task Scheduler, daemon, or background-service entries from this repo yet.
-Any future scheduler design must be reviewed first and must use all of these gates:
+launchd, Task Scheduler, daemon, or background-service entries from this repo
+unless the automation controller is used with an operator-reviewed launch plan.
+Any scheduler design must use all of these gates:
 
 - A narrow Gmail label filter, never full-inbox processing.
 - Explicit live flags such as `--live-gmail --no-dry-run`.
@@ -408,6 +438,7 @@ Any future scheduler design must be reviewed first and must use all of these gat
 - `--save` audit logging for every run and every attempted side effect.
 - Approval queue review before any generated draft is externally used.
 - Health-check and rollback instructions documented before activation.
+- Dependency audit, pytest, and ruff checks passing before unattended operation.
 
 ## 11. Enabling Live Slack Approval Notifications
 
@@ -449,7 +480,7 @@ Do not enable or add these paths without a reviewed design, tests, approval gate
 
 - Live email sending, SendGrid sending, Gmail `messages.send`, or automatic external messaging.
 - Autonomous approval or model-decided approval.
-- Scheduled live Gmail processing, outbound campaigns, or follow-ups.
+- Uncontrolled scheduled live Gmail processing, outbound campaigns, or follow-ups.
 - Cron, launchd, Task Scheduler, daemon, or background service code.
 - Live production pipeline mode outside the existing narrow Gmail, SearchProvider,
   website-extraction, and Slack paths.

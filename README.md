@@ -239,18 +239,14 @@ Use `--save` on CLI scripts to write local SQLite audit records. No storage writ
 ```bash
 .venv/bin/python -m pytest
 .venv/bin/python -m ruff check .
+.venv/bin/python -m pip_audit --skip-editable --progress-spinner off
 ```
 
 Tests use fixtures and mocks only. They do not require OpenAI, Gmail, Slack,
 SearXNG, Serper, Firecrawl, Apify, Browserless, or other live API keys.
 
-Current verification from this implementation pass:
-
-- `.venv/bin/python -m ruff check src/keystone_agents/work_items.py src/keystone_agents/workflow_runner.py src/keystone_agents/schemas/context_pack.py src/keystone_agents/schemas/__init__.py tests/test_context_packs.py`: all checks passed.
-- `.venv/bin/python -m pytest`: 924 passed.
-- `.venv/bin/python scripts/run_evals.py --agent all --json`: 22 passed.
-- `.venv/bin/python scripts/run_local_evals.py --json`: 39 passed.
-- `.venv/bin/python scripts/health_check.py`: overall status ok, auto-send disabled.
+Use `.venv/bin/python scripts/check_quality.py` for the full local gate with
+coverage, ruff, and dependency audit.
 
 ## Safety Model
 
@@ -294,6 +290,9 @@ Implemented:
   outreach, and Gmail paths, with timeline metadata for pack selection and gate
   status.
 - End-to-end dry-run Keystone workflow with approval-gated markdown report.
+- Conservative automation controller for staged weekly opportunity runs and
+  scoped Gmail preview/apply/draft stages, with health preflight, lock file,
+  bounded counts, pending-approval checks, redacted errors, and no-send summary.
 - SQLite storage and audit logging for agent runs, emails, companies, opportunities, outreach drafts, manual outreach tracking, approvals, approval queue items, feedback, sources, and tool events.
 - SQLite schema migration tracking for local storage evolution.
 - Explicit live Gmail read, label, and draft-only operations.
@@ -302,7 +301,7 @@ Implemented:
   by default or Firecrawl when explicitly configured, with optional fallback
   between those two extractors.
 - Explicit live Slack approval notifications.
-- GitHub Actions CI for Python 3.11, ruff, and pytest.
+- GitHub Actions CI for Python 3.11, ruff, pytest, and dependency audit.
 
 Not implemented:
 

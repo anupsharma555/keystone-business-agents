@@ -87,6 +87,7 @@ REQUIRED_TABLES = (
 )
 
 DRY_RUN_SCRIPTS = (
+    "run_keystone_automation.py",
     "run_gmail_triage.py",
     "run_company_research.py",
     "run_opportunity_scout.py",
@@ -286,6 +287,7 @@ def _load_script_module(path: Path) -> Any:
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot create import spec for {path}.")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
