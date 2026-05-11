@@ -1,0 +1,135 @@
+[
+  {
+    "id": "curebase_approved_context_email",
+    "agent": "outreach",
+    "input": {
+      "company_fixture": "sample_company_curebase",
+      "opportunity_fixture": "sample_lead_curebase",
+      "contact_name": "Dr. Example",
+      "contact_title": "Clinical Operations Lead",
+      "recent_signal": "decentralized clinical trial operations",
+      "outreach_goal": "compare notes on clinical AI evaluation support"
+    },
+    "expected": {
+      "email_max_words": 180,
+      "linkedin_max_chars": 300,
+      "no_em_dash": true,
+      "unsupported_claims_exact": [],
+      "approval_required": true,
+      "approval_status": "pending",
+      "approved_context_used": true,
+      "facts_used_min": 4,
+      "source_ids_used_min": 3,
+      "unsupported_claim_explanations_exact": [],
+      "personalization_terms": ["Curebase", "decentralized clinical trial operations"],
+      "tone_required_terms": ["would welcome", "brief introductory conversation"],
+      "tone_forbidden_terms": ["guaranteed", "proven results", "act now", "!!!"]
+    }
+  },
+  {
+    "id": "unbacked_recent_signal_explained",
+    "agent": "outreach",
+    "input": {
+      "company_fixture": "sample_company_curebase",
+      "opportunity_fixture": "sample_lead_curebase",
+      "contact_name": "Dr. Example",
+      "contact_title": "Clinical Operations Lead",
+      "recent_signal": "won a major hospital contract",
+      "outreach_goal": "compare notes on clinical AI evaluation support"
+    },
+    "expected": {
+      "email_max_words": 180,
+      "linkedin_max_chars": 300,
+      "no_em_dash": true,
+      "unsupported_claims_min": 1,
+      "unsupported_claim_explanations_min": 1,
+      "approval_required": true,
+      "approval_status": "pending",
+      "approved_context_used": true,
+      "facts_used_min": 4,
+      "source_ids_used_min": 3,
+      "personalization_terms": ["Curebase", "decentralized clinical trial operations"],
+      "tone_required_terms": ["would welcome", "brief introductory conversation"],
+      "tone_forbidden_terms": ["major hospital contract", "guaranteed", "proven results", "act now", "!!!"]
+    }
+  },
+  {
+    "id": "approved_style_profile_matches_copy_constraints",
+    "agent": "outreach",
+    "input": {
+      "company_fixture": "sample_company_curebase",
+      "opportunity_fixture": "sample_lead_curebase",
+      "contact_name": "Dr. Example",
+      "contact_title": "Clinical Operations Lead",
+      "style_fixture": "sample_email_style_profile_approved",
+      "recent_signal": "decentralized clinical trial operations",
+      "outreach_goal": "compare notes on clinical AI evaluation support"
+    },
+    "expected": {
+      "email_max_words": 160,
+      "linkedin_max_chars": 300,
+      "no_em_dash": true,
+      "unsupported_claims_exact": [],
+      "approval_required": true,
+      "approval_status": "pending",
+      "approved_context_used": true,
+      "style_profile_used": true,
+      "style_profile_id": "default",
+      "facts_used_min": 4,
+      "source_ids_used_min": 3,
+      "unsupported_claim_explanations_exact": [],
+      "personalization_terms": ["Curebase", "decentralized clinical trial operations"],
+      "copy_must_contain": ["Happy to compare notes", "Sincerely", "Anup"],
+      "copy_must_not_contain": ["I am reaching out", "act now", "guaranteed"],
+      "tone_required_terms": ["Happy to compare notes"],
+      "tone_forbidden_terms": ["proven results", "!!!"]
+    }
+  },
+  {
+    "id": "llm_constrained_style_aware_draft",
+    "agent": "outreach",
+    "input": {
+      "mode": "llm_constrained",
+      "company_fixture": "sample_company_curebase",
+      "opportunity_fixture": "sample_lead_curebase",
+      "contact_fixture": "sample_contact_curebase_approved",
+      "crm_fixture": "sample_crm_context_curebase",
+      "style_fixture": "sample_email_style_profile_approved",
+      "outreach_goal": "compare notes on clinical AI evaluation support",
+      "llm_draft_payload": {
+        "company_name": "Curebase",
+        "contact_name": "Dr. Priya Shah",
+        "contact_title": "Clinical Operations Lead",
+        "email_subject": "Curebase research workflow discussion",
+        "email_body": "Hello Dr. Priya Shah,\n\nI saw Curebase's decentralized clinical trial operations. Happy to compare notes on clinical AI evaluation support if useful.\n\nWarmly,\nKeystone",
+        "linkedin_note": "Hello Dr. Priya Shah, happy to compare notes if useful.",
+        "personalization_rationale": "Uses approved Curebase opportunity, contact, CRM, style, and Keystone context.",
+        "source_ids_used": [
+          "fixture:curebase_company",
+          "keystone_profile",
+          "fixture:sample_lead_curebase",
+          "fixture:curebase_growth",
+          "fixture:contact_curebase_priya",
+          "fixture:crm_context_curebase"
+        ]
+      }
+    },
+    "expected": {
+      "email_max_words": 180,
+      "linkedin_max_chars": 300,
+      "no_em_dash": true,
+      "unsupported_claims_exact": [],
+      "unsupported_claim_explanations_exact": [],
+      "approval_required": true,
+      "approval_status": "pending",
+      "approved_context_used": true,
+      "style_profile_used": true,
+      "style_profile_id": "default",
+      "drafting_mode": "llm_constrained",
+      "facts_used_min": 5,
+      "source_ids_used_min": 5,
+      "personalization_terms": ["Curebase", "Happy to compare notes", "Warmly"],
+      "tone_forbidden_terms": ["guaranteed", "proven results", "act now", "!!!"]
+    }
+  }
+]

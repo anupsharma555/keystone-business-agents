@@ -1,0 +1,128 @@
+{
+  "as_of": "2026-04-23",
+  "source_url": "https://platform.openai.com/docs/pricing/",
+  "notes": [
+    "Standard text-token pricing only.",
+    "Estimates are not invoice records and exclude provider discounts, credits, taxes, built-in tool charges, and account-specific terms.",
+    "Gemini rows use paid-tier public pricing where present; free-tier eligibility is not inferred."
+  ],
+  "models": [
+    {
+      "provider": "openai",
+      "model": "gpt-4.1",
+      "input_per_1m_usd": "2.00",
+      "cached_input_per_1m_usd": "0.50",
+      "output_per_1m_usd": "8.00",
+      "source_url": "https://platform.openai.com/docs/pricing/",
+      "as_of": "2026-04-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-4.1-mini",
+      "input_per_1m_usd": "0.40",
+      "cached_input_per_1m_usd": "0.10",
+      "output_per_1m_usd": "1.60",
+      "source_url": "https://platform.openai.com/docs/pricing/",
+      "as_of": "2026-04-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-4.1-nano",
+      "input_per_1m_usd": "0.10",
+      "cached_input_per_1m_usd": "0.025",
+      "output_per_1m_usd": "0.40",
+      "source_url": "https://platform.openai.com/docs/pricing/",
+      "as_of": "2026-04-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.4",
+      "input_per_1m_usd": "2.50",
+      "cached_input_per_1m_usd": "0.25",
+      "output_per_1m_usd": "15.00",
+      "source_url": "https://openai.com/api/pricing/",
+      "as_of": "2026-04-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "input_per_1m_usd": "0.75",
+      "cached_input_per_1m_usd": "0.075",
+      "output_per_1m_usd": "4.50",
+      "source_url": "https://openai.com/api/pricing/",
+      "as_of": "2026-04-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.4-nano",
+      "input_per_1m_usd": "0.20",
+      "cached_input_per_1m_usd": "0.02",
+      "output_per_1m_usd": "1.25",
+      "source_url": "https://openai.com/api/pricing/",
+      "as_of": "2026-04-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.2",
+      "input_per_1m_usd": "1.75",
+      "cached_input_per_1m_usd": "0.175",
+      "output_per_1m_usd": "14.00",
+      "source_url": "https://platform.openai.com/docs/pricing/",
+      "as_of": "2026-04-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.2-codex",
+      "input_per_1m_usd": "1.75",
+      "cached_input_per_1m_usd": "0.175",
+      "output_per_1m_usd": "14.00",
+      "source_url": "https://platform.openai.com/docs/pricing/",
+      "as_of": "2026-04-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.1-codex-max",
+      "input_per_1m_usd": "1.25",
+      "cached_input_per_1m_usd": "0.125",
+      "output_per_1m_usd": "10.00",
+      "source_url": "https://platform.openai.com/docs/pricing/",
+      "as_of": "2026-04-23"
+    },
+    {
+      "provider": "gemini",
+      "model": "gemini-2.5-flash",
+      "input_per_1m_usd": "0.30",
+      "cached_input_per_1m_usd": "0.03",
+      "output_per_1m_usd": "2.50",
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "rate_limit_source_url": "https://ai.google.dev/gemini-api/docs/rate-limits",
+      "as_of": "2026-04-23",
+      "free_tier": {
+        "input_output_tokens": "free_of_charge",
+        "requests_per_day": 250,
+        "requests_per_minute": 10,
+        "tokens_per_minute": 250000,
+        "used_to_improve_products": true,
+        "note": "Gemini API free-tier limits can vary by model, account, region, and time. Treat this as operator quota context, not billing proof."
+      }
+    },
+    {
+      "provider": "gemini",
+      "model": "gemini-2.5-flash-lite",
+      "input_per_1m_usd": "0.10",
+      "cached_input_per_1m_usd": "0.025",
+      "output_per_1m_usd": "0.40",
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "rate_limit_source_url": "https://ai.google.dev/gemini-api/docs/rate-limits",
+      "as_of": "2026-04-23",
+      "free_tier": {
+        "input_output_tokens": "free_of_charge",
+        "requests_per_day": 1000,
+        "requests_per_minute": 15,
+        "tokens_per_minute": 250000,
+        "used_to_improve_products": true,
+        "note": "Gemini API free-tier limits can vary by model, account, region, and time. Treat this as operator quota context, not billing proof."
+      }
+    }
+  ]
+}

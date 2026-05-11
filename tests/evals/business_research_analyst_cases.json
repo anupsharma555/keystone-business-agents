@@ -1,0 +1,80 @@
+[
+  {
+    "id": "curebase_trial_tech_fit",
+    "agent": "company",
+    "input": {
+      "company_name": "Curebase",
+      "fixture": "tests/fixtures/sample_company_curebase.json"
+    },
+    "expected": {
+      "min_sources": 1,
+      "require_source_urls": true,
+      "require_supported_claims": true,
+      "fit_score_min": 70,
+      "fit_score_max": 100,
+      "fixture_source_only": true,
+      "unsupported_claims_exact": [],
+      "forbidden_facts": ["Fortune 500", "FDA approved", "Series C"],
+      "recommended_action_contains": ["approval-gated outreach draft"]
+    }
+  },
+  {
+    "id": "neuroflow_behavioral_health_fit",
+    "agent": "company",
+    "input": {
+      "company_name": "NeuroFlow",
+      "fixture": "tests/fixtures/sample_company_neuroflow.json"
+    },
+    "expected": {
+      "min_sources": 1,
+      "require_source_urls": true,
+      "require_supported_claims": true,
+      "fit_score_min": 60,
+      "fit_score_max": 100,
+      "fixture_source_only": true,
+      "unsupported_claims_exact": [],
+      "forbidden_facts": ["clinical trial software", "FDA approved"],
+      "recommended_action_contains": ["approval-gated outreach draft"]
+    }
+  },
+  {
+    "id": "irrelevant_company_low_priority",
+    "agent": "company",
+    "input": {
+      "company_name": "Office Supplies Example Co.",
+      "fixture": "tests/fixtures/sample_company_irrelevant.json"
+    },
+    "expected": {
+      "min_sources": 1,
+      "require_source_urls": true,
+      "require_supported_claims": true,
+      "fit_score_min": 0,
+      "fit_score_max": 35,
+      "fixture_source_only": true,
+      "unsupported_claims_exact": [],
+      "forbidden_facts": ["behavioral health analytics", "clinical AI"],
+      "recommended_action_contains": ["Do not prioritize"]
+    }
+  },
+  {
+    "id": "stale_sources_lower_confidence",
+    "agent": "company",
+    "input": {
+      "company_name": "StaleSignal Health",
+      "fixture": "tests/fixtures/sample_company_stale_sources.json"
+    },
+    "expected": {
+      "min_sources": 1,
+      "require_source_urls": true,
+      "require_supported_claims": true,
+      "fit_score_min": 0,
+      "fit_score_max": 100,
+      "confidence_score_max": 0.55,
+      "source_recency_max": 45,
+      "research_completeness_max": 60,
+      "fixture_source_only": false,
+      "unsupported_claims_exact": [],
+      "forbidden_facts": ["current funding", "FDA approved", "recent launch"]
+    }
+  }
+]

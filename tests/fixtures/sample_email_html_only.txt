@@ -1,0 +1,8 @@
+Subject: Clinical AI advisory discussion
+<html>
+  <body>
+    <p>Hi Keystone,</p>
+    <p>We are looking for external consulting support around clinical AI evaluation.</p>
+    <p>Could we schedule a short advisory discussion next week?</p>
+  </body>
+</html>

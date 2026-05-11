@@ -1,0 +1,29 @@
+[
+  {
+    "company_name": "Curebase Inc.",
+    "opportunity_type": "trial technology",
+    "signal": "Hiring clinical operations roles tied to decentralized trial delivery.",
+    "signals": ["hiring clinical", "clinical trial launch"],
+    "source_title": "Fixture Curebase hiring signal",
+    "source_url": "fixture://curebase-hiring",
+    "source_type": "fixture"
+  },
+  {
+    "company_name": "Curebase",
+    "opportunity_type": "trial technology",
+    "signal": "Validation and evidence generation work for decentralized research workflows.",
+    "signals": ["validation study", "hiring evidence"],
+    "source_title": "Fixture Curebase validation signal",
+    "source_url": "fixture://curebase-validation",
+    "source_type": "fixture"
+  },
+  {
+    "company_name": "NeuroFlow",
+    "opportunity_type": "behavioral health AI",
+    "signal": "Payer partnership and outcomes evidence for behavioral health measurement.",
+    "signals": ["payer partnership", "publication or outcomes evidence"],
+    "source_title": "Fixture NeuroFlow payer signal",
+    "source_url": "fixture://neuroflow-payer",
+    "source_type": "fixture"
+  }
+]

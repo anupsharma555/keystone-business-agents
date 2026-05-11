@@ -1,0 +1,66 @@
+{
+  "template_id": "research_workflow_intro",
+  "version": "v1",
+  "name": "Research Workflow Introduction",
+  "channel": "email",
+  "use_case": "research_workflow_context_request",
+  "stage": "initial_outreach",
+  "required_context": [
+    "company_profile",
+    "source_backed_workflow_or_evidence_signal",
+    "keystone_profile"
+  ],
+  "optional_context": [
+    "contact_context",
+    "crm_context",
+    "email_style_profile",
+    "opportunity_record"
+  ],
+  "structure_blocks": [
+    {
+      "block_id": "workflow_signal",
+      "label": "Workflow Signal",
+      "guidance": "Lead with the approved workflow, evidence, or research operations signal.",
+      "required": true
+    },
+    {
+      "block_id": "keystone_relevance",
+      "label": "Keystone Relevance",
+      "guidance": "Tie the signal to approved Keystone research operations or clinical AI positioning.",
+      "required": true
+    },
+    {
+      "block_id": "context_request",
+      "label": "Context Request",
+      "guidance": "Ask for non-sensitive context or a brief exchange without implying results.",
+      "required": true
+    }
+  ],
+  "cta_style": "non-sensitive context request",
+  "tone_constraints": [
+    "specific",
+    "research-oriented",
+    "concise",
+    "no hype"
+  ],
+  "safety_constraints": [
+    "human approval required",
+    "no sending",
+    "source attribution required",
+    "source-backed claims only",
+    "no PHI",
+    "no unsupported claims",
+    "no em dash"
+  ],
+  "good_for": [
+    "clinical research workflow outreach",
+    "evidence generation and research operations opportunities"
+  ],
+  "avoid_when": [
+    "approved source attribution is unavailable",
+    "legal, financial, security, patient-specific, or contractual advice is requested"
+  ],
+  "max_words": 130,
+  "approval_scope": "external_use",
+  "send_enabled": false
+}

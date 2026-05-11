@@ -1,0 +1,22 @@
+{
+  "company_name": "Curebase",
+  "account_stage": "researching",
+  "account_owner": "Keystone fixture owner",
+  "last_touchpoint": "No outbound contact made.",
+  "next_step": "Draft only after human approval of local context.",
+  "source": "fixture",
+  "source_id": "fixture:crm_context_curebase",
+  "source_url": "fixture://sample_crm_context_curebase.json",
+  "confidence": 0.78,
+  "approval_state": "approved_for_drafting",
+  "approval_scope": "drafting",
+  "notes": "Local CRM context approves low-pressure research workflow outreach positioning.",
+  "claims": [
+    {
+      "claim_text": "Local CRM context for Curebase approves low-pressure research workflow outreach positioning.",
+      "source_id": "fixture:crm_context_curebase",
+      "confidence": 0.78,
+      "claim_type": "user_provided"
+    }
+  ]
+}

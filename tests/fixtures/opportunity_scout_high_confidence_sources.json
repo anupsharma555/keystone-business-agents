@@ -1,0 +1,35 @@
+[
+  {
+    "company_name": "AffectAI Research",
+    "opportunity_type": "behavioral health AI",
+    "signal": "Company page describes behavioral health AI validation services.",
+    "signals": ["validation study", "product launch"],
+    "source_title": "AffectAI company validation page",
+    "source_url": "https://affectai.example/platform",
+    "source_type": "company_site",
+    "source_category": "company_page",
+    "published_at": "2026-03-01"
+  },
+  {
+    "company_name": "AffectAI Research",
+    "opportunity_type": "behavioral health AI",
+    "signal": "ClinicalTrials fixture shows a psychiatry validation study launch.",
+    "signals": ["clinical trial launch", "validation study"],
+    "source_title": "AffectAI ClinicalTrials.gov fixture",
+    "source_url": "https://clinicaltrials.gov/study/fixture-affectai-research",
+    "source_type": "clinical_trial",
+    "source_category": "clinical_trial",
+    "published_at": "2026-03-15"
+  },
+  {
+    "company_name": "AffectAI Research",
+    "opportunity_type": "behavioral health AI",
+    "signal": "Hiring clinical evidence lead and research operations owner.",
+    "signals": ["hiring clinical", "hiring evidence", "hiring research"],
+    "source_title": "AffectAI evidence careers fixture",
+    "source_url": "https://affectai.example/careers/evidence-lead",
+    "source_type": "job_posting",
+    "source_category": "job_posting",
+    "published_at": "2026-04-01"
+  }
+]

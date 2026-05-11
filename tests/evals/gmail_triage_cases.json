@@ -1,0 +1,131 @@
+[
+  {
+    "id": "consulting_inquiry_draft",
+    "agent": "gmail",
+    "input": {
+      "fixture": "tests/fixtures/sample_email_consulting.txt",
+      "sender_name": "Alex",
+      "sender_email": "alex@example.com"
+    },
+    "expected": {
+      "category": "consulting_opportunity",
+      "needs_reply": true,
+      "risk_flags_exact": [],
+      "draft_required": true,
+      "draft_quality": {
+        "min_words": 25,
+        "max_words": 90,
+        "required_terms": ["Thanks", "non-sensitive", "times"],
+        "forbidden_terms": ["send automatically", "guaranteed", "patient"]
+      }
+    }
+  },
+  {
+    "id": "collaboration_inquiry_draft",
+    "agent": "gmail",
+    "input": {
+      "fixture": "tests/fixtures/sample_email_collaboration.txt",
+      "sender_name": "Riley",
+      "sender_email": "riley@example.org"
+    },
+    "expected": {
+      "category": "collaboration_opportunity",
+      "needs_reply": true,
+      "risk_flags_exact": [],
+      "draft_required": true,
+      "draft_quality": {
+        "min_words": 25,
+        "max_words": 90,
+        "required_terms": ["collaboration", "pilot goals", "timeline"],
+        "forbidden_terms": ["guaranteed", "send automatically"]
+      }
+    }
+  },
+  {
+    "id": "suspicious_email_no_reply",
+    "agent": "gmail",
+    "input": {
+      "fixture": "tests/fixtures/sample_email_suspicious.txt",
+      "sender_name": "Security",
+      "sender_email": "security@example.net"
+    },
+    "expected": {
+      "category": "suspicious",
+      "needs_reply": false,
+      "risk_flags_contains": ["security"],
+      "draft_required": false
+    }
+  },
+  {
+    "id": "html_only_consulting_inquiry",
+    "agent": "gmail",
+    "input": {
+      "fixture": "tests/fixtures/sample_email_html_only.txt",
+      "sender_name": "Jordan",
+      "sender_email": "jordan@example.com"
+    },
+    "expected": {
+      "category": "consulting_opportunity",
+      "needs_reply": true,
+      "risk_flags_exact": [],
+      "draft_required": true,
+      "draft_quality": {
+        "min_words": 25,
+        "max_words": 90,
+        "required_terms": ["Thanks", "non-sensitive", "times"],
+        "forbidden_terms": ["<html", "<p", "</", "blockquote", "send automatically"]
+      }
+    }
+  },
+  {
+    "id": "quoted_thread_does_not_create_new_draft",
+    "agent": "gmail",
+    "input": {
+      "fixture": "tests/fixtures/sample_email_quoted_thread.txt",
+      "sender_name": "Alex",
+      "sender_email": "alex@example.com"
+    },
+    "expected": {
+      "category": "unrelated",
+      "needs_reply": false,
+      "risk_flags_exact": [],
+      "draft_required": false
+    }
+  },
+  {
+    "id": "attachment_legal_ack_only",
+    "agent": "gmail",
+    "input": {
+      "fixture": "tests/fixtures/sample_email_attachment_legal.txt",
+      "sender_name": "Morgan",
+      "sender_email": "morgan@example.org"
+    },
+    "expected": {
+      "category": "unrelated",
+      "needs_reply": true,
+      "risk_flags_contains": ["legal_review"],
+      "draft_required": true,
+      "draft_quality": {
+        "min_words": 10,
+        "max_words": 45,
+        "required_terms": ["received", "review it before responding further"],
+        "forbidden_terms": ["BAA", "NDA", "contract terms", "signature"]
+      }
+    }
+  },
+  {
+    "id": "ambiguous_request_no_draft",
+    "agent": "gmail",
+    "input": {
+      "fixture": "tests/fixtures/sample_email_ambiguous_request.txt",
+      "sender_name": "Taylor",
+      "sender_email": "taylor@example.net"
+    },
+    "expected": {
+      "category": "unrelated",
+      "needs_reply": false,
+      "risk_flags_exact": [],
+      "draft_required": false
+    }
+  }
+]

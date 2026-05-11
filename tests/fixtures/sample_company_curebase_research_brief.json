@@ -1,0 +1,75 @@
+{
+  "name": "Curebase",
+  "website": "https://www.curebase.com",
+  "description": "The approved research brief describes Curebase as a clinical trial software company.",
+  "fit": "The approved research brief supports a possible Keystone fit around decentralized clinical trial workflows, evidence generation, clinical validation, and research operations.",
+  "sources": [
+    {
+      "source_id": "fixture:curebase_research_brief",
+      "title": "Attached approved research brief for Curebase",
+      "url": "fixture://sample_company_curebase_research_brief.json",
+      "source_type": "fixture",
+      "supported_claims": [
+        "Curebase is described in the approved research brief as a clinical trial software company.",
+        "Curebase supports decentralized clinical trial and health technology workflows.",
+        "Curebase provides a platform for clinical research teams and trial sponsors.",
+        "The approved research brief supports a possible Keystone fit around evidence generation, clinical validation, and research operations."
+      ],
+      "confidence": 0.82
+    }
+  ],
+  "research_data_points": [
+    {
+      "key": "business_model",
+      "value": "Clinical trial software for decentralized research workflows.",
+      "completed": true,
+      "confidence": 0.86,
+      "source_ids": ["fixture:curebase_research_brief"]
+    },
+    {
+      "key": "customer_segment",
+      "value": "Clinical research teams and trial sponsors.",
+      "completed": true,
+      "confidence": 0.82,
+      "source_ids": ["fixture:curebase_research_brief"]
+    },
+    {
+      "key": "behavioral_health_relevance",
+      "completed": false,
+      "missing_reason": "The approved research brief does not provide behavioral health-specific evidence."
+    },
+    {
+      "key": "ai_data_science_relevance",
+      "value": "Clinical research workflow software with data, evidence generation, and validation relevance.",
+      "completed": true,
+      "confidence": 0.78,
+      "source_ids": ["fixture:curebase_research_brief"]
+    },
+    {
+      "key": "research_signals",
+      "value": "Evidence generation and clinical validation needs are present in the approved research brief.",
+      "completed": true,
+      "confidence": 0.8,
+      "source_ids": ["fixture:curebase_research_brief"]
+    },
+    {
+      "key": "funding_growth_signal",
+      "completed": false,
+      "missing_reason": "The approved research brief does not provide recent funding, hiring, partnership, or launch evidence."
+    },
+    {
+      "key": "compliance_sensitivity",
+      "value": "Clinical trial operations create regulated research context.",
+      "completed": true,
+      "confidence": 0.76,
+      "source_ids": ["fixture:curebase_research_brief"]
+    },
+    {
+      "key": "consulting_fit",
+      "value": "Possible fit around evidence generation, clinical validation, and research operations.",
+      "completed": true,
+      "confidence": 0.82,
+      "source_ids": ["fixture:curebase_research_brief"]
+    }
+  ]
+}

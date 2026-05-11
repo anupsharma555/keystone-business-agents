@@ -1,0 +1,23 @@
+{
+  "source": "fixture://sample_sent_email_style_messages.json",
+  "samples": [
+    {
+      "source_id": "fixture:sent_style:1",
+      "source_url": "fixture://sample_sent_email_style_messages.json#1",
+      "subject": "Re: Clinical workflow discussion",
+      "body": "Hi Jordan,\n\nThanks for reaching out about the clinical workflow question. Happy to compare notes if useful. Please send any non-sensitive context and a few times that work.\n\nBest,\nAnup"
+    },
+    {
+      "source_id": "fixture:sent_style:2",
+      "source_url": "fixture://sample_sent_email_style_messages.json#2",
+      "subject": "Re: Research operating model",
+      "body": "Hi Morgan,\n\nThis sounds relevant to the evidence generation work we discussed. I can take a look at a short, non-sensitive overview and share whether there is a practical fit.\n\nBest,\nAnup"
+    },
+    {
+      "source_id": "fixture:sent_style:3",
+      "source_url": "fixture://sample_sent_email_style_messages.json#3",
+      "subject": "Re: Intro",
+      "body": "Hello Taylor,\n\nAppreciate the note. If useful, send a brief summary and I can suggest whether a short conversation makes sense. You can use taylor@example.com for logistics.\n\nBest,\nAnup"
+    }
+  ]
+}

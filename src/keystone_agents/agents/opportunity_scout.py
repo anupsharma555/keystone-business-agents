@@ -1,0 +1,4958 @@
+"""Opportunity scout agent builder and deterministic fixture-mode scout."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from keystone_agents.guardrails import keystone_guardrails, keystone_tool_guardrail_kwargs
+from keystone_agents.models import OpportunityScoutSDKInput, TypedAgentRunResult
+from keystone_agents.opportunity_scout.scoring import (
+    HANDOFF_PRIORITY_THRESHOLD,
+    bounded_score,
+    business_research_analyst_handoff_recommendation,
+    clean_signals,
+    keystone_fit_reason,
+    normalize_type,
+    score_from_signals,
+    should_handoff_to_business_research_analyst,
+)
+from keystone_agents.opportunity_scout.scoring import (
+    handoff_reason as build_handoff_reason,
+)
+from keystone_agents.opportunity_scout.scoring import (
+    outside_consulting_likelihood as estimate_outside_consulting_likelihood,
+)
+from keystone_agents.opportunity_scout.scoring import (
+    research_needed as build_research_needed,
+)
+from keystone_agents.opportunity_scout.search_plan import (
+    infer_opportunity_search_plan,
+    plan_has_objective,
+    plan_targets_only,
+)
+from keystone_agents.opportunity_scout.state import (
+    SKIP_EXISTING_STATUSES,
+    UPDATE_EXISTING_STATUSES,
+)
+from keystone_agents.opportunity_scout.state import (
+    load_existing_state_map as _load_existing_state_map,
+)
+from keystone_agents.opportunity_scout.state import (
+    normalize_company_key as _normalize_company_key,
+)
+from keystone_agents.opportunity_scout.state import (
+    state_items_from_payload as _state_items_from_payload,
+)
+from keystone_agents.run import run_typed_sdk_agent
+from keystone_agents.schemas.decision_trace import DecisionTrace
+from keystone_agents.schemas.opportunity import (
+    ExistingOpportunityState,
+    FilteredOpportunityCandidate,
+    OpportunityRecord,
+    OpportunityScoutResult,
+    OpportunitySignal,
+    OpportunitySource,
+    OpportunitySourceBundle,
+    OpportunityStateDecision,
+    OpportunityType,
+)
+from keystone_agents.schemas.opportunity_search_plan import OpportunitySearchPlan
+from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions, function_tool
+from keystone_agents.source_quality import (
+    score_source_quality,
+    summarize_source_quality,
+)
+from keystone_agents.tools.local_context_tool import (
+    list_local_context_sources,
+    read_local_context_file,
+    search_local_context,
+)
+from keystone_agents.tools.memory_tool import (
+    check_workflow_duplicate,
+    retrieve_memory,
+    save_entity_memory,
+    save_opportunity_memory,
+)
+from keystone_agents.tools.search_provider import (
+    LiveSearchProviderRequiredError,
+    SearchRequest,
+    build_search_provider,
+)
+from keystone_agents.tools.serper_tool import search_web
+from keystone_agents.tools.website_extraction_tool import (
+    WebsiteExtractionError,
+    extract_website_content,
+)
+
+LIVE_SEARCH_QUERIES: tuple[str, ...] = (
+    "behavioral health AI startup recent funding clinical validation",
+    "digital mental health company payer partnership outcomes study",
+    "clinical AI company psychiatry evidence generation",
+    "trial technology company CNS study AI",
+    "CRO behavioral health decentralized trial AI",
+    "neurotechnology company clinical validation psychiatry",
+    "CNS biotech precision psychiatry biomarker trial",
+)
+JOB_POSTING_URL_MARKERS = ("/jobs", "/job/", "/careers", "/positions", "/openings")
+JOB_POSTING_TEXT_MARKERS = (
+    "we're hiring",
+    "we are hiring",
+    "job posting",
+    "career opportunity",
+    "apply now",
+    "open role",
+)
+REMOTE_MARKERS = ("remote", "work from home", "anywhere in the u.s")
+ONSITE_MARKERS = ("on-site", "onsite", "in person", "hybrid", "office-based")
+UNPAID_MARKERS = ("unpaid", "volunteer", "internship", "for credit", "equity only")
+CLINICIAN_REQUIRED_MARKERS = (
+    "practicing clinician",
+    "practicing psychiatrist",
+    "licensed psychiatrist",
+    "licensed therapist",
+    "active clinical practice",
+    "active patient panel",
+    "board-certified psychiatrist",
+    "full-time practicing clinician",
+)
+ROLE_TITLE_PREFIX_RE = re.compile(
+    r"\b(?:hiring|seeking|seeks|opening for|open role:?|position:?|role:?)\s+(.+)",
+    re.I,
+)
+EMPLOYEE_RANGE_RE = re.compile(
+    r"\b(?P<low>\d{1,4})(?:\s*[-–]\s*(?P<high>\d{1,4})|\+)?\s+employees?\b",
+    re.I,
+)
+ROLE_HINT_PATTERNS = (
+    "director",
+    "manager",
+    "lead",
+    "head of",
+    "chief",
+    "officer",
+    "scientist",
+    "researcher",
+    "operations",
+    "product",
+    "strategy",
+    "advisor",
+    "medical director",
+    "clinical operations",
+)
+ROLE_SEARCH_MARKERS = (
+    " role",
+    " roles",
+    " job",
+    " jobs",
+    " hiring",
+    " position",
+    " positions",
+    " posted",
+    " remote",
+    " full-time",
+    " part-time",
+    " title",
+    " titles",
+)
+TOPIC_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "into",
+    "only",
+    "focus",
+    "find",
+    "give",
+    "need",
+    "many",
+    "across",
+    "time",
+    "opportunities",
+    "opportunity",
+    "companies",
+    "company",
+    "based",
+    "about",
+    "their",
+    "where",
+    "also",
+    "just",
+    "through",
+}
+USA_TEXT_MARKERS = (
+    "united states",
+    "u.s.",
+    "u.s ",
+    " us ",
+    " usa",
+    "nih",
+    "fda",
+    "cms",
+    "medicare",
+    "medicaid",
+    "veterans affairs",
+)
+USA_DOMAIN_MARKERS = (
+    "clinicaltrials.gov",
+    "reporter.nih.gov",
+    "nih.gov",
+    "fda.gov",
+    "cms.gov",
+    "hhs.gov",
+    ".edu",
+)
+NON_US_MARKERS = (
+    "united kingdom",
+    "uk",
+    "canada",
+    "europe",
+    "european",
+    "australia",
+    "germany",
+    "france",
+    "sweden",
+    "netherlands",
+)
+INSTITUTE_MARKERS = (
+    "university",
+    "medical school",
+    "school of medicine",
+    "hospital",
+    "health system",
+    "institute",
+    "center",
+    "centre",
+    "department",
+    "laboratory",
+    "lab",
+)
+CONFERENCE_MARKERS = (
+    "conference",
+    "symposium",
+    "congress",
+    "meeting",
+    "summit",
+    "forum",
+    "workshop",
+    "abstract",
+    "poster",
+)
+PERSON_NAME_RE = re.compile(
+    r"^(?:dr\.?\s+)?([A-Z][a-z][A-Za-z'`.-]*(?:\s+(?:[A-Z]\.?|[A-Z][a-z][A-Za-z'`.-]*)){1,4})\b"
+)
+YEAR_RE = re.compile(r"\b(20\d{2})\b")
+PERSON_CONTEXT_MARKERS = (
+    "principal investigator",
+    "investigator",
+    "faculty",
+    "researcher",
+    "scientist",
+    "professor",
+    "assistant professor",
+    "associate professor",
+    "phd",
+    "md",
+    "dr.",
+    "dr ",
+    ", phd",
+    ", md",
+)
+INVALID_CANDIDATE_NAMES = {
+    "",
+    "unknown",
+    "unknown company",
+    "http",
+    "https",
+    "www",
+    "pdf",
+    "doi",
+    "people",
+    "our people",
+    "team",
+    "faculty",
+    "speakers",
+    "agenda",
+    "schedule",
+    "conferences",
+    "pubmed",
+    "clinicaltrials",
+    "clinicaltrials.gov",
+    "nih",
+    "research",
+    "article",
+    "articles",
+    "correction",
+}
+TITLE_NOISE_MARKERS = (
+    "[pdf]",
+    "(pdf)",
+    " pdf ",
+    ".pdf",
+    "thesis",
+    "dissertation",
+    "doctoral thesis",
+    "master's thesis",
+    "masters thesis",
+    "book chapter",
+    "google books",
+    "handbook of",
+    "textbook",
+)
+GENERIC_RESEARCH_PAGE_MARKERS = (
+    "research articles",
+    "research topics",
+    "latest research",
+    "top articles",
+    "review article",
+    "systematic review",
+    "literature review",
+    "sciencedirect topics",
+    "google scholar",
+    "semantic scholar",
+    "researchgate",
+    "pubmed search",
+    "frontiers research topic",
+    "artificial intelligence for mental health monitoring",
+)
+GENERIC_RESEARCH_HOST_MARKERS = (
+    "books.google.",
+    "scholar.google.",
+    "semanticscholar.org",
+    "researchgate.net",
+    "sciencedirect.com/topics",
+    "pmc.ncbi.nlm.nih.gov/articles",
+    "ncbi.nlm.nih.gov/pmc",
+    "nature.com/articles",
+    "science.org/doi",
+)
+GENERIC_PROGRAM_PAGE_MARKERS = (
+    "seed funding projects",
+    "seed fund project archive",
+    "pathway programs",
+    "industry affiliate program",
+    "affiliate program",
+    "student projects",
+    "funding projects",
+    "awards and scholarships recipients",
+    "scholarships recipients",
+    "volume ",
+    "number ",
+    "newsletter",
+)
+ACTIVE_OPPORTUNITY_MARKERS = (
+    "raises",
+    "raised",
+    "funding round",
+    "funding opportunity",
+    "request for proposals",
+    "applications open",
+    "apply by",
+    "deadline",
+    "series a",
+    "series b",
+    "grant awarded",
+    "sbir",
+    "nih grant",
+    "hiring",
+    "careers",
+    "open role",
+    "job posting",
+    "apply now",
+    "launches",
+    "launched",
+    "selects",
+    "selected",
+    "announces",
+    "announced",
+    "partners",
+    "partners with",
+    "partner to",
+    "partnership",
+    "collaboration",
+    "collaborates",
+    "pilot",
+    "conference",
+    "symposium",
+    "workshop",
+    "validation study",
+    "trial launch",
+    "study sponsor",
+    "recruiting",
+    "outcomes evidence",
+    "contract",
+    "commercial",
+)
+PSYCHIATRY_TOPIC_MARKERS = (
+    "psychiatry",
+    "psychiatric",
+    "neuropsychiatry",
+    "mental health",
+    "behavioral health",
+    "behavioural health",
+    "depression",
+    "anxiety",
+    "adhd",
+    "mood disorder",
+    "psychosis",
+    "schizophrenia",
+    "bipolar",
+)
+ADVISORY_TOPIC_MARKERS = (
+    "advisor",
+    "advisory",
+    "consultant",
+    "consulting",
+    "fractional",
+    "medical director",
+    "clinical strategy",
+    "strategy advisor",
+    "expert network",
+)
+AI_TOPIC_MARKERS = (
+    " ai ",
+    "artificial intelligence",
+    "machine learning",
+    " ml ",
+    "predictive",
+    "automation",
+    "algorithm",
+    "analytics",
+    "digital",
+    "technology",
+    "platform",
+)
+ORGANIZATION_SUFFIX_RE = re.compile(
+    r"\b(?:"
+    r"ai|analytics|biotech|bio|biosciences|care|clinic|clinics|company|corp|"
+    r"corporation|health|healthcare|inc|institute|labs?|life sciences|llc|"
+    r"medical|medicine|partners|pharma|research|school|systems?|technologies|"
+    r"therapeutics|university|ventures"
+    r")\b",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class _OpportunityQuerySpec:
+    lane: str
+    time_window: str
+    query: str
+    entity_hint: str = "company"
+    source: str = "web"
+    country: str = "US"
+    location: str = "United States"
+    language: str = "en"
+    page: int | None = None
+
+
+@dataclass(frozen=True)
+class _OpportunityHardFilters:
+    exclude_under_employee_count: int | None = None
+    exclude_onsite: bool = False
+    exclude_unpaid: bool = False
+    exclude_practicing_clinician: bool = False
+
+    @property
+    def strict_verification(self) -> bool:
+        return any(
+            [
+                self.exclude_under_employee_count is not None,
+                self.exclude_onsite,
+                self.exclude_unpaid,
+                self.exclude_practicing_clinician,
+            ]
+        )
+
+
+@dataclass(frozen=True)
+class _RoleEvidence:
+    is_role_candidate: bool
+    role_title: str = ""
+    role_location: str = ""
+    role_remote: bool | None = None
+    role_country: str = ""
+    role_active: bool | None = None
+    employee_count_range: tuple[int, int] | None = None
+    unpaid: bool | None = None
+    practicing_clinician_required: bool | None = None
+    filter_notes: tuple[str, ...] = ()
+
+
+DEFAULT_FIXTURE_HITS: list[dict[str, Any]] = [
+    {
+        "company_name": "NeuroFlow",
+        "opportunity_type": "behavioral health AI",
+        "signal": "Payer partnership and outcomes evidence for behavioral health measurement.",
+        "signals": ["payer partnership", "publication or outcomes evidence"],
+        "source_title": "Fixture payer partnership announcement",
+        "source_url": "fixture://neuroflow-payer-partnership",
+        "source_type": "fixture",
+    },
+    {
+        "company_name": "Curebase",
+        "opportunity_type": "trial technology",
+        "signal": (
+            "Hiring clinical operations and evidence roles tied to decentralized trial delivery."
+        ),
+        "signals": ["hiring clinical", "hiring evidence", "clinical trial launch"],
+        "source_title": "Fixture clinical operations hiring signal",
+        "source_url": "fixture://curebase-clinical-ops",
+        "source_type": "fixture",
+    },
+    {
+        "company_name": "Beacon CNS Therapeutics",
+        "opportunity_type": "CNS biotech",
+        "signal": "Protocol activity and validation planning around a CNS development program.",
+        "signals": ["IRB or protocol activity", "validation study"],
+        "source_title": "Fixture CNS protocol update",
+        "source_url": "fixture://beacon-cns-protocol",
+        "source_type": "fixture",
+    },
+    {
+        "company_name": "MindSpan Digital Health",
+        "opportunity_type": "digital mental health",
+        "signal": "Product launch with research-facing evidence generation needs.",
+        "signals": ["product launch", "validation study", "conference activity"],
+        "source_title": "Fixture product launch brief",
+        "source_url": "fixture://mindspan-product-launch",
+        "source_type": "fixture",
+    },
+    {
+        "company_name": "Synapse Trial Partners",
+        "opportunity_type": "CRO",
+        "signal": "Partnership announcement focused on CNS study operations.",
+        "signals": ["partnership announcement", "hiring research"],
+        "source_title": "Fixture CNS CRO partnership",
+        "source_url": "fixture://synapse-cro-partnership",
+        "source_type": "fixture",
+    },
+    {
+        "company_name": "CortexBridge Labs",
+        "opportunity_type": "grant or collaboration opportunity",
+        "signal": (
+            "Conference activity and publication evidence around translational neuroscience "
+            "data workflows."
+        ),
+        "signals": ["conference activity", "publication or outcomes evidence"],
+        "source_title": "Fixture translational neuroscience conference abstract",
+        "source_url": "fixture://cortexbridge-conference",
+        "source_type": "fixture",
+    },
+]
+
+DEFAULT_STRUCTURED_SOURCE_HITS: list[dict[str, Any]] = [
+    {
+        "company_name": "Curebase",
+        "opportunity_type": "trial technology",
+        "signal": (
+            "Careers page lists clinical operations hiring tied to decentralized trial delivery."
+        ),
+        "signals": ["hiring clinical", "hiring evidence", "clinical trial launch"],
+        "source_title": "Curebase clinical operations careers fixture",
+        "source_url": "fixture://company/curebase-careers-clinical-ops",
+        "source_type": "job_posting",
+        "source_category": "job_posting",
+        "published_at": "2026-03-15",
+        "recommended_next_actions": [
+            "Confirm current clinical operations roles on the company careers page.",
+        ],
+    },
+    {
+        "company_name": "Curebase",
+        "opportunity_type": "trial technology",
+        "signal": (
+            "Company materials describe decentralized trial platform work for lean study teams."
+        ),
+        "signals": ["clinical trial launch", "hiring evidence"],
+        "source_title": "Curebase company page fixture",
+        "source_url": "fixture://company/curebase-platform",
+        "source_type": "company_site",
+        "source_category": "company_page",
+        "published_at": "2026-02-10",
+    },
+    {
+        "company_name": "MindSpan Digital Health",
+        "opportunity_type": "digital mental health",
+        "signal": "Conference abstract highlights digital mental health validation work.",
+        "signals": ["validation study", "conference activity"],
+        "source_title": "MindSpan outcomes conference abstract fixture",
+        "source_url": "fixture://conference/mindspan-validation-abstract",
+        "source_type": "conference",
+        "source_category": "conference",
+        "published_at": "2026-01-18",
+    },
+    {
+        "company_name": "MindSpan Digital Health",
+        "opportunity_type": "digital mental health",
+        "signal": "Company page describes evidence-generation roadmap for product launch.",
+        "signals": ["product launch", "validation study"],
+        "source_title": "MindSpan evidence roadmap fixture",
+        "source_url": "fixture://company/mindspan-evidence-roadmap",
+        "source_type": "company_site",
+        "source_category": "company_page",
+        "published_at": "2026-02-22",
+    },
+    {
+        "company_name": "NeuroFlow",
+        "opportunity_type": "behavioral health AI",
+        "signal": "News item describes payer partnership and outcomes evidence.",
+        "signals": ["payer partnership", "publication or outcomes evidence"],
+        "source_title": "NeuroFlow payer outcomes news fixture",
+        "source_url": "fixture://news/neuroflow-payer-outcomes",
+        "source_type": "news",
+        "source_category": "news",
+        "published_at": "2026-02-05",
+    },
+    {
+        "company_name": "Beacon CNS Therapeutics",
+        "opportunity_type": "CNS biotech",
+        "signal": (
+            "ClinicalTrials fixture indicates CNS protocol activity requiring validation review."
+        ),
+        "signals": ["IRB or protocol activity", "validation study", "clinical trial launch"],
+        "source_title": "Beacon CNS ClinicalTrials.gov fixture",
+        "source_url": "https://clinicaltrials.gov/study/fixture-beacon-cns",
+        "source_type": "clinical_trial",
+        "source_category": "clinical_trial",
+        "published_at": "2026-01-28",
+    },
+    {
+        "company_name": "CortexBridge Labs",
+        "opportunity_type": "grant or collaboration opportunity",
+        "signal": (
+            "NIH/SBIR-style grant fixture describes translational neuroscience data workflow."
+        ),
+        "signals": ["publication or outcomes evidence", "partnership announcement"],
+        "source_title": "CortexBridge SBIR grant fixture",
+        "source_url": "https://reporter.nih.gov/search/fixture-cortexbridge",
+        "source_type": "government",
+        "source_category": "grant",
+        "published_at": "2025-11-30",
+        "missing_evidence": ["No buyer title or commercial trigger has been confirmed."],
+    },
+]
+
+SOURCE_TOOL_FIXTURE_HITS: dict[str, list[dict[str, Any]]] = {
+    "funding_news": [
+        {
+            "company_name": "SignalPath NeuroAI",
+            "opportunity_type": "clinical AI",
+            "signal": "Recent seed funding and launch coverage for psychiatry evidence tooling.",
+            "signals": ["recent funding", "product launch", "validation study"],
+            "source_title": "SignalPath funding news fixture",
+            "source_url": "fixture://news/signalpath-neuroai-seed",
+            "source_type": "news",
+            "source_category": "news",
+            "published_at": "2026-03-20",
+            "recommended_next_actions": [
+                "Validate funding date and investor context from an independent source.",
+            ],
+        }
+    ],
+    "job_posting": [
+        DEFAULT_STRUCTURED_SOURCE_HITS[0],
+        {
+            "company_name": "TrialOps Cortex",
+            "opportunity_type": "trial technology",
+            "signal": "Hiring head of clinical operations and evidence lead for CNS trials.",
+            "signals": ["hiring clinical", "hiring evidence", "clinical trial launch"],
+            "source_title": "TrialOps Cortex careers fixture",
+            "source_url": "fixture://jobs/trialops-cortex-clinical-ops",
+            "source_type": "job_posting",
+            "source_category": "job_posting",
+            "published_at": "2026-04-01",
+        },
+    ],
+    "clinical_trial": [
+        DEFAULT_STRUCTURED_SOURCE_HITS[5],
+        {
+            "company_name": "AffectAI Research",
+            "opportunity_type": "behavioral health AI",
+            "signal": "ClinicalTrials fixture shows behavioral health AI validation study launch.",
+            "signals": ["clinical trial launch", "validation study", "IRB or protocol activity"],
+            "source_title": "AffectAI ClinicalTrials.gov fixture",
+            "source_url": "https://clinicaltrials.gov/study/fixture-affectai",
+            "source_type": "clinical_trial",
+            "source_category": "clinical_trial",
+            "published_at": "2026-03-05",
+        },
+    ],
+    "grant": [
+        DEFAULT_STRUCTURED_SOURCE_HITS[6],
+        {
+            "company_name": "CNS Biomarker Analytics",
+            "opportunity_type": "CNS biotech",
+            "signal": (
+                "NIH/SBIR fixture supports biomarker validation and clinical research operations."
+            ),
+            "signals": ["validation study", "publication or outcomes evidence"],
+            "source_title": "CNS Biomarker Analytics NIH award fixture",
+            "source_url": "https://reporter.nih.gov/search/fixture-cns-biomarker",
+            "source_type": "government",
+            "source_category": "grant",
+            "published_at": "2026-02-12",
+        },
+    ],
+    "conference_publication": [
+        DEFAULT_STRUCTURED_SOURCE_HITS[2],
+        {
+            "company_name": "NeuroMeasure Labs",
+            "opportunity_type": "neurotechnology",
+            "signal": "Publication fixture reports outcomes evidence for neuroscience measurement.",
+            "signals": ["publication or outcomes evidence", "validation study"],
+            "source_title": "NeuroMeasure validation publication fixture",
+            "source_url": "https://pubmed.ncbi.nlm.nih.gov/fixture-neuromeasure",
+            "source_type": "publication",
+            "source_category": "publication",
+            "published_at": "2026-01-09",
+        },
+    ],
+    "company_page": [
+        DEFAULT_STRUCTURED_SOURCE_HITS[1],
+        DEFAULT_STRUCTURED_SOURCE_HITS[3],
+    ],
+}
+
+
+def _load_fixture_hits(fixture: str | Path | None) -> list[dict[str, Any]]:
+    if fixture is None:
+        return list(DEFAULT_FIXTURE_HITS)
+
+    data = json.loads(Path(fixture).read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        if isinstance(data.get("records"), list):
+            return [item for item in data["records"] if isinstance(item, dict)]
+        if isinstance(data.get("opportunities"), list):
+            return [item for item in data["opportunities"] if isinstance(item, dict)]
+        return [data]
+    raise ValueError("Opportunity fixture must be a JSON object, records object, or list.")
+
+
+def _topic_keywords(topic: str | None) -> list[str]:
+    if not topic:
+        return []
+    tokens = [
+        token
+        for token in re.findall(r"[a-z0-9][a-z0-9.+-]*", topic.lower())
+        if len(token) >= 3 and token not in TOPIC_STOPWORDS
+    ]
+    ordered: list[str] = []
+    for token in tokens:
+        if token not in ordered:
+            ordered.append(token)
+    return ordered
+
+
+def _matches_topic(hit: dict[str, Any], topic: str | None) -> bool:
+    if not topic:
+        return True
+    haystack = " ".join(
+        [
+            str(hit.get("company_name", "")),
+            str(hit.get("opportunity_type", "")),
+            str(hit.get("entity_kind", "")),
+            str(hit.get("source_category", "")),
+            str(hit.get("signal", "")),
+            " ".join(str(signal) for signal in hit.get("signals", [])),
+        ]
+    ).lower()
+    needle = topic.lower().strip()
+    if needle and needle in haystack:
+        return True
+    keywords = _topic_keywords(topic)
+    if not keywords:
+        return True
+    match_count = sum(1 for token in keywords if token in haystack)
+    threshold = min(2, len(keywords))
+    return match_count >= threshold
+
+
+def _source_from_hit(hit: dict[str, Any], signal: str) -> OpportunitySource:
+    source_url = str(hit.get("source_url") or "fixture://opportunity-source")
+    source_type = str(hit.get("source_type") or "fixture")
+    source_id = str(hit.get("source_id") or "").strip()
+    if not source_id and source_url.startswith("fixture://"):
+        source_id = f"fixture:{source_url.removeprefix('fixture://')}"
+    source_quality = score_source_quality(
+        url=source_url,
+        title=str(hit.get("source_title") or ""),
+        declared_source_type=source_type,
+        supported_text=signal,
+        published_at=hit.get("published_at") or hit.get("date"),
+        claim_context="opportunity_signal",
+    )
+    return OpportunitySource(
+        source_id=source_id,
+        title=str(
+            hit.get("source_title") or f"{hit.get('company_name', 'Unknown')} fixture source"
+        ),
+        url=source_url,
+        source_type=source_quality.source_type,
+        supported_signal=signal,
+        source_quality=source_quality,
+    )
+
+
+def _source_category_from_hit(hit: dict[str, Any]) -> str:
+    category = str(hit.get("source_category") or "").strip().lower()
+    aliases = {
+        "funding": "funding",
+        "funding_news": "news",
+        "news": "news",
+        "job": "job_posting",
+        "jobs": "job_posting",
+        "job_posting": "job_posting",
+        "careers": "job_posting",
+        "clinical_trial": "clinical_trial",
+        "clinicaltrials": "clinical_trial",
+        "grant": "grant",
+        "sbir": "grant",
+        "nih": "grant",
+        "publication": "publication",
+        "conference": "conference",
+        "conference_publication": "publication",
+        "company": "company_page",
+        "company_page": "company_page",
+        "company_site": "company_page",
+        "search": "search",
+    }
+    if category in aliases:
+        return aliases[category]
+    source_type = str(hit.get("source_type") or "").strip().lower()
+    if source_type in {"job_posting", "careers"}:
+        return "job_posting"
+    if source_type in {"government"}:
+        return "grant"
+    if source_type in {"academic", "publication"}:
+        return "publication"
+    if source_type in {"company_site", "website"}:
+        return "company_page"
+    if source_type in {"news", "funding_database"}:
+        return "news" if source_type == "news" else "funding"
+    if source_type in {"conference"}:
+        return "conference"
+    if source_type in {"google_search", "search", "metasearch"}:
+        return "search"
+    return "unknown"
+
+
+def _signal_freshness(source: OpportunitySource) -> str:
+    if source.source_quality is None:
+        return "unknown"
+    recency = source.source_quality.recency_score
+    if recency >= 90:
+        return "fresh"
+    if recency >= 65:
+        return "current"
+    return "stale"
+
+
+def _signal_from_hit(
+    hit: dict[str, Any],
+    *,
+    source: OpportunitySource,
+    signal_text: str,
+) -> OpportunitySignal:
+    confidence_score = source.source_quality.overall_score if source.source_quality else 45
+    return OpportunitySignal(
+        company_name=str(hit.get("company_name") or "Unknown company"),
+        signal_type=_source_category_from_hit(hit),  # type: ignore[arg-type]
+        signal_text=signal_text,
+        source_id=source.source_id,
+        source_type=source.source_type,
+        published_at=(
+            str(hit.get("published_at") or hit.get("date"))
+            if hit.get("published_at") or hit.get("date")
+            else None
+        ),
+        freshness=_signal_freshness(source),  # type: ignore[arg-type]
+        confidence_score=confidence_score,
+        supports_why_now=bool(hit.get("supports_why_now", True)),
+        relevance_notes=str(hit.get("relevance_notes") or ""),
+    )
+
+
+def _source_bundles_from_hits(
+    *,
+    company_name: str,
+    source_hits: list[dict[str, Any]],
+    why_now: str,
+) -> list[OpportunitySourceBundle]:
+    grouped: dict[str, list[tuple[dict[str, Any], OpportunitySource]]] = {}
+    for source_hit in source_hits:
+        signal_text = str(source_hit.get("signal") or why_now)
+        source = _source_from_hit(source_hit, signal_text)
+        grouped.setdefault(_source_category_from_hit(source_hit), []).append((source_hit, source))
+
+    bundles: list[OpportunitySourceBundle] = []
+    for category in sorted(grouped):
+        items = grouped[category]
+        sources = [source for _hit, source in items]
+        source_quality_summary = summarize_source_quality(
+            [source.source_quality for source in sources if source.source_quality is not None]
+        )
+        signals = [
+            _signal_from_hit(
+                hit,
+                source=source,
+                signal_text=str(hit.get("signal") or why_now),
+            )
+            for hit, source in items
+        ]
+        missing_evidence: list[str] = []
+        contradictions: list[str] = []
+        weak_evidence_reasons: list[str] = []
+        recommended_next_actions: list[str] = []
+        for hit, source in items:
+            missing_evidence.extend(str(item) for item in hit.get("missing_evidence", []))
+            contradictions.extend(str(item) for item in hit.get("contradictions", []))
+            weak_evidence_reasons.extend(str(item) for item in hit.get("weak_evidence_reasons", []))
+            recommended_next_actions.extend(
+                str(item)
+                for item in (
+                    hit.get("recommended_next_actions") or hit.get("recommended_follow_up") or []
+                )
+            )
+            if source.source_quality and source.source_quality.overall_score < 50:
+                weak_evidence_reasons.append(
+                    f"{source.title} has low source quality "
+                    f"({source.source_quality.overall_score}/100)."
+                )
+        stale_count = sum(1 for signal in signals if signal.freshness == "stale")
+        if stale_count:
+            missing_evidence.append("Refresh stale opportunity signals before outreach.")
+        if category in {"search", "unknown"}:
+            missing_evidence.append("Replace discovery pointers with primary sources.")
+        if source_quality_summary.low_quality_source_count:
+            weak_evidence_reasons.append(source_quality_summary.rationale)
+        if not recommended_next_actions:
+            recommended_next_actions.append(
+                f"Validate {category.replace('_', ' ')} signal with a primary source."
+            )
+
+        bundles.append(
+            OpportunitySourceBundle(
+                bundle_id=f"{_normalize_company_key(company_name)}:{category}",
+                company_name=company_name,
+                source_category=category,  # type: ignore[arg-type]
+                summary="; ".join(signal.signal_text for signal in signals),
+                sources=sources,
+                signals=signals,
+                source_quality_summary=source_quality_summary,
+                missing_evidence=list(dict.fromkeys(missing_evidence)),
+                contradictions=list(dict.fromkeys(contradictions)),
+                stale_signal_count=stale_count,
+                weak_evidence_reasons=list(dict.fromkeys(weak_evidence_reasons)),
+                recommended_next_actions=list(dict.fromkeys(recommended_next_actions)),
+            )
+        )
+    return bundles
+
+
+def _flatten_bundle_items(
+    bundles: list[OpportunitySourceBundle],
+    field: str,
+) -> list[str]:
+    items: list[str] = []
+    for bundle in bundles:
+        values = getattr(bundle, field)
+        if isinstance(values, list):
+            items.extend(str(item) for item in values)
+    return list(dict.fromkeys(item for item in items if item))
+
+
+def _source_bundle_quality_notes(bundles: list[OpportunitySourceBundle]) -> list[str]:
+    notes: list[str] = []
+    for bundle in bundles:
+        prefix = f"{bundle.company_name} {bundle.source_category}"
+        if bundle.missing_evidence:
+            notes.append(f"{prefix}: missing evidence - {'; '.join(bundle.missing_evidence)}")
+        if bundle.weak_evidence_reasons:
+            notes.append(f"{prefix}: weak evidence - {'; '.join(bundle.weak_evidence_reasons)}")
+        if bundle.contradictions:
+            notes.append(f"{prefix}: contradictions - {'; '.join(bundle.contradictions)}")
+        if bundle.stale_signal_count:
+            notes.append(f"{prefix}: {bundle.stale_signal_count} stale signal(s) require refresh.")
+    return list(dict.fromkeys(notes))
+
+
+def _is_role_search(topic: str | None) -> bool:
+    lowered = str(topic or "").lower()
+    if _is_broad_multilane_request(topic):
+        return False
+    if _is_company_growth_discovery_request(topic):
+        return False
+    return any(marker in lowered for marker in ROLE_SEARCH_MARKERS)
+
+
+def _is_company_growth_discovery_request(topic: str | None) -> bool:
+    if _is_broad_multilane_request(topic):
+        return False
+    lowered = str(topic or "").lower()
+    if not lowered:
+        return False
+    company_markers = ("companies", "company", "startups", "startup", "vendors", "platforms")
+    growth_markers = (
+        "funding",
+        "raises",
+        "raised",
+        "partnership",
+        "partnerships",
+        "launch",
+        "launches",
+        "launched",
+        "hiring",
+        "growth",
+        "signals",
+    )
+    return any(marker in lowered for marker in company_markers) and any(
+        marker in lowered for marker in growth_markers
+    )
+
+
+def _resolved_search_plan(
+    topic: str | None,
+    *,
+    max_results: int = 5,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> OpportunitySearchPlan:
+    if search_plan is not None:
+        return search_plan
+    return infer_opportunity_search_plan(topic, desired_count=max_results)
+
+
+def _plan_is_conference_request(plan: OpportunitySearchPlan | None) -> bool:
+    return plan is not None and (
+        plan_targets_only(plan, "conference")
+        or plan_has_objective(plan, "presentation_opportunity")
+    )
+
+
+def _plan_is_researcher_request(plan: OpportunitySearchPlan | None) -> bool:
+    return plan is not None and plan_targets_only(plan, "researcher")
+
+
+def _plan_is_institute_request(plan: OpportunitySearchPlan | None) -> bool:
+    return plan is not None and plan_targets_only(plan, "institute")
+
+
+def _plan_is_broad_request(plan: OpportunitySearchPlan | None) -> bool:
+    return plan is not None and (
+        plan_has_objective(plan, "broad_discovery") or len(plan.target_entity_types) > 2
+    )
+
+
+def _plan_is_role_request(plan: OpportunitySearchPlan | None) -> bool:
+    return plan is not None and plan_targets_only(plan, "role")
+
+
+def _is_institute_discovery_request(topic: str | None) -> bool:
+    if _is_broad_multilane_request(topic):
+        return False
+    lowered = str(topic or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "academic institutes",
+            "institutes",
+            "institute",
+            "centers",
+            "centres",
+            "programs",
+            "programmes",
+        )
+    ) and any(
+        marker in lowered
+        for marker in ("collaboration", "partnership", "advisory", "implementation")
+    )
+
+
+def _is_researcher_discovery_request(topic: str | None) -> bool:
+    if _is_broad_multilane_request(topic):
+        return False
+    lowered = str(topic or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "researchers",
+            "principal investigators",
+            "investigators",
+            "faculty",
+            "labs",
+            "laboratories",
+        )
+    ) and any(
+        marker in lowered
+        for marker in (
+            "publications",
+            "clinical trials",
+            "grants",
+            "implementation",
+            "collaboration",
+        )
+    )
+
+
+def _is_conference_discovery_request(topic: str | None) -> bool:
+    lowered = str(topic or "").lower()
+    if not lowered:
+        return False
+    non_conference_lane_markers = (
+        "companies",
+        "company",
+        "researchers",
+        "principal investigators",
+        "institutes",
+        "clinical trials",
+        "grants",
+        "funding",
+        "launches",
+        "hiring",
+    )
+    if (
+        "across conferences" not in lowered
+        and sum(1 for marker in non_conference_lane_markers if marker in lowered) >= 2
+    ):
+        return False
+    conference_markers = (
+        "conference",
+        "conferences",
+        "symposium",
+        "symposia",
+        "summit",
+        "meeting",
+        "workshop",
+        "presentation",
+        "presentations",
+        "speaking",
+        "speaker",
+        "cfp",
+        "call for proposals",
+        "call for abstracts",
+    )
+    intent_markers = (
+        "presentation",
+        "presentations",
+        "speaking",
+        "speaker",
+        "abstract",
+        "cfp",
+        "call for proposals",
+        "call for abstracts",
+        "implementation oriented",
+        "implementation-oriented",
+        "where keystone",
+    )
+    return any(marker in lowered for marker in conference_markers) and any(
+        marker in lowered for marker in intent_markers
+    )
+
+
+def _is_broad_multilane_request(topic: str | None) -> bool:
+    lowered = str(topic or "").lower()
+    if not lowered:
+        return False
+    if _is_conference_discovery_request(topic):
+        return False
+    broad_markers = (
+        "broad",
+        "across",
+        "multiquery",
+        "multi-query",
+        "multiple lanes",
+        "all lanes",
+    )
+    lane_markers = (
+        "funding",
+        "partnership",
+        "partnerships",
+        "pilot",
+        "pilots",
+        "clinical trial",
+        "clinical trials",
+        "conference",
+        "conferences",
+        "grant",
+        "grants",
+        "advisory",
+        "advisor",
+        "roles",
+    )
+    return (
+        any(marker in lowered for marker in broad_markers)
+        and sum(1 for marker in lane_markers if marker in lowered) >= 2
+    )
+
+
+def _topic_search_context(topic: str | None) -> str:
+    core = "behavioral health psychiatry neuroscience clinical AI clinical research operations"
+    cleaned = " ".join(str(topic or "").split()).strip()
+    if not cleaned:
+        return core
+    lowered = cleaned.lower()
+    if "digital health" in lowered and "opportunit" in lowered:
+        return (
+            "digital health behavioral health clinical AI evidence generation "
+            "clinical research operations"
+        )
+    if len(cleaned.split()) > 18:
+        terms: list[str] = []
+        keyword_phrases = (
+            "digital health",
+            "behavioral health",
+            "mental health",
+            "clinical ai",
+            "clinical research",
+            "digital biomarkers",
+            "trial technology",
+            "medical director",
+            "advisory",
+            "consulting",
+            "partnership",
+        )
+        for phrase in keyword_phrases:
+            if phrase in lowered:
+                terms.append(phrase)
+        if terms:
+            return " ".join(dict.fromkeys([*terms, core]))
+    return f"{cleaned} {core}"
+
+
+def _is_broad_digital_health_request(topic: str | None) -> bool:
+    lowered = str(topic or "").lower()
+    return "digital health" in lowered and any(
+        marker in lowered
+        for marker in ("opportunit", "good opportunities", "find", "advisory", "consulting")
+    )
+
+
+def _build_live_query_specs(
+    topic: str | None = None,
+    *,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> list[_OpportunityQuerySpec]:
+    plan = _resolved_search_plan(topic, search_plan=search_plan)
+    context = _topic_search_context(topic)
+    if _plan_is_role_request(plan) or _is_role_search(topic):
+        specs = [
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="recent",
+                query=f"{context} remote United States careers hiring posted recently",
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="current",
+                query=(
+                    f"{context} clinical operations evidence generation job United States 2026 2025"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="recent",
+                query=(
+                    f"site:clinicaltrials.gov {context} sponsor hiring "
+                    "clinical operations United States"
+                ),
+                entity_hint="trial",
+            ),
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="current",
+                query=(
+                    f"{context} medical director head of product research "
+                    "strategy remote United States"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="recent",
+                query=(
+                    f"site:jobs.ashbyhq.com {context} clinical strategy advisor "
+                    "remote United States"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="recent",
+                query=(
+                    f"site:boards.greenhouse.io {context} clinical research "
+                    "advisor remote United States"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="recent",
+                query=(
+                    f"site:jobs.lever.co {context} clinical AI product strategy "
+                    "remote United States"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="recent",
+                query=(
+                    f"site:linkedin.com/jobs {context} medical director clinical AI "
+                    "remote United States"
+                ),
+                entity_hint="company",
+            ),
+        ]
+    elif _plan_is_institute_request(plan) or _is_institute_discovery_request(topic):
+        specs = [
+            _OpportunityQuerySpec(
+                lane="institute",
+                time_window="current",
+                query=(
+                    'site:.edu ("digital mental health" OR "behavioral health AI" OR '
+                    '"psychiatry AI") ("center" OR "institute" OR "program") '
+                    '("collaboration" OR "implementation" OR "partnership") United States'
+                ),
+                entity_hint="institute",
+            ),
+            _OpportunityQuerySpec(
+                lane="institute",
+                time_window="current",
+                query=(
+                    'site:.edu ("clinical AI" OR neuroinformatics) '
+                    '("mental health" OR psychiatry OR neuroscience) '
+                    '("center" OR "institute" OR "program") United States'
+                ),
+                entity_hint="institute",
+            ),
+            _OpportunityQuerySpec(
+                lane="collaboration",
+                time_window="recent",
+                query=(
+                    '"digital mental health" "AI" university '
+                    '("partnership" OR "pilot" OR "implementation" OR "collaboration") 2026'
+                ),
+                entity_hint="institute",
+                source="news",
+            ),
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="current",
+                query=(
+                    'site:reporter.nih.gov ("digital mental health" OR "behavioral health") '
+                    '("artificial intelligence" OR AI) university psychiatry'
+                ),
+                entity_hint="grant_program",
+            ),
+            _OpportunityQuerySpec(
+                lane="trial",
+                time_window="current",
+                query=(
+                    'site:clinicaltrials.gov ("digital mental health" OR psychiatry) '
+                    '("artificial intelligence" OR AI) university sponsor recruiting'
+                ),
+                entity_hint="trial",
+            ),
+        ]
+    elif _plan_is_researcher_request(plan) or _is_researcher_discovery_request(topic):
+        specs = [
+            _OpportunityQuerySpec(
+                lane="researcher",
+                time_window="current",
+                query=(
+                    'site:.edu psychiatry "artificial intelligence" "principal investigator" '
+                    '("digital mental health" OR "behavioral health")'
+                ),
+                entity_hint="researcher",
+            ),
+            _OpportunityQuerySpec(
+                lane="researcher",
+                time_window="current",
+                query=(
+                    'site:.edu ("digital mental health" OR "behavioral health AI") '
+                    "faculty researcher psychiatry neuroscience collaboration"
+                ),
+                entity_hint="researcher",
+            ),
+            _OpportunityQuerySpec(
+                lane="trial",
+                time_window="current",
+                query=(
+                    'site:clinicaltrials.gov psychiatry "artificial intelligence" '
+                    '"principal investigator" recruiting United States'
+                ),
+                entity_hint="researcher",
+            ),
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="current",
+                query=(
+                    'site:reporter.nih.gov psychiatry "artificial intelligence" '
+                    "principal investigator grant digital mental health"
+                ),
+                entity_hint="researcher",
+            ),
+            _OpportunityQuerySpec(
+                lane="researcher",
+                time_window="evergreen",
+                query=(
+                    'site:pubmed.ncbi.nlm.nih.gov ("digital mental health" OR '
+                    '"behavioral health") "artificial intelligence" psychiatry investigator'
+                ),
+                entity_hint="researcher",
+            ),
+        ]
+    elif _plan_is_conference_request(plan) or _is_conference_discovery_request(topic):
+        specs = [
+            _OpportunityQuerySpec(
+                lane="conference",
+                time_window="recent",
+                query=(
+                    '"behavioral health" "AI" conference 2026 '
+                    '("call for speakers" OR "call for proposals" OR "abstract submission")'
+                ),
+                entity_hint="conference",
+            ),
+            _OpportunityQuerySpec(
+                lane="conference",
+                time_window="recent",
+                query=(
+                    '"mental health" "artificial intelligence" conference 2026 '
+                    "(presentation OR speaker OR symposium OR workshop)"
+                ),
+                entity_hint="conference",
+            ),
+            _OpportunityQuerySpec(
+                lane="conference",
+                time_window="recent",
+                query=(
+                    '"psychiatry" "AI" conference 2026 '
+                    '(presentation OR "call for abstracts" OR workshop)'
+                ),
+                entity_hint="conference",
+            ),
+            _OpportunityQuerySpec(
+                lane="conference",
+                time_window="recent",
+                query=(
+                    '"digital mental health" conference 2026 '
+                    "(speaker OR presentation OR symposium OR workshop)"
+                ),
+                entity_hint="conference",
+            ),
+            _OpportunityQuerySpec(
+                lane="conference",
+                time_window="recent",
+                query=(
+                    '"clinical AI" "behavioral health" summit 2026 '
+                    "(speaker OR presentation OR workshop)"
+                ),
+                entity_hint="conference",
+            ),
+            _OpportunityQuerySpec(
+                lane="conference",
+                time_window="current",
+                query=(
+                    'site:.org ("behavioral health" OR psychiatry OR "mental health") '
+                    '("AI" OR "artificial intelligence") conference 2026 speaker'
+                ),
+                entity_hint="conference",
+            ),
+        ]
+    elif _is_company_growth_discovery_request(topic):
+        specs = [
+            _OpportunityQuerySpec(
+                lane="company_growth",
+                time_window="recent",
+                query=(
+                    '"behavioral health AI" '
+                    '("raises" OR "raised" OR "funding round" OR "seed" OR "Series A") '
+                    "2026"
+                ),
+                entity_hint="company",
+                source="news",
+            ),
+            _OpportunityQuerySpec(
+                lane="company_growth",
+                time_window="recent",
+                query=(
+                    '"digital mental health" ("AI" OR "artificial intelligence") '
+                    '("raises" OR "funding" OR "launches" OR "partners") 2026'
+                ),
+                entity_hint="company",
+                source="news",
+            ),
+            _OpportunityQuerySpec(
+                lane="collaboration",
+                time_window="recent",
+                query=(
+                    '"behavioral health" "AI" '
+                    '("partnership" OR "partners with" OR "pilot" OR "validation study") '
+                    "2026"
+                ),
+                entity_hint="company",
+                source="news",
+            ),
+            _OpportunityQuerySpec(
+                lane="company_growth",
+                time_window="recent",
+                query=(
+                    'site:businesswire.com ("behavioral health" OR "mental health") '
+                    '("AI" OR "artificial intelligence") '
+                    '("raises" OR "partners" OR "launches") 2026'
+                ),
+                entity_hint="company",
+                source="news",
+            ),
+            _OpportunityQuerySpec(
+                lane="company_growth",
+                time_window="recent",
+                query=(
+                    'site:prnewswire.com ("behavioral health" OR "mental health") '
+                    '("AI" OR "artificial intelligence") '
+                    '("funding" OR "partnership" OR "launch") 2026'
+                ),
+                entity_hint="company",
+                source="news",
+            ),
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="recent",
+                query=(
+                    '"behavioral health" "AI" company '
+                    '("hiring" OR "careers" OR "clinical strategy" OR "medical director") '
+                    "United States remote 2026"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="collaboration",
+                time_window="current",
+                query=(
+                    f"{context} company clinical AI evidence generation implementation "
+                    "partnership United States 2026"
+                ),
+                entity_hint="company",
+            ),
+        ]
+    else:
+        specs = [
+            *(
+                [
+                    _OpportunityQuerySpec(
+                        lane="company_growth",
+                        time_window="recent",
+                        query=(
+                            '"digital health" "behavioral health" '
+                            '("announces" OR "raises" OR "funding" OR "partnership") '
+                            "2026"
+                        ),
+                        entity_hint="company",
+                    ),
+                    _OpportunityQuerySpec(
+                        lane="collaboration",
+                        time_window="recent",
+                        query=(
+                            '"clinical AI" "behavioral health" '
+                            '("pilot" OR "partnership" OR "validation study") 2026'
+                        ),
+                        entity_hint="company",
+                    ),
+                    _OpportunityQuerySpec(
+                        lane="company_growth",
+                        time_window="recent",
+                        query=(
+                            'site:businesswire.com ("digital health" OR "mental health") '
+                            '("raises" OR "partners" OR "launches") 2026'
+                        ),
+                        entity_hint="company",
+                    ),
+                    _OpportunityQuerySpec(
+                        lane="company_growth",
+                        time_window="recent",
+                        query=(
+                            'site:prnewswire.com ("behavioral health" OR "digital health") '
+                            '("partnership" OR "funding" OR "validation") 2026'
+                        ),
+                        entity_hint="company",
+                    ),
+                ]
+                if _is_broad_digital_health_request(topic)
+                else []
+            ),
+            *(
+                [
+                    _OpportunityQuerySpec(
+                        lane="company_growth",
+                        time_window="recent",
+                        query=(
+                            '"behavioral health AI" '
+                            '("raises" OR "raised" OR "funding round" OR "seed" OR "Series A") '
+                            "2026"
+                        ),
+                        entity_hint="company",
+                        source="news",
+                    ),
+                    _OpportunityQuerySpec(
+                        lane="company_growth",
+                        time_window="recent",
+                        query=(
+                            '"digital mental health" ("AI" OR "artificial intelligence") '
+                            '("raises" OR "funding" OR "launches" OR "partners") 2026'
+                        ),
+                        entity_hint="company",
+                        source="news",
+                    ),
+                    _OpportunityQuerySpec(
+                        lane="collaboration",
+                        time_window="recent",
+                        query=(
+                            '"behavioral health" "AI" '
+                            '("partnership" OR "partners with" OR "pilot" OR "validation study") '
+                            "2026"
+                        ),
+                        entity_hint="company",
+                        source="news",
+                    ),
+                    _OpportunityQuerySpec(
+                        lane="company_growth",
+                        time_window="recent",
+                        query=(
+                            'site:businesswire.com ("behavioral health" OR "mental health") '
+                            '("AI" OR "artificial intelligence") '
+                            '("raises" OR "partners" OR "launches") 2026'
+                        ),
+                        entity_hint="company",
+                        source="news",
+                    ),
+                    _OpportunityQuerySpec(
+                        lane="company_growth",
+                        time_window="recent",
+                        query=(
+                            'site:prnewswire.com ("behavioral health" OR "mental health") '
+                            '("AI" OR "artificial intelligence") '
+                            '("funding" OR "partnership" OR "launch") 2026'
+                        ),
+                        entity_hint="company",
+                        source="news",
+                    ),
+                ]
+                if _is_broad_multilane_request(topic)
+                else []
+            ),
+            _OpportunityQuerySpec(
+                lane="company_growth",
+                time_window="recent",
+                query=(
+                    f"{context} company funding hiring validation partnership "
+                    "United States 2026 recent"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="company_growth",
+                time_window="current",
+                query=(
+                    f"{context} company evidence generation clinical research operations "
+                    "United States 2025 2026"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="collaboration",
+                time_window="recent",
+                query=(
+                    f"{context} collaboration partnership consortium pilot program "
+                    "United States 2026"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="collaboration",
+                time_window="recent",
+                query=(
+                    f"{context} advisory consultant fractional medical director "
+                    "clinical AI digital mental health 2026"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="researcher",
+                time_window="current",
+                query=(
+                    f"site:.edu {context} investigator lab collaboration "
+                    "psychiatry neuroscience United States"
+                ),
+                entity_hint="researcher",
+            ),
+            _OpportunityQuerySpec(
+                lane="researcher",
+                time_window="evergreen",
+                query=(
+                    f"site:pubmed.ncbi.nlm.nih.gov {context} investigator "
+                    "psychiatry neuroscience clinical trial"
+                ),
+                entity_hint="researcher",
+            ),
+            _OpportunityQuerySpec(
+                lane="institute",
+                time_window="current",
+                query=(
+                    f"site:.edu {context} institute center program digital mental health "
+                    "clinical AI United States"
+                ),
+                entity_hint="institute",
+            ),
+            _OpportunityQuerySpec(
+                lane="conference",
+                time_window="recent",
+                query=(
+                    f"{context} conference symposium abstract sponsor workshop United States 2026"
+                ),
+                entity_hint="conference",
+            ),
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="current",
+                query=(f"site:reporter.nih.gov {context} NIH SBIR grant psychiatry neuroscience"),
+                entity_hint="grant_program",
+            ),
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="strategic",
+                query=(
+                    f"site:grants.gov {context} funding opportunity behavioral health neuroscience"
+                ),
+                entity_hint="grant_program",
+            ),
+            _OpportunityQuerySpec(
+                lane="trial",
+                time_window="recent",
+                query=(
+                    f"site:clinicaltrials.gov {context} study sponsor recruiting United States 2026"
+                ),
+                entity_hint="trial",
+            ),
+            _OpportunityQuerySpec(
+                lane="trial",
+                time_window="current",
+                query=(
+                    f"site:clinicaltrials.gov {context} principal investigator "
+                    "study site psychiatry United States"
+                ),
+                entity_hint="trial",
+            ),
+        ]
+    seen: set[str] = set()
+    deduped: list[_OpportunityQuerySpec] = []
+    for spec in specs:
+        key = spec.query.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(spec)
+    return deduped
+
+
+def _build_live_queries(topic: str | None = None) -> list[str]:
+    return [spec.query for spec in _build_live_query_specs(topic)]
+
+
+def _build_adaptive_followup_query_specs(
+    topic: str | None,
+    *,
+    existing_specs: list[_OpportunityQuerySpec],
+    search_plan: OpportunitySearchPlan | None = None,
+) -> list[_OpportunityQuerySpec]:
+    """Return a small second-pass ladder when strict search finds no accepted record."""
+
+    context = _topic_search_context(topic)
+    lowered = str(topic or "").lower()
+    if not lowered.strip():
+        return []
+
+    specs: list[_OpportunityQuerySpec] = []
+    if "advisory" in lowered or "advisor" in lowered or "consult" in lowered:
+        specs.extend(
+            [
+                _OpportunityQuerySpec(
+                    lane="collaboration",
+                    time_window="recent",
+                    query=(
+                        f'{context} ("advisory board" OR advisor OR consultant OR '
+                        '"fractional medical director") behavioral health AI'
+                    ),
+                    entity_hint="company",
+                    source="news",
+                ),
+                _OpportunityQuerySpec(
+                    lane="role",
+                    time_window="recent",
+                    query=(
+                        f'{context} ("clinical advisor" OR "medical advisor" OR '
+                        '"clinical strategy") remote United States'
+                    ),
+                    entity_hint="company",
+                ),
+                _OpportunityQuerySpec(
+                    lane="company_growth",
+                    time_window="recent",
+                    query=(
+                        f'{context} ("raises" OR "partnership" OR "launches") '
+                        '"behavioral health" "AI"'
+                    ),
+                    entity_hint="company",
+                    source="news",
+                ),
+            ]
+        )
+    specs.extend(
+        [
+            _OpportunityQuerySpec(
+                lane="collaboration",
+                time_window="current",
+                query=(
+                    f"{context} clinical validation pilot partnership "
+                    "behavioral health AI United States"
+                ),
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="company_growth",
+                time_window="recent",
+                query=(
+                    f"{context} startup funding clinical advisory behavioral health "
+                    "mental health AI"
+                ),
+                entity_hint="company",
+                source="news",
+            ),
+        ]
+    )
+    seen = {spec.query.strip().lower() for spec in existing_specs}
+    followups: list[_OpportunityQuerySpec] = []
+    for spec in specs:
+        key = spec.query.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        followups.append(spec)
+    return followups[:5]
+
+
+def _build_underfill_followup_query_specs(
+    topic: str | None,
+    *,
+    existing_specs: list[_OpportunityQuerySpec],
+    accepted_count: int,
+    desired_count: int,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> list[_OpportunityQuerySpec]:
+    """Broaden targeted searches when the request asked for more than survived filters."""
+
+    if accepted_count >= desired_count:
+        return []
+    lowered = str(topic or "").lower()
+    if not lowered.strip():
+        return []
+
+    specs: list[_OpportunityQuerySpec] = []
+    if _plan_is_institute_request(search_plan) or _is_institute_discovery_request(topic):
+        specs.extend(
+            [
+                _OpportunityQuerySpec(
+                    lane="institute",
+                    time_window="current",
+                    query=(
+                        'site:.edu ("AI for mental health" '
+                        'OR "artificial intelligence for mental health" '
+                        'OR "digital mental health") ("industry affiliate" OR "affiliate program" '
+                        'OR "partner with us" OR collaboration)'
+                    ),
+                    entity_hint="institute",
+                ),
+                _OpportunityQuerySpec(
+                    lane="institute",
+                    time_window="current",
+                    query=(
+                        'site:.edu ("digital mental health" OR "behavioral health technology") '
+                        '("center" OR "program" OR initiative) '
+                        '("partner" OR contact OR collaborate)'
+                    ),
+                    entity_hint="institute",
+                ),
+                _OpportunityQuerySpec(
+                    lane="institute",
+                    time_window="current",
+                    query=(
+                        'site:.edu (psychiatry OR "behavioral health") ("AI" OR "clinical AI") '
+                        '("special initiative" OR "innovation center" OR "research center") '
+                        "(collaboration OR partner)"
+                    ),
+                    entity_hint="institute",
+                ),
+                _OpportunityQuerySpec(
+                    lane="institute",
+                    time_window="current",
+                    query=(
+                        'site:.edu neuroinformatics ("center" OR "program" OR initiative) '
+                        '(psychiatry OR neuroscience OR "mental health") (collaboration OR partner)'
+                    ),
+                    entity_hint="institute",
+                ),
+                _OpportunityQuerySpec(
+                    lane="institute",
+                    time_window="current",
+                    query=(
+                        'site:.edu ("mental health AI" OR "behavioral health AI") '
+                        '("external partners" OR partnership OR "industry")'
+                    ),
+                    entity_hint="institute",
+                ),
+            ]
+        )
+    elif _plan_is_researcher_request(search_plan) or _is_researcher_discovery_request(topic):
+        specs.extend(
+            [
+                _OpportunityQuerySpec(
+                    lane="researcher",
+                    time_window="current",
+                    query=(
+                        'site:.edu ("digital mental health" OR "mental health AI") '
+                        '("principal investigator" OR investigator) psychiatry'
+                    ),
+                    entity_hint="researcher",
+                ),
+                _OpportunityQuerySpec(
+                    lane="researcher",
+                    time_window="current",
+                    query=(
+                        'site:.edu ("behavioral health" OR psychiatry) '
+                        '("machine learning" OR "artificial intelligence") (PhD OR MD) grant'
+                    ),
+                    entity_hint="researcher",
+                ),
+                _OpportunityQuerySpec(
+                    lane="researcher",
+                    time_window="current",
+                    query=(
+                        'site:.edu ("digital phenotyping" OR "clinical AI") '
+                        '(psychiatry OR neuroscience) ("principal investigator" OR faculty)'
+                    ),
+                    entity_hint="researcher",
+                ),
+            ]
+        )
+    elif _plan_is_conference_request(search_plan) or _is_conference_discovery_request(topic):
+        specs.extend(
+            [
+                _OpportunityQuerySpec(
+                    lane="conference",
+                    time_window="recent",
+                    query=(
+                        '"behavioral health in the age of AI" conference 2026 '
+                        "(speaker OR presentation OR abstract)"
+                    ),
+                    entity_hint="conference",
+                ),
+                _OpportunityQuerySpec(
+                    lane="conference",
+                    time_window="recent",
+                    query=(
+                        '"AI in behavioral health" "2026" '
+                        "(conference OR summit OR symposium OR workshop)"
+                    ),
+                    entity_hint="conference",
+                ),
+                _OpportunityQuerySpec(
+                    lane="conference",
+                    time_window="recent",
+                    query=(
+                        '"mental health AI" "call for speakers" '
+                        'OR "mental health AI" "call for abstracts"'
+                    ),
+                    entity_hint="conference",
+                ),
+            ]
+        )
+    elif (
+        _plan_is_broad_request(search_plan)
+        or _is_broad_multilane_request(topic)
+        or _is_company_growth_discovery_request(topic)
+    ):
+        specs.extend(
+            [
+                _OpportunityQuerySpec(
+                    lane="company_growth",
+                    time_window="recent",
+                    query=(
+                        '"behavioral health technology" ("AI" OR analytics OR platform) '
+                        '("raises" OR "funding" OR "partners" OR "launches") 2026'
+                    ),
+                    entity_hint="company",
+                    source="news",
+                ),
+                _OpportunityQuerySpec(
+                    lane="collaboration",
+                    time_window="recent",
+                    query=(
+                        '"mental health" "clinical AI" '
+                        '("partnership" OR "pilot" OR "validation" OR "implementation") 2026'
+                    ),
+                    entity_hint="company",
+                    source="news",
+                ),
+            ]
+        )
+
+    seen = {spec.query.strip().lower() for spec in existing_specs}
+    followups: list[_OpportunityQuerySpec] = []
+    for spec in specs:
+        key = spec.query.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        followups.append(spec)
+    return followups[:6]
+
+
+def _build_result_deepening_query_specs(
+    *,
+    topic: str | None,
+    existing_specs: list[_OpportunityQuerySpec],
+    accepted_count: int,
+    desired_count: int,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> list[_OpportunityQuerySpec]:
+    """Request additional result pages for broad searches that under-fill."""
+
+    if accepted_count >= desired_count:
+        return []
+    if not _result_deepening_allowed(topic, search_plan=search_plan):
+        return []
+    deepenable_lanes = {
+        "company_growth",
+        "collaboration",
+        "grant",
+        "trial",
+        "role",
+        "institute",
+        "researcher",
+        "conference",
+    }
+    specs: list[_OpportunityQuerySpec] = []
+    seen: set[tuple[str, int]] = set()
+    for spec in existing_specs:
+        if spec.lane not in deepenable_lanes:
+            continue
+        page = 2 if spec.page in {None, 1} else spec.page + 1
+        key = (spec.query.strip().lower(), page)
+        if key in seen:
+            continue
+        seen.add(key)
+        specs.append(
+            _OpportunityQuerySpec(
+                lane=spec.lane,
+                time_window=spec.time_window,
+                query=spec.query,
+                entity_hint=spec.entity_hint,
+                source=spec.source,
+                country=spec.country,
+                location=spec.location,
+                language=spec.language,
+                page=page,
+            )
+        )
+        if len(specs) >= 6:
+            break
+    return specs
+
+
+def _result_deepening_allowed(
+    topic: str | None,
+    *,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> bool:
+    return (
+        _plan_is_broad_request(search_plan)
+        or _plan_is_conference_request(search_plan)
+        or _plan_is_institute_request(search_plan)
+        or _plan_is_researcher_request(search_plan)
+        or _is_broad_multilane_request(topic)
+        or _is_company_growth_discovery_request(topic)
+        or _is_institute_discovery_request(topic)
+        or _is_researcher_discovery_request(topic)
+        or _is_conference_discovery_request(topic)
+    )
+
+
+def _extract_company_name(title: str, url: str = "") -> str:
+    text = " ".join(title.split()).strip()
+    for separator in (" | ", " - ", ":"):
+        if separator in text:
+            text = text.split(separator, 1)[0].strip()
+            break
+    lowered = f" {text.lower()} "
+    markers = (
+        " raises ",
+        " announces ",
+        " launches ",
+        " partners ",
+        " partner ",
+        " partners with ",
+        " selects ",
+        " selected ",
+        " teams with ",
+        " publishes ",
+        " hiring ",
+        " hires ",
+        " secures ",
+        " reports ",
+        " begins ",
+        " starts ",
+        " expands ",
+        " unveils ",
+        " validation ",
+        " clinical trial ",
+        " study ",
+    )
+    cut_points = [lowered.find(marker) for marker in markers if lowered.find(marker) > 0]
+    if cut_points:
+        text = text[: min(cut_points)].strip()
+    text = re.sub(r"\b(inc\.?|llc|ltd\.?|corp\.?|corporation|company)\b\.?$", "", text).strip()
+    if text:
+        return text[:100]
+    host = re.sub(r"^https?://", "", url).split("/", 1)[0]
+    return host.split(".")[0].replace("-", " ").title() or "Unknown company"
+
+
+def _title_segment(title: str) -> str:
+    text = " ".join(title.split()).strip()
+    for separator in (" | ", " - ", ":"):
+        if separator in text:
+            return text.split(separator, 1)[0].strip()
+    return text
+
+
+def _conference_name_from_title(title: str) -> str:
+    segment = _title_segment(title)
+    if segment:
+        return segment[:140]
+    return "Unknown conference"
+
+
+def _person_name_from_title(title: str) -> str:
+    segment = _title_segment(title)
+    segment = re.sub(
+        r"(?:,\s*|\s+)(?:MD|PhD|ScD|MS|MBA|OTR/L|BCMH|CPRP|FAOTA)\b.*$",
+        "",
+        segment,
+        flags=re.I,
+    ).strip()
+    match = PERSON_NAME_RE.match(segment)
+    if match is not None:
+        return match.group(1).strip()[:140]
+    return ""
+
+
+def _looks_like_named_person(title: str, snippet: str) -> bool:
+    person_name = _person_name_from_title(title)
+    if not person_name:
+        return False
+    lowered = f" {title.lower()} {snippet.lower()} "
+    return any(marker in lowered for marker in PERSON_CONTEXT_MARKERS)
+
+
+def _entity_kind_from_lane(
+    *,
+    lane: str,
+    title: str,
+    url: str,
+    snippet: str,
+    entity_hint: str,
+) -> str:
+    haystack = " ".join([title, url, snippet]).lower()
+    if _looks_like_named_person(title, snippet):
+        return "researcher"
+    if lane == "conference" or _contains_any_marker(haystack, CONFERENCE_MARKERS):
+        if _contains_any_marker(haystack, CONFERENCE_MARKERS):
+            return "conference"
+        if _contains_any_marker(haystack, INSTITUTE_MARKERS):
+            return "institute"
+        return "company"
+    if lane == "researcher":
+        if _looks_like_named_person(title, snippet):
+            return "researcher"
+        if _contains_any_marker(haystack, INSTITUTE_MARKERS):
+            return "institute"
+        return "company"
+    if lane == "institute":
+        if ".edu" in haystack and any(
+            marker in haystack
+            for marker in ("program", "affiliate", "initiative", "special-initiatives")
+        ):
+            return "institute"
+        return "institute" if _contains_any_marker(haystack, INSTITUTE_MARKERS) else "company"
+    if lane == "grant":
+        if any(
+            marker in haystack
+            for marker in ("grants.gov", "reporter.nih.gov", "nih", "sbir", "grant")
+        ):
+            return "grant_program"
+        if _contains_any_marker(haystack, INSTITUTE_MARKERS):
+            return "institute"
+        return "company"
+    if lane == "trial":
+        if "clinicaltrials.gov" in haystack and any(
+            marker in haystack for marker in ("trial site", "study site", "principal investigator")
+        ):
+            return "trial"
+        if "clinicaltrials.gov" in haystack and _looks_like_named_person(title, snippet):
+            return "researcher"
+        if _contains_any_marker(haystack, INSTITUTE_MARKERS):
+            return "institute"
+        return "company"
+    if _contains_any_marker(haystack, INSTITUTE_MARKERS):
+        return "institute"
+    return "company"
+
+
+def _extract_candidate_name(
+    *,
+    title: str,
+    url: str,
+    snippet: str,
+    entity_kind: str,
+) -> str:
+    if entity_kind == "researcher":
+        person = _person_name_from_title(title)
+        if person:
+            return person
+    if entity_kind == "conference":
+        return _conference_name_from_title(title)
+    if entity_kind in {"institute", "grant_program", "trial"}:
+        segment = _title_segment(title)
+        if segment:
+            return segment[:140]
+    return _extract_company_name(title, url)
+
+
+def _normalize_entity_key(entity_name: str, entity_kind: str) -> str:
+    base = _normalize_company_key(entity_name)
+    return f"{entity_kind}:{base}" if base else entity_kind
+
+
+def _looks_us_focused(text: str) -> bool:
+    lowered = f" {text.lower()} "
+    if any(marker in lowered for marker in USA_TEXT_MARKERS):
+        return True
+    if re.search(r"\b[A-Z][a-zA-Z .'-]+,\s*[A-Z]{2}\b", text):
+        return True
+    return False
+
+
+def _contains_any_marker(text: str, markers: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    for marker in markers:
+        if " " in marker:
+            if marker in lowered:
+                return True
+            continue
+        if re.search(rf"\b{re.escape(marker)}\b", lowered):
+            return True
+    return False
+
+
+def _usa_relevance_from_hit(hit: dict[str, Any]) -> tuple[int, list[str]]:
+    title = str(hit.get("source_title") or hit.get("title") or "")
+    snippet = str(hit.get("signal") or hit.get("snippet") or "")
+    url = str(hit.get("source_url") or hit.get("url") or hit.get("link") or "")
+    combined = " ".join([title, snippet, url])
+    lowered = combined.lower()
+    score = 45
+    reasons: list[str] = []
+    if any(marker in lowered for marker in USA_DOMAIN_MARKERS):
+        score += 25
+        reasons.append("Source domain is U.S.-anchored or U.S.-regulatory/research-facing.")
+    if _looks_us_focused(combined):
+        score += 25
+        reasons.append("Result text includes explicit United States or U.S. location evidence.")
+    if any(marker in lowered for marker in ("fda", "nih", "cms", "medicare", "medicaid")):
+        score += 10
+        reasons.append("Result references U.S. regulatory, payer, or funding context.")
+    if any(marker in lowered for marker in NON_US_MARKERS) and not _looks_us_focused(combined):
+        score -= 15
+        reasons.append("No clear U.S. operating signal was found in a non-U.S. context.")
+    if "clinicaltrials.gov" in lowered:
+        score += 10
+        reasons.append("ClinicalTrials.gov commonly signals U.S.-relevant trial activity.")
+    return (bounded_score(score), list(dict.fromkeys(reasons)))
+
+
+def _source_freshness_text(source_hit: dict[str, Any]) -> str:
+    published_at = str(source_hit.get("published_at") or source_hit.get("date") or "")
+    if published_at.startswith("2026-"):
+        return "fresh"
+    if published_at.startswith("2025-") or published_at.startswith("2026"):
+        return "current"
+    if published_at:
+        return "stale"
+    return "unknown"
+
+
+def _novelty_score_from_hits(
+    *,
+    source_hits: list[dict[str, Any]],
+    existing_state: ExistingOpportunityState | None,
+) -> int:
+    categories = {
+        _source_category_from_hit(hit)
+        for hit in source_hits
+        if _source_category_from_hit(hit) != "unknown"
+    }
+    fresh_count = sum(
+        1 for hit in source_hits if _source_freshness_text(hit) in {"fresh", "current"}
+    )
+    score = 48 + min(20, len(categories) * 8) + min(16, fresh_count * 4)
+    if existing_state is not None:
+        score -= 18
+    return bounded_score(score)
+
+
+def _usa_relevance_summary(score: int, reasons: list[str]) -> str:
+    if score >= 85:
+        label = "high"
+    elif score >= 65:
+        label = "moderate"
+    else:
+        label = "limited"
+    detail = reasons[0] if reasons else "No explicit U.S. operating signal was identified."
+    return f"{label} U.S. relevance ({score}/100): {detail}"
+
+
+def _novelty_summary(
+    *,
+    novelty_score: int,
+    existing_state: ExistingOpportunityState | None,
+    search_lanes: list[str],
+    time_windows: list[str],
+) -> str:
+    state_note = (
+        f"existing pipeline state {existing_state.status} lowers novelty"
+        if existing_state is not None
+        else "not present in local pipeline state"
+    )
+    lane_note = ", ".join(search_lanes) if search_lanes else "default lanes"
+    window_note = ", ".join(time_windows) if time_windows else "current window"
+    return (
+        f"novelty {novelty_score}/100 from lane coverage ({lane_note}), "
+        f"time windows ({window_note}), and {state_note}."
+    )
+
+
+def _signals_from_text(text: str) -> list[str]:
+    lowered = text.lower()
+    signals: list[str] = []
+    keyword_map = (
+        ("recent funding", ("funding", "series a", "series b", "seed round", "raises")),
+        ("hiring clinical", ("hiring clinical", "clinical role", "clinical operations")),
+        ("hiring research", ("hiring research", "research scientist", "research role")),
+        ("hiring AI", ("hiring ai", "machine learning", "artificial intelligence")),
+        ("hiring product", ("hiring product", "product manager", "product role")),
+        ("hiring evidence", ("evidence role", "evidence generation", "real-world evidence")),
+        ("payer partnership", ("payer partnership", "health plan", "insurer", "payer")),
+        ("product launch", ("product launch", "launches", "launched", "unveils")),
+        ("validation study", ("validation", "validated", "validation study")),
+        ("clinical trial launch", ("clinical trial", "trial launch", "study launch")),
+        ("IRB or protocol activity", ("irb", "protocol")),
+        ("conference activity", ("conference", "symposium", "poster", "abstract")),
+        ("publication or outcomes evidence", ("publication", "published", "outcomes", "evidence")),
+        ("partnership announcement", ("partnership", "partners with", "collaboration")),
+    )
+    for signal, keywords in keyword_map:
+        if any(keyword in lowered for keyword in keywords):
+            signals.append(signal)
+    return list(dict.fromkeys(signals)) or ["partnership announcement"]
+
+
+def _opportunity_type_from_text(text: str) -> OpportunityType:
+    lowered = text.lower()
+    if "behavioral health" in lowered and "ai" in lowered:
+        return "behavioral health AI"
+    if "digital mental health" in lowered:
+        return "digital mental health"
+    if "clinical ai" in lowered or ("clinical" in lowered and "ai" in lowered):
+        return "clinical AI"
+    if "cro" in lowered or "contract research" in lowered:
+        return "CRO"
+    if "trial technology" in lowered or ("trial" in lowered and "technology" in lowered):
+        return "trial technology"
+    if "cns biotech" in lowered or ("cns" in lowered and "biotech" in lowered):
+        return "CNS biotech"
+    if "neurotechnology" in lowered or "neurotech" in lowered:
+        return "neurotechnology"
+    return "grant or collaboration opportunity"
+
+
+def _looks_like_job_posting(*, title: str, url: str, snippet: str) -> bool:
+    url_lower = url.lower()
+    title_lower = title.lower()
+    snippet_lower = snippet.lower()
+    if any(marker in url_lower for marker in JOB_POSTING_URL_MARKERS):
+        return True
+    if any(marker in title_lower or marker in snippet_lower for marker in JOB_POSTING_TEXT_MARKERS):
+        return True
+    if "hiring" in title_lower and any(pattern in title_lower for pattern in ROLE_HINT_PATTERNS):
+        return True
+    if any(pattern in title_lower for pattern in ROLE_HINT_PATTERNS) and any(
+        marker in snippet_lower for marker in REMOTE_MARKERS + ONSITE_MARKERS
+    ):
+        return True
+    return False
+
+
+def _employee_count_range(text: str) -> tuple[int, int] | None:
+    match = EMPLOYEE_RANGE_RE.search(text)
+    if match is None:
+        return None
+    try:
+        low = int(match.group("low"))
+        high = int(match.group("high") or low)
+    except ValueError:
+        return None
+    if "+" in match.group(0):
+        high = max(high, low)
+    return (low, high)
+
+
+def _role_title_from_text(title: str, snippet: str) -> str:
+    match = ROLE_TITLE_PREFIX_RE.search(title)
+    if match is not None:
+        candidate = match.group(1)
+    else:
+        candidate = title
+        for separator in (" | ", " - ", ":"):
+            if separator in candidate:
+                candidate = candidate.split(separator, 1)[-1]
+                break
+    candidate = re.sub(r"\((?:remote|hybrid|onsite|on-site)[^)]+\)", "", candidate, flags=re.I)
+    candidate = re.sub(r"\s+", " ", candidate).strip(" -,:")
+    if len(candidate.split()) <= 1 and snippet:
+        snippet_match = ROLE_TITLE_PREFIX_RE.search(snippet)
+        if snippet_match is not None:
+            candidate = snippet_match.group(1).strip(" -,:")
+    return candidate[:140]
+
+
+def _role_location_from_text(title: str, snippet: str) -> tuple[str, bool | None, str]:
+    combined = " ".join([title, snippet]).lower()
+    if any(marker in combined for marker in REMOTE_MARKERS):
+        return ("Remote, United States", True, "United States")
+    if any(marker in combined for marker in ONSITE_MARKERS):
+        location_match = re.search(
+            r"\b(?:in|based in)\s+([A-Z][A-Za-z .,&-]+(?:,\s*[A-Z]{2})?)",
+            " ".join([title, snippet]),
+        )
+        location = location_match.group(1).strip() if location_match else "On-site"
+        country = "United States" if "u.s" in combined or "united states" in combined else ""
+        return (location, False, country)
+    country = "United States" if "u.s" in combined or "united states" in combined else ""
+    return ("", None, country)
+
+
+def _practicing_clinician_requirement(text: str, *, is_role_candidate: bool) -> bool | None:
+    lowered = text.lower()
+    if any(marker in lowered for marker in CLINICIAN_REQUIRED_MARKERS):
+        return True
+    if not is_role_candidate:
+        return None
+    clinician_title_markers = ("psychiatrist", "therapist", "physician", "clinician")
+    if any(marker in lowered for marker in clinician_title_markers):
+        return None
+    return False
+
+
+def _role_evidence_from_hit(hit: dict[str, Any]) -> _RoleEvidence:
+    title = str(hit.get("source_title") or hit.get("title") or "").strip()
+    snippet = str(hit.get("signal") or hit.get("snippet") or "").strip()
+    url = str(hit.get("source_url") or hit.get("url") or "").strip()
+    is_role_candidate = _looks_like_job_posting(title=title, url=url, snippet=snippet) or (
+        str(hit.get("source_category") or "") == "job_posting"
+    )
+    role_title = _role_title_from_text(title, snippet) if is_role_candidate else ""
+    role_location, role_remote, role_country = _role_location_from_text(title, snippet)
+    combined = " ".join([title, snippet])
+    employee_count_range = _employee_count_range(combined)
+    unpaid = True if any(marker in combined.lower() for marker in UNPAID_MARKERS) else None
+    if unpaid is None and is_role_candidate:
+        unpaid = False
+    practicing_clinician_required = _practicing_clinician_requirement(
+        combined,
+        is_role_candidate=is_role_candidate,
+    )
+    filter_notes: list[str] = []
+    if is_role_candidate and role_remote is True:
+        filter_notes.append("Remote status verified from the source snippet.")
+    if employee_count_range is not None:
+        low, high = employee_count_range
+        filter_notes.append(
+            f"Company size evidence suggests approximately {low}-{high} employees."
+            if low != high
+            else f"Company size evidence suggests approximately {low} employees."
+        )
+    if unpaid is False:
+        filter_notes.append("The posting reads like a standard paid role; no unpaid marker found.")
+    if practicing_clinician_required is False:
+        filter_notes.append("No full-time practicing clinician requirement was stated.")
+    return _RoleEvidence(
+        is_role_candidate=is_role_candidate,
+        role_title=role_title,
+        role_location=role_location,
+        role_remote=role_remote,
+        role_country=role_country,
+        role_active=True if is_role_candidate else None,
+        employee_count_range=employee_count_range,
+        unpaid=unpaid,
+        practicing_clinician_required=practicing_clinician_required,
+        filter_notes=tuple(dict.fromkeys(note for note in filter_notes if note)),
+    )
+
+
+def _parse_hard_filters(topic: str | None) -> _OpportunityHardFilters:
+    if not topic:
+        return _OpportunityHardFilters()
+    lowered = topic.lower()
+    employee_threshold = None
+    match = re.search(r"under\s+(\d+)\s+employees", lowered)
+    if match is not None:
+        employee_threshold = int(match.group(1))
+    return _OpportunityHardFilters(
+        exclude_under_employee_count=employee_threshold,
+        exclude_onsite=("exclude on-site" in lowered or "exclude onsite" in lowered),
+        exclude_unpaid=("exclude unpaid" in lowered or "paid only" in lowered),
+        exclude_practicing_clinician=(
+            "full-time practicing clinician" in lowered or "practicing clinician" in lowered
+        ),
+    )
+
+
+def _apply_hard_filters_to_hits(
+    hits: list[dict[str, Any]],
+    *,
+    topic: str | None,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    filters = _parse_hard_filters(topic)
+    if not filters.strict_verification:
+        return hits, [], []
+
+    filtered: list[dict[str, Any]] = []
+    excluded_notes: list[str] = []
+    filtered_candidates: list[dict[str, Any]] = []
+    excluded_count = 0
+    for hit in hits:
+        role = _role_evidence_from_hit(hit)
+        enriched = dict(hit)
+        enriched.update(
+            {
+                "role_title": role.role_title,
+                "role_location": role.role_location,
+                "role_remote": role.role_remote,
+                "role_country": role.role_country,
+                "role_active": role.role_active,
+                "role_filter_notes": list(role.filter_notes),
+            }
+        )
+        reasons: list[str] = []
+        if not role.is_role_candidate:
+            reasons.append("not a verifiable role posting")
+        if filters.exclude_under_employee_count is not None:
+            if role.employee_count_range is None:
+                reasons.append("company size not verified for the employee-count filter")
+            else:
+                low, high = role.employee_count_range
+                threshold = filters.exclude_under_employee_count
+                if threshold is not None and (high < threshold or low < threshold):
+                    reasons.append(f"company size may be under {threshold} employees")
+        if filters.exclude_onsite and role.role_remote is not True:
+            reasons.append("remote status was not verified as remote")
+        if filters.exclude_unpaid and role.unpaid is not False:
+            reasons.append("compensation was not verified as paid")
+        if filters.exclude_practicing_clinician and role.practicing_clinician_required is True:
+            reasons.append("role requires a full-time practicing clinician")
+        if reasons:
+            excluded_count += 1
+            company_name = str(hit.get("company_name") or "Unknown company")
+            excluded_notes.append(
+                f"Filtered out {company_name}: {'; '.join(dict.fromkeys(reasons))}."
+            )
+            filtered_candidates.append(
+                {
+                    "company_name": company_name,
+                    "source_title": str(hit.get("source_title") or hit.get("title") or ""),
+                    "source_url": str(hit.get("source_url") or hit.get("url") or ""),
+                    "query": str(hit.get("query") or ""),
+                    "query_lane": str(hit.get("query_lane") or ""),
+                    "role_title": role.role_title,
+                    "role_location": role.role_location,
+                    "role_remote": role.role_remote,
+                    "role_country": role.role_country,
+                    "reasons": list(dict.fromkeys(reasons)),
+                    "role_filter_notes": list(role.filter_notes),
+                }
+            )
+            continue
+        filtered.append(enriched)
+
+    notes = [
+        "Applied strict hard filters for role discovery.",
+        (
+            f"Hard filters removed {excluded_count} candidate(s) before scoring."
+            if excluded_count
+            else "No candidates were removed by the requested hard filters."
+        ),
+        *excluded_notes[:5],
+    ]
+    if not filtered:
+        notes.append(
+            "No candidates satisfied the requested exclusions with enough evidence to verify "
+            "role type, company size, remote status, and compensation."
+        )
+    return filtered, notes, filtered_candidates
+
+
+def _filtered_candidate_from_hit(
+    hit: dict[str, Any],
+    *,
+    reasons: list[str],
+) -> dict[str, Any]:
+    return {
+        "company_name": str(hit.get("company_name") or "Unknown company"),
+        "entity_kind": str(hit.get("entity_kind") or ""),
+        "source_category": str(hit.get("source_category") or ""),
+        "source_title": str(hit.get("source_title") or hit.get("title") or ""),
+        "source_url": str(hit.get("source_url") or hit.get("url") or ""),
+        "query": str(hit.get("query") or ""),
+        "query_lane": str(hit.get("query_lane") or ""),
+        "query_time_window": str(hit.get("query_time_window") or ""),
+        "role_title": str(hit.get("role_title") or ""),
+        "role_location": str(hit.get("role_location") or ""),
+        "role_remote": hit.get("role_remote"),
+        "role_country": str(hit.get("role_country") or ""),
+        "reasons": list(dict.fromkeys(reason for reason in reasons if reason)),
+        "role_filter_notes": [
+            str(note) for note in hit.get("role_filter_notes", []) if str(note).strip()
+        ],
+    }
+
+
+def _candidate_name_rejection_reason(company_name: str) -> str:
+    stripped = " ".join(company_name.split()).strip()
+    lowered = stripped.lower().strip(" .:/-_")
+    normalized = re.sub(r"[^a-z0-9]+", "", lowered)
+    if lowered == "correction" or lowered.startswith(("correction ", "correction:")):
+        return "candidate name is a correction notice rather than an organization"
+    if lowered in INVALID_CANDIDATE_NAMES or normalized in INVALID_CANDIDATE_NAMES:
+        return "candidate name is URL/title noise rather than an organization"
+    if lowered.startswith(("http://", "https://")) or "://" in lowered:
+        return "candidate name is a URL rather than an organization"
+    if re.fullmatch(r"https?", lowered):
+        return "candidate name is URL/title noise rather than an organization"
+    if re.fullmatch(r"(?:www\.)?[a-z0-9-]+\.[a-z]{2,}(?:/.*)?", lowered):
+        return "candidate name is a domain or URL rather than an organization"
+    allowed_acronyms = {"APA", "FDA", "NIH", "NIMH", "NCQA", "VA"}
+    if re.fullmatch(r"[A-Z]{2,4}", stripped) and stripped not in allowed_acronyms:
+        return "candidate name is an unexplained ticker or acronym rather than an organization"
+    if len(normalized) < 3:
+        return "candidate name is too short to verify as an organization"
+    if re.fullmatch(r"[A-Z][a-z]+ \d{1,2}, 20\d{2}", stripped):
+        return "candidate name is a dated newsletter or archive title"
+    if re.fullmatch(r"H\.\s*Rept\.\s*\d+[-–]\d+", stripped, flags=re.I):
+        return "candidate name is a congressional report title rather than an organization"
+    if re.search(r"\b20\d{2}\b", stripped) and re.search(
+        r"\b(?:volume|number)\b",
+        stripped,
+        flags=re.I,
+    ):
+        return "candidate name is a dated newsletter or archive title"
+    if "..." in stripped or lowered.endswith(" ..."):
+        return "candidate name is an article headline rather than an organization"
+    if stripped.endswith("?") or len(stripped.split()) > 8:
+        return "candidate name is an article headline rather than an organization"
+    headline_markers = (
+        "field misfires",
+        "raises red flags",
+        "red flags",
+        "look inside",
+        "how well",
+        "what works",
+        "what lasts",
+        "what matters",
+        "using ",
+        "making sense",
+        "advancing ",
+        "predict ",
+        "study tools",
+        "study:",
+        "guides @",
+    )
+    if any(marker in lowered for marker in headline_markers):
+        return "candidate name is an article headline rather than an organization"
+    if lowered.startswith("new national ") and "study" in lowered:
+        return "candidate name is an article headline rather than an organization"
+    if lowered.startswith("top ") and "conferences" in lowered:
+        return "candidate name is a conference directory article rather than an event"
+    return ""
+
+
+def _title_noise_rejection_reasons(*, title: str, url: str, snippet: str) -> list[str]:
+    haystack = f" {title} {url} {snippet} ".lower()
+    reasons: list[str] = []
+    if any(marker in haystack for marker in TITLE_NOISE_MARKERS):
+        reasons.append("source appears to be a PDF, book, thesis, or dissertation title")
+    if "raises red flags" in haystack or " red flags" in haystack:
+        reasons.append("source appears to be an article headline rather than an opportunity")
+    if " study:" in haystack or " national construction safety study" in haystack:
+        reasons.append("source appears to be an article headline rather than an opportunity")
+    if any(marker in haystack for marker in GENERIC_RESEARCH_PAGE_MARKERS) or any(
+        marker in haystack for marker in GENERIC_RESEARCH_HOST_MARKERS
+    ):
+        reasons.append("source appears to be a generic research page rather than an opportunity")
+    if any(marker in haystack for marker in GENERIC_PROGRAM_PAGE_MARKERS):
+        reasons.append(
+            "source appears to be a generic program page rather than a specific opportunity"
+        )
+    if re.search(r"\bH\.\s*Rept\.\s*\d+[-–]\d+\b", title, flags=re.I) or (
+        "congress.gov" in haystack and "committee-report" in haystack
+    ):
+        reasons.append("source appears to be a congressional report rather than an opportunity")
+    return reasons
+
+
+def _has_real_organization_evidence(*, company_name: str, entity_kind: str, text: str) -> bool:
+    if entity_kind in {"company", "institute"}:
+        return True
+    if entity_kind in {"researcher", "conference", "grant_program", "trial"}:
+        return False
+    if ORGANIZATION_SUFFIX_RE.search(company_name):
+        return True
+    return bool(ORGANIZATION_SUFFIX_RE.search(text))
+
+
+def _active_opportunity_reasons(*, title: str, url: str, snippet: str) -> list[str]:
+    haystack = f" {title} {url} {snippet} ".lower()
+    active_haystack = haystack.replace("raises red flags", "")
+    reasons: list[str] = []
+    if any(marker in active_haystack for marker in ACTIVE_OPPORTUNITY_MARKERS):
+        reasons.append("source text includes active opportunity evidence")
+    if _looks_like_job_posting(title=title, url=url, snippet=snippet):
+        reasons.append("source is a verifiable role or careers posting")
+    return list(dict.fromkeys(reasons))
+
+
+def _contextual_activity_reasons(
+    *,
+    entity_kind: str,
+    topic: str | None,
+    search_plan: OpportunitySearchPlan | None = None,
+    title: str,
+    url: str,
+    snippet: str,
+    company_name: str,
+) -> list[str]:
+    haystack = f" {company_name} {title} {url} {snippet} ".lower()
+    reasons: list[str] = []
+    if entity_kind == "researcher" and (
+        _plan_is_researcher_request(search_plan) or _is_researcher_discovery_request(topic)
+    ):
+        researcher_activity_markers = (
+            "principal investigator",
+            "co-investigator",
+            "investigator",
+            "federally funded",
+            "funded research",
+            "grant",
+            "clinical trial",
+            "trial",
+            "implementation",
+            "project",
+            "projects",
+            "published",
+            "publications",
+        )
+        if any(marker in haystack for marker in researcher_activity_markers):
+            reasons.append("source text includes researcher activity evidence")
+    if entity_kind == "institute" and (
+        _plan_is_institute_request(search_plan) or _is_institute_discovery_request(topic)
+    ):
+        institute_activity_markers = (
+            "industry affiliate",
+            "partnership",
+            "partner",
+            "collaboration",
+            "collaborates",
+            "implementation",
+            "contact",
+        )
+        if any(marker in haystack for marker in institute_activity_markers):
+            reasons.append("source text includes institute collaboration evidence")
+    if entity_kind == "conference" and (
+        _plan_is_conference_request(search_plan) or _is_conference_discovery_request(topic)
+    ):
+        conference_activity_markers = (
+            "call for speakers",
+            "call for proposals",
+            "call for abstracts",
+            "abstract submission",
+            "presentation",
+            "presentations",
+            "speaker",
+            "speakers",
+            "symposium",
+            "workshop",
+            "conference",
+            "summit",
+        )
+        if any(marker in haystack for marker in conference_activity_markers):
+            reasons.append("source text includes conference presentation evidence")
+    return reasons
+
+
+def _candidate_acceptance_rejection_reasons(
+    hit: dict[str, Any],
+    *,
+    topic: str | None = None,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> list[str]:
+    company_name = str(hit.get("company_name") or "")
+    entity_kind = str(hit.get("entity_kind") or "company")
+    title = str(hit.get("source_title") or hit.get("title") or "")
+    url = str(hit.get("source_url") or hit.get("url") or "")
+    snippet = str(hit.get("signal") or hit.get("snippet") or "")
+    source_category = str(hit.get("source_category") or "").lower()
+    combined = " ".join([company_name, title, url, snippet])
+    is_conference_topic = _plan_is_conference_request(
+        search_plan
+    ) or _is_conference_discovery_request(topic)
+    reasons: list[str] = []
+
+    name_reason = _candidate_name_rejection_reason(company_name)
+    if name_reason:
+        reasons.append(name_reason)
+    if source_category == "publication":
+        reasons.append("source is a publication rather than an active opportunity")
+    if is_conference_topic and entity_kind == "conference" and "linkedin.com" in url.lower():
+        reasons.append("source is a social post rather than a conference or event page")
+    title_noise_reasons = _title_noise_rejection_reasons(title=title, url=url, snippet=snippet)
+    contextual_activity = _contextual_activity_reasons(
+        entity_kind=entity_kind,
+        topic=topic,
+        search_plan=search_plan,
+        title=title,
+        url=url,
+        snippet=snippet,
+        company_name=company_name,
+    )
+    if contextual_activity and (
+        _plan_is_institute_request(search_plan) or _is_institute_discovery_request(topic)
+    ):
+        title_noise_reasons = [
+            reason for reason in title_noise_reasons if "generic program page" not in reason
+        ]
+    reasons.extend(title_noise_reasons)
+    if not _has_real_organization_evidence(
+        company_name=company_name,
+        entity_kind=entity_kind,
+        text=combined,
+    ) and not _entity_kind_allowed_by_topic(
+        entity_kind=entity_kind,
+        topic=topic,
+        search_plan=search_plan,
+    ):
+        reasons.append("candidate is not a real organization")
+    if is_conference_topic and entity_kind == "conference":
+        active_reasons = contextual_activity
+    else:
+        active_reasons = [
+            *_active_opportunity_reasons(title=title, url=url, snippet=snippet),
+            *contextual_activity,
+        ]
+    if not active_reasons:
+        reasons.append("source lacks active opportunity evidence")
+    return list(dict.fromkeys(reasons))
+
+
+def _entity_kind_allowed_by_topic(
+    *,
+    entity_kind: str,
+    topic: str | None,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> bool:
+    if search_plan is not None:
+        if entity_kind in search_plan.target_entity_types:
+            return True
+        if search_plan.strict_targeting:
+            return False
+    lowered = str(topic or "").lower()
+    if not lowered:
+        return False
+    if _is_broad_multilane_request(topic):
+        return entity_kind in {"researcher", "conference", "grant_program", "trial", "institute"}
+    if entity_kind == "conference":
+        return (
+            _is_conference_discovery_request(topic)
+            or "conference" in lowered
+            or "conferences" in lowered
+        )
+    if entity_kind == "researcher":
+        return _is_researcher_discovery_request(topic)
+    if entity_kind == "grant_program":
+        return "grant" in lowered or "grants" in lowered
+    if entity_kind == "trial":
+        return "clinical trial" in lowered or "clinical trials" in lowered
+    return False
+
+
+def _candidate_acceptance_review_reasons(
+    hit: dict[str, Any],
+    *,
+    rejection_reasons: list[str],
+) -> list[str]:
+    """Preserve borderline active opportunities for review without scoring them."""
+
+    if not rejection_reasons:
+        return []
+    blocked_noise_markers = (
+        "URL/title noise",
+        "PDF, book, thesis, or dissertation",
+        "generic research page",
+    )
+    if any(
+        any(marker in reason for marker in blocked_noise_markers) for reason in rejection_reasons
+    ):
+        return []
+    if any("source lacks active opportunity evidence" in reason for reason in rejection_reasons):
+        return []
+
+    title = str(hit.get("source_title") or hit.get("title") or "")
+    url = str(hit.get("source_url") or hit.get("url") or "")
+    snippet = str(hit.get("signal") or hit.get("snippet") or "")
+    if not url or url.startswith("search://"):
+        return []
+    if not _active_opportunity_reasons(title=title, url=url, snippet=snippet):
+        return []
+
+    source_category = str(hit.get("source_category") or "").strip().lower()
+    entity_kind = str(hit.get("entity_kind") or "").strip().lower()
+    reviewable_categories = {
+        "news",
+        "clinical_trial",
+        "grant",
+        "conference",
+        "job_posting",
+        "company_page",
+        "search",
+    }
+    reviewable_entity_kinds = {
+        "researcher",
+        "conference",
+        "grant_program",
+        "trial",
+        "institute",
+        "company",
+    }
+    if source_category not in reviewable_categories and entity_kind not in reviewable_entity_kinds:
+        return []
+
+    return [
+        "borderline active opportunity preserved for orchestrator or Business Research review",
+        *rejection_reasons,
+    ]
+
+
+def _apply_candidate_acceptance_filters_to_hits(
+    hits: list[dict[str, Any]],
+    *,
+    topic: str | None = None,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    accepted: list[dict[str, Any]] = []
+    filtered_candidates: list[dict[str, Any]] = []
+    review_candidates: list[dict[str, Any]] = []
+    audit_notes: list[str] = []
+
+    for hit in hits:
+        reasons = _candidate_acceptance_rejection_reasons(
+            hit,
+            topic=topic,
+            search_plan=search_plan,
+        )
+        if not reasons:
+            accepted.append(hit)
+            continue
+        review_reasons = _candidate_acceptance_review_reasons(
+            hit,
+            rejection_reasons=reasons,
+        )
+        if review_reasons:
+            review_candidates.append(_filtered_candidate_from_hit(hit, reasons=review_reasons))
+        filtered_candidates.append(_filtered_candidate_from_hit(hit, reasons=reasons))
+
+    removed_count = len(filtered_candidates)
+    if removed_count:
+        audit_notes.append(
+            f"Candidate acceptance removed {removed_count} noisy or unsupported candidate(s)."
+        )
+        for candidate in filtered_candidates[:5]:
+            audit_notes.append(
+                f"Rejected {candidate['company_name']}: {'; '.join(candidate['reasons'])}."
+            )
+    if hits and not accepted:
+        audit_notes.append(
+            "No candidates satisfied deterministic acceptance: Scout requires a real "
+            "organization plus active opportunity evidence before scoring."
+        )
+    if review_candidates:
+        audit_notes.append(
+            f"Preserved {len(review_candidates)} borderline active candidate(s) for "
+            "orchestrator or Business Research review."
+        )
+    return accepted, audit_notes, filtered_candidates, review_candidates
+
+
+def _topic_relevance_rejection_reasons(
+    hit: dict[str, Any],
+    *,
+    topic: str | None,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> list[str]:
+    lowered_topic = str(topic or "").lower()
+    if not lowered_topic and search_plan is None:
+        return []
+    title = str(hit.get("source_title") or hit.get("title") or "")
+    url = str(hit.get("source_url") or hit.get("url") or "")
+    snippet = str(hit.get("signal") or hit.get("snippet") or "")
+    company_name = str(hit.get("company_name") or "")
+    signals = " ".join(str(signal) for signal in hit.get("signals", []) if str(signal).strip())
+    haystack = " ".join([company_name, title, url, snippet, signals]).lower()
+    entity_kind = str(hit.get("entity_kind") or "").strip().lower()
+    reasons: list[str] = []
+    if search_plan is not None and search_plan.strict_targeting:
+        if entity_kind not in search_plan.target_entity_types:
+            reasons.append("source entity type does not match the structured search plan target")
+    else:
+        if _is_researcher_discovery_request(topic) and entity_kind != "researcher":
+            reasons.append("source is not a researcher or principal investigator required by topic")
+        if _is_institute_discovery_request(topic) and entity_kind != "institute":
+            reasons.append(
+                "source is not an academic institute, center, or program required by topic"
+            )
+        if _is_conference_discovery_request(topic) and entity_kind != "conference":
+            reasons.append(
+                "source is not a conference, symposium, workshop, or presentation "
+                "opportunity required by topic"
+            )
+    if "psychiatr" in lowered_topic and not any(
+        marker in haystack for marker in PSYCHIATRY_TOPIC_MARKERS
+    ):
+        reasons.append(
+            "source lacks direct psychiatry or behavioral-health relevance required by topic"
+        )
+    if _requires_ai_company_relevance(topic) and not any(
+        marker in f" {haystack} " for marker in AI_TOPIC_MARKERS
+    ):
+        reasons.append(
+            "source lacks AI, digital, analytics, platform, or technology relevance "
+            "required by topic"
+        )
+    if _requires_advisory_topic_constraint(topic) and not any(
+        marker in haystack for marker in ADVISORY_TOPIC_MARKERS
+    ):
+        reasons.append(
+            "source lacks advisory, consulting, or fractional-role evidence required by topic"
+        )
+    return reasons
+
+
+def _requires_ai_company_relevance(topic: str | None) -> bool:
+    lowered = str(topic or "").lower()
+    if not re.search(r"\bai\b|artificial intelligence", lowered):
+        return False
+    return any(marker in lowered for marker in ("companies", "company", "startup", "startups"))
+
+
+def _requires_advisory_topic_constraint(topic: str | None) -> bool:
+    lowered = str(topic or "").lower()
+    if (
+        not lowered
+        or _is_broad_multilane_request(topic)
+        or _is_company_growth_discovery_request(topic)
+    ):
+        return False
+    advisory_needles = (
+        "advisory opportunity",
+        "advisory opportunities",
+        "advisor opportunity",
+        "advisor opportunities",
+        "advisory role",
+        "advisory roles",
+        "advisor role",
+        "advisor roles",
+        "consulting opportunity",
+        "consulting opportunities",
+        "fractional medical director",
+    )
+    return any(needle in lowered for needle in advisory_needles)
+
+
+def _apply_topic_relevance_filters_to_hits(
+    hits: list[dict[str, Any]],
+    *,
+    topic: str | None,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    accepted: list[dict[str, Any]] = []
+    filtered_candidates: list[dict[str, Any]] = []
+    audit_notes: list[str] = []
+    for hit in hits:
+        reasons = _topic_relevance_rejection_reasons(
+            hit,
+            topic=topic,
+            search_plan=search_plan,
+        )
+        if not reasons:
+            accepted.append(hit)
+            continue
+        filtered_candidates.append(_filtered_candidate_from_hit(hit, reasons=reasons))
+    if filtered_candidates:
+        audit_notes.append(
+            f"Topic relevance removed {len(filtered_candidates)} adjacent candidate(s)."
+        )
+        for candidate in filtered_candidates[:5]:
+            audit_notes.append(
+                f"Rejected {candidate['company_name']}: {'; '.join(candidate['reasons'])}."
+            )
+    if hits and not accepted:
+        audit_notes.append(
+            "No candidates satisfied the requested topic constraints strongly enough to score."
+        )
+    return accepted, audit_notes, filtered_candidates
+
+
+def _search_result_to_hit(
+    query: str | _OpportunityQuerySpec,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    query_text = query.query if isinstance(query, _OpportunityQuerySpec) else query
+    lane = query.lane if isinstance(query, _OpportunityQuerySpec) else "company_growth"
+    time_window = query.time_window if isinstance(query, _OpportunityQuerySpec) else "current"
+    entity_hint = query.entity_hint if isinstance(query, _OpportunityQuerySpec) else "company"
+    title = str(result.get("title", "")).strip()
+    url = str(result.get("url") or result.get("link") or "").strip()
+    content = str(result.get("content") or "").strip()
+    snippet = str(result.get("snippet", "") or content[:500]).strip()
+    combined = " ".join([query_text, title, snippet])
+    signals = _signals_from_text(combined)
+    source_category = _source_category_from_search_result(title=title, url=url, snippet=snippet)
+    source_type = _source_type_for_search_category(source_category, result)
+    entity_kind = _entity_kind_from_lane(
+        lane=lane,
+        title=title,
+        url=url,
+        snippet=snippet,
+        entity_hint=entity_hint,
+    )
+    entity_name = _extract_candidate_name(
+        title=title,
+        url=url,
+        snippet=snippet,
+        entity_kind=entity_kind,
+    )
+    role = _role_evidence_from_hit(
+        {
+            "source_title": title,
+            "source_url": url,
+            "signal": snippet,
+            "source_category": source_category,
+        }
+    )
+    usa_relevance_score, usa_relevance_reasons = _usa_relevance_from_hit(
+        {
+            "source_title": title,
+            "source_url": url,
+            "signal": snippet,
+        }
+    )
+    return {
+        "company_name": entity_name,
+        "opportunity_type": _opportunity_type_from_text(combined),
+        "signal": snippet or title or "Search result requires review.",
+        "signals": signals,
+        "source_title": title or "Search result",
+        "source_url": url or "search://result",
+        "source_type": source_type,
+        "source_category": source_category,
+        "published_at": result.get("published_at") or result.get("date"),
+        "verified_excerpt": content[:1000],
+        "query": query_text,
+        "query_lane": lane,
+        "query_time_window": time_window,
+        "search_lanes": [lane],
+        "time_windows": [time_window],
+        "entity_kind": entity_kind,
+        "canonical_entity_key": _normalize_entity_key(entity_name, entity_kind),
+        "usa_relevance_score": usa_relevance_score,
+        "usa_relevance_reasons": usa_relevance_reasons,
+        "role_title": role.role_title,
+        "role_location": role.role_location,
+        "role_remote": role.role_remote,
+        "role_country": role.role_country,
+        "role_active": role.role_active,
+        "role_filter_notes": list(role.filter_notes),
+    }
+
+
+def _source_category_from_search_result(*, title: str, url: str, snippet: str) -> str:
+    haystack = " ".join([title, url, snippet]).lower()
+    if "clinicaltrials.gov" in haystack or "clinical trial" in haystack:
+        return "clinical_trial"
+    if any(
+        term in haystack
+        for term in (
+            "pubmed",
+            "pmc.ncbi",
+            "ncbi.nlm.nih.gov/pmc",
+            "doi.org",
+            "science.org/doi",
+            "nature.com/articles",
+            "publication",
+            "journal",
+        )
+    ):
+        return "publication"
+    if any(term in haystack for term in ("nih.gov", "reporter.nih.gov", "sbir", "grant")):
+        return "grant"
+    if any(term in haystack for term in ("conference", "symposium", "poster", "abstract")):
+        return "conference"
+    if _looks_like_job_posting(title=title, url=url, snippet=snippet):
+        return "job_posting"
+    if any(term in haystack for term in ("funding", "raises", "seed round", "series a")):
+        return "news"
+    if any(
+        term in haystack
+        for term in ("about", "platform", "product page", "/about", "/team", "/research", ".edu/")
+    ):
+        return "company_page"
+    return "search"
+
+
+def _source_type_for_search_category(category: str, result: dict[str, Any]) -> str:
+    explicit = str(result.get("source_type") or "").strip()
+    if explicit and explicit not in {"search", "google_search", "metasearch"}:
+        return explicit
+    if category == "clinical_trial":
+        return "clinical_trial"
+    if category == "grant":
+        return "government"
+    if category == "publication":
+        return "publication"
+    if category == "conference":
+        return "conference"
+    if category == "job_posting":
+        return "job_posting"
+    if category == "company_page":
+        return "company_site"
+    if category == "news":
+        return "news"
+    return explicit or "google_search"
+
+
+def _search_with_provider(
+    search_provider: Any,
+    query: str | _OpportunityQuerySpec,
+    max_results: int,
+) -> list[dict[str, Any]]:
+    request = _search_request_from_query(query, max_results=max_results)
+    structured = getattr(search_provider, "search_structured", None)
+    if callable(structured):
+        response = structured(request)
+    elif hasattr(search_provider, "search_web"):
+        response = search_provider.search_web(request.query, num_results=max_results)
+    else:
+        try:
+            response = search_provider.search(request.query, max_results=max_results)
+        except TypeError:
+            response = search_provider.search(request.query, num_results=max_results)
+
+    if isinstance(response, dict):
+        results = response.get("results", [])
+    else:
+        results = response
+
+    normalized: list[dict[str, Any]] = []
+    for result in results or []:
+        if isinstance(result, dict):
+            normalized.append(result)
+            continue
+        if hasattr(result, "model_dump"):
+            dumped = result.model_dump()
+            source = str(dumped.get("source") or "search")
+            source_type = "metasearch" if source == "searxng" else "google_search"
+            normalized.append(
+                {
+                    "title": dumped.get("title", ""),
+                    "url": dumped.get("url") or dumped.get("link", ""),
+                    "snippet": dumped.get("snippet", ""),
+                    "source": source,
+                    "source_type": source_type,
+                    "date": dumped.get("date"),
+                    "content": dumped.get("content"),
+                }
+            )
+            continue
+        normalized.append(
+            {
+                "title": str(getattr(result, "title", "")),
+                "url": str(getattr(result, "url", "") or getattr(result, "link", "")),
+                "snippet": str(getattr(result, "snippet", "")),
+                "source_type": "google_search",
+            }
+        )
+    return normalized
+
+
+def _search_request_from_query(
+    query: str | _OpportunityQuerySpec,
+    *,
+    max_results: int,
+) -> SearchRequest:
+    if isinstance(query, _OpportunityQuerySpec):
+        source = _search_source_for_spec(query)
+        return SearchRequest(
+            query=query.query,
+            num_results=max_results,
+            source=source,
+            time_range=query.time_window,
+            country=query.country,
+            location=query.location,
+            language=query.language,
+            page=query.page,
+            safe_search=1,
+            scrape=False,
+        )
+    return SearchRequest(query=query, num_results=max_results, safe_search=1)
+
+
+def _search_source_for_spec(spec: _OpportunityQuerySpec) -> str:
+    if spec.source != "web":
+        return spec.source
+    query = spec.query.lower()
+    if spec.lane in {"company_growth", "collaboration"} and any(
+        marker in query
+        for marker in (
+            "announces",
+            "raises",
+            "funding",
+            "businesswire.com",
+            "prnewswire.com",
+            "press release",
+        )
+    ):
+        return "news"
+    return "web"
+
+
+def _opportunity_search_concurrency() -> int:
+    raw = os.getenv("KEYSTONE_OPPORTUNITY_SEARCH_CONCURRENCY", "4").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 4
+    return max(1, min(8, value))
+
+
+def _opportunity_followup_result_cap() -> int:
+    raw = os.getenv("KEYSTONE_OPPORTUNITY_FOLLOWUP_RESULT_CAP", "8").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 8
+    return max(1, min(8, value))
+
+
+def _env_flag(name: str) -> bool:
+    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _search_query_specs_with_provider(
+    *,
+    search_provider: Any,
+    query_specs: list[_OpportunityQuerySpec],
+    max_results: int,
+) -> list[dict[str, Any]]:
+    """Run Opportunity Scout query lanes with bounded concurrency and stable ordering."""
+
+    if len(query_specs) <= 1:
+        return [
+            _search_result_to_hit(spec, result)
+            for spec in query_specs
+            for result in _search_with_provider(search_provider, spec, max_results)
+        ]
+
+    max_workers = min(_opportunity_search_concurrency(), len(query_specs))
+    if max_workers <= 1:
+        return [
+            _search_result_to_hit(spec, result)
+            for spec in query_specs
+            for result in _search_with_provider(search_provider, spec, max_results)
+        ]
+
+    ordered_hits: list[list[dict[str, Any]]] = [[] for _spec in query_specs]
+
+    def run_query(index: int, spec: _OpportunityQuerySpec) -> tuple[int, list[dict[str, Any]]]:
+        results = _search_with_provider(search_provider, spec, max_results)
+        return index, [_search_result_to_hit(spec, result) for result in results]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(run_query, index, spec): index for index, spec in enumerate(query_specs)
+        }
+        for future in as_completed(futures):
+            index, hits = future.result()
+            ordered_hits[index] = hits
+
+    return [hit for hits in ordered_hits for hit in hits]
+
+
+def _require_live_search_provider(search_provider: Any) -> None:
+    provider_name = str(getattr(search_provider, "provider_name", "") or "").lower()
+    if getattr(search_provider, "dry_run", False) or provider_name == "dry-run":
+        raise LiveSearchProviderRequiredError(
+            "Opportunity Scout live search requires a live Serper, SearXNG, or Firecrawl provider. "
+            "Use --live-search --no-dry-run with --search-provider serper, searxng, or firecrawl."
+        )
+    validate = getattr(search_provider, "validate_configuration", None)
+    if callable(validate):
+        validate()
+
+
+def _search_provider_label(search_provider: Any) -> str:
+    provider_name = str(getattr(search_provider, "provider_name", "") or "").strip()
+    if provider_name:
+        return provider_name
+    class_name = type(search_provider).__name__.replace("SearchProvider", "").replace("Tool", "")
+    return re.sub(r"[^a-z0-9]+", "_", class_name.lower()).strip("_") or "custom"
+
+
+def _source_hit_key(hit: dict[str, Any]) -> str:
+    url = str(hit.get("source_url") or hit.get("url") or hit.get("link") or "").strip().lower()
+    if url:
+        return url.rstrip("/")
+    title = str(hit.get("source_title") or hit.get("title") or "").strip().lower()
+    signal = str(hit.get("signal") or hit.get("snippet") or "").strip().lower()
+    return f"{title}|{signal}"
+
+
+def _opportunity_verification_cap() -> int:
+    if not _env_flag("KEYSTONE_ENABLE_OPPORTUNITY_SOURCE_VERIFICATION"):
+        return 0
+    raw = os.getenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "4").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 4
+    return max(0, min(8, value))
+
+
+def _verify_source_hits(hits: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Optionally verify top candidate pages with capped clean-text extraction."""
+
+    cap = _opportunity_verification_cap()
+    if cap <= 0:
+        return hits, []
+
+    verified: list[dict[str, Any]] = []
+    notes: list[str] = [f"Verified up to {cap} source page(s) with capped extraction."]
+    attempts = 0
+    for hit in hits:
+        enriched = dict(hit)
+        url = str(hit.get("source_url") or "").strip()
+        if attempts < cap and url.startswith(("http://", "https://")):
+            attempts += 1
+            try:
+                extraction = extract_website_content(
+                    url,
+                    company_name=str(hit.get("company_name") or "candidate"),
+                    live=True,
+                )
+            except WebsiteExtractionError as exc:
+                notes.append(f"Verification failed for {hit.get('company_name') or url}: {exc}")
+            else:
+                text = extraction.text_or_markdown.strip()
+                if text:
+                    excerpt = text[:1000]
+                    enriched["verified_excerpt"] = excerpt
+                    enriched["signal"] = "; ".join(
+                        dict.fromkeys(
+                            [
+                                str(enriched.get("signal") or "").strip(),
+                                excerpt[:500],
+                            ]
+                        )
+                    ).strip("; ")
+                    enriched["signals"] = _signals_from_text(
+                        " ".join(
+                            [
+                                str(enriched.get("query") or ""),
+                                str(enriched.get("source_title") or ""),
+                                excerpt,
+                            ]
+                        )
+                    )
+                    notes.append(f"Verified source page for {hit.get('company_name') or url}.")
+        verified.append(enriched)
+    return verified, list(dict.fromkeys(note for note in notes if note))
+
+
+def _filter_and_dedupe_candidate_hits(
+    hits: list[dict[str, Any]],
+    *,
+    topic: str | None,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[str],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[str],
+    list[dict[str, Any]],
+    list[str],
+    list[dict[str, Any]],
+    list[str],
+]:
+    (
+        accepted_hits,
+        acceptance_audit_notes,
+        acceptance_filtered_candidates,
+        acceptance_review_candidates,
+    ) = _apply_candidate_acceptance_filters_to_hits(
+        hits,
+        topic=topic,
+        search_plan=search_plan,
+    )
+    topic_hits, topic_audit_notes, topic_filtered_candidates = (
+        _apply_topic_relevance_filters_to_hits(
+            accepted_hits,
+            topic=topic,
+            search_plan=search_plan,
+        )
+    )
+    filtered_hits, filter_audit_notes, role_filtered_candidates = _apply_hard_filters_to_hits(
+        topic_hits,
+        topic=topic,
+    )
+    deduped = _dedupe_candidate_hits(filtered_hits)
+    filtered_candidates = [
+        *acceptance_filtered_candidates,
+        *topic_filtered_candidates,
+        *role_filtered_candidates,
+    ]
+    audit_notes = [
+        *acceptance_audit_notes,
+        *topic_audit_notes,
+        *filter_audit_notes,
+    ]
+    return (
+        deduped,
+        filtered_hits,
+        filtered_candidates,
+        acceptance_review_candidates,
+        audit_notes,
+        acceptance_filtered_candidates,
+        acceptance_audit_notes,
+        role_filtered_candidates,
+        filter_audit_notes,
+    )
+
+
+def _process_candidate_hits(
+    hits: list[dict[str, Any]],
+    *,
+    topic: str | None,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[str],
+    list[str],
+]:
+    deduped_hits = _dedupe_source_hits(hits)
+    verified_hits, verification_notes = _verify_source_hits(deduped_hits)
+    (
+        deduped,
+        filtered_hits,
+        filtered_candidates,
+        acceptance_review_candidates,
+        candidate_audit_notes,
+        _acceptance_filtered_candidates,
+        _acceptance_audit_notes,
+        _role_filtered_candidates,
+        _filter_audit_notes,
+    ) = _filter_and_dedupe_candidate_hits(
+        verified_hits,
+        topic=topic,
+        search_plan=search_plan,
+    )
+    return (
+        deduped,
+        filtered_hits,
+        filtered_candidates,
+        acceptance_review_candidates,
+        candidate_audit_notes,
+        verification_notes,
+    )
+
+
+def _dedupe_source_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for hit in hits:
+        key = _source_hit_key(hit)
+        if not key:
+            continue
+        if key not in deduped:
+            deduped[key] = dict(hit)
+            continue
+        existing = deduped[key]
+        existing["signals"] = list(
+            dict.fromkeys([*existing.get("signals", []), *hit.get("signals", [])])
+        )
+        existing["signal"] = "; ".join(
+            dict.fromkeys([str(existing.get("signal", "")), str(hit.get("signal", ""))])
+        ).strip("; ")
+        existing["search_lanes"] = list(
+            dict.fromkeys(
+                [
+                    *[str(item) for item in existing.get("search_lanes", []) if str(item).strip()],
+                    *[str(item) for item in hit.get("search_lanes", []) if str(item).strip()],
+                ]
+            )
+        )
+        existing["time_windows"] = list(
+            dict.fromkeys(
+                [
+                    *[str(item) for item in existing.get("time_windows", []) if str(item).strip()],
+                    *[str(item) for item in hit.get("time_windows", []) if str(item).strip()],
+                ]
+            )
+        )
+        existing["usa_relevance_score"] = max(
+            int(existing.get("usa_relevance_score") or 0),
+            int(hit.get("usa_relevance_score") or 0),
+        )
+        existing["usa_relevance_reasons"] = list(
+            dict.fromkeys(
+                [
+                    *[
+                        str(item)
+                        for item in existing.get("usa_relevance_reasons", [])
+                        if str(item).strip()
+                    ],
+                    *[
+                        str(item)
+                        for item in hit.get("usa_relevance_reasons", [])
+                        if str(item).strip()
+                    ],
+                ]
+            )
+        )
+    return list(deduped.values())
+
+
+def _dedupe_candidate_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for hit in hits:
+        entity_kind = str(hit.get("entity_kind") or "company")
+        entity_name = str(hit.get("company_name", ""))
+        key = str(
+            hit.get("canonical_entity_key") or _normalize_entity_key(entity_name, entity_kind)
+        )
+        if key not in deduped:
+            merged = dict(hit)
+            merged["_source_hits"] = [hit]
+            merged["canonical_entity_key"] = key
+            deduped[key] = merged
+            continue
+        existing = deduped[key]
+        existing["_source_hits"].append(hit)
+        existing["_source_hits"] = _dedupe_source_hits(existing["_source_hits"])
+        existing["signals"] = list(
+            dict.fromkeys([*existing.get("signals", []), *hit.get("signals", [])])
+        )
+        existing["signal"] = "; ".join(
+            dict.fromkeys([str(existing.get("signal", "")), str(hit.get("signal", ""))])
+        ).strip("; ")
+        existing["search_lanes"] = list(
+            dict.fromkeys(
+                [
+                    *[str(item) for item in existing.get("search_lanes", []) if str(item).strip()],
+                    *[str(item) for item in hit.get("search_lanes", []) if str(item).strip()],
+                ]
+            )
+        )
+        existing["time_windows"] = list(
+            dict.fromkeys(
+                [
+                    *[str(item) for item in existing.get("time_windows", []) if str(item).strip()],
+                    *[str(item) for item in hit.get("time_windows", []) if str(item).strip()],
+                ]
+            )
+        )
+        existing["usa_relevance_score"] = max(
+            int(existing.get("usa_relevance_score") or 0),
+            int(hit.get("usa_relevance_score") or 0),
+        )
+        existing["usa_relevance_reasons"] = list(
+            dict.fromkeys(
+                [
+                    *[
+                        str(item)
+                        for item in existing.get("usa_relevance_reasons", [])
+                        if str(item).strip()
+                    ],
+                    *[
+                        str(item)
+                        for item in hit.get("usa_relevance_reasons", [])
+                        if str(item).strip()
+                    ],
+                ]
+            )
+        )
+    return list(deduped.values())
+
+
+def _records_from_hits(
+    hits: list[dict[str, Any]],
+    *,
+    topic: str | None,
+    max_results: int,
+    dry_run: bool,
+    save: bool = False,
+    existing_state_by_company: dict[str, ExistingOpportunityState] | None = None,
+) -> OpportunityScoutResult:
+    records: list[OpportunityRecord] = []
+    state_decisions: list[OpportunityStateDecision] = []
+    duplicate_companies_skipped: list[str] = []
+    existing_state_by_company = existing_state_by_company or {}
+    for hit in hits:
+        opportunity_type = normalize_type(str(hit.get("opportunity_type", "")))
+        signals = clean_signals([str(signal) for signal in hit.get("signals", [])])
+        if not signals and hit.get("signal"):
+            signals = [str(hit["signal"])]
+        company_name = str(hit.get("company_name") or "Unknown company")
+        company_key = _normalize_company_key(company_name)
+        existing_state = existing_state_by_company.get(company_key)
+        if existing_state and existing_state.status in SKIP_EXISTING_STATUSES:
+            state_decisions.append(
+                OpportunityStateDecision(
+                    company_name=company_name,
+                    status=existing_state.status,
+                    action="skipped_duplicate",
+                    reason=(
+                        f"Existing pipeline state is {existing_state.status}; Scout will "
+                        "not create a duplicate opportunity."
+                    ),
+                )
+            )
+            duplicate_companies_skipped.append(company_name)
+            continue
+        state_action = "new"
+        if existing_state and existing_state.status in UPDATE_EXISTING_STATUSES:
+            state_action = "update_existing"
+            state_decisions.append(
+                OpportunityStateDecision(
+                    company_name=company_name,
+                    status=existing_state.status,
+                    action="update_existing",
+                    reason=(
+                        f"Existing pipeline state is {existing_state.status}; enrich the "
+                        "current opportunity instead of creating a new one."
+                    ),
+                )
+            )
+        else:
+            state_decisions.append(
+                OpportunityStateDecision(
+                    company_name=company_name,
+                    status=None,
+                    action="new",
+                    reason="No existing pipeline state matched this company.",
+                )
+            )
+        why_now = str(hit.get("signal") or "; ".join(signals) or "Signal requires review.")
+        source_hits = (
+            hit.get("_source_hits") if isinstance(hit.get("_source_hits"), list) else [hit]
+        )
+        source_hits = _dedupe_source_hits(source_hits)
+        search_lanes = list(
+            dict.fromkeys(
+                str(item)
+                for source_hit in source_hits
+                for item in (
+                    source_hit.get("search_lanes")
+                    if isinstance(source_hit.get("search_lanes"), list)
+                    else [source_hit.get("query_lane") or hit.get("query_lane") or ""]
+                )
+                if str(item).strip()
+            )
+        )
+        time_windows = list(
+            dict.fromkeys(
+                str(item)
+                for source_hit in source_hits
+                for item in (
+                    source_hit.get("time_windows")
+                    if isinstance(source_hit.get("time_windows"), list)
+                    else [source_hit.get("query_time_window") or hit.get("query_time_window") or ""]
+                )
+                if str(item).strip()
+            )
+        )
+        usa_relevance_score = max(
+            int(hit.get("usa_relevance_score") or 0),
+            *[int(source_hit.get("usa_relevance_score") or 0) for source_hit in source_hits],
+        )
+        usa_relevance_reasons = list(
+            dict.fromkeys(
+                [
+                    str(item)
+                    for source_hit in source_hits
+                    for item in source_hit.get("usa_relevance_reasons", [])
+                    if str(item).strip()
+                ]
+            )
+        )
+        sources = [
+            _source_from_hit(source_hit, str(source_hit.get("signal") or why_now))
+            for source_hit in source_hits
+        ]
+        source_bundles = _source_bundles_from_hits(
+            company_name=company_name,
+            source_hits=source_hits,
+            why_now=why_now,
+        )
+        missing_evidence = _flatten_bundle_items(source_bundles, "missing_evidence")
+        contradictions = _flatten_bundle_items(source_bundles, "contradictions")
+        weak_evidence_reasons = _flatten_bundle_items(source_bundles, "weak_evidence_reasons")
+        stale_signal_count = sum(bundle.stale_signal_count for bundle in source_bundles)
+        source_quality_summary = summarize_source_quality(
+            [source.source_quality for source in sources if source.source_quality is not None]
+        )
+        score_breakdown = score_from_signals(
+            signals,
+            opportunity_type,
+            source_quality_summary=source_quality_summary,
+        )
+        outside_likelihood = estimate_outside_consulting_likelihood(
+            score_breakdown,
+            signal_count=len(signals),
+        )
+        handoff = should_handoff_to_business_research_analyst(
+            breakdown=score_breakdown,
+            source_quality_summary=source_quality_summary,
+            missing_evidence=missing_evidence,
+            contradictions=contradictions,
+            weak_evidence_reasons=weak_evidence_reasons,
+        )
+        handoff_reason = build_handoff_reason(
+            breakdown=score_breakdown,
+            source_quality_summary=source_quality_summary,
+            missing_evidence=missing_evidence,
+            contradictions=contradictions,
+            weak_evidence_reasons=weak_evidence_reasons,
+        )
+        research_needed = build_research_needed(
+            source_quality_summary=source_quality_summary,
+            source_count=len(sources),
+        )
+        recommended_next_actions = _flatten_bundle_items(
+            source_bundles,
+            "recommended_next_actions",
+        )
+        novelty_score = _novelty_score_from_hits(
+            source_hits=source_hits,
+            existing_state=existing_state,
+        )
+        research_needed = list(
+            dict.fromkeys(
+                [
+                    *research_needed,
+                    *missing_evidence,
+                    *weak_evidence_reasons,
+                    *recommended_next_actions,
+                ]
+            )
+        )
+        analyst_recommendation = (
+            "Run Business Research Analyst before any Outreach Composer work; "
+            "do not draft copy yet."
+            if handoff
+            else "Keep in Scout queue and gather stronger evidence before business research."
+        )
+        record_kwargs: dict[str, Any] = {
+            "company_name": company_name,
+            "opportunity_type": opportunity_type,
+            "role_title": str(hit.get("role_title") or ""),
+            "role_location": str(hit.get("role_location") or ""),
+            "role_remote": hit.get("role_remote"),
+            "role_country": str(hit.get("role_country") or ""),
+            "role_posted_at": (
+                str(hit.get("published_at")) if hit.get("published_at") is not None else None
+            ),
+            "role_active": hit.get("role_active"),
+            "role_fit_reason": (
+                "Role evidence matches Keystone's buyer-facing clinical, research, product, "
+                "or strategy profile."
+                if str(hit.get("role_title") or "").strip()
+                else ""
+            ),
+            "role_filter_notes": [
+                str(note) for note in hit.get("role_filter_notes", []) if str(note).strip()
+            ],
+            "priority_score": score_breakdown.priority_score,
+            "why_now_signal": why_now,
+            "recommended_next_step": (
+                "Hand off to Business Research Analyst for source-attributed company "
+                "research before outreach."
+                if handoff
+                else "Keep in scout queue and gather stronger evidence before outreach."
+            ),
+            "sources": sources,
+            "source_quality_summary": source_quality_summary,
+            "source_signals": signals,
+            "source_bundles": source_bundles,
+            "existing_state": existing_state,
+            "state_action": state_action,  # type: ignore[arg-type]
+            "missing_evidence": missing_evidence,
+            "contradictions": contradictions,
+            "stale_signal_count": stale_signal_count,
+            "weak_evidence_reasons": weak_evidence_reasons,
+            "score_breakdown": score_breakdown,
+            "score_rationale": score_breakdown.rationale,
+            "keystone_fit_reason": keystone_fit_reason(
+                opportunity_type=opportunity_type,
+                breakdown=score_breakdown,
+                signals=signals,
+            ),
+            "outside_consulting_likelihood": outside_likelihood,
+            "handoff_to_business_research_analyst": handoff,
+            "handoff_reason": handoff_reason,
+            "analyst_recommendation": analyst_recommendation,
+            "business_research_analyst_handoff_recommendation": (
+                business_research_analyst_handoff_recommendation(
+                    handoff_reason=handoff_reason,
+                    research_needed=research_needed,
+                )
+                if handoff
+                else ""
+            ),
+            "research_needed": (
+                research_needed if handoff or missing_evidence or weak_evidence_reasons else []
+            ),
+            "outreach_draft": None,
+            "approval_required_before_outreach": True,
+            "approved_for_outreach": False,
+        }
+        if "entity_kind" in OpportunityRecord.model_fields:
+            record_kwargs["entity_kind"] = str(hit.get("entity_kind") or "company")
+        if "canonical_entity_key" in OpportunityRecord.model_fields:
+            record_kwargs["canonical_entity_key"] = str(
+                hit.get("canonical_entity_key")
+                or _normalize_entity_key(
+                    company_name,
+                    str(hit.get("entity_kind") or "company"),
+                )
+            )
+        if "usa_relevance" in OpportunityRecord.model_fields:
+            record_kwargs["usa_relevance"] = _usa_relevance_summary(
+                usa_relevance_score,
+                usa_relevance_reasons,
+            )
+        if "novelty" in OpportunityRecord.model_fields:
+            record_kwargs["novelty"] = _novelty_summary(
+                novelty_score=novelty_score,
+                existing_state=existing_state,
+                search_lanes=search_lanes,
+                time_windows=time_windows,
+            )
+        if "search_lanes" in OpportunityRecord.model_fields:
+            record_kwargs["search_lanes"] = search_lanes
+        if "search_time_windows" in OpportunityRecord.model_fields:
+            record_kwargs["search_time_windows"] = time_windows
+        record = OpportunityRecord(**record_kwargs)
+        records.append(record)
+
+    records.sort(
+        key=lambda item: (
+            item.priority_score,
+            item.score_breakdown.urgency_score,
+            item.score_breakdown.next_action_clarity_score,
+            item.score_breakdown.keystone_fit_score,
+        ),
+        reverse=True,
+    )
+    limited = records[: max(0, max_results)]
+    for record in limited:
+        if record.handoff_to_business_research_analyst:
+            handoff_to_business_research_analyst_placeholder_impl(
+                company_name=record.company_name,
+                reason=record.why_now_signal,
+            )
+        if save:
+            save_opportunity_placeholder_impl(record.model_dump_json(), dry_run=True)
+    mode_note = (
+        "Fixture mode only; no live APIs were called."
+        if dry_run
+        else "Live search provider was used."
+    )
+    limited_bundles = [bundle for record in limited for bundle in record.source_bundles]
+    top_record = limited[0] if limited else None
+    scoring_components = (
+        top_record.score_breakdown.model_dump(mode="json") if top_record is not None else {}
+    )
+    source_quality = summarize_source_quality(
+        [
+            source.source_quality
+            for record in limited
+            for source in record.sources
+            if source.source_quality is not None
+        ]
+    )
+    return OpportunityScoutResult(
+        topic=topic,
+        dry_run=dry_run,
+        records=limited,
+        source_bundles=limited_bundles,
+        source_bundle_quality_notes=_source_bundle_quality_notes(limited_bundles),
+        state_decisions=state_decisions,
+        duplicate_companies_skipped=list(dict.fromkeys(duplicate_companies_skipped)),
+        source_quality_summary=source_quality,
+        decision_trace=DecisionTrace(
+            selected_route="opportunity_scout",
+            source_quality_reasons=(
+                [source_quality.rationale] if source_quality is not None else []
+            ),
+            scoring_components=scoring_components,
+            safety_gates_applied=[
+                "dedupe_before_scoring",
+                "no_outreach_generation",
+                "business_research_analyst_handoff_before_outreach",
+            ],
+            missing_information_blockers=list(
+                dict.fromkeys(
+                    blocker
+                    for record in limited
+                    for blocker in [
+                        *record.missing_evidence,
+                        *record.weak_evidence_reasons,
+                    ]
+                )
+            ),
+            handoff_readiness=(
+                "business_research_analyst_handoff_recommended"
+                if any(record.handoff_to_business_research_analyst for record in limited)
+                else "no_handoff_recommended"
+            ),
+            notes=[
+                "Analyst scoring used relevance, Keystone fit, source confidence, urgency, "
+                "and next-action clarity.",
+                "No outreach drafts were generated.",
+            ],
+        ),
+        audit_notes=[
+            mode_note,
+            "Scout discovered and deduplicated candidates before Analyst scoring.",
+            "Analyst scoring used relevance, Keystone fit, source confidence, urgency, "
+            "and next-action clarity.",
+            "No outreach drafts were generated.",
+            "High-priority records require Business Research Analyst handoff before any outreach.",
+            "Business Research Analyst handoff is represented as a placeholder in this phase.",
+        ],
+        outreach_generated=False,
+    )
+
+
+def search_opportunity_sources_placeholder_impl(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    if not dry_run:
+        raise RuntimeError("Live opportunity source search is not implemented.")
+
+    hits = json.loads(fixture_json) if fixture_json else DEFAULT_FIXTURE_HITS
+    if isinstance(hits, dict):
+        hits = hits.get("records") or hits.get("opportunities") or [hits]
+    filtered = [hit for hit in hits if isinstance(hit, dict) and _matches_topic(hit, topic)]
+    return json.dumps(
+        {
+            "mode": "dry_run",
+            "topic": topic,
+            "hits": filtered[: max(0, max_results)],
+        },
+        sort_keys=True,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def search_opportunity_sources_placeholder(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Search opportunity sources in dry-run mode without live API calls."""
+
+    return search_opportunity_sources_placeholder_impl(
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+def load_existing_opportunity_state_impl(
+    state_json: str | None = None,
+    company_names: list[str] | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Load local opportunity pipeline state without live side effects."""
+
+    if not dry_run:
+        raise RuntimeError(
+            "Live opportunity pipeline state loading is not implemented. "
+            "Provide local state_json in dry-run mode."
+        )
+    states = _load_existing_state_map(state_json)
+    company_keys = {
+        _normalize_company_key(company_name)
+        for company_name in (company_names or [])
+        if company_name.strip()
+    }
+    filtered = [
+        state for key, state in sorted(states.items()) if not company_keys or key in company_keys
+    ]
+    return json.dumps(
+        {
+            "mode": "dry_run",
+            "states": [state.model_dump(mode="json") for state in filtered],
+            "state_count": len(filtered),
+            "respected_skip_statuses": sorted(SKIP_EXISTING_STATUSES),
+            "respected_update_statuses": sorted(UPDATE_EXISTING_STATUSES),
+        },
+        sort_keys=True,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def load_existing_opportunity_state(
+    state_json: str | None = None,
+    company_names: list[str] | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Load local opportunity pipeline state to avoid duplicate Scout records."""
+
+    return load_existing_opportunity_state_impl(
+        state_json=state_json,
+        company_names=company_names,
+        dry_run=dry_run,
+    )
+
+
+def _search_structured_source_category_impl(
+    *,
+    tool_key: str,
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    if not dry_run:
+        raise RuntimeError(
+            f"Live {tool_key.replace('_', ' ')} source search is not implemented. "
+            "Use dry-run fixture mode or add an explicit live integration."
+        )
+    raw_hits = json.loads(fixture_json) if fixture_json else SOURCE_TOOL_FIXTURE_HITS[tool_key]
+    hits = _state_items_from_payload(raw_hits)
+    filtered = [hit for hit in hits if _matches_topic(hit, topic)]
+    limited_hits = filtered[: max(0, max_results)]
+    source_bundles: list[OpportunitySourceBundle] = []
+    for hit in _dedupe_candidate_hits(limited_hits):
+        company_name = str(hit.get("company_name") or "Unknown company")
+        why_now = str(hit.get("signal") or "Signal requires review.")
+        source_hits = (
+            hit.get("_source_hits") if isinstance(hit.get("_source_hits"), list) else [hit]
+        )
+        source_bundles.extend(
+            _source_bundles_from_hits(
+                company_name=company_name,
+                source_hits=source_hits,
+                why_now=why_now,
+            )
+        )
+    return json.dumps(
+        {
+            "mode": "dry_run",
+            "source_tool": tool_key,
+            "topic": topic,
+            "hits": limited_hits,
+            "source_bundles": [bundle.model_dump(mode="json") for bundle in source_bundles],
+            "live_status": "not_implemented",
+        },
+        sort_keys=True,
+    )
+
+
+def search_funding_news_sources_impl(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    return _search_structured_source_category_impl(
+        tool_key="funding_news",
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def search_funding_news_sources(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Search local dry-run funding and news opportunity fixtures."""
+
+    return search_funding_news_sources_impl(
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+def search_job_posting_sources_impl(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    return _search_structured_source_category_impl(
+        tool_key="job_posting",
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def search_job_posting_sources(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Search local dry-run job posting and hiring signal fixtures."""
+
+    return search_job_posting_sources_impl(
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+def search_clinical_trials_sources_impl(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    return _search_structured_source_category_impl(
+        tool_key="clinical_trial",
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def search_clinical_trials_sources(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Search local dry-run ClinicalTrials.gov-style opportunity fixtures."""
+
+    return search_clinical_trials_sources_impl(
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+def search_grant_sources_impl(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    return _search_structured_source_category_impl(
+        tool_key="grant",
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def search_grant_sources(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Search local dry-run NIH/SBIR/grant opportunity fixtures."""
+
+    return search_grant_sources_impl(
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+def search_conference_publication_sources_impl(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    return _search_structured_source_category_impl(
+        tool_key="conference_publication",
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def search_conference_publication_sources(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Search local dry-run conference and publication signal fixtures."""
+
+    return search_conference_publication_sources_impl(
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+def search_company_page_sources_impl(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    return _search_structured_source_category_impl(
+        tool_key="company_page",
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def search_company_page_sources(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Search local dry-run company page opportunity fixtures."""
+
+    return search_company_page_sources_impl(
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+def score_opportunity_impl(
+    company_name: str,
+    opportunity_type: str,
+    signals: list[str],
+) -> str:
+    normalized_type = normalize_type(opportunity_type)
+    score_breakdown = score_from_signals(signals, normalized_type)
+    priority_score = score_breakdown.priority_score
+    outside_consulting_likelihood = estimate_outside_consulting_likelihood(
+        score_breakdown,
+        signal_count=len(signals),
+    )
+    return json.dumps(
+        {
+            "company_name": company_name,
+            "opportunity_type": normalized_type,
+            "priority_score": priority_score,
+            "score_breakdown": score_breakdown.model_dump(mode="json"),
+            "score_rationale": score_breakdown.rationale,
+            "outside_consulting_likelihood": outside_consulting_likelihood,
+            "handoff_to_business_research_analyst": priority_score >= HANDOFF_PRIORITY_THRESHOLD,
+        },
+        sort_keys=True,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def score_opportunity(
+    company_name: str,
+    opportunity_type: str,
+    signals: list[str],
+) -> str:
+    """Score an opportunity deterministically from target type and why-now signals."""
+
+    return score_opportunity_impl(
+        company_name=company_name,
+        opportunity_type=opportunity_type,
+        signals=signals,
+    )
+
+
+def handoff_to_business_research_analyst_placeholder_impl(company_name: str, reason: str) -> str:
+    return json.dumps(
+        {
+            "mode": "dry_run",
+            "company_name": company_name,
+            "handoff_to_business_research_analyst": True,
+            "reason": reason,
+        },
+        sort_keys=True,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def handoff_to_business_research_analyst_placeholder(company_name: str, reason: str) -> str:
+    """Record that a high-priority opportunity should be handed to Business Research Analyst."""
+
+    return handoff_to_business_research_analyst_placeholder_impl(
+        company_name=company_name,
+        reason=reason,
+    )
+
+
+def save_opportunity_placeholder_impl(record_json: str, dry_run: bool = True) -> str:
+    if not dry_run:
+        raise RuntimeError("Live opportunity persistence is not implemented.")
+    record = json.loads(record_json)
+    return json.dumps(
+        {
+            "mode": "dry_run",
+            "status": "saved",
+            "company_name": record.get("company_name"),
+            "outreach_generated": False,
+        },
+        sort_keys=True,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def save_opportunity_placeholder(record_json: str, dry_run: bool = True) -> str:
+    """Persist an opportunity placeholder in dry-run mode only."""
+
+    return save_opportunity_placeholder_impl(record_json=record_json, dry_run=dry_run)
+
+
+def scout_opportunities_fixture(
+    *,
+    fixture: str | Path | None = None,
+    topic: str | None = None,
+    max_results: int = 5,
+    dry_run: bool = True,
+    save: bool = False,
+    existing_state: Any = None,
+) -> OpportunityScoutResult:
+    """Run deterministic opportunity scouting from local fixture data."""
+
+    if not dry_run:
+        raise RuntimeError(
+            "Live opportunity scouting is not implemented. Use dry-run fixture mode."
+        )
+
+    fixture_hits = _load_fixture_hits(fixture)
+    if fixture is None:
+        default_structured_hits = [
+            hit
+            for hit in DEFAULT_STRUCTURED_SOURCE_HITS
+            if hit.get("company_name") != "Beacon CNS Therapeutics"
+        ]
+        fixture_hits = [*fixture_hits, *default_structured_hits]
+    hits = _dedupe_candidate_hits([hit for hit in fixture_hits if _matches_topic(hit, topic)])
+    existing_state_by_company = _load_existing_state_map(existing_state)
+    result = _records_from_hits(
+        hits,
+        topic=topic,
+        max_results=max_results,
+        dry_run=True,
+        save=save,
+        existing_state_by_company=existing_state_by_company,
+    )
+    return result.model_copy(
+        update={
+            "raw_search_result_count": len(fixture_hits),
+            "deduped_candidate_count": len(hits),
+            "audit_notes": [
+                "Fixture mode only; no live APIs were called.",
+                "Purpose-built dry-run source bundles were used for funding/news, jobs, "
+                "clinical trials, grants, conference/publication, and company page signals.",
+                "Existing opportunity state was loaded from local input only."
+                if existing_state_by_company
+                else "No existing opportunity state was supplied.",
+                "Scout discovered and deduplicated candidates before Analyst scoring.",
+                "Analyst scoring used relevance, Keystone fit, source confidence, urgency, "
+                "and next-action clarity.",
+                "No outreach drafts were generated.",
+                "High-priority records require Business Research Analyst handoff "
+                "before any outreach.",
+            ],
+        }
+    )
+
+
+def scout_opportunities_live_search(
+    *,
+    topic: str | None = None,
+    max_results: int = 5,
+    search_plan: OpportunitySearchPlan | None = None,
+    search_provider: Any | None = None,
+    serper_tool: Any | None = None,
+    save: bool = False,
+    existing_state: Any = None,
+) -> OpportunityScoutResult:
+    """Run explicit live search, then score and rank candidates locally."""
+
+    provider = search_provider or serper_tool or build_search_provider(live=True)
+    _require_live_search_provider(provider)
+    provider_label = _search_provider_label(provider)
+    resolved_search_plan = _resolved_search_plan(
+        topic,
+        max_results=max_results,
+        search_plan=search_plan,
+    )
+    query_specs = _build_live_query_specs(topic, search_plan=resolved_search_plan)
+    queries = [spec.query for spec in query_specs]
+    hits = _search_query_specs_with_provider(
+        search_provider=provider,
+        query_specs=query_specs,
+        max_results=max_results,
+    )
+    raw_hit_count = len(hits)
+    (
+        deduped,
+        filtered_hits,
+        filtered_candidates,
+        acceptance_review_candidates,
+        candidate_audit_notes,
+        verification_audit_notes,
+    ) = _process_candidate_hits(hits, topic=topic, search_plan=resolved_search_plan)
+
+    adaptive_audit_notes: list[str] = []
+    adaptive_specs: list[_OpportunityQuerySpec] = []
+    if not deduped:
+        adaptive_specs = _build_adaptive_followup_query_specs(
+            topic,
+            existing_specs=query_specs,
+            search_plan=resolved_search_plan,
+        )
+    if adaptive_specs:
+        adaptive_hits = _search_query_specs_with_provider(
+            search_provider=provider,
+            query_specs=adaptive_specs,
+            max_results=min(8, max(max_results, _opportunity_followup_result_cap())),
+        )
+        raw_hit_count += len(adaptive_hits)
+        hits = [*hits, *adaptive_hits]
+        (
+            deduped,
+            filtered_hits,
+            filtered_candidates,
+            acceptance_review_candidates,
+            candidate_audit_notes,
+            adaptive_verification_notes,
+        ) = _process_candidate_hits(
+            hits,
+            topic=topic,
+            search_plan=resolved_search_plan,
+        )
+        query_specs = [*query_specs, *adaptive_specs]
+        queries = [spec.query for spec in query_specs]
+        adaptive_audit_notes = [
+            (
+                "Adaptive search ladder ran "
+                f"{len(adaptive_specs)} follow-up query/query lane(s) after the first pass "
+                "found no accepted candidates."
+            ),
+            *adaptive_verification_notes,
+        ]
+    else:
+        adaptive_audit_notes = [
+            "Adaptive search ladder was not needed."
+            if deduped
+            else "Adaptive search ladder had no applicable follow-up queries."
+        ]
+    deepening_audit_notes: list[str] = []
+    deepening_specs = _build_result_deepening_query_specs(
+        topic=topic,
+        existing_specs=query_specs,
+        accepted_count=len(deduped),
+        desired_count=max_results,
+        search_plan=resolved_search_plan,
+    )
+    if deepening_specs:
+        deepening_hits = _search_query_specs_with_provider(
+            search_provider=provider,
+            query_specs=deepening_specs,
+            max_results=min(8, max(max_results, _opportunity_followup_result_cap())),
+        )
+        raw_hit_count += len(deepening_hits)
+        hits = [*hits, *deepening_hits]
+        (
+            deduped,
+            filtered_hits,
+            filtered_candidates,
+            acceptance_review_candidates,
+            candidate_audit_notes,
+            deepening_verification_notes,
+        ) = _process_candidate_hits(
+            hits,
+            topic=topic,
+            search_plan=resolved_search_plan,
+        )
+        query_specs = [*query_specs, *deepening_specs]
+        queries = [spec.query for spec in query_specs]
+        deepening_audit_notes = [
+            (
+                "Result deepening requested additional SearXNG/compatible result pages "
+                f"for {len(deepening_specs)} high-yield broad-search lane(s)."
+            ),
+            *deepening_verification_notes,
+        ]
+    else:
+        deepening_audit_notes = [
+            "Result deepening was not needed."
+            if len(deduped) >= max_results or not _result_deepening_allowed(topic)
+            else "Result deepening had no eligible broad-search lanes."
+        ]
+    underfill_audit_notes: list[str] = []
+    underfill_specs = _build_underfill_followup_query_specs(
+        topic,
+        existing_specs=query_specs,
+        accepted_count=len(deduped),
+        desired_count=max_results,
+        search_plan=resolved_search_plan,
+    )
+    if underfill_specs:
+        underfill_hits = _search_query_specs_with_provider(
+            search_provider=provider,
+            query_specs=underfill_specs,
+            max_results=min(8, max(max_results, _opportunity_followup_result_cap())),
+        )
+        raw_hit_count += len(underfill_hits)
+        hits = [*hits, *underfill_hits]
+        (
+            deduped,
+            filtered_hits,
+            filtered_candidates,
+            acceptance_review_candidates,
+            candidate_audit_notes,
+            underfill_verification_notes,
+        ) = _process_candidate_hits(
+            hits,
+            topic=topic,
+            search_plan=resolved_search_plan,
+        )
+        query_specs = [*query_specs, *underfill_specs]
+        queries = [spec.query for spec in query_specs]
+        underfill_audit_notes = [
+            (
+                "Underfilled search broadened with "
+                f"{len(underfill_specs)} targeted follow-up query/query lane(s)."
+            ),
+            *underfill_verification_notes,
+        ]
+    else:
+        underfill_audit_notes = [
+            "Underfilled search broadening was not needed."
+            if len(deduped) >= max_results
+            else "Underfilled search broadening had no applicable follow-up queries."
+        ]
+    constraint_relaxation_suggestion = _constraint_relaxation_suggestion(
+        topic=topic,
+        records_found=bool(deduped),
+    )
+    search_lanes_covered = list(dict.fromkeys(spec.lane for spec in query_specs))
+    time_windows_covered = list(dict.fromkeys(spec.time_window for spec in query_specs))
+    result = _records_from_hits(
+        deduped,
+        topic=topic,
+        max_results=max_results,
+        dry_run=False,
+        save=save,
+        existing_state_by_company=_load_existing_state_map(existing_state),
+    )
+    update: dict[str, Any] = {
+        "search_provider": provider_label,
+        "search_queries": queries,
+        "raw_search_result_count": raw_hit_count,
+        "deduped_candidate_count": len(deduped),
+        "filtered_candidates": [
+            FilteredOpportunityCandidate.model_validate(candidate)
+            for candidate in filtered_candidates
+        ],
+        "review_candidates": [
+            FilteredOpportunityCandidate.model_validate(candidate)
+            for candidate in acceptance_review_candidates
+        ],
+        "constraint_relaxation_suggestion": constraint_relaxation_suggestion,
+        "audit_notes": [
+            "Live search provider was used.",
+            f"Provider: {provider_label}.",
+            (
+                "Search plan: "
+                f"{', '.join(resolved_search_plan.target_entity_types or ['unspecified'])} "
+                f"for {', '.join(resolved_search_plan.objectives or ['broad_discovery'])} "
+                f"({resolved_search_plan.source})."
+            ),
+            (
+                f"Ran {len(queries)} targeted search queries across lanes: "
+                f"{', '.join(search_lanes_covered or [spec.lane for spec in query_specs])}."
+            ),
+            (
+                "Coverage windows: "
+                f"{', '.join(time_windows_covered or [spec.time_window for spec in query_specs])}."
+            ),
+            (
+                f"Deduplicated {len(filtered_hits)} filter-passing search results to "
+                f"{len(deduped)} candidate entities."
+            ),
+            *verification_audit_notes,
+            "Broad Scout retrieval covered companies, collaborations, researchers, "
+            "institutes, conferences, grants, and trials when the topic was not role-only.",
+            *adaptive_audit_notes,
+            *deepening_audit_notes,
+            *underfill_audit_notes,
+            *candidate_audit_notes,
+            *(
+                [f"Constraint to relax next: {constraint_relaxation_suggestion}"]
+                if constraint_relaxation_suggestion
+                else []
+            ),
+            "Analyst scoring used relevance, Keystone fit, source confidence, urgency, "
+            "and next-action clarity.",
+            "No outreach drafts were generated.",
+            "High-priority records require Business Research Analyst handoff before any outreach.",
+        ],
+    }
+    if "search_lanes" in OpportunityScoutResult.model_fields:
+        update["search_lanes"] = search_lanes_covered or [spec.lane for spec in query_specs]
+    if "search_time_windows" in OpportunityScoutResult.model_fields:
+        update["search_time_windows"] = time_windows_covered or [
+            spec.time_window for spec in query_specs
+        ]
+    return result.model_copy(update=update)
+
+
+def _constraint_relaxation_suggestion(
+    *,
+    topic: str | None,
+    records_found: bool,
+) -> str:
+    """Suggest one practical relaxation when a tightly scoped live search returns nothing."""
+
+    if records_found:
+        return ""
+    text = str(topic or "").strip().lower()
+    if not text:
+        return ""
+    suggestions = (
+        (
+            "last 48 hours",
+            "Relax recency from the last 48 hours to the last 7 days.",
+        ),
+        (
+            "last 24 hours",
+            "Relax recency from the last 24 hours to the last 7 days.",
+        ),
+        (
+            "part-time",
+            "Relax part-time to contract, advisory, or fractional leadership roles.",
+        ),
+        (
+            "chief medical officer",
+            (
+                "Relax the title from chief medical officer to medical director or "
+                "head of clinical strategy."
+            ),
+        ),
+        (
+            "behavioral health ai",
+            (
+                "Expand behavioral health AI to broader clinical AI or digital mental "
+                "health leadership roles."
+            ),
+        ),
+        (
+            "remote",
+            "Broaden remote-only requirements to include hybrid roles.",
+        ),
+    )
+    for needle, suggestion in suggestions:
+        if needle in text:
+            return suggestion
+    return (
+        "Broaden one hard constraint and rerun with a wider title, recency window, or "
+        "geography filter."
+    )
+
+
+def opportunity_scout_markdown(result: OpportunityScoutResult) -> str:
+    """Render scout results as concise markdown."""
+
+    lines = [
+        "# Opportunity Scout Results",
+        "",
+        f"- Topic: {result.topic or 'all'}",
+        f"- Dry run: {result.dry_run}",
+        f"- Outreach generated: {result.outreach_generated}",
+        f"- Records: {len(result.records)}",
+    ]
+    for index, record in enumerate(result.records, start=1):
+        source_confidence = (
+            record.source_quality_summary.overall_score if record.source_quality_summary else 0
+        )
+        source_bundle_labels = (
+            ", ".join(bundle.source_category for bundle in record.source_bundles) or "none"
+        )
+        lines.extend(
+            [
+                "",
+                f"## {index}. {record.company_name}",
+                "",
+                f"- Type: {record.opportunity_type}",
+                f"- Priority score: {record.priority_score}",
+                f"- Why now: {record.why_now_signal}",
+                f"- Score rationale: {record.score_rationale}",
+                f"- Next step: {record.recommended_next_step}",
+                "- Business Research Analyst handoff: "
+                f"{record.handoff_to_business_research_analyst}",
+                f"- Handoff reason: {record.handoff_reason}",
+                f"- Pipeline action: {record.state_action}",
+                f"- Source confidence: {source_confidence}/100",
+                f"- Source bundles: {source_bundle_labels}",
+                f"- Sources: {', '.join(source.title for source in record.sources)}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def build_opportunity_scout_agent(model: str | None = None) -> Agent:
+    """Build the opportunity scout agent."""
+
+    instructions = compose_instructions(
+        "keystone_profile.md",
+        "safety_policy.md",
+        "skills.md",
+        "tools.md",
+        "opportunity_scout.md",
+    )
+    return build_sdk_agent(
+        name="opportunity_scout",
+        instructions=instructions,
+        output_type=OpportunityScoutResult,
+        tools=[
+            list_local_context_sources,
+            search_local_context,
+            read_local_context_file,
+            retrieve_memory,
+            check_workflow_duplicate,
+            search_web,
+            search_opportunity_sources_placeholder,
+            load_existing_opportunity_state,
+            search_funding_news_sources,
+            search_job_posting_sources,
+            search_clinical_trials_sources,
+            search_grant_sources,
+            search_conference_publication_sources,
+            search_company_page_sources,
+            score_opportunity,
+            handoff_to_business_research_analyst_placeholder,
+            save_opportunity_placeholder,
+            save_entity_memory,
+            save_opportunity_memory,
+        ],
+        guardrails=keystone_guardrails(),
+        model=model,
+        handoff_description=(
+            "Use to discover, source, deduplicate, score, and prioritize opportunities "
+            "without generating outreach."
+        ),
+    )
+
+
+def run_opportunity_scout_sdk(
+    typed_input: OpportunityScoutSDKInput | str,
+    *,
+    run_config: Any | None = None,
+    live: bool = False,
+    model: str | None = None,
+) -> TypedAgentRunResult[OpportunityScoutResult]:
+    """Run Opportunity Scout through the typed SDK harness."""
+
+    return run_typed_sdk_agent(
+        agent=build_opportunity_scout_agent(model=model),
+        typed_input=typed_input,
+        output_type=OpportunityScoutResult,
+        run_config=run_config,
+        live=live,
+    )

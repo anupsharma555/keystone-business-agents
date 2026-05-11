@@ -1,0 +1,74 @@
+{
+  "name": "NeuroFlow",
+  "website": "https://www.neuroflow.com",
+  "description": "Behavioral health technology company.",
+  "fit": "Potentially relevant for behavioral health analytics and care navigation.",
+  "sources": [
+    {
+      "source_id": "fixture:neuroflow_company",
+      "title": "NeuroFlow fixture company profile",
+      "url": "fixture://sample_company_neuroflow.json",
+      "source_type": "fixture",
+      "supported_claims": [
+        "NeuroFlow is a behavioral health technology company.",
+        "NeuroFlow supports behavioral health analytics and care navigation.",
+        "NeuroFlow serves healthcare organizations working on mental health engagement and measurement."
+      ],
+      "confidence": 0.82
+    }
+  ],
+  "research_data_points": [
+    {
+      "key": "business_model",
+      "value": "Behavioral health technology platform.",
+      "completed": true,
+      "confidence": 0.82,
+      "source_ids": ["fixture:neuroflow_company"]
+    },
+    {
+      "key": "customer_segment",
+      "value": "Healthcare organizations working on mental health engagement and measurement.",
+      "completed": true,
+      "confidence": 0.78,
+      "source_ids": ["fixture:neuroflow_company"]
+    },
+    {
+      "key": "behavioral_health_relevance",
+      "value": "Direct behavioral health and mental health relevance.",
+      "completed": true,
+      "confidence": 0.86,
+      "source_ids": ["fixture:neuroflow_company"]
+    },
+    {
+      "key": "ai_data_science_relevance",
+      "value": "Analytics and measurement workflows create data science relevance.",
+      "completed": true,
+      "confidence": 0.72,
+      "source_ids": ["fixture:neuroflow_company"]
+    },
+    {
+      "key": "research_signals",
+      "completed": false,
+      "missing_reason": "Fixture does not include research or validation signals."
+    },
+    {
+      "key": "funding_growth_signal",
+      "completed": false,
+      "missing_reason": "Fixture does not include funding or growth signals."
+    },
+    {
+      "key": "compliance_sensitivity",
+      "value": "Behavioral health data context suggests compliance sensitivity.",
+      "completed": true,
+      "confidence": 0.68,
+      "source_ids": ["fixture:neuroflow_company"]
+    },
+    {
+      "key": "consulting_fit",
+      "value": "Relevant for behavioral health analytics and care navigation.",
+      "completed": true,
+      "confidence": 0.82,
+      "source_ids": ["fixture:neuroflow_company"]
+    }
+  ]
+}

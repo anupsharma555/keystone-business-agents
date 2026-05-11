@@ -1,0 +1,14 @@
+[
+  {
+    "company_name": "Low Proof AI",
+    "opportunity_type": "grant or collaboration opportunity",
+    "signal": "Old conference mention with no current buyer or validation trigger.",
+    "signals": ["conference activity"],
+    "source_title": "Old aggregator mention",
+    "source_url": "https://unknown.example/old-low-proof-ai",
+    "source_type": "unknown",
+    "source_category": "search",
+    "published_at": "2019-01-01",
+    "missing_evidence": ["No recent hiring, funding, or validation source."]
+  }
+]

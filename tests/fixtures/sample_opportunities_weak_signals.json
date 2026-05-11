@@ -1,0 +1,12 @@
+[
+  {
+    "company_name": "Sparse Signal Labs",
+    "opportunity_type": "grant or collaboration opportunity",
+    "signal": "A single social post mentions a conference poster, with no buyer, project, validation, funding, or hiring context.",
+    "signals": ["conference activity"],
+    "source_title": "Social post about conference poster",
+    "source_url": "https://x.com/sparse-signal/status/123",
+    "source_type": "social",
+    "published_at": "2026-03-01"
+  }
+]

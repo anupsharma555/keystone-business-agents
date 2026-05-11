@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keystone-business-agents"
+version = "0.1.0"
+description = "OpenAI Agents SDK business agents for Keystone Neuroinformatics LLC"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "openai-agents>=0.14.5",
+  "pydantic>=2.7,<3",
+  "python-dotenv",
+  "requests",
+  "rich",
+  "trafilatura>=2.0,<3",
+]
+
+[project.scripts]
+keystone = "keystone_agents.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "coverage[toml]",
+  "pip-audit",
+  "pytest>=8.0",
+  "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+keystone_agents = [
+  "pricing/*.json",
+  "prompts/*.md",
+  "templates/outreach/*.json",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["keystone_agents"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 77
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

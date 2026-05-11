@@ -1,0 +1,26 @@
+{
+  "profile_id": "default",
+  "source": "fixture://sample_email_style_profile_approved.json",
+  "source_id": "fixture:email_style_profile_default",
+  "confidence": 0.82,
+  "approval_state": "approved_for_drafting",
+  "approval_scope": "drafting",
+  "greeting_patterns": ["Hi {name},"],
+  "signoffs": ["Sincerely,\nAnup"],
+  "sentence_length": "short",
+  "average_sentence_words": 14,
+  "directness": "medium",
+  "cta_style": "soft_question",
+  "formality": "professional",
+  "formatting_preferences": ["short paragraphs", "plain language"],
+  "preferred_phrases": ["compare notes", "non-sensitive context"],
+  "avoided_phrases": ["act now", "guaranteed", "proven results"],
+  "approved_sample_snippets": [
+    "Happy to compare notes if useful.",
+    "Please send any non-sensitive context that would help me review fit."
+  ],
+  "notes": "Approved aggregate style fixture. No raw sent-email bodies are stored.",
+  "raw_sent_email_bodies_included": false,
+  "send_enabled": false,
+  "sent": false
+}

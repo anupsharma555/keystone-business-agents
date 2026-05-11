@@ -1,0 +1,65 @@
+{
+  "name": "Office Supplies Example Co.",
+  "website": "https://example.com",
+  "description": "Generic office supplies vendor.",
+  "fit": "Low relevance for Keystone business development.",
+  "sources": [
+    {
+      "source_id": "fixture:office_supplies",
+      "title": "Office Supplies fixture profile",
+      "url": "fixture://sample_company_irrelevant.json",
+      "source_type": "fixture",
+      "supported_claims": [
+        "Office Supplies Example Co. is a generic office supplies vendor.",
+        "Office Supplies Example Co. has low relevance for Keystone business development."
+      ],
+      "confidence": 0.7
+    }
+  ],
+  "research_data_points": [
+    {
+      "key": "business_model",
+      "value": "Generic office supplies vendor.",
+      "completed": true,
+      "confidence": 0.7,
+      "source_ids": ["fixture:office_supplies"]
+    },
+    {
+      "key": "customer_segment",
+      "completed": false,
+      "missing_reason": "Fixture does not identify a healthcare or research customer segment."
+    },
+    {
+      "key": "behavioral_health_relevance",
+      "completed": false,
+      "missing_reason": "No behavioral health evidence in fixture."
+    },
+    {
+      "key": "ai_data_science_relevance",
+      "completed": false,
+      "missing_reason": "No AI or data science evidence in fixture."
+    },
+    {
+      "key": "research_signals",
+      "completed": false,
+      "missing_reason": "No research or validation signal in fixture."
+    },
+    {
+      "key": "funding_growth_signal",
+      "completed": false,
+      "missing_reason": "No funding or growth signal in fixture."
+    },
+    {
+      "key": "compliance_sensitivity",
+      "completed": false,
+      "missing_reason": "No regulated healthcare data context in fixture."
+    },
+    {
+      "key": "consulting_fit",
+      "value": "Low relevance for Keystone business development.",
+      "completed": true,
+      "confidence": 0.7,
+      "source_ids": ["fixture:office_supplies"]
+    }
+  ]
+}

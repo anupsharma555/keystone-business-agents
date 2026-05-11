@@ -1,0 +1,17 @@
+[
+  {
+    "company_name": "Curebase",
+    "status": "drafted",
+    "notes": "Already has a drafted outbound sequence."
+  },
+  {
+    "company_name": "NeuroFlow",
+    "status": "candidate",
+    "notes": "Existing candidate should be enriched instead of duplicated."
+  },
+  {
+    "company_name": "Beacon CNS Therapeutics",
+    "status": "rejected",
+    "notes": "Rejected during prior pipeline review."
+  }
+]

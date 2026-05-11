@@ -1,0 +1,824 @@
+from __future__ import annotations
+
+import json
+import sys
+from argparse import Namespace
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from keystone_agents.schemas.company_profile import CompanyProfile
+from keystone_agents.schemas.opportunity import OpportunityScoutResult
+from keystone_agents.tools.search_provider import SearchResult
+
+
+def test_company_live_retrieval_escalates_from_searxng_to_serper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    class FakeSearxngProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Curebase funding update",
+                    link="https://news.example.test/curebase-funding",
+                    snippet="Recent traction signal for Curebase.",
+                    source="searxng",
+                )
+            ]
+
+    class FakeSerperProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Curebase",
+                    link="https://www.curebase.com",
+                    snippet="Official clinical trial software site.",
+                    source="serper",
+                ),
+                SearchResult(
+                    title="Curebase leadership",
+                    link="https://www.linkedin.com/company/curebase/",
+                    snippet="Leadership and team context.",
+                    source="serper",
+                ),
+            ]
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_company_research_queries",
+        lambda *_args: ["curebase research"],
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: (
+            FakeSearxngProvider() if provider == "searxng" else FakeSerperProvider()
+        ),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "research_account_from_search_results",
+        lambda **_kwargs: CompanyProfile(
+            name="Curebase",
+            website="https://www.curebase.com",
+            description="Clinical trial software platform.",
+            fit_summary="Relevant for partnership research.",
+        ),
+    )
+
+    profile, metadata = live_retrieval.retrieve_company_profile_live(
+        company="Curebase",
+        company_url="https://www.curebase.com",
+        max_results=3,
+    )
+
+    assert metadata["search_provider"] == "searxng+serper"
+    assert metadata["precision_search_escalated"] is True
+    assert metadata["search_provider_sequence"] == ["searxng", "serper"]
+    assert metadata["search_providers_used"] == ["searxng", "serper"]
+    assert metadata["structured_enrichment_recommended"] is True
+    assert metadata["structured_enrichment_candidates"] == [
+        "trafilatura",
+        "firecrawl",
+        "browserless",
+        "apify",
+    ]
+    assert metadata["search_quality"]["official_source_present"] is True
+
+
+def test_company_live_retrieval_can_enrich_official_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+    from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResult
+
+    class FakeProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Mentavi Health",
+                    link="https://mentavi.com",
+                    snippet="Official mental health diagnostics company site.",
+                    source="serper",
+                )
+            ]
+
+    captured: dict[str, object] = {}
+
+    def fake_profile_builder(**kwargs):
+        captured.update(kwargs)
+        return CompanyProfile(
+            name="Mentavi",
+            website="https://mentavi.com",
+            description="Mental health diagnostics.",
+        )
+
+    monkeypatch.setenv("KEYSTONE_ENABLE_WEBSITE_EXTRACTION", "true")
+    monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES", "2")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="serper", website_extractor="trafilatura"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_company_research_queries",
+        lambda *_args: ["Mentavi official website"],
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "extract_website_content",
+        lambda url, **_kwargs: WebsiteExtractionResult(
+            url=url,
+            title="Mentavi extracted page",
+            provider="trafilatura",
+            status="success",
+            text_or_markdown="Mentavi offers clinician-reviewed mental health diagnostics.",
+            claims=["Mentavi offers clinician-reviewed mental health diagnostics."],
+        ),
+    )
+
+    profile, metadata = live_retrieval.retrieve_company_profile_live(
+        company="Mentavi",
+        company_url="https://mentavi.com",
+        max_results=2,
+        profile_builder=fake_profile_builder,
+    )
+
+    website_inputs = captured["website_inputs"]
+    assert isinstance(website_inputs, list)
+    assert website_inputs
+    assert website_inputs[0]["source_type"] == "website"
+    assert metadata["website_extraction"]["enabled"] is True
+    assert metadata["website_extraction"]["page_count"] == len(website_inputs)
+
+
+def test_company_live_retrieval_can_fallback_to_firecrawl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+    from keystone_agents.tools.website_extraction_tool import (
+        WebsiteExtractionError,
+        WebsiteExtractionResult,
+    )
+
+    class FakeProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Mentavi Health",
+                    link="https://mentavi.com",
+                    snippet="Official site.",
+                    source="serper",
+                )
+            ]
+
+    def fake_extract(url, *, provider, **_kwargs):
+        if provider == "trafilatura":
+            raise WebsiteExtractionError("local extraction failed")
+        return WebsiteExtractionResult(
+            url=url,
+            title="Mentavi Firecrawl page",
+            provider="firecrawl",
+            status="success",
+            text_or_markdown="Mentavi works with employers and health systems.",
+            claims=["Mentavi works with employers and health systems."],
+        )
+
+    monkeypatch.setenv("KEYSTONE_ENABLE_WEBSITE_EXTRACTION", "true")
+    monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", "firecrawl")
+    monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES", "1")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="serper", website_extractor="trafilatura"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_company_research_queries",
+        lambda *_args: ["Mentavi official website"],
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: FakeProvider(),
+    )
+    monkeypatch.setattr(live_retrieval, "extract_website_content", fake_extract)
+
+    profile, metadata = live_retrieval.retrieve_company_profile_live(
+        company="Mentavi",
+        company_url="https://mentavi.com",
+        max_results=2,
+        profile_builder=lambda **kwargs: CompanyProfile(
+            name="Mentavi",
+            website="https://mentavi.com",
+            description=str(kwargs["website_inputs"][0]["provider"]),
+        ),
+    )
+
+    assert metadata["website_extraction"]["page_count"] == 1
+    assert profile.description == "firecrawl"
+
+
+def test_opportunity_live_retrieval_fans_out_provider_ladder_for_multi_lane_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    calls: list[str] = []
+
+    class FakeSearxngProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"searxng:{query}:{num_results}")
+            return [
+                SearchResult(
+                    title="AffectAI SBIR grant award notice",
+                    link="https://reporter.nih.gov/project-details/123456",
+                    snippet="NIH grant for a behavioral health AI platform.",
+                    source="searxng",
+                ),
+                SearchResult(
+                    title="AffectAI platform study",
+                    link="https://clinicaltrials.gov/study/NCT01234567",
+                    snippet="Clinical trial launched this week for psychiatry software.",
+                    source="searxng",
+                ),
+                SearchResult(
+                    title="Precision psychiatry symposium abstract",
+                    link="https://med.stanford.edu/psychiatry-symposium/abstracts/affectai.html",
+                    snippet="Conference abstract on clinical AI evidence generation.",
+                    source="searxng",
+                ),
+            ]
+
+    class FakeSerperProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"serper:{query}:{num_results}")
+            return [
+                SearchResult(
+                    title="Parallel provider corroboration",
+                    link="https://example.test/fallback",
+                    snippet="Parallel provider result is merged into the search packet.",
+                    source="serper",
+                )
+            ]
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: (
+            FakeSearxngProvider() if provider == "searxng" else FakeSerperProvider()
+        ),
+    )
+
+    provider = live_retrieval.build_opportunity_search_provider(
+        topic="precision psychiatry collaborations",
+        desired_results=5,
+    )
+    results = provider.search_web("precision psychiatry live opportunities", num_results=5)
+    telemetry = provider.telemetry()
+    quality = live_retrieval.opportunity_search_quality(
+        topic="precision psychiatry collaborations",
+        max_results=5,
+        results=provider.collected_results(),
+    )
+
+    assert len(results) == 4
+    assert sorted(calls) == [
+        "searxng:precision psychiatry live opportunities:5",
+        "serper:precision psychiatry live opportunities:5",
+    ]
+    assert telemetry["parallel_provider_fanout"] is True
+    assert telemetry["precision_search_escalated"] is False
+    assert telemetry["search_providers_used"] == ["searxng", "serper"]
+    assert quality["needs_precision_search"] is False
+    assert {"grant", "trial", "conference"}.issubset(quality["opportunity_lane_labels"])
+
+
+def test_opportunity_role_live_retrieval_prefers_serper_for_job_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: SimpleNamespace(
+            provider_name=provider,
+            dry_run=False,
+            validate_configuration=lambda: None,
+            search_web=lambda query, num_results=5: [],
+        ),
+    )
+
+    provider = live_retrieval.build_opportunity_search_provider(
+        topic="Find remote advisory roles in mental health AI",
+        desired_results=5,
+    )
+
+    assert provider.provider_sequence == ("serper", "searxng")
+
+
+def test_opportunity_scout_os1_live_search_escalates_on_weak_initial_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_opportunity_scout as cli
+
+    class FakeSearxngProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Behavioral health AI role",
+                    link="https://jobs.example.test/broad-role",
+                    snippet="Remote role without recency evidence.",
+                    source="searxng",
+                )
+            ]
+
+    class FakeSerperProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Clinical AI Medical Director",
+                    link="https://jobs.example.test/clinical-ai-medical-director",
+                    snippet="Remote United States role posted this week.",
+                    source="serper",
+                )
+            ]
+
+    monkeypatch.setattr(cli, "load_settings", lambda: SimpleNamespace(search_provider="searxng"))
+    monkeypatch.setattr(cli, "_os1_role_search_queries", lambda: ["remote clinical ai"])
+    monkeypatch.setattr(
+        cli,
+        "build_search_provider",
+        lambda provider=None, *, live=False: (
+            FakeSearxngProvider() if provider == "searxng" else FakeSerperProvider()
+        ),
+    )
+    args = Namespace(
+        dry_run=False,
+        live_search=True,
+        search_provider=None,
+        fallback_search_provider=None,
+        max_results=2,
+    )
+
+    hits, metadata = cli._search_role_sources_live(args)
+
+    assert len(hits) == 2
+    assert metadata["search_provider"] == "searxng+serper"
+    assert metadata["precision_search_escalated"] is True
+    assert metadata["search_provider_used"] == "serper"
+    assert metadata["search_provider_sequence"] == ["searxng", "serper"]
+    assert metadata["search_providers_used"] == ["searxng", "serper"]
+
+
+def test_opportunity_scout_explicit_retrieval_hint_drives_search_review_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_opportunity_scout as cli
+
+    class FakeSearxngProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Behavioral health AI role",
+                    link="https://jobs.example.test/role-one",
+                    snippet="Remote United States role posted this week.",
+                    source="searxng",
+                )
+            ]
+
+    monkeypatch.setattr(cli, "load_settings", lambda: SimpleNamespace(search_provider="searxng"))
+    monkeypatch.setattr(cli, "_os1_role_search_queries", lambda: ["remote clinical ai"])
+    monkeypatch.setattr(
+        cli,
+        "build_search_provider",
+        lambda provider=None, *, live=False: FakeSearxngProvider(),
+    )
+    args = Namespace(
+        dry_run=False,
+        live_search=True,
+        search_provider="searxng",
+        fallback_search_provider=None,
+        max_results=1,
+        retrieval_hint_json=(
+            '{"source":"orchestrator","needs_search_review":true,"reasons":["thin data"]}'
+        ),
+    )
+
+    _hits, metadata = cli._search_role_sources_live(args)
+
+    assert metadata["autonomy_hint"]["source"] == "orchestrator"
+    assert metadata["autonomy_hint"]["needs_search_review"] is True
+    assert metadata["search_review_recommended"] is True
+
+
+def test_opportunity_scout_live_retrieval_stages_sandbox_packet_when_review_is_recommended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    class FakeProvider:
+        def telemetry(self) -> dict[str, object]:
+            return {
+                "search_provider": "searxng",
+                "search_review_recommended": True,
+                "search_quality": {
+                    "needs_search_review": True,
+                    "reasons": ["thin corroboration"],
+                },
+            }
+
+        def collected_results(self) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Thin collaboration signal",
+                    link="https://example.test/collaboration",
+                    snippet="Possible collaboration mention without corroboration.",
+                    source="searxng",
+                )
+            ]
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_opportunity_search_provider",
+        lambda **_kwargs: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "scout_opportunities_live_search",
+        lambda **_kwargs: OpportunityScoutResult(
+            topic="thin collaboration packet",
+            dry_run=False,
+            search_provider="searxng",
+            search_queries=["thin collaboration packet"],
+            records=[],
+            audit_notes=[],
+        ),
+    )
+
+    result, metadata = live_retrieval.run_opportunity_scout_live(
+        topic="thin collaboration packet",
+        max_results=3,
+        sandbox_search_review_artifact_root=tmp_path,
+    )
+
+    sandbox_review = metadata["sandbox_search_review"]
+    assert sandbox_review["status"] == "staged"
+    assert sandbox_review["recommended"] is True
+    assert sandbox_review["hosted_web_search"] is True
+    packet_file = Path(sandbox_review["packet_file"])
+    assert packet_file.exists()
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    assert packet["agent_name"] == "opportunity_scout"
+    assert packet["topic"] == "thin collaboration packet"
+    assert packet["retrieved_results"][0]["url"] == "https://example.test/collaboration"
+    assert any("staged" in note.lower() for note in result.audit_notes)
+
+
+def test_opportunity_scout_live_retrieval_records_sandbox_hosted_web_search_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    class FakeProvider:
+        def telemetry(self) -> dict[str, object]:
+            return {
+                "search_provider": "searxng",
+                "search_review_recommended": True,
+                "search_quality": {
+                    "needs_search_review": True,
+                    "reasons": ["needs corroboration"],
+                },
+            }
+
+        def collected_results(self) -> list[SearchResult]:
+            return []
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_opportunity_search_provider",
+        lambda **_kwargs: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "scout_opportunities_live_search",
+        lambda **_kwargs: OpportunityScoutResult(
+            topic="sandbox hosted search",
+            dry_run=False,
+            search_provider="searxng",
+            search_queries=["sandbox hosted search"],
+            records=[],
+            audit_notes=[],
+        ),
+    )
+
+    result, metadata = live_retrieval.run_opportunity_scout_live(
+        topic="sandbox hosted search",
+        max_results=3,
+        sandbox_search_review_artifact_root=tmp_path,
+        sandbox_search_review_hosted_web_search=True,
+        sandbox_search_review_hosted_web_search_external_web_access=False,
+        sandbox_search_review_hosted_web_search_context_size="high",
+    )
+
+    sandbox_review = metadata["sandbox_search_review"]
+    assert sandbox_review["hosted_web_search"] is True
+    assert sandbox_review["hosted_web_search_external_web_access"] is False
+    assert sandbox_review["hosted_web_search_context_size"] == "high"
+    assert any("hosted web_search" in note for note in result.audit_notes)
+
+
+def test_opportunity_scout_live_retrieval_auto_stages_review_when_objective_unmet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    class FakeProvider:
+        def telemetry(self) -> dict[str, object]:
+            return {
+                "search_provider": "searxng",
+                "search_review_recommended": False,
+                "search_providers_used": ["searxng"],
+                "provider_usage": {},
+            }
+
+        def collected_results(self) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title=f"Candidate {index}",
+                    link=f"https://example.test/candidate-{index}",
+                    snippet="Weak psychiatry advisory evidence.",
+                    source="searxng",
+                )
+                for index in range(20)
+            ]
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_opportunity_search_provider",
+        lambda **_kwargs: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "scout_opportunities_live_search",
+        lambda **_kwargs: OpportunityScoutResult(
+            topic="find one psychiatry AI advisory opportunity",
+            dry_run=False,
+            search_provider="searxng",
+            search_queries=["find one psychiatry AI advisory opportunity"],
+            records=[],
+            audit_notes=[],
+        ),
+    )
+
+    _result, metadata = live_retrieval.run_opportunity_scout_live(
+        topic="find one psychiatry AI advisory opportunity",
+        max_results=1,
+        sandbox_search_review_artifact_root=tmp_path,
+    )
+
+    sandbox_review = metadata["sandbox_search_review"]
+    assert metadata["search_review_recommended"] is True
+    assert sandbox_review["hosted_web_search_context_size"] == "low"
+    assert sandbox_review["retrieved_result_limit"] == 8
+    packet = json.loads(Path(sandbox_review["packet_file"]).read_text(encoding="utf-8"))
+    assert packet["retrieved_result_count_total"] == 20
+    assert len(packet["retrieved_results"]) == 8
+    assert any(
+        "opportunity objective was not met" in reason
+        for reason in metadata["search_quality"]["reasons"]
+    )
+
+
+def test_opportunity_scout_sandbox_auto_execute_is_env_gated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    class FakeProvider:
+        def telemetry(self) -> dict[str, object]:
+            return {
+                "search_provider": "searxng",
+                "search_review_recommended": True,
+                "search_providers_used": ["searxng"],
+                "provider_usage": {},
+            }
+
+        def collected_results(self) -> list[SearchResult]:
+            return []
+
+    calls: dict[str, object] = {}
+
+    monkeypatch.setenv("KEYSTONE_SANDBOX_SEARCH_REVIEW_AUTO_EXECUTE", "true")
+    monkeypatch.setenv("KEYSTONE_SANDBOX_SEARCH_REVIEW_LIVE", "true")
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_opportunity_search_provider",
+        lambda **_kwargs: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "scout_opportunities_live_search",
+        lambda **_kwargs: OpportunityScoutResult(
+            topic="env gated sandbox",
+            dry_run=False,
+            search_provider="searxng",
+            search_queries=["env gated sandbox"],
+            records=[],
+            audit_notes=[],
+        ),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "maybe_run_opportunity_scout_sandbox_review",
+        lambda **kwargs: calls.update(kwargs) or {"status": "executed"},
+    )
+
+    _result, metadata = live_retrieval.run_opportunity_scout_live(
+        topic="env gated sandbox",
+        max_results=1,
+    )
+
+    assert calls["execute"] is True
+    assert calls["live"] is True
+    assert calls["hosted_web_search_context_size"] == "low"
+    assert metadata["sandbox_search_review"]["status"] == "executed"
+
+
+def test_opportunity_scout_live_retrieval_allows_explicit_disable_of_sandbox_hosted_web_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    class FakeProvider:
+        def telemetry(self) -> dict[str, object]:
+            return {
+                "search_provider": "searxng",
+                "search_review_recommended": True,
+                "search_quality": {
+                    "needs_search_review": True,
+                    "reasons": ["needs corroboration"],
+                },
+            }
+
+        def collected_results(self) -> list[SearchResult]:
+            return []
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_opportunity_search_provider",
+        lambda **_kwargs: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "scout_opportunities_live_search",
+        lambda **_kwargs: OpportunityScoutResult(
+            topic="sandbox hosted search disabled",
+            dry_run=False,
+            search_provider="searxng",
+            search_queries=["sandbox hosted search disabled"],
+            records=[],
+            audit_notes=[],
+        ),
+    )
+
+    _result, metadata = live_retrieval.run_opportunity_scout_live(
+        topic="sandbox hosted search disabled",
+        max_results=3,
+        sandbox_search_review_artifact_root=tmp_path,
+        sandbox_search_review_hosted_web_search=False,
+    )
+
+    sandbox_review = metadata["sandbox_search_review"]
+    assert sandbox_review["hosted_web_search"] is False
+
+
+def test_opportunity_scout_cli_passes_sandbox_review_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    import scripts.run_opportunity_scout as cli
+
+    calls: dict[str, object] = {}
+
+    def fake_run_opportunity_scout_live(
+        **kwargs: object,
+    ) -> tuple[OpportunityScoutResult, dict[str, object]]:
+        calls.update(kwargs)
+        return (
+            OpportunityScoutResult(
+                topic="sandbox preview",
+                dry_run=False,
+                search_provider="searxng",
+                search_queries=["sandbox preview"],
+                records=[],
+                audit_notes=[],
+            ),
+            {"search_provider": "searxng"},
+        )
+
+    monkeypatch.setattr(cli, "run_opportunity_scout_live", fake_run_opportunity_scout_live)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_opportunity_scout.py",
+            "--topic",
+            "sandbox preview",
+            "--live-search",
+            "--no-dry-run",
+            "--sandbox-search-review",
+            "--force-sandbox-search-review",
+            "--sandbox-search-review-web-search",
+            "--sandbox-search-review-web-search-context",
+            "high",
+            "--sandbox-search-review-web-search-cached-only",
+            "--sandbox-search-review-artifact-root",
+            str(tmp_path),
+            "--json",
+        ],
+    )
+
+    assert cli.main() == 0
+    json.loads(capsys.readouterr().out)
+    assert calls["sandbox_search_review"] is True
+    assert calls["force_sandbox_search_review"] is True
+    assert calls["sandbox_search_review_artifact_root"] == str(tmp_path)
+    assert calls["sandbox_search_review_hosted_web_search"] is True
+    assert calls["sandbox_search_review_hosted_web_search_external_web_access"] is False
+    assert calls["sandbox_search_review_hosted_web_search_context_size"] == "high"
+
+
+def test_opportunity_scout_cli_defaults_sandbox_web_search_when_review_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.run_opportunity_scout as cli
+
+    calls: dict[str, object] = {}
+
+    def fake_run_opportunity_scout_live(
+        **kwargs: object,
+    ) -> tuple[OpportunityScoutResult, dict[str, object]]:
+        calls.update(kwargs)
+        return (
+            OpportunityScoutResult(
+                topic="sandbox default web search",
+                dry_run=False,
+                search_provider="searxng",
+                search_queries=["sandbox default web search"],
+                records=[],
+                audit_notes=[],
+            ),
+            {"search_provider": "searxng"},
+        )
+
+    monkeypatch.setattr(cli, "run_opportunity_scout_live", fake_run_opportunity_scout_live)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_opportunity_scout.py",
+            "--topic",
+            "sandbox default web search",
+            "--live-search",
+            "--no-dry-run",
+            "--sandbox-search-review",
+            "--json",
+        ],
+    )
+
+    assert cli.main() == 0
+    json.loads(capsys.readouterr().out)
+    assert calls["sandbox_search_review"] is True
+    assert calls["sandbox_search_review_hosted_web_search"] is None

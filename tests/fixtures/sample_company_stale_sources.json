@@ -1,0 +1,35 @@
+{
+  "name": "StaleSignal Health",
+  "website": "https://stalesignal.example",
+  "description": "Behavioral health analytics company described by stale public material.",
+  "fit": "Potentially relevant for behavioral health analytics, but the available evidence is stale and uncorroborated.",
+  "sources": [
+    {
+      "source_id": "fixture:stale_social_2018",
+      "title": "StaleSignal social profile from 2018",
+      "url": "https://x.com/stalesignal/status/2018",
+      "source_type": "social",
+      "supported_claims": [
+        "StaleSignal Health described behavioral health analytics and validation work in a 2018 social post."
+      ],
+      "confidence": 0.5,
+      "published_at": "2018-01-01"
+    }
+  ],
+  "research_data_points": [
+    {
+      "key": "behavioral_health_relevance",
+      "value": "Behavioral health analytics claim comes from a stale social post.",
+      "completed": true,
+      "confidence": 0.3,
+      "source_ids": ["fixture:stale_social_2018"]
+    },
+    {
+      "key": "consulting_fit",
+      "value": "Potential fit cannot be prioritized without fresh corroborating evidence.",
+      "completed": true,
+      "confidence": 0.3,
+      "source_ids": ["fixture:stale_social_2018"]
+    }
+  ]
+}

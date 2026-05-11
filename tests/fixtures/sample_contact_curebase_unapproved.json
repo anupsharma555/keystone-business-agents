@@ -1,0 +1,22 @@
+{
+  "company_name": "Curebase",
+  "contact_name": "Unreviewed Prospect",
+  "role_title": "Unverified Decision Maker",
+  "contact_email": "",
+  "linkedin_url": "",
+  "source": "fixture",
+  "source_id": "fixture:contact_curebase_unapproved",
+  "source_url": "fixture://sample_contact_curebase_unapproved.json",
+  "confidence": 0.3,
+  "approval_state": "pending",
+  "approval_scope": "drafting",
+  "notes": "Pending fixture contact that must not be used for personalization.",
+  "claims": [
+    {
+      "claim_text": "Pending local context suggests an unverified Curebase contact.",
+      "source_id": "fixture:contact_curebase_unapproved",
+      "confidence": 0.3,
+      "claim_type": "contact_context"
+    }
+  ]
+}

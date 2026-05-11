@@ -1,0 +1,234 @@
+from __future__ import annotations
+
+import socket
+
+import pytest
+
+from keystone_agents.config import (
+    cli_default_dry_run,
+    cli_default_live_gmail,
+    cli_default_live_research,
+    cli_default_live_sdk,
+    cli_live_test_stage_enabled,
+    default_database_url,
+    load_settings,
+    runtime_state_dir,
+)
+from keystone_agents.storage.sqlite_store import database_url_from_env, sqlite_path_from_url
+from keystone_agents.tools.search_provider import SerperConfigurationError, SerperSearchProvider
+
+DOTENV_BACKED_ENV_VARS = (
+    "MODEL_PROVIDER",
+    "KEYSTONE_OPENAI_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_MODEL",
+    "KEYSTONE_OPENAI_BASE_URL",
+    "KEYSTONE_OPENAI_MODEL",
+    "KEYSTONE_ORCHESTRATOR_MODEL",
+    "KEYSTONE_ORCHESTRATOR_MODEL_PROVIDER",
+    "KEYSTONE_ORCHESTRATOR_BASE_URL",
+    "KEYSTONE_GMAIL_TRIAGE_MODEL",
+    "KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER",
+    "KEYSTONE_GMAIL_TRIAGE_BASE_URL",
+    "KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL",
+    "KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL_PROVIDER",
+    "KEYSTONE_BUSINESS_RESEARCH_ANALYST_BASE_URL",
+    "KEYSTONE_OPPORTUNITY_SCOUT_MODEL",
+    "KEYSTONE_OPPORTUNITY_SCOUT_MODEL_PROVIDER",
+    "KEYSTONE_OPPORTUNITY_SCOUT_BASE_URL",
+    "KEYSTONE_OUTREACH_COMPOSER_MODEL",
+    "KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER",
+    "KEYSTONE_OUTREACH_COMPOSER_BASE_URL",
+    "GEMINI_API_KEY",
+    "GMAIL_CLIENT_ID",
+    "GMAIL_CLIENT_SECRET",
+    "GOOGLE_CREDENTIALS_FILE",
+    "GOOGLE_TOKEN_FILE",
+    "SLACK_BOT_TOKEN",
+    "SLACK_CHANNEL_APPROVALS",
+    "SEARCH_PROVIDER",
+    "SERPER_API_KEY",
+    "SEARXNG_BASE_URL",
+    "SEARXNG_API_KEY",
+    "APIFY_API_TOKEN",
+    "BROWSERLESS_API_KEY",
+    "FIRECRAWL_API_KEY",
+    "FIRECRAWL_BASE_URL",
+    "KEYSTONE_ENABLE_WEBSITE_EXTRACTION",
+    "KEYSTONE_WEBSITE_EXTRACTOR",
+    "KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK",
+    "KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES",
+    "KEYSTONE_TRACE_WORKFLOW_NAME",
+    "KEYSTONE_TRACE_GROUP_ID",
+    "KEYSTONE_TRACE_METADATA",
+    "KEYSTONE_TRACING_DISABLED",
+    "KEYSTONE_TRACE_INCLUDE_SENSITIVE_DATA",
+    "DATABASE_URL",
+    "KEYSTONE_HOME",
+    "KEYSTONE_RUNTIME_STATE_DIR",
+)
+
+
+def _clear_dotenv_backed_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in DOTENV_BACKED_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_pytest_delenv_is_not_repopulated_from_local_dotenv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_dotenv_backed_env(monkeypatch)
+
+    settings = load_settings()
+
+    assert settings.openai_api_key is None
+    assert settings.gemini_api_key is None
+    assert settings.gmail_client_secret is None
+    assert settings.slack_bot_token is None
+    assert settings.serper_api_key is None
+    assert settings.apify_api_token is None
+    assert settings.browserless_api_key is None
+    assert settings.website_extractor == "trafilatura"
+    assert settings.firecrawl_api_key is None
+    assert settings.search_provider == "dry-run"
+
+
+def test_load_settings_loads_explicit_dotenv_when_test_guard_is_removed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_dotenv_backed_env(monkeypatch)
+    monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "OPENAI_API_KEY=dotenv-test-openai-key",
+                "OPENAI_MODEL=dotenv-openclaw-model",
+                "OPENAI_BASE_URL=openclaw.local/v1",
+                "KEYSTONE_OPENAI_API_KEY=dotenv-test-keystone-openai-key",
+                "KEYSTONE_OPENAI_MODEL=dotenv-test-model",
+                "KEYSTONE_OPENAI_BASE_URL=https://keystone.example/v1",
+                "KEYSTONE_GMAIL_TRIAGE_MODEL=dotenv-gmail-model",
+                "KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER=gemini",
+                "KEYSTONE_GMAIL_TRIAGE_BASE_URL=http://localhost:4000/v1",
+                "GEMINI_API_KEY=dotenv-test-gemini-key",
+                "SLACK_BOT_TOKEN=dotenv-test-slack-token",
+                "SLACK_CHANNEL_APPROVALS=CUNITTEST",
+                "SEARCH_PROVIDER=serper",
+                "SERPER_API_KEY=dotenv-test-serper-key",
+                "KEYSTONE_WEBSITE_EXTRACTOR=firecrawl",
+                "FIRECRAWL_API_KEY=dotenv-test-firecrawl-key",
+                "FIRECRAWL_BASE_URL=https://firecrawl.example",
+                "KEYSTONE_TRACE_WORKFLOW_NAME=Dotenv test workflow",
+                'KEYSTONE_TRACE_METADATA={"agent_name":"gmail_triage","run_type":"test"}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(env_file=env_file)
+
+    assert settings.openai_api_key == "dotenv-test-keystone-openai-key"
+    assert settings.openai_model == "dotenv-test-model"
+    assert settings.openai_base_url == "https://keystone.example/v1"
+    assert settings.runtime_agent_models["gmail_triage"]["provider"] == "gemini"
+    assert settings.runtime_agent_models["gmail_triage"]["model"] == "dotenv-gmail-model"
+    assert settings.gemini_api_key == "dotenv-test-gemini-key"
+    assert settings.slack_bot_token == "dotenv-test-slack-token"
+    assert settings.slack_channel_approvals == "CUNITTEST"
+    assert settings.search_provider == "serper"
+    assert settings.serper_api_key == "dotenv-test-serper-key"
+    assert settings.website_extractor == "firecrawl"
+    assert settings.firecrawl_api_key == "dotenv-test-firecrawl-key"
+    assert settings.firecrawl_base_url == "https://firecrawl.example"
+    assert settings.workflow_name == "Dotenv test workflow"
+    assert settings.trace_metadata == {"agent_name": "gmail_triage", "run_type": "test"}
+
+
+def test_live_missing_credentials_stop_before_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    calls: list[object] = []
+
+    def fail_network(*args: object, **_kwargs: object) -> None:
+        calls.append(args)
+        raise AssertionError("live credential test must not make a network request")
+
+    monkeypatch.setattr("keystone_agents.tools.search_provider.requests.post", fail_network)
+
+    with pytest.raises(SerperConfigurationError, match="SERPER_API_KEY is required"):
+        SerperSearchProvider(live=True).search_web("Curebase", num_results=1)
+
+    assert calls == []
+
+
+def test_pytest_network_blocker_does_not_echo_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sk-" + ("t" * 24)
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+
+    with pytest.raises(AssertionError) as exc:
+        socket.getaddrinfo("google.serper.dev", 443)
+
+    assert "Network calls are disabled during pytest" in str(exc.value)
+    assert secret not in str(exc.value)
+
+
+def test_cli_defaults_stay_dry_without_live_test_stage() -> None:
+    env: dict[str, str] = {}
+
+    assert cli_default_dry_run(env) is True
+    assert cli_live_test_stage_enabled(env) is False
+    assert cli_default_live_research(env) is False
+    assert cli_default_live_gmail(env) is False
+    assert cli_default_live_sdk(env) is False
+
+
+def test_default_database_url_preserves_legacy_local_default() -> None:
+    env: dict[str, str] = {}
+
+    assert default_database_url(env) == "sqlite:///keystone_agents.db"
+    assert sqlite_path_from_url(default_database_url(env)) == "keystone_agents.db"
+
+
+def test_database_url_env_wins_over_keystone_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "sqlite:////tmp/keystone-explicit.db")
+    monkeypatch.setenv("KEYSTONE_HOME", "/tmp/keystone-home")
+
+    assert database_url_from_env() == "sqlite:////tmp/keystone-explicit.db"
+
+
+def test_keystone_home_sets_runtime_state_database_default(tmp_path) -> None:
+    env = {"KEYSTONE_HOME": str(tmp_path / "home")}
+
+    assert runtime_state_dir(env) == tmp_path / "home" / "state"
+    assert default_database_url(env) == (
+        f"sqlite:///{tmp_path / 'home' / 'state' / 'keystone_agents.db'}"
+    )
+
+
+def test_runtime_state_dir_overrides_keystone_home(tmp_path) -> None:
+    env = {
+        "KEYSTONE_HOME": str(tmp_path / "home"),
+        "KEYSTONE_RUNTIME_STATE_DIR": str(tmp_path / "state"),
+    }
+
+    assert runtime_state_dir(env) == tmp_path / "state"
+    assert default_database_url(env) == (f"sqlite:///{tmp_path / 'state' / 'keystone_agents.db'}")
+
+
+def test_cli_defaults_enable_live_test_stage_when_explicitly_configured() -> None:
+    env = {
+        "KEYSTONE_LIVE_MODE": "true",
+        "KEYSTONE_DRY_RUN": "false",
+        "KEYSTONE_ENABLE_LIVE_RESEARCH": "true",
+        "KEYSTONE_ENABLE_LIVE_GMAIL": "true",
+    }
+
+    assert cli_default_dry_run(env) is False
+    assert cli_live_test_stage_enabled(env) is True
+    assert cli_default_live_research(env) is True
+    assert cli_default_live_gmail(env) is True
+    assert cli_default_live_sdk(env) is True

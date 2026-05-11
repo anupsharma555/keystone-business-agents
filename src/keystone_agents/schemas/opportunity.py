@@ -1,0 +1,375 @@
+"""Opportunity scouting schemas."""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, model_serializer, model_validator
+
+from keystone_agents.schemas.company_profile import ClaimEvidenceRecord
+from keystone_agents.schemas.decision_trace import DecisionTrace
+from keystone_agents.source_quality import SourceQualityScore, SourceQualitySummary
+
+_DISCOVERY_METADATA_FIELDS = (
+    "entity_kind",
+    "canonical_entity_key",
+    "usa_relevance",
+    "novelty",
+    "search_lanes",
+    "search_time_windows",
+)
+
+
+def _is_empty_discovery_metadata(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return len(value) == 0
+    return False
+
+
+def _drop_empty_discovery_metadata(data: dict[str, Any]) -> dict[str, Any]:
+    for field_name in _DISCOVERY_METADATA_FIELDS:
+        if _is_empty_discovery_metadata(data.get(field_name)):
+            data.pop(field_name, None)
+    return data
+
+
+class Opportunity(BaseModel):
+    company_name: str
+    title: str
+    score: float = Field(ge=0.0, le=1.0)
+    rationale: str
+    next_step: str
+    blockers: list[str] = Field(default_factory=list)
+
+
+OpportunityType = Literal[
+    "behavioral health AI",
+    "digital mental health",
+    "clinical AI",
+    "CRO",
+    "trial technology",
+    "CNS biotech",
+    "neurotechnology",
+    "grant or collaboration opportunity",
+]
+
+OpportunitySourceType = Literal[
+    "fixture",
+    "academic",
+    "google_search",
+    "news",
+    "company_site",
+    "conference",
+    "publication",
+    "job_posting",
+    "funding_database",
+    "government",
+    "linkedin",
+    "social",
+    "unknown",
+]
+
+OpportunitySignalType = Literal[
+    "funding",
+    "news",
+    "job_posting",
+    "clinical_trial",
+    "grant",
+    "publication",
+    "conference",
+    "company_page",
+    "pipeline_state",
+    "search",
+    "unknown",
+]
+
+OpportunityPipelineStatus = Literal[
+    "candidate",
+    "researched",
+    "approved",
+    "approved_for_drafting",
+    "drafted",
+    "rejected",
+    "archived",
+]
+
+OpportunityStateAction = Literal[
+    "new",
+    "update_existing",
+    "skipped_duplicate",
+    "blocked_by_state",
+]
+
+
+class OpportunitySource(BaseModel):
+    source_id: str = ""
+    title: str
+    url: str
+    source_type: OpportunitySourceType
+    supported_signal: str
+    source_quality: SourceQualityScore | None = None
+
+    @model_validator(mode="after")
+    def populate_source_id(self) -> OpportunitySource:
+        if not self.source_id:
+            self.source_id = _source_id(self.source_type, self.url or self.title)
+        return self
+
+
+class OpportunitySignal(BaseModel):
+    """One normalized signal extracted from a purpose-built opportunity source."""
+
+    company_name: str
+    signal_type: OpportunitySignalType = "unknown"
+    signal_text: str
+    source_id: str = ""
+    source_type: OpportunitySourceType = "unknown"
+    published_at: str | None = None
+    freshness: Literal["fresh", "current", "stale", "unknown"] = "unknown"
+    confidence_score: int = Field(default=50, ge=0, le=100)
+    supports_why_now: bool = True
+    relevance_notes: str = ""
+
+
+class OpportunitySourceBundle(BaseModel):
+    """Structured evidence bundle for LLM synthesis after deterministic scoring."""
+
+    bundle_id: str
+    company_name: str
+    source_category: OpportunitySignalType
+    summary: str
+    sources: list[OpportunitySource] = Field(default_factory=list)
+    signals: list[OpportunitySignal] = Field(default_factory=list)
+    source_quality_summary: SourceQualitySummary | None = None
+    missing_evidence: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    stale_signal_count: int = Field(default=0, ge=0)
+    weak_evidence_reasons: list[str] = Field(default_factory=list)
+    recommended_next_actions: list[str] = Field(default_factory=list)
+
+
+class ExistingOpportunityState(BaseModel):
+    """Local pipeline state used to avoid duplicate opportunity work."""
+
+    company_name: str
+    status: OpportunityPipelineStatus
+    opportunity_type: OpportunityType | None = None
+    notes: str = ""
+    last_seen: str | None = None
+    source: str = "local_pipeline"
+    normalized_company_key: str = ""
+
+    @model_validator(mode="after")
+    def populate_normalized_company_key(self) -> ExistingOpportunityState:
+        if not self.normalized_company_key:
+            self.normalized_company_key = re.sub(
+                r"[^a-z0-9]+",
+                "",
+                self.company_name.lower(),
+            )
+        return self
+
+
+class OpportunityStateDecision(BaseModel):
+    """How Scout handled a candidate relative to existing pipeline state."""
+
+    company_name: str
+    status: OpportunityPipelineStatus | None = None
+    action: OpportunityStateAction
+    reason: str
+
+
+class FilteredOpportunityCandidate(BaseModel):
+    """Candidate removed by deterministic Scout filters, kept for auditability."""
+
+    company_name: str = "Unknown company"
+    entity_kind: str = ""
+    source_category: str = ""
+    source_title: str = ""
+    source_url: str = ""
+    query: str = ""
+    query_lane: str = ""
+    query_time_window: str = ""
+    role_title: str = ""
+    role_location: str = ""
+    role_remote: bool | None = None
+    role_country: str = ""
+    reasons: list[str] = Field(default_factory=list)
+    role_filter_notes: list[str] = Field(default_factory=list)
+
+
+class OpportunityScoreBreakdown(BaseModel):
+    """Transparent Analyst scoring components for one opportunity."""
+
+    relevance_score: int = Field(default=0, ge=0, le=100)
+    keystone_fit_score: int = Field(default=0, ge=0, le=100)
+    source_confidence_score: int = Field(default=0, ge=0, le=100)
+    urgency_score: int = Field(default=0, ge=0, le=100)
+    next_action_clarity_score: int = Field(default=0, ge=0, le=100)
+    priority_score: int = Field(default=0, ge=0, le=100)
+    rationale: str = ""
+    component_rationales: list[str] = Field(default_factory=list)
+
+
+class OpportunityRecord(BaseModel):
+    company_name: str
+    entity_kind: str | None = None
+    canonical_entity_key: str | None = None
+    opportunity_type: OpportunityType
+    role_title: str = ""
+    role_location: str = ""
+    role_remote: bool | None = None
+    role_country: str = ""
+    role_posted_at: str | None = None
+    role_active: bool | None = None
+    role_fit_reason: str = ""
+    role_filter_notes: list[str] = Field(default_factory=list)
+    usa_relevance: str | None = None
+    novelty: str | None = None
+    search_lanes: list[str] = Field(default_factory=list)
+    search_time_windows: list[str] = Field(default_factory=list)
+    priority_score: int = Field(ge=0, le=100)
+    why_now_signal: str
+    recommended_next_step: str
+    sources: list[OpportunitySource] = Field(min_length=1)
+    source_quality_summary: SourceQualitySummary | None = None
+    source_signals: list[str] = Field(default_factory=list)
+    source_bundles: list[OpportunitySourceBundle] = Field(default_factory=list)
+    existing_state: ExistingOpportunityState | None = None
+    state_action: Literal["new", "update_existing"] = "new"
+    missing_evidence: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    stale_signal_count: int = Field(default=0, ge=0)
+    weak_evidence_reasons: list[str] = Field(default_factory=list)
+    claims: list[ClaimEvidenceRecord] = Field(default_factory=list)
+    score_breakdown: OpportunityScoreBreakdown = Field(default_factory=OpportunityScoreBreakdown)
+    score_rationale: str = ""
+    keystone_fit_reason: str
+    outside_consulting_likelihood: int = Field(ge=0, le=100)
+    handoff_to_business_research_analyst: bool
+    handoff_reason: str = ""
+    analyst_recommendation: str = ""
+    business_research_analyst_handoff_recommendation: str = ""
+    research_needed: list[str] = Field(default_factory=list)
+    disqualification_reasons: list[str] = Field(default_factory=list)
+    outreach_draft: None = None
+    approval_required_before_outreach: bool = True
+    approved_for_outreach: bool = False
+    unsupported_claims_flagged: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def populate_scoring_and_validate_claims(self) -> OpportunityRecord:
+        if self.score_breakdown.priority_score == 0 and self.priority_score > 0:
+            self.score_breakdown = OpportunityScoreBreakdown(
+                relevance_score=self.priority_score,
+                keystone_fit_score=self.priority_score,
+                priority_score=self.priority_score,
+                source_confidence_score=(
+                    self.source_quality_summary.overall_score if self.source_quality_summary else 0
+                ),
+                rationale="Legacy score retained without component-level Analyst details.",
+            )
+        if not self.score_rationale and self.score_breakdown.rationale:
+            self.score_rationale = self.score_breakdown.rationale
+        if not self.score_rationale:
+            self.score_rationale = self.keystone_fit_reason
+        if not self.analyst_recommendation:
+            self.analyst_recommendation = self.recommended_next_step
+        if self.handoff_to_business_research_analyst and not self.handoff_reason:
+            self.handoff_reason = (
+                "Priority score or missing evidence warrants Business Research Analyst review."
+            )
+        if (
+            self.handoff_to_business_research_analyst
+            and not self.business_research_analyst_handoff_recommendation
+        ):
+            self.business_research_analyst_handoff_recommendation = (
+                "Run Business Research Analyst to validate company profile, buyer context, "
+                "recent signals, and source-backed fit before any outreach drafting."
+            )
+        if self.handoff_to_business_research_analyst and not self.research_needed:
+            self.research_needed = [
+                "Validate company segment and buyer context.",
+                "Confirm recent opportunity signals with source records.",
+                "Assess Keystone fit before drafting outbound copy.",
+            ]
+        if not self.claims:
+            self.claims = [
+                ClaimEvidenceRecord(
+                    claim_text=source.supported_signal,
+                    source_id=source.source_id,
+                    confidence=(
+                        (source.source_quality.overall_score / 100)
+                        if source.source_quality is not None
+                        else 0.7
+                    ),
+                    claim_type="opportunity_signal",
+                )
+                for source in self.sources
+                if source.supported_signal.strip()
+            ]
+            if self.keystone_fit_reason.strip() and self.sources:
+                self.claims.append(
+                    ClaimEvidenceRecord(
+                        claim_text=self.keystone_fit_reason,
+                        source_id=self.sources[0].source_id,
+                        confidence=max(
+                            0.0,
+                            min(1.0, self.score_breakdown.keystone_fit_score / 100),
+                        ),
+                        claim_type="keystone_fit",
+                    )
+                )
+        source_ids = {source.source_id for source in self.sources}
+        flagged = [
+            f"unbacked opportunity claim: {claim.claim_text}"
+            for claim in self.claims
+            if claim.source_id not in source_ids
+        ]
+        self.unsupported_claims_flagged = list(
+            dict.fromkeys([*self.unsupported_claims_flagged, *flagged])
+        )
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_model(self, handler: Any) -> dict[str, Any]:
+        return _drop_empty_discovery_metadata(handler(self))
+
+
+class OpportunityScoutResult(BaseModel):
+    topic: str | None = None
+    dry_run: bool = True
+    search_provider: str = ""
+    search_queries: list[str] = Field(default_factory=list)
+    search_lanes: list[str] = Field(default_factory=list)
+    search_time_windows: list[str] = Field(default_factory=list)
+    raw_search_result_count: int = Field(default=0, ge=0)
+    deduped_candidate_count: int = Field(default=0, ge=0)
+    filtered_candidates: list[FilteredOpportunityCandidate] = Field(default_factory=list)
+    review_candidates: list[FilteredOpportunityCandidate] = Field(default_factory=list)
+    records: list[OpportunityRecord] = Field(default_factory=list)
+    source_bundles: list[OpportunitySourceBundle] = Field(default_factory=list)
+    source_bundle_quality_notes: list[str] = Field(default_factory=list)
+    state_decisions: list[OpportunityStateDecision] = Field(default_factory=list)
+    duplicate_companies_skipped: list[str] = Field(default_factory=list)
+    source_quality_summary: SourceQualitySummary | None = None
+    decision_trace: DecisionTrace | None = None
+    audit_notes: list[str] = Field(default_factory=list)
+    constraint_relaxation_suggestion: str = ""
+    outreach_generated: bool = False
+
+    @model_serializer(mode="wrap")
+    def serialize_model(self, handler: Any) -> dict[str, Any]:
+        return _drop_empty_discovery_metadata(handler(self))
+
+
+def _source_id(source_type: str, value: str) -> str:
+    cleaned = re.sub(r"^https?://", "", value.strip().lower())
+    cleaned = cleaned.removeprefix("fixture://")
+    slug = re.sub(r"[^a-z0-9]+", "-", cleaned).strip("-") or "source"
+    return f"{source_type}:{slug[:80]}"

@@ -1,0 +1,42 @@
+{
+  "profile_id": "founder_fit_test",
+  "approved_for_search": true,
+  "approved_for_drafting": true,
+  "summary": "Physician-scientist with clinical AI, psychiatry, neuroscience, clinical research, and evidence-generation experience.",
+  "search_fit_keywords": [
+    "physician-scientist",
+    "clinical AI",
+    "psychiatry",
+    "behavioral health",
+    "clinical research",
+    "evidence generation"
+  ],
+  "role_targets": [
+    "medical director",
+    "clinical AI advisor",
+    "clinical research lead"
+  ],
+  "role_exclusions": [
+    "AI tutor",
+    "onsite only"
+  ],
+  "fit_dimensions": [
+    "behavioral health relevance",
+    "clinical research relevance",
+    "AI evaluation relevance"
+  ],
+  "allowed_outreach_claims": [
+    "Keystone is physician-scientist-led.",
+    "Keystone focuses on clinical AI evaluation, psychiatry, neuroscience, research operations, and evidence generation."
+  ],
+  "reply_context": [
+    "Prefer concise, approval-gated replies that ask for non-sensitive context."
+  ],
+  "public_links": [],
+  "sensitive_fields_removed": [
+    "personal contact details",
+    "private identifiers"
+  ],
+  "source_document": "sanitized test fixture",
+  "notes": []
+}

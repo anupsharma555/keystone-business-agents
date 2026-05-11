@@ -1,0 +1,22 @@
+{
+  "company_name": "Curebase",
+  "contact_name": "Dr. Priya Shah",
+  "role_title": "Clinical Operations Lead",
+  "contact_email": "",
+  "linkedin_url": "fixture://linkedin/priya-shah",
+  "source": "fixture",
+  "source_id": "fixture:contact_curebase_priya",
+  "source_url": "fixture://sample_contact_curebase_approved.json",
+  "confidence": 0.82,
+  "approval_state": "approved_for_drafting",
+  "approval_scope": "drafting",
+  "notes": "Approved local fixture contact for deterministic outreach tests.",
+  "claims": [
+    {
+      "claim_text": "Dr. Priya Shah is listed as a Clinical Operations Lead contact for Curebase in local approved context.",
+      "source_id": "fixture:contact_curebase_priya",
+      "confidence": 0.82,
+      "claim_type": "contact_context"
+    }
+  ]
+}

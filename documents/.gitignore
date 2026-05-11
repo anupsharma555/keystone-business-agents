@@ -1,0 +1,5 @@
+*
+!.gitignore
+!README.md
+!founder_fit_profile.example.json
+!operator_context.example.md

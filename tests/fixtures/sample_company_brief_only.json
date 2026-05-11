@@ -1,0 +1,51 @@
+{
+  "name": "BriefOnly Health",
+  "website": "https://example.com/briefonly",
+  "description": "BriefOnly Health is described in the attached research brief as a clinical research workflow software company.",
+  "fit": "The attached brief notes that BriefOnly Health may need support evaluating clinical AI workflows and research operations.",
+  "sources": [
+    {
+      "source_id": "fixture:brief_only_research_brief",
+      "title": "Attached approved research brief for BriefOnly Health",
+      "url": "fixture://sample_company_brief_only.json",
+      "source_type": "fixture",
+      "supported_claims": [
+        "BriefOnly Health is described in the attached research brief as a clinical research workflow software company.",
+        "BriefOnly Health works on clinical research workflow software.",
+        "The attached brief notes that BriefOnly Health may need support evaluating clinical AI workflows and research operations.",
+        "The attached brief supports a possible Keystone fit around clinical AI evaluation and research operations."
+      ],
+      "confidence": 0.8
+    }
+  ],
+  "research_data_points": [
+    {
+      "key": "business_model",
+      "value": "Clinical research workflow software.",
+      "completed": true,
+      "confidence": 0.8,
+      "source_ids": ["fixture:brief_only_research_brief"]
+    },
+    {
+      "key": "ai_data_science_relevance",
+      "value": "The brief notes possible clinical AI workflow evaluation needs.",
+      "completed": true,
+      "confidence": 0.78,
+      "source_ids": ["fixture:brief_only_research_brief"]
+    },
+    {
+      "key": "research_signals",
+      "value": "The brief notes research operations relevance.",
+      "completed": true,
+      "confidence": 0.76,
+      "source_ids": ["fixture:brief_only_research_brief"]
+    },
+    {
+      "key": "consulting_fit",
+      "value": "Possible fit around clinical AI evaluation and research operations.",
+      "completed": true,
+      "confidence": 0.78,
+      "source_ids": ["fixture:brief_only_research_brief"]
+    }
+  ]
+}

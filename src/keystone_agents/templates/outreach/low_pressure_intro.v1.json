@@ -1,0 +1,72 @@
+{
+  "template_id": "low_pressure_intro",
+  "version": "v1",
+  "name": "Low Pressure Introduction",
+  "channel": "email",
+  "use_case": "source_backed_initial_outreach",
+  "stage": "initial_outreach",
+  "required_context": [
+    "company_profile",
+    "source_backed_company_or_opportunity_fact",
+    "keystone_profile"
+  ],
+  "optional_context": [
+    "contact_context",
+    "crm_context",
+    "email_style_profile",
+    "opportunity_record"
+  ],
+  "structure_blocks": [
+    {
+      "block_id": "greeting",
+      "label": "Greeting",
+      "guidance": "Use approved contact context when available, otherwise use a neutral greeting.",
+      "required": true
+    },
+    {
+      "block_id": "source_backed_observation",
+      "label": "Source-backed observation",
+      "guidance": "Open with one approved company or opportunity signal and keep source attribution available.",
+      "required": true
+    },
+    {
+      "block_id": "keystone_relevance",
+      "label": "Keystone relevance",
+      "guidance": "Connect only to approved Keystone positioning and avoid unsupported claims.",
+      "required": true
+    },
+    {
+      "block_id": "soft_cta",
+      "label": "Soft CTA",
+      "guidance": "Close with a low-pressure compare notes question.",
+      "required": true
+    }
+  ],
+  "cta_style": "compare notes soft question",
+  "tone_constraints": [
+    "professional",
+    "plain-spoken",
+    "consultative",
+    "no hype"
+  ],
+  "safety_constraints": [
+    "human approval required",
+    "no sending",
+    "source attribution required",
+    "source-backed claims only",
+    "no PHI",
+    "no unsupported claims",
+    "no em dash"
+  ],
+  "good_for": [
+    "first-touch outreach from approved research context",
+    "clinical AI, evidence generation, or research operations prospects"
+  ],
+  "avoid_when": [
+    "source-backed company or opportunity context is missing",
+    "legal, financial, security, patient-specific, or contractual advice is requested"
+  ],
+  "max_words": 120,
+  "approval_scope": "external_use",
+  "send_enabled": false
+}

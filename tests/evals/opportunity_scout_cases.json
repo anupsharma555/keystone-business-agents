@@ -1,0 +1,155 @@
+[
+  {
+    "id": "default_fixture_ranking",
+    "agent": "scout",
+    "input": {
+      "max_results": 5
+    },
+    "expected": {
+      "top_company": "Curebase",
+      "ranking_order": ["Curebase", "MindSpan Digital Health", "NeuroFlow"],
+      "strategic_fit_terms": ["clinical AI", "evidence generation"],
+      "why_now_terms": ["Hiring", "decentralized trial"],
+      "outside_consulting_likelihood_min": 80,
+      "priority_score_min": 80,
+      "approval_required_before_outreach": true,
+      "required_score_components": [
+        "relevance_score",
+        "keystone_fit_score",
+        "source_confidence_score",
+        "urgency_score",
+        "next_action_clarity_score"
+      ]
+    }
+  },
+  {
+    "id": "behavioral_health_topic",
+    "agent": "scout",
+    "input": {
+      "topic": "behavioral health",
+      "max_results": 3
+    },
+    "expected": {
+      "top_company": "NeuroFlow",
+      "strategic_fit_terms": ["behavioral health"],
+      "why_now_terms": ["payer partnership", "outcomes evidence"],
+      "outside_consulting_likelihood_min": 70,
+      "priority_score_min": 70,
+      "approval_required_before_outreach": true,
+      "required_score_components": [
+        "relevance_score",
+        "keystone_fit_score",
+        "source_confidence_score",
+        "urgency_score",
+        "next_action_clarity_score"
+      ]
+    }
+  },
+  {
+    "id": "high_confidence_source_backed_opportunity",
+    "agent": "scout",
+    "input": {
+      "fixture": "tests/fixtures/opportunity_scout_high_confidence_sources.json",
+      "max_results": 1
+    },
+    "expected": {
+      "top_company": "AffectAI Research",
+      "strategic_fit_terms": ["behavioral health", "evidence generation"],
+      "why_now_terms": ["Company page", "validation"],
+      "outside_consulting_likelihood_min": 80,
+      "priority_score_min": 80,
+      "approval_required_before_outreach": true,
+      "source_bundle_categories": ["clinical_trial", "company_page", "job_posting"],
+      "required_score_components": [
+        "relevance_score",
+        "keystone_fit_score",
+        "source_confidence_score",
+        "urgency_score",
+        "next_action_clarity_score"
+      ]
+    }
+  },
+  {
+    "id": "weak_stale_source_backed_opportunity",
+    "agent": "scout",
+    "input": {
+      "fixture": "tests/fixtures/opportunity_scout_weak_stale_sources.json",
+      "max_results": 1
+    },
+    "expected": {
+      "top_company": "Low Proof AI",
+      "why_now_terms": ["Old conference"],
+      "outside_consulting_likelihood_max": 70,
+      "priority_score_max": 70,
+      "source_confidence_max": 50,
+      "stale_signal_count_min": 1,
+      "missing_evidence_terms": ["Refresh stale", "No recent"],
+      "approval_required_before_outreach": true
+    }
+  },
+  {
+    "id": "existing_state_skips_duplicates",
+    "agent": "scout",
+    "input": {
+      "existing_state": "tests/fixtures/opportunity_scout_existing_state.json",
+      "max_results": 5
+    },
+    "expected": {
+      "duplicate_companies_skipped_contains": ["Curebase", "Beacon CNS Therapeutics"],
+      "approval_required_before_outreach": true
+    }
+  },
+  {
+    "id": "weak_signal_stays_in_scout_queue",
+    "agent": "scout",
+    "input": {
+      "fixture": "tests/fixtures/sample_opportunities_weak_signals.json",
+      "max_results": 3
+    },
+    "expected": {
+      "top_company": "Sparse Signal Labs",
+      "strategic_fit_terms": ["grant or collaboration opportunity"],
+      "why_now_terms": ["conference poster"],
+      "outside_consulting_likelihood_max": 69,
+      "priority_score_max": 69,
+      "all_priority_score_max": 69,
+      "all_handoff_to_business_research_analyst": false,
+      "approval_required_before_outreach": true,
+      "records_max": 1,
+      "unique_companies": true,
+      "required_score_components": [
+        "relevance_score",
+        "keystone_fit_score",
+        "source_confidence_score",
+        "urgency_score",
+        "next_action_clarity_score"
+      ]
+    }
+  },
+  {
+    "id": "duplicate_companies_are_deduped",
+    "agent": "scout",
+    "input": {
+      "fixture": "tests/fixtures/sample_opportunities_duplicate_companies.json",
+      "max_results": 5
+    },
+    "expected": {
+      "top_company": "Curebase Inc.",
+      "ranking_order": ["Curebase Inc.", "NeuroFlow"],
+      "strategic_fit_terms": ["trial technology"],
+      "why_now_terms": ["Hiring", "Validation"],
+      "outside_consulting_likelihood_min": 80,
+      "priority_score_min": 80,
+      "approval_required_before_outreach": true,
+      "records_max": 2,
+      "unique_companies": true,
+      "required_score_components": [
+        "relevance_score",
+        "keystone_fit_score",
+        "source_confidence_score",
+        "urgency_score",
+        "next_action_clarity_score"
+      ]
+    }
+  }
+]

@@ -1,0 +1,919 @@
+"""Run deterministic local evals for Keystone agents.
+
+This harness intentionally does not call the OpenAI Evals API. It runs local JSONL
+datasets against fixture-mode agent functions and pure Python graders so it can be
+used in offline development and CI.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from keystone_agents.agents.gmail_triage import EmailFixture, triage_email_fixture
+from keystone_agents.agents.opportunity_scout import (
+    score_opportunity_impl,
+    scout_opportunities_fixture,
+)
+from keystone_agents.agents.orchestrator import route_request
+from keystone_agents.agents.outreach_composer import (
+    check_unsupported_claims,
+    compose_outreach_draft_fixture,
+    load_company_profile,
+    load_contact_context,
+    load_crm_account_context,
+    load_opportunity_record,
+    load_style_profile,
+)
+from keystone_agents.company_research import research_company_fixture
+from keystone_agents.guardrails import assess_text_guardrails
+from keystone_agents.schemas.approval import (
+    ApprovalQueueItem,
+    approval_queue_status_allows_sending,
+)
+from keystone_agents.schemas.company_profile import CompanyProfile
+from keystone_agents.sdk import prompt_metadata_for_files, prompt_version_references
+from keystone_agents.storage.sqlite_store import SQLiteStore
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_EVAL_DIR = PROJECT_ROOT / "evals"
+
+LOCAL_EVAL_PROMPT_FILES: dict[str, tuple[str, ...]] = {
+    "gmail_triage": ("keystone_profile.md", "gmail_triage.md"),
+    "orchestrator_routing": (
+        "keystone_profile.md",
+        "safety_policy.md",
+        "orchestrator.md",
+    ),
+    "safety_refusal": ("safety_policy.md", "orchestrator.md"),
+    "source_attribution": (
+        "keystone_profile.md",
+        "safety_policy.md",
+        "business_research_analyst.md",
+        "opportunity_scout.md",
+    ),
+    "opportunity_scoring": (
+        "keystone_profile.md",
+        "safety_policy.md",
+        "opportunity_scout.md",
+    ),
+    "outreach_copy_constraints": ("keystone_profile.md", "outreach_composer.md"),
+    "approval_queue_revision": (
+        "keystone_profile.md",
+        "safety_policy.md",
+        "outreach_composer.md",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class LocalEvalCase:
+    dataset: str
+    line_number: int
+    case_id: str
+    task: str
+    input_payload: Mapping[str, Any]
+    expected: Mapping[str, Any]
+    validates_prompts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LocalEvalResult:
+    dataset: str
+    case_id: str
+    task: str
+    passed: bool
+    failures: list[str]
+    observed: Mapping[str, Any]
+    prompt_metadata: list[dict[str, Any]]
+    validates_prompts: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dataset": self.dataset,
+            "id": self.case_id,
+            "task": self.task,
+            "passed": self.passed,
+            "failures": self.failures,
+            "observed": dict(self.observed),
+            "prompt_metadata": self.prompt_metadata,
+            "prompt_versions": [str(metadata["reference"]) for metadata in self.prompt_metadata],
+            "validates_prompts": list(self.validates_prompts),
+        }
+
+
+@dataclass(frozen=True)
+class LocalEvalSummary:
+    results: list[LocalEvalResult]
+
+    @property
+    def total(self) -> int:
+        return len(self.results)
+
+    @property
+    def passed(self) -> int:
+        return sum(1 for result in self.results if result.passed)
+
+    @property
+    def failed(self) -> int:
+        return self.total - self.passed
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total": self.total,
+            "passed": self.passed,
+            "failed": self.failed,
+            "datasets": sorted({result.dataset for result in self.results}),
+            "prompt_metadata": _unique_prompt_metadata(self.results),
+            "results": [result.to_dict() for result in self.results],
+        }
+
+
+def _fail(failures: list[str], field: str, observed: Any, expected: Any) -> None:
+    failures.append(f"{field}: observed {observed!r}, expected {expected!r}")
+
+
+def _expect_equal(
+    failures: list[str],
+    observed: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    field: str,
+) -> None:
+    if field in expected and observed.get(field) != expected[field]:
+        _fail(failures, field, observed.get(field), expected[field])
+
+
+def _expect_contains_all(
+    failures: list[str],
+    observed_items: Iterable[Any],
+    expected_items: Iterable[Any],
+    field: str,
+) -> None:
+    observed_set = {str(item) for item in observed_items}
+    missing = [item for item in expected_items if str(item) not in observed_set]
+    if missing:
+        failures.append(f"{field}: missing expected values {missing!r}")
+
+
+def _expect_range(
+    failures: list[str],
+    value: int | float,
+    *,
+    field: str,
+    minimum: int | float | None = None,
+    maximum: int | float | None = None,
+) -> None:
+    if minimum is not None and value < minimum:
+        failures.append(f"{field}: observed {value!r}, expected >= {minimum!r}")
+    if maximum is not None and value > maximum:
+        failures.append(f"{field}: observed {value!r}, expected <= {maximum!r}")
+
+
+def _path_from_project(value: str | Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
+def _normalize_company_name(value: str) -> str:
+    text = value.lower()
+    text = re.sub(r"\b(?:inc|llc|ltd|corp|corporation|company|co)\b", "", text)
+    return re.sub(r"[^a-z0-9]+", "", text).strip()
+
+
+def _load_jsonl_cases(path: Path) -> list[LocalEvalCase]:
+    cases: list[LocalEvalCase] = []
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_number}: invalid JSONL row: {exc}") from exc
+
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}:{line_number}: row must be a JSON object")
+        if not isinstance(row.get("input"), dict):
+            raise ValueError(f"{path}:{line_number}: row input must be a JSON object")
+        if not isinstance(row.get("expected"), dict):
+            raise ValueError(f"{path}:{line_number}: row expected must be a JSON object")
+
+        case_id = row.get("id")
+        task = row.get("task")
+        if not isinstance(case_id, str) or not case_id:
+            raise ValueError(f"{path}:{line_number}: row id must be a non-empty string")
+        if not isinstance(task, str) or not task:
+            raise ValueError(f"{path}:{line_number}: row task must be a non-empty string")
+
+        cases.append(
+            LocalEvalCase(
+                dataset=path.stem,
+                line_number=line_number,
+                case_id=case_id,
+                task=task,
+                input_payload=row["input"],
+                expected=row["expected"],
+                validates_prompts=_validates_prompts(row, task),
+            )
+        )
+    return cases
+
+
+def _validates_prompts(row: Mapping[str, Any], task: str) -> tuple[str, ...]:
+    provided = row.get("validates_prompts")
+    if isinstance(provided, list) and all(isinstance(item, str) for item in provided):
+        return tuple(provided)
+    return tuple(prompt_version_references(LOCAL_EVAL_PROMPT_FILES.get(task, ())))
+
+
+def _prompt_metadata_for_case(case: LocalEvalCase) -> list[dict[str, Any]]:
+    if case.validates_prompts:
+        prompt_files = tuple(
+            _prompt_file_from_reference(reference) for reference in case.validates_prompts
+        )
+        return prompt_metadata_for_files(prompt_files)
+    return prompt_metadata_for_files(LOCAL_EVAL_PROMPT_FILES.get(case.task, ()))
+
+
+def _prompt_file_from_reference(reference: str) -> str:
+    prompt_name = reference.split("@", 1)[0].strip()
+    return prompt_name if prompt_name.endswith(".md") else f"{prompt_name}.md"
+
+
+def _unique_prompt_metadata(results: list[LocalEvalResult]) -> list[dict[str, Any]]:
+    by_reference: dict[str, dict[str, Any]] = {}
+    for result in results:
+        for metadata in result.prompt_metadata:
+            by_reference[str(metadata["reference"])] = metadata
+    return [by_reference[reference] for reference in sorted(by_reference)]
+
+
+def _result(
+    case: LocalEvalCase,
+    failures: list[str],
+    observed: Mapping[str, Any],
+) -> LocalEvalResult:
+    prompt_metadata = _prompt_metadata_for_case(case)
+    return LocalEvalResult(
+        dataset=case.dataset,
+        case_id=case.case_id,
+        task=case.task,
+        passed=not failures,
+        failures=failures,
+        observed=observed,
+        prompt_metadata=prompt_metadata,
+        validates_prompts=case.validates_prompts,
+    )
+
+
+def grade_gmail_triage(case: LocalEvalCase) -> LocalEvalResult:
+    payload = case.input_payload
+    expected = case.expected
+    style_profile = payload.get("email_style_profile")
+    if "style_fixture" in payload:
+        style_profile = load_style_profile(str(payload["style_fixture"]))
+    result = triage_email_fixture(
+        EmailFixture(
+            subject=str(payload.get("subject", "")),
+            body=str(payload.get("body", "")),
+            sender_name=str(payload.get("sender_name", "")),
+            sender_email=str(payload.get("sender_email", "")),
+            message_id=str(payload.get("message_id", case.case_id)),
+        ),
+        email_style_profile=style_profile,
+    )
+    observed = result.model_dump()
+    failures: list[str] = []
+
+    for field in (
+        "category",
+        "priority",
+        "needs_reply",
+        "draft_created",
+        "approval_required",
+        "style_profile_used",
+        "style_profile_id",
+    ):
+        _expect_equal(failures, observed, expected, field)
+    if "risk_flags_exact" in expected and observed["risk_flags"] != expected["risk_flags_exact"]:
+        _fail(failures, "risk_flags", observed["risk_flags"], expected["risk_flags_exact"])
+    _expect_contains_all(
+        failures,
+        observed["risk_flags"],
+        expected.get("risk_flags_contains", []),
+        "risk_flags",
+    )
+    _expect_contains_all(
+        failures,
+        observed["recommended_labels"],
+        expected.get("recommended_labels_contains", []),
+        "recommended_labels",
+    )
+
+    draft_reply = str(observed.get("draft_reply") or "")
+    for required in expected.get("draft_contains", []):
+        if str(required).lower() not in draft_reply.lower():
+            failures.append(f"draft_reply: missing required text {required!r}")
+    for forbidden in expected.get("draft_must_not_contain", []):
+        if str(forbidden).lower() in draft_reply.lower():
+            failures.append(f"draft_reply: contained forbidden text {forbidden!r}")
+    if "\u2014" in json.dumps(observed, ensure_ascii=False):
+        failures.append("observed output contains an em dash")
+
+    return _result(case, failures, observed)
+
+
+def _approved_company_profile(payload: Mapping[str, Any]) -> CompanyProfile | None:
+    profile = payload.get("approved_company_profile")
+    if profile is None:
+        return None
+    if not isinstance(profile, Mapping):
+        raise ValueError("approved_company_profile must be a JSON object")
+    return CompanyProfile.model_validate(dict(profile))
+
+
+def _check_route_result(
+    failures: list[str],
+    observed: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> None:
+    for field in (
+        "route",
+        "target_agent",
+        "refused",
+        "approved_context_present",
+        "send_enabled",
+        "can_send_email",
+        "routing_mode",
+        "state_context_used",
+    ):
+        _expect_equal(failures, observed, expected, field)
+    if "stop_reason_contains" in expected:
+        stop_reason = str(observed.get("stop_reason") or "")
+        if str(expected["stop_reason_contains"]) not in stop_reason:
+            failures.append(
+                f"stop_reason: missing expected text {expected['stop_reason_contains']!r}"
+            )
+    _expect_contains_all(
+        failures,
+        observed.get("forbidden_actions", []),
+        expected.get("forbidden_actions_contains", []),
+        "forbidden_actions",
+    )
+
+
+def grade_orchestrator_routing(case: LocalEvalCase) -> LocalEvalResult:
+    expected = case.expected
+    profile = _approved_company_profile(case.input_payload)
+    decision = route_request(
+        case.input_payload.get("request"),
+        approved_company_profile=profile,
+        workflow_state=case.input_payload.get("workflow_state"),
+    )
+    observed = decision.model_dump()
+    failures: list[str] = []
+    _check_route_result(failures, observed, expected)
+    return _result(case, failures, observed)
+
+
+def grade_safety_refusal(case: LocalEvalCase) -> LocalEvalResult:
+    mode = str(case.input_payload.get("mode", "guardrail"))
+    expected = case.expected
+    failures: list[str] = []
+
+    if mode == "guardrail":
+        assessment = assess_text_guardrails(str(case.input_payload.get("text", "")))
+        observed: Mapping[str, Any] = {
+            "allowed": assessment.allowed,
+            "manual_review_required": assessment.manual_review_required,
+            "risk_flags": list(assessment.risk_flags),
+            "reasons": list(assessment.reasons),
+            "draft_policy": assessment.draft_policy,
+        }
+        for field in ("allowed", "manual_review_required", "draft_policy"):
+            _expect_equal(failures, observed, expected, field)
+        _expect_contains_all(
+            failures,
+            observed["risk_flags"],
+            expected.get("risk_flags_contains", []),
+            "risk_flags",
+        )
+        return _result(case, failures, observed)
+
+    if mode == "route":
+        decision = route_request(case.input_payload.get("request"))
+        observed = decision.model_dump()
+        _check_route_result(failures, observed, expected)
+        return _result(case, failures, observed)
+
+    raise ValueError(f"{case.case_id}: unsupported safety_refusal mode {mode!r}")
+
+
+def grade_source_attribution(case: LocalEvalCase) -> LocalEvalResult:
+    kind = str(case.input_payload.get("kind", "company_profile"))
+    expected = case.expected
+    failures: list[str] = []
+
+    if kind == "company_profile":
+        fixture = case.input_payload.get("fixture")
+        profile = research_company_fixture(
+            company_name=str(case.input_payload.get("company_name", "")),
+            fixture_json=_path_from_project(str(fixture)) if fixture else None,
+        )
+        observed = profile.model_dump()
+        sources = profile.sources
+        _expect_range(
+            failures,
+            len(sources),
+            field="sources",
+            minimum=int(expected.get("min_sources", 0)),
+        )
+        _expect_range(
+            failures,
+            len(profile.evidence),
+            field="evidence",
+            minimum=int(expected.get("min_evidence_items", 0)),
+        )
+        if expected.get("require_source_urls") and not all(source.url for source in sources):
+            failures.append("sources: each source must include a URL")
+        if expected.get("require_supported_claims") and not all(
+            source.supported_claims for source in sources
+        ):
+            failures.append("sources: each source must include supported claims")
+        source_quality = profile.source_quality_summary
+        if source_quality is not None:
+            _expect_range(
+                failures,
+                source_quality.average_recency_score,
+                field="source_quality.average_recency_score",
+                minimum=expected.get("min_average_recency_score"),
+                maximum=expected.get("max_average_recency_score"),
+            )
+            _expect_range(
+                failures,
+                source_quality.low_quality_source_count,
+                field="source_quality.low_quality_source_count",
+                minimum=expected.get("min_low_quality_source_count"),
+                maximum=expected.get("max_low_quality_source_count"),
+            )
+        _expect_range(
+            failures,
+            profile.confidence_score,
+            field="confidence_score",
+            minimum=expected.get("min_confidence_score"),
+            maximum=expected.get("max_confidence_score"),
+        )
+        return _result(case, failures, observed)
+
+    if kind == "opportunity_scout":
+        fixture = case.input_payload.get("fixture")
+        result = scout_opportunities_fixture(
+            fixture=_path_from_project(str(fixture)) if fixture else None,
+            max_results=int(case.input_payload.get("max_results", 5)),
+        )
+        observed = result.model_dump()
+        records = result.records
+        _expect_range(
+            failures,
+            len(records),
+            field="records",
+            minimum=int(expected.get("min_records", 0)),
+        )
+        if expected.get("require_record_sources") and not all(record.sources for record in records):
+            failures.append("records: each record must include sources")
+        if expected.get("require_source_urls") and not all(
+            source.url for record in records for source in record.sources
+        ):
+            failures.append("records: each source must include a URL")
+        if expected.get("require_supported_signals") and not all(
+            source.supported_signal for record in records for source in record.sources
+        ):
+            failures.append("records: each source must include a supported signal")
+        _expect_range(
+            failures,
+            len(records),
+            field="records",
+            maximum=expected.get("max_records"),
+        )
+        if expected.get("unique_companies"):
+            normalized_names = [_normalize_company_name(record.company_name) for record in records]
+            duplicates = sorted(
+                {name for name in normalized_names if normalized_names.count(name) > 1}
+            )
+            if duplicates:
+                failures.append(f"records: duplicate companies {duplicates!r}")
+        return _result(case, failures, observed)
+
+    raise ValueError(f"{case.case_id}: unsupported source_attribution kind {kind!r}")
+
+
+def grade_opportunity_scoring(case: LocalEvalCase) -> LocalEvalResult:
+    expected = case.expected
+    observed = json.loads(
+        score_opportunity_impl(
+            company_name=str(case.input_payload.get("company_name", "")),
+            opportunity_type=str(case.input_payload.get("opportunity_type", "")),
+            signals=[str(signal) for signal in case.input_payload.get("signals", [])],
+        )
+    )
+    failures: list[str] = []
+    _expect_range(
+        failures,
+        int(observed["priority_score"]),
+        field="priority_score",
+        minimum=expected.get("min_priority_score"),
+        maximum=expected.get("max_priority_score"),
+    )
+    _expect_range(
+        failures,
+        int(observed["outside_consulting_likelihood"]),
+        field="outside_consulting_likelihood",
+        minimum=expected.get("min_outside_consulting_likelihood"),
+        maximum=expected.get("max_outside_consulting_likelihood"),
+    )
+    _expect_equal(failures, observed, expected, "handoff_to_business_research_analyst")
+    required_components = [str(item) for item in expected.get("required_score_components", [])]
+    missing_components = [
+        component
+        for component in required_components
+        if component not in observed.get("score_breakdown", {})
+    ]
+    if missing_components:
+        failures.append(f"score_breakdown: missing components {missing_components!r}")
+    return _result(case, failures, observed)
+
+
+def grade_outreach_copy_constraints(case: LocalEvalCase) -> LocalEvalResult:
+    mode = str(case.input_payload.get("mode", "fixture_draft"))
+    expected = case.expected
+    failures: list[str] = []
+
+    if mode == "fixture_draft":
+        contact_context = (
+            load_contact_context(str(case.input_payload["contact_fixture"]))
+            if "contact_fixture" in case.input_payload
+            else None
+        )
+        crm_context = (
+            load_crm_account_context(str(case.input_payload["crm_fixture"]))
+            if "crm_fixture" in case.input_payload
+            else None
+        )
+        style_profile = (
+            load_style_profile(str(case.input_payload["style_fixture"]))
+            if "style_fixture" in case.input_payload
+            else case.input_payload.get("email_style_profile")
+        )
+        draft = compose_outreach_draft_fixture(
+            company_profile=load_company_profile(
+                str(case.input_payload.get("company_fixture", ""))
+            ),
+            opportunity_record=load_opportunity_record(
+                str(case.input_payload.get("opportunity_fixture", ""))
+            ),
+            contact_name=case.input_payload.get("contact_name"),
+            contact_title=case.input_payload.get("contact_title"),
+            contact_context=contact_context,
+            crm_context=crm_context,
+            email_style_profile=style_profile,
+            recent_signal=case.input_payload.get("recent_signal"),
+            outreach_goal=case.input_payload.get("outreach_goal"),
+            include_call_prep=bool(case.input_payload.get("include_call_prep", False)),
+            include_follow_up_schedule=bool(
+                case.input_payload.get("include_follow_up_schedule", False)
+            ),
+            follow_up_date=case.input_payload.get("follow_up_date"),
+        )
+        observed = {**draft.model_dump(), "approval_status": draft.approval_status}
+        for field in (
+            "approval_required",
+            "approval_status",
+            "approved_context_used",
+            "send_enabled",
+            "sent",
+            "can_send_email",
+            "style_profile_used",
+            "style_profile_id",
+        ):
+            _expect_equal(failures, observed, expected, field)
+        _expect_range(
+            failures,
+            len(draft.email_body.split()),
+            field="email_body_words",
+            maximum=expected.get("email_max_words"),
+        )
+        _expect_range(
+            failures,
+            len(draft.linkedin_note),
+            field="linkedin_note_chars",
+            maximum=expected.get("linkedin_max_chars"),
+        )
+        if expected.get("no_em_dash") and "\u2014" in json.dumps(observed, ensure_ascii=False):
+            failures.append("outreach copy contains an em dash")
+        if (
+            "unsupported_claims_exact" in expected
+            and draft.unsupported_claims_flagged != expected["unsupported_claims_exact"]
+        ):
+            _fail(
+                failures,
+                "unsupported_claims_flagged",
+                draft.unsupported_claims_flagged,
+                expected["unsupported_claims_exact"],
+            )
+        _expect_range(
+            failures,
+            len(draft.unsupported_claims_flagged),
+            field="unsupported_claims_flagged",
+            minimum=expected.get("unsupported_claims_min"),
+        )
+        _expect_range(
+            failures,
+            len(draft.facts_used),
+            field="facts_used",
+            minimum=expected.get("facts_used_min"),
+        )
+        _expect_range(
+            failures,
+            len(draft.source_ids_used),
+            field="source_ids_used",
+            minimum=expected.get("source_ids_used_min"),
+        )
+        _expect_range(
+            failures,
+            len(draft.unsupported_claim_explanations),
+            field="unsupported_claim_explanations",
+            minimum=expected.get("unsupported_claim_explanations_min"),
+        )
+        if (
+            "unsupported_claim_explanations_exact" in expected
+            and draft.unsupported_claim_explanations
+            != expected["unsupported_claim_explanations_exact"]
+        ):
+            _fail(
+                failures,
+                "unsupported_claim_explanations",
+                draft.unsupported_claim_explanations,
+                expected["unsupported_claim_explanations_exact"],
+            )
+        observed["approved_context_used"] = draft.approved_context_used
+        _expect_equal(failures, observed, expected, "approved_context_used")
+        copy_text = "\n".join([draft.email_subject, draft.email_body, draft.linkedin_note]).lower()
+        for required in expected.get("copy_must_contain", []):
+            if str(required).lower() not in copy_text:
+                failures.append(f"outreach copy missing required text {required!r}")
+        for forbidden in expected.get("copy_must_not_contain", []):
+            if str(forbidden).lower() in copy_text:
+                failures.append(f"outreach copy contained forbidden text {forbidden!r}")
+        for required in expected.get("style_required_terms", []):
+            if str(required).lower() not in copy_text:
+                failures.append(f"style: missing required text {required!r}")
+        for forbidden in expected.get("style_forbidden_terms", []):
+            if str(forbidden).lower() in copy_text:
+                failures.append(f"style: contained forbidden text {forbidden!r}")
+        schedules = [dict(item) for item in observed.get("follow_up_schedules") or []]
+        _expect_range(
+            failures,
+            len(schedules),
+            field="follow_up_schedules",
+            minimum=expected.get("follow_up_schedules_min"),
+        )
+        if "follow_up_approval_required" in expected and not all(
+            schedule.get("approval_required") is expected["follow_up_approval_required"]
+            for schedule in schedules
+        ):
+            failures.append("follow_up_schedules: approval_required did not match")
+        for field in ("send_enabled", "gmail_scheduled", "background_job_created"):
+            expectation_key = f"follow_up_{field}" if field == "send_enabled" else field
+            expected_schedule_value = expected.get(expectation_key)
+            if (
+                field == "send_enabled"
+                and expectation_key not in expected
+                and schedules
+                and "send_enabled" in expected
+            ):
+                expected_schedule_value = expected["send_enabled"]
+            if expected_schedule_value is not None and not all(
+                schedule.get(field) is expected_schedule_value for schedule in schedules
+            ):
+                failures.append(f"follow_up_schedules: {field} did not match")
+
+        call_prep = observed.get("call_prep") if isinstance(observed.get("call_prep"), dict) else {}
+        if expected.get("call_prep_required") and not call_prep:
+            failures.append("call_prep: expected call prep artifact")
+        if call_prep:
+            if "call_prep_draft_only_internal" in expected:
+                _expect_equal(
+                    failures,
+                    call_prep,
+                    {"draft_only_internal": expected["call_prep_draft_only_internal"]},
+                    "draft_only_internal",
+                )
+            _expect_range(
+                failures,
+                len(call_prep.get("discovery_questions", [])),
+                field="call_prep.discovery_questions",
+                minimum=expected.get("discovery_questions_min"),
+            )
+            if expected.get("known_facts_source_backed"):
+                invalid_sources = [
+                    fact.get("source_id")
+                    for fact in call_prep.get("known_facts", [])
+                    if str(fact.get("source_id", "")).startswith(("user:", "unbacked:"))
+                ]
+                if invalid_sources:
+                    failures.append(f"call_prep.known_facts: unbacked sources {invalid_sources!r}")
+            if expected.get("no_professional_advice"):
+                call_prep_text = json.dumps(call_prep, ensure_ascii=False).lower()
+                advice_terms = ("diagnose", "prescribe", "treatment plan", "medical advice")
+                if any(term in call_prep_text for term in advice_terms):
+                    failures.append("call_prep: contains professional advice wording")
+        return _result(case, failures, observed)
+
+    if mode == "claim_check":
+        observed = check_unsupported_claims(
+            str(case.input_payload.get("text", "")),
+            allowed_claims=[str(claim) for claim in case.input_payload.get("allowed_claims", [])],
+        )
+        _expect_equal(failures, observed, expected, "has_unsupported_claims")
+        _expect_range(
+            failures,
+            len(observed["unsupported_claims"]),
+            field="unsupported_claims",
+            minimum=expected.get("unsupported_claims_min"),
+        )
+        return _result(case, failures, observed)
+
+    raise ValueError(f"{case.case_id}: unsupported outreach_copy_constraints mode {mode!r}")
+
+
+def grade_approval_queue_revision(case: LocalEvalCase) -> LocalEvalResult:
+    expected = case.expected
+    payload = case.input_payload
+    store = SQLiteStore(":memory:")
+    item = ApprovalQueueItem(
+        id=str(payload.get("approval_id") or case.case_id),
+        object_type=str(payload.get("object_type") or "outreach_draft"),
+        object_id=str(payload.get("object_id") or "draft-1"),
+        title=str(payload.get("title") or "Outreach draft needs review"),
+        summary=str(payload.get("summary") or "Draft remains approval-gated."),
+        draft_text=str(payload.get("draft_text") or "Draft-only outreach body."),
+        source_agent=str(payload.get("source_agent") or "outreach_composer"),
+        risk_flags=[str(flag) for flag in payload.get("risk_flags", [])],
+        approval_status="pending",
+    )
+    store.save_approval_item(item)
+    revised = store.update_approval_status(
+        item.id,
+        "revise",
+        reviewer=str(payload.get("reviewer") or "Human Reviewer"),
+        notes=str(payload.get("revision_notes") or "Revise unsupported claim."),
+    )
+    reopened = store.update_approval_status(
+        item.id,
+        "pending",
+        reviewer=str(payload.get("reviewer") or "Human Reviewer"),
+        notes=str(payload.get("requeue_notes") or "Requeued after revision."),
+    )
+    observed = {
+        "initial_status": item.approval_status.value,
+        "revision_status": revised.approval_status.value,
+        "reopened_status": reopened.approval_status.value,
+        "reviewer": reopened.reviewer,
+        "reviewer_notes": reopened.reviewer_notes,
+        "send_enabled": approval_queue_status_allows_sending(reopened.approval_status),
+        "draft_text": reopened.draft_text,
+    }
+    failures: list[str] = []
+    for field in (
+        "initial_status",
+        "revision_status",
+        "reopened_status",
+        "reviewer",
+        "send_enabled",
+    ):
+        _expect_equal(failures, observed, expected, field)
+    if "reviewer_notes_contains" in expected:
+        reviewer_notes = str(observed.get("reviewer_notes") or "")
+        if str(expected["reviewer_notes_contains"]) not in reviewer_notes:
+            failures.append(
+                f"reviewer_notes: missing expected text {expected['reviewer_notes_contains']!r}"
+            )
+    for forbidden in expected.get("draft_must_not_contain", []):
+        if str(forbidden).lower() in str(observed.get("draft_text") or "").lower():
+            failures.append(f"draft_text: contained forbidden text {forbidden!r}")
+    return _result(case, failures, observed)
+
+
+GRADERS: dict[str, Callable[[LocalEvalCase], LocalEvalResult]] = {
+    "gmail_triage": grade_gmail_triage,
+    "orchestrator_routing": grade_orchestrator_routing,
+    "safety_refusal": grade_safety_refusal,
+    "source_attribution": grade_source_attribution,
+    "opportunity_scoring": grade_opportunity_scoring,
+    "outreach_copy_constraints": grade_outreach_copy_constraints,
+    "approval_queue_revision": grade_approval_queue_revision,
+}
+
+
+def resolve_eval_paths(eval_dir: Path, dataset_names: Sequence[str] = ()) -> list[Path]:
+    if dataset_names:
+        paths: list[Path] = []
+        for name in dataset_names:
+            raw_path = Path(name)
+            if raw_path.suffix != ".jsonl":
+                raw_path = raw_path.with_suffix(".jsonl")
+            path = raw_path if raw_path.is_absolute() else eval_dir / raw_path
+            if not path.is_file():
+                raise FileNotFoundError(f"Eval dataset not found: {path}")
+            paths.append(path)
+        return paths
+
+    paths = sorted(eval_dir.glob("*.jsonl"))
+    if not paths:
+        raise FileNotFoundError(f"No eval JSONL datasets found in {eval_dir}")
+    return paths
+
+
+def run_cases(cases: Iterable[LocalEvalCase]) -> list[LocalEvalResult]:
+    results: list[LocalEvalResult] = []
+    for case in cases:
+        grader = GRADERS.get(case.task)
+        if grader is None:
+            results.append(
+                _result(
+                    case,
+                    [f"unknown task {case.task!r}"],
+                    {"task": case.task, "line_number": case.line_number},
+                )
+            )
+            continue
+        results.append(grader(case))
+    return results
+
+
+def run_local_evals(
+    *,
+    eval_dir: Path = DEFAULT_EVAL_DIR,
+    dataset_names: Sequence[str] = (),
+) -> LocalEvalSummary:
+    cases: list[LocalEvalCase] = []
+    for path in resolve_eval_paths(eval_dir, dataset_names):
+        cases.extend(_load_jsonl_cases(path))
+    return LocalEvalSummary(results=run_cases(cases))
+
+
+def format_summary(summary: LocalEvalSummary) -> str:
+    lines = [
+        "Local evals",
+        f"Total: {summary.total}",
+        f"Passed: {summary.passed}",
+        f"Failed: {summary.failed}",
+    ]
+    prompt_refs = [str(metadata["reference"]) for metadata in summary.to_dict()["prompt_metadata"]]
+    if prompt_refs:
+        lines.append(f"Prompt versions: {', '.join(prompt_refs)}")
+    for result in summary.results:
+        status = "PASS" if result.passed else "FAIL"
+        versions = ", ".join(str(metadata["reference"]) for metadata in result.prompt_metadata)
+        lines.append(f"{status} {result.dataset}/{result.case_id} [{versions}]")
+        for failure in result.failures:
+            lines.append(f"  - {failure}")
+    return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run deterministic local Keystone evals.")
+    parser.add_argument(
+        "--eval-dir",
+        default=str(DEFAULT_EVAL_DIR),
+        help="Directory containing local eval JSONL datasets.",
+    )
+    parser.add_argument(
+        "--dataset",
+        action="append",
+        default=[],
+        help="Dataset name or JSONL path. Can be passed more than once.",
+    )
+    parser.add_argument("--json", action="store_true", help="Print machine-readable summary.")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    summary = run_local_evals(eval_dir=Path(args.eval_dir), dataset_names=args.dataset)
+    if args.json:
+        print(json.dumps(summary.to_dict(), ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(format_summary(summary))
+    return 0 if summary.failed == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

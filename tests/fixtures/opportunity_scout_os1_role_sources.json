@@ -1,0 +1,22 @@
+[
+  {
+    "title": "Medical Director, Clinical AI Research",
+    "company": "NeuroMeasure Health",
+    "url": "https://jobs.example.test/neuro-measure-medical-director",
+    "snippet": "Remote U.S. role posted 2026-04-20 for a physician-scientist with behavioral health, clinical research, and AI validation experience.",
+    "posted_at": "2026-04-20",
+    "location": "Remote, United States",
+    "active": true,
+    "source_type": "job_posting"
+  },
+  {
+    "title": "AI Tutor - Psychiatry Exam Prep",
+    "company": "Tutor Example",
+    "url": "https://jobs.example.test/ai-tutor-psychiatry",
+    "snippet": "Remote AI tutor contractor role. Should be excluded by OS-1.",
+    "posted_at": "2026-04-21",
+    "location": "Remote",
+    "active": true,
+    "source_type": "job_posting"
+  }
+]

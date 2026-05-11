@@ -1,0 +1,88 @@
+{
+  "name": "Curebase",
+  "website": "https://www.curebase.com",
+  "description": "Clinical trial software company.",
+  "fit": "Potentially relevant for decentralized clinical trial and health technology workflows.",
+  "sources": [
+    {
+      "source_id": "fixture:curebase_company",
+      "title": "Curebase fixture company profile",
+      "url": "fixture://sample_company_curebase.json",
+      "source_type": "fixture",
+      "supported_claims": [
+        "Curebase is a clinical trial software company.",
+        "Curebase supports decentralized clinical trial and health technology workflows.",
+        "Curebase provides a platform for clinical research teams and trial sponsors.",
+        "Curebase work creates evidence generation and clinical validation needs."
+      ],
+      "confidence": 0.82
+    },
+    {
+      "source_id": "fixture:curebase_growth",
+      "title": "Curebase fixture growth signal",
+      "url": "fixture://sample_company_curebase.json#growth",
+      "source_type": "fixture",
+      "supported_claims": [
+        "Curebase has research workflow, partnership, and validation signals relevant to outside consulting review.",
+        "Curebase operates in regulated clinical research settings where compliance sensitivity is relevant."
+      ],
+      "confidence": 0.78
+    }
+  ],
+  "research_data_points": [
+    {
+      "key": "business_model",
+      "value": "Clinical trial software platform for decentralized research workflows.",
+      "completed": true,
+      "confidence": 0.86,
+      "source_ids": ["fixture:curebase_company"]
+    },
+    {
+      "key": "customer_segment",
+      "value": "Clinical research teams and trial sponsors.",
+      "completed": true,
+      "confidence": 0.82,
+      "source_ids": ["fixture:curebase_company"]
+    },
+    {
+      "key": "behavioral_health_relevance",
+      "completed": false,
+      "missing_reason": "Fixture does not provide behavioral health-specific evidence."
+    },
+    {
+      "key": "ai_data_science_relevance",
+      "value": "Clinical research workflow software with data and evidence generation relevance.",
+      "completed": true,
+      "confidence": 0.78,
+      "source_ids": ["fixture:curebase_company"]
+    },
+    {
+      "key": "research_signals",
+      "value": "Evidence generation and clinical validation needs are present.",
+      "completed": true,
+      "confidence": 0.8,
+      "source_ids": ["fixture:curebase_company", "fixture:curebase_growth"]
+    },
+    {
+      "key": "funding_growth_signal",
+      "value": "Research workflow, partnership, and validation signals support growth review.",
+      "completed": true,
+      "confidence": 0.74,
+      "source_ids": ["fixture:curebase_growth"]
+    },
+    {
+      "key": "compliance_sensitivity",
+      "value": "Regulated clinical research setting creates compliance sensitivity.",
+      "completed": true,
+      "confidence": 0.76,
+      "source_ids": ["fixture:curebase_growth"]
+    },
+    {
+      "key": "consulting_fit",
+      "value": "Relevant for decentralized clinical trial and health technology workflow consulting.",
+      "completed": true,
+      "confidence": 0.82,
+      "source_ids": ["fixture:curebase_company", "fixture:curebase_growth"]
+    }
+  ]
+}

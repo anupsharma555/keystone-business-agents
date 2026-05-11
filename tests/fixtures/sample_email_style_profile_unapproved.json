@@ -1,0 +1,33 @@
+{
+  "profile_id": "pending-style",
+  "source": "fixture://sample_email_style_profile_unapproved.json",
+  "source_id": "fixture:email_style_pending",
+  "source_url": "fixture://sample_email_style_profile_unapproved.json",
+  "confidence": 0.4,
+  "approval_state": "pending",
+  "approval_scope": "drafting",
+  "greeting_patterns": [
+    "Yo {name},"
+  ],
+  "signoffs": [
+    "Sent from unapproved style,"
+  ],
+  "sentence_length": "short",
+  "average_sentence_words": 8,
+  "directness": "high",
+  "cta_style": "direct_question",
+  "formality": "casual",
+  "formatting_preferences": [
+    "Unapproved preference"
+  ],
+  "preferred_phrases": [
+    "unapproved phrase"
+  ],
+  "avoided_phrases": [],
+  "approved_sample_snippets": [
+    "Pending snippet."
+  ],
+  "raw_sent_email_bodies_included": false,
+  "send_enabled": false,
+  "sent": false
+}

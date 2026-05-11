@@ -1,0 +1,44 @@
+{
+  "profile_id": "founder_fit_2026",
+  "approved_for_search": true,
+  "approved_for_drafting": false,
+  "summary": "Physician-scientist with clinical AI, psychiatry, neuroscience, clinical research, and evidence-generation experience.",
+  "search_fit_keywords": [
+    "physician-scientist",
+    "clinical AI",
+    "psychiatry",
+    "behavioral health",
+    "clinical research",
+    "evidence generation"
+  ],
+  "role_targets": [
+    "medical director",
+    "clinical AI advisor",
+    "clinical research lead"
+  ],
+  "role_exclusions": [
+    "AI tutor",
+    "onsite only"
+  ],
+  "fit_dimensions": [
+    "behavioral health relevance",
+    "clinical research relevance",
+    "AI evaluation relevance"
+  ],
+  "allowed_outreach_claims": [],
+  "reply_context": [],
+  "public_links": [],
+  "sensitive_fields_removed": [
+    "PHI",
+    "patient-specific details",
+    "personal IDs",
+    "home address",
+    "private phone numbers",
+    "secrets",
+    "private contract terms"
+  ],
+  "source_document": "documents/CV_AnupSharma_2026.docx",
+  "notes": [
+    "Copy to documents/founder_fit_profile.json and set approval flags deliberately."
+  ]
+}
