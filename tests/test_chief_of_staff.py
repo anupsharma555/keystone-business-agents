@@ -97,7 +97,8 @@ def test_supplied_slack_history_digest_renders_timestamped_answer() -> None:
     result = plan_chief_of_staff_request(
         "\n".join(
             [
-                "chief of staff what were the last articles posted in #grants-and-funding regarding?",
+                "chief of staff what were the last articles posted in "
+                "#grants-and-funding regarding?",
                 "",
                 "Read-only Slack message-history context supplied by the KNI Slack runtime.",
                 "Slack channel history digest:",

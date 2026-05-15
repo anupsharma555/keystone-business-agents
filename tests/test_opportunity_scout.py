@@ -790,7 +790,7 @@ def test_prompt_is_loaded_from_markdown() -> None:
 
     assert prompt.strip() in agent.instructions
     assert "`search_web`" in prompt
-    assert "SearXNG first for broad recall" in prompt
+    assert "SearXNG plus a capped Agents hosted web-search lane" in prompt
     assert "Apify or Browserless enrichment" in prompt
 
 
@@ -1623,7 +1623,7 @@ def test_strict_company_prompt_rejects_awards_program_records() -> None:
     assert any("awards program" in reason for reason in reasons)
 
 
-def test_strict_mental_health_ai_company_prompt_rejects_health_system_without_behavioral_focus() -> None:
+def test_strict_mental_health_ai_company_prompt_rejects_health_system_without_focus() -> None:
     plan = scout_module.infer_opportunity_search_plan(
         "Identify 5 mental health AI companies with possible clinical validation needs; "
         "no outreach.",
@@ -1656,7 +1656,7 @@ def test_strict_mental_health_ai_company_prompt_rejects_health_system_without_be
     assert any("direct behavioral-health" in reason for reason in reasons)
 
 
-def test_strict_mental_health_ai_company_prompt_does_not_count_query_derived_behavioral_signal() -> None:
+def test_strict_mental_health_ai_company_prompt_ignores_query_derived_signal() -> None:
     plan = scout_module.infer_opportunity_search_plan(
         "Identify 5 mental health AI companies with possible clinical validation needs; "
         "no outreach.",

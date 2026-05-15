@@ -763,7 +763,11 @@ def _deepening_search_providers(
     if agents_enabled and requested in {"", "searxng"}:
         providers.append("agents-web-search")
     return tuple(
-        dict.fromkeys(provider_name for provider_name in providers if provider_name not in provider_sequence)
+        dict.fromkeys(
+            provider_name
+            for provider_name in providers
+            if provider_name not in provider_sequence
+        )
     )
 
 

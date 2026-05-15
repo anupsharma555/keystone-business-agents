@@ -85,8 +85,8 @@ from keystone_agents.tools.memory_tool import (
 )
 from keystone_agents.tools.search_provider import (
     LiveSearchProviderRequiredError,
-    SearchRequest,
     SearchProviderError,
+    SearchRequest,
     build_search_provider,
 )
 from keystone_agents.tools.serper_tool import search_web
@@ -3870,7 +3870,9 @@ def _topic_relevance_rejection_reasons(
             reasons.append(
                 "source lacks direct behavioral-health or psychiatry relevance required by topic"
             )
-    elif requires_behavioral_relevance and not _has_behavioral_health_or_adjacent_healthcare_ai_relevance(haystack):
+    elif requires_behavioral_relevance and not (
+        _has_behavioral_health_or_adjacent_healthcare_ai_relevance(haystack)
+    ):
         reasons.append(
             "source lacks behavioral-health or adjacent healthcare AI relevance required by topic"
         )

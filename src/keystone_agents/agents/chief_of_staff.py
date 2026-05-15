@@ -243,7 +243,9 @@ def _plan_slack_history_digest_request(text: str) -> ChiefOfStaffResult:
             summary_lines.append(f"{index}. {item['topic']}")
             summary_lines.append(f"   Posted: {_format_slack_history_timestamp(item['ts'])}")
     else:
-        summary_lines.append("- No candidate Slack history items were present in the supplied digest.")
+        summary_lines.append(
+            "- No candidate Slack history items were present in the supplied digest."
+        )
     summary_lines.append("")
     summary_lines.append(f"Theme: {_slack_history_theme(items)}")
     summary = "\n".join(summary_lines)
@@ -255,7 +257,10 @@ def _plan_slack_history_digest_request(text: str) -> ChiefOfStaffResult:
             workflow_type="slack-runtime-review",
             command_text=f"Summarize supplied Slack history digest for {channel_id or channel}",
             target_channel=(channel.lstrip("#") or channel_id or "selected-channel"),
-            rationale="A bounded Slack message-history digest was supplied by the KNI Slack runtime.",
+            rationale=(
+                "A bounded Slack message-history digest was supplied by the "
+                "KNI Slack runtime."
+            ),
             requires_live_connector=False,
             requires_human_approval_before_post=True,
         ),
