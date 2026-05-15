@@ -7,7 +7,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from keystone_agents.schemas.approval import ApprovalState, normalize_approval_state
+from keystone_agents.schemas.approval import (
+    ApprovalQueueStatus,
+    ApprovalState,
+    approved_state_for_scope,
+    normalize_approval_queue_status,
+    normalize_approval_state,
+)
 from keystone_agents.schemas.context_pack import (
     ContextPack,
     ContextPackReadinessGate,
@@ -46,6 +52,17 @@ class ReadinessResult:
     ready: bool
     blockers: tuple[WorkItemBlocker, ...] = ()
     next_action: WorkItemNextAction | None = None
+
+
+@dataclass(frozen=True)
+class ApprovalGateUpdateResult:
+    work_item: WorkItem
+    approval_id: str
+    gate_scope: str
+    previous_state: str
+    new_state: str
+    changed: bool
+    event_recorded: bool
 
 
 def create_or_load_work_item(
@@ -272,6 +289,113 @@ def approve_artifact_context(
     return resolve_blocker(updated, "outreach_requires_approved_context")
 
 
+def apply_slack_approval_to_work_item_gate(
+    work_item: WorkItem,
+    approval_id: str,
+    status: ApprovalQueueStatus | str,
+    *,
+    actor: str,
+    notes: str = "",
+    slack_context: dict[str, Any] | None = None,
+    store: SQLiteStore | None = None,
+) -> ApprovalGateUpdateResult:
+    """Apply one Slack approval decision to the exact WorkItem gate it references."""
+
+    cleaned_approval_id = str(approval_id or "").strip()
+    if not cleaned_approval_id:
+        raise ValueError("approval_id is required to update a WorkItem approval gate")
+    resolved_status = normalize_approval_queue_status(status)
+    matching_gate = next(
+        (gate for gate in work_item.approval_gates if gate.approval_id == cleaned_approval_id),
+        None,
+    )
+    if matching_gate is None:
+        raise ValueError(f"stale WorkItem approval id: {cleaned_approval_id}")
+
+    previous_state = matching_gate.state
+    new_state = _gate_state_for_queue_status(matching_gate, resolved_status)
+    changed = previous_state != new_state
+    if not changed:
+        return ApprovalGateUpdateResult(
+            work_item=work_item,
+            approval_id=cleaned_approval_id,
+            gate_scope=matching_gate.scope,
+            previous_state=previous_state,
+            new_state=new_state,
+            changed=False,
+            event_recorded=False,
+        )
+
+    updated_gates = [
+        gate.model_copy(
+            update={
+                "state": new_state,
+                "rationale": _gate_rationale(
+                    gate,
+                    resolved_status,
+                    actor=actor,
+                    notes=notes,
+                ),
+            }
+        )
+        if gate.approval_id == cleaned_approval_id
+        else gate
+        for gate in work_item.approval_gates
+    ]
+    updated = work_item.model_copy(update={"approval_gates": updated_gates}).touch()
+    blocker_code = _gate_blocker_code(cleaned_approval_id)
+    if resolved_status == ApprovalQueueStatus.APPROVED:
+        updated = resolve_blocker(updated, blocker_code)
+        updated = set_next_action(
+            updated,
+            _approved_gate_next_action(matching_gate, approval_id=cleaned_approval_id),
+        )
+    else:
+        updated = add_blocker(
+            updated,
+            WorkItemBlocker(
+                code=blocker_code,
+                message=_blocked_gate_message(matching_gate, resolved_status, actor=actor),
+            ),
+        )
+        updated = set_next_action(
+            updated,
+            _blocked_gate_next_action(matching_gate, resolved_status),
+        )
+
+    updated = updated.model_copy(update={"status": derive_case_status(updated)}).touch()
+    record_event(
+        updated,
+        event_type="approval_gate_updated",
+        actor=actor or "slack",
+        summary=(
+            f"Slack {resolved_status.value} action changed "
+            f"{matching_gate.scope} approval gate from {previous_state} to {new_state}."
+        ),
+        metadata={
+            "approval_id": cleaned_approval_id,
+            "gate_scope": matching_gate.scope,
+            "previous_state": previous_state,
+            "new_state": new_state,
+            "approval_queue_status": resolved_status.value,
+            "notes": notes,
+            "slack": slack_context or {},
+        },
+        store=store,
+    )
+    if store is not None:
+        store.save_work_item(updated)
+    return ApprovalGateUpdateResult(
+        work_item=updated,
+        approval_id=cleaned_approval_id,
+        gate_scope=matching_gate.scope,
+        previous_state=previous_state,
+        new_state=new_state,
+        changed=True,
+        event_recorded=True,
+    )
+
+
 def record_event(
     work_item: WorkItem,
     *,
@@ -315,6 +439,124 @@ def resolve_blocker(work_item: WorkItem, code: str) -> WorkItem:
         else:
             resolved.append(blocker)
     return work_item.model_copy(update={"blockers": resolved}).touch()
+
+
+def _gate_state_for_queue_status(
+    gate: WorkItemApprovalGate,
+    status: ApprovalQueueStatus,
+) -> str:
+    if status == ApprovalQueueStatus.APPROVED:
+        return approved_state_for_scope(_approval_scope_for_gate(gate.scope)).value
+    if status == ApprovalQueueStatus.REJECTED:
+        return ApprovalState.REJECTED.value
+    if status == ApprovalQueueStatus.REVISE:
+        return "revision_requested"
+    if status == ApprovalQueueStatus.EXPIRED:
+        return ApprovalState.EXPIRED.value
+    return ApprovalState.PENDING.value
+
+
+def _approval_scope_for_gate(scope: str) -> str:
+    if scope == "drafting_context":
+        return "drafting"
+    return scope
+
+
+def _gate_rationale(
+    gate: WorkItemApprovalGate,
+    status: ApprovalQueueStatus,
+    *,
+    actor: str,
+    notes: str,
+) -> str:
+    actor_text = actor or "Slack reviewer"
+    if status == ApprovalQueueStatus.APPROVED:
+        return (
+            f"{actor_text} approved this {gate.scope} gate from Slack. "
+            "No send, publish, schedule, post, or live draft side effect was executed."
+        )
+    if status == ApprovalQueueStatus.REVISE:
+        suffix = f" Feedback: {notes}" if notes else ""
+        return f"{actor_text} requested revision for this {gate.scope} gate from Slack.{suffix}"
+    if status == ApprovalQueueStatus.REJECTED:
+        suffix = f" Feedback: {notes}" if notes else ""
+        return f"{actor_text} rejected this {gate.scope} gate from Slack.{suffix}"
+    return f"{actor_text} updated this {gate.scope} gate from Slack."
+
+
+def _gate_blocker_code(approval_id: str) -> str:
+    suffix = re.sub(r"[^a-zA-Z0-9_]+", "_", approval_id).strip("_") or "unknown"
+    return f"approval_gate_blocked_{suffix}"
+
+
+def _blocked_gate_message(
+    gate: WorkItemApprovalGate,
+    status: ApprovalQueueStatus,
+    *,
+    actor: str,
+) -> str:
+    actor_text = actor or "Slack reviewer"
+    if status == ApprovalQueueStatus.REVISE:
+        return (
+            f"{actor_text} requested revisions for the {gate.scope} approval gate. "
+            "Revise the artifact and resubmit a new approval request before continuing."
+        )
+    if status == ApprovalQueueStatus.REJECTED:
+        return (
+            f"{actor_text} rejected the {gate.scope} approval gate. "
+            "Create a new reviewed artifact or close the WorkItem before continuing."
+        )
+    return f"The {gate.scope} approval gate is blocked pending human review."
+
+
+def _blocked_gate_next_action(
+    gate: WorkItemApprovalGate,
+    status: ApprovalQueueStatus,
+) -> WorkItemNextAction:
+    if status == ApprovalQueueStatus.REVISE:
+        return WorkItemNextAction(
+            action="revise_approval_artifact",
+            description=(
+                f"Revise the artifact for the {gate.scope} gate, then request approval again."
+            ),
+            requires_approval=True,
+        )
+    return WorkItemNextAction(
+        action="resolve_rejected_approval",
+        description=(
+            f"The {gate.scope} gate was rejected. Create a new approval request or archive "
+            "the WorkItem."
+        ),
+        requires_approval=True,
+    )
+
+
+def _approved_gate_next_action(
+    gate: WorkItemApprovalGate,
+    *,
+    approval_id: str,
+) -> WorkItemNextAction:
+    if gate.scope == "external_use":
+        return WorkItemNextAction(
+            action="external_use_approval_recorded",
+            description=(
+                "External-use approval was recorded for this specific gate only. "
+                "No email send, Slack post, publication, scheduling action, or live draft "
+                "creation was performed."
+            ),
+            command_hint=f"approval gate {approval_id} approved",
+        )
+    if gate.scope == "drafting":
+        return WorkItemNextAction(
+            action="continue_after_drafting_approval",
+            description="Drafting-context approval was recorded for this specific gate.",
+            command_hint=f"approval gate {approval_id} approved",
+        )
+    return WorkItemNextAction(
+        action=f"{gate.scope}_approval_recorded",
+        description=f"Approval was recorded for the {gate.scope} gate only.",
+        command_hint=f"approval gate {approval_id} approved",
+    )
 
 
 def derive_case_status(work_item: WorkItem) -> WorkItemStatus:

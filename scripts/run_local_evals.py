@@ -42,6 +42,12 @@ from keystone_agents.storage.sqlite_store import SQLiteStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EVAL_DIR = PROJECT_ROOT / "evals"
+SPECIALIZED_EVAL_DATASETS = frozenset(
+    {
+        "browser_extraction_cases.jsonl",
+        "search_coverage_cases.jsonl",
+    }
+)
 
 LOCAL_EVAL_PROMPT_FILES: dict[str, tuple[str, ...]] = {
     "gmail_triage": ("keystone_profile.md", "gmail_triage.md"),
@@ -835,7 +841,11 @@ def resolve_eval_paths(eval_dir: Path, dataset_names: Sequence[str] = ()) -> lis
             paths.append(path)
         return paths
 
-    paths = sorted(eval_dir.glob("*.jsonl"))
+    paths = [
+        path
+        for path in sorted(eval_dir.glob("*.jsonl"))
+        if path.name not in SPECIALIZED_EVAL_DATASETS
+    ]
     if not paths:
         raise FileNotFoundError(f"No eval JSONL datasets found in {eval_dir}")
     return paths

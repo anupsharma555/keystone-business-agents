@@ -17,6 +17,7 @@ concept in an explicit local boundary.
 | Guardrails and approval checks | `src/keystone_agents/guardrails.py`, `src/keystone_agents/schemas/approval.py` |
 | Handoffs and orchestration | `src/keystone_agents/agents/orchestrator.py` |
 | Results, local state, and audit storage | `src/keystone_agents/run.py`, `src/keystone_agents/storage/` |
+| Optional LangGraph WorkItem orchestration | `src/keystone_agents/langgraph_workflow.py`, `docs/LANGGRAPH_OPTION.md` |
 | Evals and regression tests | `tests/`, `tests/evals/`, `evals/` |
 | Future improvement test pack | `docs/AGENT_IMPROVEMENT_TEST_PACK.md` |
 | MCP servers | Not added yet; use only when a live provider needs an MCP boundary |
@@ -39,6 +40,8 @@ concept in an explicit local boundary.
   guarded function wrappers.
 - Storage and approval state are local-first and do not create send, schedule, or
   publish side effects.
+- LangGraph is an optional orchestration wrapper around WorkItems. It must call
+  existing typed runners and preserve SDK specialists as the behavior boundary.
 - Sandbox execution is explicit. `run_sandbox_workspace_review(...)` defaults to
   setup preview, and real execution requires `execute=True` with either
   credential-gated `live=True` or an injected fake/local runner for tests.

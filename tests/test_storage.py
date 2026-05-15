@@ -70,6 +70,10 @@ EXPECTED_TABLES = {
     "work_items",
     "work_item_events",
     "work_item_artifacts",
+    "automation_specs",
+    "automation_runs",
+    "automation_channel_bindings",
+    "automation_findings",
     "schema_migrations",
 }
 

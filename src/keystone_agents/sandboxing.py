@@ -45,7 +45,7 @@ DEFAULT_TASK_INSTRUCTIONS = (
     "manifests, logs, or generated artifacts."
 )
 DEFAULT_SEARCH_REVIEW_PROMPT = (
-    "Review the staged SearXNG/Serper search materials against TASK.md as the "
+    "Review the staged SearXNG/hosted web-search materials against TASK.md as the "
     "third stage after retrieval and retrieval quality gates. Assess source "
     "quality, contradictions, stale evidence, and missing evidence. Write draft "
     "notes only under artifacts/."
@@ -367,7 +367,7 @@ def build_search_review_task_instructions(
         or DEFAULT_SEARCH_REVIEW_QUESTIONS
     )
     lines = [
-        "You are a second-pass reviewer for already retrieved SearXNG/Serper search artifacts.",
+        "You are a second-pass reviewer for already retrieved SearXNG/hosted web-search artifacts.",
         "This sandbox review is stage three, after retrieval and retrieval quality gates.",
         (
             "Do not replace live search, retrieval, or quality-gate logic. "
@@ -631,7 +631,7 @@ def build_unix_local_search_review_setup(
     hosted_web_search: bool = False,
     hosted_web_search_config: SandboxHostedWebSearchConfig | None = None,
 ) -> SandboxAgentSetup:
-    """Build sandbox objects for stage-three review of staged SearXNG/Serper artifacts."""
+    """Build sandbox objects for stage-three review of staged search artifacts."""
 
     tools: list[Any] = []
     if hosted_web_search:

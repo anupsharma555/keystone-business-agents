@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             provider.value
             for provider in SearchProviderName
-            if provider != SearchProviderName.DRY_RUN
+            if provider not in {SearchProviderName.DRY_RUN, SearchProviderName.SERPER}
         ],
         default=None,
         help="Optional fallback provider for routed live opportunity scouting.",

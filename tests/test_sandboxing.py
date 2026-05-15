@@ -68,7 +68,7 @@ def test_sandbox_docs_cover_keystone_use_cases_and_security() -> None:
         "Mounted research folders",
         "Search/research artifact review",
         "after retrieval and retrieval quality gates",
-        "SearXNG/Serper",
+        "SearXNG/hosted web-search",
         "Generated reports",
         "Document batches",
         "Resumable workspace review",
@@ -288,7 +288,7 @@ def test_search_review_task_instructions_cover_second_pass_review() -> None:
     instructions = sandboxing.build_search_review_task_instructions(spec)
 
     assert "second-pass reviewer" in instructions
-    assert "SearXNG/Serper" in instructions
+    assert "SearXNG/hosted web-search" in instructions
     assert "after retrieval and retrieval quality gates" in instructions
     assert "Do not replace live search, retrieval, or quality-gate logic" in instructions
     assert "source quality" in instructions

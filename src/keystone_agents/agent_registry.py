@@ -155,6 +155,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         safety_notes=(
             "Source attribution required",
             "No hallucinated research facts",
+            "Hosted file search attaches only with explicit vector store configuration",
             "Local/Zotero context is private unless explicitly approved for external use",
             "CRM/contact context must be approved before use",
         ),
@@ -175,6 +176,14 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "retrieve_memory",
             "search_web",
             "search_opportunity_sources_placeholder",
+            "search_funding_news_sources",
+            "search_job_posting_sources",
+            "search_clinical_trials_sources",
+            "search_grant_sources",
+            "search_conference_publication_sources",
+            "search_journal_call_sources",
+            "search_contract_rfp_sources",
+            "search_company_page_sources",
             "score_opportunity",
             "handoff_to_business_research_analyst_placeholder",
             "save_opportunity_placeholder",
@@ -260,9 +269,59 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
     ),
 )
 
+CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
+    route_name="chief_of_staff",
+    agent_name="KNI Chief of Staff Agent",
+    builder="keystone_agents.agents.chief_of_staff:build_chief_of_staff_agent",
+    output_schema="keystone_agents.schemas.chief_of_staff.ChiefOfStaffResult",
+    prompt_files=(
+        "keystone_profile.md",
+        "safety_policy.md",
+        "skills.md",
+        "tools.md",
+        "chief_of_staff.md",
+    ),
+    tools=(
+        "list_chief_of_staff_context_sources",
+        "summarize_slack_runtime_config",
+        "search_slack_repo_context",
+        "read_slack_repo_context_file",
+        "lookup_slack_workflow_capability",
+        "search_official_operations_docs",
+        "list_local_context_sources",
+        "search_local_context",
+        "read_local_context_file",
+        "list_automation_specs",
+        "list_recent_automation_runs",
+        "list_channel_automation_bindings",
+        "summarize_automation_health",
+        "list_pending_automation_approvals",
+        "inspect_active_work_items",
+        "publish_document_report",
+        "publish_table_mirror",
+        "publish_slack_summary",
+    ),
+    live_flags_required=("--live-sdk",),
+    eval_datasets=(),
+    validation_paths=("tests/test_chief_of_staff.py",),
+    handoff_description=(
+        "Plan read-only KNI Slack operations routing across calendar, Gmail, "
+        "business-agent, and Slack runtime workflows without posting."
+    ),
+    safety_notes=(
+        "Internal review writes only through typed tools",
+        "Hosted file search attaches only with explicit vector store configuration",
+        "No direct public Slack posts",
+        "No Gmail sends or calendar writes",
+        "Human approval required before outbound Slack copy is used",
+        "Keystone Slack repo access is read-only and secret-filtered",
+    ),
+)
+
 REGISTERED_AGENT_SPECS: tuple[AgentSpec, ...] = (
     *SPECIALIST_AGENT_SPECS,
     ORCHESTRATOR_AGENT_SPEC,
+    CHIEF_OF_STAFF_AGENT_SPEC,
 )
 AGENT_REGISTRY: Mapping[str, AgentSpec] = {spec.route_name: spec for spec in REGISTERED_AGENT_SPECS}
 

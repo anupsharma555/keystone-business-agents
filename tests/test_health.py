@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import keystone_agents.health as health
+from keystone_agents.agent_registry import list_agent_specs
 from keystone_agents.health import (
     MASKED_VALUE,
     SEVERITY_HIGH,
@@ -30,6 +31,15 @@ HEALTH_ENV_VARS = (
     "SLACK_BOT_TOKEN",
     "SLACK_CHANNEL_APPROVALS",
     "SERPER_API_KEY",
+    "TAVILY_API_KEY",
+    "TAVILY_BASE_URL",
+    "TAVILY_SEARCH_DEPTH",
+    "TAVILY_MCP_LINK",
+    "TAVILY_MCP_link",
+    "KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT",
+    "KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT",
+    "KEYSTONE_TAVILY_CREDIT_ENFORCEMENT",
+    "KEYSTONE_TAVILY_USAGE_PATH",
     "APIFY_API_TOKEN",
     "BROWSERLESS_API_KEY",
     "GOOGLE_CREDENTIALS_FILE",
@@ -39,6 +49,16 @@ HEALTH_ENV_VARS = (
     "KEYSTONE_ENABLE_LIVE_RESEARCH",
     "KEYSTONE_LIVE_MODE",
     "KEYSTONE_DRY_RUN",
+    "KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED",
+    "KNI_BUSINESS_AGENTS_BACKGROUND_RUNS",
+    "KNI_BUSINESS_AGENTS_APPROVALS_ENABLED",
+    "KNI_BUSINESS_AGENTS_MESSAGE_ACTIONS_ENABLED",
+    "KNI_BUSINESS_AGENTS_HISTORY_CONTEXT_ENABLED",
+    "KNI_BUSINESS_AGENTS_LIVE_SDK",
+    "KNI_BUSINESS_AGENTS_LIVE_SEARCH",
+    "KNI_BUSINESS_AGENTS_LIVE_SLACK",
+    "KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS",
+    "KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL",
     "SEARCH_PROVIDER",
     "SEARXNG_BASE_URL",
     "SEARXNG_API_KEY",
@@ -91,6 +111,18 @@ def test_health_check_runs_without_credentials(monkeypatch: pytest.MonkeyPatch) 
     assert all(item.status != STATUS_ERROR for item in report.imports)
     assert all(item.status != STATUS_ERROR for item in report.agent_builders)
     assert report.overall_status == STATUS_OK
+
+
+def test_health_agent_checks_follow_registry() -> None:
+    report = run_health_check(database_url=":memory:", env={})
+
+    assert {item.name for item in report.agent_builders} == {
+        spec.builder_name for spec in list_agent_specs()
+    }
+    assert {item.details["route_name"] for item in report.agent_builders} == {
+        spec.route_name for spec in list_agent_specs()
+    }
+    assert all(item.details["output_type_matches_registry"] for item in report.agent_builders)
 
 
 def test_health_reports_litellm_gateway_mode_without_requiring_package(
@@ -168,6 +200,8 @@ def test_disabled_optional_integrations_are_ok_not_failures() -> None:
     assert integrations["gmail"].details["live_enabled"] is False
     assert integrations["slack"].status != STATUS_ERROR
     assert integrations["slack"].details["required_now"] is False
+    assert integrations["slack_business_agents"].status == STATUS_OK
+    assert integrations["slack_business_agents"].details["required_now"] is False
     assert integrations["serper"].status != STATUS_ERROR
     assert integrations["serper"].details["required_now"] is False
     assert not any(message.severity == "error" for message in report.messages)
@@ -190,6 +224,40 @@ def test_live_flags_warn_when_credentials_are_missing() -> None:
     assert integrations["openai"].status == STATUS_OK
     assert report.overall_status == STATUS_WARNING
     assert any(message.code == "live_credentials_missing" for message in report.messages)
+
+
+def test_slack_business_agents_health_warns_for_enabled_context_missing_config() -> None:
+    report = run_health_check(
+        database_url=":memory:",
+        env={
+            "KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED": "true",
+            "KNI_BUSINESS_AGENTS_BACKGROUND_RUNS": "true",
+        },
+    )
+    item = {item.name: item for item in report.live_integrations}["slack_business_agents"]
+
+    assert item.status == STATUS_WARNING
+    assert item.details["required_now"] is True
+    assert item.details["missing"] == ["SLACK_BOT_TOKEN"]
+    assert any(message.code == "live_credentials_missing" for message in report.messages)
+
+
+def test_slack_business_agents_health_accepts_configured_live_slack() -> None:
+    report = run_health_check(
+        database_url=":memory:",
+        env={
+            "KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED": "true",
+            "KNI_BUSINESS_AGENTS_LIVE_SLACK": "true",
+            "SLACK_BOT_TOKEN": "xoxb-test-token",
+            "KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL": "#ai-agents-workflow",
+        },
+    )
+    item = {item.name: item for item in report.live_integrations}["slack_business_agents"]
+
+    assert item.status == STATUS_OK
+    assert item.details["required_now"] is True
+    assert item.details["configured"] is True
+    assert item.details["live_slack_enabled"] is True
 
 
 def test_missing_prompt_is_reported_as_error(tmp_path) -> None:

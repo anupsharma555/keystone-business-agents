@@ -1,9 +1,10 @@
-"""Search provider implementations for dry-run, Serper, SearXNG, and Firecrawl."""
+"""Search provider implementations for dry-run, Serper, SearXNG, Firecrawl, and SDK search."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urljoin
@@ -16,6 +17,11 @@ from keystone_agents.guardrails import (
     assess_tool_payload_guardrails,
     enforce_tool_input_guardrails,
     enforce_tool_output_guardrails,
+)
+from keystone_agents.tavily_usage import (
+    record_tavily_credit_usage,
+    tavily_credit_preflight,
+    tavily_search_credit_estimate,
 )
 
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
@@ -31,6 +37,8 @@ class SearchProviderName(StrEnum):
     SERPER = "serper"
     SEARXNG = "searxng"
     FIRECRAWL = "firecrawl"
+    TAVILY = "tavily"
+    AGENTS_WEB_SEARCH = "agents-web-search"
 
 
 class SearchProviderConfigurationError(RuntimeError):
@@ -63,6 +71,22 @@ class FirecrawlConfigurationError(SearchProviderConfigurationError):
 
 class FirecrawlSearchError(SearchProviderError):
     """Raised when Firecrawl returns an error or malformed response."""
+
+
+class TavilyConfigurationError(SearchProviderConfigurationError):
+    """Raised when live Tavily search is requested without required configuration."""
+
+
+class TavilySearchError(SearchProviderError):
+    """Raised when Tavily returns an error or malformed response."""
+
+
+class AgentsWebSearchConfigurationError(SearchProviderConfigurationError):
+    """Raised when hosted Agents SDK web search is unavailable or misconfigured."""
+
+
+class AgentsWebSearchError(SearchProviderError):
+    """Raised when hosted Agents SDK web search fails."""
 
 
 class LiveSearchProviderRequiredError(SearchProviderConfigurationError):
@@ -102,6 +126,30 @@ class SearchResult(BaseModel):
     content: str | None = None
 
 
+class AgentsWebSearchResult(BaseModel):
+    """One source-attributed result returned by hosted Agents SDK web search."""
+
+    title: str = ""
+    url: str = ""
+    snippet: str = ""
+    date: str | None = None
+
+
+class AgentsWebSearchOutput(BaseModel):
+    """Structured output expected from the hosted Agents SDK web-search adapter."""
+
+    results: list[AgentsWebSearchResult] = Field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TavilySearchPacket:
+    """Internal Tavily response packet with normalized results and credit usage."""
+
+    results: list[SearchResult]
+    credits_used: int
+    usage_source: str
+
+
 def normalize_search_provider_name(value: str | SearchProviderName | None) -> SearchProviderName:
     """Normalize provider configuration into a supported provider name."""
 
@@ -114,8 +162,14 @@ def normalize_search_provider_name(value: str | SearchProviderName | None) -> Se
         "dryrun": SearchProviderName.DRY_RUN,
         "fixture": SearchProviderName.DRY_RUN,
         "fixtures": SearchProviderName.DRY_RUN,
+        "tavily-search": SearchProviderName.TAVILY,
+        "openai-web-search": SearchProviderName.AGENTS_WEB_SEARCH,
+        "openai-websearch": SearchProviderName.AGENTS_WEB_SEARCH,
+        "agents-websearch": SearchProviderName.AGENTS_WEB_SEARCH,
+        "sdk-web-search": SearchProviderName.AGENTS_WEB_SEARCH,
+        "native-web-search": SearchProviderName.AGENTS_WEB_SEARCH,
     }
-    normalized = str(value).strip().lower()
+    normalized = str(value).strip().lower().replace("_", "-")
     if normalized in aliases:
         return aliases[normalized]
     try:
@@ -419,6 +473,214 @@ class FirecrawlSearchProvider:
         return self.search_web(query, num_results=result_count)
 
 
+@dataclass(frozen=True)
+class TavilySearchProvider:
+    """Tavily-backed search provider for AI-oriented web results."""
+
+    live: bool = False
+    api_key: str | None = None
+    base_url: str | None = None
+    search_depth: str | None = None
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    _last_credit_usage: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+
+    @property
+    def dry_run(self) -> bool:
+        return not self.live
+
+    def _settings(self) -> Any:
+        return load_settings()
+
+    def _api_key(self) -> str:
+        key = self.api_key or self._settings().tavily_api_key
+        if not key:
+            raise TavilyConfigurationError(
+                "TAVILY_API_KEY is required for live Tavily search. "
+                "Set it in the environment or .env, or run without --live-search."
+            )
+        return key
+
+    def _base_url(self) -> str:
+        return (self.base_url or self._settings().tavily_base_url).rstrip("/")
+
+    def _search_depth(self) -> str:
+        depth = (self.search_depth or self._settings().tavily_search_depth or "basic").lower()
+        return depth if depth in {"ultra-fast", "fast", "basic", "advanced"} else "basic"
+
+    def validate_configuration(self) -> None:
+        """Validate live Tavily credentials without making a network call."""
+
+        self._api_key()
+
+    def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+        return self.search_structured(SearchRequest(query=query, num_results=num_results))
+
+    def search_structured(self, request: SearchRequest) -> list[SearchResult]:
+        _guard_search_input(
+            tool_name="tavily_search",
+            query=request.query,
+            num_results=request.num_results,
+            live=self.live,
+        )
+        if not self.live:
+            return enforce_tool_output_guardrails("tavily_search", [])
+        api_key = self._api_key()
+        search_depth = self._search_depth()
+        estimated_credits = tavily_search_credit_estimate(search_depth)
+        decision = tavily_credit_preflight(estimated_credits)
+        object.__setattr__(self, "_last_credit_usage", decision.to_dict())
+        if not decision.allowed:
+            raise TavilySearchError(decision.note)
+        packet = _search_tavily_live(
+            request=request,
+            api_key=api_key,
+            base_url=self._base_url(),
+            search_depth=search_depth,
+            estimated_credits=estimated_credits,
+            timeout_seconds=self.timeout_seconds,
+        )
+        usage = record_tavily_credit_usage(
+            credits=packet.credits_used,
+            estimated_credits=estimated_credits,
+            usage_source=packet.usage_source,
+        )
+        object.__setattr__(self, "_last_credit_usage", usage.to_dict())
+        return _filter_unsafe_search_results("tavily_search", packet.results)
+
+    @property
+    def last_credit_usage(self) -> dict[str, Any]:
+        """Return the most recent local Tavily credit context."""
+
+        return dict(self._last_credit_usage)
+
+    def search(
+        self,
+        query: str,
+        num_results: int = 5,
+        *,
+        max_results: int | None = None,
+    ) -> list[SearchResult]:
+        result_count = max_results if max_results is not None else num_results
+        return self.search_web(query, num_results=result_count)
+
+
+@dataclass(frozen=True)
+class AgentsWebSearchProvider:
+    """OpenAI Agents SDK hosted web-search provider for slow recall deepening."""
+
+    live: bool = False
+    search_context_size: str = "low"
+    external_web_access: bool = True
+    model: str | None = None
+    runner: Callable[[str, SearchRequest], Any] | None = None
+
+    @property
+    def provider_name(self) -> str:
+        return SearchProviderName.AGENTS_WEB_SEARCH.value
+
+    @property
+    def dry_run(self) -> bool:
+        return not self.live
+
+    def validate_configuration(self) -> None:
+        """Validate hosted web-search prerequisites without making a model call."""
+
+        if self.live and self.runner is None:
+            self._validate_live_configuration()
+
+    def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+        return self.search_structured(SearchRequest(query=query, num_results=num_results))
+
+    def search_structured(self, request: SearchRequest) -> list[SearchResult]:
+        _guard_search_input(
+            tool_name="agents_web_search",
+            query=request.query,
+            num_results=request.num_results,
+            live=self.live,
+        )
+        if not self.live:
+            return enforce_tool_output_guardrails("agents_web_search", [])
+        prompt = _agents_web_search_prompt(request)
+        if self.runner is not None:
+            output = self.runner(prompt, request)
+        else:
+            self._validate_live_configuration()
+            output = self._run_live(prompt)
+        results = _agents_web_search_output_to_results(output, provider=self.provider_name)
+        return _filter_unsafe_search_results("agents_web_search", results)
+
+    def search(
+        self,
+        query: str,
+        num_results: int = 5,
+        *,
+        max_results: int | None = None,
+    ) -> list[SearchResult]:
+        result_count = max_results if max_results is not None else num_results
+        return self.search_web(query, num_results=result_count)
+
+    def _validate_live_configuration(self) -> None:
+        try:
+            from keystone_agents.model_provider import DEFAULT_PROVIDER, get_model_config
+            from keystone_agents.sdk import validate_web_search_sdk_available
+
+            validate_web_search_sdk_available()
+            model_config = get_model_config()
+            if self.model is not None:
+                model_config = replace(model_config, model=self.model)
+            if model_config.provider != DEFAULT_PROVIDER or model_config.use_responses is False:
+                raise AgentsWebSearchConfigurationError(
+                    "Agents SDK hosted web search requires MODEL_PROVIDER=openai on the "
+                    "OpenAI Responses path."
+                )
+            model_config.require_live_execution_ready()
+        except AgentsWebSearchConfigurationError:
+            raise
+        except RuntimeError as exc:
+            raise AgentsWebSearchConfigurationError(str(exc)) from exc
+
+    def _run_live(self, prompt: str) -> Any:
+        try:
+            from keystone_agents.model_provider import get_model_config
+            from keystone_agents.sdk import WebSearchTool, build_sdk_agent, run_sdk_sync
+
+            model_config = get_model_config()
+            if self.model is not None:
+                model_config = replace(model_config, model=self.model)
+            agent = build_sdk_agent(
+                name="search_provider_agents_web_search",
+                instructions=(
+                    "You are a hosted web-search adapter for Keystone research agents. "
+                    "Use web_search to return source-attributed search results. Prefer "
+                    "primary and authoritative sources. Do not use authenticated, "
+                    "private, or patient-specific pages."
+                ),
+                output_type=AgentsWebSearchOutput,
+                tools=[
+                    WebSearchTool(
+                        search_context_size=self.search_context_size,
+                        external_web_access=self.external_web_access,
+                    )
+                ],
+                model=self.model,
+            )
+            run_result = run_sdk_sync(
+                agent,
+                prompt,
+                config=model_config,
+                workflow_name="Keystone hosted web search fallback",
+                tracing_disabled=True,
+                trace_include_sensitive_data=False,
+            )
+            return getattr(run_result, "final_output", run_result)
+        except SearchProviderConfigurationError:
+            raise
+        except Exception as exc:
+            raise AgentsWebSearchError(
+                f"Agents SDK hosted web search failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+
 def build_search_provider(
     provider: str | SearchProviderName | None = None,
     *,
@@ -426,7 +688,14 @@ def build_search_provider(
     api_key: str | None = None,
     searxng_base_url: str | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-) -> DryRunSearchProvider | SerperSearchProvider | SearxngSearchProvider | FirecrawlSearchProvider:
+) -> (
+    DryRunSearchProvider
+    | SerperSearchProvider
+    | SearxngSearchProvider
+    | FirecrawlSearchProvider
+    | TavilySearchProvider
+    | AgentsWebSearchProvider
+):
     """Build a configured search provider without making a network call."""
 
     if not live:
@@ -438,14 +707,14 @@ def build_search_provider(
     explicit_provider = provider or settings.search_provider
     if explicit_provider is None or not str(explicit_provider).strip():
         raise LiveSearchProviderRequiredError(
-            "Live search requires --search-provider serper or --search-provider searxng "
-            "or SEARCH_PROVIDER set to serper or searxng."
+            "Live search requires --search-provider serper, searxng, firecrawl, "
+            "tavily, or agents-web-search, or SEARCH_PROVIDER set to one of those values."
         )
     provider_name = normalize_search_provider_name(explicit_provider)
     if provider_name == SearchProviderName.DRY_RUN:
         raise LiveSearchProviderRequiredError(
-            "Live search requires --search-provider serper or --search-provider searxng "
-            "or SEARCH_PROVIDER set to serper or searxng."
+            "Live search requires --search-provider serper, searxng, firecrawl, "
+            "tavily, or agents-web-search, or SEARCH_PROVIDER set to one of those values."
         )
     if provider_name == SearchProviderName.SERPER:
         return SerperSearchProvider(
@@ -460,6 +729,16 @@ def build_search_provider(
             base_url=settings.firecrawl_base_url,
             timeout_seconds=timeout_seconds,
         )
+    if provider_name == SearchProviderName.TAVILY:
+        return TavilySearchProvider(
+            live=True,
+            api_key=api_key or settings.tavily_api_key,
+            base_url=settings.tavily_base_url,
+            search_depth=settings.tavily_search_depth,
+            timeout_seconds=timeout_seconds,
+        )
+    if provider_name == SearchProviderName.AGENTS_WEB_SEARCH:
+        return AgentsWebSearchProvider(live=True)
     return SearxngSearchProvider(
         live=True,
         base_url=searxng_base_url or settings.searxng_base_url,
@@ -677,6 +956,177 @@ def _search_firecrawl_live(
         if len(results) >= request.num_results:
             break
     return results
+
+
+def _agents_web_search_prompt(request: SearchRequest) -> str:
+    parts = [
+        "Find web search results for this Keystone search request.",
+        f"Query: {request.query}",
+        f"Return up to {request.num_results} distinct results.",
+        "Each result must include title, URL, a concise relevance snippet, and date if visible.",
+        "Prefer primary-source domains when available. Preserve canonical source URLs.",
+        "Do not include authenticated, private, or patient-specific pages.",
+    ]
+    if request.time_range:
+        parts.append(f"Requested time range hint: {request.time_range}.")
+    if request.source and request.source != "web":
+        parts.append(f"Requested source hint: {request.source}.")
+    return "\n".join(parts)
+
+
+def _search_tavily_live(
+    *,
+    request: SearchRequest,
+    api_key: str,
+    base_url: str,
+    search_depth: str,
+    estimated_credits: int,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    http_post: Callable[..., Any] | None = None,
+) -> TavilySearchPacket:
+    resolved_query = _validate_query(request.query, request.num_results)
+    if not resolved_query:
+        return TavilySearchPacket(results=[], credits_used=0, usage_source="empty_query")
+
+    post = http_post or requests.post
+    payload: dict[str, Any] = {
+        "query": resolved_query,
+        "max_results": min(request.num_results, 20),
+        "search_depth": search_depth,
+        "topic": "news" if _normalized_source(request.source) == "news" else "general",
+        "include_answer": False,
+        "include_images": False,
+        "include_raw_content": "markdown" if request.scrape else False,
+        "include_usage": True,
+    }
+    time_range = _tavily_time_range(request.time_range)
+    if time_range:
+        payload["time_range"] = time_range
+    country = _tavily_country(request.country)
+    if country and payload["topic"] == "general":
+        payload["country"] = country
+    try:
+        response = post(
+            f"{base_url.rstrip('/')}/search",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=timeout_seconds,
+        )
+    except requests.Timeout as exc:
+        raise TavilySearchError(
+            f"Tavily search timed out after {timeout_seconds:.1f} seconds."
+        ) from exc
+    except requests.RequestException as exc:
+        raise TavilySearchError("Tavily search request failed.") from exc
+
+    data = _response_json(response, provider_name="Tavily", error_type=TavilySearchError)
+    results: list[SearchResult] = []
+    for item in data.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        raw_content = item.get("raw_content")
+        result = _search_result_from_fields(
+            title=item.get("title"),
+            link=item.get("url"),
+            snippet=item.get("content"),
+            source="tavily",
+            date=item.get("published_date") or item.get("date"),
+            content=raw_content if raw_content else None,
+        )
+        if result is not None:
+            results.append(result)
+        if len(results) >= request.num_results:
+            break
+    credits_used = _tavily_response_credits(data, default=estimated_credits)
+    usage_source = "provider_response" if _tavily_response_credits(data, default=0) else "estimate"
+    return TavilySearchPacket(
+        results=results,
+        credits_used=credits_used,
+        usage_source=usage_source,
+    )
+
+
+def _tavily_response_credits(data: dict[str, Any], *, default: int) -> int:
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return default
+    try:
+        credits = int(float(usage.get("credits") or 0))
+    except (TypeError, ValueError):
+        return default
+    return credits if credits > 0 else default
+
+
+def _tavily_time_range(time_range: str | None) -> str | None:
+    normalized = str(time_range or "").strip().lower()
+    mapping = {
+        "day": "day",
+        "d": "day",
+        "week": "week",
+        "w": "week",
+        "recent": "month",
+        "month": "month",
+        "m": "month",
+        "current": "year",
+        "year": "year",
+        "y": "year",
+    }
+    return mapping.get(normalized)
+
+
+def _tavily_country(country: str | None) -> str | None:
+    normalized = str(country or "").strip().lower()
+    mapping = {
+        "us": "united states",
+        "usa": "united states",
+        "united states of america": "united states",
+        "uk": "united kingdom",
+    }
+    return mapping.get(normalized, normalized or None)
+
+
+def _agents_web_search_output_to_results(output: Any, *, provider: str) -> list[SearchResult]:
+    parsed = _coerce_agents_web_search_output(output)
+    results: list[SearchResult] = []
+    for item in parsed.results:
+        url = str(item.url or "").strip()
+        if not url:
+            continue
+        title = str(item.title or "").strip() or url
+        results.append(
+            SearchResult(
+                title=title,
+                link=url,
+                snippet=str(item.snippet or "").strip(),
+                source=provider,
+                date=item.date,
+            )
+        )
+    return results
+
+
+def _coerce_agents_web_search_output(output: Any) -> AgentsWebSearchOutput:
+    if hasattr(output, "final_output"):
+        output = output.final_output
+    if isinstance(output, AgentsWebSearchOutput):
+        return output
+    if isinstance(output, BaseModel):
+        output = output.model_dump(mode="json")
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except json.JSONDecodeError:
+            return AgentsWebSearchOutput()
+    if isinstance(output, list | tuple):
+        output = {"results": list(output)}
+    if isinstance(output, dict):
+        if "results" not in output and "items" in output:
+            output = {**output, "results": output["items"]}
+        return AgentsWebSearchOutput.model_validate(output)
+    return AgentsWebSearchOutput()
 
 
 def _response_json(

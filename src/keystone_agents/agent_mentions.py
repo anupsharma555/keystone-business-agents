@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from keystone_agents.schemas.orchestrator import RouteName
 
 KNI_MENTION_RE = re.compile(r"^\s*(?:@KNI|<@[^>]+>)\s+", re.IGNORECASE)
+KEYSTONE_ASK_PREFIX_RE = re.compile(r"^\s*keystone\s+ask\b\s*", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,18 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "triage",
         ),
     ),
+    (
+        "chief_of_staff",
+        "KNI Chief of Staff Agent",
+        (
+            "kni chief of staff agent",
+            "kni chief of staff",
+            "chief of staff agent",
+            "chief of staff",
+            "slack operations",
+            "slack ops",
+        ),
+    ),
 )
 
 
@@ -94,7 +107,7 @@ def parse_agent_mention(text: str) -> AgentMention:
     if match is None:
         return AgentMention(route=None, agent_name="Keystone Orchestrator Agent", input_text=raw)
 
-    after_mention = raw[match.end() :].strip()
+    after_mention = KEYSTONE_ASK_PREFIX_RE.sub("", raw[match.end() :].strip()).strip()
     normalized = _normalize(after_mention)
     best: tuple[RouteName, str, str] | None = None
     for route, agent_name, aliases in AGENT_ALIASES:

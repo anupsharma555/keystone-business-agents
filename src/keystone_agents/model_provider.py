@@ -121,6 +121,13 @@ RUNTIME_AGENT_MODEL_SPECS: dict[str, RuntimeAgentModelSpec] = {
         default_model=GEMINI_OUTREACH_COMPOSER_DEFAULT_MODEL,
         default_provider=GEMINI_PROVIDER,
     ),
+    "chief_of_staff": RuntimeAgentModelSpec(
+        agent_name="chief_of_staff",
+        model_env="KEYSTONE_CHIEF_OF_STAFF_MODEL",
+        provider_env="KEYSTONE_CHIEF_OF_STAFF_MODEL_PROVIDER",
+        base_url_env="KEYSTONE_CHIEF_OF_STAFF_BASE_URL",
+        default_model=OPENAI_BUSINESS_AGENT_DEFAULT_MODEL,
+    ),
 }
 
 

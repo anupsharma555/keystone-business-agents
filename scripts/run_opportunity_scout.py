@@ -38,7 +38,10 @@ from keystone_agents.founder_profile import (
     founder_search_context,
     load_founder_fit_profile,
 )
-from keystone_agents.live_retrieval import run_opportunity_scout_live
+from keystone_agents.live_retrieval import (
+    build_shared_search_provider_config,
+    run_opportunity_scout_live,
+)
 from keystone_agents.memory import retrieval_tool_performance_memory_item
 from keystone_agents.models import OpportunityScoutSDKInput
 from keystone_agents.reporting import (
@@ -48,7 +51,6 @@ from keystone_agents.reporting import (
 from keystone_agents.retrieval_policy import (
     HybridSearchProvider,
     assess_role_search_quality,
-    build_provider_sequence,
     derive_request_autonomy_hint,
 )
 from keystone_agents.run import run_retrieved_sdk_synthesis
@@ -113,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             provider.value
             for provider in SearchProviderName
-            if provider != SearchProviderName.DRY_RUN
+            if provider not in {SearchProviderName.DRY_RUN, SearchProviderName.SERPER}
         ],
         default=None,
         help=(
@@ -337,13 +339,14 @@ def _build_hybrid_search_provider(
         request_text=request_text,
         agent_hint=_explicit_retrieval_hint(args),
     )
-    provider_sequence = build_provider_sequence(
+    search_config = build_shared_search_provider_config(
         requested_provider=args.search_provider,
         configured_provider=load_settings().search_provider,
         fallback_provider=args.fallback_search_provider,
     )
     provider = HybridSearchProvider(
-        provider_sequence=provider_sequence,
+        provider_sequence=search_config.provider_sequence,
+        deepening_provider_sequence=search_config.deepening_provider_sequence,
         autonomy_hint=autonomy_hint,
         quality_assessor=lambda results, _query: assess_role_search_quality(
             results=results,
@@ -355,8 +358,10 @@ def _build_hybrid_search_provider(
             provider=provider_name,
             live=True,
         ),
+        parallel_provider_fanout=search_config.parallel_provider_fanout,
+        provider_request_budget=search_config.provider_request_budget,
     )
-    if len(provider_sequence) == 1:
+    if len(search_config.provider_sequence) == 1:
         provider.validate_configuration()
     return provider
 
@@ -582,6 +587,7 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
                             ),
                             "retrieval_ladder": retrieval_metadata.get("retrieval_ladder"),
                             "search_quality": retrieval_metadata.get("search_quality"),
+                            "search_plan": retrieval_metadata.get("search_plan"),
                             "retrieved_source_candidates": retrieval_metadata.get(
                                 "retrieved_source_candidates",
                                 [],
@@ -590,6 +596,10 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
                                 "If accepted records are empty but retrieved source candidates "
                                 "contain relevant active opportunities, reason over those "
                                 "candidates and return up to max_results source-backed records. "
+                                "When search_plan.strict_targeting is true and target_entity_types "
+                                "is only company, final records must be companies; keep agencies, "
+                                "institutes, programs, projects, grants, trials, researchers, "
+                                "conferences, and publication calls out of final records. "
                                 "If review_candidates are present, treat them as borderline "
                                 "active opportunities for orchestrator or Business Research "
                                 "review, not as outreach-ready records. "

@@ -31,6 +31,9 @@ def infer_opportunity_search_plan(
         ),
     )
 
+    if _broad_intent(lowered):
+        return _broad_search_plan(plan)
+
     if _conference_intent(lowered):
         plan.target_entity_types = ["conference"]
         plan.objectives = ["presentation_opportunity"]
@@ -46,19 +49,30 @@ def infer_opportunity_search_plan(
         plan.strict_targeting = True
         return plan
 
-    if _broad_intent(lowered):
-        plan.target_entity_types = [
-            "company",
-            "institute",
-            "researcher",
-            "conference",
-            "grant_program",
-            "trial",
+    if _journal_call_intent(lowered):
+        plan.target_entity_types = ["journal_call"]
+        plan.objectives = ["journal_article_call", "research_collaboration"]
+        plan.must_include_terms = [
+            "call for papers",
+            "special issue",
+            "journal",
+            "article",
+            "manuscript",
         ]
-        plan.objectives = ["broad_discovery", "company_growth", "research_collaboration"]
-        plan.must_include_terms = ["behavioral health", "clinical AI", "partnership", "funding"]
-        plan.strict_targeting = False
+        plan.exclude_entity_types = ["company", "conference", "role"]
+        plan.strict_targeting = True
         return plan
+
+    if _contract_rfp_intent(lowered):
+        plan.target_entity_types = ["contract_rfp"]
+        plan.objectives = ["contract_opportunity", "broad_discovery"]
+        plan.must_include_terms = ["RFP", "contract", "solicitation", "proposal", "procurement"]
+        plan.exclude_entity_types = ["researcher", "conference", "role"]
+        plan.strict_targeting = True
+        return plan
+
+    if _broad_intent(lowered):
+        return _broad_search_plan(plan)
 
     if _company_growth_intent(lowered):
         plan.target_entity_types = ["company"]
@@ -67,7 +81,7 @@ def infer_opportunity_search_plan(
             "advisory" if "advisory" in lowered else "broad_discovery",
         ]
         plan.must_include_terms = ["funding", "partnership", "launch", "clinical AI"]
-        plan.strict_targeting = False
+        _apply_company_only_targeting(plan)
         return plan
 
     if _researcher_intent(lowered):
@@ -97,6 +111,41 @@ def infer_opportunity_search_plan(
     plan.target_entity_types = ["company"]
     plan.objectives = ["company_growth", "advisory" if "advisory" in lowered else "broad_discovery"]
     plan.must_include_terms = ["funding", "partnership", "launch", "clinical AI"]
+    if _company_target_intent(lowered):
+        _apply_company_only_targeting(plan)
+    else:
+        plan.strict_targeting = False
+    return plan
+
+
+def _broad_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearchPlan:
+    plan.target_entity_types = [
+        "company",
+        "institute",
+        "researcher",
+        "conference",
+        "journal_call",
+        "contract_rfp",
+        "grant_program",
+        "trial",
+    ]
+    plan.objectives = [
+        "broad_discovery",
+        "company_growth",
+        "research_collaboration",
+        "presentation_opportunity",
+        "journal_article_call",
+        "contract_opportunity",
+    ]
+    plan.must_include_terms = [
+        "behavioral health",
+        "clinical AI",
+        "partnership",
+        "funding",
+        "conference",
+        "RFP",
+        "special issue",
+    ]
     plan.strict_targeting = False
     return plan
 
@@ -124,6 +173,12 @@ def merge_opportunity_search_plan(
         merged.domains = list(base.domains)
     if not merged.must_include_terms:
         merged.must_include_terms = list(base.must_include_terms)
+    if (
+        base.strict_targeting
+        and plan_targets_only(base, "company")
+        and plan_targets_only(merged, "company")
+    ):
+        _apply_company_only_targeting(merged)
     merged.desired_count = max(1, min(10, merged.desired_count or base.desired_count))
     return merged
 
@@ -201,6 +256,41 @@ def _conference_intent(lowered: str) -> bool:
     )
 
 
+def _journal_call_intent(lowered: str) -> bool:
+    if not lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "journal call",
+            "article request",
+            "call for papers",
+            "call for manuscripts",
+            "special issue",
+            "journal article",
+            "publication call",
+        )
+    )
+
+
+def _contract_rfp_intent(lowered: str) -> bool:
+    if not lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "rfp",
+            "request for proposal",
+            "contract opportunity",
+            "contract opportunities",
+            "solicitation",
+            "procurement",
+            "sam.gov",
+            "government contract",
+        )
+    )
+
+
 def _researcher_intent(lowered: str) -> bool:
     return any(
         marker in lowered
@@ -234,8 +324,28 @@ def _role_intent(lowered: str) -> bool:
     )
 
 
+def _company_target_intent(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in ("companies", "company", "startups", "startup", "vendors", "platforms")
+    )
+
+
+def _apply_company_only_targeting(plan: OpportunitySearchPlan) -> None:
+    plan.strict_targeting = True
+    plan.exclude_entity_types = [
+        "institute",
+        "researcher",
+        "conference",
+        "journal_call",
+        "contract_rfp",
+        "grant_program",
+        "trial",
+        "role",
+    ]
+
+
 def _company_growth_intent(lowered: str) -> bool:
-    company_markers = ("companies", "company", "startups", "startup", "vendors", "platforms")
     growth_markers = (
         "funding",
         "raises",
@@ -249,9 +359,7 @@ def _company_growth_intent(lowered: str) -> bool:
         "growth",
         "signals",
     )
-    return any(marker in lowered for marker in company_markers) and any(
-        marker in lowered for marker in growth_markers
-    )
+    return _company_target_intent(lowered) and any(marker in lowered for marker in growth_markers)
 
 
 def _broad_intent(lowered: str) -> bool:
@@ -262,6 +370,12 @@ def _broad_intent(lowered: str) -> bool:
         "pilot",
         "clinical trial",
         "conference",
+        "journal",
+        "special issue",
+        "call for papers",
+        "rfp",
+        "contract",
+        "solicitation",
         "grant",
         "advisory",
         "researcher",

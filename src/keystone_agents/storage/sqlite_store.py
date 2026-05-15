@@ -28,6 +28,12 @@ from keystone_agents.schemas.approval import (
     validate_approval_queue_transition,
     validate_approval_transition,
 )
+from keystone_agents.schemas.automation import (
+    AutomationChannelBinding,
+    AutomationFinding,
+    AutomationRun,
+    AutomationSpec,
+)
 from keystone_agents.schemas.company_profile import CompanyFeatureRecord, CompanyProfile
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
 from keystone_agents.schemas.email_style import EmailStyleProfile
@@ -118,6 +124,10 @@ TIMESTAMP_METADATA_TABLES = (
     "work_items",
     "work_item_events",
     "work_item_artifacts",
+    "automation_specs",
+    "automation_runs",
+    "automation_channel_bindings",
+    "automation_findings",
 )
 
 OUTREACH_EMAIL_BODY_STORAGE_NOTE = (
@@ -531,6 +541,104 @@ ON work_item_artifacts(work_item_id);
 
 CREATE INDEX IF NOT EXISTS idx_work_item_artifacts_type
 ON work_item_artifacts(artifact_type, artifact_id);
+"""
+
+AUTOMATIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS automation_specs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'enabled',
+    trigger_type TEXT NOT NULL DEFAULT 'manual',
+    workflow TEXT NOT NULL DEFAULT '',
+    target_agent TEXT NOT NULL DEFAULT '',
+    default_channel TEXT NOT NULL DEFAULT '',
+    spec_json TEXT NOT NULL DEFAULT '{}',
+    created_at_utc TEXT NOT NULL DEFAULT '',
+    created_at_et TEXT NOT NULL DEFAULT '',
+    created_date_et TEXT NOT NULL DEFAULT '',
+    updated_at_utc TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_automation_specs_status
+ON automation_specs(status);
+
+CREATE INDEX IF NOT EXISTS idx_automation_specs_name
+ON automation_specs(name);
+
+CREATE TABLE IF NOT EXISTS automation_channel_bindings (
+    id TEXT PRIMARY KEY,
+    automation_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL DEFAULT '',
+    channel_name TEXT NOT NULL DEFAULT '',
+    destination_type TEXT NOT NULL DEFAULT 'slack',
+    purpose TEXT NOT NULL DEFAULT 'review',
+    binding_json TEXT NOT NULL DEFAULT '{}',
+    created_at_utc TEXT NOT NULL DEFAULT '',
+    created_at_et TEXT NOT NULL DEFAULT '',
+    created_date_et TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_automation_channel_bindings_automation
+ON automation_channel_bindings(automation_id);
+
+CREATE INDEX IF NOT EXISTS idx_automation_channel_bindings_channel
+ON automation_channel_bindings(channel_name, channel_id);
+
+CREATE TABLE IF NOT EXISTS automation_runs (
+    id TEXT PRIMARY KEY,
+    automation_id TEXT NOT NULL,
+    automation_name TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'dry_run',
+    work_item_id TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL DEFAULT '',
+    approval_count INTEGER NOT NULL DEFAULT 0,
+    failure_summary TEXT NOT NULL DEFAULT '',
+    next_safe_action TEXT NOT NULL DEFAULT '',
+    run_json TEXT NOT NULL DEFAULT '{}',
+    created_at_utc TEXT NOT NULL DEFAULT '',
+    created_at_et TEXT NOT NULL DEFAULT '',
+    created_date_et TEXT NOT NULL DEFAULT '',
+    completed_at_utc TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_automation_runs_automation
+ON automation_runs(automation_id);
+
+CREATE INDEX IF NOT EXISTS idx_automation_runs_status
+ON automation_runs(status);
+
+CREATE INDEX IF NOT EXISTS idx_automation_runs_work_item
+ON automation_runs(work_item_id);
+
+CREATE TABLE IF NOT EXISTS automation_findings (
+    id TEXT PRIMARY KEY,
+    automation_id TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL DEFAULT '',
+    finding_type TEXT NOT NULL DEFAULT 'status',
+    severity TEXT NOT NULL DEFAULT 'info',
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    recommendation TEXT NOT NULL DEFAULT '',
+    finding_json TEXT NOT NULL DEFAULT '{}',
+    created_at_utc TEXT NOT NULL DEFAULT '',
+    created_at_et TEXT NOT NULL DEFAULT '',
+    created_date_et TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_automation_findings_automation
+ON automation_findings(automation_id);
+
+CREATE INDEX IF NOT EXISTS idx_automation_findings_run
+ON automation_findings(run_id);
+
+CREATE INDEX IF NOT EXISTS idx_automation_findings_severity
+ON automation_findings(severity);
 """
 
 INITIAL_SCHEMA_SQL = """
@@ -1057,6 +1165,7 @@ class SQLiteStore:
         connection.executescript(MEMORY_TABLE_SQL)
         connection.executescript(OUTREACH_EXAMPLES_TABLE_SQL)
         connection.executescript(WORK_ITEMS_TABLE_SQL)
+        connection.executescript(AUTOMATIONS_TABLE_SQL)
 
         outreach_columns = self._column_names(connection, "outreach_drafts")
         if "approval_state" not in outreach_columns:
@@ -1397,6 +1506,307 @@ class SQLiteStore:
                 created_at=str(row["created_at_utc"] or row["created_at"]),
             )
             for row in rows
+        ]
+
+    def save_automation_spec(self, spec: AutomationSpec) -> str:
+        """Upsert an automation spec."""
+
+        item = AutomationSpec.model_validate(_as_dict(spec))
+        created = _time_metadata()
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM automation_specs WHERE id = ?",
+                (item.id,),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO automation_specs
+                    (
+                        id, name, status, trigger_type, workflow, target_agent,
+                        default_channel, spec_json, created_at_utc, created_at_et,
+                        created_date_et, updated_at_utc
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    status = excluded.status,
+                    trigger_type = excluded.trigger_type,
+                    workflow = excluded.workflow,
+                    target_agent = excluded.target_agent,
+                    default_channel = excluded.default_channel,
+                    spec_json = excluded.spec_json,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (
+                    item.id,
+                    _redact_string(item.name),
+                    item.status.value,
+                    item.trigger_type.value,
+                    _redact_string(item.workflow),
+                    _redact_string(item.target_agent),
+                    _redact_string(item.default_channel),
+                    stable_json(item.model_dump(mode="json")),
+                    created["utc"] if existing is None else item.created_at,
+                    created["et"] if existing is None else "",
+                    created["date_et"] if existing is None else "",
+                    item.updated_at,
+                ),
+            )
+        return item.id
+
+    def get_automation_spec(self, automation_id: str) -> AutomationSpec | None:
+        """Load one automation spec by id."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT spec_json FROM automation_specs WHERE id = ?",
+                (automation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return AutomationSpec.model_validate(_json_dict(row["spec_json"]))
+
+    def list_automation_specs(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[AutomationSpec]:
+        """List automation specs."""
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status and status != "all":
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT spec_json FROM automation_specs {where} "
+                "ORDER BY name LIMIT ?",
+                (*params, max(1, min(500, int(limit)))),
+            ).fetchall()
+        return [AutomationSpec.model_validate(_json_dict(row["spec_json"])) for row in rows]
+
+    def save_automation_channel_binding(self, binding: AutomationChannelBinding) -> str:
+        """Upsert an automation channel binding."""
+
+        item = AutomationChannelBinding.model_validate(_as_dict(binding))
+        created = _time_metadata()
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM automation_channel_bindings WHERE id = ?",
+                (item.id,),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO automation_channel_bindings
+                    (
+                        id, automation_id, channel_id, channel_name, destination_type,
+                        purpose, binding_json, created_at_utc, created_at_et, created_date_et
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    automation_id = excluded.automation_id,
+                    channel_id = excluded.channel_id,
+                    channel_name = excluded.channel_name,
+                    destination_type = excluded.destination_type,
+                    purpose = excluded.purpose,
+                    binding_json = excluded.binding_json
+                """,
+                (
+                    item.id,
+                    item.automation_id,
+                    _redact_string(item.channel_id),
+                    _redact_string(item.channel_name),
+                    item.destination_type,
+                    item.purpose,
+                    stable_json(item.model_dump(mode="json")),
+                    created["utc"] if existing is None else item.created_at,
+                    created["et"] if existing is None else "",
+                    created["date_et"] if existing is None else "",
+                ),
+            )
+        return item.id
+
+    def list_automation_channel_bindings(
+        self,
+        *,
+        automation_id: str | None = None,
+        channel: str | None = None,
+        limit: int = 100,
+    ) -> list[AutomationChannelBinding]:
+        """List automation channel bindings."""
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if automation_id:
+            clauses.append("automation_id = ?")
+            params.append(automation_id)
+        if channel:
+            clauses.append("(channel_name = ? OR channel_id = ?)")
+            params.extend([channel.lstrip("#"), channel])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT binding_json FROM automation_channel_bindings {where} "
+                "ORDER BY channel_name, id LIMIT ?",
+                (*params, max(1, min(500, int(limit)))),
+            ).fetchall()
+        return [
+            AutomationChannelBinding.model_validate(_json_dict(row["binding_json"]))
+            for row in rows
+        ]
+
+    def save_automation_run(self, run: AutomationRun) -> str:
+        """Save one automation run."""
+
+        item = AutomationRun.model_validate(_as_dict(run))
+        created = _time_metadata()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO automation_runs
+                    (
+                        id, automation_id, automation_name, stage, status,
+                        work_item_id, channel, approval_count, failure_summary,
+                        next_safe_action, run_json, created_at_utc, created_at_et,
+                        created_date_et, completed_at_utc
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    automation_id = excluded.automation_id,
+                    automation_name = excluded.automation_name,
+                    stage = excluded.stage,
+                    status = excluded.status,
+                    work_item_id = excluded.work_item_id,
+                    channel = excluded.channel,
+                    approval_count = excluded.approval_count,
+                    failure_summary = excluded.failure_summary,
+                    next_safe_action = excluded.next_safe_action,
+                    run_json = excluded.run_json,
+                    completed_at_utc = excluded.completed_at_utc
+                """,
+                (
+                    item.id,
+                    item.automation_id,
+                    _redact_string(item.automation_name),
+                    _redact_string(item.stage),
+                    item.status.value,
+                    item.work_item_id,
+                    _redact_string(item.channel),
+                    item.approval_count,
+                    _redact_string(item.failure_summary),
+                    _redact_string(item.next_safe_action),
+                    stable_json(item.model_dump(mode="json"), summarize_email_content=True),
+                    item.started_at or created["utc"],
+                    created["et"],
+                    created["date_et"],
+                    item.completed_at,
+                ),
+            )
+        return item.id
+
+    def list_automation_runs(
+        self,
+        *,
+        automation_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[AutomationRun]:
+        """List recent automation runs."""
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if automation_id:
+            clauses.append("automation_id = ?")
+            params.append(automation_id)
+        if status and status != "all":
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT run_json FROM automation_runs {where} "
+                "ORDER BY created_at_utc DESC, id DESC LIMIT ?",
+                (*params, max(1, min(500, int(limit)))),
+            ).fetchall()
+        return [AutomationRun.model_validate(_json_dict(row["run_json"])) for row in rows]
+
+    def save_automation_finding(self, finding: AutomationFinding) -> str:
+        """Save or update one automation finding."""
+
+        item = AutomationFinding.model_validate(_as_dict(finding))
+        created = _time_metadata()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO automation_findings
+                    (
+                        id, automation_id, run_id, channel, finding_type, severity,
+                        title, summary, recommendation, finding_json, created_at_utc,
+                        created_at_et, created_date_et
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    automation_id = excluded.automation_id,
+                    run_id = excluded.run_id,
+                    channel = excluded.channel,
+                    finding_type = excluded.finding_type,
+                    severity = excluded.severity,
+                    title = excluded.title,
+                    summary = excluded.summary,
+                    recommendation = excluded.recommendation,
+                    finding_json = excluded.finding_json
+                """,
+                (
+                    item.id,
+                    item.automation_id,
+                    item.run_id,
+                    _redact_string(item.channel),
+                    item.finding_type,
+                    item.severity.value,
+                    _redact_string(item.title),
+                    _redact_string(item.summary),
+                    _redact_string(item.recommendation),
+                    stable_json(item.model_dump(mode="json")),
+                    item.created_at or created["utc"],
+                    created["et"],
+                    created["date_et"],
+                ),
+            )
+        return item.id
+
+    def list_automation_findings(
+        self,
+        *,
+        automation_id: str | None = None,
+        run_id: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+    ) -> list[AutomationFinding]:
+        """List automation findings."""
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if automation_id:
+            clauses.append("automation_id = ?")
+            params.append(automation_id)
+        if run_id:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if severity and severity != "all":
+            clauses.append("severity = ?")
+            params.append(severity)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT finding_json FROM automation_findings {where} "
+                "ORDER BY created_at_utc DESC, id DESC LIMIT ?",
+                (*params, max(1, min(500, int(limit)))),
+            ).fetchall()
+        return [
+            AutomationFinding.model_validate(_json_dict(row["finding_json"])) for row in rows
         ]
 
     def save(self, kind: str, payload: dict[str, Any]) -> int:

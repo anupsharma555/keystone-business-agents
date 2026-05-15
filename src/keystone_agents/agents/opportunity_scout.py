@@ -68,6 +68,10 @@ from keystone_agents.source_quality import (
     score_source_quality,
     summarize_source_quality,
 )
+from keystone_agents.source_registry import (
+    assess_source_coverage,
+    required_source_lanes_for_opportunity,
+)
 from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
@@ -82,6 +86,7 @@ from keystone_agents.tools.memory_tool import (
 from keystone_agents.tools.search_provider import (
     LiveSearchProviderRequiredError,
     SearchRequest,
+    SearchProviderError,
     build_search_provider,
 )
 from keystone_agents.tools.serper_tool import search_web
@@ -247,6 +252,23 @@ CONFERENCE_MARKERS = (
     "abstract",
     "poster",
 )
+JOURNAL_CALL_MARKERS = (
+    "journal",
+    "special issue",
+    "call for papers",
+    "call for manuscripts",
+    "manuscript",
+    "article collection",
+)
+CONTRACT_RFP_MARKERS = (
+    "rfp",
+    "request for proposal",
+    "solicitation",
+    "procurement",
+    "contract opportunity",
+    "sam.gov",
+    "sources sought",
+)
 PERSON_NAME_RE = re.compile(
     r"^(?:dr\.?\s+)?([A-Z][a-z][A-Za-z'`.-]*(?:\s+(?:[A-Z]\.?|[A-Z][a-z][A-Za-z'`.-]*)){1,4})\b"
 )
@@ -276,6 +298,10 @@ INVALID_CANDIDATE_NAMES = {
     "www",
     "pdf",
     "doi",
+    "blog",
+    "blogs",
+    "insights",
+    "news",
     "people",
     "our people",
     "team",
@@ -355,6 +381,10 @@ ACTIVE_OPPORTUNITY_MARKERS = (
     "funding round",
     "funding opportunity",
     "request for proposals",
+    "request for proposal",
+    "rfp",
+    "solicitation",
+    "sources sought",
     "applications open",
     "apply by",
     "deadline",
@@ -384,6 +414,10 @@ ACTIVE_OPPORTUNITY_MARKERS = (
     "conference",
     "symposium",
     "workshop",
+    "call for papers",
+    "call for manuscripts",
+    "special issue",
+    "manuscript submission",
     "validation study",
     "trial launch",
     "study sponsor",
@@ -395,6 +429,8 @@ ACTIVE_OPPORTUNITY_MARKERS = (
 PSYCHIATRY_TOPIC_MARKERS = (
     "psychiatry",
     "psychiatric",
+    "psychiatrist",
+    "psychiatrists",
     "neuropsychiatry",
     "mental health",
     "behavioral health",
@@ -431,6 +467,68 @@ AI_TOPIC_MARKERS = (
     "technology",
     "platform",
 )
+ADJACENT_HEALTHCARE_AI_MARKERS = (
+    "healthcare",
+    "health care",
+    "clinical ai",
+    "clinical workflow",
+    "clinical automation",
+    "clinical decision",
+    "care delivery",
+    "patient care",
+    "provider workflow",
+    "health system",
+    "hospital",
+    "payer",
+    "medical ai",
+    "digital health",
+    "clinical operations",
+    "clinical trial",
+    "trial technology",
+    "study delivery",
+    "cns",
+)
+NON_CLINICAL_AI_MARKERS = (
+    "workforce management",
+    "human capital",
+    "human resources",
+    "hr technology",
+    "employee experience",
+    "payroll",
+    "advertising",
+    "marketing automation",
+    "automaker",
+    "automotive",
+    "vehicle",
+    "mobility",
+    "payment",
+    "payments",
+    "fintech",
+    "cloud infrastructure",
+    "ai infrastructure",
+    "model infrastructure",
+    "developer platform",
+)
+EXPLICIT_EXCLUSION_MARKERS: dict[str, tuple[str, ...]] = {
+    "payments": ("payment", "payments", "fintech"),
+    "payment": ("payment", "payments", "fintech"),
+    "advertising": ("advertising", "adtech", "marketing automation"),
+    "automaker": ("automaker", "automotive", "vehicle", "stellantis", "ford", "gm"),
+    "automotive": ("automaker", "automotive", "vehicle", "stellantis", "ford", "gm"),
+    "generic ai infrastructure": (
+        "generic ai infrastructure",
+        "cloud infrastructure",
+        "ai infrastructure",
+        "model infrastructure",
+        "developer platform",
+    ),
+    "ai infrastructure": (
+        "cloud infrastructure",
+        "ai infrastructure",
+        "model infrastructure",
+        "developer platform",
+    ),
+}
 ORGANIZATION_SUFFIX_RE = re.compile(
     r"\b(?:"
     r"ai|analytics|biotech|bio|biosciences|care|clinic|clinics|company|corp|"
@@ -640,6 +738,42 @@ DEFAULT_STRUCTURED_SOURCE_HITS: list[dict[str, Any]] = [
         "published_at": "2025-11-30",
         "missing_evidence": ["No buyer title or commercial trigger has been confirmed."],
     },
+    {
+        "company_name": "Precision Psychiatry Special Issue",
+        "entity_kind": "journal_call",
+        "opportunity_type": "journal article or publication call",
+        "signal": (
+            "Special issue call seeks manuscripts on AI, digital mental health, and "
+            "implementation evidence."
+        ),
+        "signals": ["journal article call", "publication or outcomes evidence"],
+        "source_title": "Precision psychiatry AI special issue call fixture",
+        "source_url": "fixture://journal/precision-psychiatry-ai-special-issue",
+        "source_type": "publication",
+        "source_category": "journal_call",
+        "published_at": "2026-04-10",
+        "recommended_next_actions": [
+            "Confirm submission deadline, article scope, and editor contact path.",
+        ],
+    },
+    {
+        "company_name": "SAM.gov Behavioral Health AI Evaluation RFP",
+        "entity_kind": "contract_rfp",
+        "opportunity_type": "contract or RFP opportunity",
+        "signal": (
+            "Solicitation fixture requests behavioral health analytics and evaluation support "
+            "for U.S. public-sector programs."
+        ),
+        "signals": ["contract or RFP", "validation study", "partnership announcement"],
+        "source_title": "SAM.gov behavioral health analytics solicitation fixture",
+        "source_url": "fixture://government/sam-behavioral-health-ai-rfp",
+        "source_type": "government",
+        "source_category": "contract_rfp",
+        "published_at": "2026-04-15",
+        "recommended_next_actions": [
+            "Confirm eligibility, response deadline, and whether a teaming partner is needed.",
+        ],
+    },
 ]
 
 SOURCE_TOOL_FIXTURE_HITS: dict[str, list[dict[str, Any]]] = {
@@ -716,6 +850,12 @@ SOURCE_TOOL_FIXTURE_HITS: dict[str, list[dict[str, Any]]] = {
             "source_category": "publication",
             "published_at": "2026-01-09",
         },
+    ],
+    "journal_call": [
+        DEFAULT_STRUCTURED_SOURCE_HITS[7],
+    ],
+    "contract_rfp": [
+        DEFAULT_STRUCTURED_SOURCE_HITS[8],
     ],
     "company_page": [
         DEFAULT_STRUCTURED_SOURCE_HITS[1],
@@ -821,8 +961,15 @@ def _source_category_from_hit(hit: dict[str, Any]) -> str:
         "sbir": "grant",
         "nih": "grant",
         "publication": "publication",
+        "journal": "journal_call",
+        "journal_call": "journal_call",
+        "special_issue": "journal_call",
         "conference": "conference",
         "conference_publication": "publication",
+        "contract": "contract_rfp",
+        "contract_rfp": "contract_rfp",
+        "rfp": "contract_rfp",
+        "solicitation": "contract_rfp",
         "company": "company_page",
         "company_page": "company_page",
         "company_site": "company_page",
@@ -833,9 +980,31 @@ def _source_category_from_hit(hit: dict[str, Any]) -> str:
     source_type = str(hit.get("source_type") or "").strip().lower()
     if source_type in {"job_posting", "careers"}:
         return "job_posting"
+    if source_type in {"government"} and _contains_any_marker(
+        " ".join(
+            [
+                str(hit.get("source_title") or ""),
+                str(hit.get("signal") or ""),
+                str(hit.get("source_url") or ""),
+            ]
+        ),
+        CONTRACT_RFP_MARKERS,
+    ):
+        return "contract_rfp"
     if source_type in {"government"}:
         return "grant"
     if source_type in {"academic", "publication"}:
+        if _contains_any_marker(
+            " ".join(
+                [
+                    str(hit.get("source_title") or ""),
+                    str(hit.get("signal") or ""),
+                    str(hit.get("source_url") or ""),
+                ]
+            ),
+            JOURNAL_CALL_MARKERS,
+        ):
+            return "journal_call"
         return "publication"
     if source_type in {"company_site", "website"}:
         return "company_page"
@@ -1036,7 +1205,30 @@ def _resolved_search_plan(
 def _plan_is_conference_request(plan: OpportunitySearchPlan | None) -> bool:
     return plan is not None and (
         plan_targets_only(plan, "conference")
-        or plan_has_objective(plan, "presentation_opportunity")
+        or (
+            len(plan.target_entity_types) <= 1
+            and plan_has_objective(plan, "presentation_opportunity")
+        )
+    )
+
+
+def _plan_is_journal_call_request(plan: OpportunitySearchPlan | None) -> bool:
+    return plan is not None and (
+        plan_targets_only(plan, "journal_call")
+        or (
+            len(plan.target_entity_types) <= 1
+            and plan_has_objective(plan, "journal_article_call")
+        )
+    )
+
+
+def _plan_is_contract_rfp_request(plan: OpportunitySearchPlan | None) -> bool:
+    return plan is not None and (
+        plan_targets_only(plan, "contract_rfp")
+        or (
+            len(plan.target_entity_types) <= 1
+            and plan_has_objective(plan, "contract_opportunity")
+        )
     )
 
 
@@ -1117,6 +1309,14 @@ def _is_conference_discovery_request(topic: str | None) -> bool:
         "institutes",
         "clinical trials",
         "grants",
+        "journal",
+        "journals",
+        "special issue",
+        "call for papers",
+        "rfp",
+        "rfps",
+        "contracts",
+        "solicitation",
         "funding",
         "launches",
         "hiring",
@@ -1160,11 +1360,34 @@ def _is_conference_discovery_request(topic: str | None) -> bool:
     )
 
 
-def _is_broad_multilane_request(topic: str | None) -> bool:
+def _is_journal_call_discovery_request(topic: str | None) -> bool:
     lowered = str(topic or "").lower()
     if not lowered:
         return False
-    if _is_conference_discovery_request(topic):
+    return any(marker in lowered for marker in JOURNAL_CALL_MARKERS) and any(
+        marker in lowered
+        for marker in (
+            "call",
+            "calls",
+            "special issue",
+            "article request",
+            "manuscript",
+            "submission",
+            "submit",
+        )
+    )
+
+
+def _is_contract_rfp_discovery_request(topic: str | None) -> bool:
+    lowered = str(topic or "").lower()
+    if not lowered:
+        return False
+    return any(marker in lowered for marker in CONTRACT_RFP_MARKERS)
+
+
+def _is_broad_multilane_request(topic: str | None) -> bool:
+    lowered = str(topic or "").lower()
+    if not lowered:
         return False
     broad_markers = (
         "broad",
@@ -1186,13 +1409,27 @@ def _is_broad_multilane_request(topic: str | None) -> bool:
         "conferences",
         "grant",
         "grants",
+        "journal",
+        "journals",
+        "special issue",
+        "call for papers",
+        "rfp",
+        "rfps",
+        "contract",
+        "contracts",
+        "solicitation",
         "advisory",
         "advisor",
         "roles",
     )
+    lane_count = sum(1 for marker in lane_markers if marker in lowered)
+    if _is_conference_discovery_request(topic) and not (
+        "all lanes" in lowered or "multiple lanes" in lowered or lane_count >= 3
+    ):
+        return False
     return (
         any(marker in lowered for marker in broad_markers)
-        and sum(1 for marker in lane_markers if marker in lowered) >= 2
+        and lane_count >= 2
     )
 
 
@@ -1415,6 +1652,95 @@ def _build_live_query_specs(
                 entity_hint="researcher",
             ),
         ]
+    elif _plan_is_journal_call_request(plan) or _is_journal_call_discovery_request(topic):
+        specs = [
+            _OpportunityQuerySpec(
+                lane="journal_call",
+                time_window="current",
+                query=(
+                    f'{context} ("call for papers" OR "call for manuscripts" OR '
+                    '"special issue") psychiatry "digital mental health"'
+                ),
+                entity_hint="journal_call",
+            ),
+            _OpportunityQuerySpec(
+                lane="journal_call",
+                time_window="current",
+                query=(
+                    '"mental health" "artificial intelligence" "special issue" '
+                    '("submit" OR "submission" OR "call for papers")'
+                ),
+                entity_hint="journal_call",
+            ),
+            _OpportunityQuerySpec(
+                lane="journal_call",
+                time_window="current",
+                query=(
+                    '"digital mental health" journal "call for papers" '
+                    '(psychiatry OR behavioral health OR implementation)'
+                ),
+                entity_hint="journal_call",
+            ),
+            _OpportunityQuerySpec(
+                lane="journal_call",
+                time_window="strategic",
+                query=(
+                    'site:frontiersin.org "digital mental health" "research topic" '
+                    '(AI OR "artificial intelligence")'
+                ),
+                entity_hint="journal_call",
+            ),
+            _OpportunityQuerySpec(
+                lane="journal_call",
+                time_window="strategic",
+                query=(
+                    'site:biomedcentral.com "call for papers" '
+                    '("mental health" OR psychiatry) ("AI" OR "digital")'
+                ),
+                entity_hint="journal_call",
+            ),
+        ]
+    elif _plan_is_contract_rfp_request(plan) or _is_contract_rfp_discovery_request(topic):
+        specs = [
+            _OpportunityQuerySpec(
+                lane="contract_rfp",
+                time_window="current",
+                query=(
+                    'site:sam.gov ("behavioral health" OR "mental health") '
+                    '("artificial intelligence" OR AI OR analytics) '
+                    '(solicitation OR "sources sought" OR RFP)'
+                ),
+                entity_hint="contract_rfp",
+            ),
+            _OpportunityQuerySpec(
+                lane="contract_rfp",
+                time_window="current",
+                query=(
+                    'site:sam.gov (psychiatry OR neuroscience OR "digital mental health") '
+                    '("request for proposal" OR solicitation OR contract)'
+                ),
+                entity_hint="contract_rfp",
+            ),
+            _OpportunityQuerySpec(
+                lane="contract_rfp",
+                time_window="current",
+                query=(
+                    'site:.gov ("behavioral health" OR "mental health") '
+                    '("RFP" OR "request for proposals" OR procurement) '
+                    '("AI" OR analytics OR evaluation)'
+                ),
+                entity_hint="contract_rfp",
+            ),
+            _OpportunityQuerySpec(
+                lane="contract_rfp",
+                time_window="current",
+                query=(
+                    '"behavioral health" "request for proposals" '
+                    '("evaluation" OR "clinical AI" OR analytics) United States'
+                ),
+                entity_hint="contract_rfp",
+            ),
+        ]
     elif _plan_is_conference_request(plan) or _is_conference_discovery_request(topic):
         specs = [
             _OpportunityQuerySpec(
@@ -1472,7 +1798,7 @@ def _build_live_query_specs(
                 entity_hint="conference",
             ),
         ]
-    elif _is_company_growth_discovery_request(topic):
+    elif _is_company_growth_discovery_request(topic) or _plan_is_strict_company_request(plan):
         specs = [
             _OpportunityQuerySpec(
                 lane="company_growth",
@@ -1725,6 +2051,24 @@ def _build_live_query_specs(
                 entity_hint="conference",
             ),
             _OpportunityQuerySpec(
+                lane="journal_call",
+                time_window="current",
+                query=(
+                    f'{context} ("call for papers" OR "special issue" OR '
+                    '"call for manuscripts") psychiatry digital mental health'
+                ),
+                entity_hint="journal_call",
+            ),
+            _OpportunityQuerySpec(
+                lane="contract_rfp",
+                time_window="current",
+                query=(
+                    f'site:sam.gov {context} ("RFP" OR solicitation OR "sources sought") '
+                    "behavioral health"
+                ),
+                entity_hint="contract_rfp",
+            ),
+            _OpportunityQuerySpec(
                 lane="grant",
                 time_window="current",
                 query=(f"site:reporter.nih.gov {context} NIH SBIR grant psychiatry neuroscience"),
@@ -1757,6 +2101,12 @@ def _build_live_query_specs(
             ),
         ]
     seen: set[str] = set()
+    if _plan_is_strict_company_request(plan):
+        specs = [
+            spec
+            for spec in specs
+            if spec.entity_hint == "company" and spec.lane not in {"role"}
+        ]
     deduped: list[_OpportunityQuerySpec] = []
     for spec in specs:
         key = spec.query.strip().lower()
@@ -1988,6 +2338,52 @@ def _build_underfill_followup_query_specs(
                 ),
             ]
         )
+    elif _plan_is_journal_call_request(search_plan) or _is_journal_call_discovery_request(topic):
+        specs.extend(
+            [
+                _OpportunityQuerySpec(
+                    lane="journal_call",
+                    time_window="current",
+                    query=(
+                        '"precision psychiatry" "special issue" '
+                        '("call for papers" OR "call for manuscripts")'
+                    ),
+                    entity_hint="journal_call",
+                ),
+                _OpportunityQuerySpec(
+                    lane="journal_call",
+                    time_window="current",
+                    query=(
+                        '"AI for mental health" journal "special issue" '
+                        '(submission OR submit OR manuscripts)'
+                    ),
+                    entity_hint="journal_call",
+                ),
+            ]
+        )
+    elif _plan_is_contract_rfp_request(search_plan) or _is_contract_rfp_discovery_request(topic):
+        specs.extend(
+            [
+                _OpportunityQuerySpec(
+                    lane="contract_rfp",
+                    time_window="current",
+                    query=(
+                        'site:sam.gov "mental health" ("data analytics" OR "AI") '
+                        '("sources sought" OR solicitation)'
+                    ),
+                    entity_hint="contract_rfp",
+                ),
+                _OpportunityQuerySpec(
+                    lane="contract_rfp",
+                    time_window="current",
+                    query=(
+                        '"behavioral health" ("notice of funding opportunity" OR RFP OR '
+                        '"request for proposal") "evaluation"'
+                    ),
+                    entity_hint="contract_rfp",
+                ),
+            ]
+        )
     elif (
         _plan_is_broad_request(search_plan)
         or _is_broad_multilane_request(topic)
@@ -2029,6 +2425,195 @@ def _build_underfill_followup_query_specs(
     return followups[:6]
 
 
+def _build_coverage_followup_query_specs(
+    topic: str | None,
+    *,
+    existing_specs: list[_OpportunityQuerySpec],
+    hits: list[dict[str, Any]],
+    search_plan: OpportunitySearchPlan | None = None,
+) -> tuple[list[_OpportunityQuerySpec], dict[str, Any]]:
+    """Target missing high-value source lanes after the first search pass."""
+
+    if not _coverage_followup_enabled():
+        return [], {}
+    expected_lanes = _expected_source_lanes_for_plan(topic, search_plan=search_plan)
+    if not expected_lanes:
+        return [], {}
+    coverage = assess_source_coverage(hits, expected_lanes=expected_lanes)
+    if not coverage.missing_lanes:
+        return [], coverage.to_dict()
+
+    context = _topic_search_context(topic)
+    seen_queries = {spec.query.strip().lower() for spec in existing_specs}
+    followups: list[_OpportunityQuerySpec] = []
+    for lane in coverage.missing_lanes:
+        for spec in _coverage_specs_for_source_lane(lane, context=context):
+            key = spec.query.strip().lower()
+            if key in seen_queries:
+                continue
+            seen_queries.add(key)
+            followups.append(spec)
+            if len(followups) >= _coverage_followup_query_cap():
+                return followups, coverage.to_dict()
+    return followups[: _coverage_followup_query_cap()], coverage.to_dict()
+
+
+def _expected_source_lanes_for_plan(
+    topic: str | None,
+    *,
+    search_plan: OpportunitySearchPlan | None,
+) -> tuple[str, ...]:
+    entity_lanes = {
+        "company": ("company_site", "press_news"),
+        "institute": ("people_institutions",),
+        "researcher": ("people_institutions", "literature"),
+        "conference": ("conference_events",),
+        "journal_call": ("literature",),
+        "contract_rfp": ("procurement_rfp",),
+        "grant_program": ("grants_funding",),
+        "trial": ("clinical_trials",),
+        "role": ("careers_jobs",),
+    }
+    lanes: list[str] = []
+    if search_plan is not None:
+        for entity_type in search_plan.target_entity_types:
+            lanes.extend(entity_lanes.get(entity_type, ()))
+    lanes.extend(
+        required_source_lanes_for_opportunity(
+            request_text=topic or "",
+            target_entity_types=search_plan.target_entity_types if search_plan else (),
+            objectives=search_plan.objectives if search_plan else (),
+        )
+    )
+    return tuple(dict.fromkeys(lanes))
+
+
+def _coverage_specs_for_source_lane(
+    lane: str,
+    *,
+    context: str,
+) -> tuple[_OpportunityQuerySpec, ...]:
+    if lane == "company_site":
+        return (
+            _OpportunityQuerySpec(
+                lane="company_growth",
+                time_window="current",
+                query=f"{context} official company website about product platform partners",
+                entity_hint="company",
+            ),
+        )
+    if lane == "press_news":
+        return (
+            _OpportunityQuerySpec(
+                lane="company_growth",
+                time_window="recent",
+                query=(
+                    f'site:businesswire.com {context} ("funding" OR "partnership" OR launch)'
+                ),
+                entity_hint="company",
+                source="news",
+            ),
+            _OpportunityQuerySpec(
+                lane="company_growth",
+                time_window="recent",
+                query=f'site:prnewswire.com {context} ("funding" OR partnership OR launch)',
+                entity_hint="company",
+                source="news",
+            ),
+        )
+    if lane == "careers_jobs":
+        return (
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="recent",
+                query=f"site:boards.greenhouse.io {context} clinical strategy remote",
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="recent",
+                query=f"site:jobs.lever.co {context} clinical AI strategy remote",
+                entity_hint="company",
+            ),
+            _OpportunityQuerySpec(
+                lane="role",
+                time_window="recent",
+                query=f"site:jobs.ashbyhq.com {context} clinical research advisor remote",
+                entity_hint="company",
+            ),
+        )
+    if lane == "clinical_trials":
+        return (
+            _OpportunityQuerySpec(
+                lane="trial",
+                time_window="current",
+                query=f"site:clinicaltrials.gov {context} recruiting study sponsor",
+                entity_hint="trial",
+            ),
+        )
+    if lane == "grants_funding":
+        return (
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="current",
+                query=f"site:reporter.nih.gov {context} NIH SBIR grant project",
+                entity_hint="grant_program",
+            ),
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="current",
+                query=f"site:grants.gov {context} funding opportunity",
+                entity_hint="grant_program",
+            ),
+        )
+    if lane == "literature":
+        return (
+            _OpportunityQuerySpec(
+                lane="journal_call",
+                time_window="evergreen",
+                query=f"site:pubmed.ncbi.nlm.nih.gov {context} psychiatry artificial intelligence",
+                entity_hint="journal_call",
+            ),
+        )
+    if lane == "procurement_rfp":
+        return (
+            _OpportunityQuerySpec(
+                lane="contract_rfp",
+                time_window="current",
+                query=f'site:sam.gov {context} ("RFP" OR solicitation OR "sources sought")',
+                entity_hint="contract_rfp",
+            ),
+        )
+    if lane == "conference_events":
+        return (
+            _OpportunityQuerySpec(
+                lane="conference",
+                time_window="recent",
+                query=f"{context} conference symposium workshop speaker abstract 2026",
+                entity_hint="conference",
+            ),
+        )
+    if lane == "people_institutions":
+        return (
+            _OpportunityQuerySpec(
+                lane="researcher",
+                time_window="current",
+                query=f"site:.edu {context} faculty principal investigator collaboration",
+                entity_hint="researcher",
+            ),
+        )
+    if lane == "regulatory":
+        return (
+            _OpportunityQuerySpec(
+                lane="contract_rfp",
+                time_window="current",
+                query=f"site:fda.gov {context} digital health medical device AI",
+                entity_hint="contract_rfp",
+            ),
+        )
+    return ()
+
+
 def _build_result_deepening_query_specs(
     *,
     topic: str | None,
@@ -2047,6 +2632,8 @@ def _build_result_deepening_query_specs(
         "company_growth",
         "collaboration",
         "grant",
+        "journal_call",
+        "contract_rfp",
         "trial",
         "role",
         "institute",
@@ -2054,11 +2641,18 @@ def _build_result_deepening_query_specs(
         "conference",
     }
     specs: list[_OpportunityQuerySpec] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, int]] = {
+        (spec.query.strip().lower(), spec.page)
+        for spec in existing_specs
+        if spec.page is not None
+    }
+    max_page = _result_deepening_max_page()
     for spec in existing_specs:
         if spec.lane not in deepenable_lanes:
             continue
         page = 2 if spec.page in {None, 1} else spec.page + 1
+        if page > max_page:
+            continue
         key = (spec.query.strip().lower(), page)
         if key in seen:
             continue
@@ -2089,6 +2683,8 @@ def _result_deepening_allowed(
     return (
         _plan_is_broad_request(search_plan)
         or _plan_is_conference_request(search_plan)
+        or _plan_is_journal_call_request(search_plan)
+        or _plan_is_contract_rfp_request(search_plan)
         or _plan_is_institute_request(search_plan)
         or _plan_is_researcher_request(search_plan)
         or _is_broad_multilane_request(topic)
@@ -2096,15 +2692,66 @@ def _result_deepening_allowed(
         or _is_institute_discovery_request(topic)
         or _is_researcher_discovery_request(topic)
         or _is_conference_discovery_request(topic)
+        or _is_journal_call_discovery_request(topic)
+        or _is_contract_rfp_discovery_request(topic)
     )
+
+
+def _coverage_followup_enabled() -> bool:
+    return os.getenv("KEYSTONE_ENABLE_SEARCH_COVERAGE_FOLLOWUP", "true").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _coverage_followup_query_cap() -> int:
+    raw = os.getenv("KEYSTONE_SEARCH_COVERAGE_FOLLOWUP_QUERY_CAP", "6").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 6
+    return max(0, min(12, value))
+
+
+def _result_deepening_max_page() -> int:
+    raw = os.getenv("KEYSTONE_OPPORTUNITY_DEEPENING_MAX_PAGE", "3").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 3
+    return max(2, min(3, value))
 
 
 def _extract_company_name(title: str, url: str = "") -> str:
     text = " ".join(title.split()).strip()
     for separator in (" | ", " - ", ":"):
         if separator in text:
-            text = text.split(separator, 1)[0].strip()
+            left, right = (part.strip() for part in text.split(separator, 1))
+            if left.lower().strip(".") in {
+                "blog",
+                "blogs",
+                "exclusive",
+                "insights",
+                "news",
+                "press",
+                "press release",
+                "press releases",
+                "resources",
+            } and right:
+                text = right
+            else:
+                text = left
             break
+    selected_vendor_match = re.match(
+        r"^.+?\s+selects\s+([A-Z][A-Za-z0-9&.' -]{2,80}?)(?:\s+as\b|\s+for\b|\s+to\b|$)",
+        text,
+        flags=re.I,
+    )
+    if selected_vendor_match:
+        text = selected_vendor_match.group(1).strip()
     lowered = f" {text.lower()} "
     markers = (
         " raises ",
@@ -2130,9 +2777,28 @@ def _extract_company_name(title: str, url: str = "") -> str:
         " study ",
     )
     cut_points = [lowered.find(marker) for marker in markers if lowered.find(marker) > 0]
+    action_cut = bool(cut_points)
     if cut_points:
         text = text[: min(cut_points)].strip()
+    if action_cut and " and " in text:
+        first, second = (part.strip() for part in text.split(" and ", 1))
+        if first and len(second.split()) >= 3:
+            text = first
     text = re.sub(r"\b(inc\.?|llc|ltd\.?|corp\.?|corporation|company)\b\.?$", "", text).strip()
+    descriptor_match = re.match(
+        (
+            r"^(?:(?:ai[- ](?:powered|augmented|driven|enabled)|"
+            r"technology[- ](?:driven|enabled)|tech[- ]enabled)\s+)?"
+            r"(?:(?:behavioral|behavioural|mental|digital|clinical|healthcare|health)\s+)*"
+            r"(?:company|provider|platform|startup|vendor)\s+(.+)$"
+        ),
+        text,
+        flags=re.I,
+    )
+    if descriptor_match:
+        candidate = descriptor_match.group(1).strip()
+        if 1 <= len(candidate.split()) <= 3:
+            text = candidate
     if text:
         return text[:100]
     host = re.sub(r"^https?://", "", url).split("/", 1)[0]
@@ -2193,6 +2859,10 @@ def _entity_kind_from_lane(
         if _contains_any_marker(haystack, INSTITUTE_MARKERS):
             return "institute"
         return "company"
+    if lane == "journal_call" or _contains_any_marker(haystack, JOURNAL_CALL_MARKERS):
+        return "journal_call"
+    if lane == "contract_rfp" or _contains_any_marker(haystack, CONTRACT_RFP_MARKERS):
+        return "contract_rfp"
     if lane == "researcher":
         if _looks_like_named_person(title, snippet):
             return "researcher"
@@ -2243,7 +2913,7 @@ def _extract_candidate_name(
             return person
     if entity_kind == "conference":
         return _conference_name_from_title(title)
-    if entity_kind in {"institute", "grant_program", "trial"}:
+    if entity_kind in {"institute", "grant_program", "trial", "journal_call", "contract_rfp"}:
         segment = _title_segment(title)
         if segment:
             return segment[:140]
@@ -2380,6 +3050,14 @@ def _signals_from_text(text: str) -> list[str]:
         ("IRB or protocol activity", ("irb", "protocol")),
         ("conference activity", ("conference", "symposium", "poster", "abstract")),
         ("publication or outcomes evidence", ("publication", "published", "outcomes", "evidence")),
+        (
+            "journal article call",
+            ("call for papers", "call for manuscripts", "special issue", "manuscript"),
+        ),
+        (
+            "contract or RFP",
+            ("rfp", "request for proposal", "solicitation", "procurement", "sources sought"),
+        ),
         ("partnership announcement", ("partnership", "partners with", "collaboration")),
     )
     for signal, keywords in keyword_map:
@@ -2404,6 +3082,10 @@ def _opportunity_type_from_text(text: str) -> OpportunityType:
         return "CNS biotech"
     if "neurotechnology" in lowered or "neurotech" in lowered:
         return "neurotechnology"
+    if any(marker in lowered for marker in JOURNAL_CALL_MARKERS):
+        return "journal article or publication call"
+    if any(marker in lowered for marker in CONTRACT_RFP_MARKERS):
+        return "contract or RFP opportunity"
     return "grant or collaboration opportunity"
 
 
@@ -2687,6 +3369,10 @@ def _candidate_name_rejection_reason(company_name: str) -> str:
         flags=re.I,
     ):
         return "candidate name is a dated newsletter or archive title"
+    if "roundup" in lowered or "rundown" in lowered or "funding and news" in lowered:
+        return "candidate name is an article, news roundup, or rundown rather than an organization"
+    if "trends" in lowered and re.search(r"\b20\d{2}\b|\b(?:vc|funding|market)\b", lowered):
+        return "candidate name is a report or trend article rather than an organization"
     if "..." in stripped or lowered.endswith(" ..."):
         return "candidate name is an article headline rather than an organization"
     if stripped.endswith("?") or len(stripped.split()) > 8:
@@ -2702,6 +3388,7 @@ def _candidate_name_rejection_reason(company_name: str) -> str:
         "what matters",
         "using ",
         "making sense",
+        "emergency readiness",
         "advancing ",
         "predict ",
         "study tools",
@@ -2710,6 +3397,10 @@ def _candidate_name_rejection_reason(company_name: str) -> str:
     )
     if any(marker in lowered for marker in headline_markers):
         return "candidate name is an article headline rather than an organization"
+    if lowered.startswith("top ") and any(
+        marker in lowered for marker in ("startup", "startups", "compan", "vendors", "platforms")
+    ):
+        return "candidate name is a listicle title rather than an organization"
     if lowered.startswith("new national ") and "study" in lowered:
         return "candidate name is an article headline rather than an organization"
     if lowered.startswith("top ") and "conferences" in lowered:
@@ -2744,7 +3435,14 @@ def _title_noise_rejection_reasons(*, title: str, url: str, snippet: str) -> lis
 def _has_real_organization_evidence(*, company_name: str, entity_kind: str, text: str) -> bool:
     if entity_kind in {"company", "institute"}:
         return True
-    if entity_kind in {"researcher", "conference", "grant_program", "trial"}:
+    if entity_kind in {
+        "researcher",
+        "conference",
+        "journal_call",
+        "contract_rfp",
+        "grant_program",
+        "trial",
+    }:
         return False
     if ORGANIZATION_SUFFIX_RE.search(company_name):
         return True
@@ -2827,6 +3525,19 @@ def _contextual_activity_reasons(
         )
         if any(marker in haystack for marker in conference_activity_markers):
             reasons.append("source text includes conference presentation evidence")
+    if entity_kind == "journal_call" and (
+        _plan_is_journal_call_request(search_plan) or _is_journal_call_discovery_request(topic)
+    ):
+        if any(marker in haystack for marker in JOURNAL_CALL_MARKERS) and any(
+            marker in haystack
+            for marker in ("call", "submission", "submit", "deadline", "special issue")
+        ):
+            reasons.append("source text includes journal article call evidence")
+    if entity_kind == "contract_rfp" and (
+        _plan_is_contract_rfp_request(search_plan) or _is_contract_rfp_discovery_request(topic)
+    ):
+        if any(marker in haystack for marker in CONTRACT_RFP_MARKERS):
+            reasons.append("source text includes contract or RFP evidence")
     return reasons
 
 
@@ -2909,7 +3620,15 @@ def _entity_kind_allowed_by_topic(
     if not lowered:
         return False
     if _is_broad_multilane_request(topic):
-        return entity_kind in {"researcher", "conference", "grant_program", "trial", "institute"}
+        return entity_kind in {
+            "researcher",
+            "conference",
+            "journal_call",
+            "contract_rfp",
+            "grant_program",
+            "trial",
+            "institute",
+        }
     if entity_kind == "conference":
         return (
             _is_conference_discovery_request(topic)
@@ -2920,9 +3639,63 @@ def _entity_kind_allowed_by_topic(
         return _is_researcher_discovery_request(topic)
     if entity_kind == "grant_program":
         return "grant" in lowered or "grants" in lowered
+    if entity_kind == "journal_call":
+        return _is_journal_call_discovery_request(topic)
+    if entity_kind == "contract_rfp":
+        return _is_contract_rfp_discovery_request(topic)
     if entity_kind == "trial":
         return "clinical trial" in lowered or "clinical trials" in lowered
     return False
+
+
+def _plan_is_strict_company_request(search_plan: OpportunitySearchPlan | None) -> bool:
+    return bool(
+        search_plan is not None
+        and search_plan.strict_targeting
+        and plan_targets_only(search_plan, "company")
+    )
+
+
+def _strict_company_target_rejection_reason(*, company_name: str, haystack: str) -> str:
+    name = " ".join(str(company_name or "").split()).strip()
+    lowered_name = name.lower()
+    lowered_haystack = str(haystack or "").lower()
+    if not lowered_name:
+        return "strict company search requires a named company entity"
+    non_company_name_patterns = (
+        r"\bagenc(?:y|ies)\b",
+        r"\badministration\b",
+        r"\bbureau\b",
+        r"\bdepartment\b",
+        r"\bministry\b",
+        r"\boffice of\b",
+        r"\buniversity\b",
+        r"\bcollege\b",
+        r"\bschool of\b",
+        r"\binstitute\b",
+        r"\blab(?:oratory)?\b",
+        r"\bprograms?\b",
+        r"\bprojects?\b",
+        r"\bstud(?:y|ies)\b",
+        r"\btrials?\b",
+        r"\bgrants?\b",
+        r"\binitiative\b",
+    )
+    if any(re.search(pattern, lowered_name) for pattern in non_company_name_patterns):
+        return "strict company search rejected a non-company agency, program, project, or institute"
+    if re.fullmatch(r"(?:hhs|nih|nimh|cms|ahrq|fda|va)(?:\s+.+)?", lowered_name):
+        return "strict company search rejected a government or agency entity"
+    if (
+        lowered_name in {"hhs", "nih", "nimh", "cms", "ahrq", "fda", "va"}
+        and ".gov" in lowered_haystack
+    ):
+        return "strict company search rejected a government or agency entity"
+    if (
+        "breakthrough" in lowered_name
+        and re.search(r"\b(?:award winners?|awards program|annual awards)\b", lowered_haystack)
+    ):
+        return "strict company search rejected an awards program or media entity"
+    return ""
 
 
 def _candidate_acceptance_review_reasons(
@@ -2960,6 +3733,8 @@ def _candidate_acceptance_review_reasons(
         "news",
         "clinical_trial",
         "grant",
+        "journal_call",
+        "contract_rfp",
         "conference",
         "job_posting",
         "company_page",
@@ -2968,6 +3743,8 @@ def _candidate_acceptance_review_reasons(
     reviewable_entity_kinds = {
         "researcher",
         "conference",
+        "journal_call",
+        "contract_rfp",
         "grant_program",
         "trial",
         "institute",
@@ -3046,12 +3823,26 @@ def _topic_relevance_rejection_reasons(
     snippet = str(hit.get("signal") or hit.get("snippet") or "")
     company_name = str(hit.get("company_name") or "")
     signals = " ".join(str(signal) for signal in hit.get("signals", []) if str(signal).strip())
-    haystack = " ".join([company_name, title, url, snippet, signals]).lower()
+    source_haystack = " ".join([company_name, title, url, snippet]).lower()
+    haystack = " ".join([source_haystack, signals]).lower()
     entity_kind = str(hit.get("entity_kind") or "").strip().lower()
     reasons: list[str] = []
+    reasons.extend(
+        _explicit_exclusion_rejection_reasons(
+            haystack=haystack,
+            topic=topic,
+        )
+    )
     if search_plan is not None and search_plan.strict_targeting:
         if entity_kind not in search_plan.target_entity_types:
             reasons.append("source entity type does not match the structured search plan target")
+        if _plan_is_strict_company_request(search_plan):
+            company_target_reason = _strict_company_target_rejection_reason(
+                company_name=company_name,
+                haystack=haystack,
+            )
+            if company_target_reason:
+                reasons.append(company_target_reason)
     else:
         if _is_researcher_discovery_request(topic) and entity_kind != "researcher":
             reasons.append("source is not a researcher or principal investigator required by topic")
@@ -3070,12 +3861,25 @@ def _topic_relevance_rejection_reasons(
         reasons.append(
             "source lacks direct psychiatry or behavioral-health relevance required by topic"
         )
-    if _requires_ai_company_relevance(topic) and not any(
-        marker in f" {haystack} " for marker in AI_TOPIC_MARKERS
+    requires_behavioral_relevance = _requires_behavioral_health_or_healthcare_ai_relevance(
+        topic,
+        search_plan=search_plan,
+    )
+    if requires_behavioral_relevance and _plan_is_strict_company_request(search_plan):
+        if not any(marker in source_haystack for marker in PSYCHIATRY_TOPIC_MARKERS):
+            reasons.append(
+                "source lacks direct behavioral-health or psychiatry relevance required by topic"
+            )
+    elif requires_behavioral_relevance and not _has_behavioral_health_or_adjacent_healthcare_ai_relevance(haystack):
+        reasons.append(
+            "source lacks behavioral-health or adjacent healthcare AI relevance required by topic"
+        )
+    if _requires_ai_company_relevance(topic) and not _has_explicit_ai_company_relevance(
+        source_haystack
     ):
         reasons.append(
-            "source lacks AI, digital, analytics, platform, or technology relevance "
-            "required by topic"
+            "source lacks explicit AI, ML, analytics, automation, or algorithm evidence "
+            "required by an AI company topic"
         )
     if _requires_advisory_topic_constraint(topic) and not any(
         marker in haystack for marker in ADVISORY_TOPIC_MARKERS
@@ -3084,6 +3888,84 @@ def _topic_relevance_rejection_reasons(
             "source lacks advisory, consulting, or fractional-role evidence required by topic"
         )
     return reasons
+
+
+def _explicit_exclusion_rejection_reasons(
+    *,
+    haystack: str,
+    topic: str | None,
+) -> list[str]:
+    lowered_topic = str(topic or "").lower()
+    if "exclude" not in lowered_topic and "excluding" not in lowered_topic:
+        return []
+    reasons: list[str] = []
+    for request_marker, candidate_markers in EXPLICIT_EXCLUSION_MARKERS.items():
+        if request_marker not in lowered_topic:
+            continue
+        if any(marker in haystack for marker in candidate_markers):
+            reasons.append(f"source matches explicitly excluded {request_marker} domain")
+    return list(dict.fromkeys(reasons))
+
+
+def _requires_behavioral_health_or_healthcare_ai_relevance(
+    topic: str | None,
+    *,
+    search_plan: OpportunitySearchPlan | None = None,
+) -> bool:
+    domain_text = " ".join(search_plan.domains if search_plan else ()).lower()
+    lowered = " ".join([str(topic or "").lower(), domain_text])
+    return any(
+        marker in lowered
+        for marker in (
+            "behavioral health",
+            "behavioural health",
+            "mental health",
+            "digital mental health",
+        )
+    )
+
+
+def _has_behavioral_health_or_adjacent_healthcare_ai_relevance(haystack: str) -> bool:
+    if any(marker in haystack for marker in PSYCHIATRY_TOPIC_MARKERS):
+        return True
+    has_adjacent_healthcare = any(marker in haystack for marker in ADJACENT_HEALTHCARE_AI_MARKERS)
+    has_ai_signal = any(marker in f" {haystack} " for marker in AI_TOPIC_MARKERS)
+    has_clinical_signal = any(
+        marker in haystack
+        for marker in (
+            "clinical",
+            "patient",
+            "provider",
+            "care",
+            "trial",
+            "evidence",
+            "outcomes",
+        )
+    )
+    has_non_clinical_focus = any(marker in haystack for marker in NON_CLINICAL_AI_MARKERS)
+    return has_adjacent_healthcare and (has_ai_signal or has_clinical_signal) and not (
+        has_non_clinical_focus
+    )
+
+
+def _has_explicit_ai_company_relevance(haystack: str) -> bool:
+    padded = f" {haystack} "
+    return any(
+        marker in padded
+        for marker in (
+            " ai ",
+            " artificial intelligence ",
+            " machine learning ",
+            " ml ",
+            " predictive ",
+            " automation ",
+            " algorithm ",
+            " analytics ",
+            " ambient ai ",
+            " copilot ",
+            " copilots ",
+        )
+    )
 
 
 def _requires_ai_company_relevance(topic: str | None) -> bool:
@@ -3226,6 +4108,12 @@ def _search_result_to_hit(
 
 def _source_category_from_search_result(*, title: str, url: str, snippet: str) -> str:
     haystack = " ".join([title, url, snippet]).lower()
+    if _contains_any_marker(haystack, CONTRACT_RFP_MARKERS):
+        return "contract_rfp"
+    if _contains_any_marker(haystack, JOURNAL_CALL_MARKERS) and any(
+        term in haystack for term in ("call", "submit", "submission", "deadline", "special issue")
+    ):
+        return "journal_call"
     if "clinicaltrials.gov" in haystack or "clinical trial" in haystack:
         return "clinical_trial"
     if any(
@@ -3266,6 +4154,10 @@ def _source_type_for_search_category(category: str, result: dict[str, Any]) -> s
         return "clinical_trial"
     if category == "grant":
         return "government"
+    if category == "contract_rfp":
+        return "government"
+    if category == "journal_call":
+        return "publication"
     if category == "publication":
         return "publication"
     if category == "conference":
@@ -3408,7 +4300,7 @@ def _search_query_specs_with_provider(
         return [
             _search_result_to_hit(spec, result)
             for spec in query_specs
-            for result in _search_with_provider(search_provider, spec, max_results)
+            for result in _search_with_provider_safe(search_provider, spec, max_results)
         ]
 
     max_workers = min(_opportunity_search_concurrency(), len(query_specs))
@@ -3416,13 +4308,13 @@ def _search_query_specs_with_provider(
         return [
             _search_result_to_hit(spec, result)
             for spec in query_specs
-            for result in _search_with_provider(search_provider, spec, max_results)
+            for result in _search_with_provider_safe(search_provider, spec, max_results)
         ]
 
     ordered_hits: list[list[dict[str, Any]]] = [[] for _spec in query_specs]
 
     def run_query(index: int, spec: _OpportunityQuerySpec) -> tuple[int, list[dict[str, Any]]]:
-        results = _search_with_provider(search_provider, spec, max_results)
+        results = _search_with_provider_safe(search_provider, spec, max_results)
         return index, [_search_result_to_hit(spec, result) for result in results]
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -3434,6 +4326,17 @@ def _search_query_specs_with_provider(
             ordered_hits[index] = hits
 
     return [hit for hits in ordered_hits for hit in hits]
+
+
+def _search_with_provider_safe(
+    search_provider: Any,
+    spec: _OpportunityQuerySpec,
+    max_results: int,
+) -> list[dict[str, Any]]:
+    try:
+        return _search_with_provider(search_provider, spec, max_results)
+    except SearchProviderError:
+        return []
 
 
 def _require_live_search_provider(search_provider: Any) -> None:
@@ -4387,6 +5290,70 @@ def search_conference_publication_sources(
     )
 
 
+def search_journal_call_sources_impl(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    return _search_structured_source_category_impl(
+        tool_key="journal_call",
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def search_journal_call_sources(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Search local dry-run journal call and special issue fixtures."""
+
+    return search_journal_call_sources_impl(
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+def search_contract_rfp_sources_impl(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    return _search_structured_source_category_impl(
+        tool_key="contract_rfp",
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def search_contract_rfp_sources(
+    topic: str | None = None,
+    max_results: int = 5,
+    fixture_json: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Search local dry-run contract, RFP, and solicitation fixtures."""
+
+    return search_contract_rfp_sources_impl(
+        topic=topic,
+        max_results=max_results,
+        fixture_json=fixture_json,
+        dry_run=dry_run,
+    )
+
+
 def search_company_page_sources_impl(
     topic: str | None = None,
     max_results: int = 5,
@@ -4545,7 +5512,8 @@ def scout_opportunities_fixture(
             "audit_notes": [
                 "Fixture mode only; no live APIs were called.",
                 "Purpose-built dry-run source bundles were used for funding/news, jobs, "
-                "clinical trials, grants, conference/publication, and company page signals.",
+                "clinical trials, grants, conference/publication, journal call, "
+                "contract/RFP, and company page signals.",
                 "Existing opportunity state was loaded from local input only."
                 if existing_state_by_company
                 else "No existing opportunity state was supplied.",
@@ -4597,6 +5565,51 @@ def scout_opportunities_live_search(
         verification_audit_notes,
     ) = _process_candidate_hits(hits, topic=topic, search_plan=resolved_search_plan)
 
+    coverage_audit_notes: list[str] = []
+    coverage_specs, source_coverage = _build_coverage_followup_query_specs(
+        topic,
+        existing_specs=query_specs,
+        hits=hits,
+        search_plan=resolved_search_plan,
+    )
+    if coverage_specs:
+        coverage_hits = _search_query_specs_with_provider(
+            search_provider=provider,
+            query_specs=coverage_specs,
+            max_results=min(8, max(max_results, _opportunity_followup_result_cap())),
+        )
+        raw_hit_count += len(coverage_hits)
+        hits = [*hits, *coverage_hits]
+        (
+            deduped,
+            filtered_hits,
+            filtered_candidates,
+            acceptance_review_candidates,
+            candidate_audit_notes,
+            coverage_verification_notes,
+        ) = _process_candidate_hits(
+            hits,
+            topic=topic,
+            search_plan=resolved_search_plan,
+        )
+        query_specs = [*query_specs, *coverage_specs]
+        queries = [spec.query for spec in query_specs]
+        missing_lanes = ", ".join(source_coverage.get("missing_lanes") or [])
+        coverage_audit_notes = [
+            (
+                "Coverage-aware search ran "
+                f"{len(coverage_specs)} targeted follow-up query/query lane(s)"
+                + (f" for missing source lanes: {missing_lanes}." if missing_lanes else ".")
+            ),
+            *coverage_verification_notes,
+        ]
+    else:
+        coverage_audit_notes = [
+            "Coverage-aware search found no missing required source lanes."
+            if source_coverage
+            else "Coverage-aware search had no applicable source-lane requirements."
+        ]
+
     adaptive_audit_notes: list[str] = []
     adaptive_specs: list[_OpportunityQuerySpec] = []
     if not deduped:
@@ -4642,14 +5655,18 @@ def scout_opportunities_live_search(
             else "Adaptive search ladder had no applicable follow-up queries."
         ]
     deepening_audit_notes: list[str] = []
-    deepening_specs = _build_result_deepening_query_specs(
-        topic=topic,
-        existing_specs=query_specs,
-        accepted_count=len(deduped),
-        desired_count=max_results,
-        search_plan=resolved_search_plan,
-    )
-    if deepening_specs:
+    deepening_rounds = 0
+    while True:
+        deepening_specs = _build_result_deepening_query_specs(
+            topic=topic,
+            existing_specs=query_specs,
+            accepted_count=len(deduped),
+            desired_count=max_results,
+            search_plan=resolved_search_plan,
+        )
+        if not deepening_specs:
+            break
+        deepening_rounds += 1
         deepening_hits = _search_query_specs_with_provider(
             search_provider=provider,
             query_specs=deepening_specs,
@@ -4674,11 +5691,14 @@ def scout_opportunities_live_search(
         deepening_audit_notes = [
             (
                 "Result deepening requested additional SearXNG/compatible result pages "
-                f"for {len(deepening_specs)} high-yield broad-search lane(s)."
+                f"for {len(deepening_specs)} high-yield broad-search lane(s) "
+                f"(round {deepening_rounds}, max page {_result_deepening_max_page()})."
             ),
             *deepening_verification_notes,
         ]
-    else:
+        if len(deduped) >= max_results:
+            break
+    if not deepening_audit_notes:
         deepening_audit_notes = [
             "Result deepening was not needed."
             if len(deduped) >= max_results or not _result_deepening_allowed(topic)
@@ -4779,6 +5799,7 @@ def scout_opportunities_live_search(
             *verification_audit_notes,
             "Broad Scout retrieval covered companies, collaborations, researchers, "
             "institutes, conferences, grants, and trials when the topic was not role-only.",
+            *coverage_audit_notes,
             *adaptive_audit_notes,
             *deepening_audit_notes,
             *underfill_audit_notes,
@@ -4924,6 +5945,8 @@ def build_opportunity_scout_agent(model: str | None = None) -> Agent:
             search_clinical_trials_sources,
             search_grant_sources,
             search_conference_publication_sources,
+            search_journal_call_sources,
+            search_contract_rfp_sources,
             search_company_page_sources,
             score_opportunity,
             handoff_to_business_research_analyst_placeholder,
@@ -4946,6 +5969,7 @@ def run_opportunity_scout_sdk(
     run_config: Any | None = None,
     live: bool = False,
     model: str | None = None,
+    session: Any | None = None,
 ) -> TypedAgentRunResult[OpportunityScoutResult]:
     """Run Opportunity Scout through the typed SDK harness."""
 
@@ -4955,4 +5979,5 @@ def run_opportunity_scout_sdk(
         output_type=OpportunityScoutResult,
         run_config=run_config,
         live=live,
+        session=session,
     )

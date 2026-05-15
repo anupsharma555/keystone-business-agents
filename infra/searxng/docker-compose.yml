@@ -1,0 +1,35 @@
+name: ${SEARXNG_COMPOSE_PROJECT:-kba-searxng}
+
+services:
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: ${SEARXNG_CONTAINER_NAME:-kba-searxng}
+    restart: unless-stopped
+    depends_on:
+      - valkey
+    ports:
+      - "127.0.0.1:${SEARXNG_PORT:-18080}:8080"
+    environment:
+      SEARXNG_SETTINGS_PATH: /etc/searxng/settings.yml
+      FORCE_OWNERSHIP: "true"
+    volumes:
+      - ./core-config:/etc/searxng
+      - searxng-cache:/var/cache/searxng
+
+  valkey:
+    image: docker.io/valkey/valkey:8-alpine
+    container_name: ${SEARXNG_VALKEY_CONTAINER_NAME:-kba-searxng-valkey}
+    restart: unless-stopped
+    command:
+      - valkey-server
+      - --save
+      - "60"
+      - "1"
+      - --loglevel
+      - warning
+    volumes:
+      - valkey-data:/data
+
+volumes:
+  searxng-cache:
+  valkey-data:

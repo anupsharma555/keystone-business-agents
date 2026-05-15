@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any
 
 from keystone_agents.agents.business_research_analyst import (
     run_business_research_analyst_research_brief_sdk,
 )
 from keystone_agents.agents.opportunity_scout import scout_opportunities_fixture
+from keystone_agents.agents.opportunity_search_planner import resolve_opportunity_search_plan
 from keystone_agents.agents.orchestrator import route_request
 from keystone_agents.agents.outreach_composer import compose_outreach_draft_fixture
 from keystone_agents.company_research import research_company_fixture
@@ -33,6 +36,11 @@ from keystone_agents.schemas.work_item import (
     WorkItemRoute,
     WorkItemSourceRef,
     utc_now_iso,
+)
+from keystone_agents.sdk_sessions import (
+    build_sdk_session,
+    context_file_session_components,
+    resolve_sdk_session_spec,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.approval_tool import build_approval_queue_item
@@ -77,6 +85,13 @@ def advance_work_item(request: WorkflowRunRequest) -> WorkflowRunResult:
     if input_text and input_text.lower() not in {"continue", "resume"}:
         work_item = work_item.model_copy(update={"request_text": input_text})
     work_item = _apply_manual_request_plan(work_item, request.manual_request_plan)
+    external_context = _load_external_context(request)
+    work_item = _apply_external_context(
+        work_item,
+        external_context,
+        context_file_path=request.context_file_path,
+    )
+    sdk_session_spec = _sdk_session_spec_for_work_item(request, work_item)
     if route != WorkItemRoute.ORCHESTRATOR:
         work_item = work_item.model_copy(
             update={
@@ -97,6 +112,7 @@ def advance_work_item(request: WorkflowRunRequest) -> WorkflowRunResult:
         metadata={
             "live_search": request.live_search,
             "live_sdk": request.live_sdk,
+            "sdk_session": sdk_session_spec.log_metadata(),
             "context_pack": {
                 "pack_type": context_pack.pack_type,
                 "ready": context_pack.ready,
@@ -110,12 +126,21 @@ def advance_work_item(request: WorkflowRunRequest) -> WorkflowRunResult:
                 ],
             },
             "manual_request_plan": _manual_plan_event_payload(request.manual_request_plan),
+            "external_context": _external_context_event_payload(
+                external_context,
+                context_file_path=request.context_file_path,
+            ),
         },
         store=store,
     )
 
     if route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
-        result = _advance_research(work_item, request=request, store=store)
+        result = _advance_research(
+            work_item,
+            request=request,
+            store=store,
+            sdk_session=build_sdk_session(sdk_session_spec) if request.live_sdk else None,
+        )
     elif route == WorkItemRoute.OPPORTUNITY_SCOUT:
         result = _advance_opportunity(work_item, request=request, store=store)
     elif route == WorkItemRoute.OUTREACH_COMPOSER:
@@ -171,6 +196,23 @@ def _route_from_manual_plan(plan: dict | None) -> WorkItemRoute | None:
         return WorkItemRoute(target_agent)
     except ValueError:
         return None
+
+
+def _sdk_session_spec_for_work_item(request: WorkflowRunRequest, work_item: WorkItem) -> Any:
+    context_scope = context_file_session_components(request.context_file_path)
+    if context_scope is not None:
+        scope, components = context_scope
+    else:
+        scope = "workitem"
+        components = (work_item.id,)
+    return resolve_sdk_session_spec(
+        scope=scope,
+        components=components,
+        enabled=request.sdk_session_enabled,
+        explicit_session_id=request.sdk_session_id,
+        database_path=request.sdk_session_db_path,
+        default_enabled=request.live_sdk,
+    )
 
 
 def _apply_manual_request_plan(work_item: WorkItem, plan: dict | None) -> WorkItem:
@@ -232,6 +274,203 @@ def _manual_plan_event_payload(plan: dict | None) -> dict:
     return {key: plan[key] for key in allowed if key in plan and plan[key] not in (None, "")}
 
 
+def _load_external_context(request: WorkflowRunRequest) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if isinstance(request.external_context, dict):
+        payload.update(request.external_context)
+    if request.context_file_path:
+        file_payload = json.loads(Path(request.context_file_path).read_text(encoding="utf-8"))
+        if not isinstance(file_payload, dict):
+            raise ValueError("context_file_path must contain a JSON object.")
+        payload.update(file_payload)
+    return payload
+
+
+def _apply_external_context(
+    work_item: WorkItem,
+    context: dict[str, Any],
+    *,
+    context_file_path: str,
+) -> WorkItem:
+    if not context:
+        return work_item
+    if str(context.get("schema") or "") == "keystone.slack.selected_message_context.v1":
+        return _apply_slack_selected_context(
+            work_item,
+            context,
+            context_file_path=context_file_path,
+        )
+    metadata = {
+        **work_item.target.metadata,
+        "external_context": _bounded_context_metadata(context),
+    }
+    if context_file_path:
+        metadata["external_context_file_path"] = context_file_path
+    return work_item.model_copy(
+        update={"target": work_item.target.model_copy(update={"metadata": metadata})}
+    ).touch()
+
+
+def _apply_slack_selected_context(
+    work_item: WorkItem,
+    context: dict[str, Any],
+    *,
+    context_file_path: str,
+) -> WorkItem:
+    selected = (
+        context.get("selected_message")
+        if isinstance(context.get("selected_message"), dict)
+        else {}
+    )
+    selected_text = _compact_context_text(selected.get("text"), max_chars=900)
+    channel_id = _compact_context_text(context.get("channel_id"), max_chars=80)
+    selected_ts = _compact_context_text(context.get("selected_message_ts"), max_chars=80)
+    permalink = _compact_context_text(context.get("permalink"), max_chars=500)
+    source_id = f"slack:{channel_id}:{selected_ts}".strip(":")
+    warnings = _context_string_list(context.get("warnings"), max_items=5, max_chars=320)
+    slack_metadata = {
+        "schema": str(context.get("schema") or ""),
+        "source": str(context.get("source") or "slack_message_action"),
+        "team_id": _compact_context_text(context.get("team_id"), max_chars=80),
+        "team_domain": _compact_context_text(context.get("team_domain"), max_chars=120),
+        "channel_id": channel_id,
+        "channel_name": _compact_context_text(context.get("channel_name"), max_chars=120),
+        "selected_message_ts": selected_ts,
+        "thread_ts": _compact_context_text(context.get("thread_ts"), max_chars=80),
+        "permalink": permalink,
+        "thread_fetch_status": _compact_context_text(
+            context.get("thread_fetch_status"),
+            max_chars=40,
+        ),
+        "warnings": warnings,
+        "selected_message": {
+            "ts": _compact_context_text(selected.get("ts"), max_chars=80),
+            "user_id": _compact_context_text(selected.get("user_id"), max_chars=80),
+            "username": _compact_context_text(selected.get("username"), max_chars=120),
+            "text": selected_text,
+            "permalink": _compact_context_text(
+                selected.get("permalink") or permalink,
+                max_chars=500,
+            ),
+        },
+        "thread_messages": _context_messages_metadata(context.get("thread_messages")),
+    }
+    if context_file_path:
+        slack_metadata["context_file_path"] = context_file_path
+    metadata = {**work_item.target.metadata, "slack_context": slack_metadata}
+    sources = list(work_item.sources)
+    if source_id and all(source.source_id != source_id for source in sources):
+        sources.append(
+            WorkItemSourceRef(
+                title="Selected Slack message",
+                url=permalink,
+                source_type="slack_message",
+                source_id=source_id,
+                supported_claim="Selected Slack context supplied by the user for this run.",
+                provider="slack",
+                extraction_status=str(context.get("thread_fetch_status") or "not_requested"),
+                retrieved_at=utc_now_iso(),
+                key_facts=[selected_text] if selected_text else [],
+            )
+        )
+    audit_notes = list(work_item.audit_notes)
+    for warning in warnings:
+        note = f"Slack context warning: {warning}"
+        if note not in audit_notes:
+            audit_notes.append(note)
+    return work_item.model_copy(
+        update={
+            "target": work_item.target.model_copy(update={"metadata": metadata}),
+            "sources": sources,
+            "audit_notes": audit_notes,
+        }
+    ).touch()
+
+
+def _external_context_event_payload(
+    context: dict[str, Any],
+    *,
+    context_file_path: str,
+) -> dict[str, Any]:
+    if not context:
+        return {}
+    payload = {
+        "schema": str(context.get("schema") or ""),
+        "source": str(context.get("source") or ""),
+    }
+    if context_file_path:
+        payload["context_file_path"] = context_file_path
+    if str(context.get("schema") or "") == "keystone.slack.selected_message_context.v1":
+        payload.update(
+            {
+                "channel_id": _compact_context_text(context.get("channel_id"), max_chars=80),
+                "selected_message_ts": _compact_context_text(
+                    context.get("selected_message_ts"),
+                    max_chars=80,
+                ),
+                "thread_ts": _compact_context_text(context.get("thread_ts"), max_chars=80),
+                "permalink": _compact_context_text(context.get("permalink"), max_chars=500),
+                "thread_fetch_status": _compact_context_text(
+                    context.get("thread_fetch_status"),
+                    max_chars=40,
+                ),
+                "warnings": _context_string_list(
+                    context.get("warnings"),
+                    max_items=5,
+                    max_chars=320,
+                ),
+            }
+        )
+    return {key: value for key, value in payload.items() if value not in ("", [], {})}
+
+
+def _bounded_context_metadata(context: dict[str, Any]) -> dict[str, Any]:
+    allowed = {}
+    for key in ("schema", "source", "permalink", "warnings"):
+        if key in context:
+            allowed[key] = context[key]
+    return allowed
+
+
+def _context_messages_metadata(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    messages: list[dict[str, str]] = []
+    for item in value[:20]:
+        if not isinstance(item, dict):
+            continue
+        messages.append(
+            {
+                "ts": _compact_context_text(item.get("ts"), max_chars=80),
+                "user_id": _compact_context_text(item.get("user_id"), max_chars=80),
+                "username": _compact_context_text(item.get("username"), max_chars=120),
+                "text": _compact_context_text(item.get("text"), max_chars=900),
+                "permalink": _compact_context_text(item.get("permalink"), max_chars=500),
+            }
+        )
+    return messages
+
+
+def _context_string_list(value: Any, *, max_items: int, max_chars: int) -> list[str]:
+    if value is None:
+        return []
+    raw_values = value if isinstance(value, list) else [value]
+    return [
+        text
+        for text in (
+            _compact_context_text(item, max_chars=max_chars) for item in raw_values[:max_items]
+        )
+        if text
+    ]
+
+
+def _compact_context_text(value: Any, *, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3].rstrip()}..."
+
+
 def _effective_max_results(request: WorkflowRunRequest) -> int:
     count = request.max_results
     plan = request.manual_request_plan if isinstance(request.manual_request_plan, dict) else {}
@@ -246,11 +485,12 @@ def _advance_research(
     *,
     request: WorkflowRunRequest,
     store: SQLiteStore | None,
+    sdk_session: Any | None = None,
 ) -> WorkflowRunResult:
     request_text = request.request_text.strip()
     selected_opportunity = selected_artifacts(work_item, "opportunity")
     target = ""
-    if request_text.lower() in {"", "continue", "resume"} and selected_opportunity:
+    if selected_opportunity and _should_research_selected_opportunity(request_text):
         target = selected_opportunity[0].title
     target = (
         target
@@ -271,7 +511,12 @@ def _advance_research(
         return _blocked_result(work_item, ready.blockers, ready.next_action, store=store)
 
     if _should_run_zotero_article_brief(work_item, request.request_text):
-        return _advance_zotero_article_research(work_item, request=request, store=store)
+        return _advance_zotero_article_research(
+            work_item,
+            request=request,
+            store=store,
+            sdk_session=sdk_session,
+        )
 
     if _should_run_zotero_collection_brief(work_item, request.request_text):
         return _advance_zotero_collection_research(work_item, request=request, store=store)
@@ -517,6 +762,7 @@ def _advance_zotero_article_research(
     *,
     request: WorkflowRunRequest,
     store: SQLiteStore | None,
+    sdk_session: Any | None = None,
 ) -> WorkflowRunResult:
     query = (
         extract_zotero_article_query(request.request_text)
@@ -572,6 +818,7 @@ def _advance_zotero_article_research(
                     local_context_source_ids=("zotero_import_cache",),
                 ),
                 live=True,
+                session=sdk_session,
             )
         except Exception as exc:
             blocker = WorkItemBlocker(
@@ -699,6 +946,16 @@ def _advance_zotero_article_research(
     )
 
 
+def _should_research_selected_opportunity(request_text: str) -> bool:
+    normalized = " ".join(str(request_text or "").strip().lower().split())
+    if normalized in {"", "continue", "resume"}:
+        return True
+    return normalized in {
+        "run deeper source-backed business research for this workitem.",
+        "find a better source-backed contact or destination for this outreach workitem.",
+    }
+
+
 def _advance_opportunity(
     work_item: WorkItem,
     *,
@@ -723,11 +980,25 @@ def _advance_opportunity(
         return _blocked_result(work_item, ready.blockers, ready.next_action, store=store)
 
     if request.live_search:
+        search_plan = (
+            resolve_opportunity_search_plan(
+                topic,
+                desired_count=_effective_max_results(request),
+                live=bool(request.live_sdk),
+            )
+            if request.live_sdk
+            else None
+        )
         scout_result, metadata = run_opportunity_scout_live(
             topic=topic,
             max_results=_effective_max_results(request),
+            search_plan=search_plan,
         )
         audit_notes = ["Live opportunity retrieval executed.", *metadata.get("debug_notes", [])]
+        if search_plan is not None:
+            audit_notes.append(
+                "Opportunity Scout used the named-agent live search planning path."
+            )
         retrieval_memory_id = _persist_retrieval_tool_memory(
             metadata,
             object_id=f"work_item_opportunity_scout:{topic}",

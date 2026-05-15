@@ -3,10 +3,12 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pydantic import BaseModel
 
+import keystone_agents.run as agent_run
 import keystone_agents.sdk as sdk
 from keystone_agents.config import load_settings
 from keystone_agents.model_provider import (
@@ -71,6 +73,9 @@ MODEL_ENV_VARS = (
     "KEYSTONE_OUTREACH_COMPOSER_MODEL",
     "KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER",
     "KEYSTONE_OUTREACH_COMPOSER_BASE_URL",
+    "KEYSTONE_CHIEF_OF_STAFF_MODEL",
+    "KEYSTONE_CHIEF_OF_STAFF_MODEL_PROVIDER",
+    "KEYSTONE_CHIEF_OF_STAFF_BASE_URL",
     "KEYSTONE_TRACE_WORKFLOW_NAME",
     "KEYSTONE_TRACE_GROUP_ID",
     "KEYSTONE_TRACE_METADATA",
@@ -98,6 +103,120 @@ def test_get_model_config_defaults_without_api_key(monkeypatch: pytest.MonkeyPat
 
 def test_validate_sdk_available() -> None:
     assert validate_sdk_available() is True
+
+
+def test_typed_sdk_sync_forwards_session_to_local_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+    session = object()
+
+    class DummyRunner:
+        @staticmethod
+        def run_sync(agent: Any, prompt: str, **kwargs: Any) -> Any:
+            calls.append({"agent": agent, "prompt": prompt, **kwargs})
+            return SimpleNamespace(final_output={"value": "ok"})
+
+    monkeypatch.setattr(sdk, "Runner", DummyRunner)
+    monkeypatch.setattr(sdk, "validate_sdk_available", lambda: True)
+
+    agent = SimpleNamespace(name="Dummy Agent", model=None)
+    raw_result, output = sdk.run_typed_sdk_sync(
+        agent,
+        "Hello",
+        MinimalOutput,
+        run_config=SimpleNamespace(model="fake-local"),
+        session=session,
+    )
+
+    assert raw_result.final_output == {"value": "ok"}
+    assert output == MinimalOutput(value="ok")
+    assert calls[0]["session"] is session
+
+
+def test_typed_sdk_sync_forwards_session_to_live_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+    session = object()
+
+    class DummyRunner:
+        @staticmethod
+        def run_sync(agent: Any, prompt: str, **kwargs: Any) -> Any:
+            calls.append({"agent": agent, "prompt": prompt, **kwargs})
+            return SimpleNamespace(final_output={"value": "ok"})
+
+    monkeypatch.setattr(sdk, "Runner", DummyRunner)
+    monkeypatch.setattr(
+        sdk,
+        "_live_config_for_agent",
+        lambda agent, config: SimpleNamespace(provider="openai", model="fake-live"),
+    )
+    monkeypatch.setattr(
+        sdk,
+        "build_live_run_config",
+        lambda *args, **kwargs: SimpleNamespace(model="fake-live"),
+    )
+
+    sdk.run_typed_sdk_sync(
+        SimpleNamespace(name="Dummy Agent", model=None),
+        "Hello",
+        MinimalOutput,
+        live=True,
+        session=session,
+    )
+
+    assert calls[0]["session"] is session
+
+
+def test_retrieved_sdk_synthesis_forwards_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    session = object()
+
+    def fake_run_typed_sdk_agent(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        output = MinimalOutput(value="ok")
+        return agent_run.TypedAgentRunResult(
+            agent_name=kwargs["agent"].name,
+            output=output,
+            raw_result=SimpleNamespace(final_output=output),
+            live=False,
+        )
+
+    monkeypatch.setattr(agent_run, "run_typed_sdk_agent", fake_run_typed_sdk_agent)
+
+    outcome = agent_run.run_retrieved_sdk_synthesis(
+        agent=SimpleNamespace(name="Dummy Agent", model=None),
+        output_type=MinimalOutput,
+        retrieve=lambda: {"raw": True},
+        normalize=lambda raw: f"raw={raw['raw']}",
+        input_summary="dummy",
+        run_config=SimpleNamespace(model="fake-local"),
+        session=session,
+    )
+
+    assert outcome.output == MinimalOutput(value="ok")
+    assert captured["session"] is session
+
+
+def test_typed_sdk_agent_uses_env_session_when_not_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    session = object()
+
+    def fake_run_typed_sdk_sync(*args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return SimpleNamespace(final_output={"value": "ok"}), MinimalOutput(value="ok")
+
+    monkeypatch.setattr(agent_run, "build_sdk_session_from_env", lambda: session)
+    monkeypatch.setattr(agent_run, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+
+    result = agent_run.run_typed_sdk_agent(
+        agent=SimpleNamespace(name="Dummy Agent", model=None),
+        typed_input="Hello",
+        output_type=MinimalOutput,
+        run_config=SimpleNamespace(model="fake-local"),
+    )
+
+    assert result.output == MinimalOutput(value="ok")
+    assert captured["session"] is session
 
 
 def test_sdk_fallback_validation_errors_are_clear(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -320,6 +439,7 @@ def test_runtime_agent_model_config_keeps_research_agents_openai_based(
     monkeypatch.setenv("KEYSTONE_ORCHESTRATOR_MODEL", "openai-orchestrator-fixture")
     monkeypatch.setenv("KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL", "openai-account-fixture")
     monkeypatch.setenv("KEYSTONE_OPPORTUNITY_SCOUT_MODEL", "openai-opportunity-fixture")
+    monkeypatch.setenv("KEYSTONE_CHIEF_OF_STAFF_MODEL", "openai-chief-fixture")
 
     assert get_runtime_agent_model_config("orchestrator").provider == "openai"
     assert get_runtime_agent_model_config("orchestrator").model == ("openai-orchestrator-fixture")
@@ -329,6 +449,7 @@ def test_runtime_agent_model_config_keeps_research_agents_openai_based(
     assert get_runtime_agent_model_config("opportunity_scout").model == (
         "openai-opportunity-fixture"
     )
+    assert get_runtime_agent_model_config("chief_of_staff").model == "openai-chief-fixture"
 
 
 def test_business_agent_model_defaults_are_scoped(
@@ -353,6 +474,9 @@ def test_business_agent_model_defaults_are_scoped(
         OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
     )
     assert get_runtime_agent_model_config("opportunity_scout").model == (
+        OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
+    )
+    assert get_runtime_agent_model_config("chief_of_staff").model == (
         OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
     )
 

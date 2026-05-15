@@ -73,6 +73,14 @@ class Settings:
     serper_api_key: str | None = None
     searxng_base_url: str | None = None
     searxng_api_key: str | None = None
+    tavily_api_key: str | None = None
+    tavily_base_url: str = "https://api.tavily.com"
+    tavily_search_depth: str = "basic"
+    tavily_mcp_link: str | None = None
+    tavily_monthly_credit_limit: int = 1000
+    tavily_monthly_soft_limit: int = 850
+    tavily_credit_enforcement: str = "warn"
+    tavily_usage_path: str | None = None
     apify_api_token: str | None = None
     browserless_api_key: str | None = None
     website_extractor: str = "trafilatura"
@@ -99,6 +107,16 @@ def _env_value(name: str) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _env_int(name: str, default: int) -> int:
+    value = _env_value(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def _mapping_env_value(env: Mapping[str, str], name: str) -> str | None:
@@ -253,6 +271,16 @@ def load_settings(env_file: str | Path | None = None, *, force_dotenv: bool = Fa
         serper_api_key=_env_value("SERPER_API_KEY"),
         searxng_base_url=_env_value("SEARXNG_BASE_URL"),
         searxng_api_key=_env_value("SEARXNG_API_KEY"),
+        tavily_api_key=_env_value("TAVILY_API_KEY"),
+        tavily_base_url=_env_value("TAVILY_BASE_URL") or "https://api.tavily.com",
+        tavily_search_depth=(_env_value("TAVILY_SEARCH_DEPTH") or "basic").lower(),
+        tavily_mcp_link=_env_value("TAVILY_MCP_LINK") or _env_value("TAVILY_MCP_link"),
+        tavily_monthly_credit_limit=_env_int("KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT", 1000),
+        tavily_monthly_soft_limit=_env_int("KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT", 850),
+        tavily_credit_enforcement=(
+            _env_value("KEYSTONE_TAVILY_CREDIT_ENFORCEMENT") or "warn"
+        ).lower(),
+        tavily_usage_path=_env_value("KEYSTONE_TAVILY_USAGE_PATH"),
         apify_api_token=_env_value("APIFY_API_TOKEN"),
         browserless_api_key=_env_value("BROWSERLESS_API_KEY"),
         website_extractor=(_env_value("KEYSTONE_WEBSITE_EXTRACTOR") or "trafilatura").lower(),

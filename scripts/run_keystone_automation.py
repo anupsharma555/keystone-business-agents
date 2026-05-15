@@ -11,6 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.automation_inventory import (
+    automation_spec_for_command,
+    ensure_default_automation_inventory,
+)
 from keystone_agents.health import (
     SEVERITY_ERROR,
     SEVERITY_HIGH,
@@ -18,6 +22,7 @@ from keystone_agents.health import (
     run_health_check,
 )
 from keystone_agents.schemas.approval import ApprovalQueueStatus
+from keystone_agents.schemas.automation import AutomationRun, AutomationRunStatus
 from keystone_agents.storage.sqlite_store import SQLiteStore, redact_secrets
 from keystone_agents.tools.slack_tool import SlackTool
 
@@ -208,11 +213,14 @@ def main(argv: list[str] | None = None) -> int:
             child = _run_child(_gmail_command(args), env=env, timeout_seconds=args.timeout_seconds)
 
     if child.returncode != 0:
+        summary = _automation_summary(args, child)
+        _record_automation_summary(args, child, summary)
         _notify_failure(args, child)
         _print_child_failure(child)
         return child.returncode
 
     summary = _automation_summary(args, child)
+    _record_automation_summary(args, child, summary)
     if args.json:
         print(json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True))
     else:
@@ -436,6 +444,11 @@ def _automation_summary(args: argparse.Namespace, child: ChildRun) -> dict[str, 
     items = storage.get("items") if isinstance(storage, dict) else []
     agent_run = storage.get("agent_run") if isinstance(storage, dict) else {}
     approval_count = len(items) if isinstance(items, list) else 0
+    work_item_id = _first_nested_value(output, "work_item_id") or _first_nested_value(
+        output,
+        "work_item",
+        "id",
+    )
     return {
         "automation": {
             "command": args.command,
@@ -447,9 +460,101 @@ def _automation_summary(args: argparse.Namespace, child: ChildRun) -> dict[str, 
             "external_writes_enabled": _external_writes_enabled(args),
             "agent_run_id": agent_run.get("id") if isinstance(agent_run, dict) else None,
             "approval_queue_items": approval_count,
+            "work_item_id": work_item_id or "",
+            "channel": getattr(args, "approval_channel", "")
+            or getattr(args, "failure_slack_channel", "")
+            or "",
         },
         "child_output": output,
     }
+
+
+def _record_automation_summary(
+    args: argparse.Namespace,
+    child: ChildRun,
+    summary: dict[str, Any],
+) -> None:
+    """Persist AutomationSpec and AutomationRun state for Chief of Staff review."""
+
+    database_url = getattr(args, "database_url", None)
+    store = SQLiteStore(database_url)
+    ensure_default_automation_inventory(store)
+    spec = automation_spec_for_command(
+        str(args.command),
+        stage=str(getattr(args, "stage", "")),
+    )
+    store.save_automation_spec(spec)
+    automation = summary.get("automation") if isinstance(summary, dict) else {}
+    if not isinstance(automation, dict):
+        automation = {}
+    status = _automation_run_status(args, child)
+    run = AutomationRun(
+        automation_id=spec.id,
+        automation_name=spec.name,
+        stage=str(getattr(args, "stage", "")),
+        status=status,
+        work_item_id=str(automation.get("work_item_id") or ""),
+        channel=str(automation.get("channel") or spec.default_channel),
+        approval_count=int(automation.get("approval_queue_items") or 0),
+        failure_summary=_redacted_excerpt(child.stderr or child.stdout) if child.returncode else "",
+        next_safe_action=_next_safe_action_for_automation(args, child),
+        command=child.command,
+        output_summary={
+            "agent_run_id": automation.get("agent_run_id"),
+            "returncode": child.returncode,
+            "gmail_writes_enabled": automation.get("gmail_writes_enabled"),
+            "external_writes_enabled": automation.get("external_writes_enabled"),
+        },
+        metadata={
+            "controller": "scripts/run_keystone_automation.py",
+            "child_stdout_present": bool(child.stdout.strip()),
+            "child_stderr_present": bool(child.stderr.strip()),
+        },
+    )
+    store.save_automation_run(run)
+
+
+def _automation_run_status(
+    args: argparse.Namespace,
+    child: ChildRun,
+) -> AutomationRunStatus:
+    if child.returncode != 0:
+        return AutomationRunStatus.FAILED
+    if getattr(args, "stage", "") == "dry-run":
+        return AutomationRunStatus.DRY_RUN
+    return AutomationRunStatus.SUCCESS
+
+
+def _next_safe_action_for_automation(args: argparse.Namespace, child: ChildRun) -> str:
+    if child.returncode != 0:
+        return "Review the redacted child error, fix the blocker, then rerun dry-run first."
+    if args.command == "weekly-opportunity":
+        return "Review generated opportunities and pending approval queue items."
+    if args.command == "gmail-triage":
+        return "Review Gmail triage output before enabling the next gated stage."
+    return "Review automation output."
+
+
+def _first_nested_value(payload: Any, *keys: str) -> str:
+    if not keys:
+        return ""
+    if isinstance(payload, dict):
+        if len(keys) == 1 and keys[0] in payload and not isinstance(payload[keys[0]], dict):
+            return str(payload[keys[0]] or "")
+        if keys[0] in payload:
+            value = _first_nested_value(payload[keys[0]], *keys[1:])
+            if value:
+                return value
+        for value in payload.values():
+            found = _first_nested_value(value, *keys)
+            if found:
+                return found
+    if isinstance(payload, list):
+        for item in payload:
+            found = _first_nested_value(item, *keys)
+            if found:
+                return found
+    return ""
 
 
 def _gmail_writes_enabled(args: argparse.Namespace) -> bool:

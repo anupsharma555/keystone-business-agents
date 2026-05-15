@@ -32,6 +32,10 @@ Keystone agents are dry-run first and draft-only by default. They may classify m
 - Current live paths are intentionally narrow: Gmail read, Gmail labels, Gmail
   draft creation, SearchProvider-backed research search, live-gated website
   extraction for selected pages, and Slack approval notifications.
+- Slack `@KNI` business-agent mode is a request/review bridge only. Slack
+  context, background thread results, approval-card posting, message actions,
+  Slack history access, live model execution, live search, and Gmail draft
+  creation are separate flags, and none enables external sending.
 - Gmail live mode is draft-only. External email sending is intentionally not implemented.
 - Gmail label management is preview-first for cleanup: managed labels use one primary triage label plus overlays, and obsolete label removal requires an explicit cleanup flag.
 - Data-only follow-up recommendations may be saved locally for review, but scheduling remains a

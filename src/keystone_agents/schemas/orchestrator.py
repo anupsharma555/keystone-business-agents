@@ -17,6 +17,7 @@ RouteName = Literal[
     "business_research_analyst",
     "opportunity_scout",
     "outreach_composer",
+    "chief_of_staff",
     "clarification",
 ]
 RoutingMode = Literal["deterministic", "llm", "llm_unavailable"]

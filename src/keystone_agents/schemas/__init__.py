@@ -6,6 +6,21 @@ from keystone_agents.schemas.approval import (
     ApprovalScope,
     ApprovalState,
 )
+from keystone_agents.schemas.automation import (
+    AutomationArtifactRef,
+    AutomationChannelBinding,
+    AutomationFinding,
+    AutomationInventoryReport,
+    AutomationRun,
+    AutomationSpec,
+    ChiefOfStaffWriteRequest,
+    NaturalInteractionResolution,
+)
+from keystone_agents.schemas.chief_of_staff import (
+    ChiefOfStaffResult,
+    ChiefOfStaffRouteRecommendation,
+    ChiefOfStaffSourceRef,
+)
 from keystone_agents.schemas.company_profile import (
     ClaimEvidenceRecord,
     CompanyBriefFact,
@@ -199,6 +214,14 @@ __all__ = [
     "ApprovalRequest",
     "ApprovalScope",
     "ApprovalState",
+    "AutomationArtifactRef",
+    "AutomationChannelBinding",
+    "AutomationFinding",
+    "AutomationInventoryReport",
+    "AutomationRun",
+    "AutomationSpec",
+    "ChiefOfStaffWriteRequest",
+    "NaturalInteractionResolution",
     "SourceRecord",
     "ContactRecord",
     "CRMAccountContext",
@@ -215,6 +238,9 @@ __all__ = [
     "CRMWriteOperation",
     "CRMWriteResult",
     "CRMWriteStatus",
+    "ChiefOfStaffResult",
+    "ChiefOfStaffRouteRecommendation",
+    "ChiefOfStaffSourceRef",
     "LocalAccountContext",
     "EmailTriage",
     "EmailTriageResult",

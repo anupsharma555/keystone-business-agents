@@ -8,7 +8,9 @@ The implemented human interface is local-first:
 - SQLite is the system of record and audit layer.
 - Gmail is an optional live source and draft surface for labeled email only.
 - Sent-email style profiling is optional and stores aggregate redacted profile data only.
-- Slack is an optional approval notification surface, not a command center yet.
+- Slack is an optional request and approval notification surface through the
+  local `keystone-slack` runtime; business-agent actions remain local,
+  dry-run-safe, and approval-gated unless each live flag is explicitly enabled.
 - CRM access is local fixture/table-mirror context only; no live CRM provider is enabled.
 - Local dashboard exports are markdown or JSON generated from SQLite.
 
@@ -97,6 +99,10 @@ Live opt-in:
 - Gmail draft creation: also requires `--create-draft` plus a local
   `approved_for_send/send` approval record for the target `gmail_draft`.
 - Slack approval notification: `--request-approval --live-slack --no-dry-run`.
+- Slack `@KNI` business-agent context: configure the `keystone-slack` bridge
+  flags in `docs/SLACK_BUSINESS_AGENT_MODE.md`; live model execution, search,
+  Slack posting, Slack history access, and Gmail draft creation remain separate
+  opt-ins.
 - Live search: `--live-search --no-dry-run` plus provider configuration.
 - Live CRM: not implemented. CRM write-like operations remain dry-run local table-mirror
   previews and require approval metadata before use.
@@ -108,7 +114,8 @@ Live opt-in:
 Implemented:
 
 - Triggered by CLI in fixture mode by default.
-- Optional live search through `SearchProvider` for SearXNG, Serper, or Firecrawl
+- Optional live search through `SearchProvider` for SearXNG plus capped hosted
+  web search, or explicit Serper/Firecrawl selection
   when explicitly enabled.
 - Broad live searches use multi-lane retrieval and can run bounded adaptive
   follow-up queries plus result-page deepening when accepted records under-fill.

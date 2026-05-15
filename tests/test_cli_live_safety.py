@@ -784,6 +784,26 @@ def test_live_test_env_defaults_search_and_gmail_clis(
     assert gmail_args.allow_inbox is True
 
 
+def test_serper_is_not_offered_as_live_search_fallback() -> None:
+    import scripts.run_opportunity_scout as scout_cli
+    import scripts.run_opportunity_to_outreach_loop as loop_cli
+    import scripts.run_orchestrated_search_handoff as handoff_cli
+    import scripts.run_weekly_opportunity_workflow as weekly_cli
+
+    for parser in (
+        scout_cli.build_parser(),
+        handoff_cli.build_parser(),
+        weekly_cli.build_parser(),
+        loop_cli.build_parser(),
+    ):
+        action = next(
+            item
+            for item in parser._actions
+            if item.option_strings == ["--fallback-search-provider"]
+        )
+        assert "serper" not in action.choices
+
+
 def test_live_test_env_auto_promotes_sdk_only_specialist_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1262,6 +1282,7 @@ def test_company_research_cr1_improvement_case_run_sdk_supports_live_search(
             ]
 
     _disable_dotenv(monkeypatch)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "false")
     monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(cli, "SDK_RUN_CONFIG_FACTORY", lambda: LOCAL_RUN_CONFIG)

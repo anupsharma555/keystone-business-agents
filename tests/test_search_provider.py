@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
+
 import pytest
 
 from keystone_agents.config import Settings
 from keystone_agents.sdk import ToolGuardrailViolation
 from keystone_agents.tools.search_provider import (
+    AgentsWebSearchOutput,
+    AgentsWebSearchProvider,
+    AgentsWebSearchResult,
     DryRunSearchProvider,
     FirecrawlSearchProvider,
     LiveSearchProviderRequiredError,
@@ -15,7 +21,11 @@ from keystone_agents.tools.search_provider import (
     SearxngSearchProvider,
     SerperConfigurationError,
     SerperSearchProvider,
+    TavilyConfigurationError,
+    TavilySearchError,
+    TavilySearchProvider,
     build_search_provider,
+    normalize_search_provider_name,
 )
 from keystone_agents.tools.serper_tool import search_web
 
@@ -132,6 +142,25 @@ class FirecrawlSearchResponse:
         }
 
 
+class TavilySearchResponse:
+    status_code = 200
+
+    def json(self) -> dict[str, object]:
+        return {
+            "results": [
+                {
+                    "title": "Mentavi Health careers",
+                    "url": "https://mentavi.com/careers/",
+                    "content": "Official careers page for Mentavi Health.",
+                    "raw_content": "Full careers page text.",
+                    "published_date": "2026-05-01",
+                }
+            ],
+            "response_time": "0.80",
+            "usage": {"credits": 1},
+        }
+
+
 def test_build_search_provider_defaults_to_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
 
@@ -158,6 +187,22 @@ def test_invalid_search_provider_name_fails_clearly() -> None:
         build_search_provider("not-a-search-provider", live=False)
 
 
+def test_search_provider_normalizer_accepts_agents_web_search_aliases() -> None:
+    assert normalize_search_provider_name("tavily-search") == SearchProviderName.TAVILY
+    assert (
+        normalize_search_provider_name("agents-web-search")
+        == SearchProviderName.AGENTS_WEB_SEARCH
+    )
+    assert (
+        normalize_search_provider_name("openai-web-search")
+        == SearchProviderName.AGENTS_WEB_SEARCH
+    )
+    assert (
+        normalize_search_provider_name("native_web_search")
+        == SearchProviderName.AGENTS_WEB_SEARCH
+    )
+
+
 def test_live_search_uses_configured_provider_from_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -173,6 +218,57 @@ def test_live_search_uses_configured_provider_from_settings(
 
     assert isinstance(provider, SearxngSearchProvider)
     provider.validate_configuration()
+
+
+def test_build_search_provider_can_build_agents_web_search_provider() -> None:
+    dry_provider = build_search_provider("agents-web-search", live=False)
+    live_provider = build_search_provider("agents-web-search", live=True)
+
+    assert isinstance(dry_provider, DryRunSearchProvider)
+    assert dry_provider.provider_name == "agents-web-search"
+    assert isinstance(live_provider, AgentsWebSearchProvider)
+
+
+def test_build_search_provider_can_build_tavily_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "keystone_agents.tools.search_provider.load_settings",
+        lambda: Settings(tavily_api_key="test-tavily-key"),
+    )
+
+    dry_provider = build_search_provider("tavily", live=False)
+    live_provider = build_search_provider("tavily", live=True)
+
+    assert isinstance(dry_provider, DryRunSearchProvider)
+    assert dry_provider.provider_name == "tavily"
+    assert isinstance(live_provider, TavilySearchProvider)
+
+
+def test_agents_web_search_provider_normalizes_runner_output() -> None:
+    provider = AgentsWebSearchProvider(
+        live=True,
+        runner=lambda _prompt, _request: AgentsWebSearchOutput(
+            results=[
+                AgentsWebSearchResult(
+                    title="Mentavi careers",
+                    url="https://mentavi.com/careers/",
+                    snippet="Official careers page.",
+                    date="last week",
+                )
+            ]
+        ),
+    )
+
+    assert provider.search_web("Mentavi careers", num_results=1) == [
+        SearchResult(
+            title="Mentavi careers",
+            link="https://mentavi.com/careers/",
+            snippet="Official careers page.",
+            source="agents-web-search",
+            date="last week",
+        )
+    ]
 
 
 def test_search_provider_guardrails_reject_sensitive_queries() -> None:
@@ -459,6 +555,126 @@ def test_firecrawl_provider_parses_search_response_and_sends_search_options(
     }
 
 
+def test_tavily_structured_search_uses_basic_depth_and_parses_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url: str, *, headers: dict[str, str], json: dict[str, object], timeout: float):
+        calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return TavilySearchResponse()
+
+    monkeypatch.setattr("keystone_agents.tools.search_provider.requests.post", fake_post)
+
+    provider = TavilySearchProvider(
+        live=True,
+        api_key="test-tavily-key",
+        base_url="https://api.tavily.com",
+        search_depth="basic",
+        timeout_seconds=4.0,
+    )
+    results = provider.search_structured(
+        SearchRequest(
+            query="Mentavi Health careers",
+            num_results=1,
+            time_range="month",
+            country="US",
+            scrape=True,
+        )
+    )
+
+    assert results == [
+        SearchResult(
+            title="Mentavi Health careers",
+            link="https://mentavi.com/careers/",
+            snippet="Official careers page for Mentavi Health.",
+            source="tavily",
+            date="2026-05-01",
+            content="Full careers page text.",
+        )
+    ]
+    assert calls[0]["url"] == "https://api.tavily.com/search"
+    assert calls[0]["headers"]["Authorization"] == "Bearer test-tavily-key"
+    assert calls[0]["json"] == {
+        "query": "Mentavi Health careers",
+        "max_results": 1,
+        "search_depth": "basic",
+        "topic": "general",
+        "include_answer": False,
+        "include_images": False,
+        "include_raw_content": "markdown",
+        "include_usage": True,
+        "time_range": "month",
+        "country": "united states",
+    }
+    assert provider.last_credit_usage["request_credits"] == 1
+    assert provider.last_credit_usage["status"] == "ok"
+
+
+def test_tavily_structured_search_tracks_provider_reported_credits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    usage_path = tmp_path / "tavily_usage.json"
+
+    def fake_post(url: str, *, headers: dict[str, str], json: dict[str, object], timeout: float):
+        return TavilySearchResponse()
+
+    monkeypatch.setenv("KEYSTONE_TAVILY_USAGE_PATH", str(usage_path))
+    monkeypatch.setattr("keystone_agents.tools.search_provider.requests.post", fake_post)
+
+    provider = TavilySearchProvider(
+        live=True,
+        api_key="test-tavily-key",
+        base_url="https://api.tavily.com",
+        search_depth="basic",
+    )
+    provider.search_web("Mentavi Health careers", num_results=1)
+
+    current_month = datetime.now(UTC).strftime("%Y-%m")
+    stored = json.loads(usage_path.read_text(encoding="utf-8"))
+    assert stored["months"][current_month]["credits"] == 1
+    assert provider.last_credit_usage["request_credits"] == 1
+    assert provider.last_credit_usage["observed_monthly_credits"] == 1
+    assert provider.last_credit_usage["status"] == "ok"
+
+
+def test_tavily_credit_budget_can_block_when_monthly_limit_is_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    usage_path = tmp_path / "tavily_usage.json"
+    current_month = datetime.now(UTC).strftime("%Y-%m")
+    usage_path.write_text(
+        json.dumps({"months": {current_month: {"credits": 1}}}),
+        encoding="utf-8",
+    )
+    calls: list[object] = []
+
+    def fake_post(*args: object, **kwargs: object) -> None:
+        calls.append((args, kwargs))
+        raise AssertionError("credit budget block should happen before network")
+
+    monkeypatch.setenv("KEYSTONE_TAVILY_USAGE_PATH", str(usage_path))
+    monkeypatch.setenv("KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT", "1")
+    monkeypatch.setenv("KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT", "1")
+    monkeypatch.setenv("KEYSTONE_TAVILY_CREDIT_ENFORCEMENT", "block")
+    monkeypatch.setattr("keystone_agents.tools.search_provider.requests.post", fake_post)
+
+    provider = TavilySearchProvider(
+        live=True,
+        api_key="test-tavily-key",
+        base_url="https://api.tavily.com",
+        search_depth="basic",
+    )
+
+    with pytest.raises(TavilySearchError, match="above the configured limit"):
+        provider.search_web("Mentavi Health careers", num_results=1)
+
+    assert calls == []
+    assert provider.last_credit_usage["allowed"] is False
+
+
 def test_searxng_provider_filters_unsafe_search_result_outputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -503,6 +719,17 @@ def test_serper_live_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
         SerperSearchProvider(live=True).search_web("Curebase", num_results=1)
 
 
+def test_tavily_live_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "keystone_agents.tools.search_provider.load_settings",
+        lambda: Settings(tavily_api_key=None),
+    )
+
+    with pytest.raises(TavilyConfigurationError, match="TAVILY_API_KEY is required"):
+        TavilySearchProvider(live=True).search_web("Curebase", num_results=1)
+
+
 def test_pytest_search_paths_make_no_network_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SERPER_API_KEY", "test-key-that-must-not-be-used")
     monkeypatch.setenv("SEARXNG_BASE_URL", "http://127.0.0.1:8080")
@@ -515,4 +742,5 @@ def test_pytest_search_paths_make_no_network_calls(monkeypatch: pytest.MonkeyPat
 
     assert build_search_provider("serper", live=False).search_web("Curebase", 1) == []
     assert build_search_provider("searxng", live=False).search_web("Curebase", 1) == []
+    assert build_search_provider("tavily", live=False).search_web("Curebase", 1) == []
     assert search_web("Curebase", num_results=1) == []

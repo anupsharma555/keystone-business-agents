@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from threading import RLock
 from time import perf_counter
 from typing import Any
@@ -13,6 +13,11 @@ from urllib.parse import urlparse
 from pydantic import BaseModel
 
 from keystone_agents.schemas.retrieval import RetrievalHint
+from keystone_agents.source_registry import (
+    assess_source_coverage,
+    required_source_lanes_for_company,
+    required_source_lanes_for_opportunity,
+)
 from keystone_agents.tools.search_provider import (
     SearchProviderConfigurationError,
     SearchProviderError,
@@ -215,6 +220,10 @@ class RetrievalQualityAssessment:
     reasons: tuple[str, ...]
     opportunity_lane_count: int = 0
     opportunity_lane_labels: tuple[str, ...] = ()
+    source_lane_count: int = 0
+    source_lane_labels: tuple[str, ...] = ()
+    missing_source_lanes: tuple[str, ...] = ()
+    source_coverage: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -227,6 +236,7 @@ class RetrievalProviderUsage:
     requests_attempted: int = 0
     requests_succeeded: int = 0
     raw_result_count: int = 0
+    credits_used: int = 0
     total_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -243,6 +253,7 @@ def provider_value_summary(
         attempted = int(float(usage.get("requests_attempted") or 0))
         succeeded = int(float(usage.get("requests_succeeded") or 0))
         raw_results = int(float(usage.get("raw_result_count") or 0))
+        credits_used = int(float(usage.get("credits_used") or 0))
         seconds = float(usage.get("total_seconds") or 0.0)
         summaries.append(
             {
@@ -250,6 +261,7 @@ def provider_value_summary(
                 "requests_attempted": attempted,
                 "requests_succeeded": succeeded,
                 "raw_result_count": raw_results,
+                "credits_used": credits_used,
                 "results_per_success": round(raw_results / succeeded, 2) if succeeded else 0.0,
                 "seconds_per_success": round(seconds / succeeded, 2) if succeeded else 0.0,
             }
@@ -357,10 +369,14 @@ def build_provider_sequence(
     else:
         configured = (configured_provider or "").strip().lower()
         if configured in ("", SearchProviderName.DRY_RUN.value, SearchProviderName.SEARXNG.value):
-            providers = [SearchProviderName.SEARXNG.value, SearchProviderName.SERPER.value]
+            providers = [SearchProviderName.SEARXNG.value]
         else:
             providers = [configured]
-    if fallback_provider and fallback_provider not in providers:
+    if (
+        fallback_provider
+        and fallback_provider != SearchProviderName.SERPER.value
+        and fallback_provider not in providers
+    ):
         providers.append(fallback_provider)
     return tuple(_dedupe_sequence(providers))
 
@@ -384,6 +400,14 @@ def assess_company_search_quality(
     linkedin_source_present = _linkedin_source_present(results)
     primary_source_count = _primary_source_count(results, company_url=company_url)
     recent_signal_count = _recent_signal_count(results)
+    source_coverage = assess_source_coverage(
+        results,
+        expected_lanes=required_source_lanes_for_company(
+            company_url=company_url,
+            request_text=request_text,
+        ),
+        expected_domains=[company_url] if company_url else [],
+    )
 
     reasons: list[str] = list(hint.reasons)
     needs_precision = False
@@ -402,6 +426,17 @@ def assess_company_search_quality(
     if hint.needs_precision_search and recent_signal_count == 0:
         needs_precision = True
         reasons.append("request needs higher-precision or more current evidence")
+    if source_coverage.missing_lanes:
+        reasons.append(
+            "source coverage missing lanes: " + ", ".join(source_coverage.missing_lanes)
+        )
+        if result_count < 4 or "company_site" in source_coverage.missing_lanes:
+            needs_precision = True
+    if source_coverage.missing_expected_domains:
+        reasons.append(
+            "expected source domains missing: "
+            + ", ".join(source_coverage.missing_expected_domains)
+        )
 
     needs_structured = hint.needs_structured_enrichment and not linkedin_source_present
     if needs_structured:
@@ -425,6 +460,10 @@ def assess_company_search_quality(
         needs_structured_enrichment=needs_structured,
         needs_search_review=needs_review,
         reasons=tuple(dict.fromkeys(reasons)),
+        source_lane_count=len(source_coverage.observed_lanes),
+        source_lane_labels=source_coverage.observed_lanes,
+        missing_source_lanes=source_coverage.missing_lanes,
+        source_coverage=source_coverage.to_dict(),
     )
 
 
@@ -446,6 +485,10 @@ def assess_opportunity_search_quality(
     recent_signal_count = _recent_signal_count(results)
     linkedin_source_present = _linkedin_source_present(results)
     lane_coverage = _opportunity_scout_lane_coverage(results)
+    source_coverage = assess_source_coverage(
+        results,
+        expected_lanes=required_source_lanes_for_opportunity(request_text=request_text),
+    )
     minimum_results = max(2, min(desired_results, 3))
     request_is_role_focused = _request_is_role_focused(request_text)
     reasons: list[str] = list(hint.reasons)
@@ -472,6 +515,12 @@ def assess_opportunity_search_quality(
     if hint.needs_precision_search and recent_signal_count == 0:
         needs_precision = True
         reasons.append("opportunity search lacks clear recency evidence")
+    if source_coverage.missing_lanes:
+        reasons.append(
+            "source coverage missing lanes: " + ", ".join(source_coverage.missing_lanes)
+        )
+        if source_coverage.expected_lane_recall < 0.5:
+            needs_precision = True
 
     company_heavy = (
         result_count >= minimum_results
@@ -518,6 +567,10 @@ def assess_opportunity_search_quality(
         reasons=tuple(dict.fromkeys(reasons)),
         opportunity_lane_count=len(lane_coverage.lane_labels),
         opportunity_lane_labels=lane_coverage.lane_labels,
+        source_lane_count=len(source_coverage.observed_lanes),
+        source_lane_labels=source_coverage.observed_lanes,
+        missing_source_lanes=source_coverage.missing_lanes,
+        source_coverage=source_coverage.to_dict(),
     )
 
 
@@ -537,6 +590,10 @@ def assess_role_search_quality(
     result_count, unique_domain_count, duplicate_ratio = _result_stats(results)
     primary_source_count = _primary_source_count(results, company_url=None)
     recent_signal_count = _recent_signal_count(results)
+    source_coverage = assess_source_coverage(
+        results,
+        expected_lanes=required_source_lanes_for_opportunity(request_text=request_text),
+    )
     reasons: list[str] = list(hint.reasons)
 
     needs_precision = False
@@ -549,6 +606,12 @@ def assess_role_search_quality(
     if hint.needs_precision_search and recent_signal_count == 0:
         needs_precision = True
         reasons.append("role search lacks clear recency evidence")
+    if source_coverage.missing_lanes:
+        reasons.append(
+            "source coverage missing lanes: " + ", ".join(source_coverage.missing_lanes)
+        )
+        if "careers_jobs" in source_coverage.missing_lanes:
+            needs_precision = True
 
     needs_structured = hint.needs_structured_enrichment
     if needs_structured:
@@ -570,6 +633,10 @@ def assess_role_search_quality(
         needs_structured_enrichment=needs_structured,
         needs_search_review=needs_review,
         reasons=tuple(dict.fromkeys(reasons)),
+        source_lane_count=len(source_coverage.observed_lanes),
+        source_lane_labels=source_coverage.observed_lanes,
+        missing_source_lanes=source_coverage.missing_lanes,
+        source_coverage=source_coverage.to_dict(),
     )
 
 
@@ -603,26 +670,40 @@ class HybridSearchProvider:
         quality_assessor: Callable[[Sequence[Any], str], RetrievalQualityAssessment],
         provider_factory: Callable[[str | None], Any] | None = None,
         parallel_provider_fanout: bool = False,
+        deepening_provider_sequence: Sequence[str] = (),
+        provider_request_budget: ProviderRequestBudget | None = None,
     ) -> None:
         resolved_sequence = tuple(_dedupe_sequence(provider_sequence))
         if not resolved_sequence:
-            resolved_sequence = (SearchProviderName.SEARXNG.value, SearchProviderName.SERPER.value)
+            resolved_sequence = (SearchProviderName.SEARXNG.value,)
         self.provider_name = resolved_sequence[0]
         self._provider_sequence = resolved_sequence
+        self._deepening_provider_sequence = tuple(
+            provider_name
+            for provider_name in _dedupe_sequence(deepening_provider_sequence)
+            if provider_name not in resolved_sequence
+        )
         self._autonomy_hint = autonomy_hint
         self._quality_assessor = quality_assessor
         self._provider_factory = provider_factory or (
             lambda provider_name: build_search_provider(provider=provider_name, live=True)
         )
         self._parallel_provider_fanout = parallel_provider_fanout
+        self._provider_request_budget = provider_request_budget
         self._lock = RLock()
         self._providers: dict[str, Any] = {}
         self._provider_usage = {
-            provider_name: RetrievalProviderUsage() for provider_name in self._provider_sequence
+            provider_name: RetrievalProviderUsage()
+            for provider_name in (*self._provider_sequence, *self._deepening_provider_sequence)
+        }
+        self._provider_credit_contexts: dict[str, list[dict[str, Any]]] = {
+            provider_name: []
+            for provider_name in (*self._provider_sequence, *self._deepening_provider_sequence)
         }
         self._provider_errors: list[dict[str, str]] = []
         self._all_results: list[Any] = []
         self._precision_search_escalated = False
+        self._deepening_search_used = False
         self._provider_error_fallback_used = False
         self._structured_enrichment_recommended = False
         self._search_review_recommended = False
@@ -631,6 +712,10 @@ class HybridSearchProvider:
     @property
     def provider_sequence(self) -> tuple[str, ...]:
         return self._provider_sequence
+
+    @property
+    def deepening_provider_sequence(self) -> tuple[str, ...]:
+        return self._deepening_provider_sequence
 
     @property
     def autonomy_hint(self) -> RetrievalAutonomyHint:
@@ -657,8 +742,11 @@ class HybridSearchProvider:
         merged: list[Any] = []
         last_error: SearchProviderConfigurationError | SearchProviderError | None = None
         recovered_from_error = False
+        last_assessment: RetrievalQualityAssessment | None = None
 
         for index, provider_name in enumerate(self._provider_sequence):
+            if not self._acquire_provider_request_budget(provider_name):
+                continue
             self._increment_usage(provider_name, "requests_attempted")
             provider = self._get_provider(provider_name)
             started_at = perf_counter()
@@ -674,7 +762,7 @@ class HybridSearchProvider:
                         "message": str(exc),
                     }
                 )
-                if merged:
+                if merged and index >= len(self._provider_sequence) - 1:
                     break
                 recovered_from_error = True
                 continue
@@ -682,18 +770,29 @@ class HybridSearchProvider:
             self._record_provider_elapsed(provider_name, perf_counter() - started_at)
             self._increment_usage(provider_name, "requests_succeeded")
             self._increment_usage(provider_name, "raw_result_count", amount=len(results))
+            self._record_provider_credit_usage(provider_name, provider)
             merged = list(results) if not merged else merge_search_results(merged, results)
             assessment = self._quality_assessor(merged, request.query)
+            last_assessment = assessment
             self._record_assessment(assessment)
-            if not assessment.needs_precision_search or index >= len(self._provider_sequence) - 1:
+            if not self._should_use_backup_provider(assessment):
                 self._all_results.extend(merged)
                 if recovered_from_error and provider_name != self.provider_name:
                     self._provider_error_fallback_used = True
                 return merged
+            if index >= len(self._provider_sequence) - 1:
+                break
             self._precision_search_escalated = True
 
         if merged:
+            merged = self._run_deepening_providers_if_needed(
+                merged,
+                request,
+                assessment=last_assessment,
+            )
             self._all_results.extend(merged)
+            if recovered_from_error:
+                self._provider_error_fallback_used = True
             return merged
         if last_error is not None:
             raise last_error
@@ -712,30 +811,41 @@ class HybridSearchProvider:
         result_groups: dict[str, list[Any]] = {}
         last_error: SearchProviderConfigurationError | SearchProviderError | None = None
 
-        def run_provider(provider_name: str) -> tuple[str, list[Any], float, Exception | None]:
+        def run_provider(
+            provider_name: str,
+        ) -> tuple[str, list[Any], float, dict[str, Any], Exception | None]:
             provider = self._get_provider(provider_name)
             started_at = perf_counter()
             try:
+                results = self._provider_search(provider, request)
                 return (
                     provider_name,
-                    self._provider_search(provider, request),
+                    results,
                     perf_counter() - started_at,
+                    self._provider_credit_usage_context(provider),
                     None,
                 )
             except (SearchProviderConfigurationError, SearchProviderError) as exc:
-                return provider_name, [], perf_counter() - started_at, exc
+                return provider_name, [], perf_counter() - started_at, {}, exc
 
+        runnable_providers: list[str] = []
         for provider_name in self._provider_sequence:
+            if not self._acquire_provider_request_budget(provider_name):
+                continue
             self._increment_usage(provider_name, "requests_attempted")
+            runnable_providers.append(provider_name)
 
-        max_workers = max(1, min(len(self._provider_sequence), 4))
+        if not runnable_providers:
+            return []
+
+        max_workers = max(1, min(len(runnable_providers), 4))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(run_provider, provider_name): provider_name
-                for provider_name in self._provider_sequence
+                for provider_name in runnable_providers
             }
             for future in as_completed(futures):
-                provider_name, results, elapsed_seconds, error = future.result()
+                provider_name, results, elapsed_seconds, credit_usage, error = future.result()
                 self._record_provider_elapsed(provider_name, elapsed_seconds)
                 if error is not None:
                     last_error = error
@@ -750,6 +860,7 @@ class HybridSearchProvider:
                     continue
                 self._increment_usage(provider_name, "requests_succeeded")
                 self._increment_usage(provider_name, "raw_result_count", amount=len(results))
+                self._record_provider_credit_usage(provider_name, credit_usage=credit_usage)
                 result_groups[provider_name] = list(results)
 
         ordered_result_groups = [
@@ -759,14 +870,19 @@ class HybridSearchProvider:
         ]
         merged = merge_search_results(*ordered_result_groups)
         if not merged:
-            if last_error is not None:
+            if last_error is not None and not result_groups:
                 raise last_error
             return []
 
         assessment = self._quality_assessor(merged, request.query)
         self._record_assessment(assessment)
-        if assessment.needs_precision_search:
+        if self._should_use_backup_provider(assessment):
             self._precision_search_escalated = True
+            merged = self._run_deepening_providers_if_needed(
+                merged,
+                request,
+                assessment=assessment,
+            )
         if last_error is not None:
             self._provider_error_fallback_used = True
         with self._lock:
@@ -779,6 +895,54 @@ class HybridSearchProvider:
         if callable(structured):
             return list(structured(request))
         return list(provider.search_web(request.query, num_results=request.num_results))
+
+    def _run_deepening_providers_if_needed(
+        self,
+        merged: list[Any],
+        request: SearchRequest,
+        *,
+        assessment: RetrievalQualityAssessment | None,
+    ) -> list[Any]:
+        if not self._deepening_provider_sequence:
+            return merged
+        current_assessment = assessment or self._quality_assessor(merged, request.query)
+        if not self._should_use_backup_provider(current_assessment):
+            return merged
+
+        self._precision_search_escalated = True
+        deepened = list(merged)
+        for provider_name in self._deepening_provider_sequence:
+            if not self._acquire_provider_request_budget(provider_name):
+                continue
+            self._increment_usage(provider_name, "requests_attempted")
+            provider = self._get_provider(provider_name)
+            started_at = perf_counter()
+            try:
+                results = self._provider_search(provider, request)
+            except (SearchProviderConfigurationError, SearchProviderError) as exc:
+                self._record_provider_elapsed(provider_name, perf_counter() - started_at)
+                with self._lock:
+                    self._provider_errors.append(
+                        {
+                            "provider": provider_name,
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                    )
+                continue
+
+            self._record_provider_elapsed(provider_name, perf_counter() - started_at)
+            self._increment_usage(provider_name, "requests_succeeded")
+            self._increment_usage(provider_name, "raw_result_count", amount=len(results))
+            self._record_provider_credit_usage(provider_name, provider)
+            if results:
+                self._deepening_search_used = True
+            deepened = merge_search_results(deepened, results)
+            current_assessment = self._quality_assessor(deepened, request.query)
+            self._record_assessment(current_assessment)
+            if not self._should_use_backup_provider(current_assessment):
+                break
+        return deepened
 
     def search(
         self,
@@ -817,16 +981,34 @@ class HybridSearchProvider:
         }
         return {
             "search_provider_sequence": list(self._provider_sequence),
+            "search_deepening_provider_sequence": list(self._deepening_provider_sequence),
             "primary_search_provider": self.provider_name,
             "search_providers_attempted": providers_attempted,
             "search_providers_used": providers_used,
             "search_provider_used": providers_used[-1] if providers_used else self.provider_name,
             "parallel_provider_fanout": self._parallel_provider_fanout,
             "precision_search_escalated": self._precision_search_escalated,
+            "deepening_search_used": self._deepening_search_used,
             "provider_error_fallback_used": self._provider_error_fallback_used,
             "search_provider_errors": list(self._provider_errors),
             "provider_usage": provider_usage,
             "provider_value_summary": provider_value_summary(provider_usage),
+            "tavily_estimated_credits_used": self._provider_usage[
+                SearchProviderName.TAVILY.value
+            ].credits_used
+            or self._provider_usage[SearchProviderName.TAVILY.value].requests_succeeded
+            if SearchProviderName.TAVILY.value in self._provider_usage
+            else 0,
+            "tavily_credit_budget": (
+                self._provider_credit_contexts.get(SearchProviderName.TAVILY.value, [])[-1]
+                if self._provider_credit_contexts.get(SearchProviderName.TAVILY.value)
+                else {}
+            ),
+            "agents_web_search_estimated_calls_used": self._provider_usage[
+                SearchProviderName.AGENTS_WEB_SEARCH.value
+            ].requests_succeeded
+            if SearchProviderName.AGENTS_WEB_SEARCH.value in self._provider_usage
+            else 0,
             "serper_estimated_credits_used": self._provider_usage[
                 SearchProviderName.SERPER.value
             ].requests_succeeded
@@ -849,6 +1031,24 @@ class HybridSearchProvider:
                 self._providers[provider_name] = provider
             return provider
 
+    def _acquire_provider_request_budget(self, provider_name: str) -> bool:
+        if self._provider_request_budget is None:
+            return True
+        if self._provider_request_budget.try_acquire(provider_name):
+            return True
+        with self._lock:
+            self._provider_errors.append(
+                {
+                    "provider": provider_name,
+                    "error_type": "ProviderRequestCapExceeded",
+                    "message": (
+                        f"{provider_name} request cap reached "
+                        f"({self._provider_request_budget.limit_for(provider_name)} per run)."
+                    ),
+                }
+            )
+        return False
+
     def _increment_usage(self, provider_name: str, field_name: str, amount: int = 1) -> None:
         with self._lock:
             usage = self._provider_usage.get(provider_name, RetrievalProviderUsage())
@@ -868,6 +1068,11 @@ class HybridSearchProvider:
                     if field_name == "raw_result_count"
                     else usage.raw_result_count
                 ),
+                credits_used=(
+                    usage.credits_used + amount
+                    if field_name == "credits_used"
+                    else usage.credits_used
+                ),
                 total_seconds=usage.total_seconds,
             )
 
@@ -878,6 +1083,7 @@ class HybridSearchProvider:
                 requests_attempted=usage.requests_attempted,
                 requests_succeeded=usage.requests_succeeded,
                 raw_result_count=usage.raw_result_count,
+                credits_used=usage.credits_used,
                 total_seconds=round(usage.total_seconds + max(0.0, elapsed_seconds), 3),
             )
 
@@ -891,12 +1097,111 @@ class HybridSearchProvider:
             )
             self._quality_reasons.extend(assessment.reasons)
 
+    def _record_provider_credit_usage(
+        self,
+        provider_name: str,
+        provider: Any | None = None,
+        *,
+        credit_usage: dict[str, Any] | None = None,
+    ) -> None:
+        usage_context = credit_usage or self._provider_credit_usage_context(provider)
+        credits = _credit_usage_count(usage_context)
+        if credits <= 0 and provider_name != SearchProviderName.TAVILY.value:
+            return
+        with self._lock:
+            if credits > 0:
+                usage = self._provider_usage.get(provider_name, RetrievalProviderUsage())
+                self._provider_usage[provider_name] = RetrievalProviderUsage(
+                    requests_attempted=usage.requests_attempted,
+                    requests_succeeded=usage.requests_succeeded,
+                    raw_result_count=usage.raw_result_count,
+                    credits_used=usage.credits_used + credits,
+                    total_seconds=usage.total_seconds,
+                )
+            if usage_context:
+                contexts = self._provider_credit_contexts.setdefault(provider_name, [])
+                contexts.append(dict(usage_context))
+                del contexts[:-5]
+
+    @staticmethod
+    def _provider_credit_usage_context(provider: Any | None) -> dict[str, Any]:
+        if provider is None:
+            return {}
+        usage = getattr(provider, "last_credit_usage", None)
+        if callable(usage):
+            try:
+                usage = usage()
+            except TypeError:
+                usage = {}
+        if isinstance(usage, Mapping):
+            return dict(usage)
+        return {}
+
+    @staticmethod
+    def _should_use_backup_provider(assessment: RetrievalQualityAssessment) -> bool:
+        return (
+            assessment.needs_precision_search
+            or assessment.needs_structured_enrichment
+            or assessment.needs_search_review
+        )
+
+
+@dataclass
+class ProviderRequestBudget:
+    """Thread-safe per-run request cap for optional live providers."""
+
+    limits: Mapping[str, int]
+    _used: dict[str, int] = field(default_factory=dict)
+    _lock: RLock = field(default_factory=RLock, repr=False)
+
+    def limit_for(self, provider_name: str) -> int | None:
+        normalized = _dedupe_sequence([provider_name])[0] if provider_name else provider_name
+        limit = self.limits.get(normalized)
+        if limit is None:
+            return None
+        return int(limit)
+
+    def try_acquire(self, provider_name: str) -> bool:
+        normalized = _dedupe_sequence([provider_name])[0] if provider_name else provider_name
+        limit = self.limit_for(normalized)
+        if limit is None:
+            return True
+        if limit <= 0:
+            return False
+        with self._lock:
+            used = self._used.get(normalized, 0)
+            if used >= limit:
+                return False
+            self._used[normalized] = used + 1
+            return True
+
+
+def _credit_usage_count(usage_context: Mapping[str, Any] | None) -> int:
+    if not usage_context:
+        return 0
+    for key in ("request_credits", "credits_used", "credits"):
+        try:
+            value = int(float(usage_context.get(key) or 0))
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
 
 def _dedupe_sequence(items: Sequence[str]) -> list[str]:
     seen: set[str] = set()
     ordered: list[str] = []
+    aliases = {
+        "openai-web-search": SearchProviderName.AGENTS_WEB_SEARCH.value,
+        "openai-websearch": SearchProviderName.AGENTS_WEB_SEARCH.value,
+        "agents-websearch": SearchProviderName.AGENTS_WEB_SEARCH.value,
+        "sdk-web-search": SearchProviderName.AGENTS_WEB_SEARCH.value,
+        "native-web-search": SearchProviderName.AGENTS_WEB_SEARCH.value,
+    }
     for item in items:
-        normalized = str(item or "").strip().lower()
+        normalized = str(item or "").strip().lower().replace("_", "-")
+        normalized = aliases.get(normalized, normalized)
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)

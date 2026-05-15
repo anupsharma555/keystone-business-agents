@@ -115,6 +115,12 @@ SIGNAL_TERMS = (
     "study",
     "trial",
     "validation",
+    "rfp",
+    "solicitation",
+    "procurement",
+    "special issue",
+    "call for papers",
+    "call for manuscripts",
 )
 COMPANY_FACT_TERMS = ("about", "company", "leadership", "platform", "product", "team")
 

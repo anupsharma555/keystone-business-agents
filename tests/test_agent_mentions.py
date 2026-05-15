@@ -21,11 +21,27 @@ def test_parse_kni_business_agent_analyst_alias() -> None:
     assert mention.input_text == "research Lindus Health"
 
 
+def test_parse_kni_keystone_ask_alias() -> None:
+    mention = parse_agent_mention("@KNI keystone ask business research analyst research Lindus")
+
+    assert mention.explicit is True
+    assert mention.route == "business_research_analyst"
+    assert mention.input_text == "research Lindus"
+
+
 def test_parse_kni_slack_user_mention() -> None:
     mention = parse_agent_mention("<@U123> opportunity scout find psychiatry AI roles")
 
     assert mention.route == "opportunity_scout"
     assert mention.input_text == "find psychiatry AI roles"
+
+
+def test_parse_kni_chief_of_staff_alias() -> None:
+    mention = parse_agent_mention("@KNI chief of staff route calendar update to #meetings")
+
+    assert mention.route == "chief_of_staff"
+    assert mention.agent_name == "KNI Chief of Staff Agent"
+    assert mention.input_text == "route calendar update to #meetings"
 
 
 def test_parse_without_mention_defaults_to_orchestrator_context() -> None:

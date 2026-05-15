@@ -131,3 +131,94 @@ def test_cli_work_items_continue_resolves_single_active_item(tmp_path: Path, cap
     output = capsys.readouterr().out
     assert f"WorkItem: {work_item_id}" in output
     assert "Route: opportunity_scout" in output
+
+
+def test_cli_work_items_langgraph_json_exposes_graph_metadata(tmp_path: Path, capsys) -> None:
+    database_url = _database_url(tmp_path)
+
+    exit_code = main(
+        [
+            "work-items",
+            "advance",
+            "--input",
+            "research NeuroFlow",
+            "--database-url",
+            database_url,
+            "--langgraph",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["route"] == "business_research_analyst"
+    assert payload["_langgraph"]["runtime"] in {"langgraph", "dependency_free_fallback"}
+    assert payload["_langgraph"]["node_path"] == ["advance_work_item"]
+    assert payload["_langgraph"]["checkpoint_required"] is False
+
+
+def test_cli_work_items_langgraph_env_enables_graph_metadata(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    monkeypatch.setenv("KNI_BUSINESS_AGENTS_LANGGRAPH", "true")
+
+    exit_code = main(
+        [
+            "work-items",
+            "advance",
+            "--input",
+            "research NeuroFlow",
+            "--database-url",
+            database_url,
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["route"] == "business_research_analyst"
+    assert payload["_langgraph"]["runtime"] in {"langgraph", "dependency_free_fallback"}
+    assert payload["_langgraph"]["node_path"] == ["advance_work_item"]
+
+
+def test_cli_work_items_langgraph_env_uses_stable_work_item_thread(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    start_exit = main(
+        [
+            "work-items",
+            "advance",
+            "--input",
+            "research NeuroFlow",
+            "--database-url",
+            database_url,
+            "--json",
+        ]
+    )
+    start_payload = json.loads(capsys.readouterr().out)
+    work_item_id = start_payload["work_item"]["id"]
+    monkeypatch.setenv("KNI_BUSINESS_AGENTS_LANGGRAPH", "true")
+
+    continue_exit = main(
+        [
+            "work-items",
+            "advance",
+            work_item_id,
+            "--input",
+            "continue",
+            "--database-url",
+            database_url,
+            "--json",
+        ]
+    )
+    continue_payload = json.loads(capsys.readouterr().out)
+
+    assert start_exit == 0
+    assert continue_exit == 0
+    assert continue_payload["_langgraph"]["checkpoint_key"] == f"work-item:{work_item_id}"

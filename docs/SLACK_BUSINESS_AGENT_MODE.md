@@ -1,0 +1,83 @@
+# Slack Business-Agent Mode
+
+Slack business-agent mode is the bridge from the local `keystone-slack` Socket
+Mode worker into this repository's `keystone ask` and script-backed agent
+workflows. Slack is the request and review surface. SQLite remains the audit
+record. Keystone still does not send external email, publish outbound copy, or
+approve work automatically.
+
+## Safe Operating Model
+
+- Dry-run is the default in this repo.
+- Live model execution is separate from live search, Slack posting, Gmail draft
+  creation, and external sending.
+- `@KNI` Slack context can route a request into the business-agents CLI, but it
+  does not grant permission to send, publish, schedule, or bypass approval.
+- `@KNI keystone ask ...` is accepted as an alias for the same natural-language
+  entrypoint; the bridge should strip the CLI-shaped prefix and route the
+  remaining request normally.
+- Slack approval cards are notifications only unless a human uses the local
+  approval flow or a Slack button that records a local SQLite decision.
+- Gmail draft creation is draft-only and requires a local approved approval
+  item. Gmail send is not implemented.
+- Slack history access is disabled by default and should stay disabled unless
+  the workspace intentionally grants and reviews history scopes.
+
+## Config Reference
+
+These variables are read by the `keystone-slack` runtime. They are listed here
+so business-agent developers can see the safety boundary from this repo.
+
+| Feature | Env vars | Requires | Boundary |
+| --- | --- | --- | --- |
+| Slack mention context | `KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED`, `KNI_BUSINESS_AGENTS_REPO`, `KNI_BUSINESS_AGENTS_PYTHON`, `KNI_BUSINESS_AGENTS_DATABASE_URL` | Slack `app_mentions:read`, `chat:write`, `SLACK_BOT_TOKEN` | Routes text into local agent workflows only. |
+| Background thread results | `KNI_BUSINESS_AGENTS_BACKGROUND_RUNS` | Slack `chat:write`, `SLACK_BOT_TOKEN` | Posts started/final messages; does not alter agent side-effect gates. |
+| Approval packets | `KNI_BUSINESS_AGENTS_APPROVALS_ENABLED`, `KNI_BUSINESS_AGENTS_LIVE_SLACK`, `KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL` | Slack `chat:write`, `SLACK_BOT_TOKEN` | Posts review cards. Approval remains local and scoped. |
+| Slack message actions | `KNI_BUSINESS_AGENTS_MESSAGE_ACTIONS_ENABLED` | Slack interactivity enabled | Buttons update local approval records for the named scope; they do not send email, post externally, publish, or schedule. |
+| Slack history context | `KNI_BUSINESS_AGENTS_HISTORY_CONTEXT_ENABLED`, `SLACK_APP_MENTION_POLLING_ENABLED` | Slack `channels:history` and `groups:history` if intentionally enabled | Optional fallback/history access; disabled by default. |
+| LangGraph WorkItem orchestration | `KNI_BUSINESS_AGENTS_LANGGRAPH` | KBA installed with `.[orchestration]` in `KNI_BUSINESS_AGENTS_PYTHON` | Routes WorkItem advancement through the optional graph wrapper; does not change live side-effect gates. |
+| SDK conversation sessions | `KEYSTONE_SDK_SESSIONS`, `KEYSTONE_SDK_SESSION_DB`, `KEYSTONE_SDK_SESSION_ID` | OpenAI Agents SDK live or local SDK run | Local SQLite conversation continuity for follow-up wording. Default automatic capture is limited to Chief of Staff and live WorkItem scopes; WorkItems remain canonical state. |
+| Live model execution | `KNI_BUSINESS_AGENTS_LIVE_SDK` and workflow-specific live SDK flags | Business-agent model credentials | Enables LLM synthesis/planning only. |
+| Live search | `KNI_BUSINESS_AGENTS_LIVE_SEARCH` | Search provider config in this repo | Enables retrieval only. |
+| Gmail drafts | `KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS`, `KNI_BUSINESS_AGENTS_GMAIL_DRAFT_ACCOUNT` or `KEYSTONE_GMAIL_DRAFT_ACCOUNT` | Gmail OAuth plus an approval item that explicitly allows Slack-triggered Gmail draft creation | Creates Gmail drafts only in the configured account; no send path. |
+
+`SLACK_CONFIGURED_BOT_SCOPES` is optional in `keystone-slack`. When set to the
+installed app's bot-scope list, Socket Mode startup can warn if enabled features
+are missing required scopes.
+
+## End-To-End Workflows
+
+1. `@KNI business agents status` checks bridge configuration and live flag
+   posture.
+2. `@KNI business research analyst research Lindus Health` routes a named
+   specialist request. Live SDK and live search are still controlled by explicit
+   flags.
+   `@KNI keystone ask business research analyst research Lindus Health` is the
+   equivalent CLI-shaped alias.
+   Business Research Analyst, Opportunity Scout, Gmail Triage, and Outreach
+   Composer do not get broad default SDK conversation sessions unless routed
+   through a scoped WorkItem/Slack context or explicitly opted in.
+3. `@KNI opportunity scout "find 5 behavioral health AI advisory opportunities"`
+   can save local opportunity artifacts. It does not draft outreach by itself.
+4. `@KNI business agents weekly opportunities for digital mental health
+   partnerships` can create local approval items. Set
+   `KNI_BUSINESS_AGENTS_LIVE_SLACK=true` only when review cards should be posted
+   to Slack.
+5. `@KNI workitem continue <work_item_id>` advances an existing WorkItem. With
+   `KNI_BUSINESS_AGENTS_LANGGRAPH=true`, the same command records a
+   `langgraph_orchestration` timeline event and a stable graph thread key.
+6. A human approval updates SQLite approval state. If
+   `KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS=true`, an approved email item may
+   create a Gmail draft only when the approval card says it is for saving a
+   Gmail draft and the OAuth account matches the configured draft account.
+   Nothing sends the draft.
+
+Run this repo's health check after changing flags:
+
+```bash
+.venv/bin/python scripts/health_check.py --verbose
+```
+
+Run `keystone-slack` Socket Mode startup after changing Slack app scopes. It now
+prints actionable config warnings for enabled business-agent features that lack
+required local config or declared Slack scopes.

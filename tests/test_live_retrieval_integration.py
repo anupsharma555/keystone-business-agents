@@ -13,7 +13,7 @@ from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.tools.search_provider import SearchResult
 
 
-def test_company_live_retrieval_escalates_from_searxng_to_serper(
+def test_company_live_retrieval_defaults_to_searxng_with_hosted_parallel_lane(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import keystone_agents.live_retrieval as live_retrieval
@@ -29,21 +29,15 @@ def test_company_live_retrieval_escalates_from_searxng_to_serper(
                 )
             ]
 
-    class FakeSerperProvider:
+    class FakeAgentsWebSearchProvider:
         def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
             return [
                 SearchResult(
-                    title="Curebase",
-                    link="https://www.curebase.com",
-                    snippet="Official clinical trial software site.",
-                    source="serper",
-                ),
-                SearchResult(
-                    title="Curebase leadership",
-                    link="https://www.linkedin.com/company/curebase/",
-                    snippet="Leadership and team context.",
-                    source="serper",
-                ),
+                    title="Curebase careers",
+                    link="https://www.curebase.com/careers",
+                    snippet="Official careers page.",
+                    source="agents-web-search",
+                )
             ]
 
     monkeypatch.setattr(
@@ -59,9 +53,10 @@ def test_company_live_retrieval_escalates_from_searxng_to_serper(
     monkeypatch.setattr(
         live_retrieval,
         "build_search_provider",
-        lambda provider=None, *, live=False: (
-            FakeSearxngProvider() if provider == "searxng" else FakeSerperProvider()
-        ),
+        lambda provider=None, *, live=False: {
+            "searxng": FakeSearxngProvider(),
+            "agents-web-search": FakeAgentsWebSearchProvider(),
+        }[provider],
     )
     monkeypatch.setattr(
         live_retrieval,
@@ -80,10 +75,14 @@ def test_company_live_retrieval_escalates_from_searxng_to_serper(
         max_results=3,
     )
 
-    assert metadata["search_provider"] == "searxng+serper"
+    assert metadata["search_provider"] == "searxng+agents-web-search"
     assert metadata["precision_search_escalated"] is True
-    assert metadata["search_provider_sequence"] == ["searxng", "serper"]
-    assert metadata["search_providers_used"] == ["searxng", "serper"]
+    assert metadata["search_provider_sequence"] == ["searxng", "agents-web-search"]
+    assert metadata["search_deepening_provider_sequence"] == []
+    assert metadata["search_providers_used"] == ["searxng", "agents-web-search"]
+    assert metadata["deepening_search_used"] is False
+    assert metadata["agents_web_search_estimated_calls_used"] == 1
+    assert metadata["serper_estimated_credits_used"] == 0
     assert metadata["structured_enrichment_recommended"] is True
     assert metadata["structured_enrichment_candidates"] == [
         "trafilatura",
@@ -264,17 +263,22 @@ def test_opportunity_live_retrieval_fans_out_provider_ladder_for_multi_lane_resu
                 ),
             ]
 
-    class FakeSerperProvider:
+    class FakeFirecrawlProvider:
         def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
-            calls.append(f"serper:{query}:{num_results}")
+            calls.append(f"firecrawl:{query}:{num_results}")
             return [
                 SearchResult(
                     title="Parallel provider corroboration",
                     link="https://example.test/fallback",
                     snippet="Parallel provider result is merged into the search packet.",
-                    source="serper",
+                    source="firecrawl",
                 )
             ]
+
+    class FakeAgentsWebSearchProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"agents-web-search:{query}:{num_results}")
+            return []
 
     monkeypatch.setattr(
         live_retrieval,
@@ -284,13 +288,16 @@ def test_opportunity_live_retrieval_fans_out_provider_ladder_for_multi_lane_resu
     monkeypatch.setattr(
         live_retrieval,
         "build_search_provider",
-        lambda provider=None, *, live=False: (
-            FakeSearxngProvider() if provider == "searxng" else FakeSerperProvider()
-        ),
+        lambda provider=None, *, live=False: {
+            "searxng": FakeSearxngProvider(),
+            "agents-web-search": FakeAgentsWebSearchProvider(),
+            "firecrawl": FakeFirecrawlProvider(),
+        }[provider],
     )
 
     provider = live_retrieval.build_opportunity_search_provider(
         topic="precision psychiatry collaborations",
+        fallback_provider="firecrawl",
         desired_results=5,
     )
     results = provider.search_web("precision psychiatry live opportunities", num_results=5)
@@ -303,17 +310,18 @@ def test_opportunity_live_retrieval_fans_out_provider_ladder_for_multi_lane_resu
 
     assert len(results) == 4
     assert sorted(calls) == [
+        "agents-web-search:precision psychiatry live opportunities:5",
+        "firecrawl:precision psychiatry live opportunities:5",
         "searxng:precision psychiatry live opportunities:5",
-        "serper:precision psychiatry live opportunities:5",
     ]
     assert telemetry["parallel_provider_fanout"] is True
     assert telemetry["precision_search_escalated"] is False
-    assert telemetry["search_providers_used"] == ["searxng", "serper"]
+    assert telemetry["search_providers_used"] == ["searxng", "agents-web-search", "firecrawl"]
     assert quality["needs_precision_search"] is False
     assert {"grant", "trial", "conference"}.issubset(quality["opportunity_lane_labels"])
 
 
-def test_opportunity_role_live_retrieval_prefers_serper_for_job_discovery(
+def test_opportunity_role_live_retrieval_defaults_to_searxng_for_job_discovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import keystone_agents.live_retrieval as live_retrieval
@@ -339,7 +347,152 @@ def test_opportunity_role_live_retrieval_prefers_serper_for_job_discovery(
         desired_results=5,
     )
 
-    assert provider.provider_sequence == ("serper", "searxng")
+    assert provider.provider_sequence == ("searxng", "agents-web-search")
+    assert provider.deepening_provider_sequence == ()
+
+
+def test_opportunity_search_provider_can_disable_agents_web_search_deepening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "false")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: SimpleNamespace(
+            provider_name=provider,
+            dry_run=False,
+            validate_configuration=lambda: None,
+            search_web=lambda query, num_results=5: [],
+        ),
+    )
+
+    provider = live_retrieval.build_opportunity_search_provider(
+        topic="precision psychiatry collaborations",
+        desired_results=5,
+    )
+
+    assert provider.deepening_provider_sequence == ()
+
+
+def test_opportunity_search_provider_caps_agents_web_search_parallel_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"{self.provider_name}:{query}")
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://{self.provider_name}.example.test/{query.replace(' ', '-')}",
+                    snippet="Clinical AI opportunity signal.",
+                    source=self.provider_name,
+                )
+            ]
+
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN", "1")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: FakeProvider(str(provider)),
+    )
+
+    provider = live_retrieval.build_opportunity_search_provider(
+        topic="precision psychiatry collaborations",
+        desired_results=3,
+    )
+
+    provider.search_web("first query", num_results=3)
+    provider.search_web("second query", num_results=3)
+    telemetry = provider.telemetry()
+
+    assert calls.count("agents-web-search:first query") == 1
+    assert "agents-web-search:second query" not in calls
+    assert telemetry["provider_usage"]["agents-web-search"]["requests_attempted"] == 1
+    assert any(
+        error["error_type"] == "ProviderRequestCapExceeded"
+        for error in telemetry["search_provider_errors"]
+    )
+
+
+def test_opportunity_search_provider_can_enable_tavily_deepening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "true")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: SimpleNamespace(
+            provider_name=provider,
+            dry_run=False,
+            validate_configuration=lambda: None,
+            search_web=lambda query, num_results=5: [],
+        ),
+    )
+
+    provider = live_retrieval.build_opportunity_search_provider(
+        topic="precision psychiatry collaborations",
+        desired_results=5,
+    )
+
+    assert provider.provider_sequence == ("searxng", "agents-web-search")
+    assert provider.deepening_provider_sequence == ("tavily",)
+
+
+def test_opportunity_search_provider_skips_hosted_search_with_explicit_non_searxng_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="dry-run"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: SimpleNamespace(
+            provider_name=provider,
+            dry_run=False,
+            validate_configuration=lambda: None,
+            search_web=lambda query, num_results=5: [],
+        ),
+    )
+
+    provider = live_retrieval.build_opportunity_search_provider(
+        topic="identify 5 mental health AI companies",
+        requested_provider="serper",
+        desired_results=5,
+    )
+
+    assert provider.provider_sequence == ("serper",)
+    assert provider.deepening_provider_sequence == ()
 
 
 def test_opportunity_scout_os1_live_search_escalates_on_weak_initial_results(
@@ -358,42 +511,56 @@ def test_opportunity_scout_os1_live_search_escalates_on_weak_initial_results(
                 )
             ]
 
-    class FakeSerperProvider:
+    class FakeFirecrawlProvider:
         def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
             return [
                 SearchResult(
                     title="Clinical AI Medical Director",
                     link="https://jobs.example.test/clinical-ai-medical-director",
                     snippet="Remote United States role posted this week.",
-                    source="serper",
+                    source="firecrawl",
                 )
             ]
+
+    class FakeAgentsWebSearchProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return []
 
     monkeypatch.setattr(cli, "load_settings", lambda: SimpleNamespace(search_provider="searxng"))
     monkeypatch.setattr(cli, "_os1_role_search_queries", lambda: ["remote clinical ai"])
     monkeypatch.setattr(
         cli,
         "build_search_provider",
-        lambda provider=None, *, live=False: (
-            FakeSearxngProvider() if provider == "searxng" else FakeSerperProvider()
-        ),
+        lambda provider=None, *, live=False: {
+            "searxng": FakeSearxngProvider(),
+            "agents-web-search": FakeAgentsWebSearchProvider(),
+            "firecrawl": FakeFirecrawlProvider(),
+        }[provider],
     )
     args = Namespace(
         dry_run=False,
         live_search=True,
         search_provider=None,
-        fallback_search_provider=None,
+        fallback_search_provider="firecrawl",
         max_results=2,
     )
 
     hits, metadata = cli._search_role_sources_live(args)
 
     assert len(hits) == 2
-    assert metadata["search_provider"] == "searxng+serper"
+    assert metadata["search_provider"] == "searxng+agents-web-search+firecrawl"
     assert metadata["precision_search_escalated"] is True
-    assert metadata["search_provider_used"] == "serper"
-    assert metadata["search_provider_sequence"] == ["searxng", "serper"]
-    assert metadata["search_providers_used"] == ["searxng", "serper"]
+    assert metadata["search_provider_used"] == "firecrawl"
+    assert metadata["search_provider_sequence"] == [
+        "searxng",
+        "agents-web-search",
+        "firecrawl",
+    ]
+    assert metadata["search_providers_used"] == [
+        "searxng",
+        "agents-web-search",
+        "firecrawl",
+    ]
 
 
 def test_opportunity_scout_explicit_retrieval_hint_drives_search_review_signal(

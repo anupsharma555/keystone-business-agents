@@ -8,21 +8,33 @@ Start here when changing or operating the repository.
 - `docs/RUNBOOK.md`: operator checklist for local and live-test workflows.
 - `docs/DEPLOYMENT.md`: live integration setup, rollback, cost controls, and operations.
 - `docs/OPENAI_AGENT_PLATFORM_SETUP.md`: OpenAI dashboard, tracing, and eval setup.
+- `docs/SLACK_BUSINESS_AGENT_MODE.md`: `@KNI` Slack bridge flags, scopes, and
+  approval boundaries.
+- `docs/VISUAL_CONTEXT.md`: repo-local architecture visuals for operator and agent context.
 
 ## Natural-Language Workflows
 
 - `keystone ask` without `--agent`: WorkItem-backed natural-language entrypoint
   in dry-run mode that saves artifacts, readiness gates, next actions, timeline
   events, and the `ManualRequestPlan`.
-- `keystone ask --agent ...` or explicit `@KNI <agent>`: direct specialist path.
-  It stays dry-run by default, but live-test/full-live environments auto-enable
-  live SDK model execution unless `--no-live-sdk` is passed. Live manual
-  Business Research Analyst, Opportunity Scout, and Gmail Triage calls use
-  script-backed execution paths.
+- `keystone ask --agent ...` or explicit `@KNI <agent>`: direct registered-agent
+  path, including specialists, Orchestrator, and Chief of Staff. It stays
+  dry-run by default, but live-test/full-live environments auto-enable live SDK
+  model execution unless `--no-live-sdk` is passed. Live manual Business
+  Research Analyst, Opportunity Scout, Gmail Triage, and Chief of Staff calls
+  use script-backed execution paths where available.
+- `@KNI keystone ask ...`: Slack-friendly alias for the same natural-language
+  entrypoint.
+- SDK sessions: local SQLite conversation continuity for live SDK follow-ups.
+  Chief of Staff `ask` runs and live WorkItems enable scoped sessions by
+  default; other specialists require inherited context or explicit opt-in.
+  `--sdk-session-id`, `--sdk-session-db`, and `--no-sdk-session` control it.
 - `--live-manual-plan`: optional LLM planning stage. Configure planner provider
   routing with `KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY`.
 - `work-items continue/show/timeline/select/approve-context`: state management
   commands for existing WorkItems.
+- `work-items advance --langgraph`: optional WorkItem graph wrapper for
+  approval-checkpoint metadata and future resumable orchestration.
 
 ## Add Or Change Agents
 
@@ -35,12 +47,19 @@ Start here when changing or operating the repository.
 
 - `AGENTS.md`: tool boundary, safety, dry-run, and live flag rules.
 - `src/keystone_agents/tools/`: explicit tool wrappers and integration boundaries.
+- `docs/corpus/`: approved FileSearch corpus manifest, local resource notes, and
+  selected vendored official docs/specs.
+- `scripts/ingest_file_search_corpus.py`: dry-run-first upload helper for putting
+  the approved corpus into an OpenAI vector store.
 - `tests/test_tool_impls.py` and integration-specific tests: tool behavior and safety coverage.
 
 ## Change Prompts Or Evals
 
 - `src/keystone_agents/prompts/`: markdown prompts with metadata headers.
 - `docs/EVALS.md`: deterministic and local eval guidance.
+- `docs/SEARCH_COVERAGE_EVALS.md`: query-level search provider coverage evals.
+- `docs/BROWSER_EXTRACTION_EVALS.md`: rendered page provider evals for Browserless,
+  Firecrawl scrape, and future browser adapters.
 - `docs/AGENT_IMPROVEMENT_TEST_PACK.md`: standing improvement backlog.
 - `evals/` and `tests/evals/`: JSONL and fixture-backed eval datasets.
 

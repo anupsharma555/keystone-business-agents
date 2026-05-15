@@ -24,6 +24,7 @@ from keystone_agents.company_research import (
 from keystone_agents.company_research import (
     synthesize_company_profile_from_source_bundle as synthesize_profile_from_bundle,
 )
+from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.guardrails import keystone_guardrails
 from keystone_agents.models import (
     BusinessResearchComparisonSDKInput,
@@ -377,7 +378,47 @@ def build_business_research_analyst_agent(model: str | None = None) -> Agent:
         name="business_research_analyst",
         instructions=instructions,
         output_type=CompanyProfile,
-        tools=[
+        tools=_business_research_analyst_company_profile_tools(),
+        guardrails=keystone_guardrails(),
+        model=model,
+        handoff_description=(
+            "Use for source-attributed company, account, contact, and CRM context research "
+            "with Keystone fit scoring."
+        ),
+    )
+
+
+def _business_research_analyst_tools() -> list[Any]:
+    return append_configured_file_search_tools(
+        "business_research_analyst",
+        [
+            load_contact_context,
+            load_crm_account_context,
+            load_approved_contact_context,
+            load_approved_crm_context,
+            list_local_context_sources,
+            search_local_context,
+            read_local_context_file,
+            retrieve_memory,
+            check_workflow_duplicate,
+            search_web,
+            fetch_company_page,
+            fetch_linkedin_or_profile_placeholder,
+            extract_company_signals,
+            dedupe_and_rank_sources,
+            build_source_bundle_for_synthesis,
+            synthesize_company_profile_from_source_bundle,
+            compare_company_profiles_for_decision,
+            save_company_profile_memory,
+            save_retrieval_tool_performance_memory,
+        ],
+    )
+
+
+def _business_research_analyst_company_profile_tools() -> list[Any]:
+    return append_configured_file_search_tools(
+        "business_research_analyst",
+        [
             load_contact_context,
             load_crm_account_context,
             load_approved_contact_context,
@@ -397,37 +438,7 @@ def build_business_research_analyst_agent(model: str | None = None) -> Agent:
             compare_company_profiles_for_decision,
             save_company_profile_memory,
         ],
-        guardrails=keystone_guardrails(),
-        model=model,
-        handoff_description=(
-            "Use for source-attributed company, account, contact, and CRM context research "
-            "with Keystone fit scoring."
-        ),
     )
-
-
-def _business_research_analyst_tools() -> list[Any]:
-    return [
-        load_contact_context,
-        load_crm_account_context,
-        load_approved_contact_context,
-        load_approved_crm_context,
-        list_local_context_sources,
-        search_local_context,
-        read_local_context_file,
-        retrieve_memory,
-        check_workflow_duplicate,
-        search_web,
-        fetch_company_page,
-        fetch_linkedin_or_profile_placeholder,
-        extract_company_signals,
-        dedupe_and_rank_sources,
-        build_source_bundle_for_synthesis,
-        synthesize_company_profile_from_source_bundle,
-        compare_company_profiles_for_decision,
-        save_company_profile_memory,
-        save_retrieval_tool_performance_memory,
-    ]
 
 
 def build_business_research_analyst_focused_brief_agent(model: str | None = None) -> Agent:
@@ -702,6 +713,7 @@ def run_business_research_analyst_sdk(
     run_config: object | None = None,
     live: bool = False,
     model: str | None = None,
+    session: Any | None = None,
 ) -> TypedAgentRunResult[CompanyProfile]:
     """Run Business Research Analyst through the typed SDK harness."""
 
@@ -711,6 +723,7 @@ def run_business_research_analyst_sdk(
         output_type=CompanyProfile,
         run_config=run_config,
         live=live,
+        session=session,
     )
 
 
@@ -720,6 +733,7 @@ def run_business_research_analyst_focused_brief_sdk(
     run_config: object | None = None,
     live: bool = False,
     model: str | None = None,
+    session: Any | None = None,
 ) -> TypedAgentRunResult[CompanyResearchFocusedBrief]:
     """Run Business Research Analyst through the SDK for a BR-1 focused brief."""
 
@@ -729,6 +743,7 @@ def run_business_research_analyst_focused_brief_sdk(
         output_type=CompanyResearchFocusedBrief,
         run_config=run_config,
         live=live,
+        session=session,
     )
 
 
@@ -738,6 +753,7 @@ def run_business_research_analyst_research_brief_sdk(
     run_config: object | None = None,
     live: bool = False,
     model: str | None = None,
+    session: Any | None = None,
 ) -> TypedAgentRunResult[ResearchBrief]:
     """Run the broader Business Research Analyst through the typed SDK harness."""
 
@@ -747,4 +763,5 @@ def run_business_research_analyst_research_brief_sdk(
         output_type=ResearchBrief,
         run_config=run_config,
         live=live,
+        session=session,
     )

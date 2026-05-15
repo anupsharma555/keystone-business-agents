@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -14,6 +16,24 @@ from keystone_agents.guardrails import (
 )
 from keystone_agents.schemas.approval import ApprovalQueueItem, ApprovalRequest
 from keystone_agents.schemas.review_card import ReviewCard, ReviewEvidenceItem, ReviewSourceItem
+from keystone_agents.slack_action_contract import (
+    KBA_APPROVE_EXTERNAL_USE,
+    KBA_CREATE_GMAIL_DRAFT,
+    KBA_FIND_CONTACT,
+    KBA_INTENT_APPROVE_EXTERNAL_USE,
+    KBA_INTENT_CREATE_GMAIL_DRAFT,
+    KBA_INTENT_FIND_CONTACT,
+    KBA_INTENT_MORE_RESEARCH,
+    KBA_INTENT_OPEN_WORK_ITEM,
+    KBA_INTENT_REVISE_DRAFT,
+    KBA_INTENT_RUN_AGAIN,
+    KBA_INTENT_SHOW_SOURCES,
+    KBA_INTENT_SKIP_COMPANY,
+    KBA_MORE_RESEARCH,
+    KBA_OVERFLOW,
+    KBA_REVISE_DRAFT,
+    business_agent_action_value,
+)
 from keystone_agents.storage.sqlite_store import redact_secrets
 
 
@@ -44,6 +64,10 @@ _HUMAN_LABELS = {
     "external_copy": "external copy",
     "possible_phi": "possible PHI",
 }
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x1b]*(?:\x1b\\|\x07)|[@-Z\\-_])"
+)
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 @dataclass(frozen=True)
@@ -52,12 +76,15 @@ class SlackReviewMessage:
 
     root_text: str
     thread_blocks: tuple[str, ...] = field(default_factory=tuple)
+    root_blocks: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     approval_item_id: str = ""
     object_type: str = ""
     status: str = ""
     scope: str = ""
     risk_flags: tuple[str, ...] = field(default_factory=tuple)
     next_safe_action: str = ""
+    approval_action_label: str = "review"
+    approval_action_detail: str = ""
     send_enabled: bool = False
     interactive_actions_enabled: bool = False
 
@@ -67,15 +94,56 @@ class SlackReviewMessage:
         return {
             "root_text": self.root_text,
             "thread_blocks": list(self.thread_blocks),
+            "root_blocks": list(self.root_blocks),
             "approval_item_id": self.approval_item_id,
             "object_type": self.object_type,
             "status": self.status,
             "scope": self.scope,
             "risk_flags": list(self.risk_flags),
             "next_safe_action": self.next_safe_action,
+            "approval_action_label": self.approval_action_label,
+            "approval_action_detail": self.approval_action_detail,
             "send_enabled": self.send_enabled,
             "interactive_actions_enabled": self.interactive_actions_enabled,
         }
+
+
+@dataclass(frozen=True)
+class BusinessAgentCardAction:
+    """One compact action rendered into a business-agent Slack card."""
+
+    label: str
+    action_id: str
+    intent: str
+    work_item_id: str = ""
+    approval_id: str = ""
+    gate_scope: str = ""
+    artifact_id: str = ""
+    style: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def value(self) -> str:
+        return business_agent_action_value(
+            intent=self.intent,
+            work_item_id=self.work_item_id,
+            approval_id=self.approval_id,
+            gate_scope=self.gate_scope,
+            artifact_id=self.artifact_id,
+            metadata=self.metadata,
+        )
+
+
+@dataclass(frozen=True)
+class BusinessAgentCard:
+    """Reusable compact Slack card model for business-agent WorkItem states."""
+
+    status: str
+    summary: str
+    fields: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    primary_action: BusinessAgentCardAction | None = None
+    secondary_actions: tuple[BusinessAgentCardAction, ...] = field(default_factory=tuple)
+    overflow_actions: tuple[BusinessAgentCardAction, ...] = field(default_factory=tuple)
+    fallback_text: str = ""
 
 
 def _enum_value(value: Any) -> str:
@@ -94,7 +162,10 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 def _clean_slack_text(value: Any) -> str:
     redacted = redact_secrets(value)
-    return str(redacted if redacted is not None else "").replace("\u2014", "-").strip()
+    text = str(redacted if redacted is not None else "").replace("\u2014", "-")
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    text = _CONTROL_CHAR_RE.sub("", text)
+    return text.strip()
 
 
 def _compact_text(value: Any, *, max_chars: int = 220) -> str:
@@ -201,6 +272,56 @@ def _scope_for_queue_item(data: dict[str, Any]) -> str:
     return "review"
 
 
+def _metadata_allows_gmail_draft_creation(
+    metadata: dict[str, Any],
+    *,
+    object_type: str,
+) -> bool:
+    return (
+        object_type == "outreach_draft"
+        and _compact_text(metadata.get("outreach_channel"), max_chars=40).lower() == "email"
+        and bool(metadata.get("slack_approval_allows_gmail_draft_creation"))
+    )
+
+
+def _approval_action_label(value: Any, *, scope: str) -> str:
+    explicit = _public_text(value, max_chars=56)
+    if explicit:
+        return explicit
+    if _enum_value(scope).lower() == "send":
+        return "draft review only"
+    return _human_label(scope) or "review"
+
+
+def _approval_action_label_for_item(
+    metadata: dict[str, Any],
+    *,
+    object_type: str,
+    scope: str,
+) -> str:
+    explicit = metadata.get("approval_action_label") or metadata.get("approval_action")
+    if explicit:
+        return _approval_action_label(explicit, scope=scope)
+    if _metadata_allows_gmail_draft_creation(metadata, object_type=object_type):
+        return "save Gmail draft"
+    return _approval_action_label("", scope=scope)
+
+
+def _approval_action_detail_for_item(metadata: dict[str, Any], *, object_type: str) -> str:
+    if not _metadata_allows_gmail_draft_creation(metadata, object_type=object_type):
+        return ""
+    account = _public_text(
+        metadata.get("gmail_draft_account") or metadata.get("target_gmail_account"),
+        max_chars=120,
+    )
+    if account:
+        return f"Gmail draft target: {account}. Approval creates a draft only; no email is sent."
+    return (
+        "Gmail draft target: configured Gmail account. "
+        "Approval creates a draft only; no email is sent."
+    )
+
+
 def _next_safe_action(status: str, *, fallback: str = "") -> str:
     if fallback:
         return fallback
@@ -215,9 +336,172 @@ def _next_safe_action(status: str, *, fallback: str = "") -> str:
     return "Review locally before any external use."
 
 
+def _button_text(value: str) -> dict[str, str]:
+    return {"type": "plain_text", "text": _compact_text(value, max_chars=75)}
+
+
+_LOCAL_PATH_RE = re.compile(r"(?i)(file://|/Users/|/private/|/tmp/)")
+_VISIBLE_SECRET_RE = re.compile(r"(?i)(xox[baprs]-|sk-[a-z0-9]|bearer\s+[a-z0-9._-]{16,})")
+
+
+def business_agent_card_blocks(card: BusinessAgentCard) -> tuple[dict[str, Any], ...]:
+    """Render a compact 4-part business-agent card into Slack Block Kit."""
+
+    status = _public_text(card.status, max_chars=140) or "Ready for review"
+    summary = _public_text(card.summary, max_chars=700) or "Review the WorkItem before continuing."
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "block_id": "kba_status",
+            "text": {"type": "plain_text", "text": status},
+        },
+        {
+            "type": "section",
+            "block_id": "kba_decision_summary",
+            "text": {"type": "mrkdwn", "text": summary},
+        },
+    ]
+    fields = [
+        {
+            "type": "mrkdwn",
+            "text": (
+                f"*{_public_text(label, max_chars=60)}*\n"
+                f"{_public_text(value, max_chars=260) or '-'}"
+            ),
+        }
+        for label, value in card.fields[:10]
+        if _clean_slack_text(label)
+    ]
+    if fields:
+        blocks.append({"type": "section", "block_id": "kba_primary_details", "fields": fields})
+    elements: list[dict[str, Any]] = []
+    if card.primary_action is not None:
+        elements.append(_button_element(card.primary_action))
+    elements.extend(_button_element(action) for action in card.secondary_actions[:3])
+    if card.overflow_actions:
+        elements.append(_overflow_element(card.overflow_actions[:10]))
+    if elements:
+        blocks.append({"type": "actions", "block_id": "kba_actions", "elements": elements})
+    validate_business_agent_blocks(blocks)
+    return tuple(blocks)
+
+
+def validate_business_agent_blocks(blocks: Sequence[dict[str, Any]]) -> None:
+    """Validate the business-agent card subset we render for Slack."""
+
+    if len(blocks) > 50:
+        raise ValueError("Slack business-agent card cannot exceed 50 blocks")
+    seen_block_ids: set[str] = set()
+    seen_action_ids: set[str] = set()
+    visible_text: list[str] = []
+    for block in blocks:
+        block_id = str(block.get("block_id") or "").strip()
+        if block_id:
+            if block_id in seen_block_ids:
+                raise ValueError(f"duplicate Slack block_id: {block_id}")
+            seen_block_ids.add(block_id)
+        visible_text.extend(_block_visible_text(block))
+        elements = block.get("elements") if isinstance(block.get("elements"), list) else []
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            action_id = str(element.get("action_id") or "").strip()
+            if action_id:
+                if action_id in seen_action_ids:
+                    raise ValueError(f"duplicate Slack action_id: {action_id}")
+                seen_action_ids.add(action_id)
+            if element.get("type") == "button":
+                label = str((element.get("text") or {}).get("text") or "")
+                if len(label) > 75:
+                    raise ValueError(f"Slack button label too long: {label}")
+            if element.get("type") == "overflow":
+                options = element.get("options")
+                if not isinstance(options, list) or not options:
+                    raise ValueError("Slack overflow must include options")
+                for option in options:
+                    if not isinstance(option, dict) or not option.get("value"):
+                        raise ValueError("Slack overflow options must include values")
+                    value = str(option.get("value") or "")
+                    if len(value) > 150:
+                        raise ValueError("Slack overflow option value cannot exceed 150 chars")
+                    label = str((option.get("text") or {}).get("text") or "")
+                    if len(label) > 75:
+                        raise ValueError(f"Slack overflow label too long: {label}")
+    text = "\n".join(visible_text)
+    if _LOCAL_PATH_RE.search(text):
+        raise ValueError("Slack business-agent card contains a local file path")
+    if _VISIBLE_SECRET_RE.search(text):
+        raise ValueError("Slack business-agent card contains a visible secret")
+
+
+def _button_element(action: BusinessAgentCardAction) -> dict[str, Any]:
+    element: dict[str, Any] = {
+        "type": "button",
+        "text": _button_text(action.label),
+        "action_id": action.action_id,
+        "value": action.value(),
+    }
+    if action.style:
+        element["style"] = action.style
+    return element
+
+
+def _overflow_element(actions: Sequence[BusinessAgentCardAction]) -> dict[str, Any]:
+    return {
+        "type": "overflow",
+        "action_id": KBA_OVERFLOW,
+        "options": [
+            {
+                "text": _button_text(action.label),
+                "value": _overflow_action_value(action),
+            }
+            for action in actions
+        ],
+    }
+
+
+def _overflow_action_value(action: BusinessAgentCardAction) -> str:
+    payload = {
+        "schema": "kba.v1",
+        "intent": action.intent,
+        "approval_id": action.approval_id,
+    }
+    if not action.approval_id and action.work_item_id:
+        payload["work_item_id"] = action.work_item_id
+    value = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    if len(value) > 150:
+        payload.pop("schema", None)
+        value = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    if len(value) > 150:
+        raise ValueError("Slack overflow action value is too long")
+    return value
+
+
+def _block_visible_text(block: dict[str, Any]) -> list[str]:
+    text_values: list[str] = []
+    for key in ("text", "label"):
+        value = block.get(key)
+        if isinstance(value, dict):
+            text_values.append(str(value.get("text") or ""))
+    for block_field in block.get("fields") or []:
+        if isinstance(block_field, dict):
+            text_values.append(str(block_field.get("text") or ""))
+    for element in block.get("elements") or []:
+        if not isinstance(element, dict):
+            continue
+        text = element.get("text")
+        if isinstance(text, dict):
+            text_values.append(str(text.get("text") or ""))
+        for option in element.get("options") or []:
+            if isinstance(option, dict) and isinstance(option.get("text"), dict):
+                text_values.append(str(option["text"].get("text") or ""))
+    return text_values
+
+
 def _slack_action_blocks(message: SlackReviewMessage) -> list[dict[str, Any]]:
     if not message.approval_item_id or message.approval_item_id == "not saved":
         return []
+    action_label = message.approval_action_label or "review"
     return [
         {
             "type": "actions",
@@ -225,22 +509,15 @@ def _slack_action_blocks(message: SlackReviewMessage) -> list[dict[str, Any]]:
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "Yes"},
+                    "text": _button_text(f"Approve: {action_label}"),
                     "style": "primary",
                     "action_id": "keystone_approval_yes",
                     "value": message.approval_item_id,
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "Needs edits"},
+                    "text": _button_text(f"Request edits: {action_label}"),
                     "action_id": "keystone_approval_revise",
-                    "value": message.approval_item_id,
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "No"},
-                    "style": "danger",
-                    "action_id": "keystone_approval_no",
                     "value": message.approval_item_id,
                 },
             ],
@@ -299,6 +576,8 @@ def _contact_review_rows(metadata: dict[str, Any]) -> list[str]:
     contact = _public_text(metadata.get("contact_name"), max_chars=140)
     title = _public_text(metadata.get("contact_title"), max_chars=140)
     email = _public_text(metadata.get("recipient_email"), max_chars=180)
+    contact_path_label = _public_text(metadata.get("contact_path_label"), max_chars=140)
+    contact_path_value = _public_text(metadata.get("contact_path_value"), max_chars=220)
     linkedin_url = _public_text(
         metadata.get("contact_linkedin_url") or metadata.get("linkedin_url"),
         max_chars=220,
@@ -321,6 +600,31 @@ def _contact_review_rows(metadata: dict[str, Any]) -> list[str]:
             rows.append(f"Email: {email}")
         if linkedin_url:
             rows.append(f"LinkedIn: {linkedin_url}")
+    if contact_path_label or contact_path_value:
+        path_text = contact_path_label or "Source-backed contact path"
+        if contact_path_value:
+            path_text = f"{path_text}: {contact_path_value}"
+        rows.append(f"Contact path: {path_text}")
+    return rows
+
+
+def _opportunity_review_rows(metadata: dict[str, Any]) -> list[str]:
+    rows: list[str] = []
+    opportunity_type = _public_text(metadata.get("opportunity_type"), max_chars=120)
+    priority_score = metadata.get("priority_score")
+    why_now = _public_text(metadata.get("why_now_signal"), max_chars=260)
+    keystone_fit = _public_text(metadata.get("keystone_fit_reason"), max_chars=260)
+    next_step = _public_text(metadata.get("opportunity_next_step"), max_chars=220)
+    if opportunity_type:
+        rows.append(f"Opportunity type: {opportunity_type}")
+    if priority_score is not None:
+        rows.append(f"Priority score: {priority_score}/100")
+    if why_now:
+        rows.append(f"Why now: {why_now}")
+    if keystone_fit:
+        rows.append(f"Keystone fit: {keystone_fit}")
+    if next_step:
+        rows.append(f"Next step: {next_step}")
     return rows
 
 
@@ -330,14 +634,15 @@ def _company_research_rows(metadata: dict[str, Any]) -> list[str]:
     website = _public_text(metadata.get("company_website"), max_chars=220)
     summary = _public_text(
         metadata.get("company_fit_summary") or metadata.get("company_description"),
-        max_chars=520,
+        max_chars=320,
     )
-    if company:
-        rows.append(f"Company: {company}")
-    if website:
-        rows.append(f"Company link: {website}")
     if summary:
         rows.append(f"CR summary: {summary}")
+    metadata_rows: list[str] = []
+    if company:
+        metadata_rows.append(f"Company: {company}")
+    if website:
+        metadata_rows.append(f"Company link: {website}")
     scores = _as_dict(metadata.get("company_scores"))
     score_parts = [
         f"consulting fit {scores.get('consulting_fit')}/100"
@@ -358,10 +663,10 @@ def _company_research_rows(metadata: dict[str, Any]) -> list[str]:
     ]
     score_text = ", ".join(part for part in score_parts if part)
     if score_text:
-        rows.append(f"CR scores: {score_text}")
+        metadata_rows.append(f"CR scores: {score_text}")
     source_quality = _as_dict(metadata.get("company_source_quality"))
     if source_quality.get("overall_score") is not None:
-        rows.append(
+        metadata_rows.append(
             "Source quality: "
             f"{source_quality.get('overall_score')}/100; "
             f"independent sources {source_quality.get('independent_source_count', 0)}; "
@@ -369,51 +674,27 @@ def _company_research_rows(metadata: dict[str, Any]) -> list[str]:
         )
     completeness = _as_dict(metadata.get("company_research_completeness"))
     if completeness.get("score") is not None:
-        rows.append(f"Research completeness: {completeness.get('score')}/100")
-    research_points = []
-    for raw in metadata.get("company_research_points") or []:
-        point = _as_dict(raw)
-        label = _public_text(point.get("label"), max_chars=120)
-        value = _public_text(point.get("value"), max_chars=260)
-        source_ids = ", ".join(
-            _compact_text(source_id, max_chars=80)
-            for source_id in (point.get("source_ids") or [])
-            if _compact_text(source_id, max_chars=80)
-        )
-        if label and value:
-            suffix = f" [sources: {source_ids}]" if source_ids else ""
-            research_points.append(f"- {label}: {value}{suffix}")
-    if research_points:
-        rows.append("CR facts:")
-        rows.extend(research_points[:4])
-    claim_rows = []
-    for raw in metadata.get("company_claims") or []:
-        claim = _as_dict(raw)
-        text = _public_text(claim.get("text"), max_chars=260)
-        source_id = _public_text(claim.get("source_id"), max_chars=100)
-        if text:
-            suffix = f" [source: {source_id}]" if source_id else ""
-            claim_rows.append(f"- {text}{suffix}")
-    if claim_rows:
-        rows.append("Source-backed claims:")
-        rows.extend(claim_rows[:4])
+        metadata_rows.append(f"Research completeness: {completeness.get('score')}/100")
     gaps = [
         _public_text(gap, max_chars=180)
         for gap in (metadata.get("company_missing_information") or [])
     ]
     gaps = [gap for gap in gaps if gap]
     if gaps:
-        rows.append("CR gaps:")
-        rows.extend(f"- {gap}" for gap in gaps[:6])
+        metadata_rows.append("CR gaps:")
+        metadata_rows.extend(f"- {gap}" for gap in gaps[:2])
     risks = [_public_text(risk, max_chars=180) for risk in (metadata.get("company_risks") or [])]
     risks = [risk for risk in risks if risk]
     if risks:
-        rows.append("CR risks:")
-        rows.extend(f"- {risk}" for risk in risks[:4])
+        metadata_rows.append("CR risks:")
+        metadata_rows.extend(f"- {risk}" for risk in risks[:2])
     source_rows = _source_rows(_sources_from_metadata(metadata))
     if source_rows:
-        rows.append("Source links:")
-        rows.extend(source_rows[:6])
+        metadata_rows.append("Top sources:")
+        metadata_rows.extend(source_rows[:3])
+    if metadata_rows:
+        rows.append("Metadata:")
+        rows.extend(metadata_rows)
     return rows
 
 
@@ -423,7 +704,11 @@ def _draft_review_rows(
     *,
     max_thread_chars: int,
 ) -> list[str]:
-    rows: list[str] = []
+    rows: list[str] = [
+        "Draft text:",
+        _thread_text(draft_text, max_chars=max_thread_chars) or "- none",
+        "Metadata:",
+    ]
     channel = _compact_text(metadata.get("outreach_channel"), max_chars=40).lower()
     channel_label = "LinkedIn" if channel == "linkedin" else "Email"
     company = _public_text(metadata.get("company_name"), max_chars=140)
@@ -447,11 +732,308 @@ def _draft_review_rows(
     blockers = [blocker for blocker in blockers if blocker]
     if blockers:
         rows.append("Needs confirmation:")
-        rows.extend(f"- {blocker}" for blocker in blockers[:5])
-    rows.append("Draft text:")
-    rows.append(_thread_text(draft_text, max_chars=max_thread_chars) or "- none")
+        rows.extend(f"- {blocker}" for blocker in blockers[:3])
     rows.append("Draft only. Human approval is required before any external use.")
     return rows
+
+
+def _business_agent_card_for_approval_item(
+    data: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    status: str,
+    object_type: str,
+    approval_scope: str,
+    summary: str,
+) -> BusinessAgentCard:
+    approval_id = _enum_value(data.get("id"))
+    work_item_id = _compact_text(metadata.get("work_item_id"), max_chars=120)
+    artifact_id = _enum_value(data.get("object_id")) or _compact_text(
+        metadata.get("artifact_id"), max_chars=120
+    )
+    gmail_draft_allowed = _metadata_allows_gmail_draft_creation(
+        metadata,
+        object_type=object_type,
+    )
+    status_label = _approval_card_status(
+        status,
+        metadata=metadata,
+        gmail_draft_allowed=gmail_draft_allowed,
+    )
+    fields = tuple(_approval_card_fields(metadata, data, approval_scope=approval_scope))
+    action_context = {
+        "approval_title": _public_text(data.get("title"), max_chars=120),
+        "object_type": object_type,
+        "gmail_draft_account": _public_text(
+            metadata.get("gmail_draft_account") or metadata.get("target_gmail_account"),
+            max_chars=120,
+        ),
+    }
+    primary_action: BusinessAgentCardAction | None = None
+    secondary_actions: tuple[BusinessAgentCardAction, ...] = ()
+    overflow_actions: tuple[BusinessAgentCardAction, ...] = ()
+    if status == "pending" and approval_id:
+        if gmail_draft_allowed:
+            primary_action = BusinessAgentCardAction(
+                label="Create Gmail draft",
+                action_id=KBA_CREATE_GMAIL_DRAFT,
+                intent=KBA_INTENT_CREATE_GMAIL_DRAFT,
+                work_item_id=work_item_id,
+                approval_id=approval_id,
+                gate_scope=approval_scope,
+                artifact_id=artifact_id,
+                style="primary",
+                metadata=action_context,
+            )
+        else:
+            scope_label = "draft review" if approval_scope == "send" else (
+                _human_label(approval_scope) or "external use"
+            )
+            primary_action = BusinessAgentCardAction(
+                label=f"Approve {scope_label}",
+                action_id=KBA_APPROVE_EXTERNAL_USE,
+                intent=KBA_INTENT_APPROVE_EXTERNAL_USE,
+                work_item_id=work_item_id,
+                approval_id=approval_id,
+                gate_scope=approval_scope,
+                artifact_id=artifact_id,
+                style="primary",
+                metadata=action_context,
+            )
+        secondary_actions = (
+            BusinessAgentCardAction(
+                label="Revise draft",
+                action_id=KBA_REVISE_DRAFT,
+                intent=KBA_INTENT_REVISE_DRAFT,
+                work_item_id=work_item_id,
+                approval_id=approval_id,
+                gate_scope=approval_scope,
+                artifact_id=artifact_id,
+                metadata=action_context,
+            ),
+            BusinessAgentCardAction(
+                label="More research",
+                action_id=KBA_MORE_RESEARCH,
+                intent=KBA_INTENT_MORE_RESEARCH,
+                work_item_id=work_item_id,
+                approval_id=approval_id,
+                gate_scope=approval_scope,
+                artifact_id=artifact_id,
+                metadata=action_context,
+            ),
+            BusinessAgentCardAction(
+                label="Find contact",
+                action_id=KBA_FIND_CONTACT,
+                intent=KBA_INTENT_FIND_CONTACT,
+                work_item_id=work_item_id,
+                approval_id=approval_id,
+                gate_scope=approval_scope,
+                artifact_id=artifact_id,
+                metadata=action_context,
+            ),
+        )
+        overflow = [
+            BusinessAgentCardAction(
+                label="Show sources",
+                action_id=KBA_OVERFLOW,
+                intent=KBA_INTENT_SHOW_SOURCES,
+                work_item_id=work_item_id,
+                approval_id=approval_id,
+                gate_scope=approval_scope,
+                artifact_id=artifact_id,
+                metadata=action_context,
+            )
+        ]
+        if work_item_id:
+            overflow.append(
+                BusinessAgentCardAction(
+                    label="Open WorkItem",
+                    action_id=KBA_OVERFLOW,
+                    intent=KBA_INTENT_OPEN_WORK_ITEM,
+                    work_item_id=work_item_id,
+                    approval_id=approval_id,
+                    gate_scope=approval_scope,
+                    artifact_id=artifact_id,
+                    metadata=action_context,
+                )
+            )
+        overflow.extend(
+            [
+                BusinessAgentCardAction(
+                    label="Run again",
+                    action_id=KBA_OVERFLOW,
+                    intent=KBA_INTENT_RUN_AGAIN,
+                    work_item_id=work_item_id,
+                    approval_id=approval_id,
+                    gate_scope=approval_scope,
+                    artifact_id=artifact_id,
+                    metadata=action_context,
+                ),
+                BusinessAgentCardAction(
+                    label="Skip company",
+                    action_id=KBA_OVERFLOW,
+                    intent=KBA_INTENT_SKIP_COMPANY,
+                    work_item_id=work_item_id,
+                    approval_id=approval_id,
+                    gate_scope=approval_scope,
+                    artifact_id=artifact_id,
+                    metadata=action_context,
+                ),
+            ]
+        )
+        overflow_actions = tuple(overflow)
+    return BusinessAgentCard(
+        status=status_label,
+        summary=summary,
+        fields=fields,
+        primary_action=primary_action,
+        secondary_actions=secondary_actions,
+        overflow_actions=overflow_actions,
+        fallback_text=_approval_card_fallback_text(
+            status_label,
+            summary,
+            fields,
+            gmail_draft_allowed=gmail_draft_allowed,
+            metadata=metadata,
+        ),
+    )
+
+
+def _approval_card_status(
+    status: str,
+    *,
+    metadata: dict[str, Any],
+    gmail_draft_allowed: bool,
+) -> str:
+    if status == "approved":
+        if metadata.get("gmail_draft_created_from_slack_approval"):
+            return "Draft created"
+        return "Approved"
+    if status == "revise":
+        return "Revision requested"
+    if status == "rejected":
+        return "Rejected"
+    if _card_contact_missing(metadata):
+        return "Needs contact"
+    if gmail_draft_allowed:
+        return "Draft ready"
+    return "Ready for approval"
+
+
+def _approval_card_fields(
+    metadata: dict[str, Any],
+    data: dict[str, Any],
+    *,
+    approval_scope: str,
+) -> list[tuple[str, str]]:
+    channel = _compact_text(metadata.get("outreach_channel"), max_chars=40).lower()
+    destination = _card_destination(metadata)
+    fields: list[tuple[str, str]] = []
+    company = _public_text(metadata.get("company_name"), max_chars=120)
+    if company:
+        fields.append(("Company", company))
+    contact = _card_contact(metadata)
+    if contact:
+        fields.append(("Contact", contact))
+    if destination:
+        label = "Destination" if channel in {"email", "linkedin"} else "Target"
+        fields.append((label, destination))
+    priority_score = metadata.get("priority_score")
+    if priority_score is not None:
+        fields.append(("Fit score", f"{priority_score}/100"))
+    source_quality = _card_source_quality(metadata)
+    if source_quality:
+        fields.append(("Evidence", source_quality))
+    missing = _card_missing_info(metadata)
+    if missing:
+        fields.append(("Missing info", missing))
+    fields.append(("Gate", _human_label(approval_scope) or approval_scope))
+    if data.get("id"):
+        fields.append(("Approval ID", _public_text(data.get("id"), max_chars=120)))
+    return fields[:10]
+
+
+def _card_contact(metadata: dict[str, Any]) -> str:
+    name = _public_text(metadata.get("contact_name"), max_chars=120)
+    title = _public_text(metadata.get("contact_title"), max_chars=120)
+    if name and title:
+        return f"{name}, {title}"
+    return name or title
+
+
+def _card_destination(metadata: dict[str, Any]) -> str:
+    channel = _compact_text(metadata.get("outreach_channel"), max_chars=40).lower()
+    email = _public_text(metadata.get("recipient_email"), max_chars=160)
+    linkedin_url = _public_text(
+        metadata.get("contact_linkedin_url") or metadata.get("linkedin_url"),
+        max_chars=180,
+    )
+    if channel == "linkedin":
+        return linkedin_url or "LinkedIn URL needed"
+    if channel == "email":
+        return email or "Email needed"
+    return email or linkedin_url
+
+
+def _card_contact_missing(metadata: dict[str, Any]) -> bool:
+    channel = _compact_text(metadata.get("outreach_channel"), max_chars=40).lower()
+    if channel == "email":
+        return not bool(_public_text(metadata.get("recipient_email"), max_chars=160))
+    if channel == "linkedin":
+        return not bool(
+            _public_text(
+                metadata.get("contact_linkedin_url") or metadata.get("linkedin_url"),
+                max_chars=180,
+            )
+        )
+    return False
+
+
+def _card_source_quality(metadata: dict[str, Any]) -> str:
+    source_quality = _as_dict(metadata.get("company_source_quality"))
+    if source_quality.get("overall_score") is not None:
+        count = source_quality.get("independent_source_count", 0)
+        return f"{source_quality.get('overall_score')}/100; {count} independent source(s)"
+    sources = _sources_from_metadata(metadata)
+    if sources:
+        return f"{len(sources)} source(s)"
+    return "Needs source check"
+
+
+def _card_missing_info(metadata: dict[str, Any]) -> str:
+    values = metadata.get("missing_information_blockers") or metadata.get(
+        "company_missing_information"
+    ) or []
+    if not isinstance(values, Sequence) or isinstance(values, str | bytes):
+        values = [values]
+    cleaned = [_public_text(value, max_chars=140) for value in values]
+    cleaned = [value for value in cleaned if value]
+    return cleaned[0] if cleaned else "None"
+
+
+def _approval_card_fallback_text(
+    status: str,
+    summary: str,
+    fields: Sequence[tuple[str, str]],
+    *,
+    gmail_draft_allowed: bool,
+    metadata: dict[str, Any],
+) -> str:
+    rows = [status, summary]
+    rows.extend(f"{label}: {value}" for label, value in fields if value)
+    if gmail_draft_allowed:
+        account = _public_text(
+            metadata.get("gmail_draft_account") or metadata.get("target_gmail_account"),
+            max_chars=120,
+        )
+        rows.append(
+            "Primary action: Create Gmail draft"
+            f"{f' in {account}' if account else ''}. No email is sent."
+        )
+    rows.append(
+        "Slack buttons update only the referenced WorkItem gate or queue a draft-only agent step."
+    )
+    return "\n".join(row for row in rows if _clean_slack_text(row))
 
 
 def format_slack_review_message(
@@ -463,6 +1045,8 @@ def format_slack_review_message(
     scope: str | None = None,
     risk_flags: Sequence[str] | None = None,
     next_safe_action: str | None = None,
+    approval_action_label: str | None = None,
+    approval_action_detail: str | None = None,
     draft_text: str | None = None,
     max_thread_chars: int = 2400,
 ) -> SlackReviewMessage:
@@ -483,6 +1067,8 @@ def format_slack_review_message(
     )
     if not resolved_next:
         resolved_next = _next_safe_action(resolved_status)
+    resolved_action_label = _approval_action_label(approval_action_label, scope=resolved_scope)
+    resolved_action_detail = _public_text(approval_action_detail, max_chars=260)
     display_title = _public_text(data.title, max_chars=140) or _human_label(resolved_type)
 
     lowered_title = display_title.lower()
@@ -492,8 +1078,9 @@ def format_slack_review_message(
         channel = "email"
     else:
         channel = _human_label(resolved_type)
+    review_target = channel if channel.lower().endswith("draft") else f"{channel} draft"
     root_sections = [
-        "Keystone Business Agents Workflow review",
+        "Ready for approval",
         f"Review: {display_title}",
         f"Approval ID: {resolved_id}",
         (
@@ -503,15 +1090,17 @@ def format_slack_review_message(
         ),
         f"Decision: {_public_text(data.decision_summary, max_chars=220)}",
         (
-            f"Approval question: Yes or No - approve this {channel} draft for "
-            f"{_human_label(resolved_scope)}?"
+            f"Approval question: approve the action `{resolved_action_label}` "
+            f"for this {review_target}?"
         ),
-        (
-            "Feedback: Yes creates a Gmail draft for email approvals only. For Needs edits, "
-            "reply in thread with edit instructions for the LLM. For No, reply with why."
-        ),
+        f"Button scope: Approve: {resolved_action_label}; Request edits: {resolved_action_label}.",
+        resolved_action_detail,
         f"Next safe action: {resolved_next}",
-        "Slack buttons update only the local approval queue. They do not send email.",
+        (
+            "Slack buttons update only the named approval scope. They do not send email, "
+            "post externally, publish, or schedule anything. Gmail draft creation happens "
+            "only when this review explicitly says save Gmail draft."
+        ),
     ]
     review_rows = []
     evidence_rows = _evidence_rows(data.evidence)
@@ -551,6 +1140,8 @@ def format_slack_review_message(
         scope=resolved_scope,
         risk_flags=resolved_risks,
         next_safe_action=resolved_next,
+        approval_action_label=resolved_action_label,
+        approval_action_detail=resolved_action_detail,
         interactive_actions_enabled=bool(resolved_id and resolved_id != "not saved"),
     )
     return message
@@ -567,19 +1158,28 @@ def slack_review_message_from_approval_item(
     metadata = _as_dict(data.get("metadata"))
     status = _enum_value(data.get("approval_status")) or "pending"
     object_type = _enum_value(data.get("object_type")) or "other"
+    approval_scope = _scope_for_queue_item(data)
+    action_label = _approval_action_label_for_item(
+        metadata,
+        object_type=object_type,
+        scope=approval_scope,
+    )
+    action_detail = _approval_action_detail_for_item(metadata, object_type=object_type)
+    decision_summary = _public_text(data.get("summary"), max_chars=240) or (
+        "Approval review requested."
+    )
     card = ReviewCard(
         title=_public_text(data.get("title"), max_chars=160) or "Approval review",
         object_type=_review_object_type(object_type),
         object_id=_enum_value(data.get("object_id")) or _enum_value(data.get("id")),
-        decision_summary=_public_text(data.get("summary"), max_chars=240)
-        or "Approval review requested.",
+        decision_summary=decision_summary,
         reason=_public_text(data.get("summary"), max_chars=420)
         or "Human review is required before external use.",
         evidence=_evidence_from_metadata(metadata),
         risks=data.get("risk_flags") or [],
         approval_required=True,
         approval_status=status,
-        approval_scope=_scope_for_queue_item(data),
+        approval_scope=approval_scope,
         next_action=_next_safe_action(
             status,
             fallback=_public_text(metadata.get("next_safe_action"), max_chars=260),
@@ -594,11 +1194,14 @@ def slack_review_message_from_approval_item(
         status=status,
         scope=card.approval_scope,
         risk_flags=data.get("risk_flags") or [],
+        approval_action_label=action_label,
+        approval_action_detail=action_detail,
         draft_text=data.get("draft_text"),
         max_thread_chars=max_thread_chars,
     )
     root_sections = message.root_text.split("\n\n")
-    root_sections.insert(3, "\n".join(_contact_review_rows(metadata)))
+    review_rows = [*_contact_review_rows(metadata), *_opportunity_review_rows(metadata)]
+    root_sections.insert(3, "\n".join(review_rows))
     thread_blocks = tuple(message.thread_blocks)
     if metadata.get("company_name") and data.get("draft_text"):
         thread_blocks = (
@@ -612,13 +1215,30 @@ def slack_review_message_from_approval_item(
                 ),
             ),
         )
+    business_card = _business_agent_card_for_approval_item(
+        data,
+        metadata,
+        status=status,
+        object_type=object_type,
+        approval_scope=approval_scope,
+        summary=decision_summary,
+    )
+    root_blocks = business_agent_card_blocks(business_card)
     return SlackReviewMessage(
-        **{
-            **message.as_payload(),
-            "root_text": "\n\n".join(section for section in root_sections if section.strip()),
-            "thread_blocks": thread_blocks,
-            "risk_flags": tuple(message.risk_flags),
-        }
+        root_text=business_card.fallback_text
+        or "\n\n".join(section for section in root_sections if section.strip()),
+        thread_blocks=thread_blocks,
+        root_blocks=root_blocks,
+        approval_item_id=message.approval_item_id,
+        object_type=message.object_type,
+        status=message.status,
+        scope=message.scope,
+        risk_flags=tuple(message.risk_flags),
+        next_safe_action=message.next_safe_action,
+        approval_action_label=message.approval_action_label,
+        approval_action_detail=message.approval_action_detail,
+        send_enabled=message.send_enabled,
+        interactive_actions_enabled=message.interactive_actions_enabled,
     )
 
 
@@ -715,16 +1335,21 @@ class SlackTool:
                 },
             )
 
-        root = self._post_message_payload(
-            channel=channel,
-            text=message.root_text,
-            blocks=[
+        root_blocks = (
+            list(message.root_blocks)
+            if message.root_blocks
+            else [
                 {
                     "type": "section",
                     "text": {"type": "mrkdwn", "text": message.root_text},
                 },
                 *_slack_action_blocks(message),
-            ],
+            ]
+        )
+        root = self._post_message_payload(
+            channel=channel,
+            text=message.root_text,
+            blocks=root_blocks,
         )
         thread_ts = str(root.get("ts") or "")
         posted_blocks = 0

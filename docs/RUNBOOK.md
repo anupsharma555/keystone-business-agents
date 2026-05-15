@@ -38,9 +38,10 @@ execution. No-send and approval gates remain enforced.
 
 The live research ladder is:
 
-- `SearXNG` first for broad recall when no explicit provider override is set.
-- `Serper` when recall quality is weak and higher-precision search is needed,
-  or when explicitly selected.
+- `SearXNG` for broad recall when no explicit provider override is set.
+- `Agents hosted web search` as a capped parallel lane beside SearXNG for
+  default live research.
+- `Serper` only when explicitly selected for a specific run.
 - `Firecrawl` as an explicit search provider when configured, and as an
   optional website extractor for selected company pages.
 - `Trafilatura` as the default live-gated website extractor.
@@ -103,22 +104,27 @@ with dry-run fixtures and redaction reviewed first.
   --markdown
 ```
 
-Current verification from this implementation pass:
+Current verification from the 2026-05-11 stabilization pass:
 
-- `.venv/bin/python -m pytest`: 924 passed.
-- `.venv/bin/python -m ruff check src/keystone_agents/work_items.py src/keystone_agents/workflow_runner.py src/keystone_agents/schemas/context_pack.py src/keystone_agents/schemas/__init__.py tests/test_context_packs.py`: all checks passed.
+- `.venv/bin/python -m pytest -q`: 1035 passed.
+- `.venv/bin/python -m ruff check .`: all checks passed.
+- `.venv/bin/python scripts/run_evals.py --agent all --json`: 22 passed, 0 failed.
 
 Expected safety signals: no email sent, send disabled, and pending approval stops before outreach drafting.
 
-The health check is offline. It reports Python version, package imports, prompt files, agent builder functions, SQLite initialization, dry-run script entrypoints, masked environment safety, live integration readiness, `AUTO_SEND_EMAIL`, model provider status, and test fixture availability. It does not make live network calls, does not require credentials for dry-run mode, does not start OAuth browser flows, and must not print secrets.
+The health check is offline. It reports Python version, package imports, prompt files,
+registry-derived agent builder functions, SQLite initialization, dry-run script entrypoints,
+masked environment safety, live integration readiness, `AUTO_SEND_EMAIL`, model provider status,
+and test fixture availability. It does not make live network calls, does not require credentials
+for dry-run mode, does not start OAuth browser flows, and must not print secrets.
 
-Missing optional live credentials do not fail health checks in normal dry-run mode. They become warnings when a live intent flag is configured, such as `KEYSTONE_ENABLE_LIVE_GMAIL=true`, `KEYSTONE_ENABLE_LIVE_SLACK=true`, or `KEYSTONE_ENABLE_LIVE_RESEARCH=true`. Gmail is reported separately as `disabled`, `ready`, or `misconfigured`. Treat any enabled `AUTO_SEND_EMAIL` value as a high-severity warning because this repo is draft-only. If Gmail live credentials are configured but no approval queue channel is set, configure `SLACK_CHANNEL_APPROVALS` or keep Gmail live mode disabled. If `SLACK_BOT_TOKEN` is configured but `SLACK_CHANNEL_APPROVALS` is missing, Slack approval notifications are not ready.
+Missing optional live credentials do not fail health checks in normal dry-run mode. They become warnings when a live intent flag is configured, such as `KEYSTONE_ENABLE_LIVE_GMAIL=true`, `KEYSTONE_ENABLE_LIVE_SLACK=true`, or `KEYSTONE_ENABLE_LIVE_RESEARCH=true`. Gmail is reported separately as `disabled`, `ready`, or `misconfigured`. Treat any enabled `AUTO_SEND_EMAIL` value as a high-severity warning because this repo is draft-only. If Gmail live credentials are configured but no approval queue channel is set, configure `SLACK_CHANNEL_APPROVALS` or keep Gmail live mode disabled. If `SLACK_BOT_TOKEN` is configured but `SLACK_CHANNEL_APPROVALS` is missing, Slack approval notifications are not ready. If this checkout is intentionally in live-test posture with `KEYSTONE_DRY_RUN=false`, health remains a warning by design.
 
 ## Static Agent Evals
 
 Static evals measure deterministic fixture-mode agent quality beyond unit coverage.
-They do not call live models, Gmail, Slack, Serper, Apify, Browserless, or other
-external APIs.
+They do not call live models, Gmail, Slack, SearXNG, hosted web search, Serper,
+Apify, Browserless, or other external APIs.
 
 Run all four specialist eval suites:
 
@@ -156,6 +162,7 @@ copy constraints.
 .venv/bin/python scripts/run_outreach_draft.py --fixture sample_company_curebase --opportunity-fixture sample_lead_curebase --markdown
 .venv/bin/python scripts/run_outreach_draft.py --fixture sample_company_curebase --opportunity-fixture sample_lead_curebase --include-call-prep --markdown
 .venv/bin/python scripts/run_orchestrator.py --input "find behavioral health AI companies"
+.venv/bin/python scripts/run_chief_of_staff.py --input "which KNI Slack workflow should handle calendar prep?"
 .venv/bin/python scripts/export_pipeline_table.py --provider dry-run --object-type opportunities --json
 .venv/bin/python scripts/export_pipeline_table.py --dashboard
 ```
@@ -173,7 +180,8 @@ keystone agents list
 ```
 
 Expected routes: `gmail_triage`, `business_research_analyst`,
-`opportunity_scout`, and `outreach_composer`.
+`opportunity_scout`, `outreach_composer`, `orchestrator`, and
+`chief_of_staff`.
 
 ## WorkItem Natural-Language Smoke Test
 
@@ -216,10 +224,23 @@ Approve the selected company profile, then continue:
   --input "continue" \
   --database-url "$DB_URL"
 
+.venv/bin/python -m keystone_agents.cli work-items advance <work_item_id> \
+  --input "continue" \
+  --database-url "$DB_URL" \
+  --langgraph \
+  --json
+
 .venv/bin/python -m keystone_agents.cli work-items timeline <work_item_id> \
   --database-url "$DB_URL" \
   --json
 ```
+
+`--langgraph` routes the same WorkItem advancement through the optional graph
+wrapper. If the `orchestration` extra is not installed, local dry-run execution
+uses the dependency-free node contract and still records a
+`langgraph_orchestration` timeline event. With LangGraph installed, the same
+entrypoint can use graph thread IDs and future checkpointers for resumable
+approval workflows.
 
 Expected final safety signal: Outreach Composer creates a draft-only approval
 item, status becomes `needs_approval`, no external message is sent, and
@@ -228,7 +249,9 @@ item, status becomes `needs_approval`, no external message is sent, and
 For Slack parity, new `@KNI workitem "..."` starts should route through
 `keystone ask` and then save WorkItem state. WorkItem management actions such as
 `continue`, `show`, `timeline`, `select`, and `approve-context` remain direct
-`work-items` subcommands.
+`work-items` subcommands. Set `KNI_BUSINESS_AGENTS_LANGGRAPH=true` in the
+`keystone-slack` environment to route Slack WorkItem advancement through the
+same optional graph wrapper.
 
 Use live SDK synthesis over local Gmail fixtures for GT-1 priority grouping. This calls the
 model but does not read Gmail, create Gmail drafts, apply labels, send email, or post Slack:
@@ -343,18 +366,25 @@ Gmail send, create a background job, create a CRM task, or authorize outbound co
 ## Live Search Providers
 
 Search defaults to `SEARCH_PROVIDER=dry-run`, which never makes network calls. Live company
-research and opportunity scouting must name `serper` or `searxng` explicitly through
-`--search-provider` or `SEARCH_PROVIDER` and must also use `--live-search --no-dry-run`.
+research and opportunity scouting should use SearXNG plus a capped Agents hosted
+web-search lane for routine discovery, and Trafilatura for selected-page
+extraction. Serper remains available only when explicitly selected for a
+specific run.
 
 ```bash
-export SEARCH_PROVIDER=serper
-export SERPER_API_KEY="..."
+export SEARCH_PROVIDER=searxng
+export SEARXNG_BASE_URL="http://127.0.0.1:18080"
+export KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK=true
+export KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL=true
+export KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN=2
+export KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true
+export KEYSTONE_WEBSITE_EXTRACTOR=trafilatura
 .venv/bin/python scripts/run_opportunity_scout.py \
   --topic "behavioral health AI" \
   --max-results 3 \
   --live-search \
   --no-dry-run \
-  --search-provider serper \
+  --search-provider searxng \
   --save \
   --markdown
 ```
@@ -377,18 +407,28 @@ Scout records.
 For SearXNG, set `SEARCH_PROVIDER=searxng` and `SEARXNG_BASE_URL`, or pass
 `--search-provider searxng`.
 
+For the repo-local SearXNG instance:
+
+```bash
+./scripts/manage_searxng_headless.sh start
+export SEARXNG_BASE_URL="http://127.0.0.1:18080"
+```
+
+This uses the `kba-searxng` Colima profile and port `18080`, separate from the
+`keystone-slack` SearXNG runtime.
+
 For Firecrawl search, set `SEARCH_PROVIDER=firecrawl`, `FIRECRAWL_API_KEY`, and
 optionally `FIRECRAWL_BASE_URL`, or pass `--search-provider firecrawl`.
 
-For Opportunity Scout OS-1 improvement runs, SearXNG can also be configured as an explicit
-backup when Serper is missing configuration or returns a provider error:
+For Opportunity Scout OS-1 improvement runs, fallback providers should be explicit
+non-Serper exceptions, such as SearXNG or Firecrawl, while Serper credits are unavailable:
 
 ```bash
 .venv/bin/python scripts/run_opportunity_scout.py \
   --improvement-case os-1 \
   --live-search \
-  --search-provider serper \
-  --fallback-search-provider searxng \
+  --search-provider searxng \
+  --fallback-search-provider firecrawl \
   --no-dry-run \
   --live-sdk \
   --orchestrator-review \
@@ -401,9 +441,10 @@ individual hits are dropped instead of failing the whole search run.
 
 Live search is implemented for Researcher company-research paths and opportunity scouting. It requires
 `--live-search --no-dry-run` and provider configuration. Use small result counts first and
-preserve source attribution. The shared `SearchProvider` supports dry-run, SearXNG, Serper,
-and Firecrawl. The deterministic retrieval ladder defaults to SearXNG then Serper when no
-explicit provider is selected; an explicit `--search-provider` uses that provider first, and
+preserve source attribution. The shared `SearchProvider` supports dry-run, SearXNG,
+Agents hosted web search, Serper, Firecrawl, and Tavily. The deterministic
+retrieval ladder defaults to SearXNG plus a capped Agents hosted web-search lane
+when no explicit provider is selected; an explicit `--search-provider` uses that provider first, and
 `--fallback-search-provider` can recover from provider configuration or provider response errors
 without bypassing input guardrails.
 
@@ -420,10 +461,35 @@ records to Business Research Analyst. No outreach copy is generated.
 For broad Opportunity Scout prompts, search is intentionally multi-lane rather
 than role-only: company growth, collaboration, researcher, institute, conference,
 grant, trial, and role lanes can all run in one pass. If accepted records
-under-fill, Scout can run bounded adaptive follow-up queries and
-SearXNG-compatible page deepening. The follow-up result cap defaults to 8 and
-can be lowered with `KEYSTONE_OPPORTUNITY_FOLLOWUP_RESULT_CAP` to conserve
-provider credits.
+under-fill, Scout can run bounded coverage-aware follow-up queries, adaptive
+follow-up queries, and SearXNG-compatible page deepening capped at page 3. The
+follow-up result cap defaults to 8 and can be lowered with
+`KEYSTONE_OPPORTUNITY_FOLLOWUP_RESULT_CAP` to conserve provider credits.
+Coverage follow-up is controlled by `KEYSTONE_ENABLE_SEARCH_COVERAGE_FOLLOWUP`
+and `KEYSTONE_SEARCH_COVERAGE_FOLLOWUP_QUERY_CAP`.
+
+Run `scripts/run_search_coverage_eval.py` against
+`evals/search_coverage_cases.jsonl` when deciding whether current providers miss
+useful websites. This eval measures source-lane and expected-domain recall; use
+browser extraction evals only after URLs have already been discovered.
+
+Tavily is budget-aware when used as a provider or fallback. Keystone requests
+`include_usage=true` and records provider-reported credits when present; if a
+response omits usage, it estimates search credits from `TAVILY_SEARCH_DEPTH`
+(`basic`, `fast`, and `ultra-fast` = 1 credit/request; `advanced` = 2). Defaults
+are free-plan friendly:
+
+```bash
+export TAVILY_SEARCH_DEPTH=basic
+export KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT=1000
+export KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT=850
+export KEYSTONE_TAVILY_CREDIT_ENFORCEMENT=warn
+```
+
+The default `warn` mode does not block retrieval. Set
+`KEYSTONE_TAVILY_CREDIT_ENFORCEMENT=block` only when the local monthly cap should
+prevent additional Tavily requests. Budget context appears in retrieval metadata
+as `tavily_credit_budget` and provider usage includes `credits_used`.
 
 Website extraction is a separate live-gated enrichment step for selected company pages. Enable it
 only when needed:
@@ -673,6 +739,29 @@ flags, JSON audit summary, redacted child errors, and pending-approval backlog c
 Global flags such as `--json`, `--lock-file`, and `--no-health-preflight` go before
 the subcommand.
 
+Chief of Staff can now audit the local automation inventory, recent runs, channel
+bindings, pending approvals, and active WorkItems without live writes:
+
+```bash
+.venv/bin/python -m keystone_agents.cli automations audit \
+  --database-url sqlite:///.keystone/state/keystone_agents.db
+```
+
+List configured automations or recent runs:
+
+```bash
+.venv/bin/python -m keystone_agents.cli automations list \
+  --database-url sqlite:///.keystone/state/keystone_agents.db
+
+.venv/bin/python -m keystone_agents.cli automations runs \
+  --database-url sqlite:///.keystone/state/keystone_agents.db
+```
+
+The Chief of Staff publishing tools support local/dry-run Google Doc reports,
+Airtable-shaped review rows, and internal Slack summaries. SQLite and WorkItems
+remain canonical. Live Google Docs and Airtable providers still require reviewed
+adapters before real external writes are enabled.
+
 First scheduled job should be weekly Opportunity Scout dry-run with local audit storage:
 
 ```bash
@@ -889,6 +978,16 @@ export SLACK_CHANNEL_APPROVALS="C0123456789"
 
 Slack notifications do not approve, send, schedule, or publish anything.
 
+For Slack `@KNI` business-agent mode, keep the bridge flags distinct:
+`KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED` routes mentions into local
+business-agent workflows; `KNI_BUSINESS_AGENTS_LIVE_SDK` enables model
+synthesis/planning; `KNI_BUSINESS_AGENTS_LIVE_SEARCH` enables retrieval;
+`KNI_BUSINESS_AGENTS_LIVE_SLACK` posts approval cards; and
+`KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS` creates Gmail drafts only after local
+approval. Slack history context stays disabled unless
+`KNI_BUSINESS_AGENTS_HISTORY_CONTEXT_ENABLED` and the reviewed Slack history
+scopes are intentionally enabled. See `docs/SLACK_BUSINESS_AGENT_MODE.md`.
+
 ## Natural-Language Agent Mentions
 
 Use the packaged CLI to speak to a named agent from the terminal:
@@ -915,6 +1014,17 @@ calls only resolve the named specialist and skip model execution. In
 `live-test` / `full-live` mode, explicit named-agent calls through `--agent` or
 `@KNI <agent>` auto-enable live SDK model execution. Use `--no-live-sdk` to
 force the dry-run / WorkItem path.
+
+`@KNI keystone ask ...` is accepted as a Slack-friendly alias for the same
+natural-language entrypoint. With live SDK enabled, Chief of Staff `ask` runs
+use local Agents SDK SQLite sessions by default for conversation continuity.
+WorkItem advancement also uses scoped sessions when live SDK is enabled because
+the WorkItem id gives a durable boundary. Other direct specialist `ask` runs
+stay stateless unless a session is inherited from Slack/WorkItem context or the
+operator opts in. Override the logical session with `--sdk-session-id`, store
+history somewhere else with `--sdk-session-db`, or disable it with
+`--no-sdk-session`. Session ids are hashed before use; WorkItems and SQLite
+artifacts remain the canonical audit state.
 
 Use `--live-manual-plan` when you want the LLM planner to interpret a flexible
 manual request before execution. If the planner cannot run, Keystone falls back
@@ -1246,7 +1356,8 @@ Review for unexpected live flags, missing approval records, stale drafts, failed
 ## Cost-Control Checklist
 
 - Prefer fixtures and dry-run.
-- Keep first live Serper runs at `--max-results 3`.
+- Keep first live search runs at `--max-results 3` and keep hosted web search
+  capped.
 - Keep first live Gmail runs at `--max-messages 1`.
 - Avoid `--sdk` unless intentionally validating SDK construction or live model behavior.
 - Save audit rows to avoid repeating live calls.

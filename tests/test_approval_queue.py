@@ -358,13 +358,19 @@ def test_approval_queue_item_builds_slack_review_message_with_local_actions() ->
     message = slack_review_message_from_approval_item(item)
     payload = message.as_payload()
     thread_text = "\n\n".join(payload["thread_blocks"])
+    action_block = next(block for block in payload["root_blocks"] if block["type"] == "actions")
+    action_texts = [
+        element["text"]["text"]
+        for element in action_block["elements"]
+        if element["type"] == "button"
+    ]
 
     assert "approval-test-1" in payload["root_text"]
-    assert "Type: Gmail draft" in payload["root_text"]
-    assert "Status: pending" in payload["root_text"]
-    assert "Scope: send" in payload["root_text"]
-    assert "Risk flags: legal review" in payload["root_text"]
-    assert "Next safe action:" in payload["root_text"]
+    assert "Ready for approval" in payload["root_text"]
+    assert "Gate: send" in payload["root_text"]
+    assert "Slack buttons update only the referenced WorkItem gate" in payload["root_text"]
+    assert "Reject:" not in payload["root_text"]
+    assert action_texts[:2] == ["Approve draft review", "Revise draft"]
     assert "Evidence" in thread_text
     assert "Draft text" in thread_text
     assert "Hi Alex" in thread_text
@@ -372,6 +378,7 @@ def test_approval_queue_item_builds_slack_review_message_with_local_actions() ->
     assert "fixture:gmail" not in thread_text
     assert payload["object_type"] == "gmail_draft"
     assert payload["risk_flags"] == ["legal_review"]
+    assert payload["approval_action_label"] == "draft review only"
     assert payload["send_enabled"] is False
     assert payload["interactive_actions_enabled"] is True
 

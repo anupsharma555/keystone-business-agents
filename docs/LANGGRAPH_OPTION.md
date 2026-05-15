@@ -1,4 +1,4 @@
-# LangGraph Orchestration Option
+# LangGraph Orchestration
 
 ## Position
 
@@ -9,7 +9,54 @@ OpenAI Agents SDK remains the core specialist-agent layer for Keystone. The four
 - Opportunity Scout
 - Outreach Composer
 
-Each specialist keeps its `build_*_agent()` function, markdown prompts, Pydantic structured output, explicit tool wrappers, dry-run fixture mode, and safety guardrails. LangGraph, if added later, should orchestrate these specialists; it should not replace them.
+Each specialist keeps its `build_*_agent()` function, markdown prompts, Pydantic structured output, explicit tool wrappers, dry-run fixture mode, and safety guardrails. LangGraph is implemented as an optional WorkItem orchestration wrapper; it does not replace SDK agents.
+
+Current implementation:
+
+- `src/keystone_agents/langgraph_workflow.py` defines the optional graph wrapper.
+- `pyproject.toml` exposes LangGraph through the `orchestration` extra only.
+- `keystone work-items advance --langgraph` runs WorkItem advancement through the wrapper.
+- `KEYSTONE_WORKITEM_LANGGRAPH=true` enables the wrapper for repo-local
+  `work-items advance` calls without requiring `--langgraph`.
+- `KNI_BUSINESS_AGENTS_LANGGRAPH=true` enables the same wrapper for WorkItem
+  advancement reached through the local `keystone-slack` bridge.
+- If LangGraph is not installed, tests and local dry-run execution can exercise the same node contract through a dependency-free fallback.
+
+Install the optional runtime only in environments that need graph execution:
+
+```bash
+.venv/bin/python -m pip install -e ".[orchestration]"
+```
+
+## Operational Use
+
+LangGraph is used at the WorkItem orchestration boundary, not inside specialist
+agents. The graph receives a typed `WorkflowRunRequest`, calls the existing
+WorkItem runner, records node-path and checkpoint metadata, and returns the same
+`WorkflowRunResult` shape used by the CLI, Slack handlers, tests, and renderers.
+
+CLI usage:
+
+```bash
+.venv/bin/python -m keystone_agents.cli work-items advance <work_item_id> \
+  --input "continue" \
+  --database-url "$DATABASE_URL" \
+  --langgraph \
+  --json
+```
+
+Slack usage:
+
+1. Install the `orchestration` extra in the KBA virtual environment referenced
+   by `KNI_BUSINESS_AGENTS_PYTHON`.
+2. Set `KNI_BUSINESS_AGENTS_LANGGRAPH=true` in the `keystone-slack` environment.
+3. Continue using existing Slack actions such as `continue`, more research,
+   find contact, and revise draft.
+
+The `keystone-slack` bridge already merges its environment into subprocesses
+before invoking this repo, so no bridge code change is required for the flag to
+reach KBA. Existing live flags still control model execution, search, Slack
+posting, and Gmail drafts independently.
 
 ## Why SDK First
 
@@ -21,22 +68,29 @@ Keeping the SDK layer first also supports:
 - direct CLI execution of each specialist
 - focused safety checks for outbound copy
 - source-attributed company, broader research, and opportunity research
-- future orchestration that can swap workflow engines without rewriting specialists
+- orchestration that can swap workflow engines without rewriting specialists
 
-## When To Add LangGraph
+## What LangGraph Improves
 
-Add LangGraph only when the project needs stateful orchestration beyond the current CLI and deterministic fixture flows:
+LangGraph improves orchestration rather than individual agent reasoning:
 
-- resumable multi-step runs
-- persisted checkpoints between specialists
-- retry policies per node
-- explicit human approval interruptions
-- branching workflows for inbound Gmail, researcher/account work, opportunity scoring, and outreach
-- audit trails across a complete business-development run
+- It creates explicit node boundaries around WorkItem advancement.
+- It gives the project a durable checkpoint seam before approval-gated next actions.
+- It lets future Slack or scheduled runs resume from a graph thread id instead of rerouting.
+- It can add retry policies per node without changing specialist agents.
+- It can support branching workflows for inbound Gmail, account research, opportunity scoring, and outreach.
+- It preserves SQLite WorkItems as canonical audit state while allowing LangGraph checkpoints.
 
-Do not add LangGraph merely to call one specialist agent or to hide business logic in graph nodes.
+Do not use LangGraph merely to call one specialist agent or to hide business logic in graph nodes.
 
-## Proposed Nodes
+## Implemented Nodes
+
+- `advance_work_item`: Calls the existing deterministic `advance_work_item()` runner with a typed `WorkflowRunRequest`.
+- `approval_checkpoint`: Records a graph-level checkpoint payload when the WorkItem result requires human approval.
+
+The implementation intentionally starts with one WorkItem advancement per graph run. Multi-specialist loops should be added only after this wrapper is stable in real use.
+
+## Future Nodes
 
 - `classify_input`: Decide whether the input is inbound email, company/account context, broader research request, opportunity scouting request, or approved outreach context.
 - `gmail_triage`: Run the SDK Gmail Triage agent or fixture equivalent.
@@ -47,7 +101,7 @@ Do not add LangGraph merely to call one specialist agent or to hide business log
 - `storage`: Persist inputs, structured outputs, approvals, and audit records.
 - `report`: Render markdown and JSON reports from structured outputs.
 
-## Proposed Edges
+## Future Edges
 
 - `classify_input -> gmail_triage` for inbound email.
 - `classify_input -> account_research` for known companies or accounts.
@@ -64,7 +118,7 @@ Do not add LangGraph merely to call one specialist agent or to hide business log
 
 ## Interruptions And Approval Checkpoints
 
-Interruptions should be explicit and persisted. The graph should pause when:
+Interruptions should be explicit and persisted. The current wrapper records an `approval_checkpoint` node when the WorkItem result requires approval. Future live graph interrupt/resume handling should pause when:
 
 - outbound email, LinkedIn, Slack, or CRM copy may be produced
 - a draft exists and requires review
@@ -75,9 +129,9 @@ Interruptions should be explicit and persisted. The graph should pause when:
 
 Approval checkpoints must record the reviewer, decision, timestamp, scope, and approved next action. Approval to draft does not imply approval to send. No external email may be sent automatically.
 
-## What Not To Implement Yet
+## Current Guardrails
 
-- Do not add a LangGraph dependency.
+- Do not add LangGraph to core dependencies; keep it optional.
 - Do not rewrite SDK specialists as graph-native nodes.
 - Do not remove or bypass `build_*_agent()` functions.
 - Do not create live integration paths as part of orchestration.
@@ -87,4 +141,4 @@ Approval checkpoints must record the reviewer, decision, timestamp, scope, and a
 
 ## Initial Migration Shape
 
-The first implementation should be a thin orchestrator around existing SDK agent calls and fixture helpers. Each graph node should accept typed state, call one specialist or utility, store the structured output, and return the next state. Reports should be generated from structured outputs, not from graph internals.
+The first implementation is a thin orchestrator around existing WorkItem advancement. Each graph node accepts typed serializable state, calls one existing utility, stores structured output, and returns the next state. Reports remain generated from structured outputs, not graph internals.

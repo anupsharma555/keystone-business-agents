@@ -31,6 +31,7 @@ from keystone_agents.sdk import load_prompt
 from keystone_agents.tools.search_provider import (
     DryRunSearchProvider,
     LiveSearchProviderRequiredError,
+    SerperSearchError,
 )
 from keystone_agents.tools.serper_tool import SearchResult, SerperTool
 
@@ -119,6 +120,65 @@ def test_live_query_specs_run_with_bounded_parallelism(monkeypatch: pytest.Monke
 
     assert provider.max_active > 1
     assert [hit["query"] for hit in hits] == [f"query-{index}" for index in range(4)]
+
+
+def test_live_query_specs_skip_one_provider_error_without_failing_run() -> None:
+    class FlakyProvider:
+        def search_web(self, query: str, *, num_results: int = 10) -> list[SearchResult]:
+            if query == "bad-query":
+                raise SerperSearchError("Serper search failed with HTTP 400.")
+            return [
+                SearchResult(
+                    title=f"{query} company raises funding",
+                    link=f"https://example.test/{query}",
+                    snippet="Behavioral health AI company funding signal.",
+                    source="serper",
+                )
+            ]
+
+    specs = [
+        scout_module._OpportunityQuerySpec(
+            lane="company_growth",
+            time_window="recent",
+            query="good-query",
+            entity_hint="company",
+        ),
+        scout_module._OpportunityQuerySpec(
+            lane="company_growth",
+            time_window="recent",
+            query="bad-query",
+            entity_hint="company",
+        ),
+    ]
+
+    hits = scout_module._search_query_specs_with_provider(
+        search_provider=FlakyProvider(),
+        query_specs=specs,
+        max_results=2,
+    )
+
+    assert [hit["query"] for hit in hits] == ["good-query"]
+
+
+def test_strict_company_plan_uses_company_only_live_query_lanes() -> None:
+    plan = scout_module.infer_opportunity_search_plan(
+        "Identify 5 mental health AI companies with possible clinical validation needs; "
+        "no outreach.",
+        desired_count=5,
+    )
+
+    specs = scout_module._build_live_query_specs(
+        "Identify 5 mental health AI companies with possible clinical validation needs; "
+        "no outreach.",
+        search_plan=plan,
+    )
+
+    assert specs
+    assert {spec.entity_hint for spec in specs} == {"company"}
+    assert "role" not in {spec.lane for spec in specs}
+    assert {"researcher", "institute", "conference", "grant", "trial"}.isdisjoint(
+        {spec.lane for spec in specs}
+    )
 
 
 class FakeSearxngProvider:
@@ -385,6 +445,40 @@ class FakeAdaptiveOpportunityProvider:
                     "Validated clinical trial management software and artificial "
                     "intelligence solutions across cardiac safety."
                 ),
+                source="serper",
+            )
+        ][:num_results]
+
+
+class FakeCoverageFollowupProvider:
+    provider_name = "serper"
+    dry_run = False
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def validate_configuration(self) -> None:
+        return None
+
+    def search_web(self, query: str, *, num_results: int = 10) -> list[SearchResult]:
+        self.queries.append(query)
+        if "site:reporter.nih.gov" in query:
+            return [
+                SearchResult(
+                    title="AffectAI NIH SBIR grant project",
+                    link="https://reporter.nih.gov/project-details/123",
+                    snippet=(
+                        "NIH SBIR grant project supports behavioral health AI "
+                        "evidence generation."
+                    ),
+                    source="serper",
+                )
+            ][:num_results]
+        return [
+            SearchResult(
+                title="Generic behavioral health AI company page",
+                link="https://example.test/generic-company",
+                snippet="Generic company result without grant coverage.",
                 source="serper",
             )
         ][:num_results]
@@ -1243,7 +1337,75 @@ def test_ai_company_prompt_requires_source_side_ai_or_platform_relevance() -> No
         topic="Find 3 current behavioral health AI companies with recent funding.",
     )
 
-    assert any("AI, digital, analytics" in reason for reason in reasons)
+    assert any("explicit AI" in reason for reason in reasons)
+
+
+def test_behavioral_health_prompt_allows_adjacent_healthcare_ai() -> None:
+    hit = {
+        "company_name": "ClinicalFlow AI",
+        "source_title": "ClinicalFlow AI partners with health systems on care delivery",
+        "source_url": "https://example.test/clinicalflow-partnership",
+        "signal": (
+            "Healthcare AI company announces a clinical workflow partnership with "
+            "provider organizations."
+        ),
+        "signals": ["partnership announcement"],
+    }
+
+    reasons = scout_module._topic_relevance_rejection_reasons(
+        hit,
+        topic=(
+            "Find current behavioral health AI partnership or advisory opportunities; "
+            "general healthcare AI companies may be relevant when clinically adjacent."
+        ),
+    )
+
+    assert reasons == []
+
+
+def test_behavioral_health_prompt_rejects_generic_workforce_ai_partnership() -> None:
+    hit = {
+        "company_name": "Tech Mahindra and UKG",
+        "source_title": "Tech Mahindra and UKG partner on AI workforce management",
+        "source_url": "https://example.test/tech-mahindra-ukg",
+        "signal": (
+            "Partnership uses AI for human capital, payroll, and workforce management "
+            "for enterprise customers."
+        ),
+        "signals": ["partnership announcement"],
+    }
+
+    reasons = scout_module._topic_relevance_rejection_reasons(
+        hit,
+        topic=(
+            "Find current US behavioral health AI partnership or advisory opportunities; "
+            "exclude payments advertising automaker and generic AI infrastructure news."
+        ),
+    )
+
+    assert any(
+        "behavioral-health or adjacent healthcare AI relevance" in reason for reason in reasons
+    )
+
+
+def test_explicit_exclusion_terms_reject_matching_sector_noise() -> None:
+    hit = {
+        "company_name": "Stellantis and Microsoft",
+        "source_title": "Stellantis expands automotive AI partnership",
+        "source_url": "https://example.test/stellantis-microsoft-ai",
+        "signal": "Automaker announces AI partnership for vehicle customer experience.",
+        "signals": ["partnership announcement"],
+    }
+
+    reasons = scout_module._topic_relevance_rejection_reasons(
+        hit,
+        topic=(
+            "Find current US behavioral health AI partnership or advisory opportunities; "
+            "exclude payments advertising automaker and generic AI infrastructure news."
+        ),
+    )
+
+    assert any("explicitly excluded automaker" in reason for reason in reasons)
 
 
 def test_unpaid_does_not_trigger_ai_company_constraint() -> None:
@@ -1360,6 +1522,219 @@ def test_red_flags_headline_is_not_treated_as_funding_signal() -> None:
 
     assert any("article headline" in reason for reason in reasons)
     assert any("source lacks active opportunity evidence" in reason for reason in reasons)
+
+
+def test_emergency_readiness_video_headline_is_not_scored_as_company_name() -> None:
+    reason = scout_module._candidate_name_rejection_reason(
+        "Simulations make emergency readiness a regular practice"
+    )
+
+    assert "article headline" in reason
+
+
+def test_company_search_rejects_listicle_and_roundup_titles_as_company_names() -> None:
+    assert "listicle" in scout_module._candidate_name_rejection_reason(
+        "Top mental health startups 2026"
+    )
+    assert "roundup" in scout_module._candidate_name_rejection_reason(
+        "Mental Health Funding and News Roundup"
+    )
+    assert "rundown" in scout_module._candidate_name_rejection_reason(
+        "Health Tech Weekly Rundown"
+    )
+    assert "trend article" in scout_module._candidate_name_rejection_reason(
+        "Q1 2026 Healthtech VC Trends"
+    )
+
+
+def test_descriptor_prefixed_company_title_extracts_actual_company_name() -> None:
+    name = scout_module._extract_company_name(
+        "AI-augmented behavioral health provider Theris launches clinical validation pilot"
+    )
+
+    assert name == "Theris"
+
+
+def test_generic_news_page_title_extracts_domain_company_name() -> None:
+    name = scout_module._extract_company_name("News - Modality.AI")
+
+    assert name == "Modality.AI"
+
+
+def test_technology_driven_company_title_extracts_actual_company_name() -> None:
+    name = scout_module._extract_company_name(
+        "Technology-Driven Behavioral Health Company SonderMind Raises $150 Million"
+    )
+
+    assert name == "SonderMind"
+
+
+def test_exclusive_prefix_company_title_extracts_actual_company_name() -> None:
+    name = scout_module._extract_company_name(
+        "Exclusive: Blossom Health raises $20 million to bring an AI operating system"
+    )
+
+    assert name == "Blossom Health"
+
+
+def test_partnership_title_extracts_primary_company_name() -> None:
+    name = scout_module._extract_company_name(
+        "Talkiatry and New York Cancer & Blood Specialists Partner to Expand Mental Health Access"
+    )
+
+    assert name == "Talkiatry"
+
+
+def test_selects_title_extracts_selected_vendor_name() -> None:
+    name = scout_module._extract_company_name(
+        "CalMHSA Selects Eleos as Statewide AI Technology Partner for Behavioral Health"
+    )
+
+    assert name == "Eleos"
+
+
+def test_strict_company_prompt_rejects_awards_program_records() -> None:
+    plan = scout_module.infer_opportunity_search_plan(
+        "Identify 5 mental health AI companies with possible clinical validation needs; "
+        "no outreach.",
+        desired_count=5,
+    )
+    hit = {
+        "company_name": "MedTech Breakthrough",
+        "entity_kind": "company",
+        "source_title": (
+            "MedTech Breakthrough Announces 2026 Award Winners: Celebrating a Decade "
+            "of Health Technology Innovation"
+        ),
+        "source_url": "https://example.test/2026-medtech-breakthrough-award-winners",
+        "signal": "Awards program recognizes digital health and medical technology companies.",
+        "signals": ["award winners", "annual awards"],
+    }
+
+    reasons = scout_module._topic_relevance_rejection_reasons(
+        hit,
+        topic=(
+            "Identify 5 mental health AI companies with possible clinical validation needs; "
+            "no outreach."
+        ),
+        search_plan=plan,
+    )
+
+    assert any("awards program" in reason for reason in reasons)
+
+
+def test_strict_mental_health_ai_company_prompt_rejects_health_system_without_behavioral_focus() -> None:
+    plan = scout_module.infer_opportunity_search_plan(
+        "Identify 5 mental health AI companies with possible clinical validation needs; "
+        "no outreach.",
+        desired_count=5,
+    )
+    hit = {
+        "company_name": "Beth Israel Lahey Health",
+        "entity_kind": "company",
+        "source_title": (
+            "Beth Israel Lahey Health Partners with Heidi to Roll Out Ambient AI Scribing "
+            "to All Physicians"
+        ),
+        "source_url": "https://example.test/bilh-heidi-ambient-ai-rollout",
+        "signal": (
+            "Integrated delivery network deploys ambient AI scribing across its physician "
+            "network to reduce clinician administrative burden."
+        ),
+        "signals": ["ambient AI", "health system"],
+    }
+
+    reasons = scout_module._topic_relevance_rejection_reasons(
+        hit,
+        topic=(
+            "Identify 5 mental health AI companies with possible clinical validation needs; "
+            "no outreach."
+        ),
+        search_plan=plan,
+    )
+
+    assert any("direct behavioral-health" in reason for reason in reasons)
+
+
+def test_strict_mental_health_ai_company_prompt_does_not_count_query_derived_behavioral_signal() -> None:
+    plan = scout_module.infer_opportunity_search_plan(
+        "Identify 5 mental health AI companies with possible clinical validation needs; "
+        "no outreach.",
+        desired_count=5,
+    )
+    hit = {
+        "company_name": "GovWell",
+        "entity_kind": "company",
+        "source_title": "GovWell Raises $25M Series A for AI Operating System",
+        "source_url": "https://example.test/govwell-series-a",
+        "signal": "AI operating system for modern government workflows.",
+        "signals": ["behavioral health", "AI"],
+    }
+
+    reasons = scout_module._topic_relevance_rejection_reasons(
+        hit,
+        topic=(
+            "Identify 5 mental health AI companies with possible clinical validation needs; "
+            "no outreach."
+        ),
+        search_plan=plan,
+    )
+
+    assert any("direct behavioral-health" in reason for reason in reasons)
+
+
+def test_strict_ai_company_prompt_rejects_non_ai_behavioral_health_platform() -> None:
+    plan = scout_module.infer_opportunity_search_plan(
+        "Identify 5 mental health AI companies with possible clinical validation needs; "
+        "no outreach.",
+        desired_count=5,
+    )
+    hit = {
+        "company_name": "Triad",
+        "entity_kind": "company",
+        "source_title": "Triad Partners with CCBHC Workforce Accelerator",
+        "source_url": "https://example.test/triad-ccbhc",
+        "signal": "Behavioral health education platform expands clinician workforce support.",
+        "signals": ["behavioral health", "platform"],
+    }
+
+    reasons = scout_module._topic_relevance_rejection_reasons(
+        hit,
+        topic=(
+            "Identify 5 mental health AI companies with possible clinical validation needs; "
+            "no outreach."
+        ),
+        search_plan=plan,
+    )
+
+    assert any("explicit AI" in reason for reason in reasons)
+
+
+def test_strict_ai_company_prompt_does_not_count_query_derived_ai_signal() -> None:
+    plan = scout_module.infer_opportunity_search_plan(
+        "Identify 5 mental health AI companies with possible clinical validation needs; "
+        "no outreach.",
+        desired_count=5,
+    )
+    hit = {
+        "company_name": "Triad",
+        "entity_kind": "company",
+        "source_title": "Triad Partners with CCBHC Workforce Accelerator",
+        "source_url": "https://example.test/triad-ccbhc",
+        "signal": "Behavioral health education platform expands clinician workforce support.",
+        "signals": ["behavioral health", "hiring AI"],
+    }
+
+    reasons = scout_module._topic_relevance_rejection_reasons(
+        hit,
+        topic=(
+            "Identify 5 mental health AI companies with possible clinical validation needs; "
+            "no outreach."
+        ),
+        search_plan=plan,
+    )
+
+    assert any("explicit AI" in reason for reason in reasons)
 
 
 def test_study_headline_is_not_scored_as_company_name() -> None:
@@ -1565,6 +1940,33 @@ def test_institute_prompt_rejects_company_records_before_scoring() -> None:
     )
 
     assert any("academic institute" in reason for reason in reasons)
+
+
+def test_strict_company_prompt_rejects_agency_records_mislabeled_as_company() -> None:
+    plan = scout_module.infer_opportunity_search_plan(
+        "Identify 5 mental health AI companies with possible clinical validation needs; "
+        "no outreach.",
+        desired_count=5,
+    )
+    hit = {
+        "company_name": "HHS agency",
+        "entity_kind": "company",
+        "source_title": "HHS agency announces behavioral health AI initiative",
+        "source_url": "https://www.hhs.gov/example",
+        "signal": "Government program discussing behavioral health AI validation needs.",
+        "signals": ["AI", "clinical validation"],
+    }
+
+    reasons = scout_module._topic_relevance_rejection_reasons(
+        hit,
+        topic=(
+            "Identify 5 mental health AI companies with possible clinical validation needs; "
+            "no outreach."
+        ),
+        search_plan=plan,
+    )
+
+    assert any("strict company search rejected" in reason for reason in reasons)
 
 
 def test_conference_prompt_rejects_company_records_before_scoring() -> None:
@@ -1794,6 +2196,19 @@ def test_live_search_adaptive_ladder_runs_after_zero_accepted_candidates() -> No
     assert result.records[0].company_name == "MindCare AI"
     assert any("Adaptive search ladder ran" in note for note in result.audit_notes)
     assert any("advisory board" in query for query in provider.queries)
+
+
+def test_live_search_runs_coverage_followup_for_missing_source_lanes() -> None:
+    provider = FakeCoverageFollowupProvider()
+
+    result = scout_opportunities_live_search(
+        topic="find behavioral health AI grant opportunities",
+        max_results=2,
+        search_provider=provider,
+    )
+
+    assert any("site:reporter.nih.gov" in query for query in provider.queries)
+    assert any("Coverage-aware search ran" in note for note in result.audit_notes)
 
 
 def test_live_search_rejects_publication_and_generic_program_noise() -> None:

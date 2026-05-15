@@ -29,6 +29,7 @@ from keystone_agents.workflows import (
     _should_draft,
     pipeline_markdown_report,
     run_keystone_pipeline,
+    run_opportunity_to_outreach_loop,
     run_weekly_opportunity_workflow,
     save_pipeline_result,
     weekly_opportunity_workflow_markdown,
@@ -655,6 +656,69 @@ def test_weekly_opportunity_workflow_contact_override_makes_gmail_draft_ready() 
     )
 
 
+def test_opportunity_to_outreach_loop_drafts_top_three_with_retrieval_telemetry() -> None:
+    result = run_opportunity_to_outreach_loop(dry_run=True)
+
+    assert result.cadence == "top_3_opportunity_to_outreach"
+    assert len(result.items) == 3
+    assert all(item.outreach_draft is not None for item in result.items)
+    assert result.send_enabled is False
+    assert result.gmail_drafts_created is False
+    assert result.retrieval["provider_performance"]["providers_used"] == []
+    assert result.retrieval["browser_escalation_used"] is False
+
+
+def test_opportunity_to_outreach_loop_cli_outputs_json() -> None:
+    payload = _run_cli_json("run_opportunity_to_outreach_loop.py", "--top-n", "1")
+
+    assert payload["cadence"] == "top_3_opportunity_to_outreach"
+    assert len(payload["items"]) == 1
+    assert payload["items"][0]["outreach_draft"]["send_enabled"] is False
+    assert payload["gmail_drafts_created"] is False
+
+
+def test_opportunity_to_outreach_loop_cli_can_request_slack_approval_preview(
+    tmp_path: Path,
+) -> None:
+    payload = _run_cli_json(
+        "run_opportunity_to_outreach_loop.py",
+        "--top-n",
+        "1",
+        "--save",
+        "--request-approval",
+        "--approval-channel",
+        "#ai-agents-workflow",
+        "--database-url",
+        f"sqlite:///{tmp_path / 'single-loop.db'}",
+    )
+
+    posts = payload["storage"]["slack_approval_posts"]
+    assert len(posts) == 1
+    assert posts[0]["status"] == "dry-run"
+    assert posts[0]["channel"] == "#ai-agents-workflow"
+    assert posts[0]["send_enabled"] is False
+
+
+def test_weekly_opportunity_workflow_uses_source_backed_org_contact_path() -> None:
+    result = run_weekly_opportunity_workflow(
+        topic="conference journal RFP behavioral health AI",
+        max_opportunities=1,
+        approval_state=ApprovalState.APPROVED_FOR_DRAFTING,
+    )
+
+    item = result.items[0]
+    assert item.contact_candidate.contact_path_type in {
+        "form",
+        "conference_portal",
+        "website",
+        "email",
+        "linkedin",
+        "",
+    }
+    assert item.outreach_draft is not None
+    assert item.outreach_draft.send_enabled is False
+
+
 def test_weekly_opportunity_workflow_live_sdk_synthesis_uses_agent_outputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -743,6 +807,100 @@ def test_weekly_opportunity_workflow_live_sdk_synthesis_uses_agent_outputs(
         "CompanyResearchFocusedBrief",
         "OutreachLLMDraftPayload",
     ]
+
+
+def test_weekly_opportunity_workflow_live_sdk_invalid_outreach_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.workflows as workflows
+
+    class FakeOutcome:
+        def __init__(self, final_output):
+            self.final_output = final_output
+
+    def fake_run_retrieved_sdk_synthesis(**kwargs):
+        output_type = kwargs["output_type"]
+        raw = kwargs["retrieve"]()
+        kwargs["normalize"](raw)
+        if output_type is OpportunityScoutResult:
+            return FakeOutcome(raw)
+        if output_type is CompanyResearchFocusedBrief:
+            return FakeOutcome(
+                CompanyResearchFocusedBrief(
+                    company_name=getattr(raw, "name", "Curebase"),
+                    product="LLM synthesized product summary.",
+                    facts=[
+                        CompanyBriefFact(
+                            text="LLM synthesized source-backed fact.",
+                            source_ids=["fixture:weekly"],
+                            confidence=0.8,
+                        )
+                    ],
+                )
+            )
+        if output_type is OutreachLLMDraftPayload:
+            return FakeOutcome(
+                OutreachLLMDraftPayload(
+                    company_name="Curebase",
+                    email_subject="Invalid synthesized subject",
+                    email_body="Hello, this draft contains an em dash — so it must fall back.",
+                    linkedin_note="LLM synthesized LinkedIn note.",
+                    personalization_rationale="LLM synthesized rationale.",
+                    source_ids_used=[],
+                )
+            )
+        raise AssertionError(f"Unexpected output type: {output_type}")
+
+    monkeypatch.setattr(
+        workflows,
+        "run_retrieved_sdk_synthesis",
+        fake_run_retrieved_sdk_synthesis,
+    )
+
+    result = run_weekly_opportunity_workflow(
+        topic="clinical trial software",
+        max_opportunities=1,
+        approval_state=ApprovalState.APPROVED_FOR_DRAFTING,
+        live_sdk_synthesis=True,
+    )
+
+    item = result.items[0]
+    assert item.outreach_draft is not None
+    assert item.outreach_draft.drafting_mode == "deterministic_fixture"
+    assert item.outreach_draft.send_enabled is False
+    assert any("live SDK draft failed with ValueError" in note for note in item.audit_notes)
+
+
+def test_weekly_opportunity_workflow_live_sdk_timeout_keeps_loop_moving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.workflows as workflows
+
+    def fake_run_retrieved_sdk_synthesis(**kwargs):
+        kwargs["normalize"](kwargs["retrieve"]())
+        raise TimeoutError(f"{kwargs['output_type'].__name__} timed out")
+
+    monkeypatch.setattr(
+        workflows,
+        "run_retrieved_sdk_synthesis",
+        fake_run_retrieved_sdk_synthesis,
+    )
+
+    result = run_weekly_opportunity_workflow(
+        topic="clinical trial software",
+        max_opportunities=1,
+        approval_state=ApprovalState.APPROVED_FOR_DRAFTING,
+        live_sdk_synthesis=True,
+    )
+
+    item = result.items[0]
+    assert result.live_sdk_synthesis is True
+    assert item.company_brief is None
+    assert item.outreach_draft is not None
+    assert item.outreach_draft.drafting_mode == "deterministic_fixture"
+    assert any("Opportunity Scout live SDK synthesis failed" in note for note in result.audit_notes)
+    assert any("focused brief SDK synthesis failed" in note for note in item.audit_notes)
+    assert any("live SDK draft failed with TimeoutError" in note for note in item.audit_notes)
 
 
 def test_weekly_opportunity_workflow_keeps_retrieved_candidates_when_sdk_returns_none(

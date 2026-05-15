@@ -7,6 +7,7 @@ import os
 import tempfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -20,6 +21,7 @@ from keystone_agents.agents.opportunity_scout import scout_opportunities_live_se
 from keystone_agents.config import load_settings
 from keystone_agents.retrieval_policy import (
     HybridSearchProvider,
+    ProviderRequestBudget,
     assess_company_search_quality,
     assess_opportunity_search_quality,
     build_provider_sequence,
@@ -49,6 +51,17 @@ from keystone_agents.tools.website_extraction_tool import (
 DEFAULT_SANDBOX_SEARCH_REVIEW_CONTEXT_SIZE = "low"
 DEFAULT_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 8
 MAX_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 12
+DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN = 2
+
+
+@dataclass(frozen=True)
+class SharedSearchProviderConfig:
+    """Resolved live-search provider layout for Keystone research agents."""
+
+    provider_sequence: tuple[str, ...]
+    deepening_provider_sequence: tuple[str, ...]
+    provider_request_budget: ProviderRequestBudget | None
+    parallel_provider_fanout: bool
 
 
 def search_provider_label(metadata: dict[str, Any]) -> str:
@@ -326,14 +339,15 @@ def retrieve_company_profile_live(
         agent_hint=retrieval_hint,
     )
     settings = settings_loader()
-    provider_sequence = build_provider_sequence(
+    search_config = build_shared_search_provider_config(
         requested_provider=requested_provider,
         configured_provider=settings.search_provider,
     )
 
     def build_client() -> HybridSearchProvider:
         return HybridSearchProvider(
-            provider_sequence=provider_sequence,
+            provider_sequence=search_config.provider_sequence,
+            deepening_provider_sequence=search_config.deepening_provider_sequence,
             autonomy_hint=autonomy_hint,
             quality_assessor=lambda results, _query: assess_company_search_quality(
                 results=results,
@@ -346,10 +360,12 @@ def retrieve_company_profile_live(
                 provider=provider_name,
                 live=True,
             ),
+            parallel_provider_fanout=search_config.parallel_provider_fanout,
+            provider_request_budget=search_config.provider_request_budget,
         )
 
     client = build_client()
-    if len(provider_sequence) == 1:
+    if len(search_config.provider_sequence) == 1:
         client.validate_configuration()
 
     queries = query_builder(company, company_url)
@@ -416,7 +432,7 @@ def retrieve_company_profile_live(
     )
     quality_seconds = perf_counter() - quality_started_at
     metadata = _merge_company_search_telemetry(
-        provider_sequence=provider_sequence,
+        provider_sequence=search_config.provider_sequence,
         telemetry_packets=telemetry_packets or [client.telemetry()],
     )
     website_started_at = perf_counter()
@@ -444,6 +460,7 @@ def retrieve_company_profile_live(
             "raw_search_result_count": len(search_results),
             "max_results": max_results,
             "search_quality": search_quality.to_dict(),
+            "source_coverage": search_quality.source_coverage,
             "timing": {
                 "total_seconds": round(perf_counter() - total_started_at, 3),
                 "search_seconds": round(search_seconds, 3),
@@ -463,13 +480,13 @@ def retrieve_company_profile_live(
                 **website_stats,
                 "errors": website_errors[:5],
             },
-            "retrieval_ladder": [
-                {
-                    "rung": "search_discovery",
-                    "providers": list(provider_sequence),
-                    "queries": len(queries),
-                    "raw_result_count": len(search_results),
-                    "seconds": round(search_seconds, 3),
+                "retrieval_ladder": [
+                    {
+                        "rung": "search_discovery",
+                        "providers": list(search_config.provider_sequence),
+                        "queries": len(queries),
+                        "raw_result_count": len(search_results),
+                        "seconds": round(search_seconds, 3),
                     "useful": bool(search_results),
                 },
                 {
@@ -661,6 +678,106 @@ def _env_bool(name: str, *, default: bool = False) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def build_shared_search_provider_config(
+    *,
+    requested_provider: str | None,
+    configured_provider: str | None = None,
+    fallback_provider: str | None = None,
+) -> SharedSearchProviderConfig:
+    """Resolve the shared live-search policy for search-heavy Keystone agents."""
+
+    provider_sequence = build_provider_sequence(
+        requested_provider=requested_provider,
+        configured_provider=configured_provider,
+        fallback_provider=fallback_provider,
+    )
+    agents_enabled = _env_bool("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", default=True)
+    parallel_agents_enabled = (
+        agents_enabled and _env_bool("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", default=True)
+    )
+    provider_sequence = _with_agents_web_search_parallel_lane(
+        provider_sequence=provider_sequence,
+        requested_provider=requested_provider,
+        enabled=parallel_agents_enabled,
+    )
+    deepening_provider_sequence = _deepening_search_providers(
+        requested_provider=requested_provider,
+        provider_sequence=provider_sequence,
+        agents_enabled=agents_enabled,
+    )
+    return SharedSearchProviderConfig(
+        provider_sequence=provider_sequence,
+        deepening_provider_sequence=deepening_provider_sequence,
+        provider_request_budget=_agents_web_search_request_budget(enabled=agents_enabled),
+        parallel_provider_fanout=_parallel_provider_fanout_enabled(
+            requested_provider=requested_provider,
+            provider_sequence=provider_sequence,
+        ),
+    )
+
+
+def _parallel_provider_fanout_enabled(
+    *,
+    requested_provider: str | None,
+    provider_sequence: tuple[str, ...],
+) -> bool:
+    if len(provider_sequence) <= 1:
+        return False
+    requested = (requested_provider or "").strip().lower()
+    if requested and requested != "searxng":
+        return False
+    return True
+
+
+def _with_agents_web_search_parallel_lane(
+    *,
+    provider_sequence: tuple[str, ...],
+    requested_provider: str | None,
+    enabled: bool,
+) -> tuple[str, ...]:
+    if not enabled:
+        return provider_sequence
+    requested = (requested_provider or "").strip().lower()
+    if requested not in {"", "searxng"}:
+        return provider_sequence
+    if "searxng" not in provider_sequence or "agents-web-search" in provider_sequence:
+        return provider_sequence
+    expanded: list[str] = []
+    for provider_name in provider_sequence:
+        expanded.append(provider_name)
+        if provider_name == "searxng":
+            expanded.append("agents-web-search")
+    return tuple(dict.fromkeys(expanded))
+
+
+def _deepening_search_providers(
+    *,
+    requested_provider: str | None,
+    provider_sequence: tuple[str, ...],
+    agents_enabled: bool,
+) -> tuple[str, ...]:
+    requested = (requested_provider or "").strip().lower()
+    providers: list[str] = []
+    if _env_bool("KEYSTONE_TAVILY_SEARCH_FALLBACK", default=False) and requested != "tavily":
+        providers.append("tavily")
+    if agents_enabled and requested in {"", "searxng"}:
+        providers.append("agents-web-search")
+    return tuple(
+        dict.fromkeys(provider_name for provider_name in providers if provider_name not in provider_sequence)
+    )
+
+
+def _agents_web_search_request_budget(*, enabled: bool) -> ProviderRequestBudget | None:
+    if not enabled:
+        return None
+    raw = os.getenv("KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN", "").strip()
+    try:
+        cap = int(raw) if raw else DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN
+    except ValueError:
+        cap = DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN
+    return ProviderRequestBudget({"agents-web-search": max(0, cap)})
+
+
 def _sandbox_search_review_source_limit(max_results: int) -> int:
     raw = os.getenv("KEYSTONE_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT", "").strip()
     default_limit = max(DEFAULT_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT, max_results * 2)
@@ -710,14 +827,18 @@ def _merge_company_search_telemetry(
 ) -> dict[str, Any]:
     providers_attempted: list[str] = []
     providers_used: list[str] = []
+    deepening_provider_sequence: list[str] = []
     provider_usage: dict[str, dict[str, float | int]] = {}
     provider_errors: list[dict[str, Any]] = []
     quality_reasons: list[str] = []
     structured_enrichment_recommended = False
     search_review_recommended = False
     precision_search_escalated = False
+    deepening_search_used = False
     provider_error_fallback_used = False
     serper_credits = 0
+    tavily_credits = 0
+    agents_web_search_credits = 0
     autonomy_hint: dict[str, Any] = {}
 
     for packet in telemetry_packets:
@@ -729,6 +850,10 @@ def _merge_company_search_telemetry(
             name = str(provider_name)
             if name and name not in providers_used:
                 providers_used.append(name)
+        for provider_name in packet.get("search_deepening_provider_sequence") or []:
+            name = str(provider_name)
+            if name and name not in deepening_provider_sequence:
+                deepening_provider_sequence.append(name)
         raw_usage = packet.get("provider_usage")
         if isinstance(raw_usage, dict):
             for provider_name, usage in raw_usage.items():
@@ -740,10 +865,16 @@ def _merge_company_search_telemetry(
                         "requests_attempted": 0,
                         "requests_succeeded": 0,
                         "raw_result_count": 0,
+                        "credits_used": 0,
                         "total_seconds": 0.0,
                     },
                 )
-                for key in ("requests_attempted", "requests_succeeded", "raw_result_count"):
+                for key in (
+                    "requests_attempted",
+                    "requests_succeeded",
+                    "raw_result_count",
+                    "credits_used",
+                ):
                     target[key] = int(target[key]) + int(float(usage.get(key) or 0))
                 target["total_seconds"] = round(
                     float(target["total_seconds"]) + float(usage.get("total_seconds") or 0),
@@ -765,24 +896,34 @@ def _merge_company_search_telemetry(
         precision_search_escalated = precision_search_escalated or bool(
             packet.get("precision_search_escalated")
         )
+        deepening_search_used = deepening_search_used or bool(packet.get("deepening_search_used"))
         provider_error_fallback_used = provider_error_fallback_used or bool(
             packet.get("provider_error_fallback_used")
         )
         serper_credits += int(float(packet.get("serper_estimated_credits_used") or 0))
+        tavily_credits += int(float(packet.get("tavily_estimated_credits_used") or 0))
+        agents_web_search_credits += int(
+            float(packet.get("agents_web_search_estimated_calls_used") or 0)
+        )
         if not autonomy_hint and isinstance(packet.get("autonomy_hint"), dict):
             autonomy_hint = dict(packet["autonomy_hint"])
 
     return {
         "search_provider_sequence": list(provider_sequence),
+        "search_deepening_provider_sequence": deepening_provider_sequence,
         "primary_search_provider": provider_sequence[0] if provider_sequence else "",
         "search_providers_attempted": providers_attempted,
         "search_providers_used": providers_used,
         "search_provider_used": providers_used[-1] if providers_used else "",
         "precision_search_escalated": precision_search_escalated,
+        "deepening_search_used": deepening_search_used,
         "provider_error_fallback_used": provider_error_fallback_used,
         "search_provider_errors": provider_errors,
         "provider_usage": provider_usage,
         "provider_value_summary": provider_value_summary(provider_usage),
+        "tavily_estimated_credits_used": tavily_credits,
+        "tavily_credit_budget": _latest_tavily_credit_budget(telemetry_packets),
+        "agents_web_search_estimated_calls_used": agents_web_search_credits,
         "serper_estimated_credits_used": serper_credits,
         "autonomy_hint": autonomy_hint,
         "structured_enrichment_recommended": structured_enrichment_recommended,
@@ -794,6 +935,14 @@ def _merge_company_search_telemetry(
         "search_review_recommended": search_review_recommended,
         "quality_reason_hints": quality_reasons,
     }
+
+
+def _latest_tavily_credit_budget(telemetry_packets: list[dict[str, Any]]) -> dict[str, Any]:
+    for packet in reversed(telemetry_packets):
+        budget = packet.get("tavily_credit_budget")
+        if isinstance(budget, dict) and budget:
+            return dict(budget)
+    return {}
 
 
 def opportunity_scout_request_text(topic: str | None) -> str:
@@ -826,18 +975,14 @@ def build_opportunity_search_provider(
         request_text=request_text,
         agent_hint=retrieval_hint,
     )
-    if requested_provider is None and _topic_is_role_focused(topic):
-        provider_sequence = ("serper", "searxng")
-        if fallback_provider and fallback_provider not in provider_sequence:
-            provider_sequence = (*provider_sequence, fallback_provider)
-    else:
-        provider_sequence = build_provider_sequence(
-            requested_provider=requested_provider,
-            configured_provider=settings_loader().search_provider,
-            fallback_provider=fallback_provider,
-        )
+    search_config = build_shared_search_provider_config(
+        requested_provider=requested_provider,
+        configured_provider=settings_loader().search_provider,
+        fallback_provider=fallback_provider,
+    )
     provider = HybridSearchProvider(
-        provider_sequence=provider_sequence,
+        provider_sequence=search_config.provider_sequence,
+        deepening_provider_sequence=search_config.deepening_provider_sequence,
         autonomy_hint=autonomy_hint,
         quality_assessor=lambda results, _query: assess_opportunity_search_quality(
             results=results,
@@ -849,9 +994,10 @@ def build_opportunity_search_provider(
             provider=provider_name,
             live=True,
         ),
-        parallel_provider_fanout=True,
+        parallel_provider_fanout=search_config.parallel_provider_fanout,
+        provider_request_budget=search_config.provider_request_budget,
     )
-    if len(provider_sequence) == 1:
+    if len(search_config.provider_sequence) == 1:
         provider.validate_configuration()
     return provider
 
@@ -1015,6 +1161,11 @@ def run_opportunity_scout_live(
                 }
             ],
         }
+    )
+    metadata["source_coverage"] = (
+        metadata["search_quality"].get("source_coverage")
+        if isinstance(metadata.get("search_quality"), dict)
+        else None
     )
     if _should_auto_recommend_sandbox_search_review(
         result=result,

@@ -26,7 +26,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--live-gmail",
         action="store_true",
-        help="Create an approved email draft in Gmail. Without this, draft creation is dry-run.",
+        help=(
+            "Allow Gmail draft creation only when the approval item explicitly permits "
+            "Slack-triggered draft creation. Without this, button clicks only record approval."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -61,6 +64,7 @@ def main() -> int:
     result = handle_slack_approval_interaction(
         raw_payload,
         database_url=args.database_url,
+        create_email_draft=args.live_gmail,
         live_gmail=args.live_gmail,
     )
     if args.json:

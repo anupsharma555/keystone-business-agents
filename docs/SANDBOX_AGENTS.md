@@ -21,7 +21,7 @@ This follows the OpenAI Agents SDK split where `SandboxAgent` defines the agent 
 
 Use a sandbox agent when a workflow is naturally file-backed:
 
-- Search/research artifact review: after retrieval and retrieval quality gates, stage SearXNG/Serper packets, result bundles, or normalized source files into a scoped workspace for a second-pass reviewer. This is a third-stage review path that improves search quality; it does not replace live search or source acquisition.
+- Search/research artifact review: after retrieval and retrieval quality gates, stage SearXNG/hosted web-search packets, result bundles, or normalized source files into a scoped workspace for a second-pass reviewer. This is a third-stage review path that improves search quality; it does not replace live search or source acquisition.
 - Mounted research folders: review source bundles, user-curated research folders, or local analysis packets without copying their contents into prompts.
 - Generated reports: inspect draft reports, reconcile structured outputs with source files, and produce review notes.
 - Document batches: process batches of non-PHI documents where filesystem traversal, chunked review, and artifact output are useful.
@@ -69,7 +69,7 @@ Do not require real `Runner.run(...)` sandbox execution in tests for this scaffo
 ## Search Review Helper
 
 The scaffold now includes a search-review-specific wrapper for second-pass review
-of staged SearXNG/Serper artifacts after retrieval quality gates:
+of staged SearXNG/hosted web-search artifacts after retrieval quality gates:
 
 ```python
 from pathlib import Path

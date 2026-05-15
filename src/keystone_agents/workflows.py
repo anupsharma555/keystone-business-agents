@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -32,10 +33,20 @@ from keystone_agents.agents.outreach_composer import (
 )
 from keystone_agents.cli_sdk import jsonable
 from keystone_agents.company_research import research_company_fixture
+from keystone_agents.contact_enrichment import (
+    ContactCandidate,
+    ContactEnrichmentArtifact,
+    build_contact_enrichment_artifact,
+)
+from keystone_agents.costing import AgentRunBudgetExceededError
 from keystone_agents.feedback import build_operator_feedback_request
 from keystone_agents.live_retrieval import (
     retrieve_company_profile_live,
     run_opportunity_scout_live,
+)
+from keystone_agents.model_provider import (
+    MissingOpenAIAPIKeyError,
+    ModelProviderConfigurationError,
 )
 from keystone_agents.models import (
     OpportunityScoutSDKInput,
@@ -72,12 +83,28 @@ from keystone_agents.schemas.opportunity import (
 from keystone_agents.schemas.orchestrator import OrchestratorOutputReview, OrchestratorResult
 from keystone_agents.schemas.outreach import OpportunityRecord as OutreachOpportunityRecord
 from keystone_agents.schemas.outreach import OutreachDraft, OutreachLLMDraftPayload
+from keystone_agents.schemas.recommendation import OpportunityContactPath
 from keystone_agents.tools.approval_tool import build_approval_queue_item
 from keystone_agents.tools.storage_tool import StorageTool
 
 BUSINESS_OPPORTUNITY_CATEGORIES = {"consulting_opportunity", "collaboration_opportunity"}
 _URL_RE = re.compile(r"\b(?:https?://|www\.)\S+|\b[\w.-]+\.(?:com|org|net|ai|io|health)\b", re.I)
 OutreachApprovalChannel = Literal["email", "linkedin"]
+ROBUST_OPPORTUNITY_TO_OUTREACH_TOPIC = (
+    "Find high-fit Keystone collaboration opportunities across companies, conferences, "
+    "journal article calls, contract RFPs, grants, clinical trials, researchers, and "
+    "institutes. Prioritize behavioral health, psychiatry, neuroscience, clinical AI, "
+    "digital mental health, evidence generation, and U.S.-relevant timing signals."
+)
+WEEKLY_OUTREACH_FALLBACK_GOAL = (
+    "compare notes on clinical AI evaluation, research operations, and "
+    "opportunity-fit collaboration after human approval"
+)
+DEFAULT_GMAIL_DRAFT_ACCOUNT = "wisegrow05@gmail.com"
+GMAIL_DRAFT_ACCOUNT_ENV_KEYS = (
+    "KEYSTONE_GMAIL_DRAFT_ACCOUNT",
+    "KNI_BUSINESS_AGENTS_GMAIL_DRAFT_ACCOUNT",
+)
 
 
 class KeystonePipelineResult(BaseModel):
@@ -145,6 +172,10 @@ class WeeklyOpportunityContactCandidate(BaseModel):
     role_title: str = ""
     contact_email: str | None = None
     linkedin_url: str | None = None
+    contact_path_type: str = ""
+    contact_path_label: str = ""
+    contact_path_value: str = ""
+    alternate_contact_paths: list[OpportunityContactPath] = Field(default_factory=list)
     source_id: str = ""
     source_url: str = ""
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -195,6 +226,7 @@ class WeeklyOpportunityWorkflowResult(BaseModel):
     gmail_drafts_created: bool = False
     live_apis_called: bool = False
     live_sdk_synthesis: bool = False
+    retrieval: dict[str, Any] = Field(default_factory=dict)
     storage: dict[str, Any] = Field(default_factory=dict)
     audit_notes: list[str] = Field(default_factory=list)
 
@@ -433,6 +465,10 @@ def _buyer_role_from_profile(
         return "Clinical product or behavioral health leader"
     if opportunity.opportunity_type in {"CNS biotech", "neurotechnology"}:
         return "Research, clinical development, or partnerships leader"
+    if opportunity.opportunity_type == "journal article or publication call":
+        return "Editor, guest editor, or special issue contact"
+    if opportunity.opportunity_type == "contract or RFP opportunity":
+        return "Procurement, program, or teaming contact"
     return "Partnerships, research, or clinical operations leader"
 
 
@@ -445,23 +481,68 @@ def _derive_contact_candidate(
     contact_email: str | None = None,
     contact_linkedin_url: str | None = None,
 ) -> WeeklyOpportunityContactCandidate:
+    enrichment = build_contact_enrichment_artifact(
+        company_name=company_profile.name,
+        sources=[*opportunity.sources, *company_profile.sources],
+    )
+    best_candidate = _best_contact_candidate(enrichment)
+    best_path = enrichment.best_contact_path
     source = company_profile.sources[0] if company_profile.sources else None
     role_title = (contact_title or "").strip() or _buyer_role_from_profile(
         company_profile=company_profile,
         opportunity=opportunity,
     )
     resolved_contact_name = (contact_name or company_profile.lead_name or "").strip()
-    resolved_contact_email = (contact_email or "").strip() or None
-    resolved_linkedin_url = (contact_linkedin_url or company_profile.linkedin_url or "").strip()
-    source_url = resolved_linkedin_url or company_profile.website or (source.url if source else "")
-    source_id = source.source_id if source else "workflow:contact_candidate"
+    resolved_contact_email = (
+        (contact_email or "").strip()
+        or (best_candidate.email if best_candidate is not None else "")
+        or (
+            best_path.value
+            if best_path is not None and best_path.path_type == "email"
+            else ""
+        )
+    ) or None
+    resolved_linkedin_url = (
+        (contact_linkedin_url or "").strip()
+        or (best_candidate.linkedin_url if best_candidate is not None else "")
+        or company_profile.linkedin_url
+        or (
+            best_path.url
+            if best_path is not None and best_path.path_type == "linkedin"
+            else ""
+        )
+    ).strip()
+    source_url = (
+        resolved_linkedin_url
+        or (best_path.url if best_path is not None else "")
+        or company_profile.website
+        or (source.url if source else "")
+    )
+    source_id = (
+        (best_path.source_id if best_path is not None else "")
+        or (best_candidate.source_ids[0] if best_candidate and best_candidate.source_ids else "")
+        or (source.source_id if source else "")
+        or "workflow:contact_candidate"
+    )
+    contact_path_type = best_path.path_type if best_path is not None else ""
+    contact_path_label = best_path.label if best_path is not None else ""
+    contact_path_value = best_path.value or best_path.url if best_path is not None else ""
     missing_information: list[str] = []
     if not resolved_contact_name:
         missing_information.append("Confirm a named contact.")
     if not resolved_contact_email:
-        missing_information.append("Confirm recipient email address before Gmail draft creation.")
+        if best_path is not None:
+            missing_information.append(
+                "No confirmed recipient email; use the source-backed organization contact "
+                "path manually or confirm an email before Gmail draft creation."
+            )
+        else:
+            missing_information.append(
+                "Confirm recipient email address before Gmail draft creation."
+            )
     if not resolved_linkedin_url:
         missing_information.append("Confirm contact or company LinkedIn/profile URL.")
+    missing_information.extend(enrichment.missing)
 
     return WeeklyOpportunityContactCandidate(
         company_name=company_profile.name,
@@ -469,16 +550,59 @@ def _derive_contact_candidate(
         role_title=role_title,
         contact_email=resolved_contact_email,
         linkedin_url=resolved_linkedin_url or None,
+        contact_path_type=contact_path_type,
+        contact_path_label=contact_path_label,
+        contact_path_value=contact_path_value,
+        alternate_contact_paths=enrichment.alternate_contact_paths,
         source_id=source_id,
         source_url=source_url,
-        confidence=0.8 if resolved_contact_name and resolved_contact_email else 0.45,
+        confidence=_workflow_contact_confidence(
+            has_name=bool(resolved_contact_name),
+            has_email=bool(resolved_contact_email),
+            enrichment=enrichment,
+            override_supplied=bool(contact_email or contact_linkedin_url or contact_name),
+        ),
         needs_human_confirmation=bool(missing_information),
-        missing_information=missing_information,
+        missing_information=list(dict.fromkeys(missing_information)),
         notes=(
-            "Derived from Business Research Analyst profile fields and source-backed "
-            "buyer context; human confirmation is required before any live Gmail draft."
+            "Derived from Business Research Analyst profile fields, source-backed contact "
+            "paths, and buyer context; human confirmation is required before any live "
+            "Gmail draft."
         ),
     )
+
+
+def _best_contact_candidate(
+    enrichment: ContactEnrichmentArtifact,
+) -> ContactCandidate | None:
+    if not enrichment.candidates:
+        return None
+    return sorted(
+        enrichment.candidates,
+        key=lambda candidate: (
+            bool(candidate.email),
+            bool(candidate.linkedin_url),
+            candidate.confidence,
+        ),
+        reverse=True,
+    )[0]
+
+
+def _workflow_contact_confidence(
+    *,
+    has_name: bool,
+    has_email: bool,
+    enrichment: ContactEnrichmentArtifact,
+    override_supplied: bool,
+) -> float:
+    if override_supplied and has_name and has_email:
+        return 0.85
+    base = enrichment.contact_confidence or 0.35
+    if has_name:
+        base += 0.08
+    if has_email:
+        base += 0.12
+    return max(0.0, min(0.95, base))
 
 
 def _contact_record_from_candidate(
@@ -687,6 +811,24 @@ def _synthesize_weekly_outreach_draft(
     )
 
 
+def _compose_weekly_outreach_fixture_draft(
+    *,
+    company_profile: CompanyProfile,
+    opportunity: ScoutOpportunityRecord,
+    contact_candidate: WeeklyOpportunityContactCandidate,
+) -> OutreachDraft:
+    return compose_outreach_draft_fixture(
+        company_profile=company_profile,
+        opportunity_record=_to_outreach_opportunity(opportunity),
+        contact_name=contact_candidate.contact_name or None,
+        contact_title=contact_candidate.role_title or None,
+        contact_context=_contact_record_from_candidate(contact_candidate),
+        email_style_profile=load_style_profile("sample_email_style_profile_anup_approved"),
+        recent_signal=opportunity.why_now_signal,
+        outreach_goal=WEEKLY_OUTREACH_FALLBACK_GOAL,
+    )
+
+
 def _draft_blockers(
     *,
     approval_state: ApprovalState,
@@ -724,6 +866,83 @@ def _review_weekly_item_outputs(
             )
         )
     return reviews
+
+
+def _workflow_provider_performance(metadata_items: list[dict[str, Any]]) -> dict[str, Any]:
+    provider_usage: dict[str, dict[str, int | float]] = {}
+    providers_used: list[str] = []
+    serper_credits = 0
+    tavily_credits = 0
+    precision_escalations = 0
+    provider_fallbacks = 0
+    for metadata in metadata_items:
+        for provider in metadata.get("search_providers_used") or []:
+            provider_name = str(provider)
+            if provider_name and provider_name not in providers_used:
+                providers_used.append(provider_name)
+        usage = metadata.get("provider_usage")
+        if isinstance(usage, dict):
+            for provider_name, provider_stats in usage.items():
+                if not isinstance(provider_stats, dict):
+                    continue
+                target = provider_usage.setdefault(
+                    str(provider_name),
+                    {
+                        "requests_attempted": 0,
+                        "requests_succeeded": 0,
+                        "raw_result_count": 0,
+                        "credits_used": 0,
+                        "total_seconds": 0.0,
+                    },
+                )
+                for key in (
+                    "requests_attempted",
+                    "requests_succeeded",
+                    "raw_result_count",
+                    "credits_used",
+                ):
+                    target[key] = int(target[key]) + int(provider_stats.get(key) or 0)
+                provider_seconds = float(provider_stats.get("total_seconds") or 0)
+                target["total_seconds"] = round(
+                    float(target["total_seconds"]) + provider_seconds,
+                    3,
+                )
+        serper_credits += int(metadata.get("serper_estimated_credits_used") or 0)
+        tavily_credits += int(metadata.get("tavily_estimated_credits_used") or 0)
+        if metadata.get("precision_search_escalated"):
+            precision_escalations += 1
+        if metadata.get("provider_error_fallback_used") or metadata.get(
+            "search_provider_fallback_used"
+        ):
+            provider_fallbacks += 1
+    return {
+        "providers_used": providers_used,
+        "provider_usage": provider_usage,
+        "serper_estimated_credits_used": serper_credits,
+        "tavily_estimated_credits_used": tavily_credits,
+        "precision_search_escalation_count": precision_escalations,
+        "provider_error_fallback_count": provider_fallbacks,
+    }
+
+
+def _browser_escalation_recommended(metadata_items: list[dict[str, Any]]) -> bool:
+    for metadata in metadata_items:
+        if metadata.get("structured_enrichment_recommended"):
+            return True
+        candidates = metadata.get("structured_enrichment_candidates") or []
+        if any(str(candidate) == "browserless" for candidate in candidates):
+            return True
+        website = metadata.get("website_extraction")
+        if isinstance(website, dict) and website.get("enabled") and not website.get("page_count"):
+            return True
+    return False
+
+
+def _is_unrecoverable_sdk_synthesis_error(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        AgentRunBudgetExceededError | MissingOpenAIAPIKeyError | ModelProviderConfigurationError,
+    )
 
 
 def run_weekly_opportunity_workflow(
@@ -782,7 +1001,7 @@ def run_weekly_opportunity_workflow(
 
     if live_search:
         retrieval_result_limit = max(max_opportunities, 5)
-        scout_result, _retrieval = run_opportunity_scout_live(
+        scout_result, scout_retrieval = run_opportunity_scout_live(
             topic=topic,
             max_results=retrieval_result_limit,
             requested_provider=search_provider,
@@ -796,19 +1015,38 @@ def run_weekly_opportunity_workflow(
             dry_run=True,
             save=False,
         )
+        scout_retrieval = {
+            "mode": "fixture",
+            "live_search": False,
+            "search_provider": "dry-run",
+            "retrieval_ladder": [],
+        }
     if live_sdk_synthesis:
-        scout_result = _synthesize_weekly_opportunity_scout(
-            scout_result,
-            topic=topic,
-            max_opportunities=max_opportunities,
-            retrieval_hint=orchestrator_decision.retrieval_hint,
-        )
-        audit_notes.append("Opportunity Scout human-facing records synthesized through SDK.")
+        try:
+            scout_result = _synthesize_weekly_opportunity_scout(
+                scout_result,
+                topic=topic,
+                max_opportunities=max_opportunities,
+                retrieval_hint=orchestrator_decision.retrieval_hint,
+            )
+            audit_notes.append("Opportunity Scout human-facing records synthesized through SDK.")
+        except Exception as exc:
+            if _is_unrecoverable_sdk_synthesis_error(exc):
+                raise
+            audit_notes.append(
+                "Opportunity Scout live SDK synthesis failed with "
+                f"{type(exc).__name__}; retained source-backed retrieval records."
+            )
 
     items: list[WeeklyOpportunityWorkflowItem] = []
+    retrieval_metadata: dict[str, Any] = {
+        "opportunity_scout": scout_retrieval,
+        "company_research": [],
+        "provider_performance": _workflow_provider_performance([scout_retrieval]),
+    }
     for opportunity in scout_result.records[:max_opportunities]:
         if live_search:
-            company_profile, _retrieval = retrieve_company_profile_live(
+            company_profile, company_retrieval = retrieve_company_profile_live(
                 company=opportunity.company_name,
                 company_url=_company_url_hint(opportunity),
                 requested_provider=search_provider,
@@ -817,9 +1055,29 @@ def run_weekly_opportunity_workflow(
             )
         else:
             company_profile = research_company_fixture(company_name=opportunity.company_name)
+            company_retrieval = {
+                "mode": "fixture",
+                "live_search": False,
+                "search_provider": "dry-run",
+                "company": opportunity.company_name,
+                "retrieval_ladder": [],
+            }
+        retrieval_metadata["company_research"].append(company_retrieval)
         company_brief: CompanyResearchFocusedBrief | None = None
+        company_brief_audit_note = "Business Research Analyst focused brief was not requested."
         if live_sdk_synthesis:
-            company_brief = _synthesize_weekly_company_brief(company_profile)
+            try:
+                company_brief = _synthesize_weekly_company_brief(company_profile)
+                company_brief_audit_note = (
+                    "Business Research Analyst focused brief synthesized through SDK."
+                )
+            except Exception as exc:
+                if _is_unrecoverable_sdk_synthesis_error(exc):
+                    raise
+                company_brief_audit_note = (
+                    "Business Research Analyst focused brief SDK synthesis failed with "
+                    f"{type(exc).__name__}; source-backed profile retained."
+                )
         contact_candidate = _derive_contact_candidate(
             company_profile=company_profile,
             opportunity=opportunity,
@@ -829,30 +1087,36 @@ def run_weekly_opportunity_workflow(
             contact_linkedin_url=contact_linkedin_url,
         )
         outreach_draft: OutreachDraft | None = None
+        draft_audit_note = "Outreach Composer draft blocked until drafting approval."
         if state_allows_drafting(resolved_approval_state):
-            outreach_draft = (
-                _synthesize_weekly_outreach_draft(
+            if live_sdk_synthesis:
+                try:
+                    outreach_draft = _synthesize_weekly_outreach_draft(
+                        company_profile=company_profile,
+                        opportunity=opportunity,
+                        contact_candidate=contact_candidate,
+                    )
+                    draft_audit_note = "Outreach Composer draft produced for human review."
+                except Exception as exc:
+                    if _is_unrecoverable_sdk_synthesis_error(exc):
+                        raise
+                    outreach_draft = _compose_weekly_outreach_fixture_draft(
+                        company_profile=company_profile,
+                        opportunity=opportunity,
+                        contact_candidate=contact_candidate,
+                    )
+                    draft_audit_note = (
+                        "Outreach Composer live SDK draft failed with "
+                        f"{type(exc).__name__}; "
+                        "deterministic approval-gated fixture draft used instead."
+                    )
+            else:
+                outreach_draft = _compose_weekly_outreach_fixture_draft(
                     company_profile=company_profile,
                     opportunity=opportunity,
                     contact_candidate=contact_candidate,
                 )
-                if live_sdk_synthesis
-                else compose_outreach_draft_fixture(
-                    company_profile=company_profile,
-                    opportunity_record=_to_outreach_opportunity(opportunity),
-                    contact_name=contact_candidate.contact_name or None,
-                    contact_title=contact_candidate.role_title or None,
-                    contact_context=_contact_record_from_candidate(contact_candidate),
-                    email_style_profile=load_style_profile(
-                        "sample_email_style_profile_anup_approved"
-                    ),
-                    recent_signal=opportunity.why_now_signal,
-                    outreach_goal=(
-                        "compare notes on clinical AI evaluation, research operations, and "
-                        "opportunity-fit collaboration after human approval"
-                    ),
-                )
-            )
+                draft_audit_note = "Outreach Composer draft produced for human review."
         item = WeeklyOpportunityWorkflowItem(
             company_name=opportunity.company_name,
             opportunity_record=opportunity,
@@ -874,13 +1138,9 @@ def run_weekly_opportunity_workflow(
             ),
             audit_notes=[
                 "Business Research Analyst profile and contact candidate produced for review.",
+                company_brief_audit_note,
                 (
-                    "Business Research Analyst focused brief synthesized through SDK."
-                    if company_brief is not None
-                    else "Business Research Analyst focused brief was not requested."
-                ),
-                (
-                    "Outreach Composer draft produced for human review."
+                    draft_audit_note
                     if outreach_draft is not None
                     else "Outreach Composer draft blocked until drafting approval."
                 ),
@@ -902,6 +1162,22 @@ def run_weekly_opportunity_workflow(
         outreach_channel=outreach_channel,
         live_apis_called=live_search,
         live_sdk_synthesis=live_sdk_synthesis,
+        retrieval={
+            **retrieval_metadata,
+            "provider_performance": _workflow_provider_performance(
+                [
+                    retrieval_metadata["opportunity_scout"],
+                    *retrieval_metadata["company_research"],
+                ]
+            ),
+            "browser_escalation_used": False,
+            "browser_escalation_recommended": _browser_escalation_recommended(
+                [
+                    retrieval_metadata["opportunity_scout"],
+                    *retrieval_metadata["company_research"],
+                ]
+            ),
+        },
         audit_notes=audit_notes,
     )
     if save:
@@ -910,6 +1186,54 @@ def run_weekly_opportunity_workflow(
             database_url=database_url,
         )
     return result
+
+
+def run_opportunity_to_outreach_loop(
+    *,
+    topic: str = ROBUST_OPPORTUNITY_TO_OUTREACH_TOPIC,
+    top_n: int = 3,
+    approval_state: ApprovalState | str = ApprovalState.APPROVED_FOR_DRAFTING,
+    dry_run: bool = True,
+    live_search: bool = False,
+    search_provider: str | None = None,
+    fallback_search_provider: str | None = None,
+    save: bool = False,
+    database_url: str | None = None,
+    approval_channel: str = "#ai-agents-workflow",
+    outreach_channel: OutreachApprovalChannel = "email",
+    live_sdk_synthesis: bool = False,
+) -> WeeklyOpportunityWorkflowResult:
+    """Run the simple Top-N opportunity -> research -> collaboration draft loop."""
+
+    if top_n < 1:
+        raise ValueError("top_n must be at least 1.")
+    result = run_weekly_opportunity_workflow(
+        topic=topic,
+        max_opportunities=top_n,
+        approval_state=approval_state,
+        dry_run=dry_run,
+        live_search=live_search,
+        search_provider=search_provider,
+        fallback_search_provider=fallback_search_provider,
+        save=save,
+        database_url=database_url,
+        approval_channel=approval_channel,
+        include_operator_feedback_request=False,
+        outreach_channel=outreach_channel,
+        live_sdk_synthesis=live_sdk_synthesis,
+    )
+    return result.model_copy(
+        update={
+            "cadence": "top_3_opportunity_to_outreach",
+            "audit_notes": [
+                *result.audit_notes,
+                (
+                    "Top opportunity-to-outreach loop drafted one collaboration request "
+                    "per selected opportunity; no outbound email or Gmail draft was created."
+                ),
+            ],
+        }
+    )
 
 
 def save_weekly_opportunity_workflow_result(
@@ -994,6 +1318,7 @@ def _weekly_outreach_approval_context(
 ) -> dict[str, Any]:
     if item.outreach_draft is None:
         raise ValueError("outreach draft is required for outreach approval context")
+    gmail_draft_ready = outreach_channel == "email" and item.gmail_draft_ready
     if outreach_channel == "email":
         title = f"Email draft: {item.outreach_draft.email_subject}"
         draft_text = (
@@ -1016,17 +1341,40 @@ def _weekly_outreach_approval_context(
             "approval_channel": approval_channel,
             "outreach_channel": outreach_channel,
             "company_name": item.company_name,
+            "opportunity_type": item.opportunity_record.opportunity_type,
+            "priority_score": item.opportunity_record.priority_score,
+            "why_now_signal": item.opportunity_record.why_now_signal,
+            "keystone_fit_reason": item.opportunity_record.keystone_fit_reason,
+            "opportunity_next_step": item.opportunity_record.recommended_next_step,
             **_company_research_approval_metadata(item),
-            "gmail_draft_ready": outreach_channel == "email" and item.gmail_draft_ready,
+            "gmail_draft_ready": gmail_draft_ready,
+            "slack_approval_allows_gmail_draft_creation": gmail_draft_ready,
+            "gmail_draft_account": _gmail_draft_account() if gmail_draft_ready else "",
+            "approval_action_label": "save Gmail draft" if gmail_draft_ready else "external use",
             "recipient_email": item.contact_candidate.contact_email,
             "linkedin_url": item.contact_candidate.linkedin_url,
             "contact_name": item.contact_candidate.contact_name,
             "contact_title": item.contact_candidate.role_title,
+            "contact_path_type": item.contact_candidate.contact_path_type,
+            "contact_path_label": item.contact_candidate.contact_path_label,
+            "contact_path_value": item.contact_candidate.contact_path_value,
+            "alternate_contact_paths": [
+                path.model_dump(mode="json")
+                for path in item.contact_candidate.alternate_contact_paths[:5]
+            ],
             "email_subject": item.outreach_draft.email_subject,
             "missing_information_blockers": item.missing_information_blockers,
             "send_enabled": False,
         },
     }
+
+
+def _gmail_draft_account() -> str:
+    for key in GMAIL_DRAFT_ACCOUNT_ENV_KEYS:
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return DEFAULT_GMAIL_DRAFT_ACCOUNT
 
 
 def _company_research_approval_metadata(item: WeeklyOpportunityWorkflowItem) -> dict[str, Any]:
@@ -1129,6 +1477,14 @@ def _weekly_workflow_storage_summary(
         "gmail_drafts_created": False,
         "live_apis_called": result.live_apis_called,
         "live_sdk_synthesis": result.live_sdk_synthesis,
+        "retrieval": {
+            "provider_performance": result.retrieval.get("provider_performance", {}),
+            "browser_escalation_recommended": result.retrieval.get(
+                "browser_escalation_recommended",
+                False,
+            ),
+            "browser_escalation_used": result.retrieval.get("browser_escalation_used", False),
+        },
         "items": [
             {
                 "company_name": item.company_name,
@@ -1155,6 +1511,9 @@ def weekly_opportunity_workflow_markdown(
 ) -> str:
     """Render a human review packet for the weekly opportunity loop."""
 
+    providers_used = (
+        result.retrieval.get("provider_performance", {}).get("providers_used") or ["dry-run"]
+    )
     lines = [
         "# Weekly Opportunity Workflow",
         "",
@@ -1168,6 +1527,11 @@ def weekly_opportunity_workflow_markdown(
         f"- Approval channel: {result.approval_channel}",
         f"- Send enabled: {result.send_enabled}",
         f"- Gmail drafts created: {result.gmail_drafts_created}",
+        f"- Search providers used: {', '.join(providers_used)}",
+        (
+            "- Browser escalation recommended: "
+            f"{result.retrieval.get('browser_escalation_recommended', False)}"
+        ),
         "",
         "## Orchestrator",
         f"- Route: {result.orchestrator_decision.route}",
@@ -1227,6 +1591,14 @@ def weekly_opportunity_workflow_markdown(
                 lines.append("- Unknowns:")
                 lines.extend(f"  - {unknown}" for unknown in brief.unknowns[:3])
         profile_source = candidate.linkedin_url or candidate.source_url or "Needs confirmation"
+        contact_path_label = (
+            candidate.contact_path_label
+            or candidate.contact_path_type
+            or "Needs confirmation"
+        )
+        contact_path_suffix = (
+            f" ({candidate.contact_path_value})" if candidate.contact_path_value else ""
+        )
         lines.extend(
             [
                 "- Contact candidate:",
@@ -1234,6 +1606,7 @@ def weekly_opportunity_workflow_markdown(
                 f"  - Role/title: {candidate.role_title or 'Needs confirmation'}",
                 f"  - Email: {candidate.contact_email or 'Needs confirmation'}",
                 f"  - Profile/source: {profile_source}",
+                f"  - Best contact path: {contact_path_label}{contact_path_suffix}",
             ]
         )
         if item.missing_information_blockers:
