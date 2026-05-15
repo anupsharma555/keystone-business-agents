@@ -30,6 +30,7 @@ def test_registry_has_canonical_agents() -> None:
         "opportunity_scout",
         "outreach_composer",
         "orchestrator",
+        "chief_of_staff",
     }
     assert [spec.route_name for spec in REGISTERED_AGENT_SPECS] == [
         "gmail_triage",
@@ -37,6 +38,7 @@ def test_registry_has_canonical_agents() -> None:
         "opportunity_scout",
         "outreach_composer",
         "orchestrator",
+        "chief_of_staff",
     ]
 
 

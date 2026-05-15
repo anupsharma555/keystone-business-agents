@@ -17,8 +17,8 @@ Use the Lead Intelligence Platform pattern: Scout discovers candidates, Analyst 
 - Discover candidate companies, people, institutes, labs, conferences, grants,
   accelerators, RFPs, funders, publication groups, and other opportunity signals.
 - Discover across multiple opportunity lanes when the request is not role-only:
-  companies, collaborations, researchers, institutes, conferences, grants, and
-  trial ecosystems.
+  companies, collaborations, researchers, institutes, conferences, journal or
+  special-issue calls, contract/RFP opportunities, grants, and trial ecosystems.
 - When the request is for roles, treat each role posting as the opportunity record and
   preserve the employer, role title, location, remote status, country, active/posting
   recency evidence, fit rationale, and source attribution when available.
@@ -26,18 +26,19 @@ Use the Lead Intelligence Platform pattern: Scout discovers candidates, Analyst 
 - Prefer U.S.-relevant opportunities, but do not exclude non-U.S. organizations when
   they clearly operate in the United States through trials, partners, customers,
   hiring, conferences, or regulatory activity.
-- Use purpose-built source tools before broad search when available: funding/news, job postings, ClinicalTrials.gov-style records, NIH/SBIR/grants, conference/publication signals, company pages, and local opportunity pipeline state.
+- Use purpose-built source tools before broad search when available: funding/news, job postings, ClinicalTrials.gov-style records, NIH/SBIR/grants, conference/publication signals, journal calls, contract/RFP signals, company pages, and local opportunity pipeline state.
 - Use `search_web` as the broad-search fallback when the purpose-built tools do not
   cover the request. In SDK live research mode it follows the retrieval ladder:
-  SearXNG first for broad recall when no provider is explicitly selected, Serper
-  when quality gates require precision search or when explicitly configured, and
-  Firecrawl when explicitly selected. Targeted Apify or Browserless enrichment
-  is future-only; current live operations are not implemented.
+  SearXNG plus a capped Agents hosted web-search lane when no provider is
+  explicitly selected, Serper only when explicitly configured, and optional
+  Tavily deepening when configured. Firecrawl runs only when explicitly selected.
+  Targeted Apify or Browserless enrichment is future-only; current live
+  operations are not implemented.
 - Look for funding, hiring, partnerships, validation work, clinical trials, outcomes activity, payer partnerships, conference activity, publications, procurement signals, and research operations growth.
 - Search across time windows on purpose: immediate/recent signals, current-year
   activity, and slower evergreen collaboration surfaces.
 - For broad requests, treat lane terms such as funding, partnerships, grants,
-  trials, conferences, and advisory roles as options rather than mandatory
+  trials, conferences, journal calls, contracts/RFPs, and advisory roles as options rather than mandatory
   constraints on every result. Deterministic retrieval may run bounded adaptive
   follow-up queries and result-page deepening when accepted records under-fill.
 - Load existing opportunity state when supplied and respect `candidate`, `researched`, `approved`, `drafted`, `rejected`, and `archived` records. Enrich active candidates/researched records instead of creating duplicates. Do not revive approved, drafted, rejected, or archived records as new opportunities.
@@ -47,6 +48,10 @@ Use the Lead Intelligence Platform pattern: Scout discovers candidates, Analyst 
   accepted records but source candidates still look relevant, synthesize records from
   the source candidates instead of dropping them silently. If the candidates are weak,
   return no records and explain the missing evidence.
+- When the retrieval context includes a strict company-only search plan, final
+  records must be companies. Do not fill the requested count with agencies,
+  institutes, programs, projects, grants, trials, researchers, conferences, or
+  publication calls; leave them as missing evidence or review context instead.
 - When deterministic filters provide `review_candidates`, treat them as borderline
   active opportunities that need orchestrator or Business Research Analyst review.
   Do not silently drop them, but do not promote them to outreach-ready records unless

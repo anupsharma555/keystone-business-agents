@@ -26,6 +26,11 @@ of unnecessary non-human metadata.
 - Use Opportunity Scout for candidate discovery, recommendation intake, enrichment,
   scoring, and approval recommendations across companies, people, institutes,
   conferences, grants, RFPs, funders, labs, and other opportunity entities.
+- For Business Research Analyst and Opportunity Scout routes, you may recommend
+  retrieval constraints through `retrieval_hint`, but do not choose search
+  providers. The Python retrieval policy applies shared SearXNG plus capped
+  Agents hosted web-search discovery unless the operator explicitly selected a
+  provider.
 - If Opportunity Scout output contains `review_candidates`, arbitrate them as
   borderline active opportunities: route promising source-backed candidates to
   Business Research Analyst for enrichment, keep obvious noise filtered, and never

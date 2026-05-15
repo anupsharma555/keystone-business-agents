@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+
+from keystone_agents.browser_extraction_eval import (
+    BrowserExtractionCase,
+    BrowserExtractionEvalOptions,
+    RenderedLink,
+    RenderedPage,
+    load_browser_extraction_cases,
+    normalize_browser_providers,
+    run_browser_extraction_eval,
+    score_rendered_page,
+    write_browser_extraction_artifacts,
+)
+
+
+def test_load_browser_extraction_cases_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "cases.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "id": "wide-directory",
+                "mode": "wide",
+                "url": "https://example.com/directory",
+                "category": "directory",
+                "difficulty_tags": ["static"],
+                "expected_signals": ["grant"],
+                "forbidden_signals": ["captcha"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cases = load_browser_extraction_cases(path)
+
+    assert len(cases) == 1
+    assert cases[0].id == "wide-directory"
+    assert cases[0].mode == "wide"
+
+
+def test_score_rendered_page_measures_agent_useful_signals() -> None:
+    case = BrowserExtractionCase(
+        id="specific-trial",
+        mode="specific",
+        url="https://example.com/trial",
+        category="clinical_trial_record",
+        expected_signals=["clinical trial", "depression"],
+        forbidden_signals=["captcha"],
+    )
+    page = RenderedPage(
+        provider="fake",
+        url=case.url,
+        status="success",
+        title="Clinical trial page",
+        text_or_markdown=(
+            "This clinical trial studies depression. Privacy policy. Cookie notice."
+        ),
+        links=[
+            RenderedLink(
+                url="https://example.com/trial/about",
+                text="About this clinical trial",
+                internal=True,
+            )
+        ],
+        latency_ms=123,
+    )
+
+    score = score_rendered_page(case, page)
+
+    assert score.extraction_success is True
+    assert score.expected_signal_recall == 1.0
+    assert score.title_present is True
+    assert score.useful_internal_link_count == 1
+    assert score.boilerplate_ratio > 0
+
+
+def test_score_rendered_page_detects_forbidden_or_blocked_signals() -> None:
+    case = BrowserExtractionCase(
+        id="blocked",
+        mode="wide",
+        url="https://example.com",
+        category="directory",
+        forbidden_signals=["captcha"],
+    )
+    page = RenderedPage(
+        provider="fake",
+        url=case.url,
+        status="success",
+        text_or_markdown="Please complete captcha to continue.",
+    )
+
+    score = score_rendered_page(case, page)
+
+    assert score.access_blocked is True
+    assert "captcha" in [item.lower() for item in score.forbidden_signal_hits]
+
+
+def test_run_eval_compares_provider_against_trafilatura_baseline() -> None:
+    case = BrowserExtractionCase(
+        id="focused-company",
+        mode="focused",
+        url="https://example.com",
+        category="company_homepage",
+        expected_signals=["clinical", "research"],
+    )
+
+    @dataclass(frozen=True)
+    class FakeProvider:
+        provider_name: str
+        dry_run: bool = False
+
+        def render(self, url: str, timeout_seconds: int) -> RenderedPage:
+            if self.provider_name == "trafilatura":
+                text = "Clinical homepage."
+            else:
+                text = "Clinical research homepage with additional partner details."
+            return RenderedPage(
+                provider=self.provider_name,
+                url=url,
+                status="success",
+                text_or_markdown=text,
+                latency_ms=timeout_seconds,
+            )
+
+    def fake_factory(provider, **_kwargs):
+        return FakeProvider(provider_name=provider)
+
+    report = run_browser_extraction_eval(
+        [case],
+        options=BrowserExtractionEvalOptions(providers=("browserless",), live=True),
+        provider_factory=fake_factory,
+    )
+
+    runs = report.results[0].runs
+    browserless_score = next(run.score for run in runs if run.provider == "browserless")
+    assert report.providers == ["trafilatura", "browserless"]
+    assert browserless_score.improvement_over_baseline["improved"] is True
+    assert report.summary["providers"]["browserless"]["improved_over_baseline_count"] == 1
+
+
+def test_browser_provider_normalizer_accepts_current_and_future_boundaries() -> None:
+    assert normalize_browser_providers(
+        ["trafilatura", "firecrawl", "browserless", "apify", "playwright", "crawl4ai"]
+    ) == (
+        "trafilatura",
+        "firecrawl",
+        "browserless",
+        "apify",
+        "playwright",
+        "crawl4ai",
+    )
+
+    with pytest.raises(ValueError, match="provider must be"):
+        normalize_browser_providers(["not-a-provider"])
+
+
+def test_write_browser_eval_artifacts(tmp_path: Path) -> None:
+    case = BrowserExtractionCase(
+        id="dry",
+        mode="wide",
+        url="https://example.com",
+        category="directory",
+    )
+    report = run_browser_extraction_eval(
+        [case],
+        options=BrowserExtractionEvalOptions(providers=("browserless",), live=False),
+    )
+
+    paths = write_browser_extraction_artifacts(report, tmp_path)
+
+    assert Path(paths["summary"]).is_file()
+    assert Path(paths["results"]).is_file()
+    assert Path(paths["raw_dir"]).is_dir()

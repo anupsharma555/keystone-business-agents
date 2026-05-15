@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 from keystone_agents.config import require_cli_live_confirmation, with_cli_environment
 from keystone_agents.schemas.approval import ApprovalQueueObjectType, ApprovalQueueStatus
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.gmail_tool import GmailTool
+
+DEFAULT_GMAIL_DRAFT_ACCOUNT = "wisegrow05@gmail.com"
+GMAIL_DRAFT_ACCOUNT_ENV_KEYS = (
+    "KEYSTONE_GMAIL_DRAFT_ACCOUNT",
+    "KNI_BUSINESS_AGENTS_GMAIL_DRAFT_ACCOUNT",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +50,18 @@ def _parse_draft_text(draft_text: str) -> tuple[str, str]:
         text = rest.strip()
     body, _, _linkedin = text.partition("\n\nLinkedIn:")
     return subject, body.strip()
+
+
+def _target_gmail_draft_account(metadata: dict[str, object]) -> str:
+    for key in ("gmail_draft_account", "target_gmail_account"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+    for key in GMAIL_DRAFT_ACCOUNT_ENV_KEYS:
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return DEFAULT_GMAIL_DRAFT_ACCOUNT
 
 
 @with_cli_environment()
@@ -84,6 +103,7 @@ def main() -> int:
     metadata = item.metadata or {}
     recipient = (args.to or metadata.get("recipient_email") or "").strip()
     subject = (args.subject or metadata.get("email_subject") or parsed_subject).strip()
+    target_account = _target_gmail_draft_account(metadata)
     if not recipient:
         raise SystemExit("Recipient email is required. Pass --to or save recipient_email metadata.")
     if not subject:
@@ -97,11 +117,13 @@ def main() -> int:
         to=recipient,
         subject=subject,
         body=parsed_body,
+        expected_account=target_account,
     )
     payload = {
         "approval_id": item.id,
         "approval_status": item.approval_status.value,
         "gmail_result": result,
+        "gmail_account": result.get("gmail_account") or target_account,
         "sent": False,
         "send_enabled": False,
     }

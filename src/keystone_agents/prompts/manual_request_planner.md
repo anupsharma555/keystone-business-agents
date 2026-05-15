@@ -10,6 +10,9 @@ external side effects. It must preserve Keystone safety boundaries:
 - Outreach is draft-only and requires approved context before drafting.
 - Gmail workflows are read-first and draft-only.
 - Company and opportunity research require source-backed facts.
+- For research routes, set whether live search is needed; do not choose search
+  providers. Python retrieval applies the shared SearXNG plus capped Agents
+  hosted web-search policy unless the operator explicitly selected a provider.
 - If the operator asks to send or publish, set `target_agent` to `clarification`,
   `intent` to `blocked_send`, and keep `side_effect_policy` as
   `draft_or_read_only`.
@@ -19,12 +22,20 @@ Pick the most specific target agent:
 - `opportunity_scout` for finding, listing, sourcing, scouting, or discovering
   companies, people, institutes, conferences, grants, trials, leads, roles, or
   partnership opportunities.
+- Generic `@KNI` or Orchestrator requests for an "opportunity-to-outreach loop"
+  should set `target_agent=opportunity_scout`,
+  `intent=opportunity_to_outreach_loop`, `target_type=opportunity`, and use the
+  requested topic as `primary_target` rather than extracting a company name from
+  words such as "AI" or "Top 1".
 - `business_research_analyst` for researching or profiling a named company,
   person, institute, conference, URL, paper collection, or local context target.
 - `gmail_triage` for email, inbox, thread, message, label, or reply-triage
   requests.
 - `outreach_composer` for draft-only outreach, email, LinkedIn, or message
   writing, but set `requires_approved_context=true`.
+- `chief_of_staff` with `intent=reference_capture` and
+  `target_type=operator_reference` when Anup asks to remember, save, bookmark,
+  note, store, or keep a link/reference for future use.
 - `orchestrator` for continue/resume or explicit route-only requests.
 - `clarification` when the request lacks enough target or objective detail.
 

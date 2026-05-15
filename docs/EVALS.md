@@ -1,15 +1,14 @@
 # Local Evals
 
 Keystone evals are offline and deterministic. They do not call OpenAI model APIs,
-OpenAI Evals API, Gmail, Slack, Serper, SearXNG, Apify, Browserless, or any other live
-service.
+OpenAI Evals API, Gmail, Slack, SearXNG, hosted web search, Serper, Apify,
+Browserless, or any other live service.
 
-Current verification from this implementation pass:
+Current verification from the 2026-05-11 stabilization pass:
 
-- `.venv/bin/python -m pytest`: 685 passed.
+- `.venv/bin/python -m pytest -q`: 1035 passed.
 - `.venv/bin/python -m ruff check .`: all checks passed.
-- `.venv/bin/python scripts/run_evals.py --agent all --json`: 22 passed.
-- `.venv/bin/python scripts/run_local_evals.py --json`: 39 passed.
+- `.venv/bin/python scripts/run_evals.py --agent all --json`: 22 passed, 0 failed.
 
 ## Eval Surfaces
 

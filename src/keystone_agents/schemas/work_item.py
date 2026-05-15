@@ -187,6 +187,11 @@ class WorkflowRunRequest(BaseModel):
     max_results: int = Field(default=3, ge=1, le=20)
     requested_route: WorkItemRoute | None = None
     manual_request_plan: dict[str, Any] | None = None
+    context_file_path: str = ""
+    external_context: dict[str, Any] | None = None
+    sdk_session_enabled: bool | None = None
+    sdk_session_id: str = ""
+    sdk_session_db_path: str = ""
 
 
 class WorkflowRunResult(BaseModel):

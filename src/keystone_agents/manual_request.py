@@ -41,12 +41,18 @@ _AGENT_ALIASES: dict[str, ManualTargetAgent] = {
     "triage agent": "gmail_triage",
     "outreach composer": "outreach_composer",
     "outreach agent": "outreach_composer",
+    "chief of staff": "chief_of_staff",
+    "chief of staff agent": "chief_of_staff",
+    "kni chief of staff": "chief_of_staff",
+    "slack operations": "chief_of_staff",
+    "slack ops": "chief_of_staff",
 }
 _ROUTE_INTENT: dict[ManualTargetAgent, ManualRequestIntent] = {
     "business_research_analyst": "company_research",
     "opportunity_scout": "opportunity_search",
     "gmail_triage": "gmail_triage",
     "outreach_composer": "outreach_draft",
+    "chief_of_staff": "slack_operations",
     "orchestrator": "route_request",
     "clarification": "clarification",
 }
@@ -55,6 +61,7 @@ _ROUTE_TARGET_TYPE: dict[ManualTargetAgent, ManualTargetType] = {
     "opportunity_scout": "topic",
     "gmail_triage": "gmail_thread",
     "outreach_composer": "company",
+    "chief_of_staff": "slack_channel",
     "orchestrator": "unknown",
     "clarification": "unknown",
 }
@@ -69,6 +76,20 @@ _PREFIX_RE = re.compile(
     r"draft outreach to|draft email to|write outreach to|company research)\s+",
     re.I,
 )
+_OPPORTUNITY_TO_OUTREACH_RE = re.compile(
+    r"\bopportunit(?:y|ies)\s*(?:-|to\s+)?outreach\b"
+    r"|"
+    r"\bopportunit(?:y|ies)\b.*\boutreach\b.*\b(loop|draft|email|approval|collaboration)\b"
+    r"|"
+    r"\boutreach\b.*\bopportunit(?:y|ies)\b.*\b(loop|draft|email|approval|collaboration)\b",
+    re.I,
+)
+_LOOP_TOPIC_STOP_RE = re.compile(
+    r"\s*(?:[.;]\s*)?(?:top\s+\d+|post\s+approval|request\s+approval|approval\s+to|"
+    r"draft\s+only|do\s+not\s+send|don't\s+send|save\b|send\b).*$",
+    re.I,
+)
+_REFERENCE_URL_RE = re.compile(r"https?://[^\s<>)]+", re.I)
 
 
 def normalize_manual_agent(value: str | None) -> ManualTargetAgent | None:
@@ -94,7 +115,8 @@ def infer_manual_request_plan(
     normalized_agent = normalize_manual_agent(requested_agent)
     desired_count = _desired_count(text)
     target_agent = _semantic_target_agent(request, text, requested_agent=normalized_agent)
-    intent = _intent_for_target(target_agent, text)
+    workflow_allowed = normalized_agent in {None, "orchestrator"}
+    intent = _intent_for_target(target_agent, text, workflow_allowed=workflow_allowed)
     plan = ManualRequestPlan(
         source=source,
         requested_agent=normalized_agent,
@@ -140,6 +162,18 @@ def merge_manual_request_plan(
         if isinstance(candidate, ManualRequestPlan)
         else ManualRequestPlan.model_validate(candidate)
     )
+    if base.intent == "opportunity_to_outreach_loop" and plan.intent != base.intent:
+        warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
+        warnings.append(
+            "Ignored planner override that converted an opportunity-to-outreach workflow "
+            "request into a non-workflow route."
+        )
+        return base.model_copy(
+            update={
+                "source": plan.source or base.source,
+                "planner_warnings": warnings,
+            }
+        )
     merged = base.model_copy(update=plan.model_dump(mode="json"))
     if not merged.requested_agent:
         merged.requested_agent = base.requested_agent
@@ -177,6 +211,10 @@ def _semantic_target_agent(
     lower = text.lower()
     if requested_agent and requested_agent != "orchestrator":
         return requested_agent
+    if _looks_like_slack_operations_request(lower):
+        return "chief_of_staff"
+    if looks_like_opportunity_to_outreach_loop(text):
+        return "opportunity_scout"
     if SEND_RE.search(lower):
         return "clarification"
     if RESUME_RE.search(lower):
@@ -194,8 +232,21 @@ def _semantic_target_agent(
     return "clarification"
 
 
-def _intent_for_target(target_agent: ManualTargetAgent, text: str) -> ManualRequestIntent:
+def _intent_for_target(
+    target_agent: ManualTargetAgent,
+    text: str,
+    *,
+    workflow_allowed: bool = True,
+) -> ManualRequestIntent:
     lower = text.lower()
+    if target_agent == "chief_of_staff" and _looks_like_reference_capture_request(lower):
+        return "reference_capture"
+    if (
+        workflow_allowed
+        and target_agent == "opportunity_scout"
+        and looks_like_opportunity_to_outreach_loop(text)
+    ):
+        return "opportunity_to_outreach_loop"
     if SEND_RE.search(lower):
         return "blocked_send"
     if RESUME_RE.search(lower):
@@ -203,6 +254,48 @@ def _intent_for_target(target_agent: ManualTargetAgent, text: str) -> ManualRequ
     if target_agent == "business_research_analyst" and "zotero" in lower:
         return "research_brief"
     return _ROUTE_INTENT.get(target_agent, "clarification")
+
+
+def _looks_like_slack_operations_request(lower: str) -> bool:
+    if "chief of staff" in lower or "slack ops" in lower or "slack operations" in lower:
+        return True
+    return bool(
+        "slack" in lower
+        and any(
+            term in lower
+            for term in (
+                "channel",
+                "route",
+                "routing",
+                "calendar",
+                "gmail",
+                "meeting",
+                "onboarding",
+                "socket",
+                "post",
+            )
+        )
+    )
+
+
+def _looks_like_reference_capture_request(lower: str) -> bool:
+    markers = (
+        "keep this for future reference",
+        "for future reference",
+        "remember this",
+        "save this",
+        "save for later",
+        "bookmark this",
+        "note this",
+        "store this",
+        "add this to memory",
+        "keep this",
+    )
+    if any(marker in lower for marker in markers):
+        return True
+    return bool(_REFERENCE_URL_RE.search(lower)) and any(
+        marker in lower for marker in ("remember", "reference", "bookmark", "save")
+    )
 
 
 def _desired_count(text: str) -> int:
@@ -218,6 +311,8 @@ def _desired_count(text: str) -> int:
 
 def _primary_target(text: str, *, target_agent: ManualTargetAgent) -> str:
     cleaned = _strip_direct_agent_prefix(text).strip()
+    if target_agent == "chief_of_staff" and _looks_like_reference_capture_request(cleaned.lower()):
+        return _reference_target(cleaned)
     if target_agent == "business_research_analyst":
         zotero_query = (
             extract_zotero_article_query(cleaned)
@@ -230,6 +325,8 @@ def _primary_target(text: str, *, target_agent: ManualTargetAgent) -> str:
         if zotero_hint:
             return zotero_hint
     if target_agent == "opportunity_scout":
+        if looks_like_opportunity_to_outreach_loop(cleaned):
+            return _opportunity_to_outreach_topic(cleaned)
         return cleaned
     cleaned = _PREFIX_RE.sub("", cleaned).strip()
     if target_agent == "gmail_triage":
@@ -243,6 +340,8 @@ def _primary_target(text: str, *, target_agent: ManualTargetAgent) -> str:
 
 def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetType:
     lower = text.lower()
+    if target_agent == "chief_of_staff" and _looks_like_reference_capture_request(lower):
+        return "operator_reference"
     if target_agent == "business_research_analyst":
         if looks_like_zotero_article_request(text):
             return "zotero_article"
@@ -263,6 +362,8 @@ def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetT
             return "topic"
         return "company"
     if target_agent == "opportunity_scout":
+        if looks_like_opportunity_to_outreach_loop(text):
+            return "opportunity"
         if any(marker in lower for marker in ("conference", "symposium", "summit")):
             return "conference"
         if any(marker in lower for marker in ("researcher", "principal investigator", "faculty")):
@@ -275,8 +376,27 @@ def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetT
     return _ROUTE_TARGET_TYPE.get(target_agent, "unknown")
 
 
+def _reference_target(text: str) -> str:
+    url_match = _REFERENCE_URL_RE.search(text)
+    cleaned = _REFERENCE_URL_RE.sub(" ", text)
+    cleaned = re.sub(
+        r"\b(please\s+)?(keep|remember|save|bookmark|note|store|add)\b",
+        " ",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"\b(this|for|future|reference|later|to|memory)\b", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"[:\-]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if cleaned:
+        return cleaned[:120]
+    return url_match.group(0)[:120] if url_match else ""
+
+
 def _objective(text: str, *, intent: ManualRequestIntent) -> str:
     cleaned = _strip_direct_agent_prefix(text).strip()
+    if intent == "opportunity_to_outreach_loop":
+        return cleaned or "Run the opportunity-to-outreach loop and queue draft-only approval."
     if intent == "company_research":
         return cleaned or "Prepare a concise source-backed research brief."
     if intent == "research_brief":
@@ -316,6 +436,12 @@ def _constraints(text: str) -> list[str]:
     return constraints
 
 
+def looks_like_opportunity_to_outreach_loop(text: str) -> bool:
+    """Return whether text asks for the integrated opportunity -> outreach workflow."""
+
+    return bool(_OPPORTUNITY_TO_OUTREACH_RE.search(str(text or "")))
+
+
 def _strip_direct_agent_prefix(text: str) -> str:
     cleaned = " ".join(str(text or "").split()).strip()
     lowered = cleaned.lower()
@@ -323,6 +449,24 @@ def _strip_direct_agent_prefix(text: str) -> str:
         if lowered.startswith(alias + " "):
             return cleaned[len(alias) :].strip()
     return cleaned
+
+
+def _opportunity_to_outreach_topic(text: str) -> str:
+    cleaned = _strip_direct_agent_prefix(text).strip()
+    match = re.search(r"\bfor\s+(?P<topic>.+)$", cleaned, re.I)
+    if match:
+        candidate = match.group("topic").strip()
+    else:
+        candidate = re.sub(
+            r"^\s*(?:run|start|do|execute|find|source|identify)\s+"
+            r"(?:one\s+)?(?:opportunit(?:y|ies)\s*(?:-|to\s+)?outreach\s+"
+            r"(?:loop|workflow|process)?|loop)\s*",
+            "",
+            cleaned,
+            flags=re.I,
+        ).strip()
+    candidate = _LOOP_TOPIC_STOP_RE.sub("", candidate).strip(" .,:;-")
+    return candidate or cleaned[:120]
 
 
 def _companyish_target(text: str) -> str:

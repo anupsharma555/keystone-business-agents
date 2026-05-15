@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,10 @@ from keystone_agents.agent_mentions import parse_agent_mention
 from keystone_agents.agent_registry import agent_cards
 from keystone_agents.agents.business_research_analyst import (
     build_business_research_analyst_research_brief_agent,
+)
+from keystone_agents.agents.chief_of_staff import (
+    build_chief_of_staff_agent,
+    plan_chief_of_staff_request,
 )
 from keystone_agents.agents.gmail_triage import build_gmail_triage_agent
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
@@ -28,6 +33,12 @@ from keystone_agents.agents.orchestrator import (
 from keystone_agents.agents.outreach_composer import (
     build_outreach_composer_agent,
 )
+from keystone_agents.automation_inventory import (
+    build_automation_inventory_report,
+    ensure_default_automation_inventory,
+    render_automation_inventory_markdown,
+)
+from keystone_agents.cli_sdk import add_sdk_session_arguments
 from keystone_agents.config import cli_default_live_research, cli_default_live_sdk, load_settings
 from keystone_agents.evals import generate_eval_report, run_static_evals
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
@@ -53,7 +64,16 @@ from keystone_agents.schemas.work_item import (
     WorkItemRoute,
     WorkItemStatus,
 )
+from keystone_agents.sdk_sessions import (
+    SDKSessionSpec,
+    build_sdk_session,
+    context_file_session_components,
+    default_cli_ask_session_components,
+    resolve_sdk_session_spec,
+    sdk_session_env,
+)
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
+from keystone_agents.tools.slack_tool import SlackTool, slack_review_message_from_approval_item
 from keystone_agents.tools.storage_tool import StorageTool
 from keystone_agents.work_items import (
     approve_artifact_context,
@@ -66,7 +86,11 @@ from keystone_agents.work_items import (
     set_next_action,
 )
 from keystone_agents.workflow_runner import advance_work_item
-from keystone_agents.workflows import pipeline_markdown_report, run_keystone_pipeline
+from keystone_agents.workflows import (
+    pipeline_markdown_report,
+    run_keystone_pipeline,
+    run_opportunity_to_outreach_loop,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -109,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent",
         choices=[
             "orchestrator",
+            "chief_of_staff",
             "business_research_analyst",
             "opportunity_scout",
             "outreach_composer",
@@ -126,14 +151,36 @@ def build_parser() -> argparse.ArgumentParser:
             "live-test/full-live mode; use --no-live-sdk to force dry-run selection."
         ),
     )
+    add_sdk_session_arguments(ask)
     ask.add_argument(
         "--live-manual-plan",
         action="store_true",
         help="Use the SDK manual-request planner before direct agent execution.",
     )
     ask.add_argument("--database-url", default=None, help="SQLite URL for WorkItem mode.")
+    ask.add_argument(
+        "--context-file",
+        default="",
+        help="Optional selected-context JSON file to attach to a WorkItem run.",
+    )
     ask.add_argument("--live-search", action="store_true", help="Use live search in WorkItem mode.")
     ask.add_argument("--max-results", type=int, default=3, help="Max WorkItem search results.")
+    ask.add_argument("--save", action="store_true", help="Save workflow artifacts when supported.")
+    ask.add_argument(
+        "--approval-channel",
+        default="#ai-agents-workflow",
+        help="Approval channel for workflow review packets.",
+    )
+    ask.add_argument(
+        "--request-approval",
+        action="store_true",
+        help="Queue and preview approval packets for supported workflows.",
+    )
+    ask.add_argument(
+        "--live-slack",
+        action="store_true",
+        help="Post workflow approval packets to Slack when approval is requested.",
+    )
     ask.add_argument("--json", action="store_true", help="Print JSON.")
     ask.set_defaults(func=_run_ask)
 
@@ -225,9 +272,20 @@ def build_parser() -> argparse.ArgumentParser:
     work_items_advance.add_argument(
         "--input", default="", help="Request text or local fixture path."
     )
+    work_items_advance.add_argument(
+        "--context-file",
+        default="",
+        help="Optional selected-context JSON file to attach to this WorkItem advance.",
+    )
     work_items_advance.add_argument("--database-url", default=None)
     work_items_advance.add_argument("--live-search", action="store_true")
     work_items_advance.add_argument("--live-sdk", action="store_true")
+    add_sdk_session_arguments(work_items_advance)
+    work_items_advance.add_argument(
+        "--langgraph",
+        action="store_true",
+        help="Use the optional LangGraph WorkItem orchestration wrapper.",
+    )
     work_items_advance.add_argument("--max-results", type=int, default=3)
     work_items_advance.add_argument("--json", action="store_true", help="Print JSON.")
     work_items_advance.set_defaults(func=_run_work_items_advance)
@@ -280,6 +338,35 @@ def build_parser() -> argparse.ArgumentParser:
     work_items_approve.add_argument("--database-url", default=None)
     work_items_approve.add_argument("--json", action="store_true", help="Print JSON.")
     work_items_approve.set_defaults(func=_run_work_items_approve_context)
+
+    automations = subparsers.add_parser("automations", help="Inspect Keystone automations.")
+    automation_subparsers = automations.add_subparsers(
+        dest="automations_command",
+        required=True,
+    )
+    automation_list = automation_subparsers.add_parser("list", help="List automation specs.")
+    automation_list.add_argument("--status", default="all")
+    automation_list.add_argument("--database-url", default=None)
+    automation_list.add_argument("--json", action="store_true", help="Print JSON.")
+    automation_list.set_defaults(func=_run_automations_list)
+
+    automation_runs = automation_subparsers.add_parser("runs", help="List automation runs.")
+    automation_runs.add_argument("--automation-id", default=None)
+    automation_runs.add_argument("--status", default="all")
+    automation_runs.add_argument("--limit", type=int, default=20)
+    automation_runs.add_argument("--database-url", default=None)
+    automation_runs.add_argument("--json", action="store_true", help="Print JSON.")
+    automation_runs.set_defaults(func=_run_automations_runs)
+
+    automation_audit = automation_subparsers.add_parser(
+        "audit",
+        help="Build a Chief of Staff automation inventory report.",
+    )
+    automation_audit.add_argument("--channel", action="append", default=[])
+    automation_audit.add_argument("--limit", type=int, default=20)
+    automation_audit.add_argument("--database-url", default=None)
+    automation_audit.add_argument("--json", action="store_true", help="Print JSON.")
+    automation_audit.set_defaults(func=_run_automations_audit)
 
     agents = subparsers.add_parser("agents", help="Inspect registered agents.")
     agent_subparsers = agents.add_subparsers(dest="agents_command", required=True)
@@ -352,6 +439,7 @@ def _run_route(args: argparse.Namespace) -> int:
 
 AGENT_DISPLAY_NAMES = {
     "orchestrator": "Keystone Orchestrator Agent",
+    "chief_of_staff": "KNI Chief of Staff Agent",
     "business_research_analyst": "Business Research Analyst",
     "opportunity_scout": "Opportunity Scout Agent",
     "outreach_composer": "Outreach Composer Agent",
@@ -381,6 +469,27 @@ def _run_ask(args: argparse.Namespace) -> int:
             requested_agent=requested_route,
             live=live_manual_plan,
         )
+        if _should_run_opportunity_to_outreach_loop(
+            manual_plan,
+            explicit_route=mention.route if mention.explicit else None,
+        ):
+            return _run_ask_opportunity_to_outreach_loop(
+                input_text,
+                live_search=live_search,
+                live_sdk=live_sdk,
+                json_output=args.json,
+                manual_plan=manual_plan,
+                database_url=args.database_url,
+                save=args.save,
+                request_approval=args.request_approval,
+                approval_channel=args.approval_channel,
+                live_slack=args.live_slack,
+                sdk_session_spec=_sdk_session_spec_for_ask(
+                    args,
+                    route="orchestrator",
+                    default_enabled=False,
+                ),
+            )
         if live_sdk and mention.explicit and mention.route is not None:
             route = str(mention.route)
             if route == "orchestrator":
@@ -389,12 +498,22 @@ def _run_ask(args: argparse.Namespace) -> int:
                     live_sdk=True,
                     json_output=args.json,
                     manual_plan=manual_plan,
+                    sdk_session_spec=_sdk_session_spec_for_ask(
+                        args,
+                        route="orchestrator",
+                        default_enabled=False,
+                    ),
                 )
             return _run_ask_specialist_live(
                 route,
                 input_text,
                 json_output=args.json,
                 manual_plan=manual_plan,
+                sdk_session_spec=_sdk_session_spec_for_ask(
+                    args,
+                    route=route,
+                    default_enabled=_ask_route_session_default(route),
+                ),
             )
         return _run_ask_work_item(
             input_text,
@@ -404,6 +523,10 @@ def _run_ask(args: argparse.Namespace) -> int:
             max_results=args.max_results,
             json_output=args.json,
             manual_plan=manual_plan,
+            context_file_path=args.context_file,
+            sdk_session_enabled=args.sdk_session,
+            sdk_session_id=args.sdk_session_id,
+            sdk_session_db_path=args.sdk_session_db,
         )
     route = args.agent
     manual_plan = resolve_manual_request_plan(
@@ -417,6 +540,11 @@ def _run_ask(args: argparse.Namespace) -> int:
             live_sdk=live_sdk,
             json_output=args.json,
             manual_plan=manual_plan,
+            sdk_session_spec=_sdk_session_spec_for_ask(
+                args,
+                route="orchestrator",
+                default_enabled=False,
+            ),
         )
     if live_sdk:
         return _run_ask_specialist_live(
@@ -424,8 +552,19 @@ def _run_ask(args: argparse.Namespace) -> int:
             input_text,
             json_output=args.json,
             manual_plan=manual_plan,
+            sdk_session_spec=_sdk_session_spec_for_ask(
+                args,
+                route=route,
+                default_enabled=_ask_route_session_default(route),
+            ),
         )
-    return _print_ask_dry_run(route, input_text, json_output=args.json, manual_plan=manual_plan)
+    return _print_ask_dry_run(
+        route,
+        input_text,
+        json_output=args.json,
+        manual_plan=manual_plan,
+        database_url=args.database_url,
+    )
 
 
 def _ask_live_sdk_enabled(args: argparse.Namespace) -> bool:
@@ -433,6 +572,125 @@ def _ask_live_sdk_enabled(args: argparse.Namespace) -> bool:
     if explicit is not None:
         return bool(explicit)
     return cli_default_live_sdk()
+
+
+def _sdk_session_spec_for_ask(
+    args: argparse.Namespace,
+    *,
+    route: str,
+    default_enabled: bool,
+    context_file_path: str = "",
+) -> SDKSessionSpec:
+    context_scope = context_file_session_components(context_file_path)
+    if context_scope is not None:
+        scope, components = context_scope
+    else:
+        scope = "ask"
+        components = default_cli_ask_session_components(route)
+    return resolve_sdk_session_spec(
+        scope=scope,
+        components=components,
+        enabled=getattr(args, "sdk_session", None),
+        explicit_session_id=str(getattr(args, "sdk_session_id", "") or ""),
+        database_path=str(getattr(args, "sdk_session_db", "") or ""),
+        default_enabled=default_enabled,
+    )
+
+
+def _ask_route_session_default(route: str) -> bool:
+    return route == "chief_of_staff"
+
+
+def _should_run_opportunity_to_outreach_loop(
+    manual_plan: ManualRequestPlan | None,
+    *,
+    explicit_route: str | None,
+) -> bool:
+    if manual_plan is None or manual_plan.intent != "opportunity_to_outreach_loop":
+        return False
+    return explicit_route in {None, "orchestrator"}
+
+
+def _run_ask_opportunity_to_outreach_loop(
+    input_text: str,
+    *,
+    live_search: bool,
+    live_sdk: bool,
+    json_output: bool,
+    manual_plan: ManualRequestPlan,
+    database_url: str | None,
+    save: bool,
+    request_approval: bool,
+    approval_channel: str,
+    live_slack: bool,
+    sdk_session_spec: SDKSessionSpec | None = None,
+) -> int:
+    approval_requested = request_approval or _approval_requested_from_text(input_text)
+    if live_slack and not approval_requested:
+        raise SystemExit("--live-slack requires --request-approval or an approval request in text.")
+    topic = (manual_plan.primary_target or input_text).strip()
+    top_n = max(1, min(10, manual_plan.desired_count or 1))
+    dry_run = not live_search
+    session_env = sdk_session_env(sdk_session_spec) if sdk_session_spec is not None else {}
+    previous_env = {key: os.environ.get(key) for key in session_env}
+    try:
+        os.environ.update(session_env)
+        result = run_opportunity_to_outreach_loop(
+            topic=topic,
+            top_n=top_n,
+            dry_run=dry_run,
+            live_search=live_search,
+            save=save or approval_requested,
+            database_url=database_url,
+            approval_channel=approval_channel,
+            outreach_channel="email",
+            live_sdk_synthesis=bool(live_sdk and live_search),
+        )
+    finally:
+        for key, previous in previous_env.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+    if approval_requested:
+        slack = SlackTool(live=live_slack, approvals_channel=approval_channel)
+        posted = []
+        for saved_item in result.storage.get("items", []):
+            approval_item = saved_item.get("approval_queue_item")
+            if not isinstance(approval_item, dict):
+                continue
+            message = slack_review_message_from_approval_item(approval_item)
+            posted.append(slack.post_review_message(message, channel=approval_channel))
+        result.storage["slack_approval_posts"] = posted
+    payload = {
+        "mode": "live_workflow" if live_search else "dry_run_workflow",
+        "selected_agent": "orchestrator",
+        "agent_name": "Keystone Orchestrator Agent",
+        "workflow": "opportunity_to_outreach_loop",
+        "input": input_text,
+        "topic": topic,
+        "top_n": top_n,
+        "send_enabled": False,
+        "manual_request_plan": manual_plan.model_dump(mode="json"),
+        "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
+        "output_type": type(result).__name__,
+        "output": result.model_dump(mode="json"),
+    }
+    return _print_ask_live_payload(payload, json_output=json_output)
+
+
+def _approval_requested_from_text(text: str) -> bool:
+    lower = str(text or "").lower()
+    return any(
+        marker in lower
+        for marker in (
+            "post approval",
+            "request approval",
+            "approval to this channel",
+            "approval in this channel",
+            "post to this channel",
+        )
+    )
 
 
 def _run_ask_work_item(
@@ -444,6 +702,10 @@ def _run_ask_work_item(
     max_results: int,
     json_output: bool,
     manual_plan: ManualRequestPlan | None = None,
+    context_file_path: str = "",
+    sdk_session_enabled: bool | None = None,
+    sdk_session_id: str = "",
+    sdk_session_db_path: str = "",
 ) -> int:
     store = SQLiteStore(database_url or database_url_from_env())
     work_item_id = _resolve_continue_work_item_id(
@@ -462,6 +724,10 @@ def _run_ask_work_item(
             live_sdk=live_sdk,
             max_results=max_results,
             manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
+            context_file_path=context_file_path,
+            sdk_session_enabled=sdk_session_enabled,
+            sdk_session_id=sdk_session_id,
+            sdk_session_db_path=sdk_session_db_path,
         )
     )
     return _print_work_item_result(result, json_output=json_output)
@@ -473,10 +739,15 @@ def _run_ask_orchestrator(
     live_sdk: bool,
     json_output: bool,
     manual_plan: ManualRequestPlan | None = None,
+    sdk_session_spec: SDKSessionSpec | None = None,
 ) -> int:
     if live_sdk:
         load_settings(force_dotenv=True)
-        result = run_orchestrator_sdk(input_text, live=True).output
+        result = run_orchestrator_sdk(
+            input_text,
+            live=True,
+            session=build_sdk_session(sdk_session_spec) if sdk_session_spec else None,
+        ).output
     else:
         result = route_request(input_text, manual_plan=manual_plan)
     payload = {
@@ -488,6 +759,7 @@ def _run_ask_orchestrator(
         "target_agent": result.target_agent,
         "send_enabled": result.send_enabled,
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
         "output": result.model_dump(mode="json"),
     }
     if json_output:
@@ -508,14 +780,21 @@ def _print_ask_dry_run(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None = None,
+    database_url: str | None = None,
 ) -> int:
     builder = {
+        "chief_of_staff": build_chief_of_staff_agent,
         "business_research_analyst": build_business_research_analyst_research_brief_agent,
         "opportunity_scout": build_opportunity_scout_agent,
         "outreach_composer": build_outreach_composer_agent,
         "gmail_triage": build_gmail_triage_agent,
     }[route]
     agent = builder()
+    chief_of_staff_output = (
+        plan_chief_of_staff_request(input_text, database_url=database_url)
+        if route == "chief_of_staff"
+        else None
+    )
     payload = {
         "mode": "dry_run",
         "selected_agent": route,
@@ -524,6 +803,9 @@ def _print_ask_dry_run(
         "input": input_text,
         "send_enabled": False,
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "output": (
+            chief_of_staff_output.model_dump(mode="json") if chief_of_staff_output else None
+        ),
         "note": (
             "Dry-run selected the specialist but did not call a model. "
             "Re-run with --live-sdk to execute."
@@ -538,6 +820,16 @@ def _print_ask_dry_run(
             print(f"Manual plan: {manual_plan.target_agent} / {manual_plan.intent}")
             if manual_plan.primary_target:
                 print(f"Target: {manual_plan.primary_target}")
+        if chief_of_staff_output is not None:
+            route_output = chief_of_staff_output.recommended_route
+            print(f"Workflow: {route_output.workflow_type}")
+            print(f"Command: {route_output.command_text}")
+            print(
+                f"Target channel: #{route_output.target_channel}"
+                if route_output.target_channel
+                else "Target channel: clarify"
+            )
+            print(f"Slack post allowed: {chief_of_staff_output.slack_post_allowed}")
         print("Mode: dry_run")
         print("Send enabled: False")
         print(payload["note"])
@@ -550,6 +842,7 @@ def _run_ask_specialist_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None = None,
+    sdk_session_spec: SDKSessionSpec | None = None,
 ) -> int:
     load_settings(force_dotenv=True)
     if route == "business_research_analyst":
@@ -557,12 +850,21 @@ def _run_ask_specialist_live(
             input_text,
             json_output=json_output,
             manual_plan=manual_plan,
+            sdk_session_spec=sdk_session_spec,
+        )
+    elif route == "chief_of_staff":
+        return _run_ask_chief_of_staff_live(
+            input_text,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            sdk_session_spec=sdk_session_spec,
         )
     elif route == "opportunity_scout":
         return _run_ask_opportunity_scout_live(
             input_text,
             json_output=json_output,
             manual_plan=manual_plan,
+            sdk_session_spec=sdk_session_spec,
         )
     elif route == "outreach_composer":
         return _print_ask_outreach_context_blocked(
@@ -575,6 +877,7 @@ def _run_ask_specialist_live(
             input_text,
             json_output=json_output,
             manual_plan=manual_plan,
+            sdk_session_spec=sdk_session_spec,
         )
     else:
         raise SystemExit(f"Unsupported agent route: {route}")
@@ -585,6 +888,7 @@ def _run_ask_company_research_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    sdk_session_spec: SDKSessionSpec | None,
 ) -> int:
     target = (manual_plan.primary_target if manual_plan else "") or input_text[:120]
     if not target.strip():
@@ -616,6 +920,32 @@ def _run_ask_company_research_live(
         command,
         json_output=json_output,
         manual_plan=manual_plan,
+        sdk_session_spec=sdk_session_spec,
+    )
+
+
+def _run_ask_chief_of_staff_live(
+    input_text: str,
+    *,
+    json_output: bool,
+    manual_plan: ManualRequestPlan | None,
+    sdk_session_spec: SDKSessionSpec | None,
+) -> int:
+    command = [
+        sys.executable,
+        "scripts/run_chief_of_staff.py",
+        "--input",
+        input_text,
+        "--live-sdk",
+        "--json",
+    ]
+    return _run_ask_script_live(
+        "chief_of_staff",
+        input_text,
+        command,
+        json_output=json_output,
+        manual_plan=manual_plan,
+        sdk_session_spec=sdk_session_spec,
     )
 
 
@@ -624,6 +954,7 @@ def _run_ask_opportunity_scout_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    sdk_session_spec: SDKSessionSpec | None,
 ) -> int:
     max_results = manual_plan.desired_count if manual_plan else 3
     command = [
@@ -645,6 +976,7 @@ def _run_ask_opportunity_scout_live(
         command,
         json_output=json_output,
         manual_plan=manual_plan,
+        sdk_session_spec=sdk_session_spec,
     )
 
 
@@ -653,6 +985,7 @@ def _run_ask_gmail_triage_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    sdk_session_spec: SDKSessionSpec | None,
 ) -> int:
     temp_path: Path | None = None
     fixture_path = Path(input_text).expanduser() if input_text and "\n" not in input_text else None
@@ -689,6 +1022,7 @@ def _run_ask_gmail_triage_live(
             command,
             json_output=json_output,
             manual_plan=manual_plan,
+            sdk_session_spec=sdk_session_spec,
         )
     finally:
         if temp_path is not None:
@@ -732,13 +1066,18 @@ def _run_ask_script_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    sdk_session_spec: SDKSessionSpec | None = None,
 ) -> int:
+    env = None
+    if sdk_session_spec is not None:
+        env = {**os.environ, **sdk_session_env(sdk_session_spec)}
     completed = subprocess.run(
         command,
         cwd=Path(__file__).resolve().parents[2],
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
     if completed.returncode != 0:
         raise SystemExit((completed.stderr or completed.stdout or "Agent script failed.").strip())
@@ -756,6 +1095,7 @@ def _run_ask_script_live(
         "input": input_text,
         "send_enabled": _payload_send_enabled(script_payload),
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
         "output_type": (
             str(script_payload.get("output_type") or type(output).__name__)
             if isinstance(script_payload, dict)
@@ -1021,6 +1361,96 @@ def _run_work_items_timeline(args: argparse.Namespace) -> int:
     return 0
 
 
+def _automation_store(args: argparse.Namespace) -> SQLiteStore:
+    store = SQLiteStore(args.database_url or database_url_from_env())
+    ensure_default_automation_inventory(store)
+    return store
+
+
+def _run_automations_list(args: argparse.Namespace) -> int:
+    store = _automation_store(args)
+    specs = store.list_automation_specs(status=args.status, limit=100)
+    if args.json:
+        print(
+            json.dumps(
+                [spec.model_dump(mode="json") for spec in specs],
+                ensure_ascii=True,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    elif not specs:
+        print("No automations found.")
+    else:
+        print(
+            render_markdown_table(
+                ["ID", "Status", "Trigger", "Workflow", "Default channel"],
+                [
+                    [
+                        spec.id,
+                        spec.status.value,
+                        spec.trigger_type.value,
+                        spec.workflow,
+                        spec.default_channel,
+                    ]
+                    for spec in specs
+                ],
+            )
+        )
+    return 0
+
+
+def _run_automations_runs(args: argparse.Namespace) -> int:
+    store = _automation_store(args)
+    runs = store.list_automation_runs(
+        automation_id=args.automation_id,
+        status=args.status,
+        limit=args.limit,
+    )
+    if args.json:
+        print(
+            json.dumps(
+                [run.model_dump(mode="json") for run in runs],
+                ensure_ascii=True,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    elif not runs:
+        print("No automation runs found.")
+    else:
+        print(
+            render_markdown_table(
+                ["ID", "Automation", "Stage", "Status", "WorkItem", "Approvals"],
+                [
+                    [
+                        run.id,
+                        run.automation_name or run.automation_id,
+                        run.stage,
+                        run.status.value,
+                        run.work_item_id,
+                        str(run.approval_count),
+                    ]
+                    for run in runs
+                ],
+            )
+        )
+    return 0
+
+
+def _run_automations_audit(args: argparse.Namespace) -> int:
+    report = build_automation_inventory_report(
+        database_url=args.database_url,
+        channels=args.channel,
+        limit=args.limit,
+    )
+    if args.json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_automation_inventory_markdown(report))
+    return 0
+
+
 def _run_work_items_advance(args: argparse.Namespace) -> int:
     store = SQLiteStore(args.database_url or database_url_from_env())
     input_text = _read_input(args.input)
@@ -1030,18 +1460,56 @@ def _run_work_items_advance(args: argparse.Namespace) -> int:
         explicit_work_item_id=args.work_item_id,
         json_output=args.json,
     )
-    result = advance_work_item(
-        WorkflowRunRequest(
-            request_text=input_text,
-            work_item_id=work_item_id,
-            save=True,
-            database_url=args.database_url,
-            live_search=args.live_search,
-            live_sdk=args.live_sdk,
-            max_results=args.max_results,
-        )
+    request = WorkflowRunRequest(
+        request_text=input_text,
+        work_item_id=work_item_id,
+        save=True,
+        database_url=args.database_url,
+        live_search=args.live_search,
+        live_sdk=args.live_sdk,
+        max_results=args.max_results,
+        context_file_path=args.context_file,
+        sdk_session_enabled=args.sdk_session,
+        sdk_session_id=args.sdk_session_id,
+        sdk_session_db_path=args.sdk_session_db,
     )
-    return _print_work_item_result(result, json_output=args.json)
+    graph_metadata = None
+    if args.langgraph:
+        outcome = _run_work_item_langgraph_for_request(request)
+        result = outcome.result
+        graph_metadata = _work_item_langgraph_metadata(outcome)
+    else:
+        from keystone_agents.langgraph_workflow import work_item_langgraph_enabled
+
+        if work_item_langgraph_enabled():
+            outcome = _run_work_item_langgraph_for_request(request)
+            result = outcome.result
+            graph_metadata = _work_item_langgraph_metadata(outcome)
+        else:
+            result = advance_work_item(request)
+    return _print_work_item_result(result, json_output=args.json, graph_metadata=graph_metadata)
+
+
+def _run_work_item_langgraph_for_request(request: WorkflowRunRequest):
+    from keystone_agents.langgraph_workflow import (
+        run_work_item_langgraph,
+        work_item_graph_thread_id,
+    )
+
+    thread_id = work_item_graph_thread_id(request.work_item_id or "")
+    return run_work_item_langgraph(request, thread_id=thread_id or None)
+
+
+def _work_item_langgraph_metadata(outcome) -> dict:
+    return {
+        "runtime": outcome.graph_runtime,
+        "graph_available": outcome.graph_available,
+        "checkpoint_required": outcome.checkpoint_required,
+        "checkpoint_reason": outcome.checkpoint_reason,
+        "checkpoint_key": outcome.checkpoint_key,
+        "node_path": outcome.node_path,
+        "improvements": outcome.improvements,
+    }
 
 
 def _run_work_items_attach(args: argparse.Namespace) -> int:
@@ -1255,13 +1723,26 @@ def _render_work_item_candidates(items: list[WorkItem]) -> str:
     )
 
 
-def _print_work_item_result(result, *, json_output: bool) -> int:
+def _print_work_item_result(
+    result,
+    *,
+    json_output: bool,
+    graph_metadata: dict | None = None,
+) -> int:
     if json_output:
+        payload = result.model_dump(mode="json")
+        if graph_metadata is not None:
+            payload["_langgraph"] = graph_metadata
         print(
-            json.dumps(result.model_dump(mode="json"), ensure_ascii=True, indent=2, sort_keys=True)
+            json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True)
         )
     else:
         print(render_work_item_result_text(result))
+        if graph_metadata is not None:
+            print(f"Graph runtime: {graph_metadata['runtime']}")
+            print(f"Graph nodes: {' -> '.join(graph_metadata['node_path'])}")
+            if graph_metadata["checkpoint_required"]:
+                print(f"Graph checkpoint: {graph_metadata['checkpoint_reason']}")
     return 0
 
 

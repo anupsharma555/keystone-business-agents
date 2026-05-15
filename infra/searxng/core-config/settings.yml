@@ -1,0 +1,53 @@
+use_default_settings:
+  engines:
+    remove:
+      - ahmia
+      - torch
+      - wikidata
+
+engines:
+  - name: crossref
+    engine: crossref
+    shortcut: cr
+    categories: science, scientific publications
+    timeout: 30.0
+    inactive: false
+
+  - name: openalex
+    engine: openalex
+    shortcut: oa
+    categories: science, scientific publications
+    timeout: 5.0
+    mailto: "collaborate@keystoneneuroinformatics.com"
+    inactive: false
+
+general:
+  debug: false
+  instance_name: "Keystone Business Agents Local Search"
+
+search:
+  safe_search: 1
+  default_lang: "en-US"
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "kba-local-searxng-change-me"
+  bind_address: "0.0.0.0"
+  port: 8080
+  base_url: "http://127.0.0.1:18080/"
+  limiter: false
+  public_instance: false
+
+valkey:
+  url: valkey://valkey:6379/0
+
+outgoing:
+  request_timeout: 4.0
+  max_request_timeout: 8.0
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true
+  useragent_suffix: "Keystone business agents local workflow"

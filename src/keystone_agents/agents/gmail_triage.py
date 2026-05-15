@@ -409,6 +409,7 @@ def run_gmail_triage_sdk(
     run_config: Any | None = None,
     live: bool = False,
     model: str | None = None,
+    session: Any | None = None,
 ) -> TypedAgentRunResult[EmailTriageResult]:
     """Run Gmail triage through the typed SDK harness."""
 
@@ -421,6 +422,7 @@ def run_gmail_triage_sdk(
         output_type=EmailTriageResult,
         run_config=run_config,
         live=live,
+        session=session,
     )
 
 
@@ -430,6 +432,7 @@ def run_gmail_priority_grouping_sdk(
     run_config: Any | None = None,
     live: bool = False,
     model: str | None = None,
+    session: Any | None = None,
 ) -> TypedAgentRunResult[GmailPriorityGroupingResult]:
     """Run batch Gmail priority grouping through the typed SDK harness."""
 
@@ -442,6 +445,7 @@ def run_gmail_priority_grouping_sdk(
         output_type=GmailPriorityGroupingResult,
         run_config=run_config,
         live=live,
+        session=session,
     )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from keystone_agents.agents.opportunity_scout import scout_opportunities_fixture
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.reporting import render_work_item_result_text
 from keystone_agents.schemas.approval import ApprovalState
@@ -14,13 +15,22 @@ from keystone_agents.schemas.research import (
 )
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
+    WorkItem,
+    WorkItemArtifactRef,
+    WorkItemKind,
     WorkItemNextAction,
     WorkItemRoute,
     WorkItemStatus,
+    WorkItemTarget,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResult
-from keystone_agents.work_items import approve_artifact_context, drafting_ready, set_next_action
+from keystone_agents.work_items import (
+    approve_artifact_context,
+    drafting_ready,
+    select_artifact,
+    set_next_action,
+)
 from keystone_agents.workflow_runner import advance_work_item
 
 
@@ -502,6 +512,67 @@ def test_advance_work_item_opportunity_scout_attaches_opportunity_artifacts(
     assert result.next_action.agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
 
 
+def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    fake_plan = object()
+
+    def fake_resolve_plan(
+        topic: str | None,
+        *,
+        desired_count: int = 5,
+        live: bool = False,
+        **_: object,
+    ) -> object:
+        captured["planned_topic"] = topic
+        captured["desired_count"] = desired_count
+        captured["planner_live"] = live
+        return fake_plan
+
+    def fake_run_live(
+        *,
+        topic: str | None,
+        max_results: int = 5,
+        search_plan: object | None = None,
+        **_: object,
+    ):
+        captured["retrieval_topic"] = topic
+        captured["search_plan"] = search_plan
+        return (
+            scout_opportunities_fixture(topic=topic, max_results=max_results),
+            {"debug_notes": ["fake live retrieval"]},
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.resolve_opportunity_search_plan",
+        fake_resolve_plan,
+    )
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fake_run_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="find 2 behavioral health AI opportunities",
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            live_sdk=True,
+            max_results=2,
+        )
+    )
+
+    assert result.advanced is True
+    assert captured["planned_topic"] == captured["retrieval_topic"]
+    assert captured["desired_count"] == 2
+    assert captured["planner_live"] is True
+    assert captured["search_plan"] is fake_plan
+    assert "named-agent live search planning path" in " ".join(result.audit_notes)
+
+
 def test_advance_work_item_persists_manual_plan_and_uses_requested_route(
     tmp_path: Path,
 ) -> None:
@@ -606,6 +677,51 @@ def test_continue_uses_saved_next_action(tmp_path: Path) -> None:
     assert continued.advanced is True
     assert continued.route == WorkItemRoute.OPPORTUNITY_SCOUT
     assert any(ref.artifact_type == "opportunity" for ref in continued.work_item.artifact_refs)
+
+
+def test_generic_research_action_uses_selected_opportunity_candidate(tmp_path: Path) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="Opportunity scan: behavioral health AI",
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        target=WorkItemTarget(name="behavioral health AI", object_type="topic"),
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="opportunity",
+                artifact_id="38",
+                source_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                approval_state="pending",
+                title="Theris",
+                summary="AI-augmented behavioral health provider.",
+            ),
+            WorkItemArtifactRef(
+                artifact_type="opportunity",
+                artifact_id="39",
+                source_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                approval_state="pending",
+                title="ARPA-H",
+                summary="Behavioral health program source.",
+            ),
+        ],
+    )
+    item = select_artifact(item, "opportunity", "38")
+    store.save_work_item(item)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="Run deeper source-backed business research for this WorkItem.",
+            work_item_id=item.id,
+            database_url=database_url,
+            save=True,
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        )
+    )
+
+    assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.artifact_refs[0].artifact_type == "company_profile"
+    assert result.artifact_refs[0].title == "Theris"
 
 
 def test_approved_context_continue_creates_draft_only_outreach_artifact(

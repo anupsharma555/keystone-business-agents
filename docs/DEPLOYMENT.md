@@ -13,7 +13,7 @@ cd keystone-business-agents
 python3 --version
 ```
 
-Python 3.11 or newer is required. Tests and dry-run scripts do not require OpenAI, Gmail, Slack, SearXNG, Serper, Firecrawl, Apify, Browserless, or other live API credentials.
+Python 3.11 or newer is required. Tests and dry-run scripts do not require OpenAI, Gmail, Slack, SearXNG, hosted web search, Serper, Firecrawl, Apify, Browserless, or other live API credentials.
 
 ## 2. Virtual Environment Setup
 
@@ -69,12 +69,13 @@ execution. Draft-only and approval-gated behavior remains unchanged.
 
 The recommended live research ladder is:
 
-- `SearXNG` first for broad recall when no explicit provider override is set.
-- `Serper` to improve precision when the initial result set is weak, or when
-  explicitly selected.
+- `SearXNG` for broad recall when no explicit provider override is set.
+- `Agents hosted web search` as a capped parallel lane beside SearXNG for
+  default live research.
+- `Trafilatura` as the default live-gated extractor for selected company pages.
+- `Serper` only when explicitly selected for a specific run.
 - `Firecrawl` as an explicit search provider when configured, and as an
   optional website extractor for selected company pages.
-- `Trafilatura` as the default live-gated website extractor.
 - `Apify` or `Browserless` only as future structured-enrichment candidates;
   current live operations are placeholders and do not execute.
 - `Sandbox` only as a later second-pass review over staged artifacts.
@@ -90,10 +91,11 @@ Run the local quality gates before and after documentation, prompt, schema, tool
 .venv/bin/python -m ruff check .
 ```
 
-Current verification from this implementation pass:
+Current verification from the 2026-05-11 stabilization pass:
 
-- `.venv/bin/python -m pytest`: 685 passed.
+- `.venv/bin/python -m pytest -q`: 1035 passed.
 - `.venv/bin/python -m ruff check .`: all checks passed.
+- `.venv/bin/python scripts/run_evals.py --agent all --json`: 22 passed, 0 failed.
 
 Pytest is fixture and mock based. A test that needs live credentials or network access is not acceptable for the default suite.
 
@@ -116,12 +118,15 @@ There is no long-running HTTP service or health endpoint. Use this local health 
 
 Healthy output shows SQLite initialization, a deterministic route, `Email sent: false`, `Send enabled: false`, and a stop before drafting when approval is only `pending`.
 
-The health check is offline. It verifies Python version, runtime imports, prompt files, agent
-builders, SQLite initialization, dry-run script entrypoints, masked environment safety, optional
-live integration readiness, and draft-only/no-auto-send status. Missing live credentials are OK in
-normal dry-run mode. If a live flag such as `KEYSTONE_ENABLE_LIVE_GMAIL=true`,
-`KEYSTONE_ENABLE_LIVE_SLACK=true`, or `KEYSTONE_ENABLE_LIVE_RESEARCH=true` is configured, missing
-credentials become explicit warnings before an operator runs the corresponding live CLI command.
+The health check is offline. It verifies Python version, runtime imports, prompt files,
+registry-derived agent builders, SQLite initialization, dry-run script entrypoints, masked
+environment safety, optional live integration readiness, and draft-only/no-auto-send status.
+Missing live credentials are OK in normal dry-run mode. If a live flag such as
+`KEYSTONE_ENABLE_LIVE_GMAIL=true`, `KEYSTONE_ENABLE_LIVE_SLACK=true`, or
+`KEYSTONE_ENABLE_LIVE_RESEARCH=true` is configured, missing credentials become explicit warnings
+before an operator runs the corresponding live CLI command. If the local checkout is intentionally
+in live-test posture with `KEYSTONE_DRY_RUN=false`, health reports a safety warning even when
+credentials are present.
 
 ## 6. Running Each Agent In Dry-Run
 
@@ -164,6 +169,13 @@ Orchestrator:
 ```bash
 .venv/bin/python scripts/run_orchestrator.py \
   --input "find behavioral health AI companies for business research"
+```
+
+Chief of Staff:
+
+```bash
+.venv/bin/python scripts/run_chief_of_staff.py \
+  --input "summarize what KNI Slack workflow should handle calendar prep"
 ```
 
 Add `--save` only when you want local SQLite audit rows.
@@ -216,12 +228,20 @@ Terminal decisions are also auditable:
 
 ## 8. Enabling Live Search
 
-SearXNG, Serper, and Firecrawl are available through the shared `SearchProvider`
-interface. Live search is opt-in and should be used with bounded result counts:
+SearXNG, Agents SDK hosted web search, Serper, Firecrawl, and Tavily are
+available through the shared `SearchProvider` interface. Live search is opt-in
+and should be used with bounded result counts. Prefer SearXNG plus a capped
+Agents hosted web-search lane, with Trafilatura selected-page extraction, for
+routine live research:
 
 ```bash
-export SEARCH_PROVIDER=serper
-export SERPER_API_KEY="..."
+export SEARCH_PROVIDER=searxng
+export SEARXNG_BASE_URL="http://127.0.0.1:18080"
+export KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK=true
+export KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL=true
+export KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN=2
+export KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true
+export KEYSTONE_WEBSITE_EXTRACTOR=trafilatura
 .venv/bin/python scripts/run_opportunity_scout.py \
   --topic "behavioral health AI" \
   --max-results 3 \
@@ -259,7 +279,7 @@ For SearXNG:
 
 ```bash
 export SEARCH_PROVIDER=searxng
-export SEARXNG_BASE_URL="http://127.0.0.1:8080"
+export SEARXNG_BASE_URL="http://127.0.0.1:18080"
 ```
 
 For Firecrawl search:
@@ -269,6 +289,25 @@ export SEARCH_PROVIDER=firecrawl
 export FIRECRAWL_API_KEY="..."
 export FIRECRAWL_BASE_URL="https://api.firecrawl.dev"
 ```
+
+For Tavily fallback/deepening search:
+
+```bash
+export TAVILY_API_KEY="..."
+export TAVILY_SEARCH_DEPTH=basic
+export KEYSTONE_TAVILY_SEARCH_FALLBACK=true
+export KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT=1000
+export KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT=850
+export KEYSTONE_TAVILY_CREDIT_ENFORCEMENT=warn
+```
+
+Tavily should usually stay behind SearXNG plus the capped Agents hosted
+web-search lane as a coverage deepener. The
+local ledger records provider-reported credits when Tavily returns `usage`, and
+otherwise falls back to search-depth estimates: `basic`, `fast`, and
+`ultra-fast` cost 1 credit/request; `advanced` costs 2. `warn` keeps searches
+running while surfacing budget context in retrieval metadata. Use `block` only
+when the local monthly cap should stop Tavily before the network request.
 
 For company research:
 
@@ -543,7 +582,9 @@ Audit review should confirm source attribution, approval state, reviewer notes w
 ## 16. Cost-Control Checklist
 
 - Prefer fixture commands and dry-run reports.
-- Use `--max-results 3` for first live Serper checks.
+- Use `--max-results 3` for first live search checks.
+- Keep `KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN` low for first hosted
+  web-search checks.
 - Use `--max-messages 1` for live Gmail checks.
 - Do not pass `--sdk` unless intentionally validating SDK construction or live model behavior.
 - Keep global `KEYSTONE_OPENAI_MODEL=gpt-5.4-mini` unless a model change is

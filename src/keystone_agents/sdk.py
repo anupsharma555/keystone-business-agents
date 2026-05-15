@@ -34,12 +34,16 @@ try:
         Agent as SDKAgent,
     )
     from agents import (
+        FileSearchTool as SDKFileSearchTool,
+    )
+    from agents import (
         GuardrailFunctionOutput,
         ModelSettings,
         OpenAIProvider,
         RunConfig,
         RunContextWrapper,
         Runner,
+        SQLiteSession,
         ToolGuardrailFunctionOutput,
         ToolInputGuardrailData,
         ToolOutputGuardrailData,
@@ -54,6 +58,7 @@ try:
     from agents import (
         function_tool as _sdk_function_tool,
     )
+    from openai import AsyncOpenAI
     from openai.types.shared.reasoning import Reasoning
 except ImportError as exc:  # pragma: no cover - depends on optional local install state.
     _SDK_IMPORT_ERROR: ImportError | None = exc
@@ -64,8 +69,11 @@ except ImportError as exc:  # pragma: no cover - depends on optional local insta
     RunConfig = Any  # type: ignore
     RunContextWrapper = Any  # type: ignore
     Runner = Any  # type: ignore
+    SQLiteSession = Any  # type: ignore
     _sdk_function_tool = None  # type: ignore[assignment]
+    AsyncOpenAI = Any  # type: ignore
     SDKWebSearchTool = None  # type: ignore[assignment]
+    SDKFileSearchTool = None  # type: ignore[assignment]
 
     def input_guardrail(*_: Any, **__: Any) -> Any:  # type: ignore
         return lambda wrapped: wrapped
@@ -82,6 +90,11 @@ except ImportError as exc:  # pragma: no cover - depends on optional local insta
     SDKAgent = None  # type: ignore
 else:
     _SDK_IMPORT_ERROR = None
+
+DEFAULT_LIVE_MODEL_TIMEOUT_SECONDS = 45.0
+DEFAULT_LIVE_MODEL_MAX_RETRIES = 0
+LIVE_MODEL_TIMEOUT_SECONDS_ENV = "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS"
+LIVE_MODEL_MAX_RETRIES_ENV = "KEYSTONE_LIVE_MODEL_MAX_RETRIES"
 
 if _SDK_IMPORT_ERROR is not None:
     _SANDBOX_IMPORT_ERROR: ImportError | None = _SDK_IMPORT_ERROR
@@ -401,6 +414,7 @@ LocalDir = SDKLocalDir
 LocalFile = SDKLocalFile
 UnixLocalSandboxClient = SDKUnixLocalSandboxClient
 WebSearchTool = SDKWebSearchTool
+FileSearchTool = SDKFileSearchTool
 
 GuardrailSpec = (
     Mapping[str, Sequence[Any]] | tuple[Sequence[Any], Sequence[Any]] | Sequence[Any] | None
@@ -416,6 +430,19 @@ def validate_sdk_available() -> bool:
             "before constructing or running SDK agents."
         ) from _SDK_IMPORT_ERROR
     return True
+
+
+def build_sqlite_session(session_id: str, database_path: str | Path | None = None) -> Any:
+    """Build an Agents SDK SQLiteSession through the centralized SDK import boundary."""
+
+    validate_sdk_available()
+    if not session_id:
+        raise ValueError("session_id is required for SDK SQLite sessions.")
+    if database_path:
+        path = Path(database_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return SQLiteSession(session_id, str(path))
+    return SQLiteSession(session_id)
 
 
 def validate_sandbox_sdk_available() -> bool:
@@ -681,6 +708,28 @@ def build_model_settings(
     )
 
 
+def _live_model_timeout_seconds() -> float:
+    raw = os.getenv(LIVE_MODEL_TIMEOUT_SECONDS_ENV)
+    if raw is None:
+        return DEFAULT_LIVE_MODEL_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_LIVE_MODEL_TIMEOUT_SECONDS
+    return max(5.0, value)
+
+
+def _live_model_max_retries() -> int:
+    raw = os.getenv(LIVE_MODEL_MAX_RETRIES_ENV)
+    if raw is None:
+        return DEFAULT_LIVE_MODEL_MAX_RETRIES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_LIVE_MODEL_MAX_RETRIES
+    return max(0, value)
+
+
 def build_live_run_config(
     config: ModelConfig | None = None,
     *,
@@ -708,7 +757,17 @@ def build_live_run_config(
     )
     model_config.require_live_execution_ready()
     validate_sdk_available()
-    provider = OpenAIProvider(**model_config.openai_provider_kwargs())
+    provider_kwargs = model_config.openai_provider_kwargs()
+    openai_client = AsyncOpenAI(
+        api_key=provider_kwargs.get("api_key"),
+        base_url=provider_kwargs.get("base_url") or None,
+        timeout=_live_model_timeout_seconds(),
+        max_retries=_live_model_max_retries(),
+    )
+    provider = OpenAIProvider(
+        openai_client=openai_client,
+        use_responses=provider_kwargs.get("use_responses"),
+    )
     return RunConfig(
         model=model_config.model,
         model_provider=provider,
@@ -761,11 +820,24 @@ def build_local_run_config(
     )
 
 
+def _run_sync_with_optional_session(
+    agent: AgentLike,
+    prompt: str,
+    *,
+    run_config: Any,
+    session: Any | None = None,
+) -> Any:
+    if session is None:
+        return Runner.run_sync(agent, prompt, run_config=run_config)
+    return Runner.run_sync(agent, prompt, run_config=run_config, session=session)
+
+
 def run_sdk_sync(
     agent: AgentLike,
     prompt: str,
     config: ModelConfig | None = None,
     *,
+    session: Any | None = None,
     workflow_name: str | None = None,
     group_id: str | None = None,
     trace_metadata: TraceMetadata | None = None,
@@ -785,14 +857,30 @@ def run_sdk_sync(
         trace_include_sensitive_data=trace_include_sensitive_data,
         trace_config=trace_config,
     )
-    return Runner.run_sync(agent, prompt, run_config=run_config)
+    return _run_sync_with_optional_session(
+        agent,
+        prompt,
+        run_config=run_config,
+        session=session,
+    )
 
 
-def run_sdk_sync_with_config(agent: AgentLike, prompt: str, run_config: Any) -> Any:
+def run_sdk_sync_with_config(
+    agent: AgentLike,
+    prompt: str,
+    run_config: Any,
+    *,
+    session: Any | None = None,
+) -> Any:
     """Run an SDK agent with an explicit local/fake run config."""
 
     validate_sdk_available()
-    return Runner.run_sync(agent, prompt, run_config=run_config)
+    return _run_sync_with_optional_session(
+        agent,
+        prompt,
+        run_config=run_config,
+        session=session,
+    )
 
 
 def _coerce_typed_output(output: Any, output_type: type[TOutput]) -> TOutput:
@@ -813,6 +901,7 @@ def run_typed_sdk_sync(
     run_config: Any | None = None,
     live: bool = False,
     config: ModelConfig | None = None,
+    session: Any | None = None,
     workflow_name: str | None = None,
     group_id: str | None = None,
     trace_metadata: TraceMetadata | None = None,
@@ -828,7 +917,7 @@ def run_typed_sdk_sync(
     """
 
     if run_config is not None:
-        raw_result = run_sdk_sync_with_config(agent, prompt, run_config)
+        raw_result = run_sdk_sync_with_config(agent, prompt, run_config, session=session)
     else:
         if not live:
             raise RuntimeError(
@@ -839,6 +928,7 @@ def run_typed_sdk_sync(
             agent,
             prompt,
             _live_config_for_agent(agent, config),
+            session=session,
             workflow_name=workflow_name,
             group_id=group_id,
             trace_metadata=trace_metadata,

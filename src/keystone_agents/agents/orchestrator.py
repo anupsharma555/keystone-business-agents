@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -87,6 +88,8 @@ INTENDED_HANDOFFS: tuple[HandoffSpec, ...] = specialist_handoff_specs()
 ORCHESTRATOR_REASONING_EFFORT = "low"
 ORCHESTRATOR_REVIEW_VERBOSITY = "low"
 ORCHESTRATOR_REVIEW_MAX_TOKENS = 1800
+ORCHESTRATOR_SPECIALIST_TOOLS_ENV = "KEYSTONE_ORCHESTRATOR_SPECIALIST_TOOLS"
+BUSINESS_RESEARCH_TOOL_NAME = "business_research_analyst_research_brief"
 
 
 _HANDOFF_BY_ROUTE = {handoff.route: handoff for handoff in INTENDED_HANDOFFS}
@@ -153,12 +156,45 @@ _FULL_BODY_KEYS = frozenset(
         "raw_source_content",
     }
 )
+_READ_ONLY_BUSINESS_RESEARCH_TOOL_NAMES = frozenset(
+    {
+        "load_contact_context",
+        "load_crm_account_context",
+        "load_approved_contact_context",
+        "load_approved_crm_context",
+        "list_local_context_sources",
+        "search_local_context",
+        "read_local_context_file",
+        "retrieve_memory",
+        "check_workflow_duplicate",
+        "file_search",
+        "search_web",
+        "fetch_company_page",
+        "fetch_linkedin_or_profile_placeholder",
+        "extract_company_signals",
+        "dedupe_and_rank_sources",
+        "build_source_bundle_for_synthesis",
+        "synthesize_company_profile_from_source_bundle",
+        "compare_company_profiles_for_decision",
+    }
+)
 
 LLMRouter = Callable[[str, Mapping[str, Any]], OrchestratorResult | Mapping[str, Any]]
 
 
 def _handoff_specs() -> list[HandoffSpec]:
     return list(INTENDED_HANDOFFS)
+
+
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _tool_name(tool: Any) -> str:
+    return str(getattr(tool, "name", getattr(tool, "__name__", "")) or "")
 
 
 def _safe_text(value: Any, *, max_chars: int = _SAFE_STATE_TEXT_CHARS) -> str:
@@ -706,6 +742,8 @@ def _llm_route_prompt(
             "For business_research_analyst or opportunity_scout, you may optionally include "
             "retrieval_hint with precision, structured-enrichment, and search-review "
             "recommendations.",
+            "Do not choose search providers; shared Python retrieval applies SearXNG plus "
+            "capped Agents hosted web search unless the operator explicitly selected one.",
             "Return only an OrchestratorResult-compatible structured decision.",
         ],
     }
@@ -2031,7 +2069,42 @@ def _attach_handoff_metadata(agent: Agent) -> Agent:
     return agent
 
 
-def build_orchestrator_agent(model: str | None = None, *, include_handoffs: bool = True) -> Agent:
+def _build_read_only_specialist_tools() -> list[Any]:
+    from keystone_agents.agents.business_research_analyst import (
+        build_business_research_analyst_research_brief_agent,
+    )
+
+    business_research_agent = build_business_research_analyst_research_brief_agent()
+    business_research_agent.tools = [
+        tool
+        for tool in business_research_agent.tools
+        if _tool_name(tool) in _READ_ONLY_BUSINESS_RESEARCH_TOOL_NAMES
+    ]
+
+    as_tool = getattr(business_research_agent, "as_tool", None)
+    if not callable(as_tool):
+        return []
+
+    return [
+        as_tool(
+            tool_name=BUSINESS_RESEARCH_TOOL_NAME,
+            tool_description=(
+                "Run the Business Research Analyst for internal, source-attributed "
+                "research synthesis only. This tool is read-only and cannot send, publish, "
+                "schedule, create approval items, or persist memory; Python gates and "
+                "approval policy remain authoritative."
+            ),
+            max_turns=6,
+        )
+    ]
+
+
+def build_orchestrator_agent(
+    model: str | None = None,
+    *,
+    include_handoffs: bool = True,
+    include_specialist_tools: bool | None = None,
+) -> Agent:
     """Build the orchestrator agent with subordinate agent handoffs."""
 
     instructions = compose_instructions(
@@ -2042,6 +2115,15 @@ def build_orchestrator_agent(model: str | None = None, *, include_handoffs: bool
         "orchestrator.md",
     )
     handoffs = [spec.build_agent() for spec in SPECIALIST_AGENT_SPECS] if include_handoffs else []
+    specialist_tools = (
+        _build_read_only_specialist_tools()
+        if (
+            include_specialist_tools
+            if include_specialist_tools is not None
+            else _env_flag_enabled(ORCHESTRATOR_SPECIALIST_TOOLS_ENV)
+        )
+        else []
+    )
     agent = build_sdk_agent(
         name="orchestrator",
         instructions=instructions,
@@ -2053,6 +2135,7 @@ def build_orchestrator_agent(model: str | None = None, *, include_handoffs: bool
             route_request_placeholder,
             load_orchestrator_workflow_state,
             load_pending_approval_items,
+            *specialist_tools,
         ],
         guardrails=keystone_guardrails(),
         model=model,
@@ -2109,13 +2192,20 @@ def run_orchestrator_sdk(
     run_config: Any | None = None,
     live: bool = False,
     model: str | None = None,
+    session: Any | None = None,
+    include_specialist_tools: bool | None = None,
 ) -> TypedAgentRunResult[OrchestratorResult]:
     """Run the orchestrator through the shared typed SDK harness."""
 
     return run_typed_sdk_agent(
-        agent=build_orchestrator_agent(model=model, include_handoffs=False),
+        agent=build_orchestrator_agent(
+            model=model,
+            include_handoffs=False,
+            include_specialist_tools=include_specialist_tools,
+        ),
         typed_input=typed_input,
         output_type=OrchestratorResult,
         run_config=run_config,
         live=live,
+        session=session,
     )

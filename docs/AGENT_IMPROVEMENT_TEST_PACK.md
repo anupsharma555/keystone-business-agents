@@ -236,10 +236,11 @@ Latest result:
 
 - Status: pass.
 - Agent: Business Research Analyst.
-- Run: live SDK BR-1 focused brief over live Serper search results for Curebase;
-  no outbound messaging, CRM, Gmail, Slack, scheduling, or publishing.
+- Run: live SDK BR-1 focused brief over live SearXNG plus capped hosted
+  web-search results for Curebase; no outbound messaging, CRM, Gmail, Slack,
+  scheduling, or publishing.
 - Command: `.venv/bin/python scripts/run_company_research.py --company Curebase
-  --improvement-case br-1 --live-search --search-provider serper --no-dry-run
+  --improvement-case br-1 --live-search --search-provider searxng --no-dry-run
   --live-sdk --json`
 - Output type: `CompanyResearchFocusedBrief`.
 - Checks: clear product, customers, traction, leadership, and why-it-matters

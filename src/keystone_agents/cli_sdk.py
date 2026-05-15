@@ -15,6 +15,12 @@ from keystone_agents.costing import (
     provider_cost_window_unqueried,
 )
 from keystone_agents.run import SDKSynthesisOutcome
+from keystone_agents.sdk_sessions import (
+    apply_sdk_session_env,
+    build_sdk_session,
+    build_sdk_session_from_env,
+    resolve_sdk_session_spec,
+)
 
 SDKRunConfigFactory = Callable[[], Any]
 
@@ -65,6 +71,34 @@ def add_sdk_run_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Optional OpenAI project ID filter for --include-provider-cost-window.",
     )
+    add_sdk_session_arguments(parser)
+
+
+def add_sdk_session_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add optional local SDK conversation-session flags."""
+
+    parser.add_argument(
+        "--sdk-session",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use a local Agents SDK SQLite conversation session for this SDK run. "
+            "Defaults depend on the calling workflow; use --no-sdk-session to disable."
+        ),
+    )
+    parser.add_argument(
+        "--sdk-session-id",
+        default="",
+        help=(
+            "Optional logical session label. It is hashed before use and is not stored "
+            "as the raw session id."
+        ),
+    )
+    parser.add_argument(
+        "--sdk-session-db",
+        default="",
+        help="Optional SQLite path for local SDK session history.",
+    )
 
 
 def sdk_execution_requested(args: argparse.Namespace) -> bool:
@@ -82,6 +116,12 @@ def resolve_sdk_execution(
         raise SystemExit("Use either --run-sdk or --live-sdk, not both.")
     if getattr(args, "trace_include_sensitive_data", False):
         raise SystemExit("trace_include_sensitive_data=true is rejected for SDK synthesis.")
+    configure_sdk_session_from_args(
+        args,
+        scope="cli",
+        components=("direct-script",),
+        default_enabled=False,
+    )
     if getattr(args, "live_sdk", False):
         load_settings(force_dotenv=True)
         return None, True
@@ -96,6 +136,72 @@ def resolve_sdk_execution(
             raise SystemExit("--run-sdk run_config factory returned no run_config.")
         return run_config, False
     raise SystemExit("SDK execution was not requested.")
+
+
+def sdk_session_from_args(
+    args: argparse.Namespace,
+    *,
+    scope: str,
+    components: tuple[str, ...] = (),
+    default_enabled: bool = False,
+) -> Any | None:
+    """Build a local SDK session from CLI flags or inherited session env."""
+
+    explicit = (
+        getattr(args, "sdk_session", None) is not None
+        or bool(getattr(args, "sdk_session_id", ""))
+        or bool(getattr(args, "sdk_session_db", ""))
+    )
+    if explicit:
+        spec = resolve_sdk_session_spec(
+            scope=scope,
+            components=components,
+            enabled=getattr(args, "sdk_session", None),
+            explicit_session_id=str(getattr(args, "sdk_session_id", "") or ""),
+            database_path=str(getattr(args, "sdk_session_db", "") or ""),
+            default_enabled=default_enabled,
+        )
+        apply_sdk_session_env(spec)
+        return build_sdk_session(spec)
+    inherited_session = build_sdk_session_from_env()
+    if inherited_session is not None:
+        return inherited_session
+    spec = resolve_sdk_session_spec(
+        scope=scope,
+        components=components,
+        enabled=None,
+        explicit_session_id="",
+        database_path="",
+        default_enabled=default_enabled,
+    )
+    apply_sdk_session_env(spec)
+    return build_sdk_session(spec)
+
+
+def configure_sdk_session_from_args(
+    args: argparse.Namespace,
+    *,
+    scope: str,
+    components: tuple[str, ...] = (),
+    default_enabled: bool = False,
+) -> None:
+    """Apply CLI SDK session flags to env for downstream centralized SDK runs."""
+
+    if (
+        getattr(args, "sdk_session", None) is None
+        and not getattr(args, "sdk_session_id", "")
+        and not getattr(args, "sdk_session_db", "")
+    ):
+        return
+    spec = resolve_sdk_session_spec(
+        scope=scope,
+        components=components,
+        enabled=getattr(args, "sdk_session", None),
+        explicit_session_id=str(getattr(args, "sdk_session_id", "") or ""),
+        database_path=str(getattr(args, "sdk_session_db", "") or ""),
+        default_enabled=default_enabled,
+    )
+    apply_sdk_session_env(spec)
 
 
 def reject_sdk_side_effect_flags(

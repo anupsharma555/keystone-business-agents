@@ -56,6 +56,8 @@ OpportunityType = Literal[
     "CNS biotech",
     "neurotechnology",
     "grant or collaboration opportunity",
+    "journal article or publication call",
+    "contract or RFP opportunity",
 ]
 
 OpportunitySourceType = Literal[
@@ -81,7 +83,9 @@ OpportunitySignalType = Literal[
     "clinical_trial",
     "grant",
     "publication",
+    "journal_call",
     "conference",
+    "contract_rfp",
     "company_page",
     "pipeline_state",
     "search",

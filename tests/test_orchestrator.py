@@ -7,7 +7,9 @@ import pytest
 
 import scripts.run_orchestrator as run_orchestrator
 from keystone_agents.agents.orchestrator import (
+    BUSINESS_RESEARCH_TOOL_NAME,
     INTENDED_HANDOFFS,
+    ORCHESTRATOR_SPECIALIST_TOOLS_ENV,
     build_orchestrator_agent,
     load_orchestrator_workflow_state,
     load_workflow_state_context,
@@ -30,6 +32,10 @@ def _database_url(tmp_path) -> str:
     return f"sqlite:///{tmp_path / 'orchestrator.db'}"
 
 
+def _tool_names(agent) -> set[str]:
+    return {str(getattr(tool, "name", "")) for tool in agent.tools}
+
+
 def test_build_orchestrator_agent() -> None:
     agent = build_orchestrator_agent()
 
@@ -37,6 +43,25 @@ def test_build_orchestrator_agent() -> None:
     assert agent.output_type is OrchestratorResult
     assert "Orchestrator Agent" in agent.instructions
     assert "Keystone Profile" in agent.instructions
+    assert BUSINESS_RESEARCH_TOOL_NAME not in _tool_names(agent)
+
+
+def test_build_orchestrator_agent_can_opt_into_read_only_specialist_tool() -> None:
+    agent = build_orchestrator_agent(include_handoffs=False, include_specialist_tools=True)
+
+    assert BUSINESS_RESEARCH_TOOL_NAME in _tool_names(agent)
+    assert agent.handoffs == []
+
+
+def test_build_orchestrator_agent_specialist_tool_env_is_default_off(monkeypatch) -> None:
+    monkeypatch.delenv(ORCHESTRATOR_SPECIALIST_TOOLS_ENV, raising=False)
+    default_agent = build_orchestrator_agent(include_handoffs=False)
+
+    monkeypatch.setenv(ORCHESTRATOR_SPECIALIST_TOOLS_ENV, "1")
+    opt_in_agent = build_orchestrator_agent(include_handoffs=False)
+
+    assert BUSINESS_RESEARCH_TOOL_NAME not in _tool_names(default_agent)
+    assert BUSINESS_RESEARCH_TOOL_NAME in _tool_names(opt_in_agent)
 
 
 def test_orchestrator_cli_read_input_accepts_long_plain_text() -> None:

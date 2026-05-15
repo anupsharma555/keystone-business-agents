@@ -1,0 +1,320 @@
+{
+  "schema": "keystone.file_search_corpus_manifest.v1",
+  "corpora": [
+    {
+      "name": "keystone-business-agents-reference",
+      "description": "Stable repo and platform reference material for Keystone agents.",
+      "approved_for": [
+        "business_research_analyst",
+        "chief_of_staff"
+      ],
+      "sensitivity": "internal_reference",
+      "local_files": [
+        "AGENTS.md",
+        "README.md",
+        "docs/ADD_AGENT.md",
+        "docs/AGENTS_SDK_CONFORMANCE.md",
+        "docs/AGENT_IMPROVEMENT_TEST_PACK.md",
+        "docs/HUMAN_INTERFACE.md",
+        "docs/LANGGRAPH_OPTION.md",
+        "docs/LIVE_SDK_INTEGRATION.md",
+        "docs/OPENAI_AGENT_PLATFORM_SETUP.md",
+        "docs/RUNBOOK.md",
+        "docs/SAFETY.md",
+        "docs/SANDBOX_AGENTS.md",
+        "docs/SLACK_BUSINESS_AGENT_MODE.md",
+        "docs/SLACK_MESSAGE_ACTIONS.md",
+        "docs/TECH_STACK.md",
+        "docs/corpus/resources/file_search_corpus_policy.md",
+        "docs/corpus/resources/langgraph_operational_notes.md",
+        "docs/corpus/resources/openai_agents_sdk_operational_notes.md",
+        "docs/corpus/resources/slack_gmail_integration_notes.md",
+        "docs/corpus/vendor/README.md",
+        "docs/corpus/vendor/langgraph-docs/SOURCE.md",
+        "docs/corpus/vendor/langgraph-docs/LICENSE",
+        "docs/corpus/vendor/langgraph-docs/overview.md",
+        "docs/corpus/vendor/langgraph-docs/graph-api.md",
+        "docs/corpus/vendor/langgraph-docs/persistence.md",
+        "docs/corpus/vendor/langgraph-docs/interrupts.md",
+        "docs/corpus/vendor/langgraph-docs/durable-execution.md",
+        "docs/corpus/vendor/langgraph-docs/fault-tolerance.md",
+        "docs/corpus/vendor/langgraph-docs/use-subgraphs.md",
+        "docs/corpus/vendor/langgraph-docs/thinking-in-langgraph.md",
+        "docs/corpus/vendor/langgraph-docs/application-structure.md",
+        "docs/corpus/vendor/langgraph-docs/test.md",
+        "docs/corpus/vendor/openai-agents-python/SOURCE.md",
+        "docs/corpus/vendor/openai-agents-python/LICENSE",
+        "docs/corpus/vendor/openai-agents-python/agents.md",
+        "docs/corpus/vendor/openai-agents-python/tools.md",
+        "docs/corpus/vendor/openai-agents-python/sessions-index.md",
+        "docs/corpus/vendor/openai-openapi/SOURCE.md",
+        "docs/corpus/vendor/openai-openapi/LICENSE",
+        "docs/corpus/vendor/openai-openapi/README.md",
+        "docs/corpus/vendor/openai-openapi/openapi.yaml",
+        "docs/corpus/vendor/google-gmail-api/SOURCE.md",
+        "docs/corpus/vendor/google-gmail-api/gmail-v1-discovery.json",
+        "docs/corpus/vendor/slack-api-specs/SOURCE.md",
+        "docs/corpus/vendor/slack-api-specs/LICENSE",
+        "docs/corpus/vendor/slack-api-specs/README.md",
+        "docs/corpus/vendor/slack-api-specs/slack_web_openapi_v2_without_examples.json",
+        "docs/corpus/vendor/slack-api-specs/slack_events_api_async_v1.json",
+        "docs/corpus/vendor/slack-api-specs/slack_common_event_wrapper_schema.json",
+        "src/keystone_agents/prompts/business_research_analyst.md",
+        "src/keystone_agents/prompts/chief_of_staff.md",
+        "src/keystone_agents/prompts/gmail_triage.md",
+        "src/keystone_agents/prompts/local_context.md",
+        "src/keystone_agents/prompts/memory_policy.md",
+        "src/keystone_agents/prompts/opportunity_scout.md",
+        "src/keystone_agents/prompts/orchestrator.md",
+        "src/keystone_agents/prompts/outreach_composer.md",
+        "src/keystone_agents/prompts/safety_policy.md",
+        "src/keystone_agents/prompts/tools.md",
+        "src/keystone_agents/prompts/writing_style.md",
+        "src/keystone_agents/templates/outreach/low_pressure_intro.v1.json",
+        "src/keystone_agents/templates/outreach/research_workflow_intro.v1.json"
+      ],
+      "external_sources_summarized": [
+        {
+          "title": "OpenAI Agents SDK sessions",
+          "source_url": "https://openai.github.io/openai-agents-python/sessions/",
+          "local_summary": "docs/corpus/resources/openai_agents_sdk_operational_notes.md"
+        },
+        {
+          "title": "OpenAI Agents SDK Agent.as_tool",
+          "source_url": "https://openai.github.io/openai-agents-python/ref/agent/",
+          "local_summary": "docs/corpus/resources/openai_agents_sdk_operational_notes.md"
+        },
+        {
+          "title": "OpenAI Retrieval and vector stores",
+          "source_url": "https://developers.openai.com/api/docs/guides/retrieval",
+          "local_summary": "docs/corpus/resources/file_search_corpus_policy.md"
+        },
+        {
+          "title": "LangGraph orchestration",
+          "source_url": "https://docs.langchain.com/oss/python/langgraph/overview",
+          "local_summary": "docs/corpus/resources/langgraph_operational_notes.md"
+        },
+        {
+          "title": "Slack shortcuts and interactivity",
+          "source_url": "https://docs.slack.dev/interactivity/implementing-shortcuts/",
+          "local_summary": "docs/corpus/resources/slack_gmail_integration_notes.md"
+        },
+        {
+          "title": "Gmail API drafts.create",
+          "source_url": "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.drafts/create",
+          "local_summary": "docs/corpus/resources/slack_gmail_integration_notes.md"
+        }
+      ],
+      "external_sources_vendored": [
+        {
+          "title": "OpenAI Agents Python SDK docs",
+          "source_url": "https://github.com/openai/openai-agents-python",
+          "license": "MIT",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/openai-agents-python/SOURCE.md",
+            "docs/corpus/vendor/openai-agents-python/LICENSE",
+            "docs/corpus/vendor/openai-agents-python/agents.md",
+            "docs/corpus/vendor/openai-agents-python/tools.md",
+            "docs/corpus/vendor/openai-agents-python/sessions-index.md"
+          ]
+        },
+        {
+          "title": "LangGraph docs",
+          "source_url": "https://github.com/langchain-ai/docs/tree/main/src/oss/langgraph",
+          "license": "MIT",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/langgraph-docs/SOURCE.md",
+            "docs/corpus/vendor/langgraph-docs/LICENSE",
+            "docs/corpus/vendor/langgraph-docs/overview.md",
+            "docs/corpus/vendor/langgraph-docs/graph-api.md",
+            "docs/corpus/vendor/langgraph-docs/persistence.md",
+            "docs/corpus/vendor/langgraph-docs/interrupts.md",
+            "docs/corpus/vendor/langgraph-docs/durable-execution.md",
+            "docs/corpus/vendor/langgraph-docs/fault-tolerance.md",
+            "docs/corpus/vendor/langgraph-docs/use-subgraphs.md",
+            "docs/corpus/vendor/langgraph-docs/thinking-in-langgraph.md",
+            "docs/corpus/vendor/langgraph-docs/application-structure.md",
+            "docs/corpus/vendor/langgraph-docs/test.md"
+          ]
+        },
+        {
+          "title": "OpenAI OpenAPI schema",
+          "source_url": "https://github.com/openai/openai-openapi",
+          "license": "MIT",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/openai-openapi/SOURCE.md",
+            "docs/corpus/vendor/openai-openapi/LICENSE",
+            "docs/corpus/vendor/openai-openapi/README.md",
+            "docs/corpus/vendor/openai-openapi/openapi.yaml"
+          ]
+        },
+        {
+          "title": "Gmail API v1 discovery document",
+          "source_url": "https://gmail.googleapis.com/$discovery/rest?version=v1",
+          "license": "Google Developers site policy; generally CC BY 4.0 for docs except as otherwise noted",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/google-gmail-api/SOURCE.md",
+            "docs/corpus/vendor/google-gmail-api/gmail-v1-discovery.json"
+          ]
+        },
+        {
+          "title": "Slack API specs",
+          "source_url": "https://github.com/slackapi/slack-api-specs",
+          "license": "MIT",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/slack-api-specs/SOURCE.md",
+            "docs/corpus/vendor/slack-api-specs/LICENSE",
+            "docs/corpus/vendor/slack-api-specs/README.md",
+            "docs/corpus/vendor/slack-api-specs/slack_web_openapi_v2_without_examples.json",
+            "docs/corpus/vendor/slack-api-specs/slack_events_api_async_v1.json",
+            "docs/corpus/vendor/slack-api-specs/slack_common_event_wrapper_schema.json"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "keystone-business-agents-approved-knowledge",
+      "description": "Human-approved generated research and reusable business context.",
+      "approved_for": [
+        "business_research_analyst",
+        "outreach_composer",
+        "chief_of_staff"
+      ],
+      "sensitivity": "approved_internal_knowledge",
+      "local_files": [],
+      "external_sources_summarized": []
+    },
+    {
+      "name": "keystone-business-agents-public-vendor-reference",
+      "description": "Public official docs/specs only, safe for live vector-store smoke tests.",
+      "approved_for": [
+        "business_research_analyst",
+        "chief_of_staff"
+      ],
+      "sensitivity": "public_reference",
+      "local_files": [
+        "docs/corpus/vendor/README.md",
+        "docs/corpus/vendor/langgraph-docs/SOURCE.md",
+        "docs/corpus/vendor/langgraph-docs/LICENSE",
+        "docs/corpus/vendor/langgraph-docs/overview.md",
+        "docs/corpus/vendor/langgraph-docs/graph-api.md",
+        "docs/corpus/vendor/langgraph-docs/persistence.md",
+        "docs/corpus/vendor/langgraph-docs/interrupts.md",
+        "docs/corpus/vendor/langgraph-docs/durable-execution.md",
+        "docs/corpus/vendor/langgraph-docs/fault-tolerance.md",
+        "docs/corpus/vendor/langgraph-docs/use-subgraphs.md",
+        "docs/corpus/vendor/langgraph-docs/thinking-in-langgraph.md",
+        "docs/corpus/vendor/langgraph-docs/application-structure.md",
+        "docs/corpus/vendor/langgraph-docs/test.md",
+        "docs/corpus/vendor/openai-agents-python/SOURCE.md",
+        "docs/corpus/vendor/openai-agents-python/LICENSE",
+        "docs/corpus/vendor/openai-agents-python/agents.md",
+        "docs/corpus/vendor/openai-agents-python/tools.md",
+        "docs/corpus/vendor/openai-agents-python/sessions-index.md",
+        "docs/corpus/vendor/openai-openapi/SOURCE.md",
+        "docs/corpus/vendor/openai-openapi/LICENSE",
+        "docs/corpus/vendor/openai-openapi/README.md",
+        "docs/corpus/vendor/openai-openapi/openapi.yaml",
+        "docs/corpus/vendor/google-gmail-api/SOURCE.md",
+        "docs/corpus/vendor/google-gmail-api/gmail-v1-discovery.json",
+        "docs/corpus/vendor/slack-api-specs/SOURCE.md",
+        "docs/corpus/vendor/slack-api-specs/LICENSE",
+        "docs/corpus/vendor/slack-api-specs/README.md",
+        "docs/corpus/vendor/slack-api-specs/slack_web_openapi_v2_without_examples.json",
+        "docs/corpus/vendor/slack-api-specs/slack_events_api_async_v1.json",
+        "docs/corpus/vendor/slack-api-specs/slack_common_event_wrapper_schema.json"
+      ],
+      "external_sources_summarized": [],
+      "external_sources_vendored": [
+        {
+          "title": "LangGraph docs",
+          "source_url": "https://github.com/langchain-ai/docs/tree/main/src/oss/langgraph",
+          "license": "MIT",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/langgraph-docs/SOURCE.md",
+            "docs/corpus/vendor/langgraph-docs/LICENSE",
+            "docs/corpus/vendor/langgraph-docs/overview.md",
+            "docs/corpus/vendor/langgraph-docs/graph-api.md",
+            "docs/corpus/vendor/langgraph-docs/persistence.md",
+            "docs/corpus/vendor/langgraph-docs/interrupts.md",
+            "docs/corpus/vendor/langgraph-docs/durable-execution.md",
+            "docs/corpus/vendor/langgraph-docs/fault-tolerance.md",
+            "docs/corpus/vendor/langgraph-docs/use-subgraphs.md",
+            "docs/corpus/vendor/langgraph-docs/thinking-in-langgraph.md",
+            "docs/corpus/vendor/langgraph-docs/application-structure.md",
+            "docs/corpus/vendor/langgraph-docs/test.md"
+          ]
+        },
+        {
+          "title": "OpenAI Agents Python SDK docs",
+          "source_url": "https://github.com/openai/openai-agents-python",
+          "license": "MIT",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/openai-agents-python/SOURCE.md",
+            "docs/corpus/vendor/openai-agents-python/LICENSE",
+            "docs/corpus/vendor/openai-agents-python/agents.md",
+            "docs/corpus/vendor/openai-agents-python/tools.md",
+            "docs/corpus/vendor/openai-agents-python/sessions-index.md"
+          ]
+        },
+        {
+          "title": "OpenAI OpenAPI schema",
+          "source_url": "https://github.com/openai/openai-openapi",
+          "license": "MIT",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/openai-openapi/SOURCE.md",
+            "docs/corpus/vendor/openai-openapi/LICENSE",
+            "docs/corpus/vendor/openai-openapi/README.md",
+            "docs/corpus/vendor/openai-openapi/openapi.yaml"
+          ]
+        },
+        {
+          "title": "Gmail API v1 discovery document",
+          "source_url": "https://gmail.googleapis.com/$discovery/rest?version=v1",
+          "license": "Google Developers site policy; generally CC BY 4.0 for docs except as otherwise noted",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/google-gmail-api/SOURCE.md",
+            "docs/corpus/vendor/google-gmail-api/gmail-v1-discovery.json"
+          ]
+        },
+        {
+          "title": "Slack API specs",
+          "source_url": "https://github.com/slackapi/slack-api-specs",
+          "license": "MIT",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/slack-api-specs/SOURCE.md",
+            "docs/corpus/vendor/slack-api-specs/LICENSE",
+            "docs/corpus/vendor/slack-api-specs/README.md",
+            "docs/corpus/vendor/slack-api-specs/slack_web_openapi_v2_without_examples.json",
+            "docs/corpus/vendor/slack-api-specs/slack_events_api_async_v1.json",
+            "docs/corpus/vendor/slack-api-specs/slack_common_event_wrapper_schema.json"
+          ]
+        }
+      ]
+    }
+  ],
+  "blocked_patterns": [
+    ".env",
+    ".env.*",
+    "credentials.json",
+    "token.json",
+    "client_secret*.json",
+    "authorized_user*.json",
+    ".keystone/**",
+    "artifacts/**",
+    "*.db",
+    "*.sqlite",
+    "*.sqlite3",
+    "**/__pycache__/**"
+  ]
+}

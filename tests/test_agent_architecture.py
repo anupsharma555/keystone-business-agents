@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from keystone_agents.agents.business_research_analyst import build_business_research_analyst_agent
+from keystone_agents.agents.chief_of_staff import build_chief_of_staff_agent
 from keystone_agents.agents.gmail_triage import build_gmail_triage_agent
 from keystone_agents.agents.opportunity_scout import build_opportunity_scout_agent
 from keystone_agents.agents.orchestrator import (
@@ -10,6 +11,7 @@ from keystone_agents.agents.orchestrator import (
     build_orchestrator_review_agent,
 )
 from keystone_agents.agents.outreach_composer import build_outreach_composer_agent
+from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
 from keystone_agents.schemas.company_profile import CompanyProfile
 from keystone_agents.schemas.email_triage import EmailTriageResult
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
@@ -24,6 +26,7 @@ MODEL_ENV_VARS = (
     "KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL",
     "KEYSTONE_OPPORTUNITY_SCOUT_MODEL",
     "KEYSTONE_OUTREACH_COMPOSER_MODEL",
+    "KEYSTONE_CHIEF_OF_STAFF_MODEL",
 )
 
 
@@ -88,6 +91,17 @@ def test_all_builders_return_sdk_agents_with_prompts_and_guardrails() -> None:
             OrchestratorResult,
             {"route_request_placeholder", "load_pending_approval_items"},
         ),
+        (
+            build_chief_of_staff_agent,
+            ChiefOfStaffResult,
+            {
+                "list_chief_of_staff_context_sources",
+                "summarize_slack_runtime_config",
+                "search_slack_repo_context",
+                "lookup_slack_workflow_capability",
+                "search_local_context",
+            },
+        ),
     ]
 
     for build_agent, output_type, expected_tools in cases:
@@ -108,6 +122,7 @@ def test_no_agent_exposes_send_tool() -> None:
         build_opportunity_scout_agent(),
         build_outreach_composer_agent(),
         build_orchestrator_agent(),
+        build_chief_of_staff_agent(),
     ]
 
     tool_names = {name for agent in agents for name in _tool_names(agent)}
@@ -124,6 +139,7 @@ def test_main_agents_expose_allowlisted_local_context_tools() -> None:
         build_opportunity_scout_agent(),
         build_outreach_composer_agent(),
         build_orchestrator_agent(),
+        build_chief_of_staff_agent(),
     ]
 
     expected_tools = {
@@ -145,12 +161,14 @@ def test_runtime_agent_builders_use_agent_specific_models(
     monkeypatch.setenv("KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL", "openai-account-fixture")
     monkeypatch.setenv("KEYSTONE_OPPORTUNITY_SCOUT_MODEL", "openai-opportunity-fixture")
     monkeypatch.setenv("KEYSTONE_OUTREACH_COMPOSER_MODEL", "gemini-outreach-fixture")
+    monkeypatch.setenv("KEYSTONE_CHIEF_OF_STAFF_MODEL", "openai-chief-fixture")
 
     assert build_orchestrator_agent().model == "openai-orchestrator-fixture"
     assert build_gmail_triage_agent().model == "gemini-gmail-fixture"
     assert build_business_research_analyst_agent().model == "openai-account-fixture"
     assert build_opportunity_scout_agent().model == "openai-opportunity-fixture"
     assert build_outreach_composer_agent().model == "gemini-outreach-fixture"
+    assert build_chief_of_staff_agent().model == "openai-chief-fixture"
     assert build_gmail_triage_agent(model="explicit-fixture").model == "explicit-fixture"
 
 

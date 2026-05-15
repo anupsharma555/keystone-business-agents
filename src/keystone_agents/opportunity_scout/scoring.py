@@ -17,6 +17,8 @@ TARGET_TYPES: tuple[OpportunityType, ...] = (
     "CNS biotech",
     "neurotechnology",
     "grant or collaboration opportunity",
+    "journal article or publication call",
+    "contract or RFP opportunity",
 )
 
 SIGNAL_WEIGHTS: dict[str, int] = {
@@ -33,6 +35,8 @@ SIGNAL_WEIGHTS: dict[str, int] = {
     "IRB or protocol activity": 16,
     "conference activity": 10,
     "publication or outcomes evidence": 18,
+    "journal article call": 14,
+    "contract or RFP": 16,
     "partnership announcement": 14,
 }
 
@@ -53,6 +57,8 @@ TYPE_RELEVANCE_BASE: dict[OpportunityType, int] = {
     "CNS biotech": 78,
     "neurotechnology": 82,
     "grant or collaboration opportunity": 58,
+    "journal article or publication call": 64,
+    "contract or RFP opportunity": 68,
 }
 
 TYPE_KEYSTONE_FIT_BASE: dict[OpportunityType, int] = {
@@ -64,6 +70,8 @@ TYPE_KEYSTONE_FIT_BASE: dict[OpportunityType, int] = {
     "CNS biotech": 76,
     "neurotechnology": 82,
     "grant or collaboration opportunity": 58,
+    "journal article or publication call": 68,
+    "contract or RFP opportunity": 72,
 }
 
 HANDOFF_PRIORITY_THRESHOLD = 70
@@ -116,6 +124,7 @@ def _relevance_component(signals: list[str], opportunity_type: OpportunityType) 
                 "validation study",
                 "clinical trial launch",
                 "publication or outcomes evidence",
+                "journal article call",
                 "hiring evidence",
             },
         )
@@ -134,6 +143,8 @@ def _keystone_fit_component(signals: list[str], opportunity_type: OpportunityTyp
                 "validation study",
                 "clinical trial launch",
                 "publication or outcomes evidence",
+                "journal article call",
+                "contract or RFP",
                 "hiring evidence",
                 "IRB or protocol activity",
             },

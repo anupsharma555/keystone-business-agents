@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import tomllib
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -570,8 +571,22 @@ def test_keystone_agents_builders_use_shared_sdk_helper(monkeypatch) -> None:
     ]
 
 
-def test_no_langchain_or_langgraph_dependency() -> None:
-    pyproject_text = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8").lower()
+def test_no_langchain_dependency_and_langgraph_is_optional() -> None:
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    core_dependencies = pyproject["project"]["dependencies"]
+    optional_dependencies = pyproject["project"]["optional-dependencies"]
+    all_dependencies = [
+        *core_dependencies,
+        *[
+            dependency
+            for dependency_group in optional_dependencies.values()
+            for dependency in dependency_group
+        ],
+    ]
 
-    assert "langchain" not in pyproject_text
-    assert "langgraph" not in pyproject_text
+    assert not any("langchain" in dependency.lower() for dependency in all_dependencies)
+    assert not any("langgraph" in dependency.lower() for dependency in core_dependencies)
+    assert any(
+        dependency.lower().startswith("langgraph")
+        for dependency in optional_dependencies["orchestration"]
+    )

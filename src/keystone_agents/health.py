@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.agent_registry import list_agent_specs
 from keystone_agents.model_provider import (
     DEFAULT_PROVIDER,
     KEYSTONE_OPENAI_API_KEY_ENV,
@@ -54,20 +55,13 @@ CORE_IMPORTS = (
 
 REQUIRED_PROMPTS = (
     "business_research_analyst.md",
+    "chief_of_staff.md",
     "gmail_triage.md",
     "keystone_profile.md",
     "opportunity_scout.md",
     "orchestrator.md",
     "outreach_composer.md",
     "safety_policy.md",
-)
-
-REQUIRED_AGENT_BUILDERS = (
-    "build_business_research_analyst_agent",
-    "build_gmail_triage_agent",
-    "build_opportunity_scout_agent",
-    "build_orchestrator_agent",
-    "build_outreach_composer_agent",
 )
 
 REQUIRED_TABLES = (
@@ -77,12 +71,22 @@ REQUIRED_TABLES = (
     "opportunities",
     "outreach_drafts",
     "approvals",
+    "approval_queue",
     "sources",
+    "feedback",
     "tool_events",
     "agent_run_logs",
     "contacts",
     "crm_contexts",
     "follow_up_schedules",
+    "outreach_tracking",
+    "email_style_profiles",
+    "memory_items",
+    "memory_index",
+    "outreach_examples",
+    "work_items",
+    "work_item_events",
+    "work_item_artifacts",
     "schema_migrations",
 )
 
@@ -93,6 +97,7 @@ DRY_RUN_SCRIPTS = (
     "run_opportunity_scout.py",
     "run_outreach_draft.py",
     "run_orchestrator.py",
+    "run_chief_of_staff.py",
     "run_keystone_pipeline.py",
 )
 
@@ -128,10 +133,29 @@ ENVIRONMENT_VARIABLES = (
     "GMAIL_CLIENT_SECRET",
     "SLACK_BOT_TOKEN",
     "SLACK_CHANNEL_APPROVALS",
+    "KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED",
+    "KNI_BUSINESS_AGENTS_BACKGROUND_RUNS",
+    "KNI_BUSINESS_AGENTS_APPROVALS_ENABLED",
+    "KNI_BUSINESS_AGENTS_MESSAGE_ACTIONS_ENABLED",
+    "KNI_BUSINESS_AGENTS_HISTORY_CONTEXT_ENABLED",
+    "KNI_BUSINESS_AGENTS_LIVE_SDK",
+    "KNI_BUSINESS_AGENTS_LIVE_SEARCH",
+    "KNI_BUSINESS_AGENTS_LIVE_SLACK",
+    "KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS",
+    "KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL",
     "SEARCH_PROVIDER",
     "SERPER_API_KEY",
     "SEARXNG_BASE_URL",
     "SEARXNG_API_KEY",
+    "TAVILY_API_KEY",
+    "TAVILY_BASE_URL",
+    "TAVILY_SEARCH_DEPTH",
+    "TAVILY_MCP_LINK",
+    "TAVILY_MCP_link",
+    "KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT",
+    "KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT",
+    "KEYSTONE_TAVILY_CREDIT_ENFORCEMENT",
+    "KEYSTONE_TAVILY_USAGE_PATH",
     "APIFY_API_TOKEN",
     "BROWSERLESS_API_KEY",
     "KEYSTONE_TRACE_WORKFLOW_NAME",
@@ -149,11 +173,28 @@ VISIBLE_ENVIRONMENT_VALUES = {
     "KEYSTONE_ENABLE_LIVE_SLACK",
     "KEYSTONE_ENABLE_LIVE_RESEARCH",
     "KEYSTONE_ENABLE_LIVE_CRM",
+    "KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED",
+    "KNI_BUSINESS_AGENTS_BACKGROUND_RUNS",
+    "KNI_BUSINESS_AGENTS_APPROVALS_ENABLED",
+    "KNI_BUSINESS_AGENTS_MESSAGE_ACTIONS_ENABLED",
+    "KNI_BUSINESS_AGENTS_HISTORY_CONTEXT_ENABLED",
+    "KNI_BUSINESS_AGENTS_LIVE_SDK",
+    "KNI_BUSINESS_AGENTS_LIVE_SEARCH",
+    "KNI_BUSINESS_AGENTS_LIVE_SLACK",
+    "KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS",
+    "KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL",
     "MODEL_PROVIDER",
     "KEYSTONE_OPENAI_MODEL",
     "KEYSTONE_OPENAI_BASE_URL",
     "SEARCH_PROVIDER",
     "SEARXNG_BASE_URL",
+    "TAVILY_BASE_URL",
+    "TAVILY_SEARCH_DEPTH",
+    "TAVILY_MCP_LINK",
+    "KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT",
+    "KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT",
+    "KEYSTONE_TAVILY_CREDIT_ENFORCEMENT",
+    "KEYSTONE_TAVILY_USAGE_PATH",
     "KEYSTONE_TRACING_DISABLED",
     "KEYSTONE_TRACE_INCLUDE_SENSITIVE_DATA",
 }
@@ -361,7 +402,10 @@ def check_prompts(prompts_root: Path = PROMPTS_ROOT) -> list[CheckItem]:
     """Check that required prompt markdown files exist."""
 
     items: list[CheckItem] = []
-    for filename in REQUIRED_PROMPTS:
+    registry_prompt_files = {
+        prompt_file for spec in list_agent_specs() for prompt_file in spec.prompt_files
+    }
+    for filename in sorted(set(REQUIRED_PROMPTS) | registry_prompt_files):
         path = prompts_root / filename
         present = path.is_file()
         size = path.stat().st_size if present else 0
@@ -376,51 +420,52 @@ def check_prompts(prompts_root: Path = PROMPTS_ROOT) -> list[CheckItem]:
 
 
 def check_agent_builders() -> list[CheckItem]:
-    """Check that required build_*_agent functions construct agent-like objects."""
-
-    try:
-        agents_module = importlib.import_module("keystone_agents.agents")
-    except Exception as exc:  # pragma: no cover - exercised by environment.
-        return [
-            CheckItem(
-                name="keystone_agents.agents",
-                status=STATUS_ERROR,
-                details={"error": f"{type(exc).__name__}: {exc}"},
-            )
-        ]
+    """Check registered build_*_agent functions construct matching SDK agents."""
 
     items: list[CheckItem] = []
-    for function_name in REQUIRED_AGENT_BUILDERS:
-        value = getattr(agents_module, function_name, None)
-        details: dict[str, Any] = {"present": value is not None, "callable": callable(value)}
+    for spec in list_agent_specs():
+        details: dict[str, Any] = {
+            "route_name": spec.route_name,
+            "registry_agent_name": spec.agent_name,
+            "builder": spec.builder,
+            "present": False,
+            "callable": False,
+        }
         status = STATUS_ERROR
-        if callable(value):
+        try:
+            builder = spec.resolve_builder()
+            expected_output_type = spec.resolve_output_schema()
+        except Exception as exc:
+            details["error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            details["present"] = True
+            details["callable"] = callable(builder)
             try:
-                agent = value()
+                agent = builder()
             except Exception as exc:
                 details["error"] = f"{type(exc).__name__}: {exc}"
             else:
+                output_type = getattr(agent, "output_type", None)
                 details.update(
                     {
                         "constructed": True,
                         "agent_name": getattr(agent, "name", ""),
                         "has_instructions": bool(getattr(agent, "instructions", "")),
                         "tool_count": len(getattr(agent, "tools", []) or []),
-                        "output_type": getattr(
-                            getattr(agent, "output_type", None),
-                            "__name__",
-                            str(getattr(agent, "output_type", "")),
-                        ),
+                        "output_type": getattr(output_type, "__name__", str(output_type)),
+                        "expected_output_type": expected_output_type.__name__,
+                        "output_type_matches_registry": output_type is expected_output_type,
                     }
                 )
                 status = (
                     STATUS_OK
                     if details["agent_name"] and details["has_instructions"]
+                    and details["output_type_matches_registry"]
                     else STATUS_ERROR
                 )
         items.append(
             CheckItem(
-                name=function_name,
+                name=spec.builder_name,
                 status=status,
                 details=details,
             )
@@ -565,8 +610,50 @@ def check_live_integrations(env: Mapping[str, str] | None = None) -> list[CheckI
     )
     live_slack_flags = tuple(_enabled_env_names(source, ("KEYSTONE_ENABLE_LIVE_SLACK",)))
     live_search_flags = tuple(_enabled_env_names(source, ("KEYSTONE_ENABLE_LIVE_RESEARCH",)))
+    slack_business_flags = tuple(
+        _enabled_env_names(
+            source,
+            (
+                "KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED",
+                "KNI_BUSINESS_AGENTS_BACKGROUND_RUNS",
+                "KNI_BUSINESS_AGENTS_LIVE_SDK",
+                "KNI_BUSINESS_AGENTS_LIVE_SEARCH",
+                "KNI_BUSINESS_AGENTS_LIVE_SLACK",
+                "KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS",
+                "KNI_BUSINESS_AGENTS_HISTORY_CONTEXT_ENABLED",
+            ),
+        )
+    )
     slack_token = _env_value(source, "SLACK_BOT_TOKEN")
     slack_channel = _env_value(source, "SLACK_CHANNEL_APPROVALS")
+    slack_business_approval_channel = _env_value(
+        source, "KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL"
+    )
+    slack_business_context = _bool_from_env(
+        _env_value(source, "KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED")
+    )
+    slack_business_live_slack = _bool_from_env(
+        _env_value(source, "KNI_BUSINESS_AGENTS_LIVE_SLACK")
+    )
+    slack_business_background = _bool_from_env(
+        _env_value(source, "KNI_BUSINESS_AGENTS_BACKGROUND_RUNS")
+    )
+    slack_business_history = _bool_from_env(
+        _env_value(source, "KNI_BUSINESS_AGENTS_HISTORY_CONTEXT_ENABLED")
+    )
+    slack_business_required = bool(slack_business_flags)
+    slack_business_missing = []
+    if (
+        slack_business_context
+        or slack_business_live_slack
+        or slack_business_background
+        or slack_business_history
+    ) and not slack_token:
+        slack_business_missing.append("SLACK_BOT_TOKEN")
+    if slack_business_live_slack and not (slack_business_approval_channel or slack_channel):
+        slack_business_missing.append(
+            "KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL or SLACK_CHANNEL_APPROVALS"
+        )
     gmail_details = gmail_oauth_readiness(source)
     gmail_readiness = str(gmail_details["readiness"])
     gmail_status = {
@@ -577,6 +664,7 @@ def check_live_integrations(env: Mapping[str, str] | None = None) -> list[CheckI
     search_provider = (_env_value(source, "SEARCH_PROVIDER") or "dry-run").lower()
     serper_configured = bool(_env_value(source, "SERPER_API_KEY"))
     searxng_configured = bool(_env_value(source, "SEARXNG_BASE_URL"))
+    tavily_configured = bool(_env_value(source, "TAVILY_API_KEY"))
 
     def status_for(required_now: bool, configured: bool) -> str:
         return STATUS_WARNING if required_now and not configured else STATUS_OK
@@ -615,6 +703,36 @@ def check_live_integrations(env: Mapping[str, str] | None = None) -> list[CheckI
             },
         ),
         CheckItem(
+            name="slack_business_agents",
+            status=(
+                STATUS_WARNING
+                if slack_business_required and slack_business_missing
+                else STATUS_OK
+            ),
+            details={
+                "configured": not slack_business_missing,
+                "required_now": slack_business_required,
+                "live_flags": slack_business_flags,
+                "missing": slack_business_missing,
+                "slack_context_enabled": slack_business_context,
+                "background_runs_enabled": slack_business_background,
+                "live_sdk_enabled": _bool_from_env(
+                    _env_value(source, "KNI_BUSINESS_AGENTS_LIVE_SDK")
+                ),
+                "live_search_enabled": _bool_from_env(
+                    _env_value(source, "KNI_BUSINESS_AGENTS_LIVE_SEARCH")
+                ),
+                "live_slack_enabled": slack_business_live_slack,
+                "live_gmail_drafts_enabled": _bool_from_env(
+                    _env_value(source, "KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS")
+                ),
+                "history_context_enabled": slack_business_history,
+                "approval_gated": True,
+                "external_send_implemented": False,
+                "required_for": "@KNI Slack business-agent bridge",
+            },
+        ),
+        CheckItem(
             name="serper",
             status=status_for(
                 bool(live_search_flags) and search_provider == "serper",
@@ -642,6 +760,36 @@ def check_live_integrations(env: Mapping[str, str] | None = None) -> list[CheckI
                 "base_url_present": searxng_configured,
                 "api_key_present": bool(_env_value(source, "SEARXNG_API_KEY")),
                 "required_for": "live SearXNG search",
+            },
+        ),
+        CheckItem(
+            name="tavily",
+            status=status_for(
+                bool(live_search_flags) and search_provider == "tavily",
+                tavily_configured,
+            ),
+            details={
+                "configured": tavily_configured,
+                "required_now": bool(live_search_flags) and search_provider == "tavily",
+                "live_flags": live_search_flags,
+                "search_provider": search_provider,
+                "base_url": _env_value(source, "TAVILY_BASE_URL") or "https://api.tavily.com",
+                "search_depth": _env_value(source, "TAVILY_SEARCH_DEPTH") or "basic",
+                "monthly_credit_limit": _env_value(
+                    source,
+                    "KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT",
+                )
+                or "1000",
+                "monthly_soft_limit": _env_value(source, "KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT")
+                or "850",
+                "credit_enforcement": _env_value(source, "KEYSTONE_TAVILY_CREDIT_ENFORCEMENT")
+                or "warn",
+                "usage_path_present": bool(_env_value(source, "KEYSTONE_TAVILY_USAGE_PATH")),
+                "mcp_link_present": bool(
+                    _env_value(source, "TAVILY_MCP_LINK")
+                    or _env_value(source, "TAVILY_MCP_link")
+                ),
+                "required_for": "live Tavily search",
             },
         ),
         CheckItem(

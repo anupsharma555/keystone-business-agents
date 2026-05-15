@@ -50,15 +50,17 @@ def test_dry_run_profile_updates_known_keys_and_preserves_unrelated_content(tmp_
     assert "KEYSTONE_ENABLE_LIVE_SLACK=false" in text
     assert "KEYSTONE_ENABLE_LIVE_RESEARCH=false" in text
     assert "KEYSTONE_ENABLE_LIVE_CRM=false" in text
+    assert "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=false" in text
+    assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
 
 
-def test_live_test_profile_preserves_existing_live_search_provider(tmp_path) -> None:
+def test_live_test_profile_replaces_existing_serper_default_with_searxng(tmp_path) -> None:
     module = load_module()
     env_file = tmp_path / ".env"
     env_file.write_text(
         "\n".join(
             [
-                "SEARCH_PROVIDER=searxng",
+                "SEARCH_PROVIDER=serper",
                 "KEYSTONE_LIVE_MODE=false",
                 "KEYSTONE_DRY_RUN=true",
                 "",
@@ -77,7 +79,21 @@ def test_live_test_profile_preserves_existing_live_search_provider(tmp_path) -> 
     assert "KEYSTONE_ENABLE_LIVE_RESEARCH=true" in text
     assert "KEYSTONE_ENABLE_LIVE_CRM=false" in text
     assert "SEARCH_PROVIDER=searxng" in text
+    assert "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true" in text
+    assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
     assert "AUTO_SEND_EMAIL=false" in text
+
+
+def test_live_test_profile_can_explicitly_select_serper(tmp_path) -> None:
+    module = load_module()
+    env_file = tmp_path / ".env"
+
+    module.main(["live-test", "--env-file", str(env_file), "--search-provider", "serper"])
+
+    text = env_file.read_text(encoding="utf-8")
+    assert "SEARCH_PROVIDER=serper" in text
+    assert "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true" in text
+    assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
 
 
 def test_full_live_profile_creates_missing_env_file_with_expected_values(tmp_path) -> None:
@@ -94,5 +110,7 @@ def test_full_live_profile_creates_missing_env_file_with_expected_values(tmp_pat
     assert "KEYSTONE_ENABLE_LIVE_SLACK=true" in text
     assert "KEYSTONE_ENABLE_LIVE_RESEARCH=true" in text
     assert "KEYSTONE_ENABLE_LIVE_CRM=false" in text
+    assert "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true" in text
+    assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
     assert "SEARCH_PROVIDER=searxng" in text
     assert "AUTO_SEND_EMAIL=false" in text

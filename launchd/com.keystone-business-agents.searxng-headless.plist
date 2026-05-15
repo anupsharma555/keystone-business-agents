@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.keystone-business-agents.searxng-headless</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>__KBA_REPO_ROOT__/scripts/run_searxng_headless.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__KBA_REPO_ROOT__</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>__KBA_REPO_ROOT__/.local/logs/searxng-headless.stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__KBA_REPO_ROOT__/.local/logs/searxng-headless.stderr.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>SEARXNG_COLIMA_PROFILE</key>
+    <string>kba-searxng</string>
+    <key>SEARXNG_PORT</key>
+    <string>18080</string>
+    <key>SEARXNG_COMPOSE_PROJECT</key>
+    <string>kba-searxng</string>
+  </dict>
+</dict>
+</plist>

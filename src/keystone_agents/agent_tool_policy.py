@@ -29,6 +29,7 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "retrieve_memory",
                 "check_workflow_duplicate",
                 "search_web",
+                "file_search",
                 "fetch_company_page",
                 "fetch_linkedin_or_profile_placeholder",
                 "extract_company_signals",
@@ -59,6 +60,8 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "search_clinical_trials_sources",
                 "search_grant_sources",
                 "search_conference_publication_sources",
+                "search_journal_call_sources",
+                "search_contract_rfp_sources",
                 "search_company_page_sources",
                 "score_opportunity",
                 "handoff_to_business_research_analyst_placeholder",
@@ -134,9 +137,40 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "route_request_placeholder",
                 "load_orchestrator_workflow_state",
                 "load_pending_approval_items",
+                "business_research_analyst_research_brief",
             }
         ),
         rationale="The orchestrator routes, reviews, and sets retrieval hints instead of browsing.",
+    ),
+    "chief_of_staff": AgentToolPolicy(
+        agent_name="chief_of_staff",
+        allowed_tool_names=frozenset(
+            {
+                "list_chief_of_staff_context_sources",
+                "summarize_slack_runtime_config",
+                "search_slack_repo_context",
+                "read_slack_repo_context_file",
+                "lookup_slack_workflow_capability",
+                "search_official_operations_docs",
+                "file_search",
+                "list_local_context_sources",
+                "search_local_context",
+                "read_local_context_file",
+                "list_automation_specs",
+                "list_recent_automation_runs",
+                "list_channel_automation_bindings",
+                "summarize_automation_health",
+                "list_pending_automation_approvals",
+                "inspect_active_work_items",
+                "publish_document_report",
+                "publish_table_mirror",
+                "publish_slack_summary",
+            }
+        ),
+        rationale=(
+            "The Chief of Staff may inspect operations state and coordinate bounded "
+            "internal review writes through typed tools."
+        ),
     ),
 }
 

@@ -43,14 +43,19 @@ implementations are:
 
 - `dry-run`: default, no network calls.
 - `searxng`: broad-recall live search when explicitly live-enabled.
-- `serper`: precision-oriented live search when selected or escalated by quality
-  gates.
+- `agents-web-search`: OpenAI Agents SDK hosted web search, enabled as a capped
+  parallel lane beside SearXNG for default live research.
+- `serper`: precision-oriented live search when explicitly selected.
 - `firecrawl`: explicit live search provider when configured with
   `FIRECRAWL_API_KEY`.
+- `tavily`: optional configured deepening provider with local credit tracking.
 
 The SDK `search_web` tool is inert unless live mode, non-dry-run mode, and live
-research are enabled. With no `SEARCH_PROVIDER` override, it resolves to SearXNG
-first and can escalate to Serper through the deterministic retrieval ladder.
+research are enabled. With no `SEARCH_PROVIDER` override, it resolves to
+SearXNG plus a capped Agents hosted web-search parallel lane. Serper remains
+available through explicit provider selection, not as an automatic fallback.
+Planner agents may set live-search intent and constraints, but provider
+selection stays in the shared Python retrieval policy.
 
 Website extraction is a separate live-gated path. Use Trafilatura by default for
 selected company pages, or Firecrawl when `KEYSTONE_WEBSITE_EXTRACTOR=firecrawl`.

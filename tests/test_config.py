@@ -47,14 +47,36 @@ DOTENV_BACKED_ENV_VARS = (
     "GOOGLE_TOKEN_FILE",
     "SLACK_BOT_TOKEN",
     "SLACK_CHANNEL_APPROVALS",
+    "KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED",
+    "KNI_BUSINESS_AGENTS_BACKGROUND_RUNS",
+    "KNI_BUSINESS_AGENTS_APPROVALS_ENABLED",
+    "KNI_BUSINESS_AGENTS_MESSAGE_ACTIONS_ENABLED",
+    "KNI_BUSINESS_AGENTS_HISTORY_CONTEXT_ENABLED",
+    "KNI_BUSINESS_AGENTS_LIVE_SDK",
+    "KNI_BUSINESS_AGENTS_LIVE_SEARCH",
+    "KNI_BUSINESS_AGENTS_LIVE_SLACK",
+    "KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS",
+    "KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL",
     "SEARCH_PROVIDER",
     "SERPER_API_KEY",
     "SEARXNG_BASE_URL",
     "SEARXNG_API_KEY",
+    "TAVILY_API_KEY",
+    "TAVILY_BASE_URL",
+    "TAVILY_SEARCH_DEPTH",
+    "TAVILY_MCP_LINK",
+    "TAVILY_MCP_link",
+    "KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT",
+    "KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT",
+    "KEYSTONE_TAVILY_CREDIT_ENFORCEMENT",
+    "KEYSTONE_TAVILY_USAGE_PATH",
     "APIFY_API_TOKEN",
     "BROWSERLESS_API_KEY",
     "FIRECRAWL_API_KEY",
     "FIRECRAWL_BASE_URL",
+    "KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK",
+    "KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL",
+    "KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN",
     "KEYSTONE_ENABLE_WEBSITE_EXTRACTION",
     "KEYSTONE_WEBSITE_EXTRACTOR",
     "KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK",
@@ -118,6 +140,14 @@ def test_load_settings_loads_explicit_dotenv_when_test_guard_is_removed(
                 "SLACK_CHANNEL_APPROVALS=CUNITTEST",
                 "SEARCH_PROVIDER=serper",
                 "SERPER_API_KEY=dotenv-test-serper-key",
+                "TAVILY_API_KEY=dotenv-test-tavily-key",
+                "TAVILY_BASE_URL=https://tavily.example",
+                "TAVILY_SEARCH_DEPTH=fast",
+                "TAVILY_MCP_LINK=https://mcp.tavily.example",
+                "KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT=1000",
+                "KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT=850",
+                "KEYSTONE_TAVILY_CREDIT_ENFORCEMENT=warn",
+                "KEYSTONE_TAVILY_USAGE_PATH=/tmp/keystone-tavily-usage.json",
                 "KEYSTONE_WEBSITE_EXTRACTOR=firecrawl",
                 "FIRECRAWL_API_KEY=dotenv-test-firecrawl-key",
                 "FIRECRAWL_BASE_URL=https://firecrawl.example",
@@ -140,6 +170,14 @@ def test_load_settings_loads_explicit_dotenv_when_test_guard_is_removed(
     assert settings.slack_channel_approvals == "CUNITTEST"
     assert settings.search_provider == "serper"
     assert settings.serper_api_key == "dotenv-test-serper-key"
+    assert settings.tavily_api_key == "dotenv-test-tavily-key"
+    assert settings.tavily_base_url == "https://tavily.example"
+    assert settings.tavily_search_depth == "fast"
+    assert settings.tavily_mcp_link == "https://mcp.tavily.example"
+    assert settings.tavily_monthly_credit_limit == 1000
+    assert settings.tavily_monthly_soft_limit == 850
+    assert settings.tavily_credit_enforcement == "warn"
+    assert settings.tavily_usage_path == "/tmp/keystone-tavily-usage.json"
     assert settings.website_extractor == "firecrawl"
     assert settings.firecrawl_api_key == "dotenv-test-firecrawl-key"
     assert settings.firecrawl_base_url == "https://firecrawl.example"

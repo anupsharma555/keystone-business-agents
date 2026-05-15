@@ -22,6 +22,7 @@ MemoryType = Literal[
     "risk_flag",
     "retrieval_tool_performance",
     "workflow_dedup",
+    "operator_reference",
 ]
 MemoryObjectType = Literal[
     "company",

@@ -1548,6 +1548,7 @@ def run_outreach_composer_sdk(
     run_config: Any | None = None,
     live: bool = False,
     model: str | None = None,
+    session: Any | None = None,
 ) -> TypedAgentRunResult[OutreachDraft]:
     """Run Outreach Composer through the typed SDK harness."""
 
@@ -1572,4 +1573,5 @@ def run_outreach_composer_sdk(
         output_type=OutreachDraft,
         run_config=run_config,
         live=live,
+        session=session,
     )

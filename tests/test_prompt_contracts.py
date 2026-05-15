@@ -24,6 +24,7 @@ REQUIRED_PROMPTS = {
     "opportunity_scout.md",
     "outreach_composer.md",
     "orchestrator.md",
+    "chief_of_staff.md",
     "safety_policy.md",
 }
 
@@ -108,6 +109,7 @@ def test_agent_builders_include_shared_skills_and_tools_prompts() -> None:
     from keystone_agents.agents.business_research_analyst import (
         build_business_research_analyst_agent,
     )
+    from keystone_agents.agents.chief_of_staff import build_chief_of_staff_agent
     from keystone_agents.agents.gmail_triage import build_gmail_triage_agent
     from keystone_agents.agents.opportunity_scout import build_opportunity_scout_agent
     from keystone_agents.agents.orchestrator import build_orchestrator_agent
@@ -119,6 +121,7 @@ def test_agent_builders_include_shared_skills_and_tools_prompts() -> None:
         build_opportunity_scout_agent(),
         build_outreach_composer_agent(),
         build_orchestrator_agent(),
+        build_chief_of_staff_agent(),
     ):
         instructions = str(agent.instructions)
         assert "<!-- AGENTS.md -->" in instructions

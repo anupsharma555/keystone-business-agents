@@ -17,6 +17,11 @@ from keystone_agents.agents.business_research_analyst import (
     run_business_research_analyst_research_brief_sdk,
     run_business_research_analyst_sdk,
 )
+from keystone_agents.agents.chief_of_staff import (
+    build_chief_of_staff_agent,
+    plan_chief_of_staff_request,
+    run_chief_of_staff_sdk,
+)
 from keystone_agents.agents.gmail_triage import (
     build_gmail_priority_grouping_agent,
     build_gmail_triage_agent,
@@ -46,6 +51,7 @@ from keystone_agents.agents.outreach_composer import (
 
 __all__ = [
     "build_business_research_analyst_agent",
+    "build_chief_of_staff_agent",
     "AgentSpec",
     "AGENT_REGISTRY",
     "REGISTERED_AGENT_SPECS",
@@ -66,10 +72,12 @@ __all__ = [
     "run_business_research_analyst_sdk",
     "run_business_research_analyst_focused_brief_sdk",
     "run_business_research_analyst_research_brief_sdk",
+    "run_chief_of_staff_sdk",
     "run_gmail_triage_sdk",
     "run_gmail_priority_grouping_sdk",
     "run_opportunity_scout_sdk",
     "run_orchestrator_sdk",
     "run_outreach_composer_sdk",
     "resolve_manual_request_plan",
+    "plan_chief_of_staff_request",
 ]

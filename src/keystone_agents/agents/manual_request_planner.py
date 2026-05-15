@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -71,23 +73,27 @@ def resolve_manual_request_plan(
         return fallback
     errors: list[str] = []
     for config in _planner_model_configs(requested_agent=requested_agent, model=model):
+        stdout_capture = io.StringIO()
         try:
-            result = run_typed_sdk_agent(
-                agent=build_manual_request_planner_agent(model=config.model),
-                typed_input=ManualRequestPlannerInput(
-                    request_text=str(request_text or ""),
-                    requested_agent=requested_agent,
-                    fallback_plan=fallback,
-                ),
-                output_type=ManualRequestPlan,
-                run_config=run_config,
-                live=live,
-                config=config,
-                workflow_name="Keystone manual request planning",
-                tracing_disabled=True,
-            )
+            with contextlib.redirect_stdout(stdout_capture):
+                result = run_typed_sdk_agent(
+                    agent=build_manual_request_planner_agent(model=config.model),
+                    typed_input=ManualRequestPlannerInput(
+                        request_text=str(request_text or ""),
+                        requested_agent=requested_agent,
+                        fallback_plan=fallback,
+                    ),
+                    output_type=ManualRequestPlan,
+                    run_config=run_config,
+                    live=live,
+                    config=config,
+                    workflow_name="Keystone manual request planning",
+                    tracing_disabled=True,
+                )
         except Exception as exc:
-            errors.append(f"{config.provider}/{config.model}: {exc}")
+            captured = " ".join(stdout_capture.getvalue().split())
+            suffix = f" ({captured})" if captured else ""
+            errors.append(f"{config.provider}/{config.model}: {exc}{suffix}")
             continue
         return merge_manual_request_plan(
             fallback,

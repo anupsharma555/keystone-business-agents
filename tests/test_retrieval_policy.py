@@ -35,8 +35,8 @@ def _assessment(
     )
 
 
-def test_build_provider_sequence_defaults_to_searxng_then_serper() -> None:
-    assert build_provider_sequence(requested_provider=None) == ("searxng", "serper")
+def test_build_provider_sequence_defaults_to_searxng_only() -> None:
+    assert build_provider_sequence(requested_provider=None) == ("searxng",)
 
 
 def test_build_provider_sequence_respects_configured_primary_override() -> None:
@@ -44,6 +44,22 @@ def test_build_provider_sequence_respects_configured_primary_override() -> None:
         requested_provider=None,
         configured_provider="serper",
     ) == ("serper",)
+
+
+def test_build_provider_sequence_allows_explicit_non_serper_fallback() -> None:
+    assert build_provider_sequence(
+        requested_provider=None,
+        configured_provider="searxng",
+        fallback_provider="firecrawl",
+    ) == ("searxng", "firecrawl")
+
+
+def test_build_provider_sequence_omits_serper_fallback() -> None:
+    assert build_provider_sequence(
+        requested_provider=None,
+        configured_provider="searxng",
+        fallback_provider="serper",
+    ) == ("searxng",)
 
 
 def test_coerce_retrieval_autonomy_hint_accepts_schema_payload() -> None:
@@ -125,6 +141,30 @@ def test_assess_opportunity_search_quality_flags_company_heavy_packets_for_enric
     assert assessment.needs_structured_enrichment is True
     assert "company" in assessment.opportunity_lane_labels
     assert any("company-heavy" in reason for reason in assessment.reasons)
+
+
+def test_assess_opportunity_search_quality_reports_missing_source_lanes() -> None:
+    assessment = assess_opportunity_search_quality(
+        results=[
+            SearchResult(
+                title="Behavioral health AI company announces partnership",
+                link="https://www.businesswire.com/news/example-partnership",
+                snippet="Press release announces a behavioral health AI partnership.",
+                source="serper",
+            )
+        ],
+        desired_results=5,
+        request_text="Find grant, trial, RFP, and conference opportunities.",
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+    )
+
+    assert assessment.needs_precision_search is True
+    assert "press_news" in assessment.source_lane_labels
+    assert {"clinical_trials", "grants_funding", "procurement_rfp"}.issubset(
+        assessment.missing_source_lanes
+    )
+    assert assessment.source_coverage is not None
+    assert any("source coverage missing lanes" in reason for reason in assessment.reasons)
 
 
 def test_hybrid_search_provider_escalates_when_quality_is_weak() -> None:
@@ -238,6 +278,187 @@ def test_hybrid_search_provider_can_fan_out_across_providers() -> None:
     assert [result.source for result in results] == ["searxng", "serper"]
     assert telemetry["parallel_provider_fanout"] is True
     assert telemetry["search_providers_used"] == ["searxng", "serper"]
+
+
+def test_hybrid_search_provider_keeps_parallel_optional_errors_nonfatal() -> None:
+    class EmptySearxngProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return []
+
+    class FailingAgentsWebSearchProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            raise SearchProviderError("missing hosted web-search credentials")
+
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng", "agents-web-search"),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=False,
+        ),
+        provider_factory=lambda provider_name: (
+            EmptySearxngProvider()
+            if provider_name == "searxng"
+            else FailingAgentsWebSearchProvider()
+        ),
+        parallel_provider_fanout=True,
+    )
+
+    assert provider.search_web("behavioral health ai", num_results=3) == []
+    telemetry = provider.telemetry()
+
+    assert telemetry["search_providers_attempted"] == ["searxng", "agents-web-search"]
+    assert telemetry["search_providers_used"] == ["searxng"]
+    assert telemetry["search_provider_errors"][0]["provider"] == "agents-web-search"
+
+
+def test_hybrid_search_provider_runs_deepening_provider_only_after_weak_fast_results() -> None:
+    calls: list[str] = []
+
+    class FastProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"searxng:{query}:{num_results}")
+            return [
+                SearchResult(
+                    title="Thin company result",
+                    link="https://example.test/company",
+                    snippet="Company source without careers or press coverage.",
+                    source="searxng",
+                )
+            ]
+
+    class DeepeningProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"agents-web-search:{query}:{num_results}")
+            return [
+                SearchResult(
+                    title="Official careers",
+                    link="https://example.test/careers",
+                    snippet="Official careers page.",
+                    source="agents-web-search",
+                )
+            ]
+
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng",),
+        deepening_provider_sequence=("agents-web-search",),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=len(results) < 2,
+            reasons=("thin fast results",) if len(results) < 2 else (),
+        ),
+        provider_factory=lambda provider_name: (
+            FastProvider() if provider_name == "searxng" else DeepeningProvider()
+        ),
+    )
+
+    results = provider.search_web("Mentavi Health", num_results=3)
+    telemetry = provider.telemetry()
+
+    assert calls == [
+        "searxng:Mentavi Health:3",
+        "agents-web-search:Mentavi Health:3",
+    ]
+    assert [result.source for result in results] == ["searxng", "agents-web-search"]
+    assert telemetry["deepening_search_used"] is True
+    assert telemetry["search_deepening_provider_sequence"] == ["agents-web-search"]
+    assert telemetry["search_providers_used"] == ["searxng", "agents-web-search"]
+    assert telemetry["agents_web_search_estimated_calls_used"] == 1
+
+
+def test_hybrid_search_provider_deepens_when_structured_enrichment_is_needed() -> None:
+    calls: list[str] = []
+
+    class FastProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"searxng:{query}:{num_results}")
+            return [
+                SearchResult(
+                    title="Company profile",
+                    link="https://example.test/company",
+                    snippet="Company source without people or partnership context.",
+                    source="searxng",
+                )
+            ]
+
+    class TavilyDeepeningProvider:
+        @property
+        def last_credit_usage(self) -> dict[str, object]:
+            return {"request_credits": 1, "status": "ok"}
+
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"tavily:{query}:{num_results}")
+            return [
+                SearchResult(
+                    title="Company leadership",
+                    link="https://example.test/team",
+                    snippet="Leadership and partnership context.",
+                    source="tavily",
+                )
+            ]
+
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng",),
+        deepening_provider_sequence=("tavily",),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=False,
+            needs_structured_enrichment=len(results) < 2,
+            reasons=("missing structured context",) if len(results) < 2 else (),
+        ),
+        provider_factory=lambda provider_name: (
+            FastProvider() if provider_name == "searxng" else TavilyDeepeningProvider()
+        ),
+    )
+
+    results = provider.search_web("Mentavi Health leadership", num_results=3)
+    telemetry = provider.telemetry()
+
+    assert calls == [
+        "searxng:Mentavi Health leadership:3",
+        "tavily:Mentavi Health leadership:3",
+    ]
+    assert [result.source for result in results] == ["searxng", "tavily"]
+    assert telemetry["deepening_search_used"] is True
+    assert telemetry["tavily_estimated_credits_used"] == 1
+    assert telemetry["provider_usage"]["tavily"]["credits_used"] == 1
+
+
+def test_hybrid_search_provider_skips_deepening_provider_when_fast_results_are_enough() -> None:
+    calls: list[str] = []
+
+    class FastProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"searxng:{query}:{num_results}")
+            return [
+                SearchResult(
+                    title="Strong result",
+                    link="https://example.test/strong",
+                    snippet="Strong source coverage.",
+                    source="searxng",
+                )
+            ]
+
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng",),
+        deepening_provider_sequence=("agents-web-search",),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=False,
+        ),
+        provider_factory=lambda _provider_name: FastProvider(),
+    )
+
+    results = provider.search_web("Mentavi Health", num_results=3)
+    telemetry = provider.telemetry()
+
+    assert calls == ["searxng:Mentavi Health:3"]
+    assert [result.source for result in results] == ["searxng"]
+    assert telemetry["deepening_search_used"] is False
+    assert telemetry["agents_web_search_estimated_calls_used"] == 0
 
 
 def test_hybrid_search_provider_uses_next_provider_after_provider_error() -> None:

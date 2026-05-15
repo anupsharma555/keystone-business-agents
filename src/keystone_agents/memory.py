@@ -273,6 +273,42 @@ def opportunity_entity_memory_items(
     return items
 
 
+def operator_reference_memory_item(
+    *,
+    title: str,
+    summary: str,
+    url: str = "",
+    request_text: str = "",
+    source: str = "chief_of_staff",
+    approval_state: ApprovalState | str = ApprovalState.APPROVED_FOR_RESEARCH,
+) -> MemoryItem:
+    """Build prompt-safe memory for an operator-supplied reference."""
+
+    bounded_title = _bounded_text(title or url or "Operator reference", max_chars=160)
+    bounded_summary = _bounded_text(summary or bounded_title, max_chars=500)
+    source_ids = [url] if url else ["operator_supplied_reference"]
+    return MemoryItem(
+        memory_type="operator_reference",
+        object_type="other",
+        object_id=url or bounded_title,
+        object_key=normalize_memory_key(bounded_title),
+        title=bounded_title,
+        summary=bounded_summary,
+        content={
+            "title": bounded_title,
+            "summary": bounded_summary,
+            "url": url,
+            "request_text": _bounded_text(request_text, max_chars=500),
+            "source": source,
+        },
+        source_ids=source_ids,
+        approval_state=approval_state,
+        confidence=0.8 if url else 0.6,
+        sensitivity="internal",
+        metadata={"source": source, "reference_url": url},
+    )
+
+
 def outreach_dedup_memory_items(
     draft: OutreachDraft | dict[str, Any],
     *,

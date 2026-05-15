@@ -14,6 +14,8 @@ MANAGED_KEYS: Final[tuple[str, ...]] = (
     "KEYSTONE_ENABLE_LIVE_SLACK",
     "KEYSTONE_ENABLE_LIVE_RESEARCH",
     "KEYSTONE_ENABLE_LIVE_CRM",
+    "KEYSTONE_ENABLE_WEBSITE_EXTRACTION",
+    "KEYSTONE_WEBSITE_EXTRACTOR",
     "SEARCH_PROVIDER",
     "AUTO_SEND_EMAIL",
 )
@@ -84,7 +86,7 @@ def _current_values(lines: list[str]) -> dict[str, str]:
 
 def _default_live_search_provider(current_values: dict[str, str]) -> str:
     existing = current_values.get("SEARCH_PROVIDER", "").strip().lower()
-    if existing in LIVE_SEARCH_PROVIDERS:
+    if existing in LIVE_SEARCH_PROVIDERS and existing != "serper":
         return existing
     return "searxng"
 
@@ -105,6 +107,8 @@ def mode_values(
             "KEYSTONE_ENABLE_LIVE_SLACK": "false",
             "KEYSTONE_ENABLE_LIVE_RESEARCH": "false",
             "KEYSTONE_ENABLE_LIVE_CRM": "false",
+            "KEYSTONE_ENABLE_WEBSITE_EXTRACTION": "false",
+            "KEYSTONE_WEBSITE_EXTRACTOR": "trafilatura",
             "SEARCH_PROVIDER": "dry-run",
             "AUTO_SEND_EMAIL": "false",
         }
@@ -116,6 +120,8 @@ def mode_values(
             "KEYSTONE_ENABLE_LIVE_SLACK": "false",
             "KEYSTONE_ENABLE_LIVE_RESEARCH": "true",
             "KEYSTONE_ENABLE_LIVE_CRM": "false",
+            "KEYSTONE_ENABLE_WEBSITE_EXTRACTION": "true",
+            "KEYSTONE_WEBSITE_EXTRACTOR": "trafilatura",
             "SEARCH_PROVIDER": live_search_provider,
             "AUTO_SEND_EMAIL": "false",
         }
@@ -127,6 +133,8 @@ def mode_values(
             "KEYSTONE_ENABLE_LIVE_SLACK": "true",
             "KEYSTONE_ENABLE_LIVE_RESEARCH": "true",
             "KEYSTONE_ENABLE_LIVE_CRM": "false",
+            "KEYSTONE_ENABLE_WEBSITE_EXTRACTION": "true",
+            "KEYSTONE_WEBSITE_EXTRACTOR": "trafilatura",
             "SEARCH_PROVIDER": live_search_provider,
             "AUTO_SEND_EMAIL": "false",
         }

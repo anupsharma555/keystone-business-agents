@@ -6,14 +6,14 @@ Nothing in this repository sends external email automatically.
 
 ## Agents
 
-The project centers on four specialist agents:
+The project centers on four business specialist agents:
 
 - Gmail Inbound Triage Agent: classifies inbound email, recommends labels, flags safety issues, and creates draft-only response recommendations.
 - Business Research Analyst: builds source-attributed briefs for companies, institutes, conferences, labs, topics, Zotero collections, and article collections; legacy company-profile workflows still produce fit and confidence scores.
 - Opportunity Scout Agent: finds or updates opportunity records, scores priority, and preserves approval gates before outreach.
 - Outreach Composer Agent: drafts email or LinkedIn copy only from approved context and marks all output for human approval.
 
-An Orchestrator Agent routes requests to those specialists and preserves an SDK handoff contract. The first end-to-end dry-run workflow calls the specialists in sequence without replacing them. For the two search-heavy routes, `keystone_agents.workflows.run_orchestrated_search_handoff(...)` now carries the orchestrator's `retrieval_hint` directly into Business Research Analyst or Opportunity Scout execution.
+An Orchestrator Agent routes requests to those specialists and preserves an SDK handoff contract. A KNI Chief of Staff Agent plans Slack operations routing and coordinates bounded internal review writes for automation audits, Google Doc dry-runs, Airtable-shaped mirrors, and private/admin Slack summaries. The first end-to-end dry-run workflow calls the specialists in sequence without replacing them. For the two search-heavy routes, `keystone_agents.workflows.run_orchestrated_search_handoff(...)` now carries the orchestrator's `retrieval_hint` directly into Business Research Analyst or Opportunity Scout execution.
 
 WorkItem workflows use a typed context-pack layer before specialist execution.
 Research, opportunity, outreach, and Gmail context packs are derived from the
@@ -95,6 +95,8 @@ datasets/evals, Agent Builder exploration, and future model migration, see
 For the local folder layout mapped to Agents SDK concepts, see
 `docs/AGENTS_SDK_CONFORMANCE.md`.
 For documentation navigation and extension guides, start with `docs/INDEX.md`.
+For the `@KNI` Slack bridge configuration, Slack scope requirements, and
+approval boundaries, see `docs/SLACK_BUSINESS_AGENT_MODE.md`.
 
 The default database is local SQLite:
 
@@ -113,7 +115,7 @@ timestamps and ET calendar dates for local business-day filtering.
 ## Deployment And Operations
 
 This repo is operated local-first by default. Use `docs/DEPLOYMENT.md` for setup,
-health checks, dry-run commands, live Serper/Gmail/Slack enablement, rollback,
+health checks, dry-run commands, live search/Gmail/Slack enablement, rollback,
 audit review, security checks, cost controls, and daily or weekly routines.
 Use `docs/RUNBOOK.md` as the shorter operator checklist.
 
@@ -128,9 +130,12 @@ python3 scripts/switch_operator_mode.py full-live
 
 The intended retrieval ladder for live research is:
 
-- `SearXNG` first for broad recall when no explicit provider override is set.
-- `Serper` when quality gates indicate precision search is needed, or when
-  `SEARCH_PROVIDER=serper` is explicitly selected.
+- `SearXNG` for broad recall when no explicit provider override is set.
+- `Agents hosted web search` as a capped parallel lane beside SearXNG for
+  default live research. The default cap is 2 hosted web-search requests per
+  run through `KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN`.
+- `Serper` only when `SEARCH_PROVIDER=serper` or `--search-provider serper` is
+  explicitly selected.
 - `Firecrawl` as an explicit `SearchProvider` option when configured, and as an
   optional website extraction provider when `KEYSTONE_WEBSITE_EXTRACTOR=firecrawl`.
 - `Trafilatura` as the default live-gated website extraction provider for
@@ -142,6 +147,27 @@ The intended retrieval ladder for live research is:
   collaboration, researcher, institute, conference, grant, trial, and role
   lanes. When a run under-fills, Scout can run bounded adaptive follow-up
   queries and SearXNG-compatible result-page deepening.
+- Manual and opportunity planners structure retrieval intent, desired count, and
+  safety constraints. They do not select providers; Business Research Analyst,
+  Opportunity Scout, Orchestrator handoffs, and Chief of Staff delegated
+  research use the shared retrieval policy above.
+
+For local live search, this repo owns a separate SearXNG runtime from
+`keystone-slack`:
+
+```bash
+./scripts/manage_searxng_headless.sh start
+export SEARCH_PROVIDER=searxng
+export SEARXNG_BASE_URL=http://127.0.0.1:18080
+export KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK=true
+export KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL=true
+export KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN=2
+```
+
+The runtime uses Colima profile `kba-searxng`, Docker context
+`colima-kba-searxng`, and host port `18080`. The Slack repo can keep its own
+`kni-searxng` profile on port `8080` without sharing lifecycle state.
+
   `KEYSTONE_OPPORTUNITY_FOLLOWUP_RESULT_CAP` controls follow-up results per
   query and is capped at 8.
 - Manual Orchestrator and Business Research Analyst calls can use the shared
@@ -243,7 +269,8 @@ Use `--save` on CLI scripts to write local SQLite audit records. No storage writ
 ```
 
 Tests use fixtures and mocks only. They do not require OpenAI, Gmail, Slack,
-SearXNG, Serper, Firecrawl, Apify, Browserless, or other live API keys.
+SearXNG, hosted web search, Serper, Firecrawl, Apify, Browserless, or other
+live API keys.
 
 Use `.venv/bin/python scripts/check_quality.py` for the full local gate with
 coverage, ruff, and dependency audit.
@@ -256,6 +283,9 @@ The safety model is enforced through prompts, schemas, guardrails, tool boundari
 - Live integrations require explicit CLI flags and credentials.
 - Gmail live mode is limited to reading, labeling, and draft creation behind `--live-gmail --no-dry-run`.
 - Slack approval notifications require `--request-approval --live-slack --no-dry-run`.
+- Slack `@KNI` business-agent mode keeps Slack context, background thread
+  results, approval-card posting, message actions, Slack history access, live
+  model execution, live search, and Gmail draft creation as separate flags.
 - Live search requires `--live-search --no-dry-run`.
 - PHI and patient-specific content are blocked.
 - Medical, legal, tax, and regulatory advice are blocked.
@@ -275,7 +305,8 @@ Outbound communication is draft-only. The codebase does not expose an implemente
 Implemented:
 
 - Shared OpenAI Agents SDK helper layer and model-provider configuration.
-- Four specialist SDK agent builders.
+- Four business specialist SDK agent builders, plus Orchestrator and KNI Chief
+  of Staff agent builders.
 - Shared `skills.md` and `tools.md` prompt contracts that document agent capabilities,
   current tools, future tool gaps, and safe tool-addition rules.
 - Guarded local helper tools for approved contact/CRM context lookup, approval queue
@@ -285,6 +316,8 @@ Implemented:
   prompt, tool, schema, live-flag, eval, validation, handoff, and safety
   metadata.
 - Orchestrator Agent with intended handoff metadata and deterministic routing.
+- KNI Chief of Staff Agent for Slack operations routing, automation inventory
+  review, and bounded internal operating-layer writes.
 - Deterministic dry-run fixture wrappers for triage, company research, opportunity scouting, and outreach drafting.
 - Typed WorkItem context packs and readiness gates for research, opportunity,
   outreach, and Gmail paths, with timeline metadata for pack selection and gate
@@ -293,10 +326,15 @@ Implemented:
 - Conservative automation controller for staged weekly opportunity runs and
   scoped Gmail preview/apply/draft stages, with health preflight, lock file,
   bounded counts, pending-approval checks, redacted errors, and no-send summary.
+- Top 3 opportunity-to-outreach dry-run loop across company, conference,
+  journal call, contract/RFP, grant, trial, researcher, and institute lanes,
+  with source-backed contact-path fallback and provider-performance telemetry.
 - SQLite storage and audit logging for agent runs, emails, companies, opportunities, outreach drafts, manual outreach tracking, approvals, approval queue items, feedback, sources, and tool events.
 - SQLite schema migration tracking for local storage evolution.
 - Explicit live Gmail read, label, and draft-only operations.
-- Explicit live search for Researcher/company research and opportunity scouting through `SearchProvider`. SearXNG, Serper, and Firecrawl are supported when configured; tests remain offline.
+- Explicit live search for Researcher/company research and opportunity scouting
+  through `SearchProvider`. Default live research uses SearXNG plus capped
+  hosted web search; Serper and Firecrawl remain explicit configured options.
 - Live-gated website extraction for selected company pages through Trafilatura
   by default or Firecrawl when explicitly configured, with optional fallback
   between those two extractors.
@@ -308,6 +346,8 @@ Not implemented:
 - Live email sending.
 - Autonomous approval.
 - Live production pipeline execution outside the narrow explicit integrations above.
-- Live Apify, Browserless, Airtable, Google Sheets, CRM, or Google Docs writes.
+- Live Apify, Browserless, Airtable, Google Sheets, CRM, or Google Docs writes
+  as automatic production side effects. Chief of Staff exposes dry-run/internal
+  review publishing surfaces; live providers must be added as reviewed adapters.
 - LangGraph orchestration.
 - Server-backed storage.

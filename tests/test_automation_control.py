@@ -82,6 +82,10 @@ def test_weekly_dry_run_uses_save_without_live_flags(
     assert output["automation"]["gmail_writes_enabled"] is False
     assert output["automation"]["external_writes_enabled"] is False
     assert output["automation"]["agent_run_id"] == 42
+    runs = SQLiteStore(_db_url(tmp_path / "weekly.db")).list_automation_runs(limit=5)
+    assert runs[0].automation_id == "auto_weekly_opportunity"
+    assert runs[0].stage == "dry-run"
+    assert runs[0].approval_count == 1
 
 
 def test_weekly_live_research_requires_operator_confirmation(tmp_path: Path) -> None:
@@ -264,3 +268,5 @@ def test_child_failure_is_redacted_and_returns_child_code(
     assert code == 7
     assert "sk-" + ("x" * 24) not in captured.err
     assert "[REDACTED]" in captured.err
+    runs = SQLiteStore(_db_url(tmp_path / "weekly.db")).list_automation_runs(status="failed")
+    assert runs[0].status.value == "failed"

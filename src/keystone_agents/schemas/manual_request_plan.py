@@ -12,6 +12,7 @@ ManualTargetAgent = Literal[
     "business_research_analyst",
     "opportunity_scout",
     "outreach_composer",
+    "chief_of_staff",
     "clarification",
 ]
 
@@ -20,8 +21,11 @@ ManualRequestIntent = Literal[
     "company_research",
     "research_brief",
     "opportunity_search",
+    "opportunity_to_outreach_loop",
     "gmail_triage",
     "outreach_draft",
+    "slack_operations",
+    "reference_capture",
     "continue_work_item",
     "blocked_send",
     "clarification",
@@ -38,6 +42,8 @@ ManualTargetType = Literal[
     "gmail_thread",
     "topic",
     "opportunity",
+    "operator_reference",
+    "slack_channel",
     "unknown",
 ]
 

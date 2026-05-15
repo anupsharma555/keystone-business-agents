@@ -1474,27 +1474,68 @@ class GmailTool:
         }
         return enforce_tool_output_guardrails("gmail_create_draft_reply", output)
 
-    def create_draft(self, to: str, subject: str, body: str) -> dict[str, Any]:
-        if not self.live:
-            return self.create_draft_reply(
-                message_id="dry-run-message",
-                body=body,
-                to=to,
-                subject=subject,
-            )
+    def current_account_email(self) -> str:
+        """Return the authenticated Gmail account for live account scoping."""
 
+        if not self.live:
+            return ""
+        data = self._request("GET", "profile", operation="get Gmail profile")
+        email_address = str(data.get("emailAddress") or "").strip()
+        if not email_address:
+            raise GmailAPIError("Gmail API profile response did not include emailAddress.")
+        return email_address
+
+    def create_draft(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        *,
+        expected_account: str | None = None,
+    ) -> dict[str, Any]:
         enforce_tool_input_guardrails(
             "gmail_create_draft",
-            {"to": to, "subject": subject, "body": body},
+            {
+                "to": to,
+                "subject": subject,
+                "body": body,
+                "expected_account": expected_account or "",
+            },
         )
         to_address = to.strip()
         if not to_address:
             raise ValueError("Gmail draft recipient cannot be empty.")
+        subject_text = subject.strip()
+        body_text = body.strip()
+        expected = (expected_account or "").strip()
+        if not self.live:
+            return enforce_tool_output_guardrails(
+                "gmail_create_draft",
+                {
+                    "status": "dry-run",
+                    "message_id": "dry-run-message",
+                    "draft_id": "",
+                    "to": to_address,
+                    "subject": subject_text,
+                    "body_preview": body_text[:120],
+                    "gmail_account": expected,
+                    "sent": False,
+                    "approval_required": True,
+                },
+            )
+        current_account = ""
+        if expected:
+            current_account = self.current_account_email()
+            if current_account.lower() != expected.lower():
+                raise GmailConfigurationError(
+                    "Live Gmail draft creation is configured for "
+                    f"{expected}, but OAuth is authenticated as {current_account}."
+                )
 
         message = EmailMessage()
         message["To"] = to_address
-        message["Subject"] = subject.strip()
-        message.set_content(body.strip())
+        message["Subject"] = subject_text
+        message.set_content(body_text)
 
         encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         data = self._request(
@@ -1511,8 +1552,9 @@ class GmailTool:
             "message_id": str(created_message.get("id") or ""),
             "draft_id": str(data.get("id") or ""),
             "to": to_address,
-            "subject": subject.strip(),
-            "body_preview": body[:120],
+            "subject": subject_text,
+            "body_preview": body_text[:120],
+            "gmail_account": current_account or expected,
             "sent": False,
             "approval_required": True,
         }

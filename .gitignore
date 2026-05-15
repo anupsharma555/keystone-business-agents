@@ -11,6 +11,8 @@ authorized_user*.json
 .pytest_cache/
 .ruff_cache/
 .keystone/
+.local/
+.playwright-mcp/
 .cache/
 artifacts/
 __pycache__/

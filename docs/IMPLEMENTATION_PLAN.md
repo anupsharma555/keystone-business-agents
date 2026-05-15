@@ -253,11 +253,11 @@ SDK usage expectations:
 
 ## Optional LangGraph Orchestration Layer
 
-LangGraph should not be implemented in version 1.
+LangGraph is implemented only as an optional WorkItem orchestration wrapper. It
+is not part of the core dependency set and does not replace OpenAI Agents SDK
+agent builders, prompts, schemas, tools, or Python safety gates.
 
-Later, a LangGraph layer may be useful for long-running workflows with resumable state, branching, dashboard visibility, and human approval checkpoints. The v1 design should keep orchestration interfaces clean enough to allow this later without replacing the OpenAI Agents SDK agents.
-
-Version 1 orchestration should remain a small Python module that:
+Version 1 orchestration remains a small Python module that:
 
 - Runs agents in a deterministic order.
 - Passes structured outputs between agents.
@@ -265,7 +265,7 @@ Version 1 orchestration should remain a small Python module that:
 - Stops at human approval gates.
 - Never sends external communication.
 
-Future LangGraph candidates:
+Future LangGraph expansion candidates:
 
 - Inbound email to triage to draft workflow.
 - Business research waterfall.
@@ -585,7 +585,7 @@ Live integration gates:
 - No autonomous processing of PHI or patient-specific records.
 - No medical, legal, tax, or regulatory advice generation.
 - No unsupported Keystone claims, case studies, customer references, or outcomes.
-- No LangGraph implementation in v1.
+- No graph-native rewrite of SDK specialists.
 - No browser dashboard until the core contracts, tests, and dry-run flows are stable.
 - No broad web scraping system until source policy, rate limits, robots considerations, and attribution behavior are reviewed.
 

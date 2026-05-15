@@ -28,6 +28,7 @@ from keystone_agents.model_provider import (
 )
 from keystone_agents.models import AgentRunRequest, AgentRunResult, RunMode, TypedAgentRunResult
 from keystone_agents.sdk import AgentLike, run_typed_sdk_sync
+from keystone_agents.sdk_sessions import build_sdk_session_from_env
 
 TOutput = TypeVar("TOutput")
 TRaw = TypeVar("TRaw")
@@ -98,6 +99,7 @@ def run_typed_sdk_agent(
     run_config: Any | None = None,
     live: bool = False,
     config: ModelConfig | None = None,
+    session: Any | None = None,
     workflow_name: str | None = None,
     group_id: str | None = None,
     trace_metadata: TraceMetadata | None = None,
@@ -121,6 +123,7 @@ def run_typed_sdk_agent(
         )
         model_provider = model_config.provider
         model_name = model_config.model
+    resolved_session = session or build_sdk_session_from_env()
     raw_result, output = run_typed_sdk_sync(
         agent,
         prompt_from_typed_input(typed_input),
@@ -128,6 +131,7 @@ def run_typed_sdk_agent(
         run_config=run_config,
         live=live,
         config=config,
+        session=resolved_session,
         workflow_name=workflow_name,
         group_id=group_id,
         trace_metadata=trace_metadata,
@@ -397,6 +401,7 @@ def run_retrieved_sdk_synthesis(
     run_config: Any | None = None,
     live: bool = False,
     config: ModelConfig | None = None,
+    session: Any | None = None,
     workflow_name: str | None = None,
     group_id: str | None = None,
     trace_metadata: TraceMetadata | None = None,
@@ -487,6 +492,7 @@ def run_retrieved_sdk_synthesis(
                     run_config=run_config,
                     live=live,
                     config=attempt_config,
+                    session=session,
                     workflow_name=workflow,
                     group_id=group_id,
                     trace_metadata=resolved_trace_metadata,
@@ -503,11 +509,9 @@ def run_retrieved_sdk_synthesis(
                 last_exc = exc
                 if isinstance(
                     exc,
-                    (
-                        AgentRunBudgetExceededError,
-                        MissingOpenAIAPIKeyError,
-                        ModelProviderConfigurationError,
-                    ),
+                    AgentRunBudgetExceededError
+                    | MissingOpenAIAPIKeyError
+                    | ModelProviderConfigurationError,
                 ):
                     raise
                 if attempt_index >= len(live_attempts) - 1:
