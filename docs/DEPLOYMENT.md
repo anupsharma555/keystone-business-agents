@@ -280,7 +280,12 @@ For SearXNG:
 ```bash
 export SEARCH_PROVIDER=searxng
 export SEARXNG_BASE_URL="http://127.0.0.1:18080"
+export KEYSTONE_SEARXNG_TRANSIENT=true
 ```
+
+`KEYSTONE_SEARXNG_TRANSIENT=true` lets one-off Slack/CLI live-search runs start
+the repo-local Colima/SearXNG runtime on demand and stop it afterward only when
+that run started it.
 
 For Firecrawl search:
 

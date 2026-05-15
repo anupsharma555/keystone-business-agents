@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from keystone_agents.agents.business_research_analyst import (
     build_company_research_queries,
@@ -52,6 +56,7 @@ DEFAULT_SANDBOX_SEARCH_REVIEW_CONTEXT_SIZE = "low"
 DEFAULT_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 8
 MAX_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 12
 DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN = 2
+DEFAULT_SEARXNG_TRANSIENT_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -372,56 +377,64 @@ def retrieve_company_profile_live(
     search_results: list[Any] = []
     query_timings: list[dict[str, Any]] = []
     telemetry_packets: list[dict[str, Any]] = []
-    search_started_at = perf_counter()
-    search_concurrency = min(_company_search_concurrency(), max(1, len(queries)))
-    if search_concurrency <= 1 or len(queries) <= 1:
-        for query in queries:
-            query_started_at = perf_counter()
-            results = client.search_web(query, num_results=max_results)
-            query_timings.append(
-                {
-                    "query": query,
-                    "seconds": round(perf_counter() - query_started_at, 3),
-                    "result_count": len(results),
-                }
-            )
-            search_results.extend(results)
-        telemetry_packets.append(client.telemetry())
-    else:
-        ordered_results: list[list[Any]] = [[] for _query in queries]
-
-        def run_query(index: int, query: str) -> tuple[int, str, list[Any], float, dict[str, Any]]:
-            query_client = build_client()
-            query_started_at = perf_counter()
-            results = query_client.search_web(query, num_results=max_results)
-            return (
-                index,
-                query,
-                results,
-                perf_counter() - query_started_at,
-                query_client.telemetry(),
-            )
-
-        with ThreadPoolExecutor(max_workers=search_concurrency) as executor:
-            futures = {
-                executor.submit(run_query, index, query): (index, query)
-                for index, query in enumerate(queries)
-            }
-            for future in as_completed(futures):
-                index, query, results, seconds, telemetry = future.result()
-                ordered_results[index] = results
-                telemetry_packets.append(telemetry)
+    with _maybe_transient_searxng_runtime(
+        provider_sequence=search_config.provider_sequence,
+        settings=settings,
+        enabled=search_provider_builder is build_search_provider,
+    ) as searxng_runtime:
+        search_started_at = perf_counter()
+        search_concurrency = min(_company_search_concurrency(), max(1, len(queries)))
+        if search_concurrency <= 1 or len(queries) <= 1:
+            for query in queries:
+                query_started_at = perf_counter()
+                results = client.search_web(query, num_results=max_results)
                 query_timings.append(
                     {
                         "query": query,
-                        "seconds": round(seconds, 3),
+                        "seconds": round(perf_counter() - query_started_at, 3),
                         "result_count": len(results),
                     }
                 )
-        for results in ordered_results:
-            search_results.extend(results)
+                search_results.extend(results)
+            telemetry_packets.append(client.telemetry())
+        else:
+            ordered_results: list[list[Any]] = [[] for _query in queries]
 
-    search_seconds = perf_counter() - search_started_at
+            def run_query(
+                index: int,
+                query: str,
+            ) -> tuple[int, str, list[Any], float, dict[str, Any]]:
+                query_client = build_client()
+                query_started_at = perf_counter()
+                results = query_client.search_web(query, num_results=max_results)
+                return (
+                    index,
+                    query,
+                    results,
+                    perf_counter() - query_started_at,
+                    query_client.telemetry(),
+                )
+
+            with ThreadPoolExecutor(max_workers=search_concurrency) as executor:
+                futures = {
+                    executor.submit(run_query, index, query): (index, query)
+                    for index, query in enumerate(queries)
+                }
+                for future in as_completed(futures):
+                    index, query, results, seconds, telemetry = future.result()
+                    ordered_results[index] = results
+                    telemetry_packets.append(telemetry)
+                    query_timings.append(
+                        {
+                            "query": query,
+                            "seconds": round(seconds, 3),
+                            "result_count": len(results),
+                        }
+                    )
+            for results in ordered_results:
+                search_results.extend(results)
+
+        search_seconds = perf_counter() - search_started_at
     quality_started_at = perf_counter()
     search_quality = assess_company_search_quality(
         results=search_results,
@@ -459,6 +472,7 @@ def retrieve_company_profile_live(
             "search_queries": queries,
             "raw_search_result_count": len(search_results),
             "max_results": max_results,
+            "searxng_transient_runtime": dict(searxng_runtime),
             "search_quality": search_quality.to_dict(),
             "source_coverage": search_quality.source_coverage,
             "timing": {
@@ -780,6 +794,91 @@ def _agents_web_search_request_budget(*, enabled: bool) -> ProviderRequestBudget
     except ValueError:
         cap = DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN
     return ProviderRequestBudget({"agents-web-search": max(0, cap)})
+
+
+@contextmanager
+def _maybe_transient_searxng_runtime(
+    *,
+    provider_sequence: tuple[str, ...],
+    settings: Any,
+    enabled: bool = True,
+) -> Any:
+    """Start repo-local SearXNG for one live run, then stop it if we started it."""
+
+    metadata: dict[str, Any] = {
+        "enabled": False,
+        "started": False,
+        "stopped": False,
+        "reason": "not_needed",
+    }
+    base_url = str(getattr(settings, "searxng_base_url", "") or "")
+    if not enabled:
+        metadata["reason"] = "custom_search_provider_builder"
+        yield metadata
+        return
+    if "searxng" not in provider_sequence:
+        yield metadata
+        return
+    if not _env_bool("KEYSTONE_SEARXNG_TRANSIENT", default=True):
+        metadata["reason"] = "disabled"
+        yield metadata
+        return
+    if not _is_local_searxng_base_url(base_url):
+        metadata["reason"] = "non_local_base_url"
+        yield metadata
+        return
+    metadata.update({"enabled": True, "base_url": base_url})
+    if _searxng_endpoint_reachable(base_url):
+        metadata["reason"] = "already_running"
+        yield metadata
+        return
+
+    metadata["reason"] = "started_for_run"
+    _run_searxng_lifecycle_command("start")
+    metadata["started"] = True
+    try:
+        yield metadata
+    finally:
+        _run_searxng_lifecycle_command("stop", check=False)
+        metadata["stopped"] = True
+
+
+def _is_local_searxng_base_url(base_url: str) -> bool:
+    if not base_url:
+        return False
+    parsed = urlparse(base_url)
+    return (parsed.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def _searxng_endpoint_reachable(base_url: str) -> bool:
+    endpoint = base_url.rstrip("/") + "/search?q=searxng%20health%20check&format=json"
+    try:
+        with urlopen(endpoint, timeout=DEFAULT_SEARXNG_TRANSIENT_TIMEOUT_SECONDS) as response:
+            return 200 <= int(getattr(response, "status", 200)) < 500
+    except Exception:
+        return False
+
+
+def _run_searxng_lifecycle_command(command: str, *, check: bool = True) -> None:
+    root = Path(os.getenv("KBA_REPO_ROOT") or Path(__file__).resolve().parents[2])
+    script = root / "scripts" / "manage_searxng_headless.sh"
+    if not script.exists():
+        if check:
+            raise RuntimeError(f"SearXNG lifecycle script not found: {script}")
+        return
+    completed = subprocess.run(
+        [str(script), command],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if check and completed.returncode != 0:
+        details = "\n".join(
+            part.strip()
+            for part in (completed.stdout, completed.stderr)
+            if part and part.strip()
+        )
+        raise RuntimeError(f"SearXNG transient {command} failed: {details}")
 
 
 def _sandbox_search_review_source_limit(max_results: int) -> int:
@@ -1117,29 +1216,42 @@ def run_opportunity_scout_live(
 ) -> tuple[OpportunityScoutResult, dict[str, Any]]:
     """Run Opportunity Scout live search with orchestrator-aware retrieval hints."""
 
+    settings_loader = settings_loader or load_settings
+    settings = settings_loader()
     provider = build_opportunity_search_provider(
         topic=topic,
         requested_provider=requested_provider,
         fallback_provider=fallback_provider,
         desired_results=max_results,
         retrieval_hint=retrieval_hint,
-        settings_loader=settings_loader,
+        settings_loader=lambda: settings,
         search_provider_builder=search_provider_builder,
     )
-    result = scout_opportunities_live_search(
-        topic=topic,
-        max_results=max_results,
-        search_plan=search_plan,
-        search_provider=provider,
-        save=save,
-        existing_state=existing_state,
-    )
-    collected_results = provider.collected_results()
-    metadata = provider.telemetry()
+    effective_provider_builder = search_provider_builder or build_search_provider
+    provider_sequence = tuple(getattr(provider, "provider_sequence", ()) or ())
+    with _maybe_transient_searxng_runtime(
+        provider_sequence=provider_sequence,
+        settings=settings,
+        enabled=(
+            effective_provider_builder is build_search_provider
+            and bool(provider_sequence)
+        ),
+    ) as searxng_runtime:
+        result = scout_opportunities_live_search(
+            topic=topic,
+            max_results=max_results,
+            search_plan=search_plan,
+            search_provider=provider,
+            save=save,
+            existing_state=existing_state,
+        )
+        collected_results = provider.collected_results()
+        metadata = provider.telemetry()
     metadata.update(
         {
             "search_provider": search_provider_label(metadata),
             "fallback_search_provider": fallback_provider,
+            "searxng_transient_runtime": dict(searxng_runtime),
             "search_provider_fallback_used": metadata.get(
                 "provider_error_fallback_used",
                 False,

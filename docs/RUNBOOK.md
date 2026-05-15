@@ -412,10 +412,14 @@ For the repo-local SearXNG instance:
 ```bash
 ./scripts/manage_searxng_headless.sh start
 export SEARXNG_BASE_URL="http://127.0.0.1:18080"
+export KEYSTONE_SEARXNG_TRANSIENT=true
 ```
 
 This uses the `kba-searxng` Colima profile and port `18080`, separate from the
-`keystone-slack` SearXNG runtime.
+`keystone-slack` SearXNG runtime. Live company and Opportunity Scout retrieval
+transiently start this local runtime when a run needs SearXNG and the endpoint
+is not already reachable. They stop it afterward only when the current process
+started it; an already-running runtime is left alone.
 
 For Firecrawl search, set `SEARCH_PROVIDER=firecrawl`, `FIRECRAWL_API_KEY`, and
 optionally `FIRECRAWL_BASE_URL`, or pass `--search-provider firecrawl`.

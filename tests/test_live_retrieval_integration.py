@@ -433,6 +433,55 @@ def test_opportunity_search_provider_caps_agents_web_search_parallel_calls(
     )
 
 
+def test_transient_searxng_runtime_starts_and_stops_when_needed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    calls: list[tuple[str, bool]] = []
+    monkeypatch.setattr(live_retrieval, "_searxng_endpoint_reachable", lambda _base_url: False)
+    monkeypatch.setattr(
+        live_retrieval,
+        "_run_searxng_lifecycle_command",
+        lambda command, *, check=True: calls.append((command, check)),
+    )
+
+    with live_retrieval._maybe_transient_searxng_runtime(
+        provider_sequence=("searxng", "agents-web-search"),
+        settings=SimpleNamespace(searxng_base_url="http://127.0.0.1:18080"),
+    ) as metadata:
+        assert metadata["enabled"] is True
+        assert metadata["started"] is True
+        assert metadata["reason"] == "started_for_run"
+
+    assert metadata["stopped"] is True
+    assert calls == [("start", True), ("stop", False)]
+
+
+def test_transient_searxng_runtime_leaves_existing_runtime_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    calls: list[str] = []
+    monkeypatch.setattr(live_retrieval, "_searxng_endpoint_reachable", lambda _base_url: True)
+    monkeypatch.setattr(
+        live_retrieval,
+        "_run_searxng_lifecycle_command",
+        lambda command, *, check=True: calls.append(command),
+    )
+
+    with live_retrieval._maybe_transient_searxng_runtime(
+        provider_sequence=("searxng",),
+        settings=SimpleNamespace(searxng_base_url="http://127.0.0.1:18080"),
+    ) as metadata:
+        assert metadata["reason"] == "already_running"
+
+    assert metadata["started"] is False
+    assert metadata["stopped"] is False
+    assert calls == []
+
+
 def test_opportunity_search_provider_can_enable_tavily_deepening(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
