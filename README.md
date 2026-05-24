@@ -262,6 +262,20 @@ remains draft-only and normally stops at
 
 Use `--save` on CLI scripts to write local SQLite audit records. No storage write occurs unless `--save` is passed.
 
+## Secret Hygiene Scan
+
+Run the repo-wide tracked-file secret scan locally:
+
+```bash
+.venv/bin/python scripts/scan_repo_secrets.py
+.venv/bin/python scripts/scan_repo_secrets.py --json
+```
+
+The scanner checks git-tracked text files for high-signal credential patterns
+(OpenAI keys, GitHub PATs, Slack tokens, AWS access key IDs, Google key/token
+shapes, and private key headers). It exits non-zero when a likely secret is
+detected. CI also enforces this via `tests/test_architecture.py::test_no_obvious_repo_secrets_present`.
+
 ## Tests
 
 ```bash
