@@ -9,6 +9,7 @@ from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
 from keystone_agents.memory import (
     WorkflowDedupAction,
     approval_decision_memory_item,
+    build_chief_of_staff_memory_context,
     build_email_style_profile_from_feedback,
     build_workflow_dedup_memory,
     company_profile_memory_items,
@@ -72,6 +73,31 @@ def retrieve_memory(
             "approved_only": approved_only,
             "send_enabled": False,
             "records": records,
+        }
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def retrieve_chief_of_staff_memory(
+    query: str = "",
+    object_key: str | None = None,
+    route: str = "",
+    limit: int = 8,
+    database_url: str | None = None,
+) -> str:
+    """Retrieve approved prompt-safe Chief of Staff strategic memory."""
+
+    context = build_chief_of_staff_memory_context(
+        query=query,
+        object_key=object_key,
+        route=route,
+        limit=limit,
+        database_url=database_url or database_url_from_env(),
+    )
+    return _json_payload(
+        {
+            "mode": "chief_of_staff_memory",
+            **context.model_dump(mode="json"),
         }
     )
 

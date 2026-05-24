@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from keystone_agents.schemas.approval import (
@@ -15,7 +16,11 @@ from keystone_agents.schemas.approval import (
 from keystone_agents.schemas.company_profile import ClaimEvidenceRecord, CompanyProfile
 from keystone_agents.schemas.email_style import EmailStyleProfile
 from keystone_agents.schemas.feedback import FeedbackRecord
-from keystone_agents.schemas.memory import MemoryItem, normalize_memory_key
+from keystone_agents.schemas.memory import (
+    ChiefOfStaffMemoryContext,
+    MemoryItem,
+    normalize_memory_key,
+)
 from keystone_agents.schemas.opportunity import (
     OpportunityRecord as ScoutOpportunityRecord,
 )
@@ -30,6 +35,61 @@ WorkflowDedupAction = Literal[
     "outreach_company",
     "outbound_email",
 ]
+
+CHIEF_OF_STAFF_MEMORY_TYPES = (
+    "operator_strategy",
+    "project_goal",
+    "project_constraint",
+    "project_decision",
+    "project_status_snapshot",
+    "portfolio_priority",
+    "budget_assumption",
+    "avoidance_rule",
+    "operator_reference",
+)
+
+CHIEF_OF_STAFF_ROUTE_MEMORY_TYPES: dict[str, tuple[str, ...]] = {
+    "project-context-review": (
+        "project_goal",
+        "project_constraint",
+        "project_decision",
+        "project_status_snapshot",
+        "portfolio_priority",
+        "operator_strategy",
+        "avoidance_rule",
+    ),
+    "budget-resource-review": (
+        "budget_assumption",
+        "project_constraint",
+        "project_decision",
+        "project_status_snapshot",
+        "operator_strategy",
+    ),
+    "meeting-prep": (
+        "project_goal",
+        "project_constraint",
+        "project_decision",
+        "project_status_snapshot",
+        "portfolio_priority",
+    ),
+    "portfolio-review": (
+        "portfolio_priority",
+        "project_status_snapshot",
+        "project_constraint",
+        "project_decision",
+        "operator_strategy",
+        "avoidance_rule",
+    ),
+    "research-direction-review": (
+        "operator_strategy",
+        "project_goal",
+        "project_constraint",
+        "project_decision",
+        "portfolio_priority",
+        "avoidance_rule",
+    ),
+    "memory-review": CHIEF_OF_STAFF_MEMORY_TYPES,
+}
 
 
 def company_profile_memory_items(
@@ -306,6 +366,110 @@ def operator_reference_memory_item(
         confidence=0.8 if url else 0.6,
         sensitivity="internal",
         metadata={"source": source, "reference_url": url},
+    )
+
+
+def chief_of_staff_memory_item(
+    *,
+    memory_type: str,
+    title: str,
+    summary: str,
+    object_id: str = "",
+    object_key: str = "",
+    content: dict[str, Any] | None = None,
+    source_ids: Sequence[str] = (),
+    approval_state: ApprovalState | str = ApprovalState.APPROVED_FOR_RESEARCH,
+    confidence: float = 0.7,
+    sensitivity: str = "internal",
+    supersedes_memory_id: int | None = None,
+    expires_at: str | None = None,
+) -> MemoryItem:
+    """Build one prompt-safe strategic memory item for Chief of Staff."""
+
+    if memory_type not in CHIEF_OF_STAFF_MEMORY_TYPES:
+        raise ValueError(f"unsupported Chief of Staff memory type: {memory_type}")
+    bounded_title = _bounded_text(title or summary or memory_type, max_chars=160)
+    bounded_summary = _bounded_text(summary or bounded_title, max_chars=500)
+    resolved_object_id = _bounded_text(object_id or bounded_title, max_chars=160)
+    if memory_type in {"portfolio_priority", "operator_strategy", "avoidance_rule"}:
+        object_type = "portfolio" if memory_type == "portfolio_priority" else "operator_strategy"
+    else:
+        object_type = "project"
+    return MemoryItem(
+        memory_type=memory_type,  # type: ignore[arg-type]
+        object_type=object_type,  # type: ignore[arg-type]
+        object_id=resolved_object_id,
+        object_key=normalize_memory_key(object_key or resolved_object_id),
+        title=bounded_title,
+        summary=bounded_summary,
+        content={
+            "summary": bounded_summary,
+            "memory_type": memory_type,
+            "source": "chief_of_staff",
+            **(content or {}),
+        },
+        source_ids=list(
+            dict.fromkeys(
+                _bounded_text(item, max_chars=240) for item in source_ids if item
+            )
+        ),
+        approval_state=approval_state,
+        confidence=max(0.0, min(1.0, confidence)),
+        sensitivity=sensitivity,  # type: ignore[arg-type]
+        metadata={"source": "chief_of_staff", "strategic_memory": True},
+        supersedes_memory_id=supersedes_memory_id,
+        expires_at=expires_at,
+    )
+
+
+def build_chief_of_staff_memory_context(
+    *,
+    query: str = "",
+    route: str = "",
+    object_key: str | None = None,
+    memory_types: Sequence[str] | None = None,
+    limit: int = 8,
+    database_url: str | None = None,
+) -> ChiefOfStaffMemoryContext:
+    """Retrieve bounded approved strategic memory for a Chief of Staff run."""
+
+    selected_types = tuple(
+        memory_types
+        or CHIEF_OF_STAFF_ROUTE_MEMORY_TYPES.get(route, CHIEF_OF_STAFF_MEMORY_TYPES)
+    )
+    store = SQLiteStore(database_url)
+    records = store.retrieve_memory(
+        query=query,
+        object_key=object_key,
+        memory_types=list(selected_types),
+        limit=max(1, min(int(limit or 8), 12)),
+        approved_only=True,
+        safe_for_prompt=True,
+    )
+    all_relevant = store.list_memory_items(approved_only=True, safe_for_prompt=True)
+    superseded_ids = {
+        item.supersedes_memory_id for item in all_relevant if item.supersedes_memory_id
+    }
+    filtered = [
+        item
+        for item in records
+        if (item.id not in superseded_ids) and not _memory_item_is_expired(item)
+    ]
+    missing_reason = ""
+    if not filtered:
+        missing_reason = (
+            "No approved prompt-safe Chief of Staff strategic memory matched this request."
+        )
+    return ChiefOfStaffMemoryContext(
+        query=query,
+        route=route,
+        object_key=object_key or "",
+        memory_types=list(selected_types),
+        records=filtered,
+        missing_reason=missing_reason,
+        approved_only=True,
+        safe_for_prompt=True,
+        send_enabled=False,
     )
 
 
@@ -868,6 +1032,18 @@ def _bounded_score(value: Any) -> int:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError):
         return 0
+
+
+def _memory_item_is_expired(item: MemoryItem) -> bool:
+    if not item.expires_at:
+        return False
+    try:
+        expires_at = datetime.fromisoformat(item.expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return expires_at <= datetime.now(UTC)
 
 
 def _first_non_empty(*values: Any) -> str:

@@ -21,6 +21,10 @@ from keystone_agents.tools.gmail_tool import (
     get_thread,
     list_threads_by_label_filter,
 )
+from keystone_agents.tools.html_review_tool import (
+    HtmlReviewResult,
+    extract_research_claims_from_html,
+)
 from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
@@ -30,6 +34,7 @@ from keystone_agents.tools.memory_tool import (
     check_workflow_duplicate,
     learn_email_style_profile,
     record_workflow_dedup,
+    retrieve_chief_of_staff_memory,
     retrieve_memory,
     retrieve_outreach_examples,
     save_approval_decision_memory,
@@ -76,9 +81,12 @@ __all__ = [
     "get_gmail_message",
     "get_thread",
     "list_threads_by_label_filter",
+    "HtmlReviewResult",
+    "extract_research_claims_from_html",
     "list_local_context_sources",
     "search_local_context",
     "read_local_context_file",
+    "retrieve_chief_of_staff_memory",
     "retrieve_memory",
     "retrieve_outreach_examples",
     "save_approval_decision_memory",

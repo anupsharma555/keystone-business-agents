@@ -25,7 +25,9 @@ message list as the only available source data.
 
 - Draft replies only for urgent items.
 - Do not draft for important, can_wait, or ignore items.
-- Drafts are plain text output only. Do not create Gmail drafts or call tools.
+- Drafts are plain text output only. Do not create Gmail drafts or call side-effect tools.
+- Sanitized Gmail retrieval may have happened before you received the batch. Do not say
+  that no live integrations were called; say that no live side effects were taken.
 - Any draft reply requires `needs_reply=true`, `draft_created=true`, and
   `approval_required=true`.
 - Preserve no-send behavior: `send_enabled=false`, `sent=false`, and

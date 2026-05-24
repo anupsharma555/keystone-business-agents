@@ -4,8 +4,10 @@ import json
 
 from keystone_agents.memory import (
     approval_decision_memory_item,
+    build_chief_of_staff_memory_context,
     build_email_style_profile_from_feedback,
     check_workflow_duplicate,
+    chief_of_staff_memory_item,
     company_profile_memory_items,
     email_style_memory_item,
     feedback_memory_item,
@@ -587,3 +589,52 @@ def test_retrieval_tool_performance_memory_item_is_prompt_safe() -> None:
     assert item.safe_for_prompt is True
     assert item.content["website_extraction"]["claim_count"] == 6
     assert "search discovery" in item.summary
+
+
+def test_chief_of_staff_memory_context_excludes_expired_and_superseded(
+    tmp_path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    old_id = store.save_memory_item(
+        chief_of_staff_memory_item(
+            memory_type="project_decision",
+            title="Old Beacon decision",
+            summary="Old decision should be superseded.",
+            object_id="Beacon",
+            object_key="Beacon",
+            source_ids=["operator"],
+        )
+    )
+    store.save_memory_item(
+        chief_of_staff_memory_item(
+            memory_type="project_decision",
+            title="Current Beacon decision",
+            summary="Current decision should remain visible.",
+            object_id="Beacon",
+            object_key="Beacon",
+            source_ids=["operator"],
+            supersedes_memory_id=old_id,
+        )
+    )
+    store.save_memory_item(
+        chief_of_staff_memory_item(
+            memory_type="project_goal",
+            title="Expired Beacon goal",
+            summary="Expired goal should not be visible.",
+            object_id="Beacon",
+            object_key="Beacon",
+            source_ids=["operator"],
+            expires_at="2020-01-01T00:00:00Z",
+        )
+    )
+
+    context = build_chief_of_staff_memory_context(
+        query="Beacon decision goal",
+        object_key="Beacon",
+        route="project-context-review",
+        database_url=database_url,
+    )
+
+    assert [item.title for item in context.records] == ["Current Beacon decision"]
+    assert context.send_enabled is False

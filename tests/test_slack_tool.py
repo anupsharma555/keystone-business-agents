@@ -25,6 +25,7 @@ from keystone_agents.slack_action_contract import (
     KBA_INTENT_CONTINUE_WORK_ITEM,
     KBA_INTENT_MORE_RESEARCH,
     KBA_INTENT_OPEN_WORK_ITEM,
+    KBA_INTENT_RESEARCH_ALL_CANDIDATES,
     KBA_INTENT_SHOW_SOURCES,
     KBA_INTENT_SKIP_COMPANY,
     KBA_MORE_RESEARCH,
@@ -1085,6 +1086,136 @@ def test_kba_more_research_selects_current_candidate_from_button_payload(
         and event.metadata["artifact_id"] == "38"
         for event in events
     )
+
+
+def test_kba_more_research_dedupes_per_candidate_artifact(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
+    store = SQLiteStore(database_url)
+    item = _save_linked_work_item_approval(store)
+    item = item.model_copy(
+        update={
+            "current_route": WorkItemRoute.OPPORTUNITY_SCOUT,
+            "target": WorkItemTarget(name="behavioral health AI", object_type="topic"),
+            "artifact_refs": [
+                WorkItemArtifactRef(
+                    artifact_type="opportunity",
+                    artifact_id="38",
+                    source_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                    approval_state="pending",
+                    title="Theris",
+                ),
+                WorkItemArtifactRef(
+                    artifact_type="opportunity",
+                    artifact_id="39",
+                    source_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                    approval_state="pending",
+                    title="ARPA-H",
+                ),
+            ],
+        }
+    )
+    store.save_work_item(item)
+    selected_titles: list[str] = []
+
+    def fake_advance(request):
+        loaded = SQLiteStore(database_url).get_work_item(item.id)
+        assert loaded is not None
+        selected_titles.extend(ref.title for ref in loaded.artifact_refs if ref.selected)
+        return WorkflowRunResult(
+            work_item=loaded,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=loaded.status,
+            advanced=False,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.advance_work_item_with_optional_langgraph",
+        fake_advance,
+    )
+
+    for artifact_id in ("opportunity:38", "opportunity:39"):
+        result = handle_slack_approval_interaction(
+            _kba_payload(
+                action_id=KBA_MORE_RESEARCH,
+                intent=KBA_INTENT_MORE_RESEARCH,
+                approval_id="approval-workitem",
+                work_item_id=item.id,
+                artifact_id=artifact_id,
+            ),
+            database_url=database_url,
+        )
+        assert result.outcome == "research_queued"
+
+    assert selected_titles == ["Theris", "ARPA-H"]
+
+
+def test_kba_research_all_candidates_runs_each_attached_opportunity(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
+    store = SQLiteStore(database_url)
+    item = _save_linked_work_item_approval(store)
+    item = item.model_copy(
+        update={
+            "current_route": WorkItemRoute.OPPORTUNITY_SCOUT,
+            "target": WorkItemTarget(name="behavioral health AI", object_type="topic"),
+            "artifact_refs": [
+                WorkItemArtifactRef(
+                    artifact_type="opportunity",
+                    artifact_id="38",
+                    source_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                    approval_state="pending",
+                    title="Theris",
+                ),
+                WorkItemArtifactRef(
+                    artifact_type="opportunity",
+                    artifact_id="39",
+                    source_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                    approval_state="pending",
+                    title="ARPA-H",
+                ),
+            ],
+        }
+    )
+    store.save_work_item(item)
+    selected_titles: list[str] = []
+
+    def fake_advance(request):
+        loaded = SQLiteStore(database_url).get_work_item(item.id)
+        assert loaded is not None
+        selected_titles.extend(ref.title for ref in loaded.artifact_refs if ref.selected)
+        return WorkflowRunResult(
+            work_item=loaded,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=loaded.status,
+            advanced=True,
+            human_summary="Research ran.",
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.advance_work_item_with_optional_langgraph",
+        fake_advance,
+    )
+
+    result = handle_slack_approval_interaction(
+        _kba_payload(
+            action_id=KBA_OVERFLOW,
+            intent=KBA_INTENT_RESEARCH_ALL_CANDIDATES,
+            approval_id="approval-workitem",
+            work_item_id=item.id,
+        ),
+        database_url=database_url,
+    )
+
+    assert result.outcome == "research_all_queued"
+    assert result.queued_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert selected_titles == ["Theris", "ARPA-H"]
+    assert result.agent_activity_result is not None
+    assert result.agent_activity_result["researched_candidates"] == ["Theris", "ARPA-H"]
 
 
 def test_kba_more_research_uses_langgraph_when_enabled(

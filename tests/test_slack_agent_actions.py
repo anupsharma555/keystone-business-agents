@@ -3,6 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from keystone_agents.models import TypedAgentRunResult
+from keystone_agents.schemas.chief_of_staff import (
+    ChiefOfStaffResult,
+    ChiefOfStaffRouteRecommendation,
+)
 from keystone_agents.cli import main
 from keystone_agents.slack_actions import (
     RUN_AGENT_MESSAGE_CALLBACK_ID,
@@ -195,3 +200,85 @@ def test_cli_ask_context_file_attaches_slack_context(
     slack_context = payload["work_item"]["target"]["metadata"]["slack_context"]
     assert slack_context["channel_id"] == "C123"
     assert payload["context_pack"]["source_refs"][0]["source_type"] == "slack_message"
+
+
+def test_context_pack_includes_bounded_slack_thread_messages(tmp_path: Path) -> None:
+    modal_result = handle_run_agent_interaction(
+        _message_action_payload(),
+        context_dir=tmp_path / "contexts",
+        thread_messages=[
+            {"ts": "1715366400.000100", "user": "U456", "text": "Selected root"},
+            {"ts": "1715366460.000200", "user": "U789", "text": "Thread reply with target detail"},
+        ],
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(modal_result.modal_view["private_metadata"]),
+        database_url=_database_url(tmp_path),
+    )
+
+    assert run_result.result is not None
+    slack_context = run_result.result["context_pack"]["target"]["metadata"]["slack_context"]
+    assert slack_context["thread_fetch_status"] == "ok"
+    assert [item["text"] for item in slack_context["thread_messages"]] == [
+        "Selected root",
+        "Thread reply with target detail",
+    ]
+
+
+def test_slack_thread_follow_up_can_reach_chief_of_staff_live_sdk(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_chief_of_staff_sdk(typed_input, **kwargs):
+        captured["typed_input"] = typed_input
+        captured["kwargs"] = kwargs
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary="Summarized Slack follow-ups from the selected thread.",
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="slack-follow-up-review",
+                    target_channel="bizdev",
+                ),
+                send_enabled=False,
+                slack_post_allowed=False,
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_chief_of_staff_sdk",
+        fake_run_chief_of_staff_sdk,
+    )
+    modal_result = handle_run_agent_interaction(
+        _message_action_payload(),
+        context_dir=tmp_path / "contexts",
+        thread_messages=[
+            {"ts": "1715366400.000100", "user": "U456", "text": "Selected root"},
+            {"ts": "1715366460.000200", "user": "U789", "text": "Please follow up Monday"},
+        ],
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task="chief of staff summarize the follow-ups in this Slack thread",
+        ),
+        database_url=_database_url(tmp_path),
+        live_sdk=True,
+    )
+
+    assert run_result.route == "chief_of_staff"
+    assert run_result.work_item["last_agent"] == "chief_of_staff"
+    assert captured["kwargs"]["force_sdk_interpretation"] is True
+    slack_context = captured["typed_input"]["slack_context"]
+    assert slack_context["channel_id"] == "C123"
+    assert [item["text"] for item in slack_context["thread_messages"]] == [
+        "Selected root",
+        "Please follow up Monday",
+    ]

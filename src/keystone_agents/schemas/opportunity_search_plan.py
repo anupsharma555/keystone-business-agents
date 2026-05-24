@@ -16,6 +16,7 @@ OpportunityTargetEntity = Literal[
     "grant_program",
     "trial",
     "role",
+    "github_repository",
 ]
 
 OpportunitySearchObjective = Literal[
@@ -29,8 +30,35 @@ OpportunitySearchObjective = Literal[
     "funding",
     "hiring",
     "trial_collaboration",
+    "open_source_tooling",
     "broad_discovery",
 ]
+
+
+class OpportunitySearchLane(BaseModel):
+    """One typed retrieval lane inside a mixed Opportunity Scout request."""
+
+    lane_type: str
+    desired_count: int = Field(default=1, ge=1, le=5)
+    target_entity_type: OpportunityTargetEntity
+    objective: OpportunitySearchObjective
+    required_fields: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+
+    @field_validator("lane_type", mode="before")
+    @classmethod
+    def _clean_lane_type(cls, value: object) -> str:
+        return str(value or "").replace("\u2014", "-").strip()
+
+    @field_validator("required_fields", "acceptance_criteria", mode="before")
+    @classmethod
+    def _clean_lane_list(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list | tuple | set) else [value]
+        return [
+            str(item).replace("\u2014", "-").strip() for item in values if str(item or "").strip()
+        ]
 
 
 class OpportunitySearchPlan(BaseModel):
@@ -43,6 +71,7 @@ class OpportunitySearchPlan(BaseModel):
     domains: list[str] = Field(default_factory=list)
     must_include_terms: list[str] = Field(default_factory=list)
     exclude_entity_types: list[OpportunityTargetEntity] = Field(default_factory=list)
+    lanes: list[OpportunitySearchLane] = Field(default_factory=list)
     strict_targeting: bool = False
     rationale: str = ""
     planner_warnings: list[str] = Field(default_factory=list)

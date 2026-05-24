@@ -855,7 +855,10 @@ def _search_searxng_live(
             f"SearXNG search timed out after {timeout_seconds:.1f} seconds."
         ) from exc
     except requests.RequestException as exc:
-        raise SearxngSearchError("SearXNG search request failed.") from exc
+        raise SearxngSearchError(
+            f"SearXNG search request failed for {base_url.rstrip('/')}/search: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
     data = _response_json(response, provider_name="SearXNG", error_type=SearxngSearchError)
     results: list[SearchResult] = []

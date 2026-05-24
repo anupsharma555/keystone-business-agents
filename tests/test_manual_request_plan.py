@@ -6,7 +6,9 @@ import subprocess
 from keystone_agents import cli
 from keystone_agents.agents.manual_request_planner import _planner_model_configs
 from keystone_agents.agents.orchestrator import route_request
+from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.manual_request import infer_manual_request_plan, merge_manual_request_plan
+from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
 from keystone_agents.schemas.approval import ApprovalState
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 
@@ -100,6 +102,61 @@ def test_manual_plan_extracts_business_research_target_from_direct_call() -> Non
     assert "NeuroFlow" in plan.objective
 
 
+def test_manual_plan_routes_named_research_browser_diagnostics_to_chief_of_staff() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "Use backend browser diagnostics to check https://example.com for "
+            "rendered-page, console, and network issues."
+        ),
+        requested_agent="business research analyst",
+    )
+
+    assert plan.requested_agent == "business_research_analyst"
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.intent == "browser_diagnostics"
+    assert plan.target_type == "url"
+    assert plan.primary_target == "https://example.com"
+    assert plan.requires_live_search is False
+
+
+def test_manual_plan_preserves_browser_diagnostics_when_llm_candidate_misroutes() -> None:
+    fallback = infer_manual_request_plan(
+        "Use backend browser diagnostics to check https://example.com for console issues.",
+        requested_agent="business research analyst",
+    )
+    bad_candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="business_research_analyst",
+        target_agent="business_research_analyst",
+        intent="company_research",
+        primary_target="https://example.com",
+        target_type="company",
+    )
+
+    merged = merge_manual_request_plan(fallback, bad_candidate)
+
+    assert merged.intent == "browser_diagnostics"
+    assert merged.target_agent == "chief_of_staff"
+    assert merged.target_type == "url"
+    assert any("Ignored planner override" in warning for warning in merged.planner_warnings)
+
+
+def test_manual_plan_keeps_research_route_when_browser_diagnostics_are_optional() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "Use backend browser diagnostics only if needed. Research https://example.com "
+            "and explain whether it is a real operating company."
+        ),
+        requested_agent="business research analyst",
+    )
+
+    assert plan.requested_agent == "business_research_analyst"
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.target_type == "url"
+    assert plan.primary_target == "https://example.com"
+
+
 def test_manual_plan_preserves_outreach_approval_gate_in_orchestrator() -> None:
     plan = infer_manual_request_plan(
         "draft outreach to NeuroFlow about clinical AI evaluation",
@@ -174,7 +231,7 @@ def test_cli_live_opportunity_scout_uses_script_retrieval_path(monkeypatch, caps
                 "opportunity_scout",
                 "--live-sdk",
                 "--json",
-                "Find 2 U.S.-relevant academic institutes",
+                "Find 2 U.S.-relevant academic institutes. Use live SDK and live search. No outreach.",
             ]
         )
         == 0
@@ -186,6 +243,99 @@ def test_cli_live_opportunity_scout_uses_script_retrieval_path(monkeypatch, caps
     assert "scripts/run_opportunity_scout.py" in captured["command"]
     assert "--live-search" in captured["command"]
     assert captured["command"][captured["command"].index("--max-results") + 1] == "2"
+    assert captured["command"][captured["command"].index("--topic") + 1] == (
+        "U.S.-relevant academic institutes"
+    )
+
+
+def test_cli_live_browser_diagnostics_named_research_reroutes_to_chief(monkeypatch, capsys) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "output_type": "ChiefOfStaffResult",
+                    "output": {"summary": "Rendered page diagnostics completed."},
+                    "send_enabled": False,
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert (
+        cli.main(
+            [
+                "ask",
+                "--agent",
+                "business_research_analyst",
+                "--live-sdk",
+                "--json",
+                (
+                    "Use backend browser diagnostics to check https://example.com "
+                    "for rendered-page, console, and network issues."
+                ),
+            ]
+        )
+        == 0
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["selected_agent"] == "chief_of_staff"
+    assert output["manual_request_plan"]["intent"] == "browser_diagnostics"
+    assert output["manual_request_plan"]["primary_target"] == "https://example.com"
+    assert "scripts/run_chief_of_staff.py" in captured["command"]
+
+
+def test_cli_live_business_research_url_target_passes_company_url(monkeypatch, capsys) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "output_type": "CompanyResearchFocusedBrief",
+                    "output": {"company_name": "example.com", "source_ids_used": []},
+                    "send_enabled": False,
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert (
+        cli.main(
+            [
+                "ask",
+                "--agent",
+                "business_research_analyst",
+                "--live-sdk",
+                "--json",
+                (
+                    "Use backend browser diagnostics only if needed. Research https://example.com "
+                    "and explain whether it is a real operating company."
+                ),
+            ]
+        )
+        == 0
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["selected_agent"] == "business_research_analyst"
+    assert output["manual_request_plan"]["target_type"] == "url"
+    assert captured["command"][captured["command"].index("--company") + 1] == "example.com"
+    assert captured["command"][captured["command"].index("--company-url") + 1] == (
+        "https://example.com"
+    )
 
 
 def test_cli_live_outreach_blocks_without_approved_context(capsys) -> None:
@@ -208,3 +358,122 @@ def test_cli_live_outreach_blocks_without_approved_context(capsys) -> None:
     assert output["requires_approved_context"] is True
     assert output["send_enabled"] is False
     assert "No default fixture was used" in output["message"]
+
+
+def test_gmail_execution_plan_maps_recent_actionable_threads_to_priority_grouping() -> None:
+    plan = infer_gmail_execution_plan(
+        "review recent Gmail threads from the last 7 days related to Keystone opportunities "
+        "or follow-ups. Identify the top 3 actionable threads, summarize each, and draft "
+        "replies only where a reply is needed. Do not send."
+    )
+
+    assert plan.operation == "priority_grouping"
+    assert plan.lookback_days == 7
+    assert plan.live_read_required is True
+    assert plan.create_gmail_drafts is False
+    assert plan.draft_replies_in_output is True
+    assert plan.gmail_query == "newer_than:7d"
+    assert "gmail_priority_grouping_sdk" in plan.candidate_helpers
+
+
+def test_outreach_execution_plan_keeps_drafts_gated_and_tracks_replies() -> None:
+    plan = infer_outreach_execution_plan(
+        "draft a concise follow-up email for a source-backed Keystone opportunity, and "
+        "include a plan for how future replies should be tracked or summarized. Do not send."
+    )
+
+    assert plan.operation == "draft_follow_up"
+    assert plan.approved_context_required is True
+    assert plan.use_default_approved_fixture_for_backend_test is True
+    assert plan.include_follow_up_schedule is True
+    assert plan.include_reply_tracking_plan is True
+    assert plan.side_effect_policy == "draft_only_never_send"
+
+
+def test_cli_live_gmail_priority_grouping_uses_agent_execution_plan(monkeypatch, capsys) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "output_type": "GmailPriorityGroupingResult",
+                    "output": {"buckets": {}},
+                    "send_enabled": False,
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert (
+        cli.main(
+            [
+                "ask",
+                "--agent",
+                "gmail_triage",
+                "--live-sdk",
+                "--json",
+                "review recent Gmail threads from the last 7 days related to Keystone opportunities",
+            ]
+        )
+        == 0
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["selected_agent"] == "gmail_triage"
+    assert output["agent_execution_plan"]["operation"] == "priority_grouping"
+    assert "--live-gmail" in captured["command"]
+    assert "--priority-grouping" in captured["command"]
+    assert captured["command"][captured["command"].index("--lookback-days") + 1] == "7"
+    assert captured["command"][captured["command"].index("--gmail-query") + 1] == "newer_than:7d"
+
+
+def test_cli_live_outreach_backend_fixture_uses_agent_execution_plan(monkeypatch, capsys) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "output_type": "OutreachDraft",
+                    "output": {"company_name": "Curebase", "send_enabled": False},
+                    "send_enabled": False,
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert (
+        cli.main(
+            [
+                "ask",
+                "--agent",
+                "outreach_composer",
+                "--live-sdk",
+                "--json",
+                (
+                    "draft a concise follow-up email for a source-backed Keystone opportunity, "
+                    "and include a plan for how future replies should be tracked or summarized. "
+                    "Do not send."
+                ),
+            ]
+        )
+        == 0
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["selected_agent"] == "outreach_composer"
+    assert output["agent_execution_plan"]["operation"] == "draft_follow_up"
+    assert "--include-follow-up-schedule" in captured["command"]
+    assert "--use-example-rag" in captured["command"]
+    assert captured["command"][captured["command"].index("--approval-decision") + 1] == "pending"

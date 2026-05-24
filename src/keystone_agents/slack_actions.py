@@ -10,15 +10,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.schemas.work_item import WorkflowRunRequest
+from keystone_agents.slack_action_contract import (
+    RUN_AGENT_MESSAGE_CALLBACK_ID,
+    RUN_AGENT_TASK_ACTION_ID,
+    RUN_AGENT_TASK_BLOCK_ID,
+    RUN_AGENT_VIEW_CALLBACK_ID,
+    SLACK_SELECTED_CONTEXT_SCHEMA,
+)
 from keystone_agents.slack_interactions import parse_slack_interaction_payload
 from keystone_agents.workflow_runner import advance_work_item
 
-RUN_AGENT_MESSAGE_CALLBACK_ID = "keystone_run_agent_message"
-RUN_AGENT_VIEW_CALLBACK_ID = "keystone_run_agent_submit"
-RUN_AGENT_TASK_BLOCK_ID = "keystone_agent_task_block"
-RUN_AGENT_TASK_ACTION_ID = "keystone_agent_task"
-SLACK_SELECTED_CONTEXT_SCHEMA = "keystone.slack.selected_message_context.v1"
 DEFAULT_SLACK_CONTEXT_DIR = Path("artifacts/slack_contexts")
 
 _MAX_MESSAGE_TEXT_CHARS = 4000
@@ -360,6 +363,9 @@ def handle_run_agent_interaction(
                 live_sdk=live_sdk,
                 max_results=max_results,
                 context_file_path=context_file_path,
+                manual_request_plan=infer_manual_request_plan(
+                    submission.requested_task
+                ).model_dump(mode="json"),
             )
         )
         return SlackAgentActionResult(

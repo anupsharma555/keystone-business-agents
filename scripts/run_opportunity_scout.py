@@ -40,6 +40,7 @@ from keystone_agents.founder_profile import (
 )
 from keystone_agents.live_retrieval import (
     build_shared_search_provider_config,
+    retrieval_diagnostics_from_metadata,
     run_opportunity_scout_live,
 )
 from keystone_agents.memory import retrieval_tool_performance_memory_item
@@ -665,6 +666,10 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     )
     if retrieval_metadata:
         payload["live_search_metadata"] = retrieval_metadata
+        payload["retrieval_diagnostics"] = retrieval_metadata.get(
+            "retrieval_diagnostics",
+            retrieval_diagnostics_from_metadata(retrieval_metadata),
+        )
     if args.orchestrator_review:
         payload["orchestrator_review"] = build_cli_orchestrator_review(
             args,
@@ -776,6 +781,10 @@ def main() -> int:
     payload = result.model_dump()
     if retrieval_metadata:
         payload["retrieval"] = retrieval_metadata
+        payload["retrieval_diagnostics"] = retrieval_metadata.get(
+            "retrieval_diagnostics",
+            retrieval_diagnostics_from_metadata(retrieval_metadata),
+        )
     if agent_descriptor is not None:
         payload["agent"] = agent_descriptor
     if args.orchestrator_review:

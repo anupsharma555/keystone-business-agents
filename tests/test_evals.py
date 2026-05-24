@@ -86,7 +86,7 @@ def test_eval_report_renders() -> None:
     assert "outreach/curebase_approved_context_email" in report
     assert "Average score" in report
     assert "Prompt versions" in report
-    assert "outreach_composer@2026-04-22.2" in report
+    assert "outreach_composer@2026-05-20.1" in report
 
 
 def test_eval_cli_json_output(capsys) -> None:

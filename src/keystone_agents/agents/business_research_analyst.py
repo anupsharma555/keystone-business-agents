@@ -53,6 +53,17 @@ from keystone_agents.source_enrichment import (
 )
 from keystone_agents.tools.apify_tool import fetch_linkedin_or_profile_placeholder
 from keystone_agents.tools.browserless_tool import extract_company_signals, fetch_company_page
+from keystone_agents.tools.browser_diagnostics_tool import (
+    capture_browser_diagnostics,
+    summarize_rendered_page_diagnostics,
+)
+from keystone_agents.tools.html_review_tool import extract_research_claims_from_html
+from keystone_agents.tools.internal_data_tools import (
+    airtable_get_base_schema,
+    airtable_read_records,
+    airtable_write_record,
+    google_workspace_tools,
+)
 from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
@@ -64,11 +75,13 @@ from keystone_agents.tools.memory_tool import (
     save_company_profile_memory,
     save_retrieval_tool_performance_memory,
 )
+from keystone_agents.tools.playwright_tool import render_page
 from keystone_agents.tools.serper_tool import SearchResult, search_web
 from keystone_agents.tools.storage_tool import (
     load_approved_contact_context,
     load_approved_crm_context,
 )
+from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
 
 DEFAULT_CONTACT_FIXTURE = "sample_contact_curebase_approved"
 DEFAULT_CRM_CONTEXT_FIXTURE = "sample_crm_context_curebase"
@@ -381,6 +394,7 @@ def build_business_research_analyst_agent(model: str | None = None) -> Agent:
         tools=_business_research_analyst_company_profile_tools(),
         guardrails=keystone_guardrails(),
         model=model,
+        policy_agent_name="business_research_analyst",
         handoff_description=(
             "Use for source-attributed company, account, contact, and CRM context research "
             "with Keystone fit scoring."
@@ -401,8 +415,16 @@ def _business_research_analyst_tools() -> list[Any]:
             read_local_context_file,
             retrieve_memory,
             check_workflow_duplicate,
+            airtable_get_base_schema,
+            airtable_read_records,
+            airtable_write_record,
             search_web,
             fetch_company_page,
+            extract_research_claims_from_html,
+            structure_web_data_for_schema,
+            render_page,
+            capture_browser_diagnostics,
+            summarize_rendered_page_diagnostics,
             fetch_linkedin_or_profile_placeholder,
             extract_company_signals,
             dedupe_and_rank_sources,
@@ -411,6 +433,7 @@ def _business_research_analyst_tools() -> list[Any]:
             compare_company_profiles_for_decision,
             save_company_profile_memory,
             save_retrieval_tool_performance_memory,
+            *google_workspace_tools(),
         ],
     )
 
@@ -428,8 +451,16 @@ def _business_research_analyst_company_profile_tools() -> list[Any]:
             read_local_context_file,
             retrieve_memory,
             check_workflow_duplicate,
+            airtable_get_base_schema,
+            airtable_read_records,
+            airtable_write_record,
             search_web,
             fetch_company_page,
+            extract_research_claims_from_html,
+            structure_web_data_for_schema,
+            render_page,
+            capture_browser_diagnostics,
+            summarize_rendered_page_diagnostics,
             fetch_linkedin_or_profile_placeholder,
             extract_company_signals,
             dedupe_and_rank_sources,
@@ -437,6 +468,7 @@ def _business_research_analyst_company_profile_tools() -> list[Any]:
             synthesize_company_profile_from_source_bundle,
             compare_company_profiles_for_decision,
             save_company_profile_memory,
+            *google_workspace_tools(),
         ],
     )
 
@@ -459,6 +491,7 @@ def build_business_research_analyst_focused_brief_agent(model: str | None = None
         tools=_business_research_analyst_tools(),
         guardrails=keystone_guardrails(),
         model=model,
+        policy_agent_name="business_research_analyst",
         handoff_description=(
             "Use for concise source-cited company research briefs for Keystone "
             "partnership or advisory relevance."
@@ -484,6 +517,7 @@ def build_business_research_analyst_comparison_agent(model: str | None = None) -
         tools=_business_research_analyst_tools(),
         guardrails=keystone_guardrails(),
         model=model,
+        policy_agent_name="business_research_analyst",
         handoff_description=(
             "Use for concise source-backed side-by-side company comparisons for "
             "Keystone partnership, advisory, or outreach prioritization decisions."
@@ -509,6 +543,7 @@ def build_business_research_analyst_research_brief_agent(model: str | None = Non
         tools=_business_research_analyst_tools(),
         guardrails=keystone_guardrails(),
         model=model,
+        policy_agent_name="business_research_analyst",
         handoff_description=(
             "Use for source-attributed research on companies, institutes, conferences, "
             "labs, people, topics, Zotero collections, and article collections."

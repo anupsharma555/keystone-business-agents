@@ -77,12 +77,27 @@ from keystone_agents.sdk import (
     run_typed_sdk_sync,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
+from keystone_agents.tools.html_review_tool import extract_research_claims_from_html
+from keystone_agents.tools.internal_data_tools import (
+    airtable_get_base_schema,
+    airtable_read_records,
+    airtable_write_record,
+    google_workspace_tools,
+)
 from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
     search_local_context,
 )
+from keystone_agents.tools.browser_diagnostics_tool import (
+    capture_browser_diagnostics,
+    summarize_rendered_page_diagnostics,
+)
+from keystone_agents.tools.memory_tool import retrieve_memory
+from keystone_agents.tools.playwright_tool import render_page
+from keystone_agents.tools.serper_tool import search_web
 from keystone_agents.tools.storage_tool import load_pending_approval_items
+from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
 
 INTENDED_HANDOFFS: tuple[HandoffSpec, ...] = specialist_handoff_specs()
 ORCHESTRATOR_REASONING_EFFORT = "low"
@@ -93,6 +108,34 @@ BUSINESS_RESEARCH_TOOL_NAME = "business_research_analyst_research_brief"
 
 
 _HANDOFF_BY_ROUTE = {handoff.route: handoff for handoff in INTENDED_HANDOFFS}
+
+
+def _orchestrator_sdk_input(typed_input: str | Mapping[str, Any], *, live: bool) -> str | Mapping[str, Any]:
+    """Add live-safe operating context for SDK Orchestrator string prompts."""
+
+    if not live or not isinstance(typed_input, str):
+        return typed_input
+    return {
+        "request": typed_input,
+        "live_integration_context": {
+            "live_sdk": True,
+            "backend_browser_diagnostics_allowed": _env_flag_enabled("KEYSTONE_PLAYWRIGHT_ENABLED"),
+            "backend_browser_tools": (
+                "render_page",
+                "capture_browser_diagnostics",
+                "summarize_rendered_page_diagnostics",
+            ),
+            "browser_tool_live_argument": (
+                "Use live=true for backend browser diagnostics only when the user asks "
+                "for rendered-page, console, network, layout, or browser diagnostic evidence."
+            ),
+            "side_effect_policy": (
+                "Read-only browser diagnostics, retrieval, routing, and analysis are allowed. "
+                "No writes, posts, sends, scheduling, payments, downloads, authenticated "
+                "browser sessions, local files, clicks, or form submissions are allowed."
+            ),
+        },
+    }
 _FEEDBACK_OBJECT_TYPE_BY_ROUTE: dict[RouteName, str] = {
     "gmail_triage": "email_triage",
     "business_research_analyst": "company_profile",
@@ -1819,7 +1862,12 @@ def _route_from_manual_plan(
             workflow_state=workflow_state,
             audit_notes=audit_notes,
         )
-    if route in {"gmail_triage", "business_research_analyst", "opportunity_scout"}:
+    if route in {
+        "gmail_triage",
+        "business_research_analyst",
+        "opportunity_scout",
+        "chief_of_staff",
+    }:
         return _result(
             route=route,
             rationale=plan.objective
@@ -2132,13 +2180,25 @@ def build_orchestrator_agent(
             list_local_context_sources,
             search_local_context,
             read_local_context_file,
+            retrieve_memory,
+            airtable_get_base_schema,
+            airtable_read_records,
+            airtable_write_record,
+            search_web,
+            structure_web_data_for_schema,
+            render_page,
+            capture_browser_diagnostics,
+            summarize_rendered_page_diagnostics,
             route_request_placeholder,
             load_orchestrator_workflow_state,
             load_pending_approval_items,
+            extract_research_claims_from_html,
             *specialist_tools,
+            *google_workspace_tools(),
         ],
         guardrails=keystone_guardrails(),
         model=model,
+        policy_agent_name="orchestrator",
         model_settings=build_model_settings(
             reasoning_effort=ORCHESTRATOR_REASONING_EFFORT,
             verbosity=ORCHESTRATOR_REVIEW_VERBOSITY,
@@ -2171,6 +2231,7 @@ def build_orchestrator_review_agent(model: str | None = None) -> Agent:
             search_local_context,
             read_local_context_file,
             load_orchestrator_workflow_state,
+            extract_research_claims_from_html,
         ],
         guardrails=keystone_guardrails(),
         model=model,
@@ -2203,7 +2264,7 @@ def run_orchestrator_sdk(
             include_handoffs=False,
             include_specialist_tools=include_specialist_tools,
         ),
-        typed_input=typed_input,
+        typed_input=_orchestrator_sdk_input(typed_input, live=live),
         output_type=OrchestratorResult,
         run_config=run_config,
         live=live,

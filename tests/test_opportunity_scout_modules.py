@@ -18,6 +18,7 @@ from keystone_agents.opportunity_scout.state import (
     normalize_company_key,
     normalize_pipeline_status,
 )
+from keystone_agents.agents.opportunity_scout import _build_live_query_specs
 
 
 def test_scoring_module_normalizes_signals_and_scores_handoff_ready_candidate() -> None:
@@ -67,6 +68,35 @@ def test_search_plan_infers_journal_and_contract_lanes_for_all_lane_loop() -> No
     assert "contract_opportunity" in plan.objectives
 
 
+def test_search_plan_preserves_mixed_meeting_and_grant_lanes() -> None:
+    plan = infer_opportunity_search_plan(
+        "Find 1 meeting or conference opportunity and 1 grant or funding opportunity "
+        "relevant to Keystone Neuroinformatics.",
+        desired_count=2,
+    )
+
+    assert plan.target_entity_types == ["conference", "grant_program"]
+    assert plan.objectives == ["presentation_opportunity", "funding"]
+    assert [lane.lane_type for lane in plan.lanes] == ["meeting_conference", "grant_funding"]
+    assert plan.strict_targeting is True
+    assert any("generic conferences funding category" in item for item in plan.lanes[0].acceptance_criteria)
+
+
+def test_opportunity_scout_builds_mixed_meeting_and_grant_query_specs() -> None:
+    topic = (
+        "Find 1 meeting or conference opportunity and 1 grant or funding opportunity "
+        "relevant to Keystone Neuroinformatics."
+    )
+    plan = infer_opportunity_search_plan(topic, desired_count=2)
+
+    specs = _build_live_query_specs(topic, search_plan=plan)
+
+    assert {spec.lane for spec in specs} == {"conference", "grant"}
+    assert any("call for abstracts" in spec.query.lower() for spec in specs)
+    assert any("site:grants.gov" in spec.query.lower() for spec in specs)
+    assert all(spec.entity_hint in {"conference", "grant_program"} for spec in specs)
+
+
 def test_search_plan_treats_bounded_company_requests_as_strict_company_only() -> None:
     plan = infer_opportunity_search_plan(
         "Identify 5 mental health AI companies with possible clinical validation needs; "
@@ -79,6 +109,37 @@ def test_search_plan_treats_bounded_company_requests_as_strict_company_only() ->
     assert {"institute", "grant_program", "trial", "researcher"} <= set(
         plan.exclude_entity_types
     )
+
+
+def test_search_plan_maps_github_repo_requests_to_open_source_tooling() -> None:
+    plan = infer_opportunity_search_plan(
+        "Find 4 GitHub repositories for open-source AI agent development and data analysis.",
+        desired_count=4,
+    )
+
+    assert plan.target_entity_types == ["github_repository"]
+    assert plan.objectives == ["open_source_tooling"]
+    assert plan.strict_targeting is True
+    assert "company" in plan.exclude_entity_types
+
+
+def test_opportunity_scout_builds_github_repository_search_specs() -> None:
+    plan = infer_opportunity_search_plan(
+        "Find GitHub repositories for Keystone business agents and data analysis.",
+        desired_count=4,
+    )
+
+    specs = _build_live_query_specs(
+        "Find GitHub repositories for Keystone business agents and data analysis.",
+        search_plan=plan,
+    )
+
+    assert specs
+    assert all(spec.lane == "github_repository" for spec in specs)
+    assert all(spec.source == "github" for spec in specs)
+    assert any("stars:>=50" in spec.query for spec in specs)
+    assert any("pushed:>=2025-01-01" in spec.query for spec in specs)
+    assert all("archived:false" in spec.query for spec in specs)
 
 
 def test_search_plan_merge_preserves_strict_company_only_contract() -> None:

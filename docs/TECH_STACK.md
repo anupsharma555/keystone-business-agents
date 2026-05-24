@@ -48,7 +48,11 @@ Optional integrations must not be required for tests. They should be introduced 
 - CRM adapters: HubSpot, Airtable, and Google Sheets CRM providers are future work only.
   Version 1 exposes a local table-mirror-backed `CRMProvider` without network calls or live
   dependencies.
-- MCP servers: optional local filesystem and standardized tool access. They should be treated as provider implementations, not as mandatory runtime dependencies.
+- MCP servers: optional local filesystem, private provider, or standardized
+  tool access. They should be treated as provider implementations, not as
+  mandatory runtime dependencies. Use `docs/AGENTS_SDK_REVIEW.md` before adding
+  one; direct SDK function tools remain the default for Keystone-owned provider
+  boundaries.
 - LangGraph: optional durable orchestration for resumable WorkItem workflows. It lives behind
   the `orchestration` extra and wraps existing WorkItem advancement. It must not replace the
   OpenAI Agents SDK agent contracts.
@@ -88,6 +92,8 @@ KEYSTONE_TAVILY_SEARCH_FALLBACK=false
 KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK=true
 KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL=true
 KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN=2
+KEYSTONE_AGENT_HTML_REVIEW=true
+KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2
 ```
 
 Rules for live search providers are the same:
@@ -120,12 +126,17 @@ Website extraction is separate from search:
 KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true
 KEYSTONE_WEBSITE_EXTRACTOR=trafilatura
 KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=firecrawl
+KEYSTONE_AGENT_HTML_REVIEW=true
+KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2
 KEYSTONE_ENABLE_SOURCE_API_ENRICHMENT=false
 ```
 
 The extractor supports `trafilatura` and `firecrawl`. It should only process
 selected URLs, convert extracted text into source-backed claim candidates, and
 remain disabled by default.
+Agent HTML review is an optional second pass over already retrieved page text.
+Use it for weak/no-claim extractions, keep the page cap low, and retain the
+original URL-backed source record as the canonical evidence container.
 
 `KEYSTONE_ENABLE_SOURCE_API_ENRICHMENT=true` lets live research supplement known
 ClinicalTrials.gov, PubMed, and DOI references with structured public API fields.

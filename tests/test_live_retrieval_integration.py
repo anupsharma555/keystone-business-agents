@@ -91,6 +91,11 @@ def test_company_live_retrieval_defaults_to_searxng_with_hosted_parallel_lane(
         "apify",
     ]
     assert metadata["search_quality"]["official_source_present"] is True
+    diagnostics = metadata["retrieval_diagnostics"]
+    assert diagnostics["provider_summary"] == "searxng+agents-web-search"
+    assert diagnostics["hosted_web_search_lane_used"] is True
+    assert diagnostics["retrieval_ladder"][0]["raw_result_count"] == 2
+    assert diagnostics["search_quality_summary"]["official_source_present"] is True
 
 
 def test_company_live_retrieval_can_enrich_official_pages(
@@ -163,6 +168,86 @@ def test_company_live_retrieval_can_enrich_official_pages(
     assert website_inputs[0]["source_type"] == "website"
     assert metadata["website_extraction"]["enabled"] is True
     assert metadata["website_extraction"]["page_count"] == len(website_inputs)
+
+
+def test_company_live_retrieval_can_agent_review_weak_html_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+    from keystone_agents.tools.html_review_tool import HtmlReviewResult
+    from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResult
+
+    class FakeProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Curebase",
+                    link="https://www.curebase.com",
+                    snippet="Official site.",
+                    source="searxng",
+                )
+            ]
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setenv("KEYSTONE_ENABLE_WEBSITE_EXTRACTION", "true")
+    monkeypatch.setenv("KEYSTONE_AGENT_HTML_REVIEW", "true")
+    monkeypatch.setenv("KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES", "1")
+    monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES", "1")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng", website_extractor="trafilatura"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_company_research_queries",
+        lambda *_args: ["Curebase official website"],
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "extract_website_content",
+        lambda url, **_kwargs: WebsiteExtractionResult(
+            url=url,
+            title="Curebase page",
+            provider="trafilatura",
+            status="success",
+            text_or_markdown="Curebase provides clinical trial software for research teams.",
+            claims=[],
+        ),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "run_agent_html_review",
+        lambda **_kwargs: HtmlReviewResult(
+            url="https://www.curebase.com",
+            title="Curebase page",
+            subject="Curebase",
+            claims=["Curebase provides clinical trial software for research teams."],
+        ),
+    )
+
+    _profile, metadata = live_retrieval.retrieve_company_profile_live(
+        company="Curebase",
+        company_url="https://www.curebase.com",
+        max_results=1,
+        profile_builder=lambda **kwargs: captured.update(kwargs)
+        or CompanyProfile(name="Curebase", website="https://www.curebase.com"),
+    )
+
+    website_inputs = captured["website_inputs"]
+    assert isinstance(website_inputs, list)
+    assert website_inputs[0]["provider"] == "trafilatura+agents-sdk-html-review"
+    assert website_inputs[0]["supported_claims"] == [
+        "Curebase provides clinical trial software for research teams."
+    ]
+    assert metadata["website_extraction"]["agent_html_review_page_count"] == 1
+    assert metadata["website_extraction"]["agent_html_review_claim_count"] == 1
 
 
 def test_company_live_retrieval_can_fallback_to_firecrawl(

@@ -75,8 +75,17 @@ _URGENT_PAYMENT_PATTERN = re.compile(
 _ADVICE_PATTERNS = (
     re.compile(r"\b(?:medical|legal|tax|regulatory)\s+advice\b", re.IGNORECASE),
     re.compile(
-        r"\b(?:diagnose|prescribe|treatment plan|liability opinion|tax strategy)\b", re.IGNORECASE
+        r"\b(?:prescribe|treatment plan|liability opinion|tax strategy)\b", re.IGNORECASE
     ),
+    re.compile(
+        r"\bdiagnose\b[^.\n]{0,120}\b(?:patient|depression|anxiety|bipolar|"
+        r"schizophrenia|psychiatric|medical|condition|illness|disorder)\b",
+        re.IGNORECASE,
+    ),
+)
+_NEGATED_ADVICE_CONTEXT_RE = re.compile(
+    r"\b(?:not|no|never|cannot|can't|do not|don't|without|avoid)\b[^.\n]{0,120}$",
+    re.IGNORECASE,
 )
 _UNSUPPORTED_CLAIM_PATTERNS = (
     re.compile(r"\bwe have helped voice-?ai teams\b", re.IGNORECASE),
@@ -295,7 +304,7 @@ def assess_text_guardrails(
         reasons.append("security or suspicious request")
         draft_policy = "no_substantive_reply"
 
-    if any(pattern.search(text) for pattern in _ADVICE_PATTERNS):
+    if _contains_unnegated_professional_advice(text):
         risk_flags.append("professional_advice")
         reasons.append("medical, legal, tax, or regulatory advice")
         draft_policy = "no_substantive_reply"
@@ -471,6 +480,15 @@ def acknowledgement_only_reply(sender_name: str = "") -> str:
         "Thanks for sending this. I received it and will review it before responding further.\n\n"
         "Best,\nKeystone"
     )
+
+
+def _contains_unnegated_professional_advice(text: str) -> bool:
+    for pattern in _ADVICE_PATTERNS:
+        for match in pattern.finditer(text):
+            if _NEGATED_ADVICE_CONTEXT_RE.search(text[: match.start()]):
+                continue
+            return True
+    return False
 
 
 @input_guardrail(name="keystone_input_safety", run_in_parallel=False)

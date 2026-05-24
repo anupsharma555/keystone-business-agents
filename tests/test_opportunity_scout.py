@@ -28,12 +28,14 @@ from keystone_agents.agents.opportunity_scout import (
 from keystone_agents.live_retrieval import run_opportunity_scout_live
 from keystone_agents.schemas.opportunity import Opportunity, OpportunityScoutResult
 from keystone_agents.sdk import load_prompt
+from keystone_agents.tools.html_review_tool import HtmlReviewResult
 from keystone_agents.tools.search_provider import (
     DryRunSearchProvider,
     LiveSearchProviderRequiredError,
     SerperSearchError,
 )
 from keystone_agents.tools.serper_tool import SearchResult, SerperTool
+from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResult
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -624,10 +626,58 @@ def test_build_opportunity_scout_agent() -> None:
         "search_grant_sources",
         "search_conference_publication_sources",
         "search_company_page_sources",
+        "extract_research_claims_from_html",
         "score_opportunity",
         "handoff_to_business_research_analyst_placeholder",
         "save_opportunity_placeholder",
     } <= {getattr(tool, "name", "") for tool in agent.tools}
+
+
+def test_source_verification_can_use_agent_html_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_ENABLE_OPPORTUNITY_SOURCE_VERIFICATION", "true")
+    monkeypatch.setenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "1")
+    monkeypatch.setenv("KEYSTONE_AGENT_HTML_REVIEW", "true")
+    monkeypatch.setenv("KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES", "1")
+    monkeypatch.setattr(
+        scout_module,
+        "extract_website_content",
+        lambda *_args, **_kwargs: WebsiteExtractionResult(
+            url="https://www.curebase.com",
+            title="Curebase",
+            provider="trafilatura",
+            status="success",
+            text_or_markdown="Curebase provides clinical trial software for research teams.",
+            claims=[],
+        ),
+    )
+    monkeypatch.setattr(
+        scout_module,
+        "run_agent_html_review",
+        lambda **_kwargs: HtmlReviewResult(
+            url="https://www.curebase.com",
+            subject="Curebase",
+            claims=["Curebase provides clinical trial software for research teams."],
+        ),
+    )
+
+    verified, notes = scout_module._verify_source_hits(
+        [
+            {
+                "company_name": "Curebase",
+                "source_title": "Curebase",
+                "source_url": "https://www.curebase.com",
+                "signal": "Official site.",
+            }
+        ]
+    )
+
+    assert verified[0]["agent_html_review_claims"] == [
+        "Curebase provides clinical trial software for research teams."
+    ]
+    assert "clinical trial software" in verified[0]["signal"]
+    assert any("Agent HTML review added 1 claim" in note for note in notes)
 
 
 def test_opportunity_fixture_can_validate() -> None:
@@ -2071,6 +2121,63 @@ def test_institute_search_broadens_when_requested_count_is_underfilled() -> None
     assert len(result.records) >= 2
     assert any("Underfilled search broadened" in note for note in result.audit_notes)
     assert any("partner with us" in request.query.lower() for request in provider.requests)
+
+
+def test_company_growth_plan_broadens_partnership_advisory_underfill() -> None:
+    class FakeCompanyGrowthUnderfillProvider:
+        provider_name = "searxng"
+        dry_run = False
+
+        def __init__(self) -> None:
+            self.requests = []
+
+        def validate_configuration(self) -> None:
+            return None
+
+        def search_structured(self, request) -> list[SearchResult]:
+            self.requests.append(request)
+            query = request.query.lower()
+            if "behavioral health technology" in query and "funding" in query:
+                return [
+                    SearchResult(
+                        title="Jimini Health raises funding for behavioral health AI platform",
+                        link="https://example.test/jimini-health-funding",
+                        snippet=(
+                            "Jimini Health raises a 2026 funding round and announces a "
+                            "behavioral health AI partnership for clinical validation."
+                        ),
+                        source="searxng",
+                    )
+                ][: request.num_results]
+            return [
+                SearchResult(
+                    title="Artificial Intelligence for Mental Health Monitoring",
+                    link="https://pmc.ncbi.nlm.nih.gov/articles/PMC12745907/",
+                    snippet="Publication article about artificial intelligence for mental health monitoring.",
+                    source="searxng",
+                )
+            ][: request.num_results]
+
+    provider = FakeCompanyGrowthUnderfillProvider()
+    search_plan = scout_module.OpportunitySearchPlan(
+        source="test",
+        desired_count=3,
+        target_entity_types=["company"],
+        objectives=["company_growth", "advisory"],
+        domains=["behavioral health"],
+    )
+
+    result = scout_opportunities_live_search(
+        topic="active behavioral health AI partnership or advisory opportunities relevant to Keystone",
+        max_results=3,
+        search_plan=search_plan,
+        search_provider=provider,
+    )
+
+    assert len(result.records) == 1
+    assert result.records[0].company_name == "Jimini Health"
+    assert any("Underfilled search broadened" in note for note in result.audit_notes)
+    assert any("behavioral health technology" in request.query.lower() for request in provider.requests)
 
 
 def test_live_search_passes_provider_specific_query_hints() -> None:

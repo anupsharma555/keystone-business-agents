@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from keystone_agents.source_enrichment import extract_clean_text
 from keystone_agents.tools.browserless_tool import fetch_rendered_page
+from keystone_agents.tools.playwright_tool import render_page_impl
 from keystone_agents.tools.website_extraction_tool import (
     WebsiteExtractionError,
     extract_website_content,
@@ -329,6 +330,43 @@ class BrowserlessRenderedPageProvider:
 
 
 @dataclass(frozen=True)
+class PlaywrightRenderedPageProvider:
+    """Optional read-only local Chromium rendering provider."""
+
+    dry_run: bool = False
+    max_output_chars: int = DEFAULT_RENDERED_PAGE_MAX_OUTPUT_CHARS
+    provider_name: str = "playwright"
+
+    def render(self, url: str, timeout_seconds: int) -> RenderedPage:
+        if self.dry_run:
+            return DryRunRenderedPageProvider(self.provider_name).render(url, timeout_seconds)
+        started_at = perf_counter()
+        result = render_page_impl(
+            url,
+            timeout_seconds=timeout_seconds,
+            live=True,
+            max_text_chars=self.max_output_chars,
+        )
+        return RenderedPage(
+            provider=self.provider_name,
+            url=str(result.get("url") or url),
+            final_url=str(result.get("final_url") or url),
+            status=str(result.get("status") or "error"),
+            title=str(result.get("title") or ""),
+            text_or_markdown=_truncate(str(result.get("text_or_markdown") or ""), self.max_output_chars),
+            links=[
+                RenderedLink(url=str(link.get("url") or ""), text=str(link.get("text") or ""))
+                for link in result.get("links", [])
+                if isinstance(link, Mapping)
+            ],
+            html_length=int(result.get("html_length") or 0),
+            latency_ms=int(result.get("latency_ms") or _elapsed_ms(started_at)),
+            error=str(result.get("error") or "") or None,
+            metadata=dict(result.get("metadata") or {}),
+        )
+
+
+@dataclass(frozen=True)
 class UnsupportedRenderedPageProvider:
     """Explicit placeholder for future browser providers without changing eval logic."""
 
@@ -391,7 +429,9 @@ def build_rendered_page_provider(
         return FirecrawlRenderedPageProvider(max_output_chars=max_output_chars)
     if provider == "browserless":
         return BrowserlessRenderedPageProvider(max_output_chars=max_output_chars)
-    if provider in {"apify", "playwright", "crawl4ai"}:
+    if provider == "playwright":
+        return PlaywrightRenderedPageProvider(max_output_chars=max_output_chars)
+    if provider in {"apify", "crawl4ai"}:
         return UnsupportedRenderedPageProvider(provider_name=provider)
     return TrafilaturaRenderedPageProvider(max_output_chars=max_output_chars)
 
@@ -845,6 +885,7 @@ __all__ = [
     "BrowserlessRenderedPageProvider",
     "DryRunRenderedPageProvider",
     "FirecrawlRenderedPageProvider",
+    "PlaywrightRenderedPageProvider",
     "RenderedLink",
     "RenderedPage",
     "RenderedPageProvider",

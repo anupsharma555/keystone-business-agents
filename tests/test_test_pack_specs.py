@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import get_args
 
 from keystone_agents.schemas.feedback import FeedbackObjectType
@@ -81,3 +82,10 @@ def test_shared_criteria_cover_safety_grounding_and_failure_behavior() -> None:
     criteria = {name for name, _description in SHARED_EVALUATION_CRITERIA}
 
     assert {"Grounding", "Boundary control", "Failure behavior"} <= criteria
+
+
+def test_improvement_pack_docs_reference_executable_specs() -> None:
+    docs = Path("docs/AGENT_IMPROVEMENT_TEST_PACK.md").read_text(encoding="utf-8")
+
+    for spec in list_test_pack_specs():
+        assert f"`{spec.spec_id}`" in docs or f"### {spec.spec_id}:" in docs

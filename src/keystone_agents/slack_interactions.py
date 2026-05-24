@@ -10,10 +10,14 @@ from urllib.parse import parse_qs
 from pydantic import BaseModel
 
 from keystone_agents.agent_mentions import parse_agent_mention
+from keystone_agents.agents.outreach_composer import build_outreach_composer_compact_synthesis_agent
 from keystone_agents.automation_inventory import build_automation_inventory_report
 from keystone_agents.langgraph_workflow import advance_work_item_with_optional_langgraph
+from keystone_agents.models import OutreachComposerSDKInput
 from keystone_agents.natural_interaction import resolve_natural_followup
+from keystone_agents.run import run_retrieved_sdk_synthesis
 from keystone_agents.schemas.approval import ApprovalQueueObjectType, ApprovalQueueStatus
+from keystone_agents.schemas.outreach import OutreachLLMDraftPayload
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkItemBlocker,
@@ -41,6 +45,7 @@ from keystone_agents.slack_action_contract import (
     KBA_INTENT_MORE_RESEARCH,
     KBA_INTENT_OPEN_WORK_ITEM,
     KBA_INTENT_POST_INTERNAL_SUMMARY,
+    KBA_INTENT_RESEARCH_ALL_CANDIDATES,
     KBA_INTENT_REVISE_DRAFT,
     KBA_INTENT_RUN_AGAIN,
     KBA_INTENT_SHOW_BLOCKERS,
@@ -102,6 +107,7 @@ class SlackApprovalInteractionResult(BaseModel):
     queued_route: str = ""
     queued_command: str = ""
     read_only_payload: dict[str, Any] | None = None
+    agent_activity_result: dict[str, Any] | None = None
     gmail_draft_result: dict[str, Any] | None = None
     revision_prompt: str = ""
     feedback_prompt: str = ""
@@ -457,6 +463,7 @@ def _handle_kba_revision_modal_submission(
     queued_command = ""
     view_response_text = result.followup_text
     work_item_id = action_payload.work_item_id or result.work_item_id
+    agent_activity_result = None
     if work_item_id:
         advance = _advance_work_item_for_intent(
             work_item_id=work_item_id,
@@ -468,8 +475,22 @@ def _handle_kba_revision_modal_submission(
         queued_route = advance.route.value
         queued_command = _queued_command(work_item_id, queued_route)
         view_response_text = (
-            f"Revision requested. Outreach Composer was queued for WorkItem `{work_item_id}`."
+            f"Revision requested. Outreach Composer ran for WorkItem `{work_item_id}`. "
+            f"{advance.human_summary}"
         )
+        agent_activity_result = _agent_activity_payload(advance)
+    else:
+        agent_activity_result = _revise_approval_item_direct(
+            store,
+            item,
+            feedback=feedback,
+            reviewer=result.reviewer,
+        )
+        if agent_activity_result is not None:
+            view_response_text = (
+                "Revision requested. Outreach Composer produced a revised draft and "
+                "reset the approval item to pending."
+            )
     return result.model_copy(
         update={
             "action_id": KBA_REVISE_DRAFT,
@@ -478,8 +499,9 @@ def _handle_kba_revision_modal_submission(
             "queued_route": queued_route,
             "queued_command": queued_command,
             "followup_text": view_response_text,
+            "agent_activity_result": agent_activity_result,
             "slack_view_response_payload": _modal_update_response(
-                title="Revision queued",
+                title="Revision ran",
                 text=view_response_text,
             ),
         }
@@ -570,6 +592,19 @@ def _handle_kba_steering_action(
             idempotent=True,
         )
 
+    if intent == KBA_INTENT_RESEARCH_ALL_CANDIDATES:
+        return _handle_research_all_candidates_action(
+            store,
+            work_item,
+            action_payload,
+            action_id=action_id,
+            approval_status=status,
+            reviewer=reviewer,
+            dedupe_key=dedupe_key,
+            item=item,
+            database_url=database_url,
+        )
+
     if intent == KBA_INTENT_SKIP_COMPANY:
         updated = add_blocker(
             work_item,
@@ -650,6 +685,109 @@ def _handle_kba_steering_action(
         work_item=advance.work_item,
         queued_route=advance.route.value,
         queued_command=_queued_command(work_item.id, advance.route.value),
+        agent_activity_result=_agent_activity_payload(advance),
+    )
+
+
+def _handle_research_all_candidates_action(
+    store: SQLiteStore,
+    work_item: Any,
+    action_payload: BusinessAgentActionPayload,
+    *,
+    action_id: str,
+    approval_status: ApprovalQueueStatus,
+    reviewer: str,
+    dedupe_key: str,
+    item: Any | None,
+    database_url: str | None,
+) -> SlackApprovalInteractionResult:
+    opportunity_refs = [
+        artifact
+        for artifact in work_item.artifact_refs
+        if artifact.artifact_type == "opportunity"
+    ]
+    if not opportunity_refs:
+        return _kba_result(
+            action_payload,
+            action_id=action_id,
+            approval_status=approval_status,
+            reviewer=reviewer,
+            outcome="research_all_blocked",
+            followup_text=(
+                f"No opportunity candidates are attached to WorkItem `{work_item.id}`."
+            ),
+            item=item,
+            work_item=work_item,
+        )
+
+    _record_kba_action_event(
+        store,
+        work_item,
+        action_payload,
+        action_id=action_id,
+        reviewer=reviewer,
+        dedupe_key=dedupe_key,
+        summary=(
+            "Slack action queued `research_all_candidates` for "
+            f"{len(opportunity_refs)} opportunity candidate(s)."
+        ),
+    )
+    latest_result: Any | None = None
+    current = work_item
+    researched_titles: list[str] = []
+    for artifact in opportunity_refs:
+        current = select_artifact(current, artifact.artifact_type, artifact.artifact_id)
+        record_event(
+            current,
+            event_type="artifact_selected",
+            actor="slack",
+            summary=(
+                f"Selected {artifact.artifact_type}:{artifact.artifact_id} "
+                "from Slack research-all action."
+            ),
+            metadata={
+                "artifact_type": artifact.artifact_type,
+                "artifact_id": artifact.artifact_id,
+                "research_all": True,
+            },
+            store=store,
+        )
+        store.save_work_item(current)
+        latest_result = _advance_work_item_for_intent(
+            work_item_id=current.id,
+            intent=KBA_INTENT_MORE_RESEARCH,
+            reviewer=reviewer,
+            feedback="",
+            database_url=database_url,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        )
+        current = latest_result.work_item
+        researched_titles.append(artifact.title or f"{artifact.artifact_type}:{artifact.artifact_id}")
+
+    activity = _agent_activity_payload(latest_result) if latest_result is not None else None
+    if activity is not None:
+        activity["human_summary"] = (
+            f"Research ran for {len(researched_titles)} opportunity candidate(s): "
+            + ", ".join(researched_titles[:8])
+            + "."
+        )
+        activity["researched_candidates"] = researched_titles
+
+    return _kba_result(
+        action_payload,
+        action_id=action_id,
+        approval_status=approval_status,
+        reviewer=reviewer,
+        outcome="research_all_queued",
+        followup_text=(
+            f"Research ran for {len(researched_titles)} candidate(s) on WorkItem "
+            f"`{current.id}`."
+        ),
+        item=item,
+        work_item=current,
+        queued_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        queued_command=_queued_command(current.id, WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value),
+        agent_activity_result=activity,
     )
 
 
@@ -1084,6 +1222,8 @@ def _route_for_steering_intent(intent: str, work_item: Any) -> WorkItemRoute:
         return WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     if intent == KBA_INTENT_MORE_RESEARCH:
         return WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    if intent == KBA_INTENT_RESEARCH_ALL_CANDIDATES:
+        return WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     if intent == KBA_INTENT_RUN_AGAIN:
         route = work_item.current_route
         if route in {WorkItemRoute.ORCHESTRATOR, WorkItemRoute.CLARIFICATION}:
@@ -1099,6 +1239,8 @@ def _request_text_for_intent(intent: str, *, feedback: str) -> str:
         return "Find a better source-backed contact or destination for this outreach WorkItem."
     if intent == KBA_INTENT_MORE_RESEARCH:
         return "Run deeper source-backed business research for this WorkItem."
+    if intent == KBA_INTENT_RESEARCH_ALL_CANDIDATES:
+        return "Run source-backed business research for each attached opportunity candidate."
     if intent == KBA_INTENT_RUN_AGAIN:
         return "Run this WorkItem route again with the same request context."
     return "Advance this WorkItem from a Slack business-agent action."
@@ -1153,6 +1295,7 @@ def _kba_dedupe_key(action_id: str, action_payload: BusinessAgentActionPayload) 
             action_id,
             action_payload.intent,
             action_payload.approval_id,
+            action_payload.artifact_id,
             action_payload.source_channel_id,
             action_payload.source_message_ts,
         ]
@@ -1193,6 +1336,7 @@ def _kba_result(
     item: Any | None,
     work_item: Any | None,
     read_only_payload: dict[str, Any] | None = None,
+    agent_activity_result: dict[str, Any] | None = None,
     queued_route: str = "",
     queued_command: str = "",
     idempotent: bool = False,
@@ -1211,6 +1355,7 @@ def _kba_result(
         queued_route=queued_route,
         queued_command=queued_command,
         read_only_payload=read_only_payload,
+        agent_activity_result=agent_activity_result,
         work_item_id=work_item.id if work_item is not None else action_payload.work_item_id,
         work_item_status=work_item.status.value if work_item is not None else "",
         idempotent=idempotent,
@@ -1221,6 +1366,137 @@ def _kba_result(
 
 def _queued_command(work_item_id: str, route: str) -> str:
     return f"workitem continue {work_item_id} --route {route}"
+
+
+def _agent_activity_payload(result: Any) -> dict[str, Any]:
+    return {
+        "route": result.route.value,
+        "status": result.status.value,
+        "advanced": bool(result.advanced),
+        "human_summary": result.human_summary,
+        "artifact_refs": [
+            artifact.model_dump(mode="json") for artifact in result.artifact_refs
+        ],
+        "next_action": result.next_action.model_dump(mode="json")
+        if result.next_action
+        else None,
+        "audit_notes": result.audit_notes,
+    }
+
+
+def _revise_approval_item_direct(
+    store: SQLiteStore,
+    item: Any,
+    *,
+    feedback: str,
+    reviewer: str,
+) -> dict[str, Any] | None:
+    if not _is_email_outreach_item(item):
+        return None
+    if not _slack_work_item_live_sdk_enabled(default=False):
+        return None
+    metadata = dict(item.metadata or {})
+    subject, body = _parse_email_draft_text(item.draft_text or "")
+    company = str(metadata.get("company_name") or "").strip()
+    if not body:
+        return None
+    context = {
+        "company_name": company,
+        "contact_name": metadata.get("contact_name") or "",
+        "contact_title": metadata.get("contact_title") or "",
+        "recipient_email": metadata.get("recipient_email") or "",
+        "email_subject": metadata.get("email_subject") or subject,
+        "why_now_signal": metadata.get("why_now_signal") or "",
+        "keystone_fit_reason": metadata.get("keystone_fit_reason") or "",
+        "company_claims": metadata.get("company_claims") or [],
+        "company_research_points": metadata.get("company_research_points") or [],
+        "sources": metadata.get("sources") or [],
+        "current_draft": item.draft_text or "",
+        "operator_feedback": feedback,
+        "policy": (
+            "Revise the draft only. Do not send, schedule, publish, create a Gmail "
+            "draft, or add unsupported claims."
+        ),
+    }
+
+    def normalize(payload: dict[str, Any]) -> OutreachComposerSDKInput:
+        return OutreachComposerSDKInput(
+            company_name=company or "the target company",
+            contact_name=str(metadata.get("contact_name") or ""),
+            contact_title=str(metadata.get("contact_title") or ""),
+            recent_signal=str(metadata.get("why_now_signal") or ""),
+            outreach_goal=f"Revise this approval-gated outreach draft: {feedback}",
+            approved_context=json.dumps(payload, ensure_ascii=True, sort_keys=True),
+            email_style_profile="Use the existing draft's style unless feedback says otherwise.",
+        )
+
+    try:
+        outcome = run_retrieved_sdk_synthesis(
+            agent=build_outreach_composer_compact_synthesis_agent(),
+            output_type=OutreachLLMDraftPayload,
+            retrieve=lambda: context,
+            normalize=normalize,
+            input_summary=f"Slack approval draft revision for {company or item.id}",
+            input_audit_payload={
+                "approval_id": item.id,
+                "company": company,
+                "source": "slack_revision_modal",
+            },
+            live=True,
+            save=False,
+            model_label="sdk-live",
+        )
+        payload = outcome.final_output.model_dump(mode="json")
+        revised_subject = str(payload.get("email_subject") or subject).strip()
+        revised_body = str(payload.get("email_body") or body).strip()
+        revised_linkedin = str(payload.get("linkedin_note") or "").strip()
+        revised_text = f"Subject: {revised_subject}\n\n{revised_body}"
+        if revised_linkedin:
+            revised_text = f"{revised_text}\n\nLinkedIn:\n{revised_linkedin}"
+        revised_metadata = {
+            **metadata,
+            "email_subject": revised_subject,
+            "last_revision_feedback": feedback,
+            "last_revision_reviewer": reviewer,
+            "last_revision_source": "slack_llm",
+            "last_revision_payload": payload,
+        }
+        revised_item = item.model_copy(
+            update={
+                "draft_text": revised_text,
+                "summary": f"Revised draft pending approval: {revised_subject}",
+                "approval_status": ApprovalQueueStatus.PENDING,
+                "reviewer": reviewer,
+                "reviewer_notes": "Revised by Outreach Composer from Slack feedback.",
+                "metadata": revised_metadata,
+            }
+        )
+        store.save_approval_item(revised_item)
+        return {
+            "route": "outreach_composer",
+            "status": "pending",
+            "advanced": True,
+            "human_summary": "Outreach Composer revised the draft and reset approval to pending.",
+            "approval_id": item.id,
+            "revised_subject": revised_subject,
+            "revised_draft_text": revised_text,
+            "audit_notes": [
+                "Slack revision used live SDK synthesis and did not create a Gmail draft or send."
+            ],
+        }
+    except Exception as exc:
+        metadata["last_revision_error"] = f"{type(exc).__name__}: {exc}"
+        _save_metadata(store, item, metadata)
+        return {
+            "route": "outreach_composer",
+            "status": "revise",
+            "advanced": False,
+            "human_summary": (
+                "Outreach Composer live revision failed; revision feedback was saved for retry."
+            ),
+            "approval_id": item.id,
+            "audit_notes": [metadata["last_revision_error"]],
+        }
 
 
 def _modal_update_response(*, title: str, text: str) -> dict[str, Any]:

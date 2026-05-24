@@ -46,8 +46,35 @@ concept in an explicit local boundary.
   setup preview, and real execution requires `execute=True` with either
   credential-gated `live=True` or an injected fake/local runner for tests.
 
+## 2026 SDK Review Follow-Up
+
+The current SDK and public-implementation review lives in
+`docs/AGENTS_SDK_REVIEW.md`. Use it before adding new context sources, provider
+adapters, manager-style agent-as-tool calls, or MCP integrations.
+
+The short decision is:
+
+- direct SDK function tools remain the default for Keystone-owned providers;
+- WorkItem context packs remain the default for durable local workflow state;
+- agents-as-tools are preferred when a manager agent must retain the final
+  response while asking a specialist for a bounded subtask;
+- MCP is optional and should be added only when it gives a real external tool or
+  data boundary, cross-client reuse, or stronger permission scoping than local
+  function tools.
+
+Do not add an MCP server merely because a provider exists. Add one only with a
+reviewed schema, dry-run test server or fixture, explicit live flags, credential
+checks, source attribution rules, and approval gates for any write-capable tool.
+
 ## Naming Notes
 
 `skills.md` and `tools.md` are instruction fragments, not separate SDK primitives.
-The SDK-native surface remains agent `instructions`, `tools`, `handoffs`,
-`output_type`, guardrails, and tracing-ready metadata.
+Keystone skills are prompt-only reasoning and output patterns unless
+an existing explicit runtime capability surface is used. Do not add hidden skill
+routing, dynamic tool attachment, or implicit live integrations behind a skill
+name.
+
+The SDK-native surface remains agent `instructions`, attached `tools`,
+`handoffs`, `output_type`, guardrails, WorkItem gates, and tracing-ready
+metadata. If a future change needs runtime behavior, represent it through those
+surfaces and update the `AgentSpec` registry, tests, and documentation.

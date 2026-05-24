@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -14,6 +15,14 @@ MemoryType = Literal[
     "company_fact",
     "opportunity_signal",
     "opportunity_outcome",
+    "operator_strategy",
+    "project_goal",
+    "project_constraint",
+    "project_decision",
+    "project_status_snapshot",
+    "portfolio_priority",
+    "budget_assumption",
+    "avoidance_rule",
     "email_style_preference",
     "outreach_example",
     "human_feedback",
@@ -29,6 +38,9 @@ MemoryObjectType = Literal[
     "company_profile",
     "opportunity",
     "opportunity_scout",
+    "project",
+    "portfolio",
+    "operator_strategy",
     "outreach_draft",
     "email_style_profile",
     "feedback",
@@ -70,6 +82,14 @@ def _safe_json_text(value: Any) -> str:
     if isinstance(value, list | tuple | set):
         return " ".join(_safe_json_text(item) for item in value)
     return _clean(value)
+
+
+def _json_text(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
 
 
 class MemoryItem(BaseModel):
@@ -203,4 +223,135 @@ class MemoryRetrievalResult(BaseModel):
     def _send_enabled_must_be_false(cls, value: bool) -> bool:
         if value is not False:
             raise ValueError("memory retrieval must not enable sending")
+        return value
+
+
+class ChiefOfStaffMemoryRecord(BaseModel):
+    """Strict-schema-safe memory record returned in Chief of Staff outputs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    memory_type: MemoryType
+    object_type: MemoryObjectType = "other"
+    object_id: str = ""
+    object_key: str = ""
+    title: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    content: str = ""
+    source_ids: list[str] = Field(default_factory=list)
+    approval_state: ApprovalState = ApprovalState.PENDING
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    sensitivity: MemorySensitivity = "internal"
+    safe_for_prompt: bool = True
+    created_at: str = Field(default_factory=memory_timestamp)
+    expires_at: str | None = None
+    supersedes_memory_id: int | None = None
+    metadata: str = ""
+
+    @field_validator("approval_state", mode="before")
+    @classmethod
+    def _normalize_approval_state(cls, value: Any) -> ApprovalState:
+        return normalize_approval_state(value)
+
+    @field_validator(
+        "object_id",
+        "object_key",
+        "title",
+        "summary",
+        "content",
+        "metadata",
+        mode="before",
+    )
+    @classmethod
+    def _clean_text_fields(cls, value: Any) -> str:
+        return _json_text(value)
+
+    @field_validator("source_ids", mode="before")
+    @classmethod
+    def _clean_source_ids(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise TypeError("source_ids must be a list")
+        return list(dict.fromkeys(_clean(item) for item in value if _clean(item)))
+
+    @classmethod
+    def from_memory_item(cls, item: MemoryItem) -> ChiefOfStaffMemoryRecord:
+        return cls(
+            id=item.id,
+            memory_type=item.memory_type,
+            object_type=item.object_type,
+            object_id=item.object_id,
+            object_key=item.object_key,
+            title=item.title,
+            summary=item.summary,
+            content=item.content,
+            source_ids=item.source_ids,
+            approval_state=item.approval_state,
+            confidence=item.confidence,
+            sensitivity=item.sensitivity,
+            safe_for_prompt=item.safe_for_prompt,
+            created_at=item.created_at,
+            expires_at=item.expires_at,
+            supersedes_memory_id=item.supersedes_memory_id,
+            metadata=item.metadata,
+        )
+
+
+class ChiefOfStaffMemoryContext(BaseModel):
+    """Bounded strategic memory context for Chief of Staff runs."""
+
+    query: str = ""
+    route: str = ""
+    object_key: str = ""
+    memory_types: list[str] = Field(default_factory=list)
+    records: list[ChiefOfStaffMemoryRecord] = Field(default_factory=list)
+    missing_reason: str = ""
+    approved_only: bool = True
+    safe_for_prompt: bool = True
+    send_enabled: bool = False
+
+    @field_validator("query", "route", "object_key", "missing_reason", mode="before")
+    @classmethod
+    def _clean_fields(cls, value: Any) -> str:
+        return _clean(value)
+
+    @field_validator("memory_types", mode="before")
+    @classmethod
+    def _clean_memory_types(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list | tuple | set) else [value]
+        return list(dict.fromkeys(_clean(item) for item in values if _clean(item)))
+
+    @field_validator("records", mode="before")
+    @classmethod
+    def _coerce_records(cls, value: Any) -> list[ChiefOfStaffMemoryRecord]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise TypeError("records must be a list")
+        records: list[ChiefOfStaffMemoryRecord] = []
+        for item in value:
+            if isinstance(item, ChiefOfStaffMemoryRecord):
+                records.append(item)
+            elif isinstance(item, MemoryItem):
+                records.append(ChiefOfStaffMemoryRecord.from_memory_item(item))
+            else:
+                records.append(ChiefOfStaffMemoryRecord.model_validate(item))
+        return records
+
+    @field_validator("approved_only", "safe_for_prompt")
+    @classmethod
+    def _retrieval_must_be_restricted(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("Chief of Staff memory context must use approved prompt-safe memory.")
+        return value
+
+    @field_validator("send_enabled")
+    @classmethod
+    def _send_enabled_must_be_false(cls, value: bool) -> bool:
+        if value is not False:
+            raise ValueError("Chief of Staff memory context must not enable sending.")
         return value

@@ -9,8 +9,10 @@ import pytest
 from keystone_agents.browser_extraction_eval import (
     BrowserExtractionCase,
     BrowserExtractionEvalOptions,
+    PlaywrightRenderedPageProvider,
     RenderedLink,
     RenderedPage,
+    build_rendered_page_provider,
     load_browser_extraction_cases,
     normalize_browser_providers,
     run_browser_extraction_eval,
@@ -158,6 +160,18 @@ def test_browser_provider_normalizer_accepts_current_and_future_boundaries() -> 
 
     with pytest.raises(ValueError, match="provider must be"):
         normalize_browser_providers(["not-a-provider"])
+
+
+def test_playwright_provider_builds_only_when_selected_and_live(monkeypatch) -> None:
+    dry_provider = build_rendered_page_provider("playwright", live=False)
+    live_provider = build_rendered_page_provider("playwright", live=True)
+
+    assert dry_provider.render("https://example.com", 1).status == "dry-run"
+    assert isinstance(live_provider, PlaywrightRenderedPageProvider)
+    monkeypatch.delenv("KEYSTONE_PLAYWRIGHT_ENABLED", raising=False)
+    blocked = live_provider.render("https://example.com", 1)
+    assert blocked.status == "blocked"
+    assert "KEYSTONE_PLAYWRIGHT_ENABLED=true" in str(blocked.error)
 
 
 def test_write_browser_eval_artifacts(tmp_path: Path) -> None:

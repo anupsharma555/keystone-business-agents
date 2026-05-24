@@ -10,28 +10,18 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
+from urllib.parse import urlparse
 
 from keystone_agents.agent_mentions import parse_agent_mention
-from keystone_agents.agent_registry import agent_cards
-from keystone_agents.agents.business_research_analyst import (
-    build_business_research_analyst_research_brief_agent,
-)
+from keystone_agents.agent_registry import AGENT_REGISTRY, agent_cards
 from keystone_agents.agents.chief_of_staff import (
-    build_chief_of_staff_agent,
     plan_chief_of_staff_request,
 )
-from keystone_agents.agents.gmail_triage import build_gmail_triage_agent
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
-from keystone_agents.agents.opportunity_scout import (
-    build_opportunity_scout_agent,
-)
 from keystone_agents.agents.orchestrator import (
     build_orchestrator_agent,
     route_request,
     run_orchestrator_sdk,
-)
-from keystone_agents.agents.outreach_composer import (
-    build_outreach_composer_agent,
 )
 from keystone_agents.automation_inventory import (
     build_automation_inventory_report,
@@ -41,8 +31,10 @@ from keystone_agents.automation_inventory import (
 from keystone_agents.cli_sdk import add_sdk_session_arguments
 from keystone_agents.config import cli_default_live_research, cli_default_live_sdk, load_settings
 from keystone_agents.evals import generate_eval_report, run_static_evals
+from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
 from keystone_agents.models import RunMode
+from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
 from keystone_agents.reporting import (
     render_markdown_table,
     render_work_item_result_text,
@@ -131,14 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--input", default="", help="Request text or a local fixture path.")
     ask.add_argument(
         "--agent",
-        choices=[
-            "orchestrator",
-            "chief_of_staff",
-            "business_research_analyst",
-            "opportunity_scout",
-            "outreach_composer",
-            "gmail_triage",
-        ],
+        choices=sorted(AGENT_REGISTRY),
         default=None,
         help="Target agent route. Overrides an @KNI mention.",
     )
@@ -437,20 +422,15 @@ def _run_route(args: argparse.Namespace) -> int:
     return 0
 
 
-AGENT_DISPLAY_NAMES = {
-    "orchestrator": "Keystone Orchestrator Agent",
-    "chief_of_staff": "KNI Chief of Staff Agent",
-    "business_research_analyst": "Business Research Analyst",
-    "opportunity_scout": "Opportunity Scout Agent",
-    "outreach_composer": "Outreach Composer Agent",
-    "gmail_triage": "Gmail Triage Agent",
-}
-
-
 def _ask_input(args: argparse.Namespace) -> str:
     if args.input:
         return _read_input(args.input)
     return " ".join(args.prompt).strip()
+
+
+def _agent_display_name(route: str) -> str:
+    spec = AGENT_REGISTRY.get(route)
+    return spec.agent_name if spec is not None else route
 
 
 def _run_ask(args: argparse.Namespace) -> int:
@@ -492,6 +472,11 @@ def _run_ask(args: argparse.Namespace) -> int:
             )
         if live_sdk and mention.explicit and mention.route is not None:
             route = str(mention.route)
+            if (
+                manual_plan.intent == "browser_diagnostics"
+                and manual_plan.target_agent in {"chief_of_staff", "orchestrator"}
+            ):
+                route = manual_plan.target_agent
             if route == "orchestrator":
                 return _run_ask_orchestrator(
                     input_text,
@@ -547,6 +532,23 @@ def _run_ask(args: argparse.Namespace) -> int:
             ),
         )
     if live_sdk:
+        if (
+            manual_plan.intent == "browser_diagnostics"
+            and manual_plan.target_agent in {"chief_of_staff", "orchestrator"}
+        ):
+            route = manual_plan.target_agent
+            if route == "orchestrator":
+                return _run_ask_orchestrator(
+                    input_text,
+                    live_sdk=True,
+                    json_output=args.json,
+                    manual_plan=manual_plan,
+                    sdk_session_spec=_sdk_session_spec_for_ask(
+                        args,
+                        route="orchestrator",
+                        default_enabled=False,
+                    ),
+                )
         return _run_ask_specialist_live(
             route,
             input_text,
@@ -753,7 +755,7 @@ def _run_ask_orchestrator(
     payload = {
         "mode": "live_sdk" if live_sdk else "dry_run",
         "selected_agent": "orchestrator",
-        "agent_name": AGENT_DISPLAY_NAMES["orchestrator"],
+        "agent_name": _agent_display_name("orchestrator"),
         "input": input_text,
         "route": result.route,
         "target_agent": result.target_agent,
@@ -782,14 +784,7 @@ def _print_ask_dry_run(
     manual_plan: ManualRequestPlan | None = None,
     database_url: str | None = None,
 ) -> int:
-    builder = {
-        "chief_of_staff": build_chief_of_staff_agent,
-        "business_research_analyst": build_business_research_analyst_research_brief_agent,
-        "opportunity_scout": build_opportunity_scout_agent,
-        "outreach_composer": build_outreach_composer_agent,
-        "gmail_triage": build_gmail_triage_agent,
-    }[route]
-    agent = builder()
+    agent = AGENT_REGISTRY[route].build_agent()
     chief_of_staff_output = (
         plan_chief_of_staff_request(input_text, database_url=database_url)
         if route == "chief_of_staff"
@@ -798,7 +793,7 @@ def _print_ask_dry_run(
     payload = {
         "mode": "dry_run",
         "selected_agent": route,
-        "agent_name": AGENT_DISPLAY_NAMES[route],
+        "agent_name": _agent_display_name(route),
         "sdk_agent_name": agent.name,
         "input": input_text,
         "send_enabled": False,
@@ -867,10 +862,11 @@ def _run_ask_specialist_live(
             sdk_session_spec=sdk_session_spec,
         )
     elif route == "outreach_composer":
-        return _print_ask_outreach_context_blocked(
+        return _run_ask_outreach_composer_live(
             input_text,
             json_output=json_output,
             manual_plan=manual_plan,
+            sdk_session_spec=sdk_session_spec,
         )
     elif route == "gmail_triage":
         return _run_ask_gmail_triage_live(
@@ -899,11 +895,13 @@ def _run_ask_company_research_live(
             json_output=json_output,
             manual_plan=manual_plan,
         )
+    company_url = _manual_plan_url_target(manual_plan)
+    company_name = _company_name_for_url_target(target.strip()) if company_url else target.strip()
     command = [
         sys.executable,
         "scripts/run_company_research.py",
         "--company",
-        target.strip(),
+        company_name,
         "--request-text",
         input_text,
         "--max-results",
@@ -914,6 +912,8 @@ def _run_ask_company_research_live(
         "--focused-brief",
         "--json",
     ]
+    if company_url:
+        command.extend(["--company-url", company_url])
     return _run_ask_script_live(
         "business_research_analyst",
         input_text,
@@ -922,6 +922,19 @@ def _run_ask_company_research_live(
         manual_plan=manual_plan,
         sdk_session_spec=sdk_session_spec,
     )
+
+
+def _manual_plan_url_target(manual_plan: ManualRequestPlan | None) -> str:
+    if manual_plan is None or manual_plan.target_type != "url":
+        return ""
+    target = manual_plan.primary_target.strip()
+    return target if target.startswith(("http://", "https://")) else ""
+
+
+def _company_name_for_url_target(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.netloc or parsed.path).strip().lower()
+    return host.removeprefix("www.") or url
 
 
 def _run_ask_chief_of_staff_live(
@@ -957,11 +970,12 @@ def _run_ask_opportunity_scout_live(
     sdk_session_spec: SDKSessionSpec | None,
 ) -> int:
     max_results = manual_plan.desired_count if manual_plan else 3
+    target = (manual_plan.primary_target if manual_plan else "") or input_text
     command = [
         sys.executable,
         "scripts/run_opportunity_scout.py",
         "--topic",
-        input_text,
+        target,
         "--max-results",
         str(max(1, min(10, max_results))),
         "--live-search",
@@ -987,6 +1001,35 @@ def _run_ask_gmail_triage_live(
     manual_plan: ManualRequestPlan | None,
     sdk_session_spec: SDKSessionSpec | None,
 ) -> int:
+    gmail_plan = infer_gmail_execution_plan(input_text)
+    if gmail_plan.operation == "priority_grouping" and gmail_plan.live_read_required:
+        command = [
+            sys.executable,
+            "scripts/run_gmail_triage.py",
+            "--live-gmail",
+            "--allow-inbox",
+            "--priority-grouping",
+            "--live-sdk",
+            "--json",
+            "--request",
+            input_text,
+            "--lookback-days",
+            str(gmail_plan.lookback_days),
+            "--max-messages",
+            str(gmail_plan.max_messages),
+        ]
+        if gmail_plan.gmail_query:
+            command.extend(["--gmail-query", gmail_plan.gmail_query])
+        return _run_ask_script_live(
+            "gmail_triage",
+            input_text,
+            command,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            sdk_session_spec=sdk_session_spec,
+            agent_execution_plan=gmail_plan.model_dump(mode="json"),
+        )
+
     temp_path: Path | None = None
     fixture_path = Path(input_text).expanduser() if input_text and "\n" not in input_text else None
     if fixture_path is not None and fixture_path.is_file():
@@ -1023,6 +1066,7 @@ def _run_ask_gmail_triage_live(
             json_output=json_output,
             manual_plan=manual_plan,
             sdk_session_spec=sdk_session_spec,
+            agent_execution_plan=gmail_plan.model_dump(mode="json"),
         )
     finally:
         if temp_path is not None:
@@ -1032,11 +1076,54 @@ def _run_ask_gmail_triage_live(
                 pass
 
 
+def _run_ask_outreach_composer_live(
+    input_text: str,
+    *,
+    json_output: bool,
+    manual_plan: ManualRequestPlan | None,
+    sdk_session_spec: SDKSessionSpec | None,
+) -> int:
+    outreach_plan = infer_outreach_execution_plan(input_text)
+    if not outreach_plan.use_default_approved_fixture_for_backend_test:
+        return _print_ask_outreach_context_blocked(
+            input_text,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            extra={
+                "agent_execution_plan": outreach_plan.model_dump(mode="json"),
+            },
+        )
+    command = [
+        sys.executable,
+        "scripts/run_outreach_draft.py",
+        "--live-sdk",
+        "--json",
+        "--goal",
+        input_text,
+        "--drafting-approval-decision",
+        "approved_for_drafting",
+        "--approval-decision",
+        "pending",
+        "--include-follow-up-schedule",
+        "--use-example-rag",
+    ]
+    return _run_ask_script_live(
+        "outreach_composer",
+        input_text,
+        command,
+        json_output=json_output,
+        manual_plan=manual_plan,
+        sdk_session_spec=sdk_session_spec,
+        agent_execution_plan=outreach_plan.model_dump(mode="json"),
+    )
+
+
 def _print_ask_outreach_context_blocked(
     input_text: str,
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    extra: dict[str, object] | None = None,
 ) -> int:
     return _print_ask_clarification(
         "outreach_composer",
@@ -1055,6 +1142,7 @@ def _print_ask_outreach_context_blocked(
                 "Attach or approve source-backed context in a WorkItem, or use "
                 "scripts/run_outreach_draft.py with explicit approved fixtures."
             ),
+            **(extra or {}),
         },
     )
 
@@ -1067,6 +1155,7 @@ def _run_ask_script_live(
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
     sdk_session_spec: SDKSessionSpec | None = None,
+    agent_execution_plan: dict[str, object] | None = None,
 ) -> int:
     env = None
     if sdk_session_spec is not None:
@@ -1091,10 +1180,11 @@ def _run_ask_script_live(
     payload = {
         "mode": "live_sdk",
         "selected_agent": route,
-        "agent_name": AGENT_DISPLAY_NAMES[route],
+        "agent_name": _agent_display_name(route),
         "input": input_text,
         "send_enabled": _payload_send_enabled(script_payload),
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "agent_execution_plan": agent_execution_plan,
         "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
         "output_type": (
             str(script_payload.get("output_type") or type(output).__name__)
@@ -1105,6 +1195,9 @@ def _run_ask_script_live(
         "output": output if output is not None else script_payload,
         "script_payload": script_payload,
     }
+    retrieval_diagnostics = _payload_retrieval_diagnostics(script_payload)
+    if retrieval_diagnostics:
+        payload["retrieval_diagnostics"] = retrieval_diagnostics
     return _print_ask_live_payload(payload, json_output=json_output)
 
 
@@ -1138,6 +1231,24 @@ def _payload_missing_information(payload: object) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def _payload_retrieval_diagnostics(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    direct = payload.get("retrieval_diagnostics")
+    if isinstance(direct, dict):
+        return direct
+    retrieval = payload.get("retrieval")
+    if isinstance(retrieval, dict) and isinstance(retrieval.get("retrieval_diagnostics"), dict):
+        return retrieval["retrieval_diagnostics"]
+    live_search_metadata = payload.get("live_search_metadata")
+    if isinstance(live_search_metadata, dict) and isinstance(
+        live_search_metadata.get("retrieval_diagnostics"),
+        dict,
+    ):
+        return live_search_metadata["retrieval_diagnostics"]
+    return {}
+
+
 def _print_ask_clarification(
     route: str,
     input_text: str,
@@ -1150,7 +1261,7 @@ def _print_ask_clarification(
     payload = {
         "mode": "blocked",
         "selected_agent": route,
-        "agent_name": AGENT_DISPLAY_NAMES[route],
+        "agent_name": _agent_display_name(route),
         "input": input_text,
         "send_enabled": False,
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
@@ -1773,14 +1884,15 @@ def _run_agents_list(args: argparse.Namespace) -> int:
     else:
         print(
             render_markdown_table(
-                ["Route", "Agent", "Builder", "Schema", "Evals"],
+                ["Route", "Agent", "Schema", "Tools", "Live flags", "Safety"],
                 [
                     [
                         card["route_name"],
                         card["agent_name"],
-                        str(card["builder"]).rsplit(":", maxsplit=1)[-1],
                         str(card["output_schema"]).rsplit(".", maxsplit=1)[-1],
-                        ", ".join(card["eval_datasets"]),
+                        str(len(card["tools"])),
+                        ", ".join(card["live_flags_required"]) or "-",
+                        "; ".join(card["safety_notes"][:2]),
                     ]
                     for card in cards
                 ],

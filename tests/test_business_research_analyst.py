@@ -131,6 +131,7 @@ def test_build_business_research_analyst_agent() -> None:
         "load_crm_account_context",
         "search_web",
         "fetch_company_page",
+        "extract_research_claims_from_html",
         "fetch_linkedin_or_profile_placeholder",
         "extract_company_signals",
         "dedupe_and_rank_sources",
@@ -153,6 +154,7 @@ def test_build_business_research_analyst_research_brief_agent() -> None:
         "search_local_context",
         "read_local_context_file",
         "search_web",
+        "extract_research_claims_from_html",
         "dedupe_and_rank_sources",
     } <= {getattr(tool, "name", "") for tool in agent.tools}
 

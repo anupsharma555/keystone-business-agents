@@ -138,6 +138,105 @@ def publish_table_mirror_impl(
     }
 
 
+def publish_internal_artifact_impl(
+    artifact_json: str,
+    *,
+    artifact_type: str = "business_artifact",
+    title: str = "",
+    destinations: list[str] | None = None,
+    live: bool = False,
+) -> dict[str, Any]:
+    """Prepare a structured business artifact for internal review surfaces."""
+
+    try:
+        payload = json.loads(artifact_json or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("artifact_json must be a JSON object.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("artifact_json must be a JSON object.")
+    cleaned_type = " ".join(str(artifact_type or "business_artifact").split()).replace(" ", "_")
+    cleaned_title = " ".join(str(title or payload.get("title") or cleaned_type).split())
+    normalized_destinations = destinations or ["local_json"]
+    refs: list[AutomationArtifactRef] = []
+    for raw_destination in normalized_destinations:
+        destination = AutomationWriteDestination(str(raw_destination))
+        if live:
+            raise RuntimeError(
+                "Live internal artifact publishing is not implemented in this repo yet. "
+                "Use dry-run artifacts or add a reviewed provider adapter."
+            )
+        url = ""
+        path = ""
+        provider = destination.value
+        if destination == AutomationWriteDestination.GOOGLE_DOC:
+            url = f"dry-run://google-doc/{cleaned_type}"
+        elif destination == AutomationWriteDestination.AIRTABLE:
+            url = f"dry-run://airtable/{cleaned_type}"
+        elif destination in {
+            AutomationWriteDestination.LOCAL_JSON,
+            AutomationWriteDestination.LOCAL_MARKDOWN,
+        }:
+            path = f"artifacts/{cleaned_type}.json"
+            provider = "local"
+        else:
+            raise ValueError(f"Unsupported internal artifact destination: {destination.value}")
+        refs.append(
+            AutomationArtifactRef(
+                artifact_type=cleaned_type,
+                title=cleaned_title,
+                provider=provider,
+                dry_run=True,
+                url=url,
+                path=path,
+                metadata={
+                    "canonical_state": "sqlite",
+                    "destination": destination.value,
+                    "preview": payload,
+                    "external_sharing_enabled": False,
+                },
+            )
+        )
+    return {
+        "status": "dry-run",
+        "artifact_type": cleaned_type,
+        "title": cleaned_title,
+        "artifact_refs": [ref.model_dump(mode="json") for ref in refs],
+        "canonical_state": "sqlite",
+        "send_enabled": False,
+        "external_sharing_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def publish_internal_artifact(
+    artifact_json: str,
+    artifact_type: str = "business_artifact",
+    title: str = "",
+    destinations_json: str = "[\"local_json\"]",
+    live: bool = False,
+) -> str:
+    """Create dry-run internal artifact refs for company/contact/business data."""
+
+    try:
+        destinations = json.loads(destinations_json or "[]")
+    except json.JSONDecodeError as exc:
+        raise ValueError("destinations_json must be a JSON array.") from exc
+    if not isinstance(destinations, list):
+        raise ValueError("destinations_json must be a JSON array.")
+    return json.dumps(
+        publish_internal_artifact_impl(
+            artifact_json,
+            artifact_type=artifact_type,
+            title=title,
+            destinations=[str(destination) for destination in destinations],
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
 @function_tool(**keystone_tool_guardrail_kwargs())
 def publish_table_mirror(
     report_json: str,

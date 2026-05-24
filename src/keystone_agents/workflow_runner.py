@@ -9,10 +9,21 @@ from typing import Any
 from keystone_agents.agents.business_research_analyst import (
     run_business_research_analyst_research_brief_sdk,
 )
+from keystone_agents.agents.chief_of_staff import (
+    plan_chief_of_staff_request,
+    run_chief_of_staff_sdk,
+)
 from keystone_agents.agents.opportunity_scout import scout_opportunities_fixture
 from keystone_agents.agents.opportunity_search_planner import resolve_opportunity_search_plan
 from keystone_agents.agents.orchestrator import route_request
-from keystone_agents.agents.outreach_composer import compose_outreach_draft_fixture
+from keystone_agents.agents.outreach_composer import (
+    build_approved_outreach_drafting_context,
+    build_outreach_composer_compact_synthesis_agent,
+    compose_outreach_draft_fixture,
+    compose_outreach_draft_llm_constrained,
+    load_style_profile,
+)
+from keystone_agents.cli_sdk import jsonable
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.contact_enrichment import build_contact_enrichment_artifact
 from keystone_agents.live_retrieval import (
@@ -20,10 +31,16 @@ from keystone_agents.live_retrieval import (
     run_opportunity_scout_live,
 )
 from keystone_agents.memory import retrieval_tool_performance_memory_item
-from keystone_agents.models import ResearchSDKInput
+from keystone_agents.models import OutreachComposerSDKInput, ResearchSDKInput
+from keystone_agents.run import run_retrieved_sdk_synthesis
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.opportunity import OpportunityRecord as ScoutOpportunityRecord
-from keystone_agents.schemas.outreach import OpportunityRecord as OutreachOpportunityRecord
+from keystone_agents.schemas.outreach import (
+    OpportunityRecord as OutreachOpportunityRecord,
+)
+from keystone_agents.schemas.outreach import (
+    OutreachLLMDraftPayload,
+)
 from keystone_agents.schemas.research import ResearchBrief
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
@@ -35,6 +52,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemNextAction,
     WorkItemRoute,
     WorkItemSourceRef,
+    WorkItemStatus,
     utc_now_iso,
 )
 from keystone_agents.sdk_sessions import (
@@ -104,7 +122,7 @@ def advance_work_item(request: WorkflowRunRequest) -> WorkflowRunResult:
             }
         )
 
-    context_pack = build_context_pack_for_route(work_item, route)
+    context_pack = build_context_pack_for_route(work_item, route, store=store)
     record_event(
         work_item,
         event_type="advance_started",
@@ -145,12 +163,19 @@ def advance_work_item(request: WorkflowRunRequest) -> WorkflowRunResult:
         result = _advance_opportunity(work_item, request=request, store=store)
     elif route == WorkItemRoute.OUTREACH_COMPOSER:
         result = _advance_outreach(work_item, request=request, store=store)
+    elif route == WorkItemRoute.CHIEF_OF_STAFF:
+        result = _advance_chief_of_staff(
+            work_item,
+            request=request,
+            store=store,
+            sdk_session=build_sdk_session(sdk_session_spec) if request.live_sdk else None,
+        )
     else:
         result = _block_unsupported_route(work_item, route=route, store=store)
 
     if store is not None:
         store.save_work_item(result.work_item)
-    final_context_pack = build_context_pack_for_route(result.work_item, result.route)
+    final_context_pack = build_context_pack_for_route(result.work_item, result.route, store=store)
     return result.model_copy(
         update={
             "manual_request_plan": request.manual_request_plan,
@@ -245,6 +270,13 @@ def _apply_manual_request_plan(work_item: WorkItem, plan: dict | None) -> WorkIt
     return work_item.model_copy(
         update={"target": target.model_copy(update={"metadata": metadata})}
     ).touch()
+
+
+def _manual_primary_target(work_item: WorkItem) -> str:
+    plan = work_item.target.metadata.get("manual_request_plan")
+    if not isinstance(plan, dict):
+        return ""
+    return " ".join(str(plan.get("primary_target") or "").strip().split())
 
 
 def _manual_plan_event_payload(plan: dict | None) -> dict:
@@ -480,6 +512,106 @@ def _effective_max_results(request: WorkflowRunRequest) -> int:
     return max(1, min(20, count))
 
 
+def _advance_chief_of_staff(
+    work_item: WorkItem,
+    *,
+    request: WorkflowRunRequest,
+    store: SQLiteStore | None,
+    sdk_session: Any | None = None,
+) -> WorkflowRunResult:
+    request_text = request.request_text.strip() or work_item.request_text
+    sdk_input = {
+        "request": request_text,
+        "work_item": {
+            "id": work_item.id,
+            "route": WorkItemRoute.CHIEF_OF_STAFF.value,
+            "target": work_item.target.model_dump(mode="json"),
+            "sources": [source.model_dump(mode="json") for source in work_item.sources[:8]],
+        },
+        "slack_context": work_item.target.metadata.get("slack_context", {}),
+        "side_effect_policy": (
+            "read-only interpretation; no Slack post, Gmail send, calendar write, "
+            "Airtable write, or repo write without explicit approval gates"
+        ),
+    }
+    if request.live_sdk:
+        typed_result = run_chief_of_staff_sdk(
+            sdk_input,
+            live=True,
+            session=sdk_session,
+            force_sdk_interpretation=True,
+        )
+        output = typed_result.output
+        mode_note = "Chief of Staff live SDK interpretation executed for this WorkItem."
+    else:
+        output = plan_chief_of_staff_request(request_text, database_url=request.database_url)
+        mode_note = "Chief of Staff deterministic dry-run planner executed for this WorkItem."
+
+    artifact_id = ""
+    output_payload = output.model_dump(mode="json")
+    if store is not None:
+        artifact_id = str(
+            store.save_agent_run(
+                agent_name=WorkItemRoute.CHIEF_OF_STAFF.value,
+                input_payload=sdk_input,
+                input_summary=request_text[:240],
+                output=output_payload,
+                model="sdk-live" if request.live_sdk else "fixture",
+                dry_run=not request.live_sdk,
+                status="success",
+            )
+        )
+    artifact = WorkItemArtifactRef(
+        artifact_type="chief_of_staff_plan",
+        artifact_id=artifact_id or f"unsaved:{work_item.id}:chief_of_staff_plan",
+        source_agent=WorkItemRoute.CHIEF_OF_STAFF.value,
+        approval_state=ApprovalState.PENDING.value,
+        title="Chief of Staff plan",
+        summary=output.summary[:240],
+        metadata={
+            "workflow_type": output.recommended_route.workflow_type,
+            "target_channel": output.recommended_route.target_channel,
+            "slack_post_allowed": output.slack_post_allowed,
+            "send_enabled": output.send_enabled,
+        },
+    )
+    updated = attach_artifact(
+        work_item.model_copy(
+            update={
+                "last_agent": WorkItemRoute.CHIEF_OF_STAFF.value,
+                "status": WorkItemStatus.DONE,
+                "confidence": max(work_item.confidence, 0.7),
+                "audit_notes": [*work_item.audit_notes, mode_note, *output.audit_notes],
+                "next_action": WorkItemNextAction(
+                    action="review_chief_of_staff_plan",
+                    agent=WorkItemRoute.CHIEF_OF_STAFF,
+                    description=(
+                        "Review the Chief of Staff plan before any live internal write or post."
+                    ),
+                    requires_approval=bool(output.approval_required),
+                ),
+            }
+        ).touch(),
+        artifact,
+    )
+    _persist_artifact_and_event(
+        updated,
+        artifact,
+        summary="Attached Chief of Staff plan.",
+        store=store,
+    )
+    return WorkflowRunResult(
+        work_item=updated,
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=updated.status,
+        advanced=True,
+        artifact_refs=[artifact],
+        next_action=updated.next_action,
+        human_summary=output.summary,
+        audit_notes=[mode_note, *output.audit_notes],
+    )
+
+
 def _advance_research(
     work_item: WorkItem,
     *,
@@ -494,6 +626,7 @@ def _advance_research(
         target = selected_opportunity[0].title
     target = (
         target
+        or _manual_primary_target(work_item)
         or work_item.target.name
         or normalize_target_text(
             request.request_text or work_item.request_text,
@@ -560,6 +693,7 @@ def _advance_research(
             "consulting_fit_score": profile.consulting_fit_score,
             "confidence_score": profile.confidence_score,
             "source_refs": [source.model_dump(mode="json") for source in profile.sources[:8]],
+            "retrieval_diagnostics": metadata.get("retrieval_diagnostics"),
         },
     )
     contact_artifact_id = ""
@@ -963,10 +1097,11 @@ def _advance_opportunity(
     store: SQLiteStore | None,
 ) -> WorkflowRunResult:
     request_text = request.request_text.strip()
+    planned_topic = _manual_primary_target(work_item)
     topic_input = (
         work_item.target.name
         if request_text.lower() in {"", "continue", "resume"}
-        else request_text or work_item.request_text or work_item.target.name
+        else planned_topic or request_text or work_item.request_text or work_item.target.name
     )
     topic = normalize_target_text(topic_input, WorkItemRoute.OPPORTUNITY_SCOUT)
     work_item = work_item.model_copy(
@@ -979,6 +1114,7 @@ def _advance_opportunity(
     if not ready.ready:
         return _blocked_result(work_item, ready.blockers, ready.next_action, store=store)
 
+    metadata: dict[str, object] = {}
     if request.live_search:
         search_plan = (
             resolve_opportunity_search_plan(
@@ -1029,6 +1165,7 @@ def _advance_opportunity(
                 "priority_score": record.priority_score,
                 "opportunity_type": record.opportunity_type,
                 "recommended_next_step": record.recommended_next_step,
+                "retrieval_diagnostics": metadata.get("retrieval_diagnostics"),
             },
         )
         artifacts.append(artifact)
@@ -1424,10 +1561,10 @@ def _advance_outreach(
         except (KeyError, TypeError, ValueError):
             opportunity_record = None
 
-    draft = compose_outreach_draft_fixture(
+    draft, draft_audit_note = _compose_outreach_draft_for_work_item(
         company_profile=company_profile,
         opportunity_record=opportunity_record,
-        outreach_goal=_outreach_goal(request.request_text),
+        request=request,
     )
     draft_id = str(store.save_outreach_draft(draft))
     approval_item = build_approval_queue_item(
@@ -1480,7 +1617,7 @@ def _advance_outreach(
             ),
             "audit_notes": [
                 *work_item.audit_notes,
-                "Draft-only outreach artifact created; no send or live side effects occurred.",
+                draft_audit_note,
             ],
         }
     )
@@ -1502,10 +1639,104 @@ def _advance_outreach(
             f"Outreach Composer created a draft-only approval item for {company_profile.name}; "
             "no external message was sent."
         ),
-        audit_notes=[
-            "Draft-only outreach artifact created; no send or live side effects occurred."
-        ],
+        audit_notes=[draft_audit_note],
     )
+
+
+def _compose_outreach_draft_for_work_item(
+    *,
+    company_profile: Any,
+    opportunity_record: OutreachOpportunityRecord | None,
+    request: WorkflowRunRequest,
+) -> tuple[Any, str]:
+    objective = _outreach_goal(request.request_text)
+    if not request.live_sdk:
+        return (
+            compose_outreach_draft_fixture(
+                company_profile=company_profile,
+                opportunity_record=opportunity_record,
+                outreach_goal=objective,
+            ),
+            "Draft-only outreach artifact created; no send or live side effects occurred.",
+        )
+
+    try:
+        style_profile = load_style_profile("sample_email_style_profile_anup_approved")
+        approved_context = build_approved_outreach_drafting_context(
+            company_profile=company_profile,
+            opportunity_record=opportunity_record,
+            email_style_profile=style_profile,
+            objective=objective,
+            revision_request=request.request_text,
+        )
+
+        def retrieve() -> dict[str, Any]:
+            return {
+                "company_profile": company_profile,
+                "opportunity_record": opportunity_record,
+                "email_style_profile": style_profile,
+                "approved_context": approved_context,
+                "context_policy": "Approved source-backed WorkItem context only.",
+            }
+
+        def normalize(context: dict[str, Any]) -> OutreachComposerSDKInput:
+            return OutreachComposerSDKInput(
+                company_name=company_profile.name,
+                recent_signal=opportunity_record.rationale if opportunity_record else "",
+                outreach_goal=objective,
+                approved_context=(
+                    "Approved source-backed WorkItem outreach context:\n"
+                    f"{json.dumps(jsonable(context), ensure_ascii=True, sort_keys=True)}"
+                ),
+                email_style_profile=json.dumps(
+                    jsonable(style_profile),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            )
+
+        outcome = run_retrieved_sdk_synthesis(
+            agent=build_outreach_composer_compact_synthesis_agent(),
+            output_type=OutreachLLMDraftPayload,
+            retrieve=retrieve,
+            normalize=normalize,
+            input_summary=f"WorkItem outreach SDK synthesis for {company_profile.name}",
+            input_audit_payload={
+                "company": company_profile.name,
+                "sdk_synthesis": True,
+                "workflow": "work_item_outreach_composer",
+            },
+            live=True,
+            save=False,
+            model_label="sdk-live",
+        )
+        compact_payload = jsonable(outcome.final_output)
+        if not isinstance(compact_payload, dict):
+            raise RuntimeError("Outreach SDK synthesis did not return a JSON object.")
+        source_ids_used = compact_payload.get("source_ids_used")
+        if isinstance(source_ids_used, list) and "keystone_profile" not in source_ids_used:
+            compact_payload["source_ids_used"] = [*source_ids_used, "keystone_profile"]
+        draft = compose_outreach_draft_llm_constrained(
+            approved_context=approved_context,
+            llm_draft_payload=compact_payload,
+            fallback_to_fixture=False,
+        )
+        return (
+            draft.model_copy(update={"drafting_mode": "llm_constrained"}),
+            "Outreach Composer live SDK draft created; no send or live Gmail side effect occurred.",
+        )
+    except Exception as exc:
+        return (
+            compose_outreach_draft_fixture(
+                company_profile=company_profile,
+                opportunity_record=opportunity_record,
+                outreach_goal=objective,
+            ),
+            (
+                "Outreach Composer live SDK drafting failed with "
+                f"{type(exc).__name__}; deterministic draft-only fallback created."
+            ),
+        )
 
 
 def _block_unsupported_route(
@@ -1599,6 +1830,7 @@ def _blocked_human_summary(
         WorkItemRoute.OPPORTUNITY_SCOUT: "Opportunity Scout",
         WorkItemRoute.OUTREACH_COMPOSER: "Outreach Composer",
         WorkItemRoute.GMAIL_TRIAGE: "Gmail Triage",
+        WorkItemRoute.CHIEF_OF_STAFF: "Chief of Staff",
         WorkItemRoute.ORCHESTRATOR: "Orchestrator",
         WorkItemRoute.CLARIFICATION: "Orchestrator",
     }.get(route, route.value)

@@ -71,6 +71,8 @@ class AutomationWriteDestination(StrEnum):
     LOCAL_MARKDOWN = "local_markdown"
     LOCAL_JSON = "local_json"
     GOOGLE_DOC = "google_doc"
+    GOOGLE_DRIVE_FOLDER = "google_drive_folder"
+    GOOGLE_SHEET = "google_sheet"
     AIRTABLE = "airtable"
     SLACK = "slack"
     WORK_ITEM_NOTE = "work_item_note"

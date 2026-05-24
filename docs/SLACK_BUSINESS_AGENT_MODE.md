@@ -35,6 +35,7 @@ so business-agent developers can see the safety boundary from this repo.
 | Approval packets | `KNI_BUSINESS_AGENTS_APPROVALS_ENABLED`, `KNI_BUSINESS_AGENTS_LIVE_SLACK`, `KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL` | Slack `chat:write`, `SLACK_BOT_TOKEN` | Posts review cards. Approval remains local and scoped. |
 | Slack message actions | `KNI_BUSINESS_AGENTS_MESSAGE_ACTIONS_ENABLED` | Slack interactivity enabled | Buttons update local approval records for the named scope; they do not send email, post externally, publish, or schedule. |
 | Slack history context | `KNI_BUSINESS_AGENTS_HISTORY_CONTEXT_ENABLED`, `SLACK_APP_MENTION_POLLING_ENABLED` | Slack `channels:history` and `groups:history` if intentionally enabled | Optional fallback/history access; disabled by default. |
+| Selected-message thread context | `KNI_BUSINESS_AGENTS_THREAD_CONTEXT_ENABLED`, `KNI_BUSINESS_AGENTS_THREAD_CONTEXT_MAX_MESSAGES`, `KNI_BUSINESS_AGENTS_THREAD_CONTEXT_MAX_CHARS` | Slack `conversations.replies` access for the selected channel plus `SLACK_BOT_TOKEN` | Optional bounded thread context for message actions. The bridge writes a compact context file for KBA; failures are warnings, not approval or send authority. |
 | LangGraph WorkItem orchestration | `KNI_BUSINESS_AGENTS_LANGGRAPH` | KBA installed with `.[orchestration]` in `KNI_BUSINESS_AGENTS_PYTHON` | Routes WorkItem advancement through the optional graph wrapper; does not change live side-effect gates. |
 | SDK conversation sessions | `KEYSTONE_SDK_SESSIONS`, `KEYSTONE_SDK_SESSION_DB`, `KEYSTONE_SDK_SESSION_ID` | OpenAI Agents SDK live or local SDK run | Local SQLite conversation continuity for follow-up wording. Default automatic capture is limited to Chief of Staff and live WorkItem scopes; WorkItems remain canonical state. |
 | Live model execution | `KNI_BUSINESS_AGENTS_LIVE_SDK` and workflow-specific live SDK flags | Business-agent model credentials | Enables LLM synthesis/planning only. |
@@ -44,6 +45,22 @@ so business-agent developers can see the safety boundary from this repo.
 `SLACK_CONFIGURED_BOT_SCOPES` is optional in `keystone-slack`. When set to the
 installed app's bot-scope list, Socket Mode startup can warn if enabled features
 are missing required scopes.
+
+## Search Runtime Boundary
+
+Slack and Business Agents can each have a local SearXNG process. The Slack
+runtime may use its own search service for Slack-native workflows. Business
+Agents child processes should receive the KBA search configuration from the
+exported environment contract and default to the KBA SearXNG URL
+`http://127.0.0.1:18080` when no explicit override is set. This prevents a Slack
+run from silently using a different retrieval lane than a manual KBA CLI or
+`@KNI` agent run.
+
+KBA live retrieval emits a compact `retrieval_diagnostics` object for Slack and
+CLI renderers. It is safe to display because it contains provider names,
+reachability/fallback flags, result/source counts, extraction failures, and
+timing summaries only; it must not include credentials, raw headers, OAuth
+tokens, or verbose traces.
 
 ## End-To-End Workflows
 
@@ -81,3 +98,12 @@ Run this repo's health check after changing flags:
 Run `keystone-slack` Socket Mode startup after changing Slack app scopes. It now
 prints actionable config warnings for enabled business-agent features that lack
 required local config or declared Slack scopes.
+
+## Tested Contracts
+
+The bridge has fixture-mode smoke coverage for the highest-risk cross-repo
+contracts: status command construction, natural-language WorkItem creation,
+WorkItem continuation, selected Slack context handoff, approval actions that do
+not send externally, child-process environment propagation, and live flag
+defaults. These tests should stay deterministic and must not depend on network,
+real Slack APIs, real Gmail, or live model calls.

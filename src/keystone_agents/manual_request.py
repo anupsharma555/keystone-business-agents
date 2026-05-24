@@ -90,6 +90,18 @@ _LOOP_TOPIC_STOP_RE = re.compile(
     re.I,
 )
 _REFERENCE_URL_RE = re.compile(r"https?://[^\s<>)]+", re.I)
+_BROWSER_DIAGNOSTICS_RE = re.compile(
+    r"\b(?:backend\s+browser|browser\s+diagnostics|rendered[- ]page|"
+    r"render\s+page|console|network|playwright|lighthouse|devtools|"
+    r"frontend|page\s+diagnos(?:e|is|tic)|browser\s+check)\b",
+    re.I,
+)
+_OPTIONAL_DIAGNOSTICS_RE = re.compile(r"\b(?:only\s+if\s+needed|if\s+needed|fallback)\b", re.I)
+_RESEARCH_ACTION_RE = re.compile(
+    r"\b(?:research|profile|explain\s+whether|assess\s+whether|operating\s+company|"
+    r"partnership|advisory|source-backed)\b",
+    re.I,
+)
 
 
 def normalize_manual_agent(value: str | None) -> ManualTargetAgent | None:
@@ -162,11 +174,14 @@ def merge_manual_request_plan(
         if isinstance(candidate, ManualRequestPlan)
         else ManualRequestPlan.model_validate(candidate)
     )
-    if base.intent == "opportunity_to_outreach_loop" and plan.intent != base.intent:
+    preserved_intents = {"opportunity_to_outreach_loop", "browser_diagnostics"}
+    if base.intent in preserved_intents and (
+        plan.intent != base.intent or plan.target_agent != base.target_agent
+    ):
         warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
         warnings.append(
-            "Ignored planner override that converted an opportunity-to-outreach workflow "
-            "request into a non-workflow route."
+            "Ignored planner override that converted a protected manual request "
+            "into a different route."
         )
         return base.model_copy(
             update={
@@ -209,6 +224,8 @@ def _semantic_target_agent(
     requested_agent: ManualTargetAgent | None,
 ) -> ManualTargetAgent:
     lower = text.lower()
+    if _looks_like_browser_diagnostics_only_request(text):
+        return requested_agent if requested_agent in {"chief_of_staff", "orchestrator"} else "chief_of_staff"
     if requested_agent and requested_agent != "orchestrator":
         return requested_agent
     if _looks_like_slack_operations_request(lower):
@@ -239,6 +256,8 @@ def _intent_for_target(
     workflow_allowed: bool = True,
 ) -> ManualRequestIntent:
     lower = text.lower()
+    if _looks_like_browser_diagnostics_only_request(text):
+        return "browser_diagnostics"
     if target_agent == "chief_of_staff" and _looks_like_reference_capture_request(lower):
         return "reference_capture"
     if (
@@ -298,6 +317,35 @@ def _looks_like_reference_capture_request(lower: str) -> bool:
     )
 
 
+def _looks_like_browser_diagnostics_request(text: str) -> bool:
+    cleaned = str(text or "")
+    lower = cleaned.lower()
+    if not _BROWSER_DIAGNOSTICS_RE.search(cleaned):
+        return False
+    if _REFERENCE_URL_RE.search(cleaned) or "localhost" in lower or "127.0.0.1" in lower:
+        return True
+    return any(
+        marker in lower
+        for marker in (
+            "backend browser",
+            "browser diagnostics",
+            "playwright",
+            "rendered-page",
+            "rendered page",
+            "devtools",
+            "lighthouse",
+        )
+    ) or ("console" in lower and "page" in lower)
+
+
+def _looks_like_browser_diagnostics_only_request(text: str) -> bool:
+    if not _looks_like_browser_diagnostics_request(text):
+        return False
+    if _OPTIONAL_DIAGNOSTICS_RE.search(text) and _RESEARCH_ACTION_RE.search(text):
+        return False
+    return True
+
+
 def _desired_count(text: str) -> int:
     match = _COUNT_RE.search(text)
     if match is None:
@@ -311,6 +359,9 @@ def _desired_count(text: str) -> int:
 
 def _primary_target(text: str, *, target_agent: ManualTargetAgent) -> str:
     cleaned = _strip_direct_agent_prefix(text).strip()
+    if _looks_like_browser_diagnostics_request(cleaned):
+        url_match = _REFERENCE_URL_RE.search(cleaned)
+        return url_match.group(0).rstrip(".,;") if url_match else cleaned[:120]
     if target_agent == "chief_of_staff" and _looks_like_reference_capture_request(cleaned.lower()):
         return _reference_target(cleaned)
     if target_agent == "business_research_analyst":
@@ -327,8 +378,8 @@ def _primary_target(text: str, *, target_agent: ManualTargetAgent) -> str:
     if target_agent == "opportunity_scout":
         if looks_like_opportunity_to_outreach_loop(cleaned):
             return _opportunity_to_outreach_topic(cleaned)
-        return cleaned
-    cleaned = _PREFIX_RE.sub("", cleaned).strip()
+        return _first_nonempty(_quoted_text(cleaned), _opportunity_search_target(cleaned), cleaned[:120])
+    cleaned = _PREFIX_RE.sub("", _strip_operational_clauses(cleaned)).strip()
     if target_agent == "gmail_triage":
         return _first_nonempty(_quoted_text(cleaned), _subject_text(cleaned), cleaned[:120])
     if target_agent == "outreach_composer":
@@ -338,8 +389,52 @@ def _primary_target(text: str, *, target_agent: ManualTargetAgent) -> str:
     return _first_nonempty(_quoted_text(cleaned), cleaned[:120])
 
 
+def _opportunity_search_target(text: str) -> str:
+    cleaned = _strip_operational_clauses(text)
+    cleaned = re.sub(r"https?://\S+|www\.\S+", " ", cleaned)
+    cleaned = re.sub(
+        r"^\s*(?:please\s+)?(?:find|identify|source|search\s+for|look\s+for|list|return|show)\s+",
+        " ",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"^\s*(?:top\s+)?\d{1,2}\s+", " ", cleaned, flags=re.I)
+    cleaned = re.sub(
+        r"\b(?:opportunit(?:y|ies)|leads|targets)\b\s*$",
+        "opportunities",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = " ".join(cleaned.split()).strip(" .,:;-")
+    return cleaned[:160]
+
+
+def _strip_operational_clauses(text: str) -> str:
+    cleaned = " ".join(str(text or "").split()).strip()
+    cleaned = re.split(
+        r"(?:^|\s+)(?:"
+        r"use\s+live\b|"
+        r"live\s+sdk\b|"
+        r"live\s+search\b|"
+        r"no\s+outreach\b|"
+        r"no\s+gmail\b|"
+        r"no\s+external\s+writes\b|"
+        r"do\s+not\s+(?:send|email|post|write|modify|delete|share)\b|"
+        r"draft\s+only\b|"
+        r"test\b|"
+        r"keep\s+the\s+output\b"
+        r")",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    return cleaned.strip(" .,:;-")
+
+
 def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetType:
     lower = text.lower()
+    if _looks_like_browser_diagnostics_request(text):
+        return "url"
     if target_agent == "chief_of_staff" and _looks_like_reference_capture_request(lower):
         return "operator_reference"
     if target_agent == "business_research_analyst":
@@ -395,6 +490,8 @@ def _reference_target(text: str) -> str:
 
 def _objective(text: str, *, intent: ManualRequestIntent) -> str:
     cleaned = _strip_direct_agent_prefix(text).strip()
+    if intent == "browser_diagnostics":
+        return cleaned or "Run read-only backend browser diagnostics."
     if intent == "opportunity_to_outreach_loop":
         return cleaned or "Run the opportunity-to-outreach loop and queue draft-only approval."
     if intent == "company_research":

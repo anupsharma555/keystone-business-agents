@@ -47,6 +47,7 @@ class WorkItemRoute(StrEnum):
     BUSINESS_RESEARCH_ANALYST = "business_research_analyst"
     OPPORTUNITY_SCOUT = "opportunity_scout"
     OUTREACH_COMPOSER = "outreach_composer"
+    CHIEF_OF_STAFF = "chief_of_staff"
     CLARIFICATION = "clarification"
 
 

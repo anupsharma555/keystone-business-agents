@@ -15,6 +15,7 @@ ResearchTargetType = Literal[
     "zotero_collection",
     "zotero_article",
     "article_collection",
+    "github_repository_collection",
     "topic",
     "other",
 ]

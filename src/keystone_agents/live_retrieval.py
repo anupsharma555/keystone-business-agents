@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,6 +43,13 @@ from keystone_agents.schemas.company_profile import CompanyProfile
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.opportunity_search_plan import OpportunitySearchPlan
 from keystone_agents.schemas.retrieval import RetrievalHint
+from keystone_agents.tools.html_review_tool import (
+    HtmlReviewError,
+    agent_html_review_enabled,
+    agent_html_review_max_pages,
+    agent_html_review_min_claims,
+    run_agent_html_review,
+)
 from keystone_agents.tools.serper_tool import build_search_provider
 from keystone_agents.tools.website_extraction_tool import (
     WebsiteExtractionError,
@@ -78,6 +85,193 @@ def search_provider_label(metadata: dict[str, Any]) -> str:
     if providers_used:
         return providers_used[0]
     return str(metadata.get("primary_search_provider") or metadata.get("search_provider") or "")
+
+
+def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Return Slack/CLI-safe structured diagnostics from retrieval metadata."""
+
+    providers_used = [
+        str(item).strip()
+        for item in (metadata.get("search_providers_used") or [])
+        if str(item).strip()
+    ]
+    provider_summary = search_provider_label(dict(metadata))
+    if provider_summary and provider_summary not in providers_used:
+        providers_used = [*providers_used, *_split_provider_summary(provider_summary)]
+
+    quality = metadata.get("search_quality") if isinstance(metadata.get("search_quality"), dict) else {}
+    source_coverage = (
+        metadata.get("source_coverage")
+        if isinstance(metadata.get("source_coverage"), dict)
+        else quality.get("source_coverage")
+        if isinstance(quality.get("source_coverage"), dict)
+        else {}
+    )
+    website = (
+        metadata.get("website_extraction")
+        if isinstance(metadata.get("website_extraction"), dict)
+        else {}
+    )
+    timing = metadata.get("timing") if isinstance(metadata.get("timing"), dict) else {}
+    provider_usage = (
+        metadata.get("provider_usage")
+        if isinstance(metadata.get("provider_usage"), dict)
+        else {}
+    )
+    diagnostics = {
+        "mode": str(metadata.get("mode") or ""),
+        "live_search": bool(metadata.get("live_search")),
+        "provider_summary": provider_summary,
+        "providers_used": list(dict.fromkeys(providers_used)),
+        "provider_usage": _compact_provider_usage(provider_usage),
+        "retrieval_ladder": _compact_retrieval_ladder(metadata.get("retrieval_ladder")),
+        "search_quality_summary": _compact_quality_summary(quality),
+        "source_coverage_summary": _compact_source_coverage(source_coverage),
+        "fallback_used": bool(
+            metadata.get("search_provider_fallback_used")
+            or metadata.get("provider_error_fallback_used")
+            or metadata.get("deepening_search_used")
+        ),
+        "precision_escalated": bool(metadata.get("precision_search_escalated")),
+        "hosted_web_search_lane_used": "agents-web-search" in providers_used,
+        "review_recommended": bool(
+            metadata.get("search_review_recommended")
+            or quality.get("needs_search_review")
+        ),
+        "website_extraction_summary": _compact_website_summary(website),
+        "errors": _compact_retrieval_errors(metadata, website),
+        "timing": _compact_timing(timing),
+    }
+    searxng = metadata.get("searxng_transient_runtime")
+    if isinstance(searxng, dict):
+        diagnostics["transient_searxng"] = {
+            "enabled": bool(searxng.get("enabled")),
+            "started": bool(searxng.get("started")),
+            "stopped": bool(searxng.get("stopped")),
+            "reason": str(searxng.get("reason") or ""),
+        }
+    return diagnostics
+
+
+def _split_provider_summary(value: str) -> list[str]:
+    return [item.strip() for item in value.replace("+", ",").split(",") if item.strip()]
+
+
+def _compact_provider_usage(provider_usage: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    compact: dict[str, dict[str, Any]] = {}
+    for name, usage in provider_usage.items():
+        if not isinstance(usage, Mapping):
+            continue
+        compact[str(name)] = {
+            "requests_attempted": int(_safe_float(usage.get("requests_attempted"))),
+            "requests_succeeded": int(_safe_float(usage.get("requests_succeeded"))),
+            "requests_failed": int(_safe_float(usage.get("requests_failed"))),
+            "total_seconds": round(_safe_float(usage.get("total_seconds")), 3),
+        }
+    return compact
+
+
+def _compact_retrieval_ladder(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    ladder: list[dict[str, Any]] = []
+    for rung in value[:6]:
+        if not isinstance(rung, Mapping):
+            continue
+        ladder.append(
+            {
+                "rung": str(rung.get("rung") or "retrieval"),
+                "providers": [str(item) for item in (rung.get("providers") or []) if item],
+                "raw_result_count": int(_safe_float(rung.get("raw_result_count"))),
+                "queries": int(_safe_float(rung.get("queries"))),
+                "pages_considered": int(_safe_float(rung.get("pages_considered"))),
+                "pages_extracted": int(_safe_float(rung.get("pages_extracted"))),
+                "claim_count": int(_safe_float(rung.get("claim_count"))),
+                "seconds": round(_safe_float(rung.get("seconds")), 3),
+                "useful": bool(rung.get("useful")),
+            }
+        )
+    return ladder
+
+
+def _compact_quality_summary(quality: Mapping[str, Any]) -> dict[str, Any]:
+    if not quality:
+        return {}
+    reasons = quality.get("reasons")
+    reason_values = reasons if isinstance(reasons, list) else []
+    return {
+        "sufficient": quality.get("sufficient"),
+        "official_source_present": quality.get("official_source_present"),
+        "needs_search_review": bool(quality.get("needs_search_review")),
+        "reasons": [str(item) for item in reason_values[:5]],
+    }
+
+
+def _compact_source_coverage(source_coverage: Mapping[str, Any]) -> dict[str, Any]:
+    if not source_coverage:
+        return {}
+    return {
+        "selected_source_count": int(_safe_float(source_coverage.get("selected_source_count"))),
+        "credible_source_count": int(_safe_float(source_coverage.get("credible_source_count"))),
+        "official_source_count": int(_safe_float(source_coverage.get("official_source_count"))),
+        "sufficiency_status": str(source_coverage.get("sufficiency_status") or ""),
+    }
+
+
+def _compact_website_summary(website: Mapping[str, Any]) -> dict[str, Any]:
+    if not website:
+        return {}
+    return {
+        "enabled": bool(website.get("enabled")),
+        "provider": str(website.get("provider") or ""),
+        "fallback_provider": str(website.get("fallback_provider") or ""),
+        "pages_considered": int(_safe_float(website.get("pages_considered"))),
+        "pages_extracted": int(_safe_float(website.get("page_count"))),
+        "claim_count": int(_safe_float(website.get("claim_count"))),
+        "extraction_failures": len(website.get("errors") or []),
+        "agent_html_review_page_count": int(
+            _safe_float(website.get("agent_html_review_page_count"))
+        ),
+        "agent_html_review_claim_count": int(
+            _safe_float(website.get("agent_html_review_claim_count"))
+        ),
+    }
+
+
+def _compact_retrieval_errors(
+    metadata: Mapping[str, Any],
+    website: Mapping[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    for key in ("errors", "warnings"):
+        value = metadata.get(key)
+        if isinstance(value, list):
+            errors.extend(str(item) for item in value if str(item).strip())
+    website_errors = website.get("errors")
+    if isinstance(website_errors, list):
+        errors.extend(str(item) for item in website_errors if str(item).strip())
+    return errors[:8]
+
+
+def _compact_timing(timing: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: round(_safe_float(timing.get(key)), 3)
+        for key in (
+            "total_seconds",
+            "search_seconds",
+            "quality_assessment_seconds",
+            "website_extraction_seconds",
+            "profile_build_seconds",
+        )
+        if timing.get(key) is not None
+    }
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _slugify(value: str, *, fallback: str) -> str:
@@ -515,6 +709,7 @@ def retrieve_company_profile_live(
             ],
         }
     )
+    metadata["retrieval_diagnostics"] = retrieval_diagnostics_from_metadata(metadata)
     return profile, metadata
 
 
@@ -530,6 +725,10 @@ def _extract_company_website_inputs(
         "enabled": website_extraction_enabled(),
         "provider": provider,
         "fallback_provider": fallback_provider,
+        "agent_html_review_enabled": agent_html_review_enabled(),
+        "agent_html_review_max_pages": agent_html_review_max_pages(),
+        "agent_html_review_page_count": 0,
+        "agent_html_review_claim_count": 0,
         "pages_considered": 0,
         "internal_page_discovery_count": 0,
         "page_count": 0,
@@ -555,6 +754,8 @@ def _extract_company_website_inputs(
     base_stats["pages_considered"] = len(urls)
     website_inputs: list[dict[str, Any]] = []
     errors: list[str] = []
+    html_review_attempts = 0
+    html_review_claim_count = 0
     for index, url in enumerate(urls, start=1):
         try:
             result = extract_website_content(
@@ -592,6 +793,41 @@ def _extract_company_website_inputs(
                     )
                 else:
                     result = fallback_result
+        if (
+            agent_html_review_enabled()
+            and html_review_attempts < agent_html_review_max_pages()
+            and len(result.claims) <= agent_html_review_min_claims()
+            and result.text_or_markdown.strip()
+        ):
+            html_review_attempts += 1
+            try:
+                review = run_agent_html_review(
+                    html_or_text=result.text_or_markdown,
+                    subject=company,
+                    url=result.url,
+                    title=result.title,
+                    live=True,
+                )
+            except HtmlReviewError as exc:
+                errors.append(f"{url}: agent HTML review failed: {exc}")
+            except Exception as exc:
+                errors.append(f"{url}: agent HTML review unavailable: {exc}")
+            else:
+                review_claims = [
+                    claim for claim in review.claims if claim and claim not in result.claims
+                ]
+                if review_claims:
+                    result = result.model_copy(
+                        update={
+                            "provider": f"{result.provider}+{review.provider}",
+                            "claims": [*result.claims, *review_claims],
+                            "metadata": {
+                                **result.metadata,
+                                "agent_html_review": review.model_dump(mode="json"),
+                            },
+                        }
+                    )
+                    html_review_claim_count += len(review_claims)
         if not result.claims:
             continue
         website_inputs.append(
@@ -616,6 +852,8 @@ def _extract_company_website_inputs(
         "page_count": len(website_inputs),
         "claim_count": sum(len(item.get("supported_claims") or []) for item in website_inputs),
         "providers_used": providers_used,
+        "agent_html_review_page_count": html_review_attempts,
+        "agent_html_review_claim_count": html_review_claim_count,
     }
     return website_inputs, errors, stats
 
@@ -1325,6 +1563,7 @@ def run_opportunity_scout_live(
     )
     if sandbox_review is not None:
         metadata["sandbox_search_review"] = sandbox_review
+    metadata["retrieval_diagnostics"] = retrieval_diagnostics_from_metadata(metadata)
     result = result.model_copy(
         update={
             "search_provider": metadata["search_provider"],

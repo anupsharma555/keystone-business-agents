@@ -59,6 +59,76 @@ DEFAULT_AUTOMATION_SPECS: tuple[AutomationSpec, ...] = (
         default_channel="#ai-agents-workflow",
         live_flags=["--notify-slack", "--live-slack"],
     ),
+    AutomationSpec(
+        id="auto_chief_of_staff_weekly_meeting_prep",
+        name="Chief of Staff Weekly Meeting Prep",
+        description=(
+            "Scheduled Chief of Staff review of the next week of calendar context, "
+            "with bounded Business Research Analyst prep support for salient meetings."
+        ),
+        trigger_type=AutomationTriggerType.SCHEDULE,
+        schedule="Mondays at 8:00 AM ET",
+        target_agent="chief_of_staff",
+        workflow="chief-of-staff-weekly-meeting-prep",
+        input_template="Review the next seven days of calendar context and prepare only salient meetings.",
+        default_channel="#meetings",
+        live_flags=["--live-sdk", "--live-search"],
+        metadata={
+            "external_writes_enabled": False,
+            "calendar_writes_enabled": False,
+            "gmail_writes_enabled": False,
+            "crm_writes_enabled": False,
+        },
+    ),
+    AutomationSpec(
+        id="auto_announcements_weekly_research_synthesis",
+        name="Announcements Weekly Research Synthesis",
+        description=(
+            "Scheduled Chief of Staff selection of salient announcement links, "
+            "followed by Business Research Analyst source-backed summaries."
+        ),
+        trigger_type=AutomationTriggerType.SCHEDULE,
+        schedule="Saturdays at 9:00 AM ET",
+        target_agent="business_research_analyst",
+        workflow="announcements-weekly-research-synthesis",
+        input_template=(
+            "Select three to five Keystone-relevant announcement links from the last seven days "
+            "and synthesize concise source-backed summaries."
+        ),
+        default_channel="#announcements",
+        live_flags=["--live-sdk", "--live-search"],
+        metadata={
+            "external_writes_enabled": False,
+            "calendar_writes_enabled": False,
+            "gmail_writes_enabled": False,
+            "crm_writes_enabled": False,
+        },
+    ),
+    AutomationSpec(
+        id="auto_github_repo_opportunities_weekly",
+        name="GitHub Repository Opportunities Weekly",
+        description=(
+            "Scheduled Opportunity Scout review of open-source GitHub repositories "
+            "that may help Keystone operations, business agents, data analysis, "
+            "Slack/Google integrations, or psychiatry and behavioral-health workflows."
+        ),
+        trigger_type=AutomationTriggerType.SCHEDULE,
+        schedule="Wednesdays at 12:00 PM ET",
+        target_agent="opportunity_scout",
+        workflow="github-repo-opportunities-weekly",
+        input_template=(
+            "Find four high-quality open-source GitHub repositories relevant to Keystone."
+        ),
+        default_channel="#git",
+        live_flags=["--live-sdk", "--live-search"],
+        metadata={
+            "external_writes_enabled": False,
+            "github_writes_enabled": False,
+            "calendar_writes_enabled": False,
+            "gmail_writes_enabled": False,
+            "crm_writes_enabled": False,
+        },
+    ),
 )
 
 
@@ -83,6 +153,30 @@ DEFAULT_CHANNEL_BINDINGS: tuple[AutomationChannelBinding, ...] = (
         channel_name="ai-agents-workflow",
         destination_type="slack",
         purpose="approval_notification",
+    ),
+    AutomationChannelBinding(
+        id="acb_chief_of_staff_weekly_meeting_prep",
+        automation_id="auto_chief_of_staff_weekly_meeting_prep",
+        channel_name="meetings",
+        destination_type="slack",
+        purpose="meeting_prep",
+        approval_required=False,
+    ),
+    AutomationChannelBinding(
+        id="acb_announcements_weekly_research_synthesis",
+        automation_id="auto_announcements_weekly_research_synthesis",
+        channel_name="announcements",
+        destination_type="slack",
+        purpose="research_synthesis",
+        approval_required=False,
+    ),
+    AutomationChannelBinding(
+        id="acb_github_repo_opportunities_weekly",
+        automation_id="auto_github_repo_opportunities_weekly",
+        channel_name="git",
+        destination_type="slack",
+        purpose="github_repo_opportunity_scan",
+        approval_required=False,
     ),
 )
 
@@ -112,6 +206,12 @@ def automation_spec_for_command(command: str, *, stage: str = "") -> AutomationS
         )
     if normalized == "gmail-triage":
         return DEFAULT_AUTOMATION_SPECS[1].model_copy(update={"metadata": {"last_stage": stage}})
+    if normalized == "chief-of-staff-weekly-meeting-prep":
+        return DEFAULT_AUTOMATION_SPECS[3].model_copy(update={"metadata": {"last_stage": stage}})
+    if normalized == "announcements-weekly-research-synthesis":
+        return DEFAULT_AUTOMATION_SPECS[4].model_copy(update={"metadata": {"last_stage": stage}})
+    if normalized == "github-repo-opportunities-weekly":
+        return DEFAULT_AUTOMATION_SPECS[5].model_copy(update={"metadata": {"last_stage": stage}})
     return AutomationSpec(
         id=f"auto_{normalized.replace('-', '_') or 'manual'}",
         name=normalized.replace("-", " ").title() or "Manual Automation",

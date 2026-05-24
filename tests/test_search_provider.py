@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 
 import pytest
+import requests
 
 from keystone_agents.config import Settings
 from keystone_agents.sdk import ToolGuardrailViolation
@@ -18,6 +19,7 @@ from keystone_agents.tools.search_provider import (
     SearchRequest,
     SearchResult,
     SearxngConfigurationError,
+    SearxngSearchError,
     SearxngSearchProvider,
     SerperConfigurationError,
     SerperSearchProvider,
@@ -462,6 +464,29 @@ def test_searxng_provider_parses_mocked_response(monkeypatch: pytest.MonkeyPatch
     assert calls[0]["url"] == "http://127.0.0.1:8080/search"
     assert calls[0]["params"] == {"q": "Curebase clinical trial software", "format": "json"}
     assert calls[0]["timeout"] == 2.0
+
+
+def test_searxng_provider_reports_request_endpoint_and_exception_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_get(*_args: object, **_kwargs: object) -> object:
+        raise requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr("keystone_agents.tools.search_provider.requests.get", fake_get)
+
+    provider = SearxngSearchProvider(
+        live=True,
+        base_url="http://127.0.0.1:18080",
+        timeout_seconds=2.0,
+    )
+
+    with pytest.raises(SearxngSearchError) as excinfo:
+        provider.search_web("clinical AI safety", num_results=1)
+
+    message = str(excinfo.value)
+    assert "http://127.0.0.1:18080/search" in message
+    assert "ConnectionError" in message
+    assert "connection refused" in message
 
 
 def test_searxng_structured_search_passes_categories_time_language_and_page(

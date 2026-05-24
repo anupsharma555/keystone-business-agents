@@ -47,10 +47,12 @@ KEYSTONE_AGENT_RUN_BUDGET_USD=0.25
 KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER=gemini
 KEYSTONE_GMAIL_TRIAGE_MODEL=gemini-2.5-flash
 KEYSTONE_GMAIL_TRIAGE_BASE_URL=
-KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL=gpt-5.4-mini
-KEYSTONE_OPPORTUNITY_SCOUT_MODEL=gpt-5.4-mini
+KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL=gpt-5.4
+KEYSTONE_OPPORTUNITY_SCOUT_MODEL=gpt-5.4
 KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER=gemini
 KEYSTONE_OUTREACH_COMPOSER_MODEL=gemini-2.5-flash
+KEYSTONE_CHIEF_OF_STAFF_MODEL_PROVIDER=openai
+KEYSTONE_CHIEF_OF_STAFF_MODEL=gpt-5.4
 KEYSTONE_TRACE_INCLUDE_SENSITIVE_DATA=false
 ```
 
@@ -242,6 +244,8 @@ export KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL=true
 export KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN=2
 export KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true
 export KEYSTONE_WEBSITE_EXTRACTOR=trafilatura
+export KEYSTONE_AGENT_HTML_REVIEW=true
+export KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2
 .venv/bin/python scripts/run_opportunity_scout.py \
   --topic "behavioral health AI" \
   --max-results 3 \
@@ -593,27 +597,51 @@ Audit review should confirm source attribution, approval state, reviewer notes w
 - Use `--max-messages 1` for live Gmail checks.
 - Do not pass `--sdk` unless intentionally validating SDK construction or live model behavior.
 - Keep global `KEYSTONE_OPENAI_MODEL=gpt-5.4-mini` unless a model change is
-  being tested deliberately. OpenAI-backed defaults use `gpt-5.4-mini`.
+  being tested deliberately. Main operating agents default to OpenAI `gpt-5.4`,
+  including Gmail Triage and Outreach Composer.
 - Keep `KEYSTONE_AGENT_RUN_BUDGET_USD=0.25` unless intentionally testing a
   different per-agent SDK run budget. The shared SDK runner estimates cost from
   provider usage and the local pricing table, then stops before persistence or
   downstream steps if the run exceeds the budget. If provider usage or pricing
   metadata is unavailable on a true live run, the shared runner blocks
   continuation rather than assuming the run was free.
-- Gmail Triage and Outreach Composer default to `gemini-2.5-flash` through
-  Google's direct OpenAI-compatible Gemini endpoint. Keystone uses the SDK Chat
-  Completions compatibility path. Confirm `GEMINI_API_KEY` before live Gemini
-  SDK runs. Set `KEYSTONE_GMAIL_TRIAGE_BASE_URL`,
-  `KEYSTONE_OUTREACH_COMPOSER_BASE_URL`, or `LITELLM_BASE_URL` only when
-  intentionally routing through LiteLLM or another reviewed gateway.
+- Gemini remains available for Gmail Triage and Outreach Composer only through
+  explicit `KEYSTONE_*_MODEL_PROVIDER=gemini` plus model settings. Confirm
+  `GEMINI_API_KEY` before live Gemini SDK runs. Set
+  `KEYSTONE_GMAIL_TRIAGE_BASE_URL`, `KEYSTONE_OUTREACH_COMPOSER_BASE_URL`, or
+  `LITELLM_BASE_URL` only when intentionally routing through LiteLLM or another
+  reviewed gateway.
+- To use Gemini as a backup when OpenAI live SDK execution is unavailable, set
+  `KEYSTONE_ENABLE_GEMINI_FALLBACK=true` and keep
+  `KEYSTONE_GEMINI_FALLBACK_MODEL=gemini-2.5-flash` unless deliberately testing
+  another Gemini model.
+
+Rendered-browser diagnostics are optional. Install only when needed:
+
+```bash
+python -m pip install '.[browser]'
+python -m playwright install chromium
+```
+
+Then set `KEYSTONE_PLAYWRIGHT_ENABLED=true` for explicit live rendered-page
+checks. Optional screenshots are written under
+`KEYSTONE_PLAYWRIGHT_IMAGE_DIR=artifacts/playwright-images`; absolute or
+non-artifact paths are ignored. The Keystone Playwright tool is read-only,
+HTTP(S)-only, backend/headless, browser-free in default tests, and scoped to
+Business Research Analyst, Opportunity Scout, Orchestrator, and Chief of Staff.
+It uses a temporary non-persistent browser profile and must not open a
+user-screen browser. If the managed Playwright browser binary is missing, the
+tool falls back to the locally installed Chrome channel for headless
+diagnostics. Use `capture_browser_diagnostics` for console, page-error,
+failed-request, response-status, and resource-loading evidence, then pass that
+payload to `summarize_rendered_page_diagnostics` before publishing findings.
 - Review `gemini_free_tier_usage` in SDK/test-pack reports for Gemini daily
   request-limit context. Unsaved runs report only the current run; saved SDK
   runs aggregate sanitized same-day SQLite audit rows. Treat this as operator
   quota context, not a provider billing statement.
-- Keep Business Research Analyst, Opportunity Scout, and Orchestrator on
-  OpenAI-compatible providers by default. Outreach Composer uses the reviewed
-  direct Gemini endpoint by default and can be forced to another provider or
-  gateway only through explicit `KEYSTONE_*` overrides.
+- Keep main operating agents on OpenAI-compatible providers by default. Gemini
+  is available only through explicit `KEYSTONE_*` overrides or the reviewed
+  fallback path.
 - Save audit rows with `--save` so repeated investigations do not require repeated live calls.
 - Review live-search output before increasing result counts.
 - Disable unused provider keys in `.env`.

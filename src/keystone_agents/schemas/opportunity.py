@@ -58,6 +58,7 @@ OpportunityType = Literal[
     "grant or collaboration opportunity",
     "journal article or publication call",
     "contract or RFP opportunity",
+    "open-source repository opportunity",
 ]
 
 OpportunitySourceType = Literal[
@@ -72,6 +73,7 @@ OpportunitySourceType = Literal[
     "funding_database",
     "government",
     "linkedin",
+    "github",
     "social",
     "unknown",
 ]
@@ -86,6 +88,7 @@ OpportunitySignalType = Literal[
     "journal_call",
     "conference",
     "contract_rfp",
+    "repository",
     "company_page",
     "pipeline_state",
     "search",

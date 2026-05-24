@@ -295,6 +295,32 @@ def test_cli_ask_chief_of_staff_outputs_deterministic_plan(capsys) -> None:
     assert payload["output"]["slack_post_allowed"] is False
 
 
+def test_cli_ask_kni_chief_of_staff_uses_chief_work_item(tmp_path: Path, capsys) -> None:
+    database_url = f"sqlite:///{tmp_path / 'ask-chief.db'}"
+
+    exit_code = main(
+        [
+            "ask",
+            "--database-url",
+            database_url,
+            "@KNI",
+            "chief",
+            "of",
+            "staff",
+            "summarize",
+            "open",
+            "Slack",
+            "follow-ups",
+        ]
+    )
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "WorkItem:" in output
+    assert "Route: chief_of_staff" in output
+    assert "Artifacts: chief_of_staff_plan:" in output
+
+
 def test_cli_ask_chief_of_staff_reference_capture_persists_memory(
     tmp_path: Path,
     capsys,
@@ -492,6 +518,7 @@ def test_cli_agents_list_prints_registry_cards(capsys) -> None:
     output = capsys.readouterr().out
     assert "gmail_triage" in output
     assert "OpportunityScoutResult" in output
+    assert "Live flags" in output
 
 
 def test_cli_agents_list_json(capsys) -> None:
@@ -500,3 +527,5 @@ def test_cli_agents_list_json(capsys) -> None:
     assert exit_code == 0
     output = capsys.readouterr().out
     assert '"route_name": "orchestrator"' in output
+    assert '"tool_policy"' in output
+    assert '"allowed_tool_names"' in output

@@ -18,11 +18,13 @@ from keystone_agents.schemas.context_pack import (
     ContextPack,
     ContextPackReadinessGate,
     GmailContextPack,
+    MemoryContextRef,
     OpportunityContextPack,
     OutreachContactContext,
     OutreachContextPack,
     ResearchContextPack,
 )
+from keystone_agents.schemas.memory import normalize_memory_key
 from keystone_agents.schemas.work_item import (
     WorkItem,
     WorkItemApprovalGate,
@@ -589,19 +591,24 @@ def build_gmail_context(work_item: WorkItem) -> dict[str, Any]:
     return _context_pack_payload(build_gmail_context_pack(work_item))
 
 
-def build_context_pack_for_route(work_item: WorkItem, route: WorkItemRoute | str) -> ContextPack:
+def build_context_pack_for_route(
+    work_item: WorkItem,
+    route: WorkItemRoute | str,
+    *,
+    store: SQLiteStore | None = None,
+) -> ContextPack:
     """Build the typed WorkItem-derived context pack for a specialist route."""
 
     resolved = _coerce_route(route)
     if resolved == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
-        return build_research_context_pack(work_item)
+        return hydrate_context_pack_memory(build_research_context_pack(work_item), work_item, store)
     if resolved == WorkItemRoute.OPPORTUNITY_SCOUT:
-        return build_opportunity_context_pack(work_item)
+        return hydrate_context_pack_memory(build_opportunity_context_pack(work_item), work_item, store)
     if resolved == WorkItemRoute.OUTREACH_COMPOSER:
-        return build_outreach_context_pack(work_item)
+        return hydrate_context_pack_memory(build_outreach_context_pack(work_item), work_item, store)
     if resolved == WorkItemRoute.GMAIL_TRIAGE:
-        return build_gmail_context_pack(work_item)
-    return build_research_context_pack(work_item)
+        return hydrate_context_pack_memory(build_gmail_context_pack(work_item), work_item, store)
+    return hydrate_context_pack_memory(build_research_context_pack(work_item), work_item, store)
 
 
 def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
@@ -773,6 +780,118 @@ def build_gmail_context_pack(work_item: WorkItem) -> GmailContextPack:
         risk_flags=_metadata_text_list(metadata, "risk_flags"),
         approval_state=_highest_gate_state(work_item),
     )
+
+
+def hydrate_context_pack_memory(
+    pack: ContextPack,
+    work_item: WorkItem,
+    store: SQLiteStore | None,
+) -> ContextPack:
+    """Attach bounded approved prompt-safe memory without changing readiness gates."""
+
+    if store is None:
+        return pack
+    query = _memory_query(work_item)
+    object_keys = _memory_object_keys(work_item)
+    relevant = _retrieve_memory_refs(
+        store,
+        query=query,
+        object_keys=object_keys,
+        memory_types=_route_memory_types(pack.route),
+        limit=5,
+    )
+    updates: dict[str, Any] = {"relevant_memory_refs": relevant}
+    if isinstance(pack, ResearchContextPack):
+        updates.update(
+            {
+                "approved_company_facts": _retrieve_memory_refs(
+                    store,
+                    query=query,
+                    object_keys=object_keys,
+                    memory_types=["company_profile_snapshot", "company_fact"],
+                    limit=5,
+                ),
+                "retrieval_performance_notes": _retrieve_memory_refs(
+                    store,
+                    query=query or "company research retrieval",
+                    object_keys=object_keys,
+                    memory_types=["retrieval_tool_performance"],
+                    limit=3,
+                ),
+            }
+        )
+    elif isinstance(pack, OpportunityContextPack):
+        updates.update(
+            {
+                "prior_opportunity_refs": _retrieve_memory_refs(
+                    store,
+                    query=query,
+                    object_keys=object_keys,
+                    memory_types=["opportunity_signal", "opportunity_outcome", "workflow_dedup"],
+                    limit=5,
+                ),
+                "retrieval_performance_notes": _retrieve_memory_refs(
+                    store,
+                    query=query or "opportunity retrieval",
+                    object_keys=object_keys,
+                    memory_types=["retrieval_tool_performance"],
+                    limit=3,
+                ),
+            }
+        )
+    elif isinstance(pack, OutreachContextPack):
+        updates.update(
+            {
+                "approved_company_facts": _retrieve_memory_refs(
+                    store,
+                    query=query,
+                    object_keys=object_keys,
+                    memory_types=["company_profile_snapshot", "company_fact"],
+                    limit=5,
+                ),
+                "prior_opportunity_refs": _retrieve_memory_refs(
+                    store,
+                    query=query,
+                    object_keys=object_keys,
+                    memory_types=["opportunity_signal", "opportunity_outcome", "workflow_dedup"],
+                    limit=5,
+                ),
+                "outreach_style_examples": _retrieve_memory_refs(
+                    store,
+                    query=query or "outreach style",
+                    object_keys=object_keys,
+                    memory_types=["email_style_preference", "outreach_example", "human_feedback"],
+                    limit=3,
+                ),
+                "approval_history_refs": _retrieve_memory_refs(
+                    store,
+                    query=query,
+                    object_keys=object_keys,
+                    memory_types=["approval_decision"],
+                    limit=3,
+                ),
+            }
+        )
+    elif isinstance(pack, GmailContextPack):
+        updates.update(
+            {
+                "outreach_style_examples": _retrieve_memory_refs(
+                    store,
+                    query=query or "reply style",
+                    object_keys=object_keys,
+                    memory_types=["email_style_preference", "outreach_example", "human_feedback"],
+                    limit=3,
+                ),
+                "approval_history_refs": _retrieve_memory_refs(
+                    store,
+                    query=query,
+                    object_keys=object_keys,
+                    memory_types=["approval_decision"],
+                    limit=3,
+                ),
+            }
+        )
+    return pack.model_copy(update=updates)
 
 
 def research_ready(work_item: WorkItem) -> ReadinessResult:
@@ -1036,12 +1155,24 @@ def normalize_target_text(text: str, route: WorkItemRoute) -> str:
     cleaned = re.sub(r"^@?KNI\s+", "", cleaned, flags=re.I)
     if route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
         cleaned = re.sub(
+            r"^(business\s+research\s+analyst|business\s+agent\s+analyst|account\s+researcher|company\s+research(?:\s+agent)?)\s+",
+            "",
+            cleaned,
+            flags=re.I,
+        )
+        cleaned = re.sub(
             r"^(please\s+)?(research|analyze|profile|investigate|look\s+into)\s+",
             "",
             cleaned,
             flags=re.I,
         )
     elif route == WorkItemRoute.OPPORTUNITY_SCOUT:
+        cleaned = re.sub(
+            r"^(opportunity\s+scout|scout\s+agent|scout)\s+",
+            "",
+            cleaned,
+            flags=re.I,
+        )
         cleaned = re.sub(
             r"^(please\s+)?(find|identify|scout|search\s+for|look\s+for)\s+",
             "",
@@ -1071,6 +1202,216 @@ def _context_pack_payload(pack: ContextPack) -> dict[str, Any]:
     payload = pack.model_dump(mode="json")
     payload["agent"] = pack.route.value
     return payload
+
+
+def _retrieve_memory_refs(
+    store: SQLiteStore,
+    *,
+    query: str,
+    object_keys: list[str],
+    memory_types: list[str],
+    limit: int,
+) -> list[MemoryContextRef]:
+    found: list[Any] = []
+    seen: set[str] = set()
+
+    def add_records(records: list[Any]) -> None:
+        for record in records:
+            key = _memory_identity(record)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(record)
+            if len(found) >= limit:
+                return
+
+    for object_key in object_keys:
+        if len(found) >= limit:
+            break
+        add_records(
+            store.retrieve_memory(
+                query=query,
+                object_key=object_key,
+                memory_types=memory_types,
+                limit=limit,
+                approved_only=True,
+                safe_for_prompt=True,
+            )
+        )
+    if len(found) < limit:
+        add_records(
+            store.retrieve_memory(
+                query=query,
+                memory_types=memory_types,
+                limit=limit,
+                approved_only=True,
+                safe_for_prompt=True,
+            )
+        )
+    return [_memory_context_ref(record) for record in found[:limit]]
+
+
+def _memory_context_ref(item: Any) -> MemoryContextRef:
+    return MemoryContextRef(
+        id=getattr(item, "id", None),
+        memory_type=str(getattr(item, "memory_type", "") or ""),
+        object_type=str(getattr(item, "object_type", "") or ""),
+        object_id=str(getattr(item, "object_id", "") or ""),
+        object_key=str(getattr(item, "object_key", "") or ""),
+        title=_bounded_memory_text(getattr(item, "title", ""), max_chars=120),
+        summary=_bounded_memory_text(getattr(item, "summary", ""), max_chars=320),
+        content_summary=_memory_content_summary(getattr(item, "content", {})),
+        source_ids=[str(source_id) for source_id in getattr(item, "source_ids", [])[:8]],
+        approval_state=str(getattr(getattr(item, "approval_state", ""), "value", getattr(item, "approval_state", ""))),
+        confidence=float(getattr(item, "confidence", 0.0) or 0.0),
+        created_at=str(getattr(item, "created_at", "") or ""),
+    )
+
+
+def _memory_content_summary(content: Any) -> dict[str, Any]:
+    if not isinstance(content, dict):
+        return {}
+    allowed_keys = (
+        "company_name",
+        "entity_name",
+        "entity_kind",
+        "canonical_entity_key",
+        "claim_text",
+        "claim_type",
+        "opportunity_type",
+        "priority_score",
+        "recommended_next_step",
+        "decision",
+        "scope",
+        "outcome_status",
+        "provider",
+        "provider_name",
+        "success_rate",
+        "lessons",
+        "preference",
+        "style_summary",
+        "rationale",
+    )
+    summary: dict[str, Any] = {}
+    for key in allowed_keys:
+        if key not in content:
+            continue
+        value = content[key]
+        if isinstance(value, str):
+            summary[key] = _bounded_memory_text(value, max_chars=240)
+        elif isinstance(value, int | float | bool):
+            summary[key] = value
+        elif isinstance(value, list):
+            summary[key] = [
+                _bounded_memory_text(item, max_chars=160)
+                for item in value[:5]
+                if str(item).strip()
+            ]
+        elif isinstance(value, dict):
+            summary[key] = {
+                str(inner_key): _bounded_memory_text(inner_value, max_chars=160)
+                for inner_key, inner_value in list(value.items())[:5]
+                if str(inner_value).strip()
+            }
+    return summary
+
+
+def _memory_query(work_item: WorkItem) -> str:
+    parts = [
+        work_item.target.name,
+        work_item.target.email,
+        work_item.target.url,
+        work_item.target.external_id,
+        work_item.request_text,
+        work_item.title,
+        *_metadata_query_values(work_item.target.metadata),
+        *(artifact.title for artifact in selected_artifacts(work_item)),
+    ]
+    return " ".join(part for part in (" ".join(str(value or "").split()) for value in parts) if part)[:600]
+
+
+def _memory_object_keys(work_item: WorkItem) -> list[str]:
+    values = [
+        work_item.target.name,
+        work_item.target.email,
+        work_item.target.url,
+        work_item.target.external_id,
+        work_item.title,
+        *(_metadata_query_values(work_item.target.metadata)),
+        *(artifact.title for artifact in selected_artifacts(work_item)),
+    ]
+    keys = [normalize_memory_key(str(value or "")) for value in values if str(value or "").strip()]
+    return list(dict.fromkeys(key for key in keys if key))[:12]
+
+
+def _metadata_query_values(metadata: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in (
+        "thread_id",
+        "message_id",
+        "sender",
+        "company_name",
+        "organization",
+        "recipient",
+        "contact_name",
+        "opportunity_type",
+        "canonical_entity_key",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    return values
+
+
+def _route_memory_types(route: WorkItemRoute) -> list[str]:
+    if route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
+        return [
+            "company_profile_snapshot",
+            "company_fact",
+            "workflow_dedup",
+            "retrieval_tool_performance",
+        ]
+    if route == WorkItemRoute.OPPORTUNITY_SCOUT:
+        return [
+            "opportunity_signal",
+            "opportunity_outcome",
+            "company_profile_snapshot",
+            "workflow_dedup",
+            "retrieval_tool_performance",
+        ]
+    if route == WorkItemRoute.OUTREACH_COMPOSER:
+        return [
+            "company_profile_snapshot",
+            "company_fact",
+            "opportunity_signal",
+            "email_style_preference",
+            "outreach_example",
+            "human_feedback",
+            "approval_decision",
+        ]
+    if route == WorkItemRoute.GMAIL_TRIAGE:
+        return ["email_style_preference", "outreach_example", "human_feedback", "approval_decision"]
+    return ["workflow_dedup"]
+
+
+def _memory_identity(item: Any) -> str:
+    item_id = getattr(item, "id", None)
+    if item_id:
+        return f"id:{item_id}"
+    return "|".join(
+        [
+            str(getattr(item, "memory_type", "") or ""),
+            str(getattr(item, "object_key", "") or ""),
+            str(getattr(item, "title", "") or ""),
+        ]
+    )
+
+
+def _bounded_memory_text(value: Any, *, max_chars: int) -> str:
+    text = " ".join(str(value or "").replace("\r\n", "\n").replace("\r", "\n").split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3].rstrip()}..."
 
 
 def _gate(
@@ -1379,6 +1720,8 @@ def _kind_for_route(route: WorkItemRoute) -> WorkItemKind:
         return WorkItemKind.OUTREACH
     if route == WorkItemRoute.GMAIL_TRIAGE:
         return WorkItemKind.GMAIL_THREAD
+    if route == WorkItemRoute.CHIEF_OF_STAFF:
+        return WorkItemKind.WEEKLY_SCAN
     return WorkItemKind.WEEKLY_SCAN
 
 
@@ -1399,7 +1742,13 @@ def _kind_for_target(route: WorkItemRoute, target: WorkItemTarget) -> WorkItemKi
 
 def _target_for_request(text: str, route: WorkItemRoute) -> WorkItemTarget:
     target = normalize_target_text(text, route)
-    object_type = "topic" if route == WorkItemRoute.OPPORTUNITY_SCOUT else "company"
+    object_type = (
+        "topic"
+        if route == WorkItemRoute.OPPORTUNITY_SCOUT
+        else "slack_channel"
+        if route == WorkItemRoute.CHIEF_OF_STAFF
+        else "company"
+    )
     if (
         route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
         and looks_like_zotero_article_request(text)
@@ -1436,6 +1785,8 @@ def _title_for_request(text: str, route: WorkItemRoute) -> str:
         return f"Outreach: {target or 'Untitled draft'}"
     if route == WorkItemRoute.GMAIL_TRIAGE:
         return "Gmail triage"
+    if route == WorkItemRoute.CHIEF_OF_STAFF:
+        return f"Chief of Staff: {target or 'operations request'}"
     return target or "WorkItem"
 
 

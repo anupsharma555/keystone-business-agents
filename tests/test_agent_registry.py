@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from pydantic import BaseModel
 
 from keystone_agents.agent_registry import (
@@ -12,8 +13,12 @@ from keystone_agents.agent_registry import (
     specialist_handoff_specs,
 )
 from keystone_agents.agent_tool_policy import disallowed_tool_names, tool_policy_for_agent
+from keystone_agents.agent_tool_policy import AgentToolPolicyError
 from keystone_agents.agents.orchestrator import INTENDED_HANDOFFS, build_orchestrator_agent
 from keystone_agents.sdk import Agent, prompt_metadata_for_files
+from keystone_agents.sdk import build_sdk_agent
+from keystone_agents.tools.gmail_tool import get_gmail_message
+from keystone_agents.tools.serper_tool import search_web
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROMPTS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "prompts"
@@ -80,7 +85,30 @@ def test_registered_agent_tools_follow_controlled_tool_policy() -> None:
 
     outreach_policy = tool_policy_for_agent("outreach_composer")
     assert outreach_policy is not None
-    assert "search_web" not in outreach_policy.allowed_tool_names
+    assert "search_web" in outreach_policy.allowed_tool_names
+    assert "get_gmail_message" not in outreach_policy.allowed_tool_names
+
+
+def test_runtime_tool_policy_rejects_disallowed_tools() -> None:
+    with pytest.raises(AgentToolPolicyError, match="disallowed tool"):
+        build_sdk_agent(
+            name="outreach_composer",
+            instructions="Keystone test agent.",
+            output_type=None,
+            tools=[get_gmail_message],
+            policy_agent_name="outreach_composer",
+        )
+
+
+def test_runtime_tool_policy_rejects_missing_policy() -> None:
+    with pytest.raises(AgentToolPolicyError, match="No AgentToolPolicy"):
+        build_sdk_agent(
+            name="unregistered_agent",
+            instructions="Keystone test agent.",
+            output_type=None,
+            tools=[],
+            policy_agent_name="unregistered_agent",
+        )
 
 
 def test_orchestrator_handoffs_derive_from_specialist_registry() -> None:
@@ -102,5 +130,10 @@ def test_agent_cards_are_json_safe_extension_metadata() -> None:
         assert isinstance(card["prompt_files"], list)
         assert isinstance(card["tools"], list)
         assert isinstance(card["safety_notes"], list)
+        assert "skills.md" in card["prompt_files"]
+        assert "skills" not in card
+        assert "capabilities" not in card
         assert "builder" in card
         assert "output_schema" in card
+        assert card["tool_policy"] is not None
+        assert isinstance(card["tool_policy"]["allowed_tool_names"], list)

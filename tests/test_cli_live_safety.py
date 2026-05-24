@@ -382,7 +382,7 @@ def _sdk_cli_cases() -> list[dict[str, Any]]:
             ],
             "typed_input": GmailTriageSDKInput,
             "output": lambda: EmailTriageResult.model_validate(_email_triage_payload()),
-            "missing_live_key_message": "GEMINI_API_KEY is required",
+            "missing_live_key_message": "KEYSTONE_OPENAI_API_KEY is required",
         },
         {
             "module": "scripts.run_company_research",
@@ -461,7 +461,7 @@ def _sdk_cli_cases() -> list[dict[str, Any]]:
             "live_argv": ["run_outreach_draft.py", "--live-sdk", "--json"],
             "typed_input": OutreachComposerSDKInput,
             "output": lambda: OutreachDraft.model_validate(_outreach_draft_payload()),
-            "missing_live_key_message": "GEMINI_API_KEY is required",
+            "missing_live_key_message": "KEYSTONE_OPENAI_API_KEY is required",
         },
     ]
 

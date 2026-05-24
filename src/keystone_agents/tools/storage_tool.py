@@ -784,6 +784,18 @@ def _json_payload(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=True, sort_keys=True)
 
 
+def _json_mapping(value: str | dict[str, Any], *, field_name: str) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        loaded = json.loads(str(value or "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field_name} must be a JSON object") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{field_name} must be a JSON object")
+    return loaded
+
+
 @function_tool(**keystone_tool_guardrail_kwargs())
 def load_approved_contact_context(
     company_name: str,
@@ -830,6 +842,73 @@ def load_approved_crm_context(
             "approved_only": True,
             "send_enabled": False,
             "contexts": rows[: _bounded_max_results(max_results)],
+        }
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def save_initial_outreach_tracking_record(
+    draft_id: str,
+    draft_json: str,
+    channel: OutreachChannel = "email",
+    approval_reference: str = "",
+    database_url: str | None = None,
+) -> str:
+    """Save a local manual-only outreach lifecycle row for an approved draft.
+
+    This does not send email, schedule follow-ups, or mark outreach as agent-sent.
+    """
+
+    draft = _json_mapping(draft_json, field_name="draft_json")
+    result = StorageTool(
+        database_url=database_url,
+        agent_name="outreach_tracking",
+    ).save_initial_outreach_tracking(
+        draft_id=draft_id,
+        draft=draft,
+        channel=channel,
+    )
+    return _json_payload(
+        {
+            **result,
+            "object_type": "outreach_tracking",
+            "approval_reference": str(approval_reference or "").strip(),
+            "send_enabled": False,
+            "sent_by_agent": False,
+            "manual_update_only": True,
+        }
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def list_outreach_tracking_records(
+    draft_id: str | None = None,
+    company_name: str | None = None,
+    lifecycle_status: str | None = None,
+    outcome: str | None = None,
+    max_results: int = 10,
+    database_url: str | None = None,
+) -> str:
+    """List local outreach lifecycle rows so future replies can be matched safely."""
+
+    rows = StorageTool(
+        database_url=database_url,
+        agent_name="outreach_tracking",
+    ).list_outreach_tracking(
+        draft_id=draft_id,
+        company_name=company_name,
+        lifecycle_status=lifecycle_status,
+        outcome=outcome,
+        limit=_bounded_max_results(max_results, default=10, upper=25),
+    )
+    return _json_payload(
+        {
+            "mode": "local_storage",
+            "object_type": "outreach_tracking",
+            "send_enabled": False,
+            "sent_by_agent": False,
+            "manual_update_only": True,
+            "records": rows,
         }
     )
 

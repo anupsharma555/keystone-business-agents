@@ -30,6 +30,23 @@ class ContextPackReadinessGate(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class MemoryContextRef(BaseModel):
+    """Prompt-safe reference to approved durable memory."""
+
+    id: int | None = None
+    memory_type: str
+    object_type: str = ""
+    object_id: str = ""
+    object_key: str = ""
+    title: str = ""
+    summary: str = ""
+    content_summary: dict[str, Any] = Field(default_factory=dict)
+    source_ids: list[str] = Field(default_factory=list)
+    approval_state: str = ""
+    confidence: float = 0.0
+    created_at: str = ""
+
+
 class ContextPackBase(BaseModel):
     """Common WorkItem state shared by every specialist context pack."""
 
@@ -51,6 +68,7 @@ class ContextPackBase(BaseModel):
     can_synthesize: bool = False
     missing_requirements: list[str] = Field(default_factory=list)
     limitation_notes: list[str] = Field(default_factory=list)
+    relevant_memory_refs: list[MemoryContextRef] = Field(default_factory=list)
     summary: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -62,6 +80,8 @@ class ResearchContextPack(ContextPackBase):
     research_goal: str = ""
     source_bundle_summary: str = ""
     missing_evidence: list[str] = Field(default_factory=list)
+    approved_company_facts: list[MemoryContextRef] = Field(default_factory=list)
+    retrieval_performance_notes: list[MemoryContextRef] = Field(default_factory=list)
 
 
 class OpportunityContextPack(ContextPackBase):
@@ -76,6 +96,8 @@ class OpportunityContextPack(ContextPackBase):
     review_candidates: list[WorkItemArtifactRef] = Field(default_factory=list)
     source_sufficiency: str = "unknown"
     approval_state: str = "pending"
+    prior_opportunity_refs: list[MemoryContextRef] = Field(default_factory=list)
+    retrieval_performance_notes: list[MemoryContextRef] = Field(default_factory=list)
 
 
 class OutreachContactContext(BaseModel):
@@ -104,6 +126,10 @@ class OutreachContextPack(ContextPackBase):
     allowed_claims: list[WorkItemFact] = Field(default_factory=list)
     blocked_claims: list[WorkItemFact] = Field(default_factory=list)
     approval_state: str = "pending"
+    approved_company_facts: list[MemoryContextRef] = Field(default_factory=list)
+    prior_opportunity_refs: list[MemoryContextRef] = Field(default_factory=list)
+    outreach_style_examples: list[MemoryContextRef] = Field(default_factory=list)
+    approval_history_refs: list[MemoryContextRef] = Field(default_factory=list)
 
 
 class GmailContextPack(ContextPackBase):
@@ -121,6 +147,8 @@ class GmailContextPack(ContextPackBase):
     reply_objective: str = ""
     risk_flags: list[str] = Field(default_factory=list)
     approval_state: str = "pending"
+    outreach_style_examples: list[MemoryContextRef] = Field(default_factory=list)
+    approval_history_refs: list[MemoryContextRef] = Field(default_factory=list)
 
 
 ContextPack: TypeAlias = (

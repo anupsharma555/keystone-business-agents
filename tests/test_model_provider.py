@@ -15,16 +15,16 @@ from keystone_agents.model_provider import (
     DEFAULT_MODEL,
     DEFAULT_PROVIDER,
     DEFAULT_WORKFLOW_NAME,
-    GEMINI_GMAIL_TRIAGE_DEFAULT_MODEL,
     GEMINI_OPENAI_COMPAT_BASE_URL,
-    GEMINI_OUTREACH_COMPOSER_DEFAULT_MODEL,
     MASKED_SECRET,
     OPENAI_BUSINESS_AGENT_DEFAULT_MODEL,
+    OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL,
     OPENAI_ORCHESTRATOR_DEFAULT_MODEL,
     MissingOpenAIAPIKeyError,
     TraceConfig,
     UnsafeTraceMetadataError,
     UnsupportedModelProviderError,
+    get_gemini_fallback_model_config,
     get_runtime_agent_model_config,
     get_trace_config,
     mask_secret,
@@ -73,6 +73,9 @@ MODEL_ENV_VARS = (
     "KEYSTONE_OUTREACH_COMPOSER_MODEL",
     "KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER",
     "KEYSTONE_OUTREACH_COMPOSER_BASE_URL",
+    "KEYSTONE_ENABLE_GEMINI_FALLBACK",
+    "KEYSTONE_GEMINI_FALLBACK_MODEL",
+    "KEYSTONE_GEMINI_FALLBACK_BASE_URL",
     "KEYSTONE_CHIEF_OF_STAFF_MODEL",
     "KEYSTONE_CHIEF_OF_STAFF_MODEL_PROVIDER",
     "KEYSTONE_CHIEF_OF_STAFF_BASE_URL",
@@ -163,6 +166,29 @@ def test_typed_sdk_sync_forwards_session_to_live_runner(monkeypatch: pytest.Monk
     )
 
     assert calls[0]["session"] is session
+
+
+def test_typed_sdk_sync_forwards_max_turns_to_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class DummyRunner:
+        @staticmethod
+        def run_sync(agent: Any, prompt: str, **kwargs: Any) -> Any:
+            calls.append({"agent": agent, "prompt": prompt, **kwargs})
+            return SimpleNamespace(final_output={"value": "ok"})
+
+    monkeypatch.setattr(sdk, "Runner", DummyRunner)
+    monkeypatch.setattr(sdk, "validate_sdk_available", lambda: True)
+
+    sdk.run_typed_sdk_sync(
+        SimpleNamespace(name="Dummy Agent", model=None),
+        "Hello",
+        MinimalOutput,
+        run_config=SimpleNamespace(model="fake-local"),
+        max_turns=7,
+    )
+
+    assert calls[0]["max_turns"] == 7
 
 
 def test_retrieved_sdk_synthesis_forwards_session(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -402,17 +428,21 @@ def test_runtime_agent_model_config_supports_gemini_for_gmail_and_outreach(
     )
 
 
-def test_gemini_runtime_uses_direct_openai_compatible_endpoint_by_default(
+def test_gemini_runtime_uses_direct_openai_compatible_endpoint_when_explicit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clear_model_env(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEY", "unit-test-gemini-key")
+    monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER", "gemini")
+    monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_MODEL", "gemini-2.5-flash")
+    monkeypatch.setenv("KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER", "gemini")
+    monkeypatch.setenv("KEYSTONE_OUTREACH_COMPOSER_MODEL", "gemini-2.5-flash")
 
     gmail_config = get_runtime_agent_model_config("gmail_triage")
     outreach_config = get_runtime_agent_model_config("outreach_composer")
 
     assert gmail_config.provider == "gemini"
-    assert gmail_config.model == GEMINI_GMAIL_TRIAGE_DEFAULT_MODEL
+    assert gmail_config.model == "gemini-2.5-flash"
     assert gmail_config.base_url == GEMINI_OPENAI_COMPAT_BASE_URL
     assert gmail_config.openai_provider_kwargs() == {
         "api_key": "unit-test-gemini-key",
@@ -421,7 +451,7 @@ def test_gemini_runtime_uses_direct_openai_compatible_endpoint_by_default(
     }
     gmail_config.require_live_execution_ready()
     assert outreach_config.provider == "gemini"
-    assert outreach_config.model == GEMINI_OUTREACH_COMPOSER_DEFAULT_MODEL
+    assert outreach_config.model == "gemini-2.5-flash"
     assert outreach_config.base_url == GEMINI_OPENAI_COMPAT_BASE_URL
     assert outreach_config.openai_provider_kwargs() == {
         "api_key": "unit-test-gemini-key",
@@ -429,6 +459,29 @@ def test_gemini_runtime_uses_direct_openai_compatible_endpoint_by_default(
         "use_responses": False,
     }
     outreach_config.require_live_execution_ready()
+
+
+def test_gemini_fallback_is_explicit_backup_for_openai_agents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_model_env(monkeypatch)
+    monkeypatch.setenv("KEYSTONE_ENABLE_GEMINI_FALLBACK", "true")
+    monkeypatch.setenv("GEMINI_API_KEY", "unit-test-gemini-key")
+
+    fallback = get_gemini_fallback_model_config("gmail_triage")
+
+    assert fallback is not None
+    assert fallback.provider == "gemini"
+    assert fallback.model == "gemini-2.5-flash"
+    assert fallback.base_url == GEMINI_OPENAI_COMPAT_BASE_URL
+    fallback.require_live_execution_ready()
+
+
+def test_gemini_fallback_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    clear_model_env(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "unit-test-gemini-key")
+
+    assert get_gemini_fallback_model_config("gmail_triage") is None
 
 
 def test_runtime_agent_model_config_keeps_research_agents_openai_based(
@@ -457,31 +510,30 @@ def test_business_agent_model_defaults_are_scoped(
 ) -> None:
     clear_model_env(monkeypatch)
 
+    assert OPENAI_ORCHESTRATOR_DEFAULT_MODEL == "gpt-5.4-mini"
     assert get_runtime_agent_model_config("orchestrator").model == (
         OPENAI_ORCHESTRATOR_DEFAULT_MODEL
     )
     gmail = get_runtime_agent_model_config("gmail_triage")
     outreach = get_runtime_agent_model_config("outreach_composer")
-    assert gmail.provider == "gemini"
-    assert GEMINI_GMAIL_TRIAGE_DEFAULT_MODEL == "gemini-2.5-flash"
-    assert gmail.model == GEMINI_GMAIL_TRIAGE_DEFAULT_MODEL
-    assert gmail.base_url == GEMINI_OPENAI_COMPAT_BASE_URL
-    assert GEMINI_OUTREACH_COMPOSER_DEFAULT_MODEL == "gemini-2.5-flash"
-    assert outreach.provider == "gemini"
-    assert outreach.model == GEMINI_OUTREACH_COMPOSER_DEFAULT_MODEL
-    assert outreach.base_url == GEMINI_OPENAI_COMPAT_BASE_URL
+    assert OPENAI_BUSINESS_AGENT_DEFAULT_MODEL == "gpt-5.4-mini"
+    assert gmail.provider == "openai"
+    assert gmail.model == OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
+    assert outreach.provider == "openai"
+    assert outreach.model == OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
     assert get_runtime_agent_model_config("business_research_analyst").model == (
         OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
     )
     assert get_runtime_agent_model_config("opportunity_scout").model == (
         OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
     )
+    assert OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL == "gpt-5.4-mini"
     assert get_runtime_agent_model_config("chief_of_staff").model == (
-        OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
+        OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL
     )
 
 
-def test_gmail_triage_can_be_forced_back_to_openai_default(
+def test_gmail_triage_explicit_openai_uses_operating_agent_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clear_model_env(monkeypatch)
@@ -490,10 +542,10 @@ def test_gmail_triage_can_be_forced_back_to_openai_default(
     config = get_runtime_agent_model_config("gmail_triage")
 
     assert config.provider == "openai"
-    assert config.model == DEFAULT_MODEL
+    assert config.model == OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
 
 
-def test_outreach_composer_can_be_forced_back_to_openai_default(
+def test_outreach_composer_explicit_openai_uses_operating_agent_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clear_model_env(monkeypatch)
@@ -502,7 +554,7 @@ def test_outreach_composer_can_be_forced_back_to_openai_default(
     config = get_runtime_agent_model_config("outreach_composer")
 
     assert config.provider == "openai"
-    assert config.model == DEFAULT_MODEL
+    assert config.model == OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
 
 
 def test_gemini_runtime_keeps_litellm_as_optional_base_url_override(

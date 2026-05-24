@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from keystone_agents.agents.outreach_composer import (
     build_outreach_composer_agent,
     build_outreach_composer_compact_synthesis_agent,
     build_outreach_composer_compact_variant_agent,
+    build_follow_up_schedule_record,
     build_outreach_draft_variant_set,
     compose_outreach_draft_fixture,
     compose_outreach_draft_llm_constrained,
@@ -927,7 +929,33 @@ def _run_single_sdk_synthesis(
             outcome,
             objective_override=objective,
         )
+    outcome = _ensure_sdk_follow_up_schedule(args, outcome)
     return outcome
+
+
+def _ensure_sdk_follow_up_schedule(
+    args: argparse.Namespace,
+    outcome: SDKSynthesisOutcome,
+) -> SDKSynthesisOutcome:
+    if not args.include_follow_up_schedule:
+        return outcome
+    draft = outcome.final_output
+    if not isinstance(draft, OutreachDraft) or draft.follow_up_schedules:
+        return outcome
+    updated_draft = draft.model_copy(
+        update={
+            "follow_up_schedules": [
+                build_follow_up_schedule_record(
+                    draft,
+                    proposed_date=args.follow_up_date,
+                )
+            ]
+        }
+    )
+    return replace(
+        outcome,
+        result=replace(outcome.result, output=updated_draft),
+    )
 
 
 def _compact_variant_outcome_to_variant_set(

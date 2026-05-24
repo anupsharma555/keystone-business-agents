@@ -35,6 +35,32 @@ Reusable factual memory should stay limited to source-backed company facts,
 opportunity signals, approval decisions, risk flags, dedup records, and human
 feedback.
 
+## Tool Helper Backlog
+
+After the Playwright rendered-page tool is validated, evaluate these additional
+tool/helper families. For each one, decide which agents should receive access,
+add bounded schemas before broad prompts, keep live integrations explicit, and
+run focused tests immediately after implementing each helper:
+
+- Lighthouse / Chrome DevTools diagnostics for performance, accessibility, SEO,
+  layout, and local dashboard or customer-facing page review.
+- HAR capture and replay helpers for API failure diagnosis and reproducible
+  frontend states without repeatedly hitting live services.
+- Image, chart, screenshot, dashboard, and visual-regression review helpers
+  using OCR or vision models with bounded evidence records.
+- Extraction-first web providers such as Crawl4AI, Firecrawl, and Trafilatura,
+  with Playwright used only when static extraction fails or visualization
+  matters.
+- OpenAI file search/vector store helpers for approved durable docs, runbooks,
+  schemas, prior traces, artifact history, and source-backed context packs.
+- MCP tool-search and namespace-loading helpers for large tool surfaces, so
+  agents can load browser diagnostics or other tool groups only when needed.
+- Sandbox/Codex workspace-review helpers for repo-local diagnosis, test runs,
+  generated reports, and draft artifact inspection.
+- Structured Airtable, Gmail, Slack, Calendar, Drive, and CRM schemas/helpers
+  that keep business-system reads and writes on typed provider APIs instead of
+  browser automation.
+
 ## Test Result Reporting
 
 For every manual, fixture, eval, local SDK, or live SDK run against this test
@@ -93,6 +119,21 @@ long research output, or other verbose metadata.
 The legacy `scripts/render_test_pack_case2_report.py` entrypoint remains
 available as a compatibility wrapper, but new runs should prefer
 `scripts/render_test_pack_report.py`.
+
+## Executable Coverage Snapshot
+
+The executable spec registry currently contains these harness IDs:
+
+- `GT-1`, `GT-2`, `GT-3`, `GT-4`, `GT-5`
+- `BR-1`, `BR-2`, `BR-3`, `BR-4`, `BR-5`
+- `OS-1`, `OS-2`, `OS-3`, `OS-4`, `OS-5`
+- `OC-1`, `OC-2`, `OC-3`, `OC-4`, `OC-5`
+- `OR-1`, `OR-2`, `OR-3`, `OR-4`, `OR-5`
+
+This snapshot is intentionally separate from behavior-level pass/fail status.
+It means the case exists in `src/keystone_agents/test_pack_specs.py` and has
+reporting metadata. A case is complete only when it also has passing automated
+coverage or a documented validation path for the behavior under test.
 
 XX-2 hardening notes from the April 2026 live run:
 

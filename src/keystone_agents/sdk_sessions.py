@@ -11,12 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from keystone_agents.sdk import build_sqlite_session
+from keystone_agents.slack_action_contract import SLACK_SELECTED_CONTEXT_SCHEMA
 
 SDK_SESSIONS_ENABLED_ENV = "KEYSTONE_SDK_SESSIONS"
 SDK_SESSION_ID_ENV = "KEYSTONE_SDK_SESSION_ID"
 SDK_SESSION_DB_ENV = "KEYSTONE_SDK_SESSION_DB"
 DEFAULT_SESSION_DB_PATH = ".keystone/sdk_sessions.sqlite3"
-SLACK_SELECTED_CONTEXT_SCHEMA = "keystone.slack.selected_message_context.v1"
 
 _FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}

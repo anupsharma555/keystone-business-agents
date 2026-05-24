@@ -15,8 +15,10 @@ REQUIRED_PROMPTS = {
     "keystone_profile.md",
     "local_context.md",
     "memory_policy.md",
+    "agent-operating-architecture.md",
     "operator_context.md",
     "writing_style.md",
+    "slack-posting-rules.md",
     "skills.md",
     "tools.md",
     "gmail_triage.md",
@@ -31,6 +33,10 @@ REQUIRED_PROMPTS = {
 
 def _read_prompt(name: str) -> str:
     return (PROMPT_DIR / name).read_text(encoding="utf-8")
+
+
+def _read_repo_doc(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8")
 
 
 def test_required_prompt_files_exist() -> None:
@@ -79,7 +85,13 @@ def test_shared_skills_and_tools_prompts_capture_sdk_boundaries() -> None:
     tools = _read_prompt("tools.md")
 
     assert "Use only tools attached to the current SDK agent" in skills
+    assert "prompt-only instruction fragments" in skills
+    assert "not a runtime capability model" in skills
+    assert "hidden router" in skills
+    assert "dynamic tool attachment path" in skills
+    assert "Treat skills as prompt guidance only" in skills
     assert "Owner agent" in skills
+    assert "If runtime behavior is required" in skills
     assert "Approval scope" in skills
     assert "Entity resolution" in skills
     assert "Research sufficiency" in skills
@@ -102,6 +114,10 @@ def test_shared_skills_and_tools_prompts_capture_sdk_boundaries() -> None:
     assert "save_outreach_tracking" in tools
     assert "save_initial_outreach_tracking" in tools
     assert "list_outreach_tracking" in tools
+    assert "Google Workspace Tools" in tools
+    assert "`KNIOps` Drive folder" in tools
+    assert "`GOOGLE_WORKSPACE_WRITES_ENABLED=true`" in tools
+    assert "`google_sheet_append_rows`" in tools
     assert "Useful future tools" in tools
 
 
@@ -126,20 +142,92 @@ def test_agent_builders_include_shared_skills_and_tools_prompts() -> None:
         instructions = str(agent.instructions)
         assert "<!-- AGENTS.md -->" in instructions
         assert "<!-- memory_policy.md -->" in instructions
+        assert "<!-- agent-operating-architecture.md -->" in instructions
         assert "<!-- writing_style.md -->" in instructions
+        assert "<!-- slack-posting-rules.md -->" in instructions
         assert "<!-- operator_context.md -->" in instructions
         assert "<!-- local_context.md -->" in instructions
         assert "<!-- skills.md -->" in instructions
         assert "<!-- tools.md -->" in instructions
         assert "Agent Improvement Test Pack" in instructions
         assert "Memory And Pre-Run Context Policy" in instructions
+        assert "Shared Agent Operating Architecture" in instructions
+        assert "Schema + Tools + Helpers + Memory + Model Synthesis" in instructions
         assert "Writing Style Policy" in instructions
+        assert "Slack Posting Rules" in instructions
         assert "Operator Context" in instructions
         assert "Local Context Sources" in instructions
         assert "keystone_neuroinformatics" in instructions
         assert "zotero_active" in instructions
         assert "Output Contracts And Formatting" in instructions
         assert "Reasoning Freedom And Boundaries" in instructions
+
+
+def test_shared_agent_operating_architecture_covers_schemas_tools_helpers() -> None:
+    text = _read_prompt("agent-operating-architecture.md")
+
+    assert "Schema + Tools + Helpers + Memory + Model Synthesis" in text
+    assert "Airtable" in text
+    assert "`airtable_get_base_schema` before `airtable_read_records`" in text
+    assert "Gmail, Calendar, and Google Workspace" in text
+    assert (
+        "search planning, retrieval, source ranking, claim extraction, schema structuring, "
+        "and synthesis"
+    ) in text
+    assert "`structure_web_data_for_schema`" in text
+    assert "`airtable_write_record`" in text
+    assert "no deletes, schema changes, attachment uploads, bulk overwrites, or silent mutations" in text
+    assert "use Playwright only as a read-only backend/headless diagnostic rendering helper" in text
+    assert "`render_page`" in text
+    assert "`capture_browser_diagnostics`" in text
+    assert "`summarize_rendered_page_diagnostics`" in text
+    assert "console, page-error, failed-request, and response-status evidence" in text
+    assert "disabled by default" in text
+    assert "does not open a user-screen browser" in text
+    assert "temporary non-persistent profile" in text
+    assert "gpt-5.4" in text
+    assert "no live side effects unless the relevant tool, live flag, and approval scope allow them" in text
+    assert "Schema And Helper Backlog" in text
+    assert "`AgentRunContextPack`" in text
+    assert "`StructuredRecordSet`" in text
+    assert "`DeterministicCalculationResult`" in text
+    assert "`MutationPlan`" in text
+    assert "`WorkspaceArtifactPlan`" in text
+    assert "`SourceRetrievalPack`" in text
+    assert "`CommunicationDraftContext`" in text
+    assert "`OutboundConversationTracker`" in text
+    assert "`DataQualityIssue`" in text
+
+
+def test_agents_guide_contains_tool_use_decision_rules() -> None:
+    text = _read_repo_doc("AGENTS.md")
+
+    assert "Tool Use Decision Rules" in text
+    assert "Use schema tools first for structured systems" in text
+    assert "Use deterministic helpers for exact arithmetic" in text
+    assert "Use Google Workspace tools for internal artifacts" in text
+    assert "Use Airtable tools for table records, not browser automation" in text
+    assert "Use Gmail and Slack structured tools" in text
+    assert "Use extraction providers first for web content" in text
+    assert "Use Playwright as read-only backend/headless rendered-browser diagnostics" in text
+    assert "must not open a user-screen browser" in text
+    assert "Use `capture_browser_diagnostics`" in text
+    assert "`summarize_rendered_page_diagnostics`" in text
+    assert "After implementing each tool or helper, run its focused tests" in text
+
+
+def test_agent_improvement_pack_tracks_future_tool_helper_backlog() -> None:
+    text = _read_repo_doc("docs/AGENT_IMPROVEMENT_TEST_PACK.md")
+
+    assert "Tool Helper Backlog" in text
+    assert "Lighthouse / Chrome DevTools diagnostics" in text
+    assert "HAR capture and replay helpers" in text
+    assert "OCR or vision models" in text
+    assert "Crawl4AI, Firecrawl, and Trafilatura" in text
+    assert "OpenAI file search/vector store helpers" in text
+    assert "MCP tool-search and namespace-loading helpers" in text
+    assert "Sandbox/Codex workspace-review helpers" in text
+    assert "Structured Airtable, Gmail, Slack, Calendar, Drive, and CRM" in text
 
 
 def test_writing_style_policy_is_shared_and_model_neutral() -> None:
@@ -164,6 +252,32 @@ def test_writing_style_policy_is_shared_and_model_neutral() -> None:
     assert KEYSTONE_DEFAULT_OUTREACH_CTA in normalized
     assert "avoid sounding needy" in KEYSTONE_WRITING_STYLE_GUIDANCE
     assert load_writing_style_policy() == text.strip()
+
+
+def test_slack_posting_rules_include_readable_finance_example() -> None:
+    text = _read_prompt("slack-posting-rules.md")
+
+    assert "Slack responses should be explainable, readable" in text
+    assert "Do not compress complex results into one dense paragraph" in text
+    assert "Q1 and Q2 2026 finance_tax_tracker Summary" in text
+    assert "* Total income: $47,323.94" in text
+    assert "* Total expenses: $12,057.51" in text
+    assert "Income detail" in text
+    assert "Expense detail" in text
+    assert "one record is one row in the table" in text
+    assert "`Estimated Tax Period`, `Q`, and `Quarter`" in text
+    assert "* Business expenses: 16 matching records, totaling $3,287.40" in text
+    assert "Do not repeat standing disclaimers" in text
+
+
+def test_chief_of_staff_finance_doc_prompt_requires_analysis_not_transfer() -> None:
+    text = _read_prompt("chief_of_staff.md")
+
+    assert "pass that exact value to" in text
+    assert "`google_drive_create_folder` and `google_doc_write`" in text
+    assert "include actual analysis, not just data\ntransfer" in text
+    assert "rolling-note assumptions" in text
+    assert "Use deterministic arithmetic from\nnormalized records" in text
 
 
 def test_memory_policy_contains_required_pre_run_context() -> None:
@@ -311,6 +425,13 @@ def test_gmail_triage_prompt_requires_draft_only_behavior() -> None:
     assert "Finance" in text
     assert "Legal or contract" in text
     assert "PHI or patient-specific content" in text
+    assert "Internal Workspace Artifacts" in text
+    assert "`KNIOps`" in text
+    assert "Google Sheets for structured triage logs" in text
+    assert "Workspace artifacts do not authorize sending email" in text
+    assert "Outreach Reply Handling" in text
+    assert "`list_outreach_tracking_records`" in text
+    assert "Treat outreach tracking rows as manual lifecycle context" in text
 
 
 def test_business_research_analyst_prompt_requires_sources_and_scores() -> None:
@@ -322,6 +443,18 @@ def test_business_research_analyst_prompt_requires_sources_and_scores() -> None:
     assert "Keystone fit score" in text
     assert "Outside consulting likelihood score" in text
     assert "Do not hallucinate missing facts" in text
+    assert "Internal Workspace Artifacts" in text
+    assert "`KNIOps Structured Data`" in text
+    assert "Workspace artifact content is not independent public evidence" in text
+
+
+def test_opportunity_scout_prompt_defines_workspace_artifact_boundaries() -> None:
+    text = _read_prompt("opportunity_scout.md")
+
+    assert "Internal Workspace Artifacts" in text
+    assert "Use Google Sheets for structured watchlists" in text
+    assert "Workspace artifacts do not approve outreach" in text
+    assert "`GOOGLE_WORKSPACE_WRITES_ENABLED=true`" in text
 
 
 def test_outreach_prompt_forbids_em_dashes_and_sets_length_limits() -> None:
@@ -334,6 +467,13 @@ def test_outreach_prompt_forbids_em_dashes_and_sets_length_limits() -> None:
     assert "Cold email must be under 180 words" in text
     assert "LinkedIn note must be under 300 characters" in text
     assert "All drafts approval-gated" in text
+    assert "Internal Workspace Artifacts" in text
+    assert "Use Google Docs for internal call prep" in text
+    assert "A Sheet row or Doc note does not authorize sending" in text
+    assert "Optional Outreach Lifecycle Tracking" in text
+    assert "`save_initial_outreach_tracking_record`" in text
+    assert "`list_outreach_tracking_records`" in text
+    assert "sent_manually" in text
 
 
 def test_orchestrator_prompt_preserves_approval_gate() -> None:
@@ -342,3 +482,6 @@ def test_orchestrator_prompt_preserves_approval_gate() -> None:
     assert "Route work to the correct specialist agent" in text
     assert "Do not skip approval" in text
     assert "Do not allow outreach without approved company or opportunity context" in text
+    assert "Workspace Routing" in text
+    assert "only scoped internal artifact operations inside `KNIOps`" in text
+    assert "does not bypass specialist ownership" in text

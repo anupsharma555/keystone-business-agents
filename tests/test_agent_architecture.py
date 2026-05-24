@@ -18,6 +18,17 @@ from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.orchestrator import OrchestratorResult
 from keystone_agents.schemas.outreach import OutreachDraft
 from keystone_agents.sdk import Agent
+from keystone_agents.tools.internal_data_tools import GOOGLE_WORKSPACE_TOOL_NAMES
+
+AIRTABLE_READ_TOOL_NAMES = {"airtable_get_base_schema", "airtable_read_records"}
+AIRTABLE_WRITE_TOOL_NAMES = {"airtable_write_record"}
+WEB_STRUCTURING_TOOL_NAMES = {"structure_web_data_for_schema"}
+WEB_SEARCH_TOOL_NAMES = {"search_web"}
+PLAYWRIGHT_TOOL_NAMES = {"render_page"}
+BROWSER_DIAGNOSTIC_TOOL_NAMES = {
+    "capture_browser_diagnostics",
+    "summarize_rendered_page_diagnostics",
+}
 
 MODEL_ENV_VARS = (
     "KEYSTONE_OPENAI_MODEL",
@@ -149,6 +160,128 @@ def test_main_agents_expose_allowlisted_local_context_tools() -> None:
     }
     for agent in agents:
         assert expected_tools <= _tool_names(agent)
+
+
+def test_main_agents_expose_scoped_google_workspace_tools() -> None:
+    agents = [
+        build_gmail_triage_agent(),
+        build_business_research_analyst_agent(),
+        build_opportunity_scout_agent(),
+        build_outreach_composer_agent(),
+        build_orchestrator_agent(),
+        build_chief_of_staff_agent(),
+    ]
+
+    expected_tools = set(GOOGLE_WORKSPACE_TOOL_NAMES)
+    for agent in agents:
+        assert expected_tools <= _tool_names(agent)
+
+
+def test_main_agents_expose_schema_first_airtable_read_tools() -> None:
+    agents = [
+        build_gmail_triage_agent(),
+        build_business_research_analyst_agent(),
+        build_opportunity_scout_agent(),
+        build_outreach_composer_agent(),
+        build_orchestrator_agent(),
+        build_chief_of_staff_agent(),
+    ]
+
+    for agent in agents:
+        assert AIRTABLE_READ_TOOL_NAMES <= _tool_names(agent)
+
+
+def test_main_agents_expose_scoped_airtable_write_tools() -> None:
+    agents = [
+        build_gmail_triage_agent(),
+        build_business_research_analyst_agent(),
+        build_opportunity_scout_agent(),
+        build_outreach_composer_agent(),
+        build_orchestrator_agent(),
+        build_chief_of_staff_agent(),
+    ]
+
+    for agent in agents:
+        assert AIRTABLE_WRITE_TOOL_NAMES <= _tool_names(agent)
+
+
+def test_main_agents_expose_web_data_structuring_helper() -> None:
+    agents = [
+        build_gmail_triage_agent(),
+        build_business_research_analyst_agent(),
+        build_opportunity_scout_agent(),
+        build_outreach_composer_agent(),
+        build_orchestrator_agent(),
+        build_chief_of_staff_agent(),
+    ]
+
+    for agent in agents:
+        assert WEB_STRUCTURING_TOOL_NAMES <= _tool_names(agent)
+
+
+def test_main_agents_expose_web_search_when_needed() -> None:
+    agents = [
+        build_gmail_triage_agent(),
+        build_business_research_analyst_agent(),
+        build_opportunity_scout_agent(),
+        build_outreach_composer_agent(),
+        build_orchestrator_agent(),
+        build_chief_of_staff_agent(),
+    ]
+
+    for agent in agents:
+        assert WEB_SEARCH_TOOL_NAMES <= _tool_names(agent)
+
+
+def test_rendered_browser_tool_is_research_scoped() -> None:
+    assert PLAYWRIGHT_TOOL_NAMES <= _tool_names(build_business_research_analyst_agent())
+    assert PLAYWRIGHT_TOOL_NAMES <= _tool_names(build_opportunity_scout_agent())
+    assert PLAYWRIGHT_TOOL_NAMES <= _tool_names(build_chief_of_staff_agent())
+    assert PLAYWRIGHT_TOOL_NAMES <= _tool_names(build_orchestrator_agent())
+    assert not (PLAYWRIGHT_TOOL_NAMES & _tool_names(build_gmail_triage_agent()))
+    assert not (PLAYWRIGHT_TOOL_NAMES & _tool_names(build_outreach_composer_agent()))
+
+
+def test_browser_diagnostics_are_backend_browser_scoped() -> None:
+    diagnostic_agents = [
+        build_business_research_analyst_agent(),
+        build_opportunity_scout_agent(),
+        build_chief_of_staff_agent(),
+        build_orchestrator_agent(),
+    ]
+    for agent in diagnostic_agents:
+        assert BROWSER_DIAGNOSTIC_TOOL_NAMES <= _tool_names(agent)
+        instructions = str(agent.instructions)
+        assert "Use `capture_browser_diagnostics` when the task asks why a page" in instructions
+        assert "`summarize_rendered_page_diagnostics`" in instructions
+        assert "This backend browser does not open a user-screen browser" in instructions
+    assert not (BROWSER_DIAGNOSTIC_TOOL_NAMES & _tool_names(build_gmail_triage_agent()))
+    assert not (BROWSER_DIAGNOSTIC_TOOL_NAMES & _tool_names(build_outreach_composer_agent()))
+
+
+def test_main_agents_expose_memory_retrieval_tools() -> None:
+    cases = [
+        (build_gmail_triage_agent(), {"retrieve_memory"}),
+        (build_business_research_analyst_agent(), {"retrieve_memory"}),
+        (build_opportunity_scout_agent(), {"retrieve_memory"}),
+        (build_outreach_composer_agent(), {"retrieve_memory"}),
+        (build_orchestrator_agent(), {"retrieve_memory"}),
+        (build_chief_of_staff_agent(), {"retrieve_chief_of_staff_memory"}),
+    ]
+
+    for agent, expected_tools in cases:
+        assert expected_tools <= _tool_names(agent)
+
+
+def test_gmail_and_outreach_expose_reply_lifecycle_helpers() -> None:
+    assert {"search_web", "list_outreach_tracking_records"} <= _tool_names(
+        build_gmail_triage_agent()
+    )
+    assert {
+        "search_web",
+        "save_initial_outreach_tracking_record",
+        "list_outreach_tracking_records",
+    } <= _tool_names(build_outreach_composer_agent())
 
 
 def test_runtime_agent_builders_use_agent_specific_models(

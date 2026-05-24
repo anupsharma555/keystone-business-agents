@@ -65,6 +65,12 @@ from keystone_agents.tools.email_style_tool import (
     load_email_style_profile,
     load_email_style_profile_fixture,
 )
+from keystone_agents.tools.internal_data_tools import (
+    airtable_get_base_schema,
+    airtable_read_records,
+    airtable_write_record,
+    google_workspace_tools,
+)
 from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
@@ -83,11 +89,15 @@ from keystone_agents.tools.outreach_template_tool import (
 from keystone_agents.tools.outreach_template_tool import (
     load_outreach_template as load_outreach_template_tool,
 )
+from keystone_agents.tools.serper_tool import search_web
 from keystone_agents.tools.storage_tool import (
     load_approved_contact_context,
     load_approved_crm_context,
     load_approved_outreach_examples,
+    list_outreach_tracking_records,
+    save_initial_outreach_tracking_record,
 )
+from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_ROOT = PROJECT_ROOT / "tests" / "fixtures"
@@ -1441,6 +1451,11 @@ def build_outreach_composer_agent(
                 retrieve_memory,
                 retrieve_outreach_examples,
                 check_workflow_duplicate,
+                airtable_get_base_schema,
+                airtable_read_records,
+                airtable_write_record,
+                search_web,
+                structure_web_data_for_schema,
                 load_approved_contact_context,
                 load_approved_crm_context,
                 load_approved_outreach_examples,
@@ -1451,14 +1466,18 @@ def build_outreach_composer_agent(
                 build_follow_up_schedule_record,
                 save_outreach_dedup_memory,
                 learn_email_style_profile,
+                save_initial_outreach_tracking_record,
+                list_outreach_tracking_records,
                 create_approval_queue_item,
                 create_approval_request_placeholder,
+                *google_workspace_tools(),
             ]
             if include_tools
             else []
         ),
         guardrails=keystone_guardrails(),
         model=model,
+        policy_agent_name="outreach_composer",
         handoff_description=(
             "Use to compose approval-gated draft-only outreach, call prep, and follow-up "
             "recommendations from approved source-backed context."

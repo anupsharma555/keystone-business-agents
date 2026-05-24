@@ -21,6 +21,7 @@ from keystone_agents.slack_action_contract import (
 from keystone_agents.slack_interactions import handle_slack_approval_interaction
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.tools.operations_publisher_tool import (
+    publish_internal_artifact_impl,
     publish_document_report_impl,
     publish_table_mirror_impl,
 )
@@ -47,6 +48,13 @@ def test_automation_inventory_storage_and_report(tmp_path: Path) -> None:
     report = build_automation_inventory_report(database_url=_database_url(tmp_path))
 
     assert any(spec.id == "auto_weekly_opportunity" for spec in report.automation_specs)
+    assert any(spec.id == "auto_chief_of_staff_weekly_meeting_prep" for spec in report.automation_specs)
+    assert any(spec.id == "auto_announcements_weekly_research_synthesis" for spec in report.automation_specs)
+    assert any(binding.channel_name == "meetings" for binding in report.channel_bindings)
+    assert any(
+        binding.channel_name == "announcements" and binding.purpose == "research_synthesis"
+        for binding in report.channel_bindings
+    )
     assert report.recent_runs[0].automation_id == "auto_weekly_opportunity"
     assert report.pending_approval_count == 0
     assert "SQLite" in " ".join(report.audit_notes)
@@ -95,6 +103,23 @@ def test_publishers_are_dry_run_and_keep_sqlite_canonical(tmp_path: Path) -> Non
     assert doc["external_sharing_enabled"] is False
     assert table["canonical_state"] == "sqlite"
     assert table["artifact"]["provider"] == "airtable"
+
+
+def test_internal_artifact_publisher_mirrors_company_and_contact_refs() -> None:
+    result = publish_internal_artifact_impl(
+        '{"company_name":"Mentavi","contact_name":"Needs source-backed confirmation"}',
+        artifact_type="contact_candidates",
+        title="Mentavi contact candidates",
+        destinations=["airtable", "google_doc"],
+        live=False,
+    )
+
+    assert result["status"] == "dry-run"
+    assert result["canonical_state"] == "sqlite"
+    refs = result["artifact_refs"]
+    assert len(refs) == 2
+    assert {ref["provider"] for ref in refs} == {"airtable", "google_doc"}
+    assert all(ref["artifact_type"] == "contact_candidates" for ref in refs)
 
 
 def test_natural_followup_resolves_doc_and_failure_intents(tmp_path: Path) -> None:

@@ -57,6 +57,56 @@ def test_input_guardrail_allows_source_context_for_outreach_agent() -> None:
     assert "unsupported_claim" not in result.output_info["risk_flags"]
 
 
+def test_input_guardrail_allows_internal_finance_google_doc_artifact_request() -> None:
+    result = keystone_input_guardrail.guardrail_function(
+        None,
+        SimpleNamespace(name="chief_of_staff"),
+        {
+            "request": (
+                "review airtable tables, analyze and provide a tax summary and analysis "
+                "for Q1 in google docs. Create a folder and doc within the gdrive for "
+                "the tax updates. Provide a link to the google doc in the reply"
+            ),
+            "side_effect_policy": (
+                "internal KNIOps Google Docs artifact only; no Slack post, Gmail send, "
+                "calendar write, repo write, tax filing, or tax payment"
+            ),
+        },
+    )
+
+    assert not result.tripwire_triggered
+    assert result.output_info["risk_flags"] == ("finance_review",)
+
+
+def test_input_guardrail_allows_browser_diagnostics_language() -> None:
+    result = keystone_input_guardrail.guardrail_function(
+        None,
+        SimpleNamespace(name="orchestrator"),
+        "Diagnose https://example.com with backend browser diagnostics.",
+    )
+
+    assert not result.tripwire_triggered
+    assert "professional_advice" not in result.output_info["risk_flags"]
+
+
+def test_guardrail_allows_negated_tax_advice_disclaimer_context() -> None:
+    assessment = assess_text_guardrails(
+        "This is an operational tracker summary, not final tax advice.",
+        check_outreach_claims=False,
+    )
+
+    assert assessment.allowed
+    assert "professional_advice" not in assessment.risk_flags
+
+    blocked = assess_text_guardrails(
+        "Please provide tax advice about whether this deduction is allowed.",
+        check_outreach_claims=False,
+    )
+
+    assert not blocked.allowed
+    assert "professional_advice" in blocked.risk_flags
+
+
 def test_outreach_schema_requires_draft_only_human_approval_and_no_em_dash() -> None:
     valid = OutreachDraft.model_validate(
         {

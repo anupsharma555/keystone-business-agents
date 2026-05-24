@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from keystone_agents.agents.business_research_analyst import research_company_fixture
 from keystone_agents.agents.opportunity_scout import scout_opportunities_fixture
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.reporting import render_work_item_result_text
 from keystone_agents.schemas.approval import ApprovalState
+from keystone_agents.schemas.memory import MemoryItem
 from keystone_agents.schemas.research import (
     ResearchArticleSummary,
     ResearchBrief,
@@ -28,6 +30,7 @@ from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResul
 from keystone_agents.work_items import (
     approve_artifact_context,
     drafting_ready,
+    normalize_target_text,
     select_artifact,
     set_next_action,
 )
@@ -36,6 +39,23 @@ from keystone_agents.workflow_runner import advance_work_item
 
 def _database_url(tmp_path: Path) -> str:
     return f"sqlite:///{tmp_path / 'workflow_runner.db'}"
+
+
+def test_normalize_target_text_strips_named_agent_prefixes() -> None:
+    assert (
+        normalize_target_text(
+            "opportunity scout find 3 active behavioral health AI partnership opportunities",
+            WorkItemRoute.OPPORTUNITY_SCOUT,
+        )
+        == "3 active behavioral health AI partnership opportunities"
+    )
+    assert (
+        normalize_target_text(
+            "business research analyst research Big Health",
+            WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        )
+        == "Big Health"
+    )
 
 
 def test_advance_work_item_research_creates_case_and_company_artifact(tmp_path: Path) -> None:
@@ -67,6 +87,42 @@ def test_advance_work_item_research_creates_case_and_company_artifact(tmp_path: 
     assert loaded is not None
     assert loaded.artifact_refs[0].artifact_id == result.artifact_refs[0].artifact_id
     assert store.list_work_item_artifacts(result.work_item.id)[0].artifact_type == "company_profile"
+
+
+def test_advance_work_item_context_pack_includes_approved_memory_without_live_mode(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    store.save_memory_item(
+        MemoryItem(
+            memory_type="company_fact",
+            object_type="company",
+            object_id="NeuroFlow",
+            object_key="NeuroFlow",
+            title="NeuroFlow approved memory",
+            summary="Previously approved NeuroFlow fact.",
+            content={"claim_text": "NeuroFlow has prior approved local memory."},
+            source_ids=["fixture:memory"],
+            approval_state=ApprovalState.APPROVED_FOR_RESEARCH,
+            confidence=0.8,
+        )
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="research NeuroFlow",
+            database_url=database_url,
+            save=True,
+            live_search=False,
+            live_sdk=False,
+        )
+    )
+
+    assert result.context_pack is not None
+    assert result.context_pack["approved_company_facts"][0]["title"] == "NeuroFlow approved memory"
+    assert result.context_pack["approved_company_facts"][0]["source_ids"] == ["fixture:memory"]
+    assert result.context_pack["readiness_gates"][0]["ready"] is True
 
 
 def test_advance_work_item_zotero_collection_creates_research_brief_artifact(
@@ -542,7 +598,15 @@ def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
         captured["search_plan"] = search_plan
         return (
             scout_opportunities_fixture(topic=topic, max_results=max_results),
-            {"debug_notes": ["fake live retrieval"]},
+            {
+                "debug_notes": ["fake live retrieval"],
+                "retrieval_diagnostics": {
+                    "provider_summary": "searxng",
+                    "retrieval_ladder": [
+                        {"rung": "search_discovery", "raw_result_count": 2}
+                    ],
+                },
+            },
         )
 
     monkeypatch.setattr(
@@ -571,6 +635,125 @@ def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
     assert captured["planner_live"] is True
     assert captured["search_plan"] is fake_plan
     assert "named-agent live search planning path" in " ".join(result.audit_notes)
+    assert (
+        result.artifact_refs[0].metadata["retrieval_diagnostics"]["provider_summary"]
+        == "searxng"
+    )
+
+
+def test_live_sdk_opportunity_work_item_prefers_manual_primary_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_resolve_plan(
+        topic: str | None,
+        *,
+        desired_count: int = 5,
+        live: bool = False,
+        **_: object,
+    ) -> None:
+        captured["planned_topic"] = topic
+        captured["desired_count"] = desired_count
+        captured["planner_live"] = live
+        return None
+
+    def fake_run_live(
+        *,
+        topic: str | None,
+        max_results: int = 5,
+        search_plan: object | None = None,
+        **_: object,
+    ):
+        captured["retrieval_topic"] = topic
+        captured["search_plan"] = search_plan
+        return (
+            scout_opportunities_fixture(topic=topic, max_results=max_results),
+            {"debug_notes": ["fake live retrieval"]},
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.resolve_opportunity_search_plan",
+        fake_resolve_plan,
+    )
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fake_run_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "opportunity scout find 3 active behavioral health AI partnership "
+                "or advisory opportunities relevant to Keystone. Use live SDK and live search. "
+                "No outreach, no Gmail, no external writes. Test candidate-specific buttons."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            live_sdk=True,
+            max_results=3,
+            manual_request_plan={
+                "source": "llm",
+                "requested_agent": "opportunity_scout",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": (
+                    "behavioral health AI partnership or advisory opportunities relevant to Keystone"
+                ),
+                "desired_count": 3,
+            },
+        )
+    )
+
+    assert result.advanced is True
+    assert captured["planned_topic"] == (
+        "behavioral health AI partnership or advisory opportunities relevant to Keystone"
+    )
+    assert captured["retrieval_topic"] == captured["planned_topic"]
+    assert captured["desired_count"] == 3
+    assert captured["planner_live"] is True
+
+
+def test_business_research_work_item_prefers_manual_primary_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_retrieve_company_profile_live(*, company: str, **_: object):
+        captured["company"] = company
+        return research_company_fixture(company_name=company), {"debug_notes": ["fake live retrieval"]}
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.retrieve_company_profile_live",
+        fake_retrieve_company_profile_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "business research analyst research Big Health. Use live SDK and live search. "
+                "No outreach, no Gmail, no external writes."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            live_sdk=True,
+            manual_request_plan={
+                "source": "llm",
+                "requested_agent": "business_research_analyst",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "Big Health",
+                "desired_count": 1,
+            },
+        )
+    )
+
+    assert result.advanced is True
+    assert captured["company"] == "Big Health"
 
 
 def test_advance_work_item_persists_manual_plan_and_uses_requested_route(

@@ -13,10 +13,11 @@ from typing import Any
 from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
 from keystone_agents.sdk import function_tool
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SLACK_REPO_PATH = Path(
     os.getenv("KNI_SLACK_REPO_PATH")
     or os.getenv("KEYSTONE_SLACK_REPO_PATH")
-    or "/Users/anup/gitProjects/keystone-slack"
+    or (_REPO_ROOT.parent / "keystone-slack")
 )
 TEXT_EXTENSIONS = frozenset({".md", ".py", ".txt", ".json", ".yaml", ".yml", ".toml", ".sh"})
 SKIPPED_DIR_NAMES = frozenset(
@@ -122,7 +123,71 @@ OFFICIAL_OPERATIONS_DOCS: tuple[_DocRecord, ...] = (
         url="https://docs.slack.dev/reference/methods/chat.postMessage",
         source_type="slack_docs",
         keywords=("slack", "post", "message", "chat.postmessage", "channel", "write"),
-        note="Use only as a reference for post semantics; Chief of Staff v1 cannot post.",
+        note=(
+            "Use as a reference for post semantics; Chief of Staff Slack posts require "
+            "configured channel policy and live Slack enablement."
+        ),
+    ),
+    _DocRecord(
+        title="Airtable Web API getting started",
+        url="https://support.airtable.com/docs/getting-started-with-airtables-web-api",
+        source_type="airtable_docs",
+        keywords=("airtable", "base", "schema", "records", "api", "finance", "tax"),
+        note="Use for Airtable API paging, rate limits, and base schema setup.",
+    ),
+    _DocRecord(
+        title="IRS Small Business and Self-Employed Tax Center",
+        url="https://www.irs.gov/businesses/small-businesses-self-employed",
+        source_type="irs_docs",
+        keywords=("federal", "irs", "tax", "business", "self-employed", "expense"),
+        note="Use for federal small business and self-employed tax context.",
+    ),
+    _DocRecord(
+        title="IRS Estimated Taxes",
+        url="https://www.irs.gov/businesses/small-businesses-self-employed/estimated-taxes",
+        source_type="irs_docs",
+        keywords=("federal", "irs", "estimated tax", "self-employment", "payments"),
+        note="Use for federal estimated-tax support notes; refresh before recommendations.",
+    ),
+    _DocRecord(
+        title="Pennsylvania Personal Income Tax",
+        url=(
+            "https://www.pa.gov/agencies/revenue/resources/tax-types-and-information/"
+            "personal-income-tax"
+        ),
+        source_type="pa_revenue_docs",
+        keywords=("pennsylvania", "pa", "state", "personal income tax", "business income"),
+        note="Use for Pennsylvania income-class and personal-income-tax context.",
+    ),
+    _DocRecord(
+        title="Philadelphia Business Income & Receipts Tax",
+        url=(
+            "https://www.phila.gov/services/payments-assistance-taxes/taxes/"
+            "business-taxes/business-taxes-by-type/business-income-receipts-tax-birt/"
+        ),
+        source_type="philadelphia_revenue_docs",
+        keywords=("philadelphia", "birt", "business income receipts tax", "city tax"),
+        note="Use for Philadelphia BIRT context; BIRT questions require human tax review.",
+    ),
+    _DocRecord(
+        title="Philadelphia Net Profits Tax",
+        url=(
+            "https://www.phila.gov/services/payments-assistance-taxes/taxes/"
+            "business-taxes/business-taxes-by-type/net-profits-tax/"
+        ),
+        source_type="philadelphia_revenue_docs",
+        keywords=("philadelphia", "npt", "net profits tax", "city tax"),
+        note="Use for Philadelphia NPT context; NPT questions require human tax review.",
+    ),
+    _DocRecord(
+        title="Philadelphia School Income Tax",
+        url=(
+            "https://www.phila.gov/services/payments-assistance-taxes/taxes/"
+            "income-taxes/school-income-tax/"
+        ),
+        source_type="philadelphia_revenue_docs",
+        keywords=("philadelphia", "sit", "school income tax", "city tax", "investment income"),
+        note="Use for Philadelphia SIT context; SIT questions require human tax review.",
     ),
 )
 
@@ -149,6 +214,7 @@ CORE_CONTEXT_SOURCES: tuple[dict[str, Any], ...] = (
             "Socket Mode runtime",
             "WorkflowRunner command routing",
             "business-agents bridge",
+            "Slack app manifest scopes and events",
             "Slack config defaults",
             "workflow family modules",
         ],
@@ -438,8 +504,9 @@ def list_chief_of_staff_context_sources() -> str:
                     "through explicit gates or future handoffs."
                 ),
                 (
-                    "Core context never authorizes Slack posting, Gmail sending, calendar "
-                    "writes, or repository writes."
+                    "Core context alone never authorizes Slack posting, Gmail sending, "
+                    "calendar writes, or repository writes; Slack posting also requires "
+                    "configured channel policy and live Slack enablement."
                 ),
             ],
         }
@@ -456,6 +523,7 @@ def summarize_slack_runtime_config(repo_path: str | None = None) -> str:
         "README.md",
         "ARCHITECTURE.md",
         "SLACK_APP_SETUP.md",
+        "slack/kni-app-manifest.yaml",
         "kni_integrations/config.py",
         "kni_integrations/slack_socket_mode.py",
         "kni_integrations/workflow_runner.py",
@@ -486,7 +554,7 @@ def summarize_slack_runtime_config(repo_path: str | None = None) -> str:
             ],
             "safety_boundaries": [
                 "Chief of Staff tools are read-only.",
-                "Slack posting is not allowed from this agent.",
+                "Slack posting requires configured channel policy and live Slack enablement.",
                 "Gmail sends and calendar writes remain blocked.",
                 "Secrets, local databases, OAuth files, logs, and .env files are not read.",
             ],

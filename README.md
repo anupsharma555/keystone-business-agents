@@ -31,14 +31,14 @@ OpenAI Agents SDK usage is centralized in `keystone_agents.sdk`. Agent builders 
 
 Live model execution is intentionally separate from agent construction. Tests can construct agents without `KEYSTONE_OPENAI_API_KEY`; live execution fails clearly if that repo-specific credential is missing. Keystone intentionally ignores generic shell `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` values so those variables can be used by another project.
 
-The global live model default is `gpt-5.4-mini`. Gmail Triage and Outreach
-Composer default to `gemini-2.5-flash` through Google's direct
-OpenAI-compatible Gemini endpoint. The SDK provider uses the Chat Completions
-compatibility path for Gemini.
-Researcher and Opportunity Scout default to
-`gpt-5.4-mini` to reduce cost for the two OpenAI-based business discovery
-agents; all agent models can still be overridden with `KEYSTONE_*_MODEL`
-environment variables, including `KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL`.
+The global live model default is `gpt-5.4-mini`. During integration testing,
+Gmail Triage, Outreach Composer, Orchestrator, Business Research Analyst,
+Opportunity Scout, and Chief of Staff also default to OpenAI `gpt-5.4-mini`.
+Gemini remains available as an explicit override or fallback through Google's
+direct OpenAI-compatible endpoint. All agent models can still be overridden with
+`KEYSTONE_*_MODEL` environment variables, including
+`KEYSTONE_GMAIL_TRIAGE_MODEL`, `KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL`, and
+`KEYSTONE_CHIEF_OF_STAFF_MODEL`.
 `MODEL_PROVIDER` defaults to `openai`;
 `KEYSTONE_OPENAI_BASE_URL`, `KEYSTONE_GMAIL_TRIAGE_BASE_URL`,
 `KEYSTONE_OUTREACH_COMPOSER_BASE_URL`, and `LITELLM_BASE_URL` are optional
@@ -162,6 +162,8 @@ export SEARXNG_BASE_URL=http://127.0.0.1:18080
 export KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK=true
 export KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL=true
 export KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN=2
+export KEYSTONE_AGENT_HTML_REVIEW=true
+export KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2
 ```
 
 The runtime uses Colima profile `kba-searxng`, Docker context
@@ -338,6 +340,9 @@ Implemented:
 - Live-gated website extraction for selected company pages through Trafilatura
   by default or Firecrawl when explicitly configured, with optional fallback
   between those two extractors.
+- Optional capped Agents SDK HTML/text review for weak deterministic extraction,
+  exposed to Business Research Analyst, Opportunity Scout, Chief of Staff, and
+  Orchestrator as `extract_research_claims_from_html`.
 - Explicit live Slack approval notifications.
 - GitHub Actions CI for Python 3.11, ruff, pytest, and dependency audit.
 

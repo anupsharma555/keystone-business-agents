@@ -26,20 +26,22 @@ Do not use the platform to bypass repo behavior:
 
 ## Current Repo Contract
 
-- `KEYSTONE_OPENAI_MODEL` defaults to `gpt-5.4-mini`; the Orchestrator, Account
-  Researcher, and Opportunity Scout default to OpenAI `gpt-5.4-mini` unless
-  their `KEYSTONE_*_MODEL` values are set.
-- Gmail Triage and Outreach Composer default to `gemini-2.5-flash` through the
-  Gemini provider path and require `GEMINI_API_KEY` for live SDK execution.
-  Keystone uses Google's direct OpenAI-compatible Gemini endpoint by default and
-  sets `use_responses=false` so the Agents SDK uses Chat Completions
-  compatibility instead of requiring `/responses`.
+- `KEYSTONE_OPENAI_MODEL` defaults to `gpt-5.4-mini`; the main operating agents
+  also default to OpenAI `gpt-5.4-mini` during integration testing unless their
+  `KEYSTONE_*_MODEL` values are set.
+- Gmail Triage and Outreach Composer also default to OpenAI `gpt-5.4-mini`. Gemini
+  remains available as an explicit per-agent override and requires
+  `GEMINI_API_KEY` for live SDK execution. Keystone uses Google's direct
+  OpenAI-compatible Gemini endpoint for explicit Gemini runs and sets
+  `use_responses=false` so the Agents SDK uses Chat Completions compatibility.
+- Gemini can also be enabled as a backup path with
+  `KEYSTONE_ENABLE_GEMINI_FALLBACK=true`; this retries Gemini only after the
+  primary OpenAI live SDK attempt fails or OpenAI credentials are unavailable.
 - `MODEL_PROVIDER` defaults to `openai`.
 - Runtime agents can override provider, model, and base URL with
   `KEYSTONE_*_MODEL_PROVIDER`, `KEYSTONE_*_MODEL`, and `KEYSTONE_*_BASE_URL`.
-  Gmail Triage and Outreach Composer may override the default direct Gemini
-  endpoint through an explicit OpenAI-compatible gateway such as LiteLLM. Account
-  Researcher, Opportunity Scout, and Orchestrator should remain OpenAI-compatible
+  Gmail Triage and Outreach Composer may use Gemini or a gateway only through
+  explicit per-agent overrides. Operating agents should remain OpenAI-compatible
   unless a reviewed change says otherwise.
 - Dry-run and fixture-mode development remain the default.
 - Agent construction does not require `KEYSTONE_OPENAI_API_KEY`.
@@ -108,31 +110,39 @@ KEYSTONE_LIVE_MODE=false
 MODEL_PROVIDER=openai
 KEYSTONE_OPENAI_MODEL=gpt-5.4-mini
 KEYSTONE_AGENT_RUN_BUDGET_USD=0.25
-KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER=gemini
-KEYSTONE_GMAIL_TRIAGE_MODEL=gemini-2.5-flash
+KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER=openai
+KEYSTONE_GMAIL_TRIAGE_MODEL=gpt-5.4-mini
 KEYSTONE_GMAIL_TRIAGE_BASE_URL=
 KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL=gpt-5.4-mini
 KEYSTONE_OPPORTUNITY_SCOUT_MODEL=gpt-5.4-mini
-KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER=gemini
-KEYSTONE_OUTREACH_COMPOSER_MODEL=gemini-2.5-flash
+KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER=openai
+KEYSTONE_OUTREACH_COMPOSER_MODEL=gpt-5.4-mini
+KEYSTONE_CHIEF_OF_STAFF_MODEL_PROVIDER=openai
+KEYSTONE_CHIEF_OF_STAFF_MODEL=gpt-5.4-mini
 KEYSTONE_OPENAI_API_KEY=
 KEYSTONE_OPENAI_BASE_URL=
 LITELLM_BASE_URL=
 GEMINI_API_KEY=
+KEYSTONE_ENABLE_GEMINI_FALLBACK=false
+KEYSTONE_GEMINI_FALLBACK_MODEL=gemini-2.5-flash
+KEYSTONE_GEMINI_FALLBACK_BASE_URL=
 
 KEYSTONE_ORCHESTRATOR_MODEL_PROVIDER=openai
 KEYSTONE_ORCHESTRATOR_MODEL=gpt-5.4-mini
 KEYSTONE_AGENT_RUN_BUDGET_USD=0.25
-KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER=
-KEYSTONE_GMAIL_TRIAGE_MODEL=
+KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER=openai
+KEYSTONE_GMAIL_TRIAGE_MODEL=gpt-5.4-mini
 KEYSTONE_GMAIL_TRIAGE_BASE_URL=
 KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL_PROVIDER=openai
 KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL=gpt-5.4-mini
 KEYSTONE_OPPORTUNITY_SCOUT_MODEL_PROVIDER=openai
 KEYSTONE_OPPORTUNITY_SCOUT_MODEL=gpt-5.4-mini
-KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER=gemini
-KEYSTONE_OUTREACH_COMPOSER_MODEL=gemini-2.5-flash
+KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER=openai
+KEYSTONE_OUTREACH_COMPOSER_MODEL=gpt-5.4-mini
 KEYSTONE_OUTREACH_COMPOSER_BASE_URL=
+KEYSTONE_CHIEF_OF_STAFF_MODEL_PROVIDER=openai
+KEYSTONE_CHIEF_OF_STAFF_MODEL=gpt-5.4-mini
+KEYSTONE_CHIEF_OF_STAFF_BASE_URL=
 ```
 
 Set `KEYSTONE_OPENAI_API_KEY` only in local `.env` or your shell environment.
@@ -150,10 +160,11 @@ PY
 
 Expected properties:
 
-- The global OpenAI model is `gpt-5.4-mini` unless overridden. The Orchestrator,
-  Business Research Analyst, and Opportunity Scout use `gpt-5.4-mini` unless
-  overridden. Gmail Triage and Outreach Composer use `gemini-2.5-flash` through
-  Google's direct OpenAI-compatible endpoint unless overridden.
+- The global OpenAI model is `gpt-5.4-mini` unless overridden. The main
+  operating agents use `gpt-5.4-mini` during integration testing unless
+  overridden. Gmail Triage and Outreach Composer use OpenAI `gpt-5.4-mini` by
+  default; Gemini requires explicit per-agent
+  provider/model overrides or `KEYSTONE_ENABLE_GEMINI_FALLBACK=true`.
 - `api_key` is `[masked]` when present.
 - No raw API key is printed.
 
@@ -165,9 +176,9 @@ validation target after prompts, tools, schemas, and guardrails pass locally.
 Before a live SDK run:
 
 - Confirm `KEYSTONE_OPENAI_MODEL=gpt-5.4-mini`,
-  `KEYSTONE_ORCHESTRATOR_MODEL=gpt-5.4-mini`, and confirm any Account
-  Researcher or Opportunity Scout override only when intentionally testing a
-  different model.
+  `KEYSTONE_ORCHESTRATOR_MODEL=gpt-5.4-mini`, and confirm Business Research Analyst
+  or Opportunity Scout overrides only when intentionally testing a different
+  model.
 - Confirm any per-agent provider override is intentional. For Gmail Triage and
   Outreach Composer Gemini runs, confirm `GEMINI_API_KEY` is set.
   `KEYSTONE_GMAIL_TRIAGE_BASE_URL`, `KEYSTONE_OUTREACH_COMPOSER_BASE_URL`, or

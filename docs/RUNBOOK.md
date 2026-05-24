@@ -379,6 +379,8 @@ export KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL=true
 export KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN=2
 export KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true
 export KEYSTONE_WEBSITE_EXTRACTOR=trafilatura
+export KEYSTONE_AGENT_HTML_REVIEW=true
+export KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2
 .venv/bin/python scripts/run_opportunity_scout.py \
   --topic "behavioral health AI" \
   --max-results 3 \
@@ -420,6 +422,13 @@ This uses the `kba-searxng` Colima profile and port `18080`, separate from the
 transiently start this local runtime when a run needs SearXNG and the endpoint
 is not already reachable. They stop it afterward only when the current process
 started it; an already-running runtime is left alone.
+
+Slack scheduled automations that delegate to Business Agents should preserve
+this boundary. The Slack repo has its own `kni-searxng` profile on port `8080`,
+but Business Agents child runners load this repo's `.env` and should use
+`18080`. Do not add Slack-side `8080` SearXNG preflights for those delegated
+Business Agents runs; let the child runner report search diagnostics if the
+Business Agents endpoint is unavailable.
 
 For Firecrawl search, set `SEARCH_PROVIDER=firecrawl`, `FIRECRAWL_API_KEY`, and
 optionally `FIRECRAWL_BASE_URL`, or pass `--search-provider firecrawl`.
@@ -763,8 +772,35 @@ List configured automations or recent runs:
 
 The Chief of Staff publishing tools support local/dry-run Google Doc reports,
 Airtable-shaped review rows, and internal Slack summaries. SQLite and WorkItems
-remain canonical. Live Google Docs and Airtable providers still require reviewed
-adapters before real external writes are enabled.
+remain canonical. Scoped Airtable record reads/writes use typed tools and require
+allowed tables, explicit live flags, write env gates, and an approval or command
+audit reference.
+
+Finance/tax tracker setup for `2026 Finance & Tax Tracker`:
+
+```bash
+# Configure later with a scoped Airtable PAT:
+# AIRTABLE_BASE_ID=app...
+# AIRTABLE_ACCESS_TOKEN=pat...
+# AIRTABLE_ALLOWED_TABLES="Business Income,Business Expenses,Personal Income,Personal Expenses,Tax Payments"
+# AIRTABLE_WRITE_DRY_RUN=true
+
+.venv/bin/python scripts/run_chief_of_staff.py \
+  "chief of staff inspect the 2026 Finance & Tax Tracker Airtable schema and save a bounded context note"
+```
+
+The first pass should run with `AIRTABLE_WRITE_DRY_RUN=true`: fetch schema,
+read 1-3 records from each allowed table, prepare a dry-run write, and save
+schema/rule summaries only. After validating one test create/update, set
+`AIRTABLE_ALLOW_WRITES=true` and `AIRTABLE_WRITE_DRY_RUN=false` only for the
+approved command window. Google Drive running-update notes should be written as
+scoped internal artifacts under `KNIOps/Finance Tax Tracker Updates`; do not use
+them as final tax advice. Tracker semantics should be captured in
+`documents/finance_tax_tracker_context.md`: `Estimated Tax Periods` (formerly
+`Quarter`) is the authoritative estimated-tax period field, `Total Expenses` is
+the preferred expense amount, `Tax Payments` are excluded from expense totals
+unless explicitly requested, and the default tax profile is U.S. federal,
+Pennsylvania, and Philadelphia.
 
 First scheduled job should be weekly Opportunity Scout dry-run with local audit storage:
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,68 @@ from keystone_agents.cli_sdk import add_sdk_session_arguments, sdk_session_from_
 from keystone_agents.config import load_settings
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
+from keystone_agents.quality_budget import AgentQualityBudget, chief_of_staff_quality_budget
+
+
+def _chief_of_staff_session_from_args(args: argparse.Namespace) -> object | None:
+    if (
+        getattr(args, "sdk_session", None) is None
+        and not getattr(args, "sdk_session_id", "")
+        and not getattr(args, "sdk_session_db", "")
+    ):
+        return None
+    return sdk_session_from_args(
+        args,
+        scope="chief_of_staff",
+        components=("direct-script", os.environ.get("USER", "local"), str(Path.cwd())),
+        default_enabled=False,
+    )
+
+
+def _approval_reference_for_request(input_text: str) -> str:
+    digest = hashlib.sha256(str(input_text or "").encode("utf-8")).hexdigest()[:12]
+    return f"chief-of-staff-command:{digest}"
+
+
+def _requests_google_workspace_artifact(input_text: str) -> bool:
+    lowered = str(input_text or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "google doc",
+            "google docs",
+            "gdrive",
+            "google drive",
+            "drive folder",
+            "doc link",
+        )
+    ) and any(
+        marker in lowered
+        for marker in (
+            "create",
+            "write",
+            "provide a link",
+            "provide link",
+            "save",
+            "analysis",
+            "analyze",
+            "summary",
+            "report",
+        )
+    )
+
+
+def _live_side_effect_policy(input_text: str) -> str:
+    if _requests_google_workspace_artifact(input_text):
+        return (
+            "Live internal Airtable reads are allowed for this command. Live Google "
+            "Workspace folder/doc writes are allowed only for the explicitly requested "
+            "internal KNIOps artifact, using the supplied approval_reference and typed "
+            "Google Workspace tools. Do not post to Slack beyond the normal result, send "
+            "Gmail, create calendar events, write the repo, file tax returns, make tax "
+            "payments, or mutate Airtable unless separately requested."
+        )
+    return "read-only; no Slack post, Gmail send, calendar write, repo write, or external action"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,9 +98,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--live-sdk",
         action="store_true",
-        help="Run through live SDK model execution. Still cannot post or write externally.",
+        help=(
+            "Run through live SDK model execution. Slack posts still require channel policy; "
+            "external writes remain gated."
+        ),
     )
     parser.add_argument("--model", default=None, help="Optional model override.")
+    parser.add_argument(
+        "--quality",
+        choices=["fast", "balanced", "deep"],
+        default=None,
+        help="Chief of Staff quality budget for SDK planning.",
+    )
     add_sdk_session_arguments(parser)
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     return parser
@@ -63,9 +135,10 @@ def _payload(
     model: object,
     output: object,
     input_text: str,
+    quality_budget: AgentQualityBudget | None = None,
 ) -> dict[str, object]:
     dumped = output.model_dump(mode="json") if hasattr(output, "model_dump") else output
-    return {
+    payload: dict[str, object] = {
         "agent_name": "chief_of_staff",
         "mode": mode,
         "live_sdk": live_sdk,
@@ -75,6 +148,9 @@ def _payload(
         "send_enabled": False,
         "output": dumped,
     }
+    if quality_budget is not None:
+        payload["quality_budget"] = quality_budget.model_dump(mode="json")
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,22 +165,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.live_sdk:
         load_settings(force_dotenv=True)
         model_config = get_runtime_agent_model_config("chief_of_staff", model_override=args.model)
+        budget = chief_of_staff_quality_budget(
+            args.quality,
+            request_text=input_text,
+            live_sdk=True,
+        )
         typed_result = run_chief_of_staff_sdk(
             {
                 "request": input_text,
                 "slack_repo_path": args.slack_repo_path,
-                "side_effect_policy": (
-                    "read-only; no Slack post, Gmail send, calendar write, or repo write"
-                ),
+                "approval_reference": _approval_reference_for_request(input_text),
+                "side_effect_policy": _live_side_effect_policy(input_text),
             },
             live=True,
             model=args.model,
-            session=sdk_session_from_args(
-                args,
-                scope="chief_of_staff",
-                components=("direct-script", os.environ.get("USER", "local"), str(Path.cwd())),
-                default_enabled=True,
-            ),
+            quality_budget=budget,
+            session=_chief_of_staff_session_from_args(args),
+            force_sdk_interpretation=True,
         )
         result = typed_result.output
         payload = _payload(
@@ -113,10 +190,16 @@ def main(argv: list[str] | None = None) -> int:
             model=model_config.as_log_dict(),
             output=result,
             input_text=input_text,
+            quality_budget=budget,
         )
     else:
         if args.mode != RunMode.DRY_RUN.value:
             raise SystemExit("Only dry-run planning and --live-sdk model planning are supported.")
+        budget = chief_of_staff_quality_budget(
+            args.quality,
+            request_text=input_text,
+            live_sdk=False,
+        )
         result = plan_chief_of_staff_request(
             input_text,
             slack_repo_path=args.slack_repo_path,
@@ -128,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             model="fixture",
             output=result,
             input_text=input_text,
+            quality_budget=budget,
         )
 
     if args.json:

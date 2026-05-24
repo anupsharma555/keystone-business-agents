@@ -1,0 +1,303 @@
+{
+  "action_ids": [
+    "kba_approve_external_use",
+    "kba_cos_audit_automations",
+    "kba_cos_continue_work_item",
+    "kba_cos_generate_doc",
+    "kba_cos_post_summary",
+    "kba_cos_show_blockers",
+    "kba_cos_sync_airtable",
+    "kba_create_gmail_draft",
+    "kba_find_contact",
+    "kba_more_research",
+    "kba_overflow",
+    "kba_revise_draft"
+  ],
+  "block_ids": {
+    "revision_feedback": "kba_revision_feedback_block",
+    "run_agent_task": "keystone_agent_task_block"
+  },
+  "callback_ids": {
+    "revise_draft_view": "kba_revise_draft_submit",
+    "run_agent_message": "keystone_run_agent_message",
+    "run_agent_view": "keystone_run_agent_submit"
+  },
+  "input_action_ids": {
+    "revision_feedback": "kba_revision_feedback",
+    "run_agent_task": "keystone_agent_task",
+    "write_gate": "kba_approve_write_request"
+  },
+  "intents": [
+    "approve_external_use",
+    "audit_automations",
+    "continue_work_item",
+    "create_gmail_draft",
+    "find_contact",
+    "generate_doc",
+    "more_research",
+    "open_work_item",
+    "post_internal_summary",
+    "research_all_candidates",
+    "revise_draft",
+    "run_again",
+    "show_blockers",
+    "show_sources",
+    "skip_company",
+    "sync_airtable"
+  ],
+  "legacy_action_ids": [
+    "keystone_approval_no",
+    "keystone_approval_revise",
+    "keystone_approval_yes"
+  ],
+  "notes": [
+    "Legacy approval action IDs are supported for compatibility only.",
+    "The contract is side-effect free and does not authorize Slack, Gmail, calendar, CRM, or external writes."
+  ],
+  "payload_json_schemas": {
+    "business_agent_action": {
+      "description": "JSON value carried by first-class business-agent Slack buttons.",
+      "properties": {
+        "approval_id": {
+          "default": "",
+          "title": "Approval Id",
+          "type": "string"
+        },
+        "artifact_id": {
+          "default": "",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "gate_scope": {
+          "default": "",
+          "title": "Gate Scope",
+          "type": "string"
+        },
+        "intent": {
+          "title": "Intent",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "schema": {
+          "default": "keystone.business_agent_action.v1",
+          "title": "Schema",
+          "type": "string"
+        },
+        "source_channel_id": {
+          "default": "",
+          "title": "Source Channel Id",
+          "type": "string"
+        },
+        "source_message_ts": {
+          "default": "",
+          "title": "Source Message Ts",
+          "type": "string"
+        },
+        "source_thread_ts": {
+          "default": "",
+          "title": "Source Thread Ts",
+          "type": "string"
+        },
+        "work_item_id": {
+          "default": "",
+          "title": "Work Item Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "intent"
+      ],
+      "title": "BusinessAgentActionPayload",
+      "type": "object"
+    },
+    "selected_message_context": {
+      "$defs": {
+        "SlackContextMessage": {
+          "description": "One bounded Slack message included in selected context.",
+          "properties": {
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "permalink": {
+              "default": "",
+              "title": "Permalink",
+              "type": "string"
+            },
+            "text": {
+              "default": "",
+              "title": "Text",
+              "type": "string"
+            },
+            "ts": {
+              "default": "",
+              "title": "Ts",
+              "type": "string"
+            },
+            "user_id": {
+              "default": "",
+              "title": "User Id",
+              "type": "string"
+            },
+            "username": {
+              "default": "",
+              "title": "Username",
+              "type": "string"
+            }
+          },
+          "title": "SlackContextMessage",
+          "type": "object"
+        }
+      },
+      "description": "Local-only context captured from a selected Slack message or thread.",
+      "properties": {
+        "channel_id": {
+          "default": "",
+          "title": "Channel Id",
+          "type": "string"
+        },
+        "channel_name": {
+          "default": "",
+          "title": "Channel Name",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "permalink": {
+          "default": "",
+          "title": "Permalink",
+          "type": "string"
+        },
+        "schema": {
+          "const": "keystone.slack.selected_message_context.v1",
+          "default": "keystone.slack.selected_message_context.v1",
+          "title": "Schema",
+          "type": "string"
+        },
+        "selected_message": {
+          "$ref": "#/$defs/SlackContextMessage"
+        },
+        "selected_message_ts": {
+          "default": "",
+          "title": "Selected Message Ts",
+          "type": "string"
+        },
+        "source": {
+          "default": "slack_message_action",
+          "title": "Source",
+          "type": "string"
+        },
+        "team_domain": {
+          "default": "",
+          "title": "Team Domain",
+          "type": "string"
+        },
+        "team_id": {
+          "default": "",
+          "title": "Team Id",
+          "type": "string"
+        },
+        "thread_fetch_status": {
+          "default": "not_requested",
+          "enum": [
+            "ok",
+            "failed",
+            "not_requested"
+          ],
+          "title": "Thread Fetch Status",
+          "type": "string"
+        },
+        "thread_messages": {
+          "items": {
+            "$ref": "#/$defs/SlackContextMessage"
+          },
+          "title": "Thread Messages",
+          "type": "array"
+        },
+        "thread_ts": {
+          "default": "",
+          "title": "Thread Ts",
+          "type": "string"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "title": "SlackSelectedMessageContext",
+      "type": "object"
+    },
+    "write_gate": {
+      "description": "JSON value carried by Slack's business-agent write request gate.",
+      "properties": {
+        "intent": {
+          "default": "approve_agent_write_request",
+          "title": "Intent",
+          "type": "string"
+        },
+        "request_text": {
+          "title": "Request Text",
+          "type": "string"
+        },
+        "request_truncated": {
+          "default": false,
+          "title": "Request Truncated",
+          "type": "boolean"
+        },
+        "schema": {
+          "default": "keystone.business_agent_write_request.v1",
+          "title": "Schema",
+          "type": "string"
+        },
+        "source_channel_id": {
+          "default": "",
+          "title": "Source Channel Id",
+          "type": "string"
+        },
+        "source_request_ts": {
+          "default": "",
+          "title": "Source Request Ts",
+          "type": "string"
+        },
+        "source_thread_ts": {
+          "default": "",
+          "title": "Source Thread Ts",
+          "type": "string"
+        },
+        "source_user_id": {
+          "default": "",
+          "title": "Source User Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_text"
+      ],
+      "title": "BusinessAgentWriteGatePayload",
+      "type": "object"
+    }
+  },
+  "schema": "keystone.business_agent_slack_contract.v1",
+  "schemas": {
+    "business_agent_action": "keystone.business_agent_action.v1",
+    "selected_message_context": "keystone.slack.selected_message_context.v1",
+    "write_gate": "keystone.business_agent_write_request.v1"
+  },
+  "version": "1",
+  "write_gate": {
+    "action_id": "kba_approve_write_request",
+    "intent": "approve_agent_write_request",
+    "no_send_text": "This approval only lets the AI agent run this request. It does not allow sending email, posting externally, publishing, scheduling, or creating live drafts unless a later specific gate allows it."
+  }
+}

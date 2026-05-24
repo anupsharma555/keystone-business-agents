@@ -32,11 +32,72 @@ card source for navigation, CLI inspection, and extension tests. Keep registry
 metadata current when adding prompts, tools, schemas, live flags, or eval
 coverage.
 
+Agent capabilities should be schema-first and tool-general, not narrow
+deterministic lanes for individual natural-language requests. Deterministic
+intent classification is acceptable when it is a bounded routing hint, safety
+gate, fixture fallback, validation step, typed tool execution path, arithmetic
+step, approval check, or side-effect blocker. It should not replace the
+agent's natural-language interpretation layer with phrase-specific branches
+that make normal follow-up asks fail. For structured systems such as Airtable,
+Google Sheets, CRM records, Gmail, Slack, or local data stores, first expose a
+bounded schema/context model and generic read/query/write tools, then let the
+agent map user intent onto that schema. If mapping is ambiguous, ask for
+clarification; do not silently fall back to a canned one-record preview or a
+hard-coded path.
+
 ## Tool And Search Architecture
 
 Tool modules own provider boundaries. Agent modules may compose tools from
 `src/keystone_agents/tools/`, but they should not import provider SDKs or make
 network calls directly.
+
+## Tool Use Decision Rules
+
+Agents should choose tools from the shape of the task, not from brittle keyword
+lanes. Prefer the narrowest typed tool or helper that can produce bounded,
+inspectable state:
+
+- Use schema tools first for structured systems. For Airtable, Sheets, Gmail,
+  Slack, CRM, or local stores, inspect schema/context before reading records or
+  preparing writes.
+- Use deterministic helpers for exact arithmetic, filtering, record matching,
+  deduplication, data-quality checks, source ranking, write-plan construction,
+  and approval gates. Let the model explain helper outputs; do not let the
+  model freehand arithmetic or record identity.
+- Use Google Workspace tools for internal artifacts, docs, sheets, and Drive
+  folders when the operator asks to save or share internal work. Live writes
+  require the relevant live flags and approval/reference metadata.
+- Use Airtable tools for table records, not browser automation. Writes must be
+  scoped create/update operations with exact table/field mapping and approval
+  references; no deletes, schema changes, attachment uploads, or silent bulk
+  overwrites.
+- Use Gmail and Slack structured tools for messages, drafts, labels, thread
+  context, and posting decisions. Browser tools should not replace provider
+  APIs for business-system reads or writes.
+- Use extraction providers first for web content: Trafilatura/Firecrawl/Crawl4AI
+  style extraction, source ranking, and claim extraction. Use Playwright only
+  when static extraction is weak, a JS-rendered page must be inspected, or
+  Orchestrator needs early route diagnostics.
+- Use Playwright as read-only backend/headless rendered-browser diagnostics
+  only. It must use a temporary non-persistent profile and must not open a user-screen browser. It may capture text, links, status, title, and optional
+  screenshots under `artifacts/playwright-images`; it must not click, submit
+  forms, authenticate, download files, use local files, or perform mutations.
+- Use `capture_browser_diagnostics` when a page, dashboard, local app, or
+  customer-facing site needs backend browser evidence about console messages,
+  page errors, failed requests, response statuses, or resource loading. Pair it
+  with `summarize_rendered_page_diagnostics` before presenting findings.
+- Use OpenAI file search/vector stores for durable approved docs, runbooks,
+  schemas, prior traces, and artifact history when those stores are configured;
+  keep secrets, PHI, raw private messages, and unapproved artifacts out of
+  hosted stores.
+- Use Sandbox/Codex-style workspace review only for repo-local diagnosis, test
+  runs, generated reports, and draft artifact review. It must not trigger live
+  business side effects.
+- If a tool/helper is missing for a repeated task, add a bounded schema and
+  helper before adding prompt-specific branches. After implementing each tool or helper, run its focused tests before broad integration tests.
+- If the right schema, record identity, source basis, live flag, or approval
+  scope is missing, ask a targeted clarification or return an exact blocker
+  instead of guessing.
 
 Search-heavy agents use the shared `SearchProvider` contract. Current provider
 implementations are:
@@ -57,10 +118,31 @@ available through explicit provider selection, not as an automatic fallback.
 Planner agents may set live-search intent and constraints, but provider
 selection stays in the shared Python retrieval policy.
 
+This repo's local SearXNG runtime is separate from the `keystone-slack` repo's
+runtime. Keystone Business Agents uses the `kba-searxng` Colima profile and
+`SEARXNG_BASE_URL=http://127.0.0.1:18080`; `keystone-slack` uses its own
+`kni-searxng` profile on port `8080`. When Slack scheduled automations delegate
+to Business Agents child runners, do not preflight or start the Slack repo's
+`8080` SearXNG instance for those child runs. Let the Business Agents child
+environment and retrieval policy own the `18080` runtime and degrade with
+runner diagnostics if that endpoint is unavailable.
+
+Scheduled Business Agent automations that include research must preserve the
+same agent path used by manual `@KNI` runs: deterministic retrieval first,
+specialist SDK synthesis second, and renderer-owned Slack output last. Do not
+replace specialist agents with template-only summaries. Live search should
+record provider and reachability diagnostics, pass source context into the
+appropriate specialist, read selected article URLs when available, and avoid
+presenting weak generic search results as research leads.
+
 Website extraction is a separate live-gated path. Use Trafilatura by default for
 selected company pages, or Firecrawl when `KEYSTONE_WEBSITE_EXTRACTOR=firecrawl`.
 `KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK` may switch between `trafilatura` and
 `firecrawl` when the primary extractor fails or returns no usable claims.
+`KEYSTONE_AGENT_HTML_REVIEW=true` enables a capped Agents SDK second-pass review
+over already retrieved HTML/text when deterministic extraction is weak. Keep it
+bounded with `KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES`; it may add source-backed
+claim candidates but must not replace deterministic URL/source records.
 
 Apify and Browserless wrappers remain placeholder/dry-run boundaries. Do not
 document or implement them as live production paths until a reviewed provider
@@ -113,14 +195,16 @@ model names inside prompts, tools, or CLI branches.
 - The Orchestrator is the control plane. It defaults to `gpt-5.4-mini` through
   `KEYSTONE_ORCHESTRATOR_MODEL` for hybrid LLM/deterministic review. Python
   remains authoritative for safety gates, approvals, and side-effect blocking.
-- Business Research Analyst and Opportunity Scout default to OpenAI-compatible
-  models because source synthesis, routing, trace handling, and SDK handoffs
-  should stay on the same audited provider path unless explicitly changed.
-- OpenAI-backed defaults use `gpt-5.4-mini` unless explicitly overridden. Gmail
-  Triage and Outreach Composer default to Gemini Flash through Google's direct
-  OpenAI-compatible Gemini endpoint. The runtime still uses the OpenAI Agents
-  SDK provider path with Chat Completions compatibility; it does not use a
-  separate Gemini SDK adapter.
+- Main operating agents default to OpenAI `gpt-5.4-mini` during integration
+  testing. Schema interpretation, tool selection, memory use, source synthesis,
+  and SDK handoffs should stay on the same audited provider path unless
+  explicitly changed.
+  Gmail Triage and Outreach Composer may still use Gemini Flash through explicit
+  per-agent provider/model overrides. The runtime still uses the OpenAI Agents
+  SDK provider path with Chat Completions compatibility for Gemini; it does not
+  use a separate Gemini SDK adapter. Gemini may also be enabled as a backup with
+  `KEYSTONE_ENABLE_GEMINI_FALLBACK=true` for cases where the primary OpenAI live
+  SDK attempt is unavailable.
   LiteLLM remains an optional external gateway override through
   `LITELLM_BASE_URL` or agent-specific base URLs. Do not require or import the
   Python `litellm` package in this repo unless a future dependency review proves

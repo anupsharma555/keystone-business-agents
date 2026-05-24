@@ -12,6 +12,7 @@ DEFAULT_PROVIDER = "openai"
 DEFAULT_MODEL = "gpt-5.4-mini"
 OPENAI_BUSINESS_AGENT_DEFAULT_MODEL = "gpt-5.4-mini"
 OPENAI_ORCHESTRATOR_DEFAULT_MODEL = "gpt-5.4-mini"
+OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL = "gpt-5.4-mini"
 OPENAI_FALLBACK_DEFAULT_MODEL = OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
 GEMINI_FLASH_DEFAULT_MODEL = "gemini-2.5-flash"
 GEMINI_GMAIL_TRIAGE_DEFAULT_MODEL = GEMINI_FLASH_DEFAULT_MODEL
@@ -22,6 +23,9 @@ KEYSTONE_OPENAI_MODEL_ENV = "KEYSTONE_OPENAI_MODEL"
 KEYSTONE_OPENAI_BASE_URL_ENV = "KEYSTONE_OPENAI_BASE_URL"
 KEYSTONE_OPENAI_FALLBACK_MODEL_ENV = "KEYSTONE_OPENAI_FALLBACK_MODEL"
 KEYSTONE_OPENAI_FALLBACK_BASE_URL_ENV = "KEYSTONE_OPENAI_FALLBACK_BASE_URL"
+KEYSTONE_ENABLE_GEMINI_FALLBACK_ENV = "KEYSTONE_ENABLE_GEMINI_FALLBACK"
+KEYSTONE_GEMINI_FALLBACK_MODEL_ENV = "KEYSTONE_GEMINI_FALLBACK_MODEL"
+KEYSTONE_GEMINI_FALLBACK_BASE_URL_ENV = "KEYSTONE_GEMINI_FALLBACK_BASE_URL"
 GEMINI_PROVIDER = "gemini"
 GEMINI_OPENAI_COMPAT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 SUPPORTED_PROVIDERS = frozenset({DEFAULT_PROVIDER, GEMINI_PROVIDER})
@@ -96,8 +100,7 @@ RUNTIME_AGENT_MODEL_SPECS: dict[str, RuntimeAgentModelSpec] = {
         model_env="KEYSTONE_GMAIL_TRIAGE_MODEL",
         provider_env="KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER",
         base_url_env="KEYSTONE_GMAIL_TRIAGE_BASE_URL",
-        default_model=GEMINI_GMAIL_TRIAGE_DEFAULT_MODEL,
-        default_provider=GEMINI_PROVIDER,
+        default_model=OPENAI_BUSINESS_AGENT_DEFAULT_MODEL,
     ),
     "business_research_analyst": RuntimeAgentModelSpec(
         agent_name="business_research_analyst",
@@ -118,15 +121,14 @@ RUNTIME_AGENT_MODEL_SPECS: dict[str, RuntimeAgentModelSpec] = {
         model_env="KEYSTONE_OUTREACH_COMPOSER_MODEL",
         provider_env="KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER",
         base_url_env="KEYSTONE_OUTREACH_COMPOSER_BASE_URL",
-        default_model=GEMINI_OUTREACH_COMPOSER_DEFAULT_MODEL,
-        default_provider=GEMINI_PROVIDER,
+        default_model=OPENAI_BUSINESS_AGENT_DEFAULT_MODEL,
     ),
     "chief_of_staff": RuntimeAgentModelSpec(
         agent_name="chief_of_staff",
         model_env="KEYSTONE_CHIEF_OF_STAFF_MODEL",
         provider_env="KEYSTONE_CHIEF_OF_STAFF_MODEL_PROVIDER",
         base_url_env="KEYSTONE_CHIEF_OF_STAFF_BASE_URL",
-        default_model=OPENAI_BUSINESS_AGENT_DEFAULT_MODEL,
+        default_model=OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL,
     ),
 }
 
@@ -350,6 +352,13 @@ def _env_value(name: str) -> str | None:
     return stripped or None
 
 
+def _env_bool(name: str, *, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in TRUE_VALUES
+
+
 def openai_api_key_from_env() -> str | None:
     """Return the Keystone-specific OpenAI key."""
 
@@ -538,6 +547,45 @@ def get_openai_fallback_model_config(
             == base.litellm_base_url
             else None
         ),
+        api_key=base.api_key,
+        gemini_api_key=base.gemini_api_key,
+        litellm_base_url=base.litellm_base_url,
+    )
+
+
+def get_gemini_fallback_model_config(
+    agent_name: str | None,
+    *,
+    model_override: str | None = None,
+) -> ModelConfig | None:
+    """Return an explicit Gemini fallback config when the primary provider is OpenAI."""
+
+    primary = get_runtime_agent_model_config(agent_name, model_override=model_override)
+    if primary.provider != DEFAULT_PROVIDER:
+        return None
+    if not _env_bool(KEYSTONE_ENABLE_GEMINI_FALLBACK_ENV, False):
+        return None
+
+    base = get_model_config()
+    spec = _runtime_agent_spec(agent_name)
+    fallback_model_env = f"KEYSTONE_{spec.agent_name.upper()}_GEMINI_FALLBACK_MODEL" if spec else ""
+    fallback_base_url_env = (
+        f"KEYSTONE_{spec.agent_name.upper()}_GEMINI_FALLBACK_BASE_URL" if spec else ""
+    )
+    explicit_base_url = (
+        _env_value(fallback_base_url_env)
+        or _env_value(KEYSTONE_GEMINI_FALLBACK_BASE_URL_ENV)
+        or base.base_url
+    )
+    return ModelConfig(
+        provider=GEMINI_PROVIDER,
+        model=(
+            _env_value(fallback_model_env)
+            or _env_value(KEYSTONE_GEMINI_FALLBACK_MODEL_ENV)
+            or GEMINI_FLASH_DEFAULT_MODEL
+        ),
+        base_url=_default_base_url_for_provider(GEMINI_PROVIDER, explicit_base_url),
+        use_responses=False,
         api_key=base.api_key,
         gemini_api_key=base.gemini_api_key,
         litellm_base_url=base.litellm_base_url,

@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from keystone_agents.automation_inventory import build_automation_inventory_report
 from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.guardrails import keystone_guardrails
-from keystone_agents.memory import operator_reference_memory_item
+from keystone_agents.memory import (
+    build_chief_of_staff_memory_context,
+    chief_of_staff_memory_item,
+    operator_reference_memory_item,
+)
 from keystone_agents.models import TypedAgentRunResult
+from keystone_agents.quality_budget import (
+    AgentQualityBudget,
+    QualityMode,
+    chief_of_staff_quality_budget,
+)
 from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.automation import (
     AutomationArtifactRef,
@@ -44,45 +56,81 @@ from keystone_agents.tools.chief_of_staff_tool import (
     search_slack_repo_context,
     summarize_slack_runtime_config,
 )
+from keystone_agents.tools.html_review_tool import extract_research_claims_from_html
+from keystone_agents.tools.internal_data_tools import (
+    airtable_get_base_schema,
+    airtable_get_base_schema_impl,
+    airtable_read_records,
+    airtable_read_records_impl,
+    airtable_write_record,
+    airtable_write_record_impl,
+    explicit_full_article_read_requested,
+    google_workspace_tools,
+    read_linked_article,
+)
 from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
     search_local_context,
 )
+from keystone_agents.tools.memory_tool import retrieve_chief_of_staff_memory
 from keystone_agents.tools.operations_publisher_tool import (
     publish_document_report,
+    publish_internal_artifact,
     publish_slack_summary,
     publish_table_mirror,
 )
+from keystone_agents.tools.browser_diagnostics_tool import (
+    capture_browser_diagnostics,
+    summarize_rendered_page_diagnostics,
+)
+from keystone_agents.tools.playwright_tool import render_page
+from keystone_agents.tools.serper_tool import search_web
+from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
 
 CHIEF_OF_STAFF_REASONING_EFFORT = "low"
 CHIEF_OF_STAFF_VERBOSITY = "low"
 CHIEF_OF_STAFF_MAX_TOKENS = 2_500
 
 
-def _chief_of_staff_tools() -> list[Any]:
+def _chief_of_staff_tools(request_text: str = "") -> list[Any]:
+    tools = [
+        list_chief_of_staff_context_sources,
+        summarize_slack_runtime_config,
+        search_slack_repo_context,
+        read_slack_repo_context_file,
+        lookup_slack_workflow_capability,
+        search_official_operations_docs,
+        retrieve_chief_of_staff_memory,
+        list_automation_specs,
+        list_recent_automation_runs,
+        list_channel_automation_bindings,
+        summarize_automation_health,
+        list_pending_automation_approvals,
+        inspect_active_work_items,
+        publish_document_report,
+        publish_table_mirror,
+        publish_slack_summary,
+        list_local_context_sources,
+        search_local_context,
+        read_local_context_file,
+        extract_research_claims_from_html,
+        structure_web_data_for_schema,
+        search_web,
+        render_page,
+        capture_browser_diagnostics,
+        summarize_rendered_page_diagnostics,
+        publish_internal_artifact,
+        airtable_get_base_schema,
+        airtable_read_records,
+        airtable_write_record,
+        *google_workspace_tools(),
+    ]
+    if explicit_full_article_read_requested(request_text):
+        tools.append(read_linked_article)
     return append_configured_file_search_tools(
         "chief_of_staff",
-        [
-            list_chief_of_staff_context_sources,
-            summarize_slack_runtime_config,
-            search_slack_repo_context,
-            read_slack_repo_context_file,
-            lookup_slack_workflow_capability,
-            search_official_operations_docs,
-            list_automation_specs,
-            list_recent_automation_runs,
-            list_channel_automation_bindings,
-            summarize_automation_health,
-            list_pending_automation_approvals,
-            inspect_active_work_items,
-            publish_document_report,
-            publish_table_mirror,
-            publish_slack_summary,
-            list_local_context_sources,
-            search_local_context,
-            read_local_context_file,
-        ],
+        tools,
     )
 
 
@@ -93,7 +141,7 @@ SLACK_HISTORY_ITEM_RE = re.compile(
     r"(?:\s+title=(?P<title>.*?))?:\s+(?P<body>.*)$"
 )
 BLOCKED_SIDE_EFFECTS = [
-    "direct_slack_post",
+    "unscoped_slack_post",
     "gmail_send",
     "calendar_create_or_update",
     "repo_write",
@@ -125,11 +173,2124 @@ def _docs_for_topic(topic: str) -> list[ChiefOfStaffSourceRef]:
     ]
 
 
+FINANCE_TRACKER_TABLES = (
+    "Business Income",
+    "Business Expenses",
+    "Personal Income",
+    "Personal Expenses",
+    "Tax Payments",
+)
+FINANCE_TRACKER_DEFAULT_YEAR = 2026
+FINANCE_TRACKER_TAX_TABLE_CANDIDATES = (
+    "Tax Payments",
+    "Tax Expenses",
+    "Tax Expense",
+)
+
+
+@dataclass(frozen=True)
+class AirtableTableView:
+    name: str
+    fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NormalizedFinanceRecord:
+    table_name: str
+    record_id: str
+    fields: Mapping[str, Any]
+    period: int | None
+    amount: Decimal
+    amount_fields: tuple[str, ...]
+
+
+def _looks_like_finance_tracker_request(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized:
+        return False
+    markers = (
+        "finance_tax_tracker",
+        "finance tax tracker",
+        "2026 finance",
+        "tax tracker",
+        "tax payments",
+        "tax expenses",
+        "tax expense",
+        "airtable tracker",
+        "total expenses",
+        "business income",
+        "business expense",
+        "business expenses",
+        "personal income",
+        "personal expense",
+        "personal expenses",
+    )
+    if any(marker in normalized for marker in markers):
+        return True
+    has_finance_metric = any(
+        marker in normalized
+        for marker in ("income", "expense", "expenses", "deduction", "spend")
+    )
+    has_period = bool(re.search(r"\b(?:q[1-4]|quarter\s+[1-4]|20\d{2})\b", normalized))
+    has_tax_metric = _looks_like_tax_payment_or_estimate_request(normalized)
+    has_rank_metric = _looks_like_top_finance_record_request(normalized)
+    return (has_finance_metric or has_tax_metric) and has_period and (
+        _is_aggregate_request(normalized)
+        or _is_count_request(normalized)
+        or has_rank_metric
+        or _looks_like_rolling_tax_summary_request(normalized)
+        or has_tax_metric
+    ) or has_rank_metric
+
+
+def _looks_like_finance_tracker_mutation_request(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not _looks_like_finance_tracker_request(normalized):
+        return False
+    return any(
+        re.search(rf"\b{marker}\b", normalized)
+        for marker in (
+            "update",
+            "change",
+            "correct",
+            "adjust",
+            "set",
+            "modify",
+            "edit",
+        )
+    )
+
+
+def _looks_like_finance_tracker_artifact_workflow_request(text: str) -> bool:
+    normalized = _normalized_text(text)
+    if not _looks_like_finance_tracker_request(normalized):
+        return False
+    has_artifact_surface = any(
+        marker in normalized
+        for marker in (
+            "google doc",
+            "google docs",
+            "gdrive",
+            "google drive",
+            "drive folder",
+            "folder",
+            "doc link",
+            "link to the google doc",
+        )
+    )
+    has_artifact_intent = any(
+        marker in normalized
+        for marker in (
+            "create",
+            "write",
+            "provide a link",
+            "provide link",
+            "save",
+            "artifact",
+            "report",
+            "analysis",
+            "analyze",
+            "summary",
+        )
+    )
+    return has_artifact_surface and has_artifact_intent
+
+
+def _finance_tracker_table_from_text(text: str) -> str:
+    normalized = " ".join(str(text or "").lower().split())
+    matches = [
+        (normalized.index(table.lower()), table)
+        for table in FINANCE_TRACKER_TABLES
+        if table.lower() in normalized
+    ]
+    if matches:
+        return min(matches, key=lambda match: match[0])[1]
+    return ""
+
+
+def _looks_like_expense_total_sync_request(normalized: str) -> bool:
+    has_write_intent = any(
+        marker in normalized
+        for marker in (
+            "sync",
+            "synchronize",
+            "syncronize",
+            "syncronized",
+            "synchronized",
+            "populate",
+            "fill in",
+            "backfill",
+            "copy",
+        )
+    )
+    has_review_intent = any(
+        marker in normalized
+        for marker in (
+            "review",
+            "check",
+            "find",
+            "identify",
+            "missing",
+            "blank",
+            "empty",
+            "not populated",
+            "unpopulated",
+            "inconsistent",
+            "mismatch",
+        )
+    )
+    has_expense_total = "total expenses" in normalized or "total expense" in normalized
+    return has_expense_total and (
+        (has_write_intent and "amount" in normalized) or has_review_intent
+    )
+
+
+def _expense_total_live_write_requested(normalized: str) -> bool:
+    if any(marker in normalized for marker in ("dry-run", "dry run", "preview only")):
+        return False
+    return any(
+        marker in normalized
+        for marker in (
+            "approved",
+            "go ahead",
+            "live write",
+            "write them",
+            "update them",
+            "fill them",
+            "fill in",
+        )
+    )
+
+
+def _finance_tracker_route(command: str) -> ChiefOfStaffRouteRecommendation:
+    return ChiefOfStaffRouteRecommendation(
+        workflow_type="budget-resource-review",
+        command_text=command,
+        target_channel="docs",
+        rationale=(
+            "The request is a scoped finance/tax tracker Airtable operation using "
+            "bounded reads or dry-run write planning."
+        ),
+        requires_live_connector=True,
+        requires_human_approval_before_post=True,
+    )
+
+
+def _finance_tracker_result(
+    *,
+    text: str,
+    summary: str,
+    actions: list[str],
+    command: str,
+    audit_notes: list[str] | None = None,
+) -> ChiefOfStaffResult:
+    return ChiefOfStaffResult(
+        mode="deterministic",
+        intent=text[:500],
+        summary=summary,
+        target_channels=_extract_target_channels(text, "docs"),
+        operating_capabilities=[
+            "airtable_schema_read",
+            "airtable_capped_record_read",
+            "airtable_dry_run_write_plan",
+            "finance_tax_tracker_context",
+            "tax_review_guardrails",
+        ],
+        recommended_route=_finance_tracker_route(command),
+        recommended_actions=actions,
+        blocked_side_effects=[
+            *BLOCKED_SIDE_EFFECTS,
+            "airtable_delete",
+            "airtable_schema_change",
+            "tax_filing_or_payment",
+            "final_tax_or_legal_advice",
+        ],
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        slack_post_policy="requires_human_review",
+        sources=_docs_for_topic(f"airtable finance tax irs pennsylvania philadelphia {text}"),
+        context_sources_considered=[
+            "operator_and_agent_policy",
+            "finance_tax_tracker_airtable_schema",
+            "finance_tax_tracker_context_doc",
+            "official_tax_reference_pack",
+        ],
+        repo_context_used=_repo_context_for_capability("budget-resource-review"),
+        audit_notes=[
+            (
+                "Deterministic finance/tax tracker handler used to avoid "
+                "unnecessary large live-model calls."
+            ),
+            "No raw credentials were read into the response.",
+            *(audit_notes or []),
+        ],
+    )
+
+
+def _plan_finance_tracker_artifact_workflow_request(text: str) -> ChiefOfStaffResult:
+    write_requests = _write_requests_from_text(text)
+    return _finance_tracker_result(
+        text=text,
+        summary=(
+            "Plan a Q1 finance_tax_tracker tax analysis artifact in Google Drive. "
+            "The live run should read the Airtable schema and records, include the "
+            "Tax Payments rolling summary note, create the KNIOps folder/doc through "
+            "Google Workspace tools, and return the Google Doc link."
+        ),
+        actions=[
+            "Read finance_tax_tracker schema and Q1 records from the finance tables.",
+            "Separate paid tax rows from rolling summary/helper rows in Tax Payments.",
+            "Create the requested KNIOps Drive folder and Google Doc only through typed Google Workspace tools.",
+            "Return the Google Doc link, or the exact missing live-write configuration if blocked.",
+        ],
+        command=(
+            "Create Q1 finance_tax_tracker tax analysis Google Doc from Airtable reads"
+        ),
+        audit_notes=[
+            "Finance/tax Google Doc request routed as a finance tracker artifact workflow.",
+        ],
+    ).model_copy(
+        update={
+            "operating_capabilities": [
+                "airtable_schema_read",
+                "airtable_capped_record_read",
+                "finance_tax_tracker_context",
+                "tax_review_guardrails",
+                "google_drive_folder_planning",
+                "google_doc_artifact_planning",
+            ],
+            "recommended_route": ChiefOfStaffRouteRecommendation(
+                workflow_type="artifact-write-plan",
+                command_text=(
+                    "@KNI chief of staff create Q1 finance_tax_tracker tax analysis "
+                    "Google Doc from Airtable reads"
+                ),
+                target_channel="docs",
+                rationale=(
+                    "The request asks for a finance/tax tracker analysis artifact, "
+                    "not a generic company or opportunity research artifact."
+                ),
+                requires_live_connector=True,
+                requires_human_approval_before_post=True,
+            ),
+            "target_channels": _extract_target_channels(text, "docs"),
+            "context_sources_considered": [
+                "operator_and_agent_policy",
+                "finance_tax_tracker_airtable_schema",
+                "finance_tax_tracker_records",
+                "tax_payments_rolling_summary_notes",
+                "google_workspace_write_policy",
+            ],
+            "write_requests": write_requests,
+        }
+    )
+
+
+def _field_names_from_records(records: list[dict[str, Any]]) -> list[str]:
+    names: set[str] = set()
+    for record in records:
+        fields = record.get("fields", {})
+        if isinstance(fields, Mapping):
+            names.update(str(name) for name in fields)
+    return sorted(names)
+
+
+def _normalized_text(text: object) -> str:
+    return " ".join(str(text or "").lower().split())
+
+
+def _active_slack_followup_text(text: str) -> str:
+    raw = str(text or "")
+    lowered = raw.lower()
+    markers = (
+        "user follow-up:",
+        "current request:",
+        "follow-up request:",
+    )
+    marker_positions = [
+        (lowered.rfind(marker), marker)
+        for marker in markers
+        if lowered.rfind(marker) != -1
+    ]
+    if not marker_positions:
+        return raw
+    start, marker = max(marker_positions, key=lambda item: item[0])
+    focused = raw[start + len(marker) :].strip()
+    return focused or raw
+
+
+def _schema_table_views(schema_result: Mapping[str, Any]) -> list[AirtableTableView]:
+    raw_schema = schema_result.get("schema", {})
+    raw_tables = raw_schema.get("tables", []) if isinstance(raw_schema, Mapping) else []
+    if not isinstance(raw_tables, list):
+        return []
+    views: list[AirtableTableView] = []
+    for table in raw_tables:
+        if not isinstance(table, Mapping):
+            continue
+        name = str(table.get("name") or "").strip()
+        if not name:
+            continue
+        raw_fields = table.get("fields", [])
+        fields = []
+        if isinstance(raw_fields, list):
+            fields = [
+                str(field.get("name") or "").strip()
+                for field in raw_fields
+                if isinstance(field, Mapping) and str(field.get("name") or "").strip()
+            ]
+        views.append(AirtableTableView(name=name, fields=tuple(fields)))
+    if not views and isinstance(raw_schema, Mapping):
+        allowed_tables = raw_schema.get("allowed_tables", [])
+        if isinstance(allowed_tables, list):
+            views = [
+                AirtableTableView(name=str(table_name), fields=())
+                for table_name in allowed_tables
+                if str(table_name).strip()
+            ]
+    return views
+
+
+def _mentioned_tables(normalized: str, tables: list[AirtableTableView]) -> list[AirtableTableView]:
+    mentions = [
+        (normalized.index(table.name.lower()), table)
+        for table in tables
+        if table.name.lower() in normalized
+    ]
+    return [table for _, table in sorted(mentions, key=lambda item: item[0])]
+
+
+def _semantic_tables(normalized: str, tables: list[AirtableTableView]) -> list[AirtableTableView]:
+    selected: list[AirtableTableView] = []
+    for topic in _aggregate_topics(normalized):
+        for table in _semantic_tables_for_topic(topic, normalized, tables):
+            if table not in selected:
+                selected.append(table)
+    return selected
+
+
+def _semantic_tables_for_topic(
+    topic: str,
+    normalized: str,
+    tables: list[AirtableTableView],
+) -> list[AirtableTableView]:
+    selected: list[AirtableTableView] = []
+    for table in tables:
+        name = table.name.lower()
+        if topic == "income" and "income" in name:
+            selected.append(table)
+        elif topic == "expense" and (
+            "expense" in name or "deduction" in name or "spend" in name
+        ):
+            selected.append(table)
+        elif topic == "payment" and "tax" in name and (
+            "payment" in name or "expense" in name
+        ):
+            selected.append(table)
+    if topic == "expense" and "tax" not in normalized:
+        selected = [table for table in selected if "tax payment" not in table.name.lower()]
+    if topic in {"income", "expense"}:
+        if "business" in normalized and "personal" not in normalized:
+            selected = [table for table in selected if "business" in table.name.lower()]
+        elif "personal" in normalized and "business" not in normalized:
+            selected = [table for table in selected if "personal" in table.name.lower()]
+    return selected
+
+
+def _looks_like_top_finance_record_request(normalized: str) -> bool:
+    has_rank_word = bool(
+        re.search(r"\b(top|highest|largest|biggest|max(?:imum)?|most expensive)\b", normalized)
+    )
+    has_finance_topic = any(
+        marker in normalized
+        for marker in ("income", "expense", "expenses", "deduction", "spend")
+    )
+    return has_rank_word and has_finance_topic
+
+
+def _is_aggregate_request(normalized: str) -> bool:
+    return (
+        re.search(r"\b(total|sum|summed|summing|aggregate|add up|average|avg)\b", normalized)
+        is not None
+        or "how much" in normalized
+        or "all income" in normalized
+        or "all expenses" in normalized
+    )
+
+
+def _is_count_request(normalized: str) -> bool:
+    return re.search(r"\b(count|how many|number of)\b", normalized) is not None
+
+
+def _aggregate_topic(normalized: str) -> str:
+    topics = _aggregate_topics(normalized)
+    return topics[0] if topics else ""
+
+
+def _aggregate_topics(normalized: str) -> list[str]:
+    topics: list[str] = []
+    if "income" in normalized:
+        topics.append("income")
+    if "expense" in normalized or "deduction" in normalized or "spend" in normalized:
+        topics.append("expense")
+    if "payment" in normalized or "estimated tax" in normalized:
+        topics.append("payment")
+    return list(dict.fromkeys(topics))
+
+
+def _looks_like_rolling_tax_summary_request(normalized: str) -> bool:
+    has_tax_context = "tax" in normalized or "payment" in normalized
+    has_summary_context = any(
+        marker in normalized
+        for marker in (
+            "rolling",
+            "summary note",
+            "tax summary",
+            "tax estimate",
+            "tax estimates",
+            "projection",
+            "planning note",
+        )
+    )
+    return has_tax_context and has_summary_context
+
+
+def _looks_like_tax_payment_or_estimate_request(normalized: str) -> bool:
+    if not re.search(r"\b(?:q[1-4]|quarter\s+[1-4]|20\d{2})\b", normalized):
+        return False
+    has_tax_subject = any(
+        marker in normalized
+        for marker in (
+            "tax",
+            "taxes",
+            "irs",
+            "federal",
+            "state",
+            "pennsylvania",
+            "pa ",
+            "city",
+            "philadelphia",
+            "philly",
+            "birt",
+            "npt",
+            "sit",
+        )
+    )
+    has_task = any(
+        marker in normalized
+        for marker in (
+            "pay",
+            "paid",
+            "payment",
+            "due",
+            "owe",
+            "owed",
+            "estimate",
+            "estimated",
+            "calculate",
+            "calc",
+            "summarize",
+            "summary",
+        )
+    )
+    return has_tax_subject and has_task
+
+
+def _money_amount(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int | float | Decimal):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        cleaned = value.strip().replace("$", "").replace(",", "")
+        if not cleaned:
+            return None
+        try:
+            return Decimal(cleaned)
+        except InvalidOperation:
+            return None
+    return None
+
+
+def _mentioned_fields(normalized: str, fields: tuple[str, ...]) -> list[str]:
+    mentions = [
+        (normalized.index(field.lower()), field)
+        for field in fields
+        if field.lower() in normalized
+    ]
+    return [field for _, field in sorted(mentions, key=lambda item: item[0])]
+
+
+def _mentioned_metric_fields(normalized: str, fields: tuple[str, ...]) -> list[str]:
+    ignored_terms = (
+        "quarter",
+        "period",
+        "date",
+        "year",
+        "notes",
+        "method",
+        "type",
+        "source",
+    )
+    return [
+        field
+        for field in _mentioned_fields(normalized, fields)
+        if not any(term in field.lower() for term in ignored_terms)
+    ]
+
+
+def _requested_quarters(normalized: str) -> tuple[int, ...]:
+    quarters = {
+        int(match.group(1))
+        for match in re.finditer(r"\bq([1-4])\b", normalized, flags=re.I)
+    }
+    quarters.update(
+        int(match.group(1))
+        for match in re.finditer(r"\bquarter\s+([1-4])\b", normalized, flags=re.I)
+    )
+    return tuple(sorted(quarters))
+
+
+def _requested_years(normalized: str) -> tuple[int, ...]:
+    return tuple(
+        sorted({int(match.group(0)) for match in re.finditer(r"\b20\d{2}\b", normalized)})
+    )
+
+
+def _finance_tracker_years(normalized: str) -> tuple[int, ...]:
+    return _requested_years(normalized) or (FINANCE_TRACKER_DEFAULT_YEAR,)
+
+
+def _current_estimated_tax_period() -> int:
+    now = datetime.now(ZoneInfo("America/New_York"))
+    return _estimated_tax_quarter_for_month(now.month) or 1
+
+
+def _effective_requested_quarters(normalized: str) -> tuple[int, ...]:
+    quarters = _requested_quarters(normalized)
+    if "ytd" not in normalized and "year to date" not in normalized:
+        return quarters
+    end_quarter = max(quarters) if quarters else _current_estimated_tax_period()
+    return tuple(range(1, end_quarter + 1))
+
+
+def _quarter_from_value(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    match = re.search(r"\bq?([1-4])\b", str(value), flags=re.I)
+    return int(match.group(1)) if match else None
+
+
+def _is_period_field_name(field_name: str) -> bool:
+    normalized = str(field_name or "").lower()
+    return (
+        "quarter" in normalized
+        or "estimated tax period" in normalized
+        or normalized in {"period", "tax period", "periods"}
+    )
+
+
+def _year_quarter_from_date_value(value: Any) -> tuple[int | None, int | None]:
+    text = str(value or "").strip()
+    if not text:
+        return None, None
+    iso_match = re.search(r"\b(?P<year>20\d{2})-(?P<month>\d{1,2})-\d{1,2}\b", text)
+    if iso_match:
+        month = int(iso_match.group("month"))
+        return int(iso_match.group("year")), _estimated_tax_quarter_for_month(month)
+    us_match = re.search(r"\b(?P<month>\d{1,2})/\d{1,2}/(?P<year>20\d{2})\b", text)
+    if us_match:
+        month = int(us_match.group("month"))
+        return int(us_match.group("year")), _estimated_tax_quarter_for_month(month)
+    year_match = re.search(r"\b(20\d{2})\b", text)
+    return (int(year_match.group(1)), None) if year_match else (None, None)
+
+
+def _estimated_tax_quarter_for_month(month: int) -> int | None:
+    if month < 1 or month > 12:
+        return None
+    if month <= 3:
+        return 1
+    if month <= 5:
+        return 2
+    if month <= 8:
+        return 3
+    return 4
+
+
+def _record_matches_period(
+    fields: Mapping[str, Any],
+    *,
+    quarters: tuple[int, ...],
+    years: tuple[int, ...],
+) -> bool:
+    if not quarters and not years:
+        return True
+    explicit_quarter_values: list[int] = []
+    date_quarter_values: list[int] = []
+    year_values: list[int] = []
+    for field_name, value in fields.items():
+        normalized_name = str(field_name).lower()
+        if _is_period_field_name(normalized_name):
+            quarter = _quarter_from_value(value)
+            if quarter is not None:
+                explicit_quarter_values.append(quarter)
+        if "date" in normalized_name or "year" in normalized_name:
+            year, quarter = _year_quarter_from_date_value(value)
+            if year is not None:
+                year_values.append(year)
+            if quarter is not None:
+                date_quarter_values.append(quarter)
+    if explicit_quarter_values:
+        return not quarters or any(quarter in quarters for quarter in explicit_quarter_values)
+    quarter_values = date_quarter_values
+    quarter_ok = not quarters or not quarter_values or any(
+        quarter in quarters for quarter in quarter_values
+    )
+    year_ok = not years or not year_values or any(year in years for year in year_values)
+    return quarter_ok and year_ok
+
+
+def _record_quarter(fields: Mapping[str, Any]) -> int | None:
+    explicit_quarters: list[int] = []
+    date_quarters: list[int] = []
+    for field_name, value in fields.items():
+        normalized_name = str(field_name).lower()
+        if _is_period_field_name(normalized_name):
+            quarter = _quarter_from_value(value)
+            if quarter is not None:
+                explicit_quarters.append(quarter)
+        if "date" in normalized_name:
+            _, quarter = _year_quarter_from_date_value(value)
+            if quarter is not None:
+                date_quarters.append(quarter)
+    values = explicit_quarters or date_quarters
+    return values[0] if values else None
+
+
+def _wants_quarter_breakdown(normalized: str, quarters: tuple[int, ...]) -> bool:
+    if len(quarters) < 2:
+        return False
+    return bool(re.search(r"\b(each|per|by)\s+quarter\b|\bquarterly\b", normalized))
+
+
+def _record_amount(
+    fields: Mapping[str, Any],
+    *,
+    exact_fields: list[str],
+    topic: str,
+) -> tuple[Decimal, list[str]]:
+    if exact_fields:
+        total = Decimal("0")
+        used = []
+        for field_name in exact_fields:
+            parsed = _money_amount(fields.get(field_name))
+            if parsed is None:
+                continue
+            total += parsed
+            used.append(field_name)
+        return total, used
+
+    if topic == "expense":
+        total_expenses = _money_amount(fields.get("Total Expenses"))
+        if total_expenses is not None:
+            return total_expenses, ["Total Expenses"]
+
+        amount = _money_amount(fields.get("Amount"))
+        if amount is not None:
+            additional_taxes, tax_field = _additional_taxes_amount(fields)
+            used = ["Amount"]
+            if additional_taxes:
+                used.append(tax_field or "Additional Taxes")
+            return amount + additional_taxes, used
+
+    amount = _money_amount(fields.get("Amount"))
+    if amount is not None:
+        return amount, ["Amount"]
+
+    used_fields: list[str] = []
+    total = Decimal("0")
+    for field_name, value in fields.items():
+        normalized = str(field_name).lower()
+        if topic and topic not in normalized:
+            continue
+        if topic in {"income", "expense"} and "tax" in normalized:
+            continue
+        parsed = _money_amount(value)
+        if parsed is None:
+            continue
+        used_fields.append(str(field_name))
+        total += parsed
+    return total, used_fields
+
+
+def _normalize_finance_record(
+    *,
+    table_name: str,
+    record: Mapping[str, Any],
+    topic: str,
+    exact_fields: list[str],
+) -> NormalizedFinanceRecord | None:
+    fields = record.get("fields", {})
+    if not isinstance(fields, Mapping):
+        return None
+    amount, used_fields = _record_amount(
+        fields,
+        exact_fields=exact_fields,
+        topic=topic,
+    )
+    return NormalizedFinanceRecord(
+        table_name=table_name,
+        record_id=str(record.get("id") or ""),
+        fields=fields,
+        period=_record_quarter(fields),
+        amount=amount,
+        amount_fields=tuple(used_fields),
+    )
+
+
+def _additional_taxes_amount(fields: Mapping[str, Any]) -> tuple[Decimal, str]:
+    for field_name in ("Additional Taxes", "Additional taxes", "Tax Amount"):
+        amount = _money_amount(fields.get(field_name))
+        if amount is not None:
+            return amount, field_name
+    return Decimal("0"), ""
+
+
+def _schema_field_by_name(
+    schema_result: Mapping[str, Any],
+    *,
+    table_name: str,
+    field_name: str,
+) -> Mapping[str, Any] | None:
+    raw_tables = schema_result.get("schema", {}).get("tables", [])
+    if not isinstance(raw_tables, list):
+        return None
+    for table in raw_tables:
+        if not isinstance(table, Mapping) or str(table.get("name") or "") != table_name:
+            continue
+        raw_fields = table.get("fields", [])
+        if not isinstance(raw_fields, list):
+            return None
+        for field in raw_fields:
+            if isinstance(field, Mapping) and str(field.get("name") or "") == field_name:
+                return field
+    return None
+
+
+def _expense_tables_from_schema(tables: list[AirtableTableView]) -> list[AirtableTableView]:
+    return [
+        table
+        for table in tables
+        if table.name in {"Business Expenses", "Personal Expenses"}
+        or ("expense" in table.name.lower() and "tax" not in table.name.lower())
+    ]
+
+
+def _plan_expense_total_sync_request(
+    text: str,
+    *,
+    schema: Mapping[str, Any],
+    live: bool,
+    live_write: bool = False,
+) -> ChiefOfStaffResult:
+    tables = _expense_tables_from_schema(_schema_table_views(schema))
+    if not tables:
+        return _finance_tracker_result(
+            text=text,
+            summary=(
+                "I could not find expense tables in the finance tracker schema. "
+                "Please confirm the table names before syncing."
+            ),
+            command="Clarify expense total sync tables",
+            actions=["Confirm the expense table names and retry."],
+            audit_notes=["Expense total sync found no schema-matching expense tables."],
+        )
+
+    total_missing = 0
+    total_mismatch = 0
+    table_summaries: list[str] = []
+    write_statuses: list[str] = []
+    live_writes = live and live_write
+    for table in tables:
+        amount_field = _schema_field_by_name(schema, table_name=table.name, field_name="Amount")
+        total_field = _schema_field_by_name(
+            schema,
+            table_name=table.name,
+            field_name="Total Expenses",
+        )
+        if not amount_field or not total_field:
+            table_summaries.append(f"{table.name}: missing Amount or Total Expenses field.")
+            continue
+        if bool(total_field.get("is_computed")):
+            table_summaries.append(
+                f"{table.name}: Total Expenses is computed; fix the Airtable formula instead."
+            )
+            continue
+        read = airtable_read_records_impl(
+            table.name,
+            base_alias="finance_tax_tracker",
+            fetch_all=True,
+            live=live,
+        )
+        records = read.get("records", []) if isinstance(read, Mapping) else []
+        missing_updates = []
+        mismatches = []
+        for record in records:
+            fields = record.get("fields", {})
+            if not isinstance(fields, Mapping):
+                continue
+            amount = _money_amount(fields.get("Amount"))
+            additional_taxes, _ = _additional_taxes_amount(fields)
+            total_expenses = _money_amount(fields.get("Total Expenses"))
+            if amount is None:
+                continue
+            expected_total = amount + additional_taxes
+            if total_expenses is None:
+                record_id = str(record.get("id") or "")
+                if record_id:
+                    missing_updates.append((record_id, expected_total))
+                continue
+            if total_expenses != expected_total:
+                mismatches.append(str(record.get("id") or "unknown"))
+        for record_id, amount in missing_updates:
+            preview = airtable_write_record_impl(
+                json.dumps({"Total Expenses": float(amount)}, sort_keys=True),
+                table=table.name,
+                base_alias="finance_tax_tracker",
+                record_id=record_id,
+                approval_reference=(
+                    "chief-of-staff-expense-total-sync-approved-live"
+                    if live_writes
+                    else "chief-of-staff-expense-total-sync-preview"
+                ),
+                operation="update",
+                live=live_writes,
+            )
+            write_statuses.append(str(preview.get("status", "unknown")))
+        total_missing += len(missing_updates)
+        total_mismatch += len(mismatches)
+        mismatch_count = len(mismatches)
+        table_summaries.append(
+            f"{table.name}: {_plural_count(len(missing_updates), 'blank Total Expenses value')} "
+            f"can be backfilled from Amount; "
+            f"{_plural_count(mismatch_count, 'nonblank mismatch', 'nonblank mismatches')} "
+            f"{'needs' if mismatch_count == 1 else 'need'} review."
+        )
+    write_sentence = (
+        "Live writes were requested for blank values only."
+        if live_writes
+        else "No live write was performed."
+    )
+    summary = (
+        "I reviewed the expense tables against the live schema. `Total Expenses` is a "
+        "manual currency field, so blank values will not fill themselves unless Airtable "
+        "has a formula or automation. Based on the documented column semantics, the "
+        "expected value is Amount plus Additional Taxes. "
+        f"I found {_plural_count(total_missing, 'blank Total Expenses value')} that can be "
+        f"backfilled and {_plural_count(total_mismatch, 'nonblank mismatch')} that should "
+        f"be reviewed before overwriting. "
+        f"{' '.join(table_summaries)} {write_sentence}"
+    )
+    return _finance_tracker_result(
+        text=text,
+        summary=summary,
+        command=(
+            "Live update blank Total Expenses from Amount"
+            if live_writes
+            else "Prepare dry-run Total Expenses sync from Amount"
+        ),
+        actions=[
+            (
+                "Review the completed updates and the one mismatch before relying on totals."
+                if live_writes
+                else "Review the dry-run sync plan before allowing live Airtable updates."
+            ),
+            (
+                "For recurring consistency, consider changing Total Expenses to an Airtable "
+                "formula or automation rather than a separate manual field."
+            ),
+            (
+                "Live sync requires AIRTABLE_ALLOW_WRITES=true, AIRTABLE_WRITE_DRY_RUN=false, "
+                "and an approval reference."
+            ),
+        ],
+        audit_notes=[
+            (
+                "Expense total review used live schema, capped record reads, and "
+                "documented field semantics."
+            ),
+            (
+                "Only blank Total Expenses fields were included in live update requests."
+                if live_writes
+                else "Only blank Total Expenses fields were included in dry-run update previews."
+            ),
+            f"Write statuses: {', '.join(write_statuses) or 'none'}.",
+        ],
+    )
+
+
+def _plural_count(count: int, singular: str, plural: str | None = None) -> str:
+    if count == 1:
+        return f"1 {singular}"
+    return f"{count} {plural or singular + 's'}"
+
+
+def _format_money(amount: Decimal) -> str:
+    return f"${amount.quantize(Decimal('0.01')):,.2f}"
+
+
+def _finance_tracker_tax_table_name(
+    text: str,
+    *,
+    schema_tables: list[AirtableTableView] | None = None,
+) -> str:
+    normalized = _normalized_text(text)
+    tables = schema_tables or []
+    for table in tables:
+        if table.name.lower() in normalized and "tax" in table.name.lower():
+            return table.name
+    for candidate in FINANCE_TRACKER_TAX_TABLE_CANDIDATES:
+        if candidate.lower() in normalized:
+            return candidate
+    for table in tables:
+        table_name = table.name.lower()
+        if "tax" in table_name and any(term in table_name for term in ("payment", "expense")):
+            return table.name
+    return FINANCE_TRACKER_TAX_TABLE_CANDIDATES[0]
+
+
+def _tax_type_bucket(value: Any) -> str:
+    if isinstance(value, list | tuple | set):
+        text = " ".join(str(item) for item in value)
+    else:
+        text = str(value or "")
+    normalized = text.lower()
+    if "federal" in normalized or "irs" in normalized:
+        return "Federal"
+    if "state" in normalized or "pennsylvania" in normalized or normalized.strip() == "pa":
+        return "Pennsylvania"
+    if (
+        "city" in normalized
+        or "philadelphia" in normalized
+        or "philly" in normalized
+        or "birt" in normalized
+        or "npt" in normalized
+        or "sit" in normalized
+    ):
+        return "Philadelphia"
+    return "Unclassified"
+
+
+def _field_text(fields: Mapping[str, Any], *names: str) -> str:
+    values = []
+    for name in names:
+        value = fields.get(name)
+        if value is None:
+            continue
+        if isinstance(value, list | tuple | set):
+            values.extend(str(item) for item in value if item is not None)
+        else:
+            values.append(str(value))
+    return " ".join(values)
+
+
+def _is_rolling_tax_summary_record(fields: Mapping[str, Any]) -> bool:
+    text = _field_text(fields, "Payment Name", "Notes").lower()
+    if "rolling" in text and ("tax" in text or "estimate" in text or "summary" in text):
+        return True
+    return "tax summary" in text or "tax estimate" in text or "planning estimate" in text
+
+
+def _rolling_summary_name(fields: Mapping[str, Any]) -> str:
+    return str(fields.get("Payment Name") or fields.get("Name") or "Rolling tax summary")
+
+
+def _note_contains_tax_planning_sections(fields: Mapping[str, Any]) -> list[str]:
+    note = str(fields.get("Notes") or "").lower()
+    sections = []
+    checks = (
+        ("YTD income", ("ytd income", "total 2026 ytd income")),
+        ("self-employment income", ("self-employment", "1099")),
+        ("investment income", ("investment income", "dividends", "capital gains")),
+        ("business expenses", ("business expenses", "deductible")),
+        ("federal estimate/payment", ("federal", "irs")),
+        ("Pennsylvania estimate/payment", ("pennsylvania", "pa estimated", "state tax")),
+        ("Philadelphia NPT/SIT estimate", ("philadelphia", "philly", "npt", "sit")),
+        ("assumptions/caveats", ("notes", "estimate uses", "planning estimate", "accountant")),
+    )
+    for label, markers in checks:
+        if any(marker in note for marker in markers):
+            sections.append(label)
+    return sections
+
+
+def _plan_tax_payment_summary_request(
+    *,
+    text: str,
+    normalized: str,
+    schema: Mapping[str, Any],
+    live: bool,
+) -> ChiefOfStaffResult:
+    tax_table = _finance_tracker_tax_table_name(
+        text,
+        schema_tables=_schema_table_views(schema),
+    )
+    quarters = _effective_requested_quarters(normalized)
+    years = _finance_tracker_years(normalized)
+    read = airtable_read_records_impl(
+        tax_table,
+        base_alias="finance_tax_tracker",
+        fetch_all=True,
+        live=live,
+    )
+    records = read.get("records", []) if isinstance(read, Mapping) else []
+    paid_totals = {
+        "Federal": Decimal("0"),
+        "Pennsylvania": Decimal("0"),
+        "Philadelphia": Decimal("0"),
+        "Unclassified": Decimal("0"),
+    }
+    paid_counts = {key: 0 for key in paid_totals}
+    rolling_names: list[str] = []
+    rolling_sections: set[str] = set()
+    skipped_summary_rows = 0
+    skipped_placeholders = 0
+
+    for record in records:
+        fields = record.get("fields", {})
+        if not isinstance(fields, Mapping) or not _record_matches_period(
+            fields,
+            quarters=quarters,
+            years=years,
+        ):
+            continue
+        if _is_rolling_tax_summary_record(fields):
+            skipped_summary_rows += 1
+            rolling_names.append(_rolling_summary_name(fields))
+            rolling_sections.update(_note_contains_tax_planning_sections(fields))
+            continue
+        amount = _money_amount(fields.get("Amount"))
+        if amount is None or amount == Decimal("0"):
+            skipped_placeholders += 1
+            continue
+        bucket = _tax_type_bucket(fields.get("Tax Type"))
+        paid_totals[bucket] += amount
+        paid_counts[bucket] += 1
+
+    period = _aggregate_period_label(quarters=quarters, years=years) or "the requested period"
+    paid_parts = [
+        f"Federal: {_format_money(paid_totals['Federal'])}",
+        f"Pennsylvania: {_format_money(paid_totals['Pennsylvania'])}",
+        f"Philadelphia: {_format_money(paid_totals['Philadelphia'])}",
+    ]
+    unclassified = paid_totals["Unclassified"]
+    if unclassified:
+        paid_parts.append(f"Unclassified: {_format_money(unclassified)}")
+    total_paid = sum(paid_totals.values(), Decimal("0"))
+    wants_estimate_context = any(
+        marker in normalized
+        for marker in (
+            "estimate",
+            "estimated",
+            "due",
+            "remaining",
+            "owe",
+            "planning",
+            "calculate taxes",
+        )
+    )
+    lines = [
+        f"{period} tax payments",
+        "",
+        f"Total paid: {_format_money(total_paid)}",
+        "",
+        "By tax type",
+        *[f"* {part}" for part in paid_parts],
+    ]
+    if skipped_summary_rows or skipped_placeholders:
+        excluded_parts = []
+        if skipped_summary_rows:
+            excluded_parts.append(
+                f"{skipped_summary_rows} rolling summary/helper "
+                f"record{'s' if skipped_summary_rows != 1 else ''}"
+            )
+        if skipped_placeholders:
+            excluded_parts.append(
+                f"{skipped_placeholders} blank/zero placeholder "
+                f"record{'s' if skipped_placeholders != 1 else ''}"
+            )
+        lines.extend(["", f"Excluded from paid total: {'; '.join(excluded_parts)}."])
+    if rolling_names:
+        lines.extend(["", f"Reference note: {', '.join(rolling_names)}."])
+    if wants_estimate_context and rolling_sections:
+        lines.extend(
+            [
+                "",
+                "Rolling note includes: "
+                + ", ".join(sorted(rolling_sections))
+                + ". Reconcile it against current income and expense tables before "
+                "using it for due/remaining estimates.",
+            ]
+        )
+    summary = "\n".join(lines)
+    return _finance_tracker_result(
+        text=text,
+        summary=summary,
+        command="Summarize period tax payments and rolling tax planning notes",
+        actions=[
+            "Keep paid-tax totals separate from estimated due or remaining tax.",
+            (
+                "For Q2 estimates, reconcile the rolling summary note against current "
+                "income and expense records before recommending a payment amount."
+            ),
+            (
+                "Set `needs_human_tax_review=true` for Philadelphia NPT/SIT/BIRT, "
+                "uncertain deductions, or unclear capital-gain treatment."
+            ),
+        ],
+        audit_notes=[
+            "Schema-first Tax Payments read used normalized task records.",
+            "Paid totals exclude rolling summary/helper rows and zero-dollar placeholders.",
+            "Deterministic arithmetic computed paid amounts; estimate interpretation is advisory.",
+        ],
+    )
+
+
+def _summarize_table_read(
+    *,
+    text: str,
+    table: str,
+    read: Mapping[str, Any],
+    records: list[dict[str, Any]],
+) -> ChiefOfStaffResult:
+    fields = _field_names_from_records(records)
+    review_note = (
+        "Business-vs-personal categorization and deduction treatment require human review."
+        if "expense" in table.lower()
+        else "Income classification should be reviewed before tax estimates or filings."
+        if "income" in table.lower()
+        else "Estimated-payment status and Tax Type require CPA/human tax review when uncertain."
+    )
+    summary = (
+        f"`{table}` live read status: `{read.get('status', 'unknown')}`; "
+        f"records returned: {len(records)}. "
+        f"Visible field names: {', '.join(fields) if fields else 'none returned'}. "
+        f"{review_note} No dollar amounts are included here."
+    )
+    return _finance_tracker_result(
+        text=text,
+        summary=summary,
+        command=f"Read capped records from {table}",
+        actions=[
+            f"Use `{table}` only for its scoped Airtable purpose.",
+            "Flag uncertain tax treatment with `needs_human_tax_review=true` when relevant.",
+            "Do not write without exact field mapping and approval reference.",
+        ],
+        audit_notes=["Airtable read was capped at 1 record and values were not summarized."],
+    )
+
+
+def _aggregate_period_label(
+    *,
+    quarters: tuple[int, ...],
+    years: tuple[int, ...],
+) -> str:
+    parts = []
+    if quarters:
+        parts.append(" and ".join(f"Q{quarter}" for quarter in quarters))
+    if years:
+        parts.append(" and ".join(str(year) for year in years))
+    return " ".join(parts).strip()
+
+
+def _aggregate_topic_tables(
+    *,
+    topic: str,
+    normalized: str,
+    tables: list[AirtableTableView],
+) -> list[AirtableTableView]:
+    mentioned = [
+        table
+        for table in _mentioned_tables(normalized, tables)
+        if table in _semantic_tables_for_topic(topic, normalized, tables)
+    ]
+    return mentioned or _semantic_tables_for_topic(topic, normalized, tables)
+
+
+def _compute_airtable_topic_aggregate(
+    *,
+    topic: str,
+    normalized: str,
+    tables: list[AirtableTableView],
+    quarters: tuple[int, ...],
+    years: tuple[int, ...],
+    live: bool,
+) -> tuple[Decimal, list[str], list[AirtableTableView]]:
+    selected_tables = _aggregate_topic_tables(topic=topic, normalized=normalized, tables=tables)
+    total = Decimal("0")
+    table_parts: list[str] = []
+
+    for table in selected_tables:
+        exact_fields = _mentioned_metric_fields(normalized, table.fields)
+        read = airtable_read_records_impl(
+            table.name,
+            base_alias="finance_tax_tracker",
+            fetch_all=True,
+            live=live,
+        )
+        records = read.get("records", []) if isinstance(read, Mapping) else []
+        matched_count = 0
+        contributing_count = 0
+        subtotal = Decimal("0")
+        used_fields: set[str] = set()
+        for record in records:
+            fields = record.get("fields", {})
+            if not isinstance(fields, Mapping) or not _record_matches_period(
+                fields,
+                quarters=quarters,
+                years=years,
+            ):
+                continue
+            normalized_record = _normalize_finance_record(
+                table_name=table.name,
+                record=record,
+                exact_fields=exact_fields,
+                topic=topic,
+            )
+            if normalized_record is None:
+                continue
+            subtotal += normalized_record.amount
+            if normalized_record.amount_fields:
+                used_fields.update(normalized_record.amount_fields)
+                matched_count += 1
+                if normalized_record.amount != Decimal("0"):
+                    contributing_count += 1
+        total += subtotal
+        truncation_note = (
+            f"; read truncated at {read.get('record_limit')} records"
+            if isinstance(read, Mapping) and read.get("truncated")
+            else ""
+        )
+        contribution_text = (
+            "1 contributed a non-zero amount"
+            if contributing_count == 1
+            else f"{contributing_count} contributed non-zero amounts"
+        )
+        contribution_note = (
+            f"; {contribution_text}, totaling {_format_money(subtotal)}"
+            if contributing_count != matched_count
+            else f", totaling {_format_money(subtotal)}"
+        )
+        table_parts.append(
+            f"{_finance_tracker_table_label(table.name, topic=topic)}: "
+            f"{matched_count} matching records{contribution_note}"
+            f"{truncation_note}"
+        )
+    return total, table_parts, selected_tables
+
+
+def _finance_tracker_topic_label(topic: str) -> str:
+    return "expenses" if topic == "expense" else topic
+
+
+def _finance_tracker_table_label(table_name: str, *, topic: str) -> str:
+    normalized_name = _normalized_text(table_name)
+    if topic == "income" and "personal income" in normalized_name:
+        return "Investment / personal income"
+    return table_name.lower()
+
+
+def _finance_record_display_value(
+    fields: Mapping[str, Any],
+    candidate_names: tuple[str, ...],
+) -> str:
+    normalized_candidates = {_normalized_text(name) for name in candidate_names}
+    for field_name, value in fields.items():
+        if _normalized_text(str(field_name)) not in normalized_candidates:
+            continue
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, list):
+            return ", ".join(str(item) for item in value if str(item).strip())
+        return str(value)
+    return ""
+
+
+def _plan_top_airtable_record_from_schema(
+    *,
+    text: str,
+    normalized: str,
+    tables: list[AirtableTableView],
+    live: bool,
+) -> ChiefOfStaffResult | None:
+    if not _looks_like_top_finance_record_request(normalized):
+        return None
+
+    topic = _aggregate_topic(normalized) or "expense"
+    selected_tables = _mentioned_tables(normalized, tables) or _semantic_tables(
+        normalized, tables
+    )
+    if not selected_tables:
+        return _finance_tracker_result(
+            text=text,
+            summary=(
+                "I could not map the top-record request to an allowed finance tracker "
+                "table from the live schema. Please name the table."
+            ),
+            command="Clarify Airtable top-record table",
+            actions=[
+                "Name the Airtable table, such as Business Expenses.",
+                "Name the amount field if the metric is not obvious from the schema.",
+            ],
+            audit_notes=["Schema-first top-record planning did not find table matches."],
+        )
+
+    quarters = _effective_requested_quarters(normalized)
+    years = _finance_tracker_years(normalized)
+    best_record: NormalizedFinanceRecord | None = None
+    best_table = ""
+    table_counts: dict[str, int] = {}
+    matched_counts: dict[str, int] = {}
+
+    for table in selected_tables:
+        exact_fields = _mentioned_metric_fields(normalized, table.fields)
+        read = airtable_read_records_impl(
+            table.name,
+            base_alias="finance_tax_tracker",
+            fetch_all=True,
+            live=live,
+        )
+        records = read.get("records", []) if isinstance(read, Mapping) else []
+        table_counts[table.name] = len(records)
+        matched_counts[table.name] = 0
+        for record in records:
+            fields = record.get("fields", {})
+            if not isinstance(fields, Mapping) or not _record_matches_period(
+                fields,
+                quarters=quarters,
+                years=years,
+            ):
+                continue
+            normalized_record = _normalize_finance_record(
+                table_name=table.name,
+                record=record,
+                exact_fields=exact_fields,
+                topic=topic,
+            )
+            if normalized_record is None or not normalized_record.amount_fields:
+                continue
+            matched_counts[table.name] += 1
+            if best_record is None or normalized_record.amount > best_record.amount:
+                best_record = normalized_record
+                best_table = table.name
+
+    if best_record is None:
+        table_names = ", ".join(f"`{table.name}`" for table in selected_tables)
+        return _finance_tracker_result(
+            text=text,
+            summary=(
+                "I did not find any matching numeric finance tracker records for the "
+                f"top {topic or 'amount'} request in {table_names}."
+            ),
+            command="Find top Airtable finance record",
+            actions=[
+                "Check whether the target table has Amount or Total Expenses populated.",
+                "Specify a quarter or year if the request should be period-limited.",
+            ],
+            audit_notes=["Schema-first top-record planning found no numeric matches."],
+        )
+
+    fields = best_record.fields
+    item = _finance_record_display_value(fields, ("Item", "Payment Name", "Name"))
+    date = _finance_record_display_value(
+        fields,
+        ("Date of Expense", "Pay Date", "Payment Date", "Date"),
+    )
+    category = _finance_record_display_value(fields, ("Categories", "Category"))
+    vendor = _finance_record_display_value(
+        fields,
+        ("Expense Client/Vendor", "Vendor", "Source"),
+    )
+    description = _finance_record_display_value(fields, ("Description", "Notes"))
+    period = f"Q{best_record.period}" if best_record.period else ""
+    detail_lines = [
+        f"* Table: {best_table}",
+        f"* Amount used: {_format_money(best_record.amount)}",
+        f"* Field used: {', '.join(best_record.amount_fields)}",
+    ]
+    if item:
+        detail_lines.insert(0, f"* Item: {item}")
+    if date:
+        detail_lines.append(f"* Date: {date}")
+    if period:
+        detail_lines.append(f"* Estimated tax period: {period}")
+    if category:
+        detail_lines.append(f"* Category: {category}")
+    if vendor:
+        detail_lines.append(f"* Vendor/source: {vendor}")
+    if description and description != item:
+        detail_lines.append(f"* Description: {description}")
+    if best_record.record_id:
+        detail_lines.append(f"* Airtable record id: {best_record.record_id}")
+
+    table_summary = ", ".join(
+        f"{table.name}: {matched_counts.get(table.name, 0)} matching numeric records"
+        for table in selected_tables
+    )
+    period_label = _aggregate_period_label(quarters=quarters, years=years)
+    title_context = f" for {period_label}" if period_label else ""
+    summary = (
+        f"Top {topic or 'finance'} record in finance_tax_tracker{title_context}\n\n"
+        f"The largest matching record I found is {_format_money(best_record.amount)}.\n\n"
+        "Detail\n\n"
+        + "\n".join(detail_lines)
+        + "\n\nChecks\n\n"
+        f"* Records checked: {table_summary}"
+    )
+    return _finance_tracker_result(
+        text=text,
+        summary=summary,
+        command="Find top Airtable finance record from schema-selected tables",
+        actions=[
+            "Review the selected table and amount field before relying on the result.",
+            "Specify a quarter or year if the top record should be period-limited.",
+            "Flag deduction treatment or business-purpose uncertainty for human tax review.",
+        ],
+        audit_notes=[
+            "Schema-first Airtable top-record planning selected tables from live schema.",
+            "No Airtable mutation was attempted.",
+            "Amounts were normalized locally from typed Airtable read results.",
+        ],
+    )
+
+
+def _plan_airtable_aggregate_from_schema(
+    *,
+    text: str,
+    normalized: str,
+    tables: list[AirtableTableView],
+    live: bool,
+) -> ChiefOfStaffResult | None:
+    if not (_is_aggregate_request(normalized) or _is_count_request(normalized)):
+        return None
+
+    topics = _aggregate_topics(normalized)
+    quarters = _effective_requested_quarters(normalized)
+    years = _finance_tracker_years(normalized)
+    if _is_aggregate_request(normalized) and len(topics) > 1:
+        totals_by_topic: dict[str, Decimal] = {}
+        details_by_topic: dict[str, list[str]] = {}
+        selected_any: list[AirtableTableView] = []
+        for topic in topics:
+            total, table_parts, selected_tables = _compute_airtable_topic_aggregate(
+                topic=topic,
+                normalized=normalized,
+                tables=tables,
+                quarters=quarters,
+                years=years,
+                live=live,
+            )
+            if not selected_tables:
+                continue
+            selected_any.extend(selected_tables)
+            totals_by_topic[topic] = total
+            details_by_topic[topic] = table_parts
+        if not selected_any:
+            return _finance_tracker_result(
+                text=text,
+                summary=(
+                    "I could not map the requested income/expense totals to allowed "
+                    "Airtable tables from the live schema. Please name the tables."
+                ),
+                command="Clarify Airtable aggregate tables",
+                actions=[
+                    "Name one or more Airtable tables.",
+                    "Name the numeric field if the metric is not obvious from the schema.",
+                ],
+                audit_notes=["Schema-first multi-aggregate planning did not find table matches."],
+            )
+        period = _aggregate_period_label(quarters=quarters, years=years)
+        heading = (
+            f"{period} finance_tax_tracker Summary"
+            if period
+            else "finance_tax_tracker Summary"
+        )
+        intro = (
+            f"For {period}, the finance_tax_tracker currently shows:"
+            if period
+            else "The finance_tax_tracker currently shows:"
+        )
+        sections = [heading, "", intro, "", "Totals", ""]
+        for topic in topics:
+            if topic not in totals_by_topic:
+                continue
+            label = _finance_tracker_topic_label(topic)
+            sections.append(f"* Total {label}: {_format_money(totals_by_topic[topic])}")
+        for topic in topics:
+            table_parts = details_by_topic.get(topic, [])
+            if not table_parts:
+                continue
+            label = _finance_tracker_topic_label(topic)
+            section_title = "Expense detail" if topic == "expense" else f"{label.title()} detail"
+            sections.extend(["", section_title, ""])
+            sections.append(f"* Combined {label}: {_format_money(totals_by_topic[topic])}")
+            sections.extend(f"* {part}" for part in table_parts)
+        summary = "\n".join(sections)
+        return _finance_tracker_result(
+            text=text,
+            summary=summary,
+            command="Aggregate multiple Airtable finance metrics from schema-selected tables",
+            actions=[
+                "Review table, field, and quarter assumptions before relying on the result.",
+                (
+                    "Live aggregate reads paginate through Airtable records up to "
+                    "AIRTABLE_READ_ALL_MAX_RECORDS; export if any table reports truncation."
+                ),
+                (
+                    "Flag tax treatment, classification, and estimated-payment questions "
+                    "for human review."
+                ),
+            ],
+            audit_notes=[
+                "Schema-first Airtable multi-aggregate planning selected tables from live schema.",
+                "No Airtable mutation was attempted.",
+                "Arithmetic was computed locally from typed Airtable read results.",
+            ],
+        )
+
+    selected_tables = _mentioned_tables(normalized, tables) or _semantic_tables(
+        normalized, tables
+    )
+    if not selected_tables:
+        return _finance_tracker_result(
+            text=text,
+            summary=(
+                "I could not map the aggregate request to a specific allowed Airtable "
+                "table from the live schema. Please name the table or metric to aggregate."
+            ),
+            command="Clarify Airtable aggregate table",
+            actions=[
+                "Name one or more Airtable tables.",
+                "Name the numeric field if the metric is not obvious from the schema.",
+            ],
+            audit_notes=["Schema-first aggregate planning did not find a table match."],
+        )
+
+    topic = _aggregate_topic(normalized)
+    table_totals: dict[str, Decimal] = {}
+    table_counts: dict[str, int] = {}
+    table_matching_counts: dict[str, int] = {}
+    table_contributing_counts: dict[str, int] = {}
+    field_usage: dict[str, set[str]] = {}
+    statuses: dict[str, str] = {}
+    quarters = _effective_requested_quarters(normalized)
+    years = _finance_tracker_years(normalized)
+    quarter_breakdown_requested = _wants_quarter_breakdown(normalized, quarters)
+    quarter_totals: dict[int, Decimal] = {quarter: Decimal("0") for quarter in quarters}
+    quarter_counts: dict[int, int] = {quarter: 0 for quarter in quarters}
+
+    for table in selected_tables:
+        exact_fields = _mentioned_metric_fields(normalized, table.fields)
+        read = airtable_read_records_impl(
+            table.name,
+            base_alias="finance_tax_tracker",
+            fetch_all=True,
+            live=live,
+        )
+        records = read.get("records", []) if isinstance(read, Mapping) else []
+        statuses[table.name] = str(read.get("status", "unknown"))
+        table_counts[table.name] = len(records)
+        table_matching_counts[table.name] = 0
+        table_contributing_counts[table.name] = 0
+        table_totals[table.name] = Decimal("0")
+        field_usage[table.name] = set()
+        if _is_count_request(normalized) and not _is_aggregate_request(normalized):
+            continue
+        for record in records:
+            fields = record.get("fields", {})
+            if not isinstance(fields, Mapping) or not _record_matches_period(
+                fields,
+                quarters=quarters,
+                years=years,
+            ):
+                continue
+            normalized_record = _normalize_finance_record(
+                table_name=table.name,
+                record=record,
+                exact_fields=exact_fields,
+                topic=topic,
+            )
+            if normalized_record is None:
+                continue
+            table_totals[table.name] += normalized_record.amount
+            field_usage[table.name].update(normalized_record.amount_fields)
+            if normalized_record.amount_fields:
+                table_matching_counts[table.name] += 1
+                if normalized_record.amount != Decimal("0"):
+                    table_contributing_counts[table.name] += 1
+            if quarter_breakdown_requested:
+                quarter = normalized_record.period
+                if quarter in quarter_totals:
+                    quarter_totals[quarter] += normalized_record.amount
+                    if normalized_record.amount_fields:
+                        quarter_counts[quarter] += 1
+
+    if _is_count_request(normalized) and not _is_aggregate_request(normalized):
+        total_count = sum(table_counts.values())
+        table_parts = [
+            f"{table_counts[table.name]} from `{table.name}`"
+            for table in selected_tables
+        ]
+        summary = (
+            f"I found {total_count} record{'s' if total_count != 1 else ''} in "
+            f"`finance_tax_tracker`: {', '.join(table_parts)}. This was read-only."
+        )
+        command = "Count Airtable records from schema-selected tables"
+    else:
+        total = sum(table_totals.values(), Decimal("0"))
+        table_parts = []
+        for table in selected_tables:
+            fields_used = (
+                ", ".join(sorted(field_usage[table.name]))
+                or "none with numeric values matched"
+            )
+            truncation_note = (
+                f"; read truncated at {read.get('record_limit')} records"
+                if isinstance(read, Mapping) and read.get("truncated")
+                else ""
+            )
+            matched_count = table_matching_counts[table.name]
+            contributing_count = table_contributing_counts[table.name]
+            contribution_text = (
+                "1 contributed a non-zero amount"
+                if contributing_count == 1
+                else f"{contributing_count} contributed non-zero amounts"
+            )
+            contribution_note = (
+                f"; {contribution_text}, totaling {_format_money(table_totals[table.name])}"
+                if contributing_count != matched_count
+                else f", totaling {_format_money(table_totals[table.name])}"
+            )
+            table_parts.append(
+                f"`{table.name}` had {matched_count} matching records"
+                f"{contribution_note} from {fields_used}{truncation_note}"
+            )
+        if quarter_breakdown_requested:
+            quarter_parts = [
+                f"Q{quarter}: {_format_money(quarter_totals[quarter])}"
+                f" ({quarter_counts[quarter]} matching records)"
+                for quarter in quarters
+            ]
+            summary = (
+                f"{topic.title() if topic else 'Amount'} totals by quarter in "
+                f"`finance_tax_tracker`:\n\n"
+                + "\n".join(f"- {part}" for part in quarter_parts)
+                + "\n\nDetail\n"
+                + "\n".join(f"- {part}" for part in table_parts)
+            )
+            command = "Aggregate Airtable records by quarter from schema-selected tables"
+            return _finance_tracker_result(
+                text=text,
+                summary=summary,
+                command=command,
+                actions=[
+                    "Review the table, field, and quarter assumptions before relying on the result.",
+                    (
+                        "Live aggregate reads paginate through Airtable records up to "
+                        "AIRTABLE_READ_ALL_MAX_RECORDS; export if any table reports truncation."
+                    ),
+                    (
+                        "Flag tax treatment, classification, and estimated-payment questions "
+                        "for human review."
+                    ),
+                ],
+                audit_notes=[
+                    "Schema-first Airtable aggregate planning selected tables from live schema.",
+                    "No Airtable mutation was attempted.",
+                    "Arithmetic was computed locally from typed Airtable read results.",
+                ],
+            )
+        summary = (
+            f"Total {topic or 'amount'} in the `finance_tax_tracker` Airtable base is "
+            f"{_format_money(total)}.\n\n"
+            "Detail\n"
+            + "\n".join(f"- {part}" for part in table_parts)
+        )
+        command = "Aggregate Airtable records from schema-selected tables"
+
+    return _finance_tracker_result(
+        text=text,
+        summary=summary,
+        command=command,
+        actions=[
+            "Review the table and field assumptions before relying on the result.",
+            (
+                "Live aggregate reads paginate through Airtable records up to "
+                "AIRTABLE_READ_ALL_MAX_RECORDS; export if any table reports truncation."
+            ),
+            "Flag tax treatment, classification, and estimated-payment questions for human review.",
+        ],
+        audit_notes=[
+            "Schema-first Airtable aggregate planning selected tables from live schema.",
+            "No Airtable mutation was attempted.",
+            "Arithmetic was computed locally from typed Airtable read results.",
+        ],
+    )
+
+
+def _plan_finance_tracker_request(text: str, *, live: bool) -> ChiefOfStaffResult:
+    active_text = _active_slack_followup_text(text)
+    normalized = _normalized_text(active_text)
+    command = active_text[:240]
+    try:
+        if _looks_like_expense_total_sync_request(normalized):
+            schema = airtable_get_base_schema_impl(base_alias="finance_tax_tracker", live=live)
+            return _plan_expense_total_sync_request(
+                active_text,
+                schema=schema,
+                live=live,
+                live_write=_expense_total_live_write_requested(normalized),
+            )
+
+        if "dry-run" in normalized or "dry run" in normalized or "write plan" in normalized:
+            schema = airtable_get_base_schema_impl(base_alias="finance_tax_tracker", live=live)
+            tax_table = _finance_tracker_tax_table_name(
+                active_text,
+                schema_tables=_schema_table_views(schema),
+            )
+            fields = {
+                "Payment Name": "KNI CoS dry-run test",
+                "Estimated Tax Periods": 1,
+                "Amount": 0,
+                "Payment Date": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+                "Notes": (
+                    "TEST RECORD: dry-run Chief of Staff Airtable write plan only; "
+                    "do not use for tax reporting."
+                ),
+            }
+            preview = airtable_write_record_impl(
+                json.dumps(fields, sort_keys=True),
+                table=tax_table,
+                base_alias="finance_tax_tracker",
+                approval_reference="slack-chief-of-staff-dry-run-finance-tax-tracker-test",
+                operation="create",
+                live=False,
+            )
+            summary = (
+                "Dry-run Airtable write plan prepared for `finance_tax_tracker` / "
+                f"`{tax_table}`. Fields: Payment Name, Estimated Tax Periods, Amount, "
+                "Payment Date, Notes. Approval reference: "
+                "`slack-chief-of-staff-dry-run-finance-tax-tracker-test`. "
+                f"Tool status: `{preview.get('status', 'dry-run')}`. No live write occurred."
+            )
+            return _finance_tracker_result(
+                text=text,
+                summary=summary,
+                command="Prepare dry-run Tax Payments write plan",
+                actions=[
+                    "Review the exact test fields before any live create.",
+                    (
+                        "For a live create, set write gates and provide a "
+                        "command-scoped approval reference."
+                    ),
+                    "Keep zero-dollar test rows clearly marked as excluded from tax reporting.",
+                ],
+                audit_notes=[
+                    "Schema/text-aware tax table resolution was used for the dry-run plan.",
+                    "Airtable write tool was called in dry-run mode only.",
+                ],
+            )
+
+        if "kni_ops" in normalized or "kni ops" in normalized:
+            finance = airtable_get_base_schema_impl(base_alias="finance_tax_tracker", live=live)
+            ops = airtable_get_base_schema_impl(base_alias="kni_ops", live=live)
+            finance_tables = [
+                table["name"] for table in finance.get("schema", {}).get("tables", [])
+            ]
+            ops_tables = [table["name"] for table in ops.get("schema", {}).get("tables", [])]
+            summary = (
+                "`finance_tax_tracker` tables: "
+                f"{', '.join(finance_tables) or 'unavailable'}. "
+                "`kni_ops` tables: "
+                f"{', '.join(ops_tables) or 'unavailable'}. "
+                "Guardrail: never infer a record belongs to the other base; "
+                "choose the base alias first."
+            )
+            return _finance_tracker_result(
+                text=text,
+                summary=summary,
+                command="Compare finance_tax_tracker and kni_ops Airtable base schemas",
+                actions=[
+                    "Use `base_alias=\"finance_tax_tracker\"` for finance/tax records.",
+                    "Use `base_alias=\"kni_ops\"` for operations records.",
+                    "Ask for clarification before reading or writing if the base is ambiguous.",
+                ],
+                audit_notes=["Live schema reads attempted for both configured Airtable bases."],
+            )
+
+        record_id_match = re.search(r"\brec[a-zA-Z0-9]{8,}\b", text)
+        if record_id_match:
+            record_id = record_id_match.group(0)
+            schema = airtable_get_base_schema_impl(base_alias="finance_tax_tracker", live=live)
+            tax_table = _finance_tracker_tax_table_name(
+                active_text,
+                schema_tables=_schema_table_views(schema),
+            )
+            read = airtable_read_records_impl(
+                tax_table,
+                base_alias="finance_tax_tracker",
+                filter_formula=f"RECORD_ID()='{record_id}'",
+                max_records=1,
+                live=live,
+            )
+            records = read.get("records", []) if isinstance(read, Mapping) else []
+            fields = _field_names_from_records(records)
+            summary = (
+                f"{tax_table} record `{record_id}` "
+                f"{'was found' if records else 'was not found'} in `finance_tax_tracker`. "
+                f"Non-sensitive field names: {', '.join(fields) if fields else 'none returned'}."
+            )
+            return _finance_tracker_result(
+                text=text,
+                summary=summary,
+                command=f"Verify Tax Payments record {record_id}",
+                actions=[
+                    "Treat the test row as operational verification only.",
+                    "Do not use zero-dollar test rows for tax reporting.",
+                ],
+                audit_notes=[
+                    "Schema/text-aware tax table resolution was used for record lookup.",
+                    "Airtable read was filtered by RECORD_ID().",
+                ],
+            )
+
+        table = _finance_tracker_table_from_text(active_text)
+        schema: Mapping[str, Any] | None = None
+        if (
+            _is_aggregate_request(normalized)
+            or _is_count_request(normalized)
+            or _looks_like_top_finance_record_request(normalized)
+            or _looks_like_tax_payment_or_estimate_request(normalized)
+            or not table
+        ):
+            schema = airtable_get_base_schema_impl(base_alias="finance_tax_tracker", live=live)
+            schema_tables = _schema_table_views(schema)
+            if _looks_like_tax_payment_or_estimate_request(normalized):
+                return _plan_tax_payment_summary_request(
+                    text=active_text,
+                    normalized=normalized,
+                    schema=schema,
+                    live=live,
+                )
+            top_record_result = _plan_top_airtable_record_from_schema(
+                text=active_text,
+                normalized=normalized,
+                tables=schema_tables,
+                live=live,
+            )
+            if top_record_result is not None:
+                return top_record_result
+            aggregate_result = _plan_airtable_aggregate_from_schema(
+                text=active_text,
+                normalized=normalized,
+                tables=schema_tables,
+                live=live,
+            )
+            if aggregate_result is not None:
+                return aggregate_result
+
+        if table:
+            read = airtable_read_records_impl(
+                table,
+                base_alias="finance_tax_tracker",
+                max_records=1,
+                live=live,
+            )
+            records = read.get("records", []) if isinstance(read, Mapping) else []
+            return _summarize_table_read(
+                text=text,
+                table=table,
+                read=read,
+                records=records,
+            )
+
+        if "operating note" in normalized or "approval gates" in normalized:
+            summary = (
+                "2026 Finance & Tax Tracker operating note: CoS can read schema and capped records "
+                "from Business Income, Business Expenses, Personal Income, Personal Expenses, and "
+                "the schema-resolved tax table. It can create/update records only through "
+                "typed Airtable tools, "
+                "allowed tables, explicit live flags, exact fields, and an approval reference. "
+                "It cannot delete, change schema, upload attachments, file returns, make "
+                "payments, or give final tax/legal advice. Federal, Pennsylvania, and "
+                "Philadelphia tax outputs are operational support notes; uncertain deductions, "
+                "mixed-use expenses, entity-structure questions, estimated payments, "
+                "and Philadelphia BIRT/NPT issues need human tax review."
+            )
+            return _finance_tracker_result(
+                text=text,
+                summary=summary,
+                command="Produce finance tracker operating note",
+                actions=[
+                    "Read schema first.",
+                    "Run dry-run write preview with exact fields.",
+                    (
+                        "Perform one approved live write only after write gates "
+                        "and approval reference are present."
+                    ),
+                ],
+                audit_notes=["No Airtable mutation was attempted for the operating note."],
+            )
+
+        if schema is None:
+            schema = airtable_get_base_schema_impl(base_alias="finance_tax_tracker", live=live)
+        tables = schema.get("schema", {}).get("tables", []) if isinstance(schema, Mapping) else []
+        table_summaries = [
+            f"{table['name']}: {len(table.get('fields', []))} fields"
+            for table in tables
+            if isinstance(table, Mapping)
+        ]
+        summary = (
+            "Finance tracker schema: "
+            f"{'; '.join(table_summaries) if table_summaries else 'no tables returned'}."
+        )
+        return _finance_tracker_result(
+            text=text,
+            summary=summary,
+            command="Inspect finance_tax_tracker Airtable schema",
+            actions=[
+                "Use the schema summary before reads or writes.",
+                "Keep memory/docs to schema and rules, not raw transaction history.",
+            ],
+            audit_notes=["Airtable metadata was reduced to bounded table and field counts."],
+        )
+    except Exception as exc:
+        return _finance_tracker_result(
+            text=text,
+            summary=(
+                "Finance tracker deterministic handler could not complete: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            command=command,
+            actions=[
+                "Check Airtable base id/token and allowed-table config.",
+                "Retry after connector credentials and network access are verified.",
+            ],
+            audit_notes=["Finance tracker handler returned a controlled failure summary."],
+        )
+
+
 def _extract_target_channel(text: str, fallback: str) -> str:
     match = re.search(r"#([a-z0-9_-]+)", text, flags=re.I)
     if match:
         return match.group(1)
     return fallback
+
+
+def _extract_target_channels(text: str, fallback: str = "") -> list[str]:
+    channels: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"#([a-z0-9_-]+)", text, flags=re.I):
+        channel = match.group(1).strip().lower()
+        if channel and channel not in seen:
+            channels.append(channel)
+            seen.add(channel)
+    if not channels and fallback:
+        channels.append(fallback.strip().lstrip("#"))
+    return [channel for channel in channels if channel]
+
+
+def _extract_time_window(text: str) -> str:
+    lowered = text.lower()
+    if "since last" in lowered:
+        return "since_last_summary"
+    if "today" in lowered or "day end" in lowered or "end of day" in lowered:
+        return "today"
+    if "yesterday" in lowered:
+        return "yesterday"
+    if "this week" in lowered or "weekly" in lowered:
+        return "this_week"
+    if "last week" in lowered:
+        return "last_week"
+    if "morning" in lowered:
+        return "morning"
+    if "afternoon" in lowered:
+        return "afternoon"
+    return "recent"
+
+
+def _capabilities_for_request(text: str) -> list[str]:
+    lowered = text.lower()
+    capabilities: list[str] = []
+    if any(
+        term in lowered
+        for term in ("summarize", "summary", "brief", "catch me up", "review activity")
+    ):
+        capabilities.append("channel_summary")
+    if any(
+        term in lowered
+        for term in ("project", "context pack", "what do we know", "obtain context")
+    ):
+        capabilities.append("project_context")
+    if any(
+        term in lowered
+        for term in ("research plan", "research direction", "opportunity lane", "stakeholder")
+    ):
+        capabilities.append("research_direction")
+    if len(_extract_target_channels(text)) > 1 or "cross-channel" in lowered or "across" in lowered:
+        capabilities.append("cross_channel_synthesis")
+    if any(term in lowered for term in ("article", "articles", "link", "links", "url")):
+        capabilities.append("article_link_review")
+    if explicit_full_article_read_requested(text):
+        capabilities.append("full_article_reading")
+    if any(term in lowered for term in ("doc", "docs", "document", "proposal", "deck")):
+        capabilities.append("document_review")
+    if any(
+        term in lowered for term in ("meeting prep", "prepare me for", "agenda", "talking points")
+    ):
+        capabilities.append("meeting_prep")
+    if any(
+        term in lowered for term in ("follow-up", "follow up", "stale", "unresolved", "open loop")
+    ):
+        capabilities.append("follow_up_tracking")
+    if any(
+        term in lowered
+        for term in (
+            "airtable",
+            "google drive",
+            "google doc",
+            "google docs",
+            "google sheet",
+            "google sheets",
+            "spreadsheet",
+            "structured data",
+            "knio",
+            "artifact",
+            "contact",
+            "company info",
+        )
+    ):
+        capabilities.append("artifact_write_planning")
+    if any(term in lowered for term in ("google sheet", "google sheets", "spreadsheet")):
+        capabilities.append("google_sheets_structured_data")
+    if any(term in lowered for term in ("budget", "cost", "spend")):
+        capabilities.append("budget_aware_execution")
+    if any(
+        term in lowered
+        for term in ("portfolio", "priorities", "blocked projects", "stale opportunities")
+    ) or (
+        "weekly executive summary" in lowered and "project" in lowered
+    ):
+        capabilities.append("portfolio_oversight")
+    if any(
+        term in lowered
+        for term in ("draft an email", "write an email", "compose an email", "intro email")
+    ):
+        capabilities.append("outreach_drafting")
+    return capabilities or ["workflow_routing"]
 
 
 def _extract_digest_field(text: str, field: str) -> str:
@@ -153,6 +2314,13 @@ def _slack_history_items_from_digest(text: str) -> list[dict[str, str]]:
             title = ""
         if not title:
             title = body.split(".", 1)[0].strip()[:120]
+        lowered = f"{title} {body}".lower()
+        if "chief of staff" in lowered and any(
+            marker in lowered for marker in ("summarize activity", "review activity", "catch me up")
+        ):
+            continue
+        if "has joined the channel" in lowered:
+            continue
         topic = _slack_history_topic_from_text(title, body)
         metadata = _slack_history_metadata_from_text(body)
         items.append(
@@ -194,7 +2362,6 @@ def _slack_history_metadata_from_text(body: str) -> str:
     for label, pattern in (
         ("workflow", r"\*?Workflow:\*?\s*`?([A-Za-z0-9_-]+)`?"),
         ("status", r"\*?Status:\*?\s*`?([A-Za-z0-9_-]+)`?"),
-        ("run", r"\*?Run ID:\*?\s*`?([A-Za-z0-9_-]+)`?"),
     ):
         match = re.search(pattern, body, flags=re.I)
         if match:
@@ -235,16 +2402,21 @@ def _plan_slack_history_digest_request(text: str) -> ChiefOfStaffResult:
     channel = _extract_digest_field(text, "Channel")
     channel_id = _extract_digest_field(text, "Channel id")
     items = _slack_history_items_from_digest(text)
-    summary_lines = ["Recent posts:", ""]
+    summary_lines = ["Summary:"]
     if items:
-        for index, item in enumerate(items[:8], start=1):
-            if index > 1:
-                summary_lines.append("")
-            summary_lines.append(f"{index}. {item['topic']}")
-            summary_lines.append(f"   Posted: {_format_slack_history_timestamp(item['ts'])}")
+        topics = ", ".join(item["topic"] for item in items[:4])
+        summary_lines.append(f"The supplied channel history centers on {topics}.")
+        summary_lines.append("")
+        summary_lines.append("Useful follow-ups:")
+        for item in items[:3]:
+            detail = f" ({item['metadata']})" if item["metadata"] else ""
+            summary_lines.append(
+                f"- Review `{item['topic']}` from "
+                f"{_format_slack_history_timestamp(item['ts'])}{detail}."
+            )
     else:
         summary_lines.append(
-            "- No candidate Slack history items were present in the supplied digest."
+            "No candidate Slack history items were present in the supplied digest."
         )
     summary_lines.append("")
     summary_lines.append(f"Theme: {_slack_history_theme(items)}")
@@ -253,6 +2425,9 @@ def _plan_slack_history_digest_request(text: str) -> ChiefOfStaffResult:
         mode="deterministic",
         intent=text.split(SLACK_HISTORY_DIGEST_MARKER, 1)[0].strip() or text[:240],
         summary=summary,
+        time_window=_extract_time_window(text),
+        target_channels=_extract_target_channels(text, channel.lstrip("#") or channel_id),
+        operating_capabilities=_capabilities_for_request(text),
         recommended_route=ChiefOfStaffRouteRecommendation(
             workflow_type="slack-runtime-review",
             command_text=f"Summarize supplied Slack history digest for {channel_id or channel}",
@@ -265,8 +2440,8 @@ def _plan_slack_history_digest_request(text: str) -> ChiefOfStaffResult:
             requires_human_approval_before_post=True,
         ),
         recommended_actions=[
-            "Use the supplied Slack history digest as the source of truth.",
-            "Keep this as read-only channel analysis; do not post or draft outbound Slack copy.",
+            "Use the supplied Slack history digest as evidence for a concise channel summary.",
+            "Ignore the request message and avoid run metadata in Slack-facing output.",
         ],
         blocked_side_effects=BLOCKED_SIDE_EFFECTS,
         approval_required=True,
@@ -297,6 +2472,7 @@ def _plan_slack_history_digest_request(text: str) -> ChiefOfStaffResult:
 def _repo_context_for_capability(workflow_type: str) -> list[str]:
     common = [
         "keystone-slack:AGENTS.md",
+        "keystone-slack:slack/kni-app-manifest.yaml",
         "keystone-slack:kni_integrations/slack_socket_mode.py",
         "keystone-slack:kni_integrations/workflow_runner.py",
         "keystone-slack:kni_integrations/business_agents_bridge.py",
@@ -355,6 +2531,113 @@ def _looks_like_reference_capture_request(text: str) -> bool:
     return bool(URL_PATTERN.search(text)) and any(
         marker in lowered for marker in ("remember", "reference", "bookmark", "save")
     )
+
+
+def _looks_like_chief_memory_capture_request(text: str) -> bool:
+    lowered = text.lower()
+    has_write = any(
+        marker in lowered
+        for marker in (
+            "remember this as",
+            "save this as",
+            "store this as",
+            "mark this as",
+            "update the direction",
+            "update project aim",
+            "save this decision",
+        )
+    )
+    has_memory_kind = any(
+        marker in lowered
+        for marker in (
+            "goal",
+            "aim",
+            "constraint",
+            "decision",
+            "priority",
+            "budget",
+            "strategy",
+            "direction",
+            "status",
+            "avoid",
+            "do not",
+        )
+    )
+    return has_write and has_memory_kind
+
+
+def _looks_like_chief_memory_review_request(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "show strategic memory",
+            "show chief of staff memory",
+            "show memory for",
+            "what do you remember",
+            "what memory",
+            "review memory for",
+        )
+    )
+
+
+def _chief_memory_type_from_text(text: str) -> str:
+    lowered = text.lower()
+    if any(marker in lowered for marker in ("budget", "cost", "spend")):
+        return "budget_assumption"
+    if any(marker in lowered for marker in ("constraint", "requirement", "limitation")):
+        return "project_constraint"
+    if any(marker in lowered for marker in ("decision", "decided", "choice")):
+        return "project_decision"
+    if any(marker in lowered for marker in ("status", "snapshot", "current state")):
+        return "project_status_snapshot"
+    if any(marker in lowered for marker in ("priority", "focus", "portfolio")):
+        return "portfolio_priority"
+    if any(marker in lowered for marker in ("avoid", "do not", "don't", "never")):
+        return "avoidance_rule"
+    if any(marker in lowered for marker in ("strategy", "direction")):
+        return "operator_strategy"
+    return "project_goal"
+
+
+PROJECT_KEY_RE = re.compile(
+    r"\b(?:for|about|on|re:)\s+(?:project\s+)?(?P<key>[A-Za-z0-9][A-Za-z0-9 _-]{1,80})",
+    flags=re.I,
+)
+
+
+def _extract_memory_object_key(text: str) -> str:
+    match = PROJECT_KEY_RE.search(text)
+    if not match:
+        return ""
+    key = match.group("key")
+    key = re.split(
+        r"\b(?:that|to|is|should|because|:|;|,|\.)\b",
+        key,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    return " ".join(key.split()).strip()
+
+
+def _memory_title_from_text(text: str, memory_type: str, object_key: str) -> str:
+    title = text
+    title = re.sub(r"^@kni\b", " ", title, flags=re.I).strip()
+    title = re.sub(r"\bchief\s+of\s+staff\b", " ", title, flags=re.I).strip()
+    title = re.sub(
+        r"\b(please\s+)?(remember|save|store|mark|update|keep|note)\b",
+        " ",
+        title,
+        flags=re.I,
+    )
+    title = re.sub(r"\bas\s+a[n]?\s+\w+\b", " ", title, flags=re.I)
+    title = re.sub(r"\bfor\s+project\s+", " for ", title, flags=re.I)
+    title = re.sub(r"[:\-]+", " ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    if title:
+        return title[:160]
+    suffix = f" for {object_key}" if object_key else ""
+    return f"{memory_type.replace('_', ' ').title()}{suffix}"[:160]
 
 
 def _extract_first_url(text: str) -> str:
@@ -461,6 +2744,525 @@ def _plan_reference_capture(text: str, *, database_url: str | None = None) -> Ch
     )
 
 
+def _plan_chief_memory_capture(
+    text: str, *, database_url: str | None = None
+) -> ChiefOfStaffResult:
+    memory_type = _chief_memory_type_from_text(text)
+    object_key = _extract_memory_object_key(text)
+    title = _memory_title_from_text(text, memory_type, object_key)
+    summary = (
+        f"Operator-supplied Chief of Staff {memory_type.replace('_', ' ')}: {title}."
+    )
+    store = SQLiteStore(database_url or database_url_from_env())
+    memory_item = chief_of_staff_memory_item(
+        memory_type=memory_type,
+        title=title,
+        summary=summary,
+        object_id=object_key or title,
+        object_key=object_key or title,
+        content={
+            "request_text": text[:500],
+            "object_key": object_key or title,
+            "capture_mode": "natural_language",
+        },
+        source_ids=["operator_supplied_chief_of_staff_memory"],
+        confidence=0.75,
+    )
+    memory_id = store.save_memory_item(memory_item)
+    artifact = AutomationArtifactRef(
+        artifact_id=f"memory:{memory_id}",
+        artifact_type="chief_of_staff_memory",
+        title=title,
+        provider="sqlite",
+        dry_run=False,
+        metadata={
+            "memory_id": memory_id,
+            "memory_type": memory_type,
+            "object_key": object_key or title,
+            "operator": "Anup",
+        },
+    )
+    return ChiefOfStaffResult(
+        mode="deterministic",
+        intent=text,
+        summary=(
+            f"Saved Chief of Staff {memory_type.replace('_', ' ')} memory: {title}."
+        ),
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="reference-capture",
+            command_text="@KNI chief of staff remember this as strategic memory",
+            target_channel=_extract_target_channel(text, "current-thread"),
+            rationale=(
+                "Anup explicitly supplied durable strategic memory. It was stored as "
+                "approved prompt-safe Keystone memory and remains internal."
+            ),
+            requires_live_connector=False,
+            requires_human_approval_before_post=True,
+        ),
+        recommended_actions=[
+            f"Saved to Keystone memory `memory:{memory_id}`.",
+            "Use this memory only as internal guidance unless separately approved.",
+        ],
+        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        context_sources_considered=[
+            "operator_identity:Anup",
+            "operator_and_agent_policy",
+            "keystone_memory",
+        ],
+        artifact_refs=[artifact],
+        audit_notes=[
+            "Deterministic Chief of Staff strategic memory capture used.",
+            "No external write or live connector was attempted.",
+        ],
+    )
+
+
+def _plan_chief_memory_review(
+    text: str, *, database_url: str | None = None
+) -> ChiefOfStaffResult:
+    object_key = _extract_memory_object_key(text)
+    memory_context = build_chief_of_staff_memory_context(
+        query=text,
+        route="memory-review",
+        object_key=object_key or None,
+        database_url=database_url or database_url_from_env(),
+    )
+    count = len(memory_context.records)
+    summary = (
+        f"Found {count} approved Chief of Staff memory item{'s' if count != 1 else ''}."
+        if count
+        else memory_context.missing_reason
+    )
+    return ChiefOfStaffResult(
+        mode="deterministic",
+        intent=text,
+        summary=summary,
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="memory-review",
+            command_text="@KNI chief of staff show strategic memory",
+            target_channel=_extract_target_channel(text, "current-thread"),
+            rationale="Memory review is read-only and uses approved prompt-safe records only.",
+            requires_live_connector=False,
+            requires_human_approval_before_post=True,
+        ),
+        recommended_actions=_memory_action_lines(memory_context),
+        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        sources=_memory_source_refs(memory_context.records),
+        context_sources_considered=[
+            "operator_and_agent_policy",
+            "keystone_memory",
+        ],
+        memory_context=memory_context,
+        audit_notes=[
+            "Deterministic Chief of Staff memory review used.",
+            "Unapproved, unsafe, expired, and superseded memory is excluded.",
+        ],
+    )
+
+
+def _memory_action_lines(memory_context: Any) -> list[str]:
+    if not getattr(memory_context, "records", None):
+        return [
+            "Proceed with a validation plan instead of assuming durable context exists.",
+            (
+                "Ask Anup to save project goals, constraints, decisions, or budget "
+                "assumptions when known."
+            ),
+        ]
+    return [
+        f"Use approved memory: {item.title}."
+        for item in memory_context.records[:5]
+    ]
+
+
+def _memory_source_refs(records: list[Any]) -> list[ChiefOfStaffSourceRef]:
+    refs: list[ChiefOfStaffSourceRef] = []
+    for item in records[:5]:
+        refs.append(
+            ChiefOfStaffSourceRef(
+                title=item.title,
+                url=next((source for source in item.source_ids if source.startswith("http")), ""),
+                source_type=f"memory:{item.memory_type}",
+                note=item.summary,
+            )
+        )
+    return refs
+
+
+def _plan_natural_language_operating_intent(
+    text: str, *, database_url: str | None = None
+) -> ChiefOfStaffResult | None:
+    lowered = text.lower()
+    if _looks_like_outreach_drafting_request(lowered):
+        return _natural_language_intent_result(
+            text,
+            workflow_type="business-agents-route",
+            command_text="@KNI outreach composer <draft-only outreach request>",
+            target_channel=_extract_target_channel(text, "ai-agents-workflow"),
+            summary=(
+                "Route the request to Outreach Composer for draft-only outbound copy "
+                "using approved context."
+            ),
+            rationale="Outbound copy must remain draft-only, source-backed, and approval-gated.",
+            recommended_actions=[
+                "Confirm the recipient, objective, and approved source-backed claims.",
+                "Delegate drafting to Outreach Composer or Gmail Triage for a selected thread.",
+                "Hold any send, publish, or Gmail draft creation behind human approval.",
+            ],
+            context_sources=[
+                "operator_and_agent_policy",
+                "business_workflow_state",
+                "keystone_local_context",
+                "selected_gmail_context",
+            ],
+            requires_live_connector=False,
+            database_url=database_url,
+        )
+    if _looks_like_budget_resource_request(lowered):
+        return _natural_language_intent_result(
+            text,
+            workflow_type="budget-resource-review",
+            command_text="@KNI chief of staff review known budget and resource context",
+            target_channel=_extract_target_channel(text, "current-thread"),
+            summary=(
+                "Answer from known budget/resource records only; otherwise provide "
+                "assumptions and a validation plan."
+            ),
+            rationale="Budget answers must not invent numbers or imply unverified commitments.",
+            recommended_actions=[
+                "Check approved records, WorkItems, artifacts, and operator-supplied context.",
+                "Separate known amounts from estimates and assumptions.",
+                "List the minimum records needed to validate any unknown budget or resource plan.",
+            ],
+            context_sources=[
+                "operator_and_agent_policy",
+                "business_workflow_state",
+                "keystone_local_context",
+            ],
+            requires_live_connector=False,
+            database_url=database_url,
+        )
+    if _looks_like_meeting_prep_request(lowered):
+        return _natural_language_intent_result(
+            text,
+            workflow_type="meeting-prep",
+            command_text="@KNI chief of staff prepare meeting brief",
+            target_channel=_extract_target_channel(text, "current-thread"),
+            summary=(
+                "Prepare a meeting brief from selected project, Slack, Gmail, calendar, "
+                "and local context without changing the calendar."
+            ),
+            rationale="Meeting prep is read-only and may include draft follow-up copy only.",
+            recommended_actions=[
+                "Identify the meeting target, time window, and project or company context.",
+                "Prepare agenda, talking points, questions, and open risks.",
+                "Draft follow-up text only when requested and keep it approval-gated.",
+            ],
+            context_sources=[
+                "operator_and_agent_policy",
+                "keystone_local_context",
+                "selected_calendar_context",
+                "selected_gmail_context",
+                "keystone_slack_runtime_repo",
+            ],
+            requires_live_connector=True,
+            database_url=database_url,
+        )
+    if _looks_like_document_review_request(lowered):
+        return _natural_language_intent_result(
+            text,
+            workflow_type="slack-docs-review",
+            command_text="@KNI chief of staff review supplied docs or approved local context",
+            target_channel=_extract_target_channel(text, "current-thread"),
+            summary=(
+                "Review supplied or approved documents for decisions, risks, claims, "
+                "missing evidence, and next actions."
+            ),
+            rationale=(
+                "Document review can summarize internal context but external claims "
+                "need approval."
+            ),
+            recommended_actions=[
+                "Use supplied files or allowlisted local context as the evidence base.",
+                "Extract decisions, risks, reusable claims, missing evidence, and owners.",
+                "Mark any externally reusable claim as requiring source review and approval.",
+            ],
+            context_sources=[
+                "operator_and_agent_policy",
+                "keystone_local_context",
+                "official_developer_docs",
+            ],
+            requires_live_connector=False,
+            database_url=database_url,
+        )
+    if _looks_like_portfolio_review_request(lowered):
+        return _natural_language_intent_result(
+            text,
+            workflow_type="portfolio-review",
+            command_text="@KNI chief of staff summarize behavioral health project portfolio",
+            target_channel=_extract_target_channel(text, "ai-agents-workflow"),
+            summary=(
+                "Summarize active behavioral health project priorities, blockers, stale "
+                "items, approvals, and next actions."
+            ),
+            rationale=(
+                "Portfolio review is a summary and prioritization task unless a write "
+                "is approved."
+            ),
+            recommended_actions=[
+                "Inspect WorkItems, approvals, artifacts, memory, and selected Slack context.",
+                (
+                    "Rank current priorities and separate blocked, stale, speculative, "
+                    "and active work."
+                ),
+                "Recommend what to continue, pause, or escalate.",
+            ],
+            context_sources=[
+                "operator_and_agent_policy",
+                "business_workflow_state",
+                "keystone_memory",
+                "keystone_local_context",
+                "keystone_slack_runtime_repo",
+            ],
+            requires_live_connector=False,
+            database_url=database_url,
+        )
+    if _looks_like_project_context_request(lowered):
+        return _natural_language_intent_result(
+            text,
+            workflow_type="project-context-review",
+            command_text="@KNI chief of staff build project context brief",
+            target_channel=_extract_target_channel(text, "current-thread"),
+            summary=(
+                "Build a project context brief from approved local state and selected "
+                "operating context."
+            ),
+            rationale=(
+                "Project context should identify known facts, gaps, blockers, and "
+                "next actions."
+            ),
+            recommended_actions=[
+                (
+                    "Gather WorkItems, memory, local context, and selected "
+                    "Slack/Gmail/Calendar summaries."
+                ),
+                "Summarize what is known, what is missing, and which facts need validation.",
+                (
+                    "Recommend the next owner or specialist handoff if research, "
+                    "outreach, or triage is needed."
+                ),
+            ],
+            context_sources=[
+                "operator_and_agent_policy",
+                "business_workflow_state",
+                "keystone_memory",
+                "keystone_local_context",
+                "selected_gmail_context",
+                "selected_calendar_context",
+            ],
+            requires_live_connector=False,
+            database_url=database_url,
+        )
+    if _looks_like_research_direction_request(lowered):
+        return _natural_language_intent_result(
+            text,
+            workflow_type="research-direction-review",
+            command_text="@KNI business research analyst <research direction request>",
+            target_channel=_extract_target_channel(text, "ai-agents-workflow"),
+            summary=(
+                "Route the idea into source-backed research questions, opportunity lanes, "
+                "and specialist handoff."
+            ),
+            rationale="Research direction needs source-backed synthesis before prioritization.",
+            recommended_actions=[
+                "Clarify the behavioral health topic, target population, and business objective.",
+                (
+                    "Delegate source-backed synthesis to Business Research Analyst "
+                    "when facts are needed."
+                ),
+                (
+                    "Delegate opportunity discovery to Opportunity Scout when the "
+                    "goal is leads, grants, partners, or companies."
+                ),
+            ],
+            context_sources=[
+                "operator_and_agent_policy",
+                "keystone_local_context",
+                "business_workflow_state",
+            ],
+            requires_live_connector=False,
+            database_url=database_url,
+        )
+    return None
+
+
+def _natural_language_intent_result(
+    text: str,
+    *,
+    workflow_type: str,
+    command_text: str,
+    target_channel: str,
+    summary: str,
+    rationale: str,
+    recommended_actions: list[str],
+    context_sources: list[str],
+    requires_live_connector: bool,
+    database_url: str | None = None,
+) -> ChiefOfStaffResult:
+    memory_context = build_chief_of_staff_memory_context(
+        query=text,
+        route=workflow_type,
+        object_key=_extract_memory_object_key(text) or None,
+        database_url=database_url or database_url_from_env(),
+    )
+    memory_actions = _memory_action_lines(memory_context)
+    memory_audit_note = (
+        f"Retrieved {len(memory_context.records)} approved Chief of Staff memory item(s)."
+        if memory_context.records
+        else memory_context.missing_reason
+    )
+    return ChiefOfStaffResult(
+        mode="deterministic",
+        intent=text,
+        summary=summary,
+        time_window=_extract_time_window(text),
+        target_channels=_extract_target_channels(text, target_channel),
+        operating_capabilities=_capabilities_for_request(text),
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type=workflow_type,  # type: ignore[arg-type]
+            command_text=command_text,
+            target_channel=target_channel,
+            rationale=rationale,
+            requires_live_connector=requires_live_connector,
+            requires_human_approval_before_post=True,
+        ),
+        recommended_actions=[
+            *recommended_actions,
+            *memory_actions,
+        ],
+        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        sources=[
+            *_docs_for_topic(text),
+            *_memory_source_refs(memory_context.records),
+        ],
+        context_sources_considered=list(dict.fromkeys([*context_sources, "keystone_memory"])),
+        repo_context_used=_repo_context_for_capability(workflow_type),
+        memory_context=memory_context,
+        audit_notes=[
+            "Deterministic Chief of Staff natural-language intent routing used.",
+            "Intent matrix selected a flexible route family, not a fixed command grammar.",
+            memory_audit_note,
+            "No Slack, Gmail, Calendar, CRM, LinkedIn, or repo write was attempted.",
+        ],
+    )
+
+
+def _looks_like_outreach_drafting_request(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "write an email",
+            "draft an email",
+            "compose an email",
+            "email to",
+            "intro email",
+            "linkedin note",
+            "draft a reply",
+        )
+    )
+
+
+def _looks_like_budget_resource_request(lowered: str) -> bool:
+    return any(marker in lowered for marker in ("budget", "cost", "spend", "resources"))
+
+
+def _looks_like_meeting_prep_request(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "meeting prep",
+            "prepare me for",
+            "prep me for",
+            "agenda for",
+            "talking points",
+            "post-meeting",
+        )
+    ) and any(marker in lowered for marker in ("meeting", "call", "agenda", "talking points"))
+
+
+def _looks_like_document_review_request(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "review these docs",
+            "review this doc",
+            "review the docs",
+            "review this proposal",
+            "review the proposal",
+            "review this deck",
+            "extract decisions",
+            "extract risks",
+            "extract claims",
+        )
+    )
+
+
+def _looks_like_portfolio_review_request(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "portfolio",
+            "top priorities",
+            "this week priorities",
+            "weekly executive summary",
+            "blocked projects",
+            "stale opportunities",
+            "what should i focus on",
+        )
+    )
+
+
+def _looks_like_project_context_request(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "obtain context",
+            "project context",
+            "context pack",
+            "what do we know about",
+            "summarize what we know",
+            "current status of project",
+            "project status",
+        )
+    )
+
+
+def _looks_like_research_direction_request(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "research plan",
+            "research direction",
+            "turn this idea into",
+            "opportunity lanes",
+            "commercialization paths",
+            "key stakeholders",
+        )
+    )
+
+
 def plan_chief_of_staff_request(
     request_text: str,
     *,
@@ -473,8 +3275,27 @@ def plan_chief_of_staff_request(
     text = str(request_text or "").strip()
     if _looks_like_slack_history_digest_request(text):
         return _plan_slack_history_digest_request(text)
+    if _looks_like_finance_tracker_artifact_workflow_request(text):
+        return _plan_finance_tracker_artifact_workflow_request(text)
+    if _looks_like_finance_tracker_request(text):
+        return _plan_finance_tracker_request(text, live=False)
+    if _looks_like_chief_memory_capture_request(text):
+        return _plan_chief_memory_capture(text, database_url=database_url)
+    if _looks_like_chief_memory_review_request(text):
+        return _plan_chief_memory_review(text, database_url=database_url)
     if _looks_like_reference_capture_request(text):
         return _plan_reference_capture(text, database_url=database_url)
+    if _looks_like_google_sheets_management_request(text):
+        return _plan_google_sheets_management_request(text)
+    if _looks_like_google_drive_management_request(text):
+        return _plan_google_drive_management_request(text)
+    if _looks_like_artifact_write_request(text):
+        return _plan_business_artifact_write_request(text)
+    natural_intent = _plan_natural_language_operating_intent(
+        text, database_url=database_url
+    )
+    if natural_intent is not None:
+        return natural_intent
     if _looks_like_automation_inventory_request(text):
         report = build_automation_inventory_report(database_url=database_url)
         write_requests = _write_requests_from_text(text)
@@ -482,6 +3303,11 @@ def plan_chief_of_staff_request(
             mode="deterministic",
             intent=text,
             summary=report.summary,
+            time_window=_extract_time_window(text),
+            target_channels=_extract_target_channels(
+                text, _extract_target_channel(text, "ai-agents-workflow")
+            ),
+            operating_capabilities=_capabilities_for_request(text),
             recommended_route=ChiefOfStaffRouteRecommendation(
                 workflow_type="slack-runtime-review",
                 command_text="@KNI chief of staff audit automations",
@@ -527,7 +3353,24 @@ def plan_chief_of_staff_request(
     capability = _capability_for_topic(text)
     workflow_type = str(capability.get("workflow_type") or "clarification")
     target_channel = _extract_target_channel(text, str(capability.get("target_channel") or ""))
+    target_channels = _extract_target_channels(text, target_channel)
     command = str(capability.get("command_text") or "/kni help")
+    lowered_text = text.lower()
+    if ("across" in lowered_text or "cross-channel" in lowered_text) and len(target_channels) > 1:
+        workflow_type = "slack-cross-channel-review"
+        command = "@KNI chief of staff summarize approved cross-channel context"
+    elif (
+        any(term in lowered_text for term in ("article", "articles", "link", "links"))
+        and target_channels
+    ):
+        workflow_type = "slack-article-review"
+        command = "@KNI chief of staff review channel links"
+    elif any(
+        term in lowered_text
+        for term in ("follow-up", "follow up", "stale", "unresolved", "open loop")
+    ):
+        workflow_type = "slack-follow-up-review"
+        command = "@KNI chief of staff find unresolved follow-ups"
     if (
         workflow_type == "calendar-read"
         and target_channel == "calendar"
@@ -556,6 +3399,9 @@ def plan_chief_of_staff_request(
         mode="deterministic",
         intent=text,
         summary=summary,
+        time_window=_extract_time_window(text),
+        target_channels=target_channels,
+        operating_capabilities=_capabilities_for_request(text),
         recommended_route=route,
         recommended_actions=_action_lines(capability, target_channel or "selected channel"),
         blocked_side_effects=BLOCKED_SIDE_EFFECTS,
@@ -593,11 +3439,235 @@ def _looks_like_automation_inventory_request(text: str) -> bool:
             "automations",
             "audit current",
             "current runs",
-            "airtable",
-            "google doc",
-            "google docs",
-            "sync",
         )
+    )
+
+
+def _looks_like_google_drive_management_request(text: str) -> bool:
+    lowered = text.lower()
+    has_drive_surface = any(
+        marker in lowered
+        for marker in ("google drive", "gdrive", "drive folder", "knio", "kniops")
+    )
+    has_management_intent = any(
+        marker in lowered
+        for marker in (
+            "folder",
+            "subfolder",
+            "folders",
+            "list",
+            "what is in",
+            "what's in",
+            "rename",
+            "manage",
+            "move",
+        )
+    )
+    return has_drive_surface and has_management_intent
+
+
+def _looks_like_google_sheets_management_request(text: str) -> bool:
+    lowered = text.lower()
+    has_sheet_surface = any(
+        marker in lowered
+        for marker in (
+            "google sheet",
+            "google sheets",
+            "spreadsheet",
+            "sheet",
+            "structured data",
+        )
+    )
+    has_management_intent = any(
+        marker in lowered
+        for marker in (
+            "create",
+            "read",
+            "list",
+            "append",
+            "add row",
+            "update",
+            "modify",
+            "delete",
+            "trash",
+            "tab",
+            "row",
+            "table",
+        )
+    )
+    return has_sheet_surface and has_management_intent
+
+
+def _plan_google_sheets_management_request(text: str) -> ChiefOfStaffResult:
+    lowered = text.lower()
+    write_requests: list[ChiefOfStaffWriteRequest] = []
+    if any(
+        marker in lowered
+        for marker in ("create", "append", "add row", "update", "modify", "delete", "trash")
+    ):
+        write_requests.append(
+            ChiefOfStaffWriteRequest(
+                destination=AutomationWriteDestination.GOOGLE_SHEET,
+                title="KNIOps Structured Data",
+                summary=(
+                    "Manage structured Google Sheets data only within the configured "
+                    "KNIOps Google Drive boundary."
+                ),
+                approval_required=True,
+                live_required=True,
+                metadata={
+                    "scope": "KNIOps",
+                    "default_workbook": "KNIOps Structured Data",
+                    "delete_policy": "trash spreadsheet files or remove explicit rows/tabs only",
+                },
+            )
+        )
+    return ChiefOfStaffResult(
+        mode="deterministic",
+        intent=text,
+        summary=(
+            "Use Google Sheets as a scoped structured-data surface under KNIOps. "
+            "Prefer the KNIOps Structured Data workbook for routine tables unless "
+            "a separate spreadsheet is explicitly requested."
+        ),
+        time_window=_extract_time_window(text),
+        target_channels=_extract_target_channels(text, _extract_target_channel(text, "docs")),
+        operating_capabilities=[
+            *_capabilities_for_request(text),
+            "google_sheets_structured_data",
+        ],
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="google-drive-management",
+            command_text="@KNI chief of staff manage KNIOps Google Sheets structured data",
+            target_channel=_extract_target_channel(text, "docs"),
+            rationale=(
+                "Google Sheets operations are internal structured-data writes bounded "
+                "to KNIOps and gated by explicit approval."
+            ),
+            requires_live_connector=True,
+            requires_human_approval_before_post=True,
+        ),
+        recommended_actions=[
+            "Use google_sheet_list or google_sheet_read_table for read-only inspection.",
+            "Use google_sheet_create, append_rows, update_row, and tab tools for approved changes.",
+            "Trash spreadsheet files only when explicitly requested; do not permanently delete.",
+        ],
+        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        sources=_docs_for_topic(text),
+        context_sources_considered=[
+            "operator_and_agent_policy",
+            "keystone_slack_runtime_repo",
+            "google_workspace_knioops",
+        ],
+        repo_context_used=_repo_context_for_capability("google-drive-management"),
+        write_requests=write_requests,
+        audit_notes=[
+            "Deterministic Chief of Staff Google Sheets management routing used.",
+            (
+                "Google Sheets are structured internal records; Google Docs remain "
+                "narrative artifacts."
+            ),
+            (
+                "Sheet contents do not authorize Gmail, Slack, outreach, CRM, or "
+                "calendar side effects."
+            ),
+        ],
+    )
+
+
+def _plan_google_drive_management_request(text: str) -> ChiefOfStaffResult:
+    lowered = text.lower()
+    write_requests: list[ChiefOfStaffWriteRequest] = []
+    if any(marker in lowered for marker in ("create", "rename", "modify", "move")):
+        write_requests.append(
+            ChiefOfStaffWriteRequest(
+                destination=AutomationWriteDestination.GOOGLE_DRIVE_FOLDER,
+                title="KNIOps Folder Management",
+                summary=(
+                    "Manage folders only within the configured KNIOps Google Drive "
+                    "folder tree."
+                ),
+                approval_required=True,
+                live_required=True,
+                allowed=False,
+                status="planned",
+                blocked_reason=(
+                    "Live Google Drive folder writes require an approval reference and "
+                    "GOOGLE_WORKSPACE_WRITES_ENABLED=true."
+                ),
+                metadata=json.dumps(
+                    {
+                        "boundary": "KNIOps",
+                        "allowed_operations": ["list", "create_subfolder", "rename_subfolder"],
+                        "disallowed_operations": ["delete", "share_outside_boundary"],
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            )
+        )
+    return ChiefOfStaffResult(
+        mode="deterministic",
+        intent=text,
+        summary=(
+            "Use scoped Google Drive tools for the KNIOps folder tree: list folder "
+            "contents, create subfolders with approval, rename subfolders with approval, "
+            "and read or write Google Docs only inside that tree."
+        ),
+        time_window=_extract_time_window(text),
+        target_channels=_extract_target_channels(text),
+        operating_capabilities=[
+            "document_review",
+            "artifact_write_planning",
+            "google_drive_folder_management",
+        ],
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="google-drive-management",
+            command_text="@KNI chief of staff manage the KNIOps Drive folder",
+            target_channel=_extract_target_channel(text, "docs"),
+            rationale=(
+                "Google Drive management must stay inside KNIOps and use typed Drive/Docs "
+                "tools rather than broad Drive browsing."
+            ),
+            requires_live_connector=True,
+            requires_human_approval_before_post=True,
+        ),
+        recommended_actions=[
+            (
+                "List KNIOps or a named subfolder with `google_drive_list_folder` "
+                "when live OAuth is available."
+            ),
+            (
+                "Create or rename subfolders only with an approval reference and "
+                "`GOOGLE_WORKSPACE_WRITES_ENABLED=true`."
+            ),
+            "Create, read, or update Google Docs only inside KNIOps or its subfolders.",
+            "Do not delete, share, or modify Drive items outside KNIOps.",
+        ],
+        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        slack_post_policy="requires_human_review",
+        sources=_docs_for_topic(text),
+        context_sources_considered=[
+            "operator_and_agent_policy",
+            "keystone_local_context",
+            "keystone_slack_runtime_repo",
+            "google_workspace_oauth",
+        ],
+        repo_context_used=_repo_context_for_capability("business-agents-route"),
+        write_requests=write_requests,
+        audit_notes=[
+            "Chief of Staff planned a scoped Google Drive folder management path.",
+            "KNIOps is the only permitted Drive boundary for this capability.",
+            "No live Google Drive write was attempted by the deterministic planner.",
+        ],
     )
 
 
@@ -608,29 +3678,68 @@ def _write_requests_from_text(text: str) -> list[ChiefOfStaffWriteRequest]:
         requests.append(
             ChiefOfStaffWriteRequest(
                 destination=AutomationWriteDestination.GOOGLE_DOC,
-                title="Automation Inventory Google Doc",
-                summary="Create an internal Google Doc report from the automation inventory.",
-                approval_required=False,
+                title="Internal Google Doc",
+                summary="Create an internal Google Doc for the requested analysis or report.",
+                approval_required=True,
                 live_required=True,
                 allowed=False,
                 status="planned",
-                blocked_reason="Live Google Docs adapter is not implemented yet.",
+                blocked_reason=(
+                    "Live Google Docs writes require an approval reference and "
+                    "GOOGLE_WORKSPACE_WRITES_ENABLED=true."
+                ),
             )
         )
-    if "airtable" in lowered:
+    if (
+        "folder" in lowered
+        and any(
+            marker in lowered
+            for marker in ("google drive", "gdrive", "drive", "google doc", "google docs")
+        )
+    ):
+        requests.append(
+            ChiefOfStaffWriteRequest(
+                destination=AutomationWriteDestination.GOOGLE_DRIVE_FOLDER,
+                title="KNIOps Folder Management",
+                summary=(
+                    "Create or use a scoped KNIOps Drive subfolder for the requested "
+                    "internal artifact."
+                ),
+                approval_required=True,
+                live_required=True,
+                allowed=False,
+                status="planned",
+                blocked_reason=(
+                    "Live Google Drive folder writes require an approval reference and "
+                    "GOOGLE_WORKSPACE_WRITES_ENABLED=true."
+                ),
+                metadata=json.dumps(
+                    {
+                        "boundary": "KNIOps",
+                        "requested_surface": "google_drive_folder",
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            )
+        )
+    if _requests_airtable_write_surface(lowered):
         requests.append(
             ChiefOfStaffWriteRequest(
                 destination=AutomationWriteDestination.AIRTABLE,
                 title="Automation Inventory Airtable Mirror",
                 summary="Sync automation findings to an Airtable-shaped review table.",
-                approval_required=False,
+                approval_required=True,
                 live_required=True,
                 allowed=False,
                 status="planned",
-                blocked_reason="Live Airtable adapter is not implemented yet.",
+                blocked_reason=(
+                    "Live Airtable writes require an approval reference, "
+                    "AIRTABLE_ALLOW_WRITES=true, and AIRTABLE_WRITE_DRY_RUN=false."
+                ),
             )
         )
-    if "slack" in lowered or "summary" in lowered:
+    if "slack" in lowered:
         requests.append(
             ChiefOfStaffWriteRequest(
                 destination=AutomationWriteDestination.SLACK,
@@ -646,9 +3755,214 @@ def _write_requests_from_text(text: str) -> list[ChiefOfStaffWriteRequest]:
     return requests
 
 
-def build_chief_of_staff_agent(model: str | None = None) -> Agent:
+def _requests_airtable_write_surface(lowered: str) -> bool:
+    if "airtable" not in lowered:
+        return False
+    return bool(
+        re.search(
+            r"\b(save|add|write|publish|mirror|sync|create|update|organize)\b.{0,80}"
+            r"\b(?:to|into|in)?\s*airtable\b",
+            lowered,
+        )
+        or re.search(
+            r"\bairtable\b.{0,80}\b(record|row|mirror|write|publish|sync|update)\b",
+            lowered,
+        )
+    )
+
+
+def _looks_like_artifact_write_request(text: str) -> bool:
+    lowered = text.lower()
+    has_google_docs_surface = any(marker in lowered for marker in ("google doc", "google docs"))
+    has_airtable_surface = "airtable" in lowered
+    has_surface = has_google_docs_surface or has_airtable_surface or "artifact" in lowered
+    has_text_artifact = has_google_docs_surface and any(
+        marker in lowered
+        for marker in (
+            "note",
+            "notes",
+            "brief",
+            "summary",
+            "writeup",
+            "write-up",
+            "memo",
+            "decision log",
+            "meeting",
+            "research",
+            "artifact write test",
+            "draft artifact",
+            "text",
+        )
+    )
+    has_business_artifact = any(
+        marker in lowered
+        for marker in (
+            "company info",
+            "company profile",
+            "company note",
+            "company notes",
+            "company artifact",
+            "contact info",
+            "contact details",
+            "contacts",
+            "lead",
+            "account info",
+        )
+    )
+    return has_surface and (has_business_artifact or has_text_artifact)
+
+
+def _artifact_type_from_text(text: str) -> str:
+    lowered = text.lower()
+    if "contact" in lowered:
+        return "contact_candidates"
+    if "company" in lowered or "account" in lowered:
+        return "company_profile"
+    if "decision" in lowered:
+        return "decision_log"
+    if "meeting" in lowered:
+        return "meeting_brief"
+    if "research" in lowered:
+        return "research_brief"
+    if "memo" in lowered:
+        return "memo"
+    if "note" in lowered:
+        return "note"
+    if "summary" in lowered:
+        return "summary"
+    return "business_artifact"
+
+
+def _plan_business_artifact_write_request(text: str) -> ChiefOfStaffResult:
+    artifact_type = _artifact_type_from_text(text)
+    channels = _extract_target_channels(text, "ai-agents-workflow")
+    write_requests = []
+    for request in _write_requests_from_text(text):
+        write_requests.append(
+            request.model_copy(
+                update={
+                    "title": (
+                        "Company Profile Artifact"
+                        if artifact_type == "company_profile"
+                        else "Contact Candidate Artifact"
+                        if artifact_type == "contact_candidates"
+                        else "Text Artifact"
+                        if request.destination == AutomationWriteDestination.GOOGLE_DOC
+                        else "Business Artifact"
+                    ),
+                    "summary": (
+                        "Prepare a source-backed structured artifact for review and optional "
+                        f"{request.destination.value} publishing."
+                        if request.destination == AutomationWriteDestination.AIRTABLE
+                        else "Prepare a source-backed internal text artifact for Google Docs."
+                    ),
+                    "metadata": json.dumps(
+                        {
+                            "artifact_type": artifact_type,
+                            "canonical_state": "sqlite",
+                            "requires_source_backing": True,
+                        },
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                }
+            )
+        )
+    destinations = {request.destination for request in write_requests}
+    google_doc_text_only = (
+        destinations == {AutomationWriteDestination.GOOGLE_DOC}
+        and artifact_type not in {"company_profile", "contact_candidates"}
+    )
+    return ChiefOfStaffResult(
+        mode="deterministic",
+        intent=text,
+        summary=(
+            "Plan an internal Google Docs text artifact in the KNIOps Drive folder. "
+            "Use the supplied title/body when present, keep the artifact internal, "
+            "and only create or update live Docs with an approval reference."
+            if google_doc_text_only
+            else (
+            "Plan a source-backed internal business artifact before any Airtable or "
+            "Google Docs write. Use Business Research Analyst or Opportunity Scout "
+            "for missing company/contact facts, then publish only reviewed structured fields."
+            )
+        ),
+        time_window=_extract_time_window(text),
+        target_channels=channels,
+        operating_capabilities=_capabilities_for_request(text),
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="artifact-write-plan",
+            command_text=(
+                "@KNI chief of staff create or update an internal Google Doc text artifact"
+                if google_doc_text_only
+                else "@KNI business research analyst <company/contact artifact request>"
+            ),
+            target_channel=channels[0] if channels else "ai-agents-workflow",
+            rationale=(
+                "Google Docs text artifacts can be created or updated in the KNIOps "
+                "Drive folder when the title/body and approval boundary are clear."
+                if google_doc_text_only
+                else (
+                "Company and contact artifacts need source-backed structured data before "
+                "mirroring to Airtable or Google Docs."
+                )
+            ),
+            requires_live_connector=True,
+            requires_human_approval_before_post=True,
+        ),
+        recommended_actions=(
+            [
+                "Resolve the Google Doc title and text body.",
+                (
+                    "Create new Docs in the KNIOps Drive folder, or update an existing "
+                    "KNIOps doc by id."
+                ),
+                "Require an approval reference before any live Google Docs write.",
+            ]
+            if google_doc_text_only
+            else [
+            "Resolve the company/contact target and collect source-backed facts.",
+            "Create a structured artifact in SQLite as canonical state.",
+            "Mirror reviewed fields to Airtable or Google Docs only through typed publisher tools.",
+            ]
+        ),
+        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        slack_post_policy="requires_human_review",
+        sources=_docs_for_topic(text),
+        context_sources_considered=[
+            "operator_and_agent_policy",
+            "business_workflow_state",
+            "keystone_local_context",
+            "keystone_slack_runtime_repo",
+        ],
+        repo_context_used=_repo_context_for_capability("business-agents-route"),
+        write_requests=write_requests,
+        audit_notes=[
+            "Chief of Staff planned an internal artifact write path.",
+            "Airtable and Google Docs are review surfaces; SQLite remains canonical.",
+            "No live provider write was attempted by the deterministic planner.",
+        ],
+    )
+
+
+def build_chief_of_staff_agent(
+    model: str | None = None,
+    *,
+    quality_budget: AgentQualityBudget | None = None,
+    quality_mode: QualityMode | str | None = None,
+    request_text: str = "",
+) -> Agent:
     """Build the KNI Chief of Staff SDK agent."""
 
+    budget = quality_budget or chief_of_staff_quality_budget(
+        quality_mode,
+        request_text=request_text,
+        live_sdk=False,
+    )
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
@@ -660,17 +3974,19 @@ def build_chief_of_staff_agent(model: str | None = None) -> Agent:
         name="chief_of_staff",
         instructions=instructions,
         output_type=ChiefOfStaffResult,
-        tools=_chief_of_staff_tools(),
+        tools=_chief_of_staff_tools(request_text),
         guardrails=keystone_guardrails(),
         model=model,
+        policy_agent_name="chief_of_staff",
         model_settings=build_model_settings(
-            reasoning_effort=CHIEF_OF_STAFF_REASONING_EFFORT,
-            verbosity=CHIEF_OF_STAFF_VERBOSITY,
-            max_tokens=CHIEF_OF_STAFF_MAX_TOKENS,
+            reasoning_effort=budget.reasoning_effort or CHIEF_OF_STAFF_REASONING_EFFORT,
+            verbosity=budget.verbosity or CHIEF_OF_STAFF_VERBOSITY,
+            max_tokens=budget.max_tokens or CHIEF_OF_STAFF_MAX_TOKENS,
         ),
         handoff_description=(
-            "Use to plan KNI Slack operations routing and bounded internal review writes "
-            "across automation, calendar, Gmail, business-agent, and Slack workflows."
+            "Use to plan KNI Slack operations routing, scoped internal Slack communication, "
+            "and bounded internal review writes across automation, calendar, Gmail, "
+            "business-agent, and Slack workflows."
         ),
     )
 
@@ -682,6 +3998,9 @@ def run_chief_of_staff_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    quality_mode: QualityMode | str | None = None,
+    quality_budget: AgentQualityBudget | None = None,
+    force_sdk_interpretation: bool = False,
 ) -> TypedAgentRunResult[ChiefOfStaffResult]:
     """Run Chief of Staff through the shared typed SDK harness."""
 
@@ -689,22 +4008,71 @@ def run_chief_of_staff_sdk(
         request_text = str(typed_input.get("request") or "")
     else:
         request_text = str(typed_input or "")
-    if _looks_like_slack_history_digest_request(request_text):
+    if (
+        not force_sdk_interpretation
+        and not live
+        and _looks_like_slack_history_digest_request(request_text)
+    ):
         return TypedAgentRunResult(
             agent_name="chief_of_staff",
             output=_plan_slack_history_digest_request(request_text),
             raw_result={"deterministic": "slack_history_digest"},
             live=live,
         )
+    finance_artifact_workflow = _looks_like_finance_tracker_artifact_workflow_request(
+        request_text
+    )
+    if finance_artifact_workflow and not live:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=_plan_finance_tracker_artifact_workflow_request(request_text),
+            raw_result={"deterministic": "finance_tax_tracker_artifact_plan"},
+            live=live,
+        )
+    if (
+        _looks_like_finance_tracker_request(request_text)
+        and not finance_artifact_workflow
+        and not (live and _looks_like_finance_tracker_mutation_request(request_text))
+    ):
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=_plan_finance_tracker_request(request_text, live=live),
+            raw_result={"deterministic": "finance_tax_tracker"},
+            live=live,
+        )
 
-    return run_typed_sdk_agent(
-        agent=build_chief_of_staff_agent(model=model),
+    budget = quality_budget or chief_of_staff_quality_budget(
+        quality_mode,
+        request_text=request_text,
+        live_sdk=live,
+    )
+    result = run_typed_sdk_agent(
+        agent=build_chief_of_staff_agent(
+            model=model,
+            quality_budget=budget,
+            request_text=request_text,
+        ),
         typed_input=typed_input,
         output_type=ChiefOfStaffResult,
         run_config=run_config,
         live=live,
         session=session,
+        max_turns=budget.max_turns,
+        trace_metadata={
+            "quality_mode": budget.mode.value,
+            "quality_max_turns": budget.max_turns,
+            "quality_reasoning_effort": budget.reasoning_effort,
+            "quality_output_budget": budget.max_tokens,
+        },
     )
+    note = (
+        f"Chief of Staff quality budget used: {budget.mode.value}; "
+        f"max_turns={budget.max_turns}; reasoning_effort={budget.reasoning_effort}."
+    )
+    audit_notes = list(result.output.audit_notes)
+    if note not in audit_notes:
+        audit_notes.append(note)
+    return replace(result, output=result.output.model_copy(update={"audit_notes": audit_notes}))
 
 
 def render_chief_of_staff_result(result: ChiefOfStaffResult) -> str:

@@ -58,6 +58,9 @@ from keystone_agents.live_retrieval import (
     retrieve_company_profile_live,
 )
 from keystone_agents.live_retrieval import (
+    retrieval_diagnostics_from_metadata,
+)
+from keystone_agents.live_retrieval import (
     search_provider_label as _live_search_provider_label,
 )
 from keystone_agents.memory import retrieval_tool_performance_memory_item
@@ -328,6 +331,7 @@ def _retrieval_metadata(
     }
     if hybrid_metadata:
         payload.update(hybrid_metadata)
+    payload["retrieval_diagnostics"] = retrieval_diagnostics_from_metadata(payload)
     return payload
 
 
@@ -613,6 +617,7 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         args,
         retrieval_mode="live_search" if args.live_search else "fixture",
     )
+    payload["retrieval_diagnostics"] = payload["retrieval"].get("retrieval_diagnostics")
     if getattr(args, "manual_request_plan", None):
         payload["manual_request_plan"] = args.manual_request_plan
     _save_retrieval_tool_performance_memory(args, payload)
@@ -727,6 +732,10 @@ def main() -> int:
             raise SystemExit(str(exc)) from exc
         payload = comparison.model_dump(mode="json")
         payload["retrieval"] = retrieval
+        if isinstance(retrieval, dict):
+            primary = retrieval.get("primary")
+            if isinstance(primary, dict):
+                payload["retrieval_diagnostics"] = primary.get("retrieval_diagnostics")
         if getattr(args, "manual_request_plan", None):
             payload["manual_request_plan"] = args.manual_request_plan
         if agent_descriptor is not None:
@@ -789,6 +798,7 @@ def main() -> int:
         raise SystemExit(str(exc)) from exc
     payload = profile.model_dump()
     payload["retrieval"] = retrieval
+    payload["retrieval_diagnostics"] = retrieval.get("retrieval_diagnostics")
     if getattr(args, "manual_request_plan", None):
         payload["manual_request_plan"] = args.manual_request_plan
     if args.output_format:

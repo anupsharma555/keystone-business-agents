@@ -1,20 +1,24 @@
 <!--
 prompt_name: skills
-prompt_version: 2026-04-25.1
-prompt_purpose: Shared Keystone agent capability map and skill boundaries.
+prompt_version: 2026-05-21.1
+prompt_purpose: Shared Keystone prompt-only instruction fragments and skill boundaries.
 prompt_safety_notes: Skills do not grant live integration access; approval gates and no-send rules remain mandatory.
 prompt_eval_datasets: tests/evals/gmail_triage_cases.json, tests/evals/business_research_analyst_cases.json, tests/evals/opportunity_scout_cases.json, tests/evals/outreach_composer_cases.json
 -->
 
 # Keystone Agent Skills
 
-This file defines reusable skills for Keystone SDK agents. A skill is a bounded
-capability pattern that tells an agent how to reason, decide, and hand off work.
-It is not a live integration and does not expand the agent's attached tools.
+This file defines reusable prompt-only instruction fragments for Keystone SDK
+agents. In Keystone, a skill is a bounded reasoning and output pattern that
+tells an agent how to apply the current prompt, schema, tools, handoffs, and
+safety policy. It is not a runtime capability model, hidden router, live
+integration, tool bundle, MCP server, ShellTool skill, or dynamic tool attachment path.
 
 ## Shared Rules
 
 - Use only tools attached to the current SDK agent.
+- Treat skills as prompt guidance only. They never select routes, attach tools,
+  grant permissions, or create capabilities outside the registered SDK agent.
 - Treat dry-run fixture mode as the default.
 - Require explicit live flags and credentials before any live integration path.
 - Keep source attribution with company, opportunity, contact, CRM, and outreach claims.
@@ -225,6 +229,10 @@ PHI processing, unsupported claims, longer copy, or bypassing human approval.
 Before adding a new skill, record:
 
 - Owner agent.
+- Whether the change is prompt-only. If runtime behavior is required, use an
+  existing explicit capability surface such as `AgentSpec`, attached tools,
+  handoffs, guardrails, output schemas, or WorkItem gates instead of inventing
+  hidden skill routing.
 - Required input schema.
 - Output schema fields affected.
 - Allowed tools.

@@ -1350,6 +1350,28 @@ def test_orchestrator_typed_runtime_uses_fake_model_without_openai_key(
     assert result.final_output.send_enabled is False
 
 
+def test_orchestrator_live_sdk_prompt_includes_backend_browser_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("KEYSTONE_PLAYWRIGHT_ENABLED", "true")
+    model = FakeModel(outputs=[[_structured_message(_orchestrator_payload())]])
+    provider = FakeProvider(model)
+
+    run_orchestrator_sdk(
+        "Diagnose https://example.com with backend browser diagnostics.",
+        live=True,
+        run_config=build_local_run_config(provider),
+    )
+
+    prompt = _model_input_text(model.calls[0]["input"])
+    assert "backend_browser_diagnostics_allowed" in prompt
+    assert "capture_browser_diagnostics" in prompt
+    assert "Use live=true for backend browser diagnostics" in prompt
+    assert "No writes, posts, sends" in prompt
+
+
 def test_orchestrator_llm_output_review_uses_fake_model_with_cost_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

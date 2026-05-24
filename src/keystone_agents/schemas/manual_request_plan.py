@@ -25,6 +25,7 @@ ManualRequestIntent = Literal[
     "gmail_triage",
     "outreach_draft",
     "slack_operations",
+    "browser_diagnostics",
     "reference_capture",
     "continue_work_item",
     "blocked_send",
@@ -44,6 +45,7 @@ ManualTargetType = Literal[
     "opportunity",
     "operator_reference",
     "slack_channel",
+    "url",
     "unknown",
 ]
 

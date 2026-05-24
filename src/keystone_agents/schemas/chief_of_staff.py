@@ -11,16 +11,34 @@ from keystone_agents.schemas.automation import (
     AutomationInventoryReport,
     ChiefOfStaffWriteRequest,
 )
+from keystone_agents.schemas.memory import ChiefOfStaffMemoryContext
 
 ChiefOfStaffMode = Literal["deterministic", "llm", "llm_unavailable"]
+ChiefOfStaffSlackPostPolicy = Literal[
+    "not_allowed",
+    "draft_only",
+    "channel_policy_allowed",
+    "requires_human_review",
+]
 ChiefOfStaffWorkflowType = Literal[
     "calendar-read",
     "gmail-summary",
     "gmail-triage",
     "business-agents-route",
     "slack-runtime-review",
+    "slack-cross-channel-review",
+    "slack-article-review",
+    "slack-follow-up-review",
     "slack-docs-review",
+    "project-context-review",
+    "research-direction-review",
+    "budget-resource-review",
+    "meeting-prep",
+    "portfolio-review",
+    "artifact-write-plan",
+    "google-drive-management",
     "reference-capture",
+    "memory-review",
     "clarification",
 ]
 
@@ -69,13 +87,6 @@ class ChiefOfStaffRouteRecommendation(BaseModel):
     def _clean_fields(cls, value: object) -> str:
         return _clean_text(value)
 
-    @field_validator("requires_human_approval_before_post")
-    @classmethod
-    def _approval_required(cls, value: bool) -> bool:
-        if value is not True:
-            raise ValueError("Chief of Staff Slack routing requires approval before posting.")
-        return value
-
 
 class ChiefOfStaffResult(BaseModel):
     """Structured Chief of Staff recommendation with gated operating writes."""
@@ -84,13 +95,16 @@ class ChiefOfStaffResult(BaseModel):
     mode: ChiefOfStaffMode = "deterministic"
     intent: str = ""
     summary: str = ""
+    time_window: str = ""
+    target_channels: list[str] = Field(default_factory=list)
+    operating_capabilities: list[str] = Field(default_factory=list)
     recommended_route: ChiefOfStaffRouteRecommendation = Field(
         default_factory=ChiefOfStaffRouteRecommendation
     )
     recommended_actions: list[str] = Field(default_factory=list)
     blocked_side_effects: list[str] = Field(
         default_factory=lambda: [
-            "direct_slack_post",
+            "unscoped_slack_post",
             "gmail_send",
             "calendar_create_or_update",
             "repo_write",
@@ -102,10 +116,14 @@ class ChiefOfStaffResult(BaseModel):
     human_review_required: bool = True
     send_enabled: bool = False
     slack_post_allowed: bool = False
+    slack_post_policy: ChiefOfStaffSlackPostPolicy = "not_allowed"
+    slack_target_channel: str = ""
+    slack_post_reason: str = ""
     sources: list[ChiefOfStaffSourceRef] = Field(default_factory=list)
     context_sources_considered: list[str] = Field(default_factory=list)
     repo_context_used: list[str] = Field(default_factory=list)
     automation_report: AutomationInventoryReport | None = None
+    memory_context: ChiefOfStaffMemoryContext | None = None
     write_requests: list[ChiefOfStaffWriteRequest] = Field(default_factory=list)
     artifact_refs: list[AutomationArtifactRef] = Field(default_factory=list)
     audit_notes: list[str] = Field(default_factory=list)
@@ -121,6 +139,8 @@ class ChiefOfStaffResult(BaseModel):
         "context_sources_considered",
         "repo_context_used",
         "audit_notes",
+        "target_channels",
+        "operating_capabilities",
         mode="before",
     )
     @classmethod
@@ -134,15 +154,46 @@ class ChiefOfStaffResult(BaseModel):
             raise ValueError("Chief of Staff recommendations require human review and approval.")
         return value
 
-    @field_validator("send_enabled", "slack_post_allowed")
+    @field_validator("send_enabled")
     @classmethod
-    def _side_effects_blocked(cls, value: bool) -> bool:
+    def _email_send_blocked(cls, value: bool) -> bool:
         if value is not False:
-            raise ValueError("Chief of Staff v1 cannot send or post to Slack directly.")
+            raise ValueError("Chief of Staff cannot send email or external messages directly.")
         return value
+
+    @field_validator(
+        "slack_post_policy",
+        "slack_target_channel",
+        "slack_post_reason",
+        mode="before",
+    )
+    @classmethod
+    def _clean_slack_policy_fields(cls, value: object) -> str:
+        return _clean_text(value)
 
     @model_validator(mode="after")
     def _enforce_blocked_outputs(self) -> ChiefOfStaffResult:
-        if self.recommended_route.requires_human_approval_before_post is not True:
-            raise ValueError("recommended route must require human approval before posting")
+        route_channel = self.recommended_route.target_channel.strip()
+        target_channel = self.slack_target_channel.strip() or route_channel
+        if self.slack_post_allowed:
+            if self.slack_post_policy != "channel_policy_allowed":
+                raise ValueError(
+                    "slack_post_allowed requires slack_post_policy='channel_policy_allowed'."
+                )
+            if not target_channel:
+                raise ValueError("slack_post_allowed requires a target Slack channel.")
+            if "unscoped_slack_post" in self.blocked_side_effects:
+                raise ValueError(
+                    "slack_post_allowed cannot leave unscoped_slack_post in blocked_side_effects."
+                )
+        elif self.slack_post_policy == "channel_policy_allowed":
+            raise ValueError("channel_policy_allowed requires slack_post_allowed=True.")
+
+        if (
+            self.recommended_route.requires_human_approval_before_post is not True
+            and not self.slack_post_allowed
+        ):
+            raise ValueError(
+                "Slack routing can skip human approval only for channel-policy-allowed posts."
+            )
         return self

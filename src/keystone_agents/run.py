@@ -23,6 +23,7 @@ from keystone_agents.model_provider import (
     ModelProviderConfigurationError,
     TraceConfig,
     TraceMetadata,
+    get_gemini_fallback_model_config,
     get_openai_fallback_model_config,
     get_runtime_agent_model_config,
 )
@@ -106,6 +107,7 @@ def run_typed_sdk_agent(
     tracing_disabled: bool | None = None,
     trace_include_sensitive_data: bool | None = None,
     trace_config: TraceConfig | None = None,
+    max_turns: int | None = None,
 ) -> TypedAgentRunResult[TOutput]:
     """Run an SDK agent through a typed, credential-safe execution path."""
 
@@ -138,6 +140,7 @@ def run_typed_sdk_agent(
         tracing_disabled=tracing_disabled,
         trace_include_sensitive_data=trace_include_sensitive_data,
         trace_config=trace_config,
+        max_turns=max_turns,
     )
     usage = _extract_sdk_usage(raw_result)
     cost = estimate_usage_cost(provider=model_provider, model=model_name, usage=usage)
@@ -446,13 +449,23 @@ def run_retrieved_sdk_synthesis(
         resolved_model_provider = resolved_model_config.provider
         resolved_model_name = resolved_model_config.model
         resolved_model_run_mode = "live_sdk" if live else "sdk"
-    fallback_model_config = (
-        get_openai_fallback_model_config(
-            getattr(agent, "name", None),
-            model_override=None,
-        )
+    fallback_model_configs = (
+        [
+            fallback_config
+            for fallback_config in (
+                get_openai_fallback_model_config(
+                    getattr(agent, "name", None),
+                    model_override=None,
+                ),
+                get_gemini_fallback_model_config(
+                    getattr(agent, "name", None),
+                    model_override=None,
+                ),
+            )
+            if fallback_config is not None
+        ]
         if live and run_config is None and config is None
-        else None
+        else []
     )
 
     workflow = workflow_name or f"Keystone {agent.name} SDK synthesis"
@@ -479,7 +492,7 @@ def run_retrieved_sdk_synthesis(
 
     try:
         live_attempts: list[tuple[str, ModelConfig | None]] = [(resolved_model_provider, config)]
-        if fallback_model_config is not None:
+        for fallback_model_config in fallback_model_configs:
             live_attempts.append((fallback_model_config.provider, fallback_model_config))
 
         last_exc: Exception | None = None
@@ -509,17 +522,22 @@ def run_retrieved_sdk_synthesis(
                 last_exc = exc
                 if isinstance(
                     exc,
-                    AgentRunBudgetExceededError
-                    | MissingOpenAIAPIKeyError
-                    | ModelProviderConfigurationError,
+                    AgentRunBudgetExceededError | ModelProviderConfigurationError,
                 ):
+                    raise
+                if isinstance(exc, MissingOpenAIAPIKeyError) and not fallback_model_configs:
                     raise
                 if attempt_index >= len(live_attempts) - 1:
                     raise
+                fallback_provider = live_attempts[attempt_index + 1][0]
+                fallback_label = {"openai": "OpenAI", "gemini": "Gemini"}.get(
+                    fallback_provider,
+                    fallback_provider,
+                )
                 audit_notes.append(
                     "Primary live SDK provider "
                     f"{attempt_provider} failed with {type(exc).__name__}; "
-                    "retried once with OpenAI fallback."
+                    f"retried once with {fallback_label} fallback."
                 )
         else:
             raise RuntimeError("SDK synthesis did not execute a model attempt.") from last_exc

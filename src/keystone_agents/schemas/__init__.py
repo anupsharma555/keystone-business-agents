@@ -1,5 +1,10 @@
 """Pydantic schemas for structured agent outputs."""
 
+from keystone_agents.schemas.airtable import (
+    AirtableBaseSchemaSummary,
+    AirtableFieldSummary,
+    AirtableTableSummary,
+)
 from keystone_agents.schemas.approval import (
     ApprovalDecisionRecord,
     ApprovalRequest,
@@ -39,6 +44,7 @@ from keystone_agents.schemas.context_pack import (
     ContextPackBase,
     ContextPackReadinessGate,
     GmailContextPack,
+    MemoryContextRef,
     OpportunityContextPack,
     OutreachContactContext,
     OutreachContextPack,
@@ -95,7 +101,12 @@ from keystone_agents.schemas.manual_request_plan import (
     ManualTargetAgent,
     ManualTargetType,
 )
+from keystone_agents.schemas.gmail_execution_plan import (
+    GmailExecutionOperation,
+    GmailExecutionPlan,
+)
 from keystone_agents.schemas.memory import (
+    ChiefOfStaffMemoryContext,
     MemoryItem,
     MemoryRetrievalResult,
     MemorySensitivity,
@@ -109,6 +120,10 @@ from keystone_agents.schemas.opportunity import (
     OpportunitySignal,
     OpportunitySourceBundle,
     OpportunityStateDecision,
+)
+from keystone_agents.schemas.outreach_execution_plan import (
+    OutreachExecutionOperation,
+    OutreachExecutionPlan,
 )
 from keystone_agents.schemas.opportunity import (
     OpportunityRecord as ScoutOpportunityRecord,
@@ -201,6 +216,11 @@ from keystone_agents.schemas.work_item import (
     WorkItemStatus,
     WorkItemTarget,
 )
+from keystone_agents.schemas.web_data import (
+    StructuredWebRecord,
+    WebDataFieldSpec,
+    WebDataSchemaMappingResult,
+)
 
 OpportunityRecord = ScoutOpportunityRecord
 
@@ -222,6 +242,9 @@ __all__ = [
     "AutomationSpec",
     "ChiefOfStaffWriteRequest",
     "NaturalInteractionResolution",
+    "AirtableBaseSchemaSummary",
+    "AirtableFieldSummary",
+    "AirtableTableSummary",
     "SourceRecord",
     "ContactRecord",
     "CRMAccountContext",
@@ -229,6 +252,7 @@ __all__ = [
     "ContextPackBase",
     "ContextPackReadinessGate",
     "GmailContextPack",
+    "MemoryContextRef",
     "OpportunityContextPack",
     "OutreachContactContext",
     "OutreachContextPack",
@@ -268,6 +292,7 @@ __all__ = [
     "validate_orchestrator_to_approval_review",
     "validate_outreach_composer_to_orchestrator",
     "validate_pipeline_handoff_contracts",
+    "ChiefOfStaffMemoryContext",
     "MemoryItem",
     "MemoryRetrievalResult",
     "MemorySensitivity",
@@ -276,6 +301,8 @@ __all__ = [
     "ManualRequestPlan",
     "ManualTargetAgent",
     "ManualTargetType",
+    "GmailExecutionOperation",
+    "GmailExecutionPlan",
     "Opportunity",
     "OpportunitySignal",
     "OpportunitySourceBundle",
@@ -286,6 +313,8 @@ __all__ = [
     "ScoutOpportunityRecord",
     "OutreachOpportunityRecord",
     "OpportunityScoutResult",
+    "OutreachExecutionOperation",
+    "OutreachExecutionPlan",
     "OpportunitySearchObjective",
     "OpportunitySearchPlan",
     "OpportunityTargetEntity",
@@ -318,6 +347,9 @@ __all__ = [
     "WorkItemTarget",
     "WorkflowRunRequest",
     "WorkflowRunResult",
+    "StructuredWebRecord",
+    "WebDataFieldSpec",
+    "WebDataSchemaMappingResult",
     "ApprovedOutreachDraftingContext",
     "CallPrepArtifact",
     "FollowUpScheduleRecord",

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from keystone_agents.schemas.opportunity_search_plan import OpportunitySearchPlan
+from keystone_agents.schemas.opportunity_search_plan import (
+    OpportunitySearchLane,
+    OpportunitySearchPlan,
+)
 
 
 def infer_opportunity_search_plan(
@@ -31,8 +34,29 @@ def infer_opportunity_search_plan(
         ),
     )
 
+    if _mixed_meeting_grant_intent(lowered):
+        return _meeting_grant_search_plan(plan)
+
     if _broad_intent(lowered):
         return _broad_search_plan(plan)
+
+    if _github_repository_intent(lowered):
+        plan.target_entity_types = ["github_repository"]
+        plan.objectives = ["open_source_tooling"]
+        plan.must_include_terms = ["github", "open source", "repository", "license"]
+        plan.exclude_entity_types = [
+            "company",
+            "institute",
+            "researcher",
+            "conference",
+            "journal_call",
+            "contract_rfp",
+            "grant_program",
+            "trial",
+            "role",
+        ]
+        plan.strict_targeting = True
+        return plan
 
     if _conference_intent(lowered):
         plan.target_entity_types = ["conference"]
@@ -150,6 +174,50 @@ def _broad_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearchPlan:
     return plan
 
 
+def _meeting_grant_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearchPlan:
+    plan.target_entity_types = ["conference", "grant_program"]
+    plan.objectives = ["presentation_opportunity", "funding"]
+    plan.must_include_terms = [
+        "conference",
+        "meeting",
+        "call for abstracts",
+        "speaker",
+        "grant",
+        "funding opportunity",
+        "deadline",
+    ]
+    plan.exclude_entity_types = ["company", "role", "github_repository"]
+    plan.strict_targeting = True
+    plan.desired_count = max(2, plan.desired_count)
+    plan.lanes = [
+        OpportunitySearchLane(
+            lane_type="meeting_conference",
+            desired_count=1,
+            target_entity_type="conference",
+            objective="presentation_opportunity",
+            required_fields=["title", "organizer", "date_or_deadline", "source_url"],
+            acceptance_criteria=[
+                "specific event, meeting, conference, workshop, abstract call, or speaker call",
+                "must include event date or submission deadline when available",
+                "do not satisfy with a generic conferences funding category page",
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="grant_funding",
+            desired_count=1,
+            target_entity_type="grant_program",
+            objective="funding",
+            required_fields=["title", "funder", "deadline_or_status", "source_url"],
+            acceptance_criteria=[
+                "specific active grant, funding notice, forecast, or program page",
+                "must include deadline, due date, posted date, or active status when available",
+                "do not satisfy with a generic funding topic page alone",
+            ],
+        ),
+    ]
+    return plan
+
+
 def merge_opportunity_search_plan(
     base: OpportunitySearchPlan,
     candidate: OpportunitySearchPlan | dict[str, Any] | None,
@@ -173,6 +241,8 @@ def merge_opportunity_search_plan(
         merged.domains = list(base.domains)
     if not merged.must_include_terms:
         merged.must_include_terms = list(base.must_include_terms)
+    if not merged.lanes:
+        merged.lanes = list(base.lanes)
     if (
         base.strict_targeting
         and plan_targets_only(base, "company")
@@ -209,6 +279,33 @@ def _domains_from_topic(lowered: str) -> list[str]:
         "evidence generation",
     )
     return [phrase for phrase in phrases if phrase in lowered]
+
+
+def _mixed_meeting_grant_intent(lowered: str) -> bool:
+    if not lowered:
+        return False
+    if "across" in lowered or "all lanes" in lowered or "multiple lanes" in lowered:
+        return False
+    meeting = any(
+        marker in lowered
+        for marker in (
+            "meeting",
+            "meetings",
+            "conference",
+            "conferences",
+            "workshop",
+            "symposium",
+            "speaker",
+            "abstract",
+        )
+    )
+    funding = any(
+        marker in lowered
+        for marker in ("grant", "grants", "funding", "funder", "nofo", "sbir")
+    )
+    return meeting and funding and any(
+        marker in lowered for marker in ("1 ", "one ", "exactly", "each", " and ")
+    )
 
 
 def _conference_intent(lowered: str) -> bool:
@@ -321,6 +418,24 @@ def _role_intent(lowered: str) -> bool:
     return any(
         marker in f" {lowered} "
         for marker in (" role ", " roles ", " job ", " jobs ", " hiring ", " remote ")
+    )
+
+
+def _github_repository_intent(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "github repo",
+            "github repository",
+            "github repositories",
+            "open source repo",
+            "open-source repo",
+            "open source repository",
+            "open-source repository",
+            "repositories",
+            "repos",
+            "developer tooling",
+        )
     )
 
 

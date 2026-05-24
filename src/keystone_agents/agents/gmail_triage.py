@@ -52,11 +52,21 @@ from keystone_agents.tools.gmail_tool import (
     get_gmail_message,
     gmail_message_envelope_from_dict,
 )
+from keystone_agents.tools.internal_data_tools import (
+    airtable_get_base_schema,
+    airtable_read_records,
+    airtable_write_record,
+    google_workspace_tools,
+)
 from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
     search_local_context,
 )
+from keystone_agents.tools.memory_tool import retrieve_memory
+from keystone_agents.tools.serper_tool import search_web
+from keystone_agents.tools.storage_tool import list_outreach_tracking_records
+from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
 
 
 @dataclass(frozen=True)
@@ -476,13 +486,22 @@ def build_gmail_triage_agent(
                 list_local_context_sources,
                 search_local_context,
                 read_local_context_file,
+                retrieve_memory,
+                airtable_get_base_schema,
+                airtable_read_records,
+                airtable_write_record,
+                search_web,
+                structure_web_data_for_schema,
+                list_outreach_tracking_records,
                 create_approval_queue_item,
+                *google_workspace_tools(),
             ]
             if include_tools
             else []
         ),
         guardrails=keystone_guardrails(),
         model=model,
+        policy_agent_name="gmail_triage",
         handoff_description=(
             "Use for inbound email classification, label planning, suspicious message review, "
             "and draft-only reply preparation."

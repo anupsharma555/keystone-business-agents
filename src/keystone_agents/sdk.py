@@ -334,7 +334,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REPO_AGENT_GUIDE = "AGENTS.md"
 SHARED_PRE_RUN_PROMPTS = (
     "memory_policy.md",
+    "agent-operating-architecture.md",
     "writing_style.md",
+    "slack-posting-rules.md",
     "operator_context.md",
     "local_context.md",
 )
@@ -622,10 +624,20 @@ def build_sdk_agent(
     model: str | None = None,
     model_settings: Any | None = None,
     handoff_description: str | None = None,
+    policy_agent_name: str | None = None,
+    enforce_tool_policy: bool = True,
 ) -> AgentLike:
     """Construct an OpenAI Agents SDK `Agent` without making a model call."""
 
     tools_list = list(tools or [])
+    if policy_agent_name:
+        from keystone_agents.agent_tool_policy import validate_agent_tool_policy
+
+        validate_agent_tool_policy(
+            policy_agent_name,
+            tools_list,
+            strict=enforce_tool_policy,
+        )
     sdk_tools_list = [_sdk_tool_for(tool) for tool in tools_list]
     handoffs_list = list(handoffs or [])
     input_guardrails, output_guardrails = _split_guardrails(guardrails)
@@ -670,6 +682,8 @@ def create_agent(
     guardrails: GuardrailSpec = None,
     handoff_description: str | None = None,
     model_settings: Any | None = None,
+    policy_agent_name: str | None = None,
+    enforce_tool_policy: bool = True,
 ) -> AgentLike:
     """Backward-compatible alias for older scaffold builders."""
 
@@ -683,6 +697,8 @@ def create_agent(
         model=model,
         model_settings=model_settings,
         handoff_description=handoff_description,
+        policy_agent_name=policy_agent_name,
+        enforce_tool_policy=enforce_tool_policy,
     )
 
 
@@ -826,10 +842,14 @@ def _run_sync_with_optional_session(
     *,
     run_config: Any,
     session: Any | None = None,
+    max_turns: int | None = None,
 ) -> Any:
-    if session is None:
-        return Runner.run_sync(agent, prompt, run_config=run_config)
-    return Runner.run_sync(agent, prompt, run_config=run_config, session=session)
+    kwargs: dict[str, Any] = {"run_config": run_config}
+    if session is not None:
+        kwargs["session"] = session
+    if max_turns is not None:
+        kwargs["max_turns"] = max_turns
+    return Runner.run_sync(agent, prompt, **kwargs)
 
 
 def run_sdk_sync(
@@ -844,6 +864,7 @@ def run_sdk_sync(
     tracing_disabled: bool | None = None,
     trace_include_sensitive_data: bool | None = None,
     trace_config: TraceConfig | None = None,
+    max_turns: int | None = None,
 ) -> Any:
     """Run an SDK agent only after an explicit live-readiness check."""
 
@@ -862,6 +883,7 @@ def run_sdk_sync(
         prompt,
         run_config=run_config,
         session=session,
+        max_turns=max_turns,
     )
 
 
@@ -871,6 +893,7 @@ def run_sdk_sync_with_config(
     run_config: Any,
     *,
     session: Any | None = None,
+    max_turns: int | None = None,
 ) -> Any:
     """Run an SDK agent with an explicit local/fake run config."""
 
@@ -880,6 +903,7 @@ def run_sdk_sync_with_config(
         prompt,
         run_config=run_config,
         session=session,
+        max_turns=max_turns,
     )
 
 
@@ -908,6 +932,7 @@ def run_typed_sdk_sync(
     tracing_disabled: bool | None = None,
     trace_include_sensitive_data: bool | None = None,
     trace_config: TraceConfig | None = None,
+    max_turns: int | None = None,
 ) -> tuple[Any, TOutput]:
     """Run an SDK agent and validate the final output type.
 
@@ -917,7 +942,13 @@ def run_typed_sdk_sync(
     """
 
     if run_config is not None:
-        raw_result = run_sdk_sync_with_config(agent, prompt, run_config, session=session)
+        raw_result = run_sdk_sync_with_config(
+            agent,
+            prompt,
+            run_config,
+            session=session,
+            max_turns=max_turns,
+        )
     else:
         if not live:
             raise RuntimeError(
@@ -935,6 +966,7 @@ def run_typed_sdk_sync(
             tracing_disabled=tracing_disabled,
             trace_include_sensitive_data=trace_include_sensitive_data,
             trace_config=trace_config,
+            max_turns=max_turns,
         )
 
     return raw_result, _coerce_typed_output(raw_result.final_output, output_type)

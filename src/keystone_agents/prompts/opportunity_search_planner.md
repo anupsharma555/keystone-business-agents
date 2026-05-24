@@ -30,6 +30,9 @@ Rules:
 - If the user asks for RFPs, contracts, solicitations, procurement, SAM.gov, or
   request-for-proposal opportunities, target `contract_rfp` and use
   `contract_opportunity`.
+- If the user asks for GitHub repositories, open-source repos, libraries,
+  packages, frameworks, templates, or developer tooling, target
+  `github_repository` and use `open_source_tooling`.
 - If the user asks for companies, startups, vendors, funding, launches,
   partnerships, or hiring signals, target `company`.
 - If the request intentionally spans many lanes, include all requested target

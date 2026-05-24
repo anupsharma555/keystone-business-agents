@@ -40,6 +40,8 @@ Start here when changing or operating the repository.
 
 - `docs/ADD_AGENT.md`: checklist for adding a new SDK agent safely.
 - `docs/AGENTS_SDK_CONFORMANCE.md`: project mapping to OpenAI Agents SDK concepts.
+- `docs/AGENTS_SDK_REVIEW.md`: current SDK/public-implementation review,
+  context-source map, and MCP decision rules.
 - `src/keystone_agents/agent_registry.py`: canonical `AgentSpec` registry and agent cards.
 - `docs/AGENT_LEARNING_LOOP.md`: feedback to eval to prompt-version promotion path.
 
