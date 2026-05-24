@@ -39,6 +39,7 @@ from keystone_agents.tools.storage_tool import (
     load_approved_crm_context,
     load_pending_approval_items,
 )
+from scripts.scan_repo_secrets import scan_tracked_files
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 KEYSTONE_AGENTS_ROOT = PROJECT_ROOT / "src" / "keystone_agents"
@@ -286,32 +287,10 @@ def test_runbook_documents_outreach_templates_and_private_example_rag() -> None:
 
 
 def test_no_obvious_repo_secrets_present() -> None:
-    secret_patterns = (
-        re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
-        re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----"),
-    )
-    text_suffixes = {
-        ".env",
-        ".example",
-        ".json",
-        ".md",
-        ".py",
-        ".toml",
-        ".txt",
-        ".yaml",
-        ".yml",
-    }
+    report = scan_tracked_files(PROJECT_ROOT)
 
-    for path in PROJECT_ROOT.rglob("*"):
-        if path.is_dir():
-            continue
-        if {".git", ".pytest_cache", ".venv", "__pycache__"} & set(path.parts):
-            continue
-        if path.suffix not in text_suffixes:
-            continue
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        for pattern in secret_patterns:
-            assert not pattern.search(text), f"secret-like value found in {path}"
+    assert report.scanned_files > 0
+    assert report.findings == ()
 
 
 def test_outbound_copy_prompts_forbid_em_dash() -> None:
