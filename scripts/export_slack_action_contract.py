@@ -9,7 +9,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from keystone_agents.slack_action_contract import business_agent_slack_contract
 from keystone_agents.slack_actions import SlackSelectedMessageContext
 
-
 DEFAULT_OUTPUT = Path("contracts/keystone_slack_business_agent_contract.v1.json")
 
 

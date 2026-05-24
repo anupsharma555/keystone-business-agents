@@ -104,7 +104,8 @@ BUSINESS_AGENT_WRITE_GATE_SCHEMA = "keystone.business_agent_write_request.v1"
 BUSINESS_AGENT_WRITE_GATE_INTENT = "approve_agent_write_request"
 BUSINESS_AGENT_WRITE_GATE_NO_SEND_TEXT = (
     "This approval only lets the AI agent run this request. It does not allow sending email, "
-    "posting externally, publishing, scheduling, or creating live drafts unless a later specific gate allows it."
+    "posting externally, publishing, scheduling, or creating live drafts unless a later "
+    "specific gate allows it."
 )
 
 
@@ -330,6 +331,9 @@ def business_agent_slack_contract() -> dict[str, Any]:
         },
         "notes": [
             "Legacy approval action IDs are supported for compatibility only.",
-            "The contract is side-effect free and does not authorize Slack, Gmail, calendar, CRM, or external writes.",
+            (
+                "The contract is side-effect free and does not authorize Slack, Gmail, "
+                "calendar, CRM, or external writes."
+            ),
         ],
     }

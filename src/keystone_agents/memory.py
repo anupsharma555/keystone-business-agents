@@ -409,9 +409,7 @@ def chief_of_staff_memory_item(
             **(content or {}),
         },
         source_ids=list(
-            dict.fromkeys(
-                _bounded_text(item, max_chars=240) for item in source_ids if item
-            )
+            dict.fromkeys(_bounded_text(item, max_chars=240) for item in source_ids if item)
         ),
         approval_state=approval_state,
         confidence=max(0.0, min(1.0, confidence)),
@@ -434,8 +432,7 @@ def build_chief_of_staff_memory_context(
     """Retrieve bounded approved strategic memory for a Chief of Staff run."""
 
     selected_types = tuple(
-        memory_types
-        or CHIEF_OF_STAFF_ROUTE_MEMORY_TYPES.get(route, CHIEF_OF_STAFF_MEMORY_TYPES)
+        memory_types or CHIEF_OF_STAFF_ROUTE_MEMORY_TYPES.get(route, CHIEF_OF_STAFF_MEMORY_TYPES)
     )
     store = SQLiteStore(database_url)
     records = store.retrieve_memory(

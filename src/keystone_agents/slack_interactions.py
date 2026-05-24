@@ -289,9 +289,7 @@ def handle_slack_approval_interaction(
                     "no email was sent."
                 )
             elif draft_status == "skipped":
-                reason = str(
-                    gmail_draft_result.get("reason") or "missing required draft metadata"
-                )
+                reason = str(gmail_draft_result.get("reason") or "missing required draft metadata")
                 followup_text = (
                     f"Approved. Gmail draft was not created: {reason}; no email was sent."
                 )
@@ -342,9 +340,8 @@ def handle_slack_approval_interaction(
         work_item_gate_state=gate_update.new_state if gate_update else "",
         work_item_gate_changed=bool(gate_update and gate_update.changed),
         work_item_event_recorded=bool(gate_update and gate_update.event_recorded),
-        idempotent=previous_queue_status == status and not bool(
-            gate_update and gate_update.changed
-        ),
+        idempotent=previous_queue_status == status
+        and not bool(gate_update and gate_update.changed),
         slack_channel_id=slack_context.get("channel_id", ""),
         slack_message_ts=slack_context.get("message_ts", ""),
     )
@@ -371,9 +368,7 @@ def _handle_kba_action(
         result = handle_slack_approval_interaction(
             legacy,
             database_url=database_url,
-            create_email_draft=(
-                action_id == KBA_CREATE_GMAIL_DRAFT or create_email_draft
-            ),
+            create_email_draft=(action_id == KBA_CREATE_GMAIL_DRAFT or create_email_draft),
             live_gmail=live_gmail,
         )
         outcome = (
@@ -405,8 +400,7 @@ def _handle_kba_action(
             followup_text="Opening revision instructions modal.",
             modal_view=_build_revision_modal(action_payload, item),
             work_item_id=(
-                action_payload.work_item_id
-                or str((item.metadata or {}).get("work_item_id") or "")
+                action_payload.work_item_id or str((item.metadata or {}).get("work_item_id") or "")
             ),
             slack_channel_id=action_payload.source_channel_id,
             slack_message_ts=action_payload.source_message_ts,
@@ -443,9 +437,7 @@ def _handle_kba_revision_modal_submission(
             followup_text="Revision instructions are required.",
             slack_view_response_payload={
                 "response_action": "errors",
-                "errors": {
-                    KBA_REVISION_FEEDBACK_BLOCK_ID: "Tell the agent what to change."
-                },
+                "errors": {KBA_REVISION_FEEDBACK_BLOCK_ID: "Tell the agent what to change."},
             },
             work_item_id=action_payload.work_item_id,
             slack_channel_id=action_payload.source_channel_id,
@@ -702,9 +694,7 @@ def _handle_research_all_candidates_action(
     database_url: str | None,
 ) -> SlackApprovalInteractionResult:
     opportunity_refs = [
-        artifact
-        for artifact in work_item.artifact_refs
-        if artifact.artifact_type == "opportunity"
+        artifact for artifact in work_item.artifact_refs if artifact.artifact_type == "opportunity"
     ]
     if not opportunity_refs:
         return _kba_result(
@@ -713,9 +703,7 @@ def _handle_research_all_candidates_action(
             approval_status=approval_status,
             reviewer=reviewer,
             outcome="research_all_blocked",
-            followup_text=(
-                f"No opportunity candidates are attached to WorkItem `{work_item.id}`."
-            ),
+            followup_text=(f"No opportunity candidates are attached to WorkItem `{work_item.id}`."),
             item=item,
             work_item=work_item,
         )
@@ -762,7 +750,9 @@ def _handle_research_all_candidates_action(
             route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
         )
         current = latest_result.work_item
-        researched_titles.append(artifact.title or f"{artifact.artifact_type}:{artifact.artifact_id}")
+        researched_titles.append(
+            artifact.title or f"{artifact.artifact_type}:{artifact.artifact_id}"
+        )
 
     activity = _agent_activity_payload(latest_result) if latest_result is not None else None
     if activity is not None:
@@ -780,8 +770,7 @@ def _handle_research_all_candidates_action(
         reviewer=reviewer,
         outcome="research_all_queued",
         followup_text=(
-            f"Research ran for {len(researched_titles)} candidate(s) on WorkItem "
-            f"`{current.id}`."
+            f"Research ran for {len(researched_titles)} candidate(s) on WorkItem `{current.id}`."
         ),
         item=item,
         work_item=current,
@@ -1283,8 +1272,7 @@ def _has_recorded_kba_action(store: SQLiteStore, work_item_id: str, dedupe_key: 
     if not dedupe_key:
         return False
     return any(
-        event.event_type == "slack_action_intent"
-        and event.metadata.get("dedupe_key") == dedupe_key
+        event.event_type == "slack_action_intent" and event.metadata.get("dedupe_key") == dedupe_key
         for event in store.list_work_item_events(work_item_id)
     )
 
@@ -1374,12 +1362,8 @@ def _agent_activity_payload(result: Any) -> dict[str, Any]:
         "status": result.status.value,
         "advanced": bool(result.advanced),
         "human_summary": result.human_summary,
-        "artifact_refs": [
-            artifact.model_dump(mode="json") for artifact in result.artifact_refs
-        ],
-        "next_action": result.next_action.model_dump(mode="json")
-        if result.next_action
-        else None,
+        "artifact_refs": [artifact.model_dump(mode="json") for artifact in result.artifact_refs],
+        "next_action": result.next_action.model_dump(mode="json") if result.next_action else None,
         "audit_notes": result.audit_notes,
     }
 
@@ -1577,11 +1561,7 @@ def _slack_context(payload: dict[str, Any]) -> dict[str, str]:
     message = payload.get("message")
     team = payload.get("team")
     message_ts = str(
-        (
-            container.get("message_ts")
-            if isinstance(container, dict)
-            else ""
-        )
+        (container.get("message_ts") if isinstance(container, dict) else "")
         or (message.get("ts") if isinstance(message, dict) else "")
         or ""
     )
@@ -1591,11 +1571,7 @@ def _slack_context(payload: dict[str, Any]) -> dict[str, str]:
         "channel_name": str(channel.get("name") if isinstance(channel, dict) else ""),
         "message_ts": message_ts,
         "thread_ts": str(
-            (
-                container.get("thread_ts")
-                if isinstance(container, dict)
-                else ""
-            )
+            (container.get("thread_ts") if isinstance(container, dict) else "")
             or (message.get("thread_ts") if isinstance(message, dict) else "")
             or message_ts
             or ""
@@ -1623,14 +1599,9 @@ def _work_item_followup_text(
         )
     if status == ApprovalQueueStatus.REVISE:
         suffix = (
-            " Feedback was captured."
-            if feedback
-            else " Add edit instructions before re-drafting."
+            " Feedback was captured." if feedback else " Add edit instructions before re-drafting."
         )
-        return (
-            f"Revision requested. WorkItem `{gate_update.work_item.id}` remains blocked."
-            f"{suffix}"
-        )
+        return f"Revision requested. WorkItem `{gate_update.work_item.id}` remains blocked.{suffix}"
     if status == ApprovalQueueStatus.REJECTED:
         suffix = " Feedback was captured." if feedback else " Add a rejection reason for the agent."
         return f"Rejected. WorkItem `{gate_update.work_item.id}` remains blocked.{suffix}"
@@ -1683,9 +1654,8 @@ def _is_email_outreach_item(item: Any) -> bool:
 
 def _slack_draft_creation_allowed(item: Any) -> bool:
     metadata = item.metadata or {}
-    return (
-        _is_email_outreach_item(item)
-        and bool(metadata.get("slack_approval_allows_gmail_draft_creation"))
+    return _is_email_outreach_item(item) and bool(
+        metadata.get("slack_approval_allows_gmail_draft_creation")
     )
 
 

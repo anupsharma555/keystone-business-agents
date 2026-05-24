@@ -64,9 +64,7 @@ _HUMAN_LABELS = {
     "external_copy": "external copy",
     "possible_phi": "possible PHI",
 }
-_ANSI_ESCAPE_RE = re.compile(
-    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x1b]*(?:\x1b\\|\x07)|[@-Z\\-_])"
-)
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x1b]*(?:\x1b\\|\x07)|[@-Z\\-_])")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -786,8 +784,10 @@ def _business_agent_card_for_approval_item(
                 metadata=action_context,
             )
         else:
-            scope_label = "draft review" if approval_scope == "send" else (
-                _human_label(approval_scope) or "external use"
+            scope_label = (
+                "draft review"
+                if approval_scope == "send"
+                else (_human_label(approval_scope) or "external use")
             )
             primary_action = BusinessAgentCardAction(
                 label=f"Approve {scope_label}",
@@ -1001,9 +1001,11 @@ def _card_source_quality(metadata: dict[str, Any]) -> str:
 
 
 def _card_missing_info(metadata: dict[str, Any]) -> str:
-    values = metadata.get("missing_information_blockers") or metadata.get(
-        "company_missing_information"
-    ) or []
+    values = (
+        metadata.get("missing_information_blockers")
+        or metadata.get("company_missing_information")
+        or []
+    )
     if not isinstance(values, Sequence) or isinstance(values, str | bytes):
         values = [values]
     cleaned = [_public_text(value, max_chars=140) for value in values]

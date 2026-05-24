@@ -72,7 +72,10 @@ def infer_gmail_execution_plan(
             draft_replies_in_output=True,
             live_read_required=True,
             candidate_helpers=["gmail_single_message_read", "gmail_triage_sdk"],
-            rationale="Request asks for reply drafting; keep draft text in output unless explicitly approved.",
+            rationale=(
+                "Request asks for reply drafting; keep draft text in output unless "
+                "explicitly approved."
+            ),
         )
 
     return GmailExecutionPlan(

@@ -12,13 +12,14 @@ from keystone_agents.agent_registry import (
     agent_cards,
     specialist_handoff_specs,
 )
-from keystone_agents.agent_tool_policy import disallowed_tool_names, tool_policy_for_agent
-from keystone_agents.agent_tool_policy import AgentToolPolicyError
+from keystone_agents.agent_tool_policy import (
+    AgentToolPolicyError,
+    disallowed_tool_names,
+    tool_policy_for_agent,
+)
 from keystone_agents.agents.orchestrator import INTENDED_HANDOFFS, build_orchestrator_agent
-from keystone_agents.sdk import Agent, prompt_metadata_for_files
-from keystone_agents.sdk import build_sdk_agent
+from keystone_agents.sdk import Agent, build_sdk_agent, prompt_metadata_for_files
 from keystone_agents.tools.gmail_tool import get_gmail_message
-from keystone_agents.tools.serper_tool import search_web
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROMPTS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "prompts"

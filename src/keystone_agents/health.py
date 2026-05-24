@@ -485,7 +485,8 @@ def check_agent_builders() -> list[CheckItem]:
                 )
                 status = (
                     STATUS_OK
-                    if details["agent_name"] and details["has_instructions"]
+                    if details["agent_name"]
+                    and details["has_instructions"]
                     and details["output_type_matches_registry"]
                     else STATUS_ERROR
                 )
@@ -652,15 +653,11 @@ def check_live_integrations(env: Mapping[str, str] | None = None) -> list[CheckI
     )
     slack_token = _env_value(source, "SLACK_BOT_TOKEN")
     slack_channel = _env_value(source, "SLACK_CHANNEL_APPROVALS")
-    slack_business_approval_channel = _env_value(
-        source, "KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL"
-    )
+    slack_business_approval_channel = _env_value(source, "KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL")
     slack_business_context = _bool_from_env(
         _env_value(source, "KNI_BUSINESS_AGENTS_SLACK_CONTEXT_ENABLED")
     )
-    slack_business_live_slack = _bool_from_env(
-        _env_value(source, "KNI_BUSINESS_AGENTS_LIVE_SLACK")
-    )
+    slack_business_live_slack = _bool_from_env(_env_value(source, "KNI_BUSINESS_AGENTS_LIVE_SLACK"))
     slack_business_background = _bool_from_env(
         _env_value(source, "KNI_BUSINESS_AGENTS_BACKGROUND_RUNS")
     )
@@ -731,9 +728,7 @@ def check_live_integrations(env: Mapping[str, str] | None = None) -> list[CheckI
         CheckItem(
             name="slack_business_agents",
             status=(
-                STATUS_WARNING
-                if slack_business_required and slack_business_missing
-                else STATUS_OK
+                STATUS_WARNING if slack_business_required and slack_business_missing else STATUS_OK
             ),
             details={
                 "configured": not slack_business_missing,
@@ -812,8 +807,7 @@ def check_live_integrations(env: Mapping[str, str] | None = None) -> list[CheckI
                 or "warn",
                 "usage_path_present": bool(_env_value(source, "KEYSTONE_TAVILY_USAGE_PATH")),
                 "mcp_link_present": bool(
-                    _env_value(source, "TAVILY_MCP_LINK")
-                    or _env_value(source, "TAVILY_MCP_link")
+                    _env_value(source, "TAVILY_MCP_LINK") or _env_value(source, "TAVILY_MCP_link")
                 ),
                 "required_for": "live Tavily search",
             },

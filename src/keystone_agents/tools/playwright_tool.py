@@ -40,7 +40,9 @@ def _bounded_timeout_ms(timeout_seconds: int | float | None) -> int:
 
 
 def _bounded_text(text: Any, max_chars: int = DEFAULT_PLAYWRIGHT_MAX_TEXT_CHARS) -> str:
-    return str(text or "")[: max(1000, min(int(max_chars or DEFAULT_PLAYWRIGHT_MAX_TEXT_CHARS), 50_000))]
+    return str(text or "")[
+        : max(1000, min(int(max_chars or DEFAULT_PLAYWRIGHT_MAX_TEXT_CHARS), 50_000))
+    ]
 
 
 def _is_missing_browser_error(exc: BaseException) -> bool:
@@ -105,7 +107,9 @@ def render_page_impl(
 
     normalized_url = str(url or "").strip()
     if not _valid_http_url(normalized_url):
-        return _blocked_payload(normalized_url, reason="Only http/https URLs are allowed.", live=live)
+        return _blocked_payload(
+            normalized_url, reason="Only http/https URLs are allowed.", live=live
+        )
     timeout_ms = _bounded_timeout_ms(timeout_seconds)
     if not live:
         return {
@@ -214,7 +218,9 @@ def render_page_impl(
             }
     except PlaywrightError as exc:  # type: ignore[name-defined]
         return {
-            **_blocked_payload(normalized_url, reason=f"Playwright render failed: {exc}", live=live),
+            **_blocked_payload(
+                normalized_url, reason=f"Playwright render failed: {exc}", live=live
+            ),
             "latency_ms": int((time.perf_counter() - started_at) * 1000),
         }
     finally:

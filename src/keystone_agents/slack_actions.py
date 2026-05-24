@@ -363,9 +363,9 @@ def handle_run_agent_interaction(
                 live_sdk=live_sdk,
                 max_results=max_results,
                 context_file_path=context_file_path,
-                manual_request_plan=infer_manual_request_plan(
-                    submission.requested_task
-                ).model_dump(mode="json"),
+                manual_request_plan=infer_manual_request_plan(submission.requested_task).model_dump(
+                    mode="json"
+                ),
             )
         )
         return SlackAgentActionResult(

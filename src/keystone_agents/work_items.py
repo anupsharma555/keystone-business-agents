@@ -603,7 +603,9 @@ def build_context_pack_for_route(
     if resolved == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
         return hydrate_context_pack_memory(build_research_context_pack(work_item), work_item, store)
     if resolved == WorkItemRoute.OPPORTUNITY_SCOUT:
-        return hydrate_context_pack_memory(build_opportunity_context_pack(work_item), work_item, store)
+        return hydrate_context_pack_memory(
+            build_opportunity_context_pack(work_item), work_item, store
+        )
     if resolved == WorkItemRoute.OUTREACH_COMPOSER:
         return hydrate_context_pack_memory(build_outreach_context_pack(work_item), work_item, store)
     if resolved == WorkItemRoute.GMAIL_TRIAGE:
@@ -1262,7 +1264,11 @@ def _memory_context_ref(item: Any) -> MemoryContextRef:
         summary=_bounded_memory_text(getattr(item, "summary", ""), max_chars=320),
         content_summary=_memory_content_summary(getattr(item, "content", {})),
         source_ids=[str(source_id) for source_id in getattr(item, "source_ids", [])[:8]],
-        approval_state=str(getattr(getattr(item, "approval_state", ""), "value", getattr(item, "approval_state", ""))),
+        approval_state=str(
+            getattr(
+                getattr(item, "approval_state", ""), "value", getattr(item, "approval_state", "")
+            )
+        ),
         confidence=float(getattr(item, "confidence", 0.0) or 0.0),
         created_at=str(getattr(item, "created_at", "") or ""),
     )
@@ -1303,9 +1309,7 @@ def _memory_content_summary(content: Any) -> dict[str, Any]:
             summary[key] = value
         elif isinstance(value, list):
             summary[key] = [
-                _bounded_memory_text(item, max_chars=160)
-                for item in value[:5]
-                if str(item).strip()
+                _bounded_memory_text(item, max_chars=160) for item in value[:5] if str(item).strip()
             ]
         elif isinstance(value, dict):
             summary[key] = {
@@ -1327,7 +1331,9 @@ def _memory_query(work_item: WorkItem) -> str:
         *_metadata_query_values(work_item.target.metadata),
         *(artifact.title for artifact in selected_artifacts(work_item)),
     ]
-    return " ".join(part for part in (" ".join(str(value or "").split()) for value in parts) if part)[:600]
+    return " ".join(
+        part for part in (" ".join(str(value or "").split()) for value in parts) if part
+    )[:600]
 
 
 def _memory_object_keys(work_item: WorkItem) -> list[str]:
@@ -1749,15 +1755,11 @@ def _target_for_request(text: str, route: WorkItemRoute) -> WorkItemTarget:
         if route == WorkItemRoute.CHIEF_OF_STAFF
         else "company"
     )
-    if (
-        route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
-        and looks_like_zotero_article_request(text)
-    ):
+    if route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST and looks_like_zotero_article_request(text):
         target = extract_zotero_article_query(text) or target
         object_type = "zotero_article"
-    elif (
-        route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
-        and looks_like_zotero_collection_request(text)
+    elif route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST and looks_like_zotero_collection_request(
+        text
     ):
         target = extract_zotero_collection_hint(text) or target
         object_type = "zotero_collection"

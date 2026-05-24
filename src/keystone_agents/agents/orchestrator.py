@@ -77,6 +77,10 @@ from keystone_agents.sdk import (
     run_typed_sdk_sync,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
+from keystone_agents.tools.browser_diagnostics_tool import (
+    capture_browser_diagnostics,
+    summarize_rendered_page_diagnostics,
+)
 from keystone_agents.tools.html_review_tool import extract_research_claims_from_html
 from keystone_agents.tools.internal_data_tools import (
     airtable_get_base_schema,
@@ -88,10 +92,6 @@ from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
     search_local_context,
-)
-from keystone_agents.tools.browser_diagnostics_tool import (
-    capture_browser_diagnostics,
-    summarize_rendered_page_diagnostics,
 )
 from keystone_agents.tools.memory_tool import retrieve_memory
 from keystone_agents.tools.playwright_tool import render_page
@@ -110,7 +110,9 @@ BUSINESS_RESEARCH_TOOL_NAME = "business_research_analyst_research_brief"
 _HANDOFF_BY_ROUTE = {handoff.route: handoff for handoff in INTENDED_HANDOFFS}
 
 
-def _orchestrator_sdk_input(typed_input: str | Mapping[str, Any], *, live: bool) -> str | Mapping[str, Any]:
+def _orchestrator_sdk_input(
+    typed_input: str | Mapping[str, Any], *, live: bool
+) -> str | Mapping[str, Any]:
     """Add live-safe operating context for SDK Orchestrator string prompts."""
 
     if not live or not isinstance(typed_input, str):
@@ -136,6 +138,8 @@ def _orchestrator_sdk_input(typed_input: str | Mapping[str, Any], *, live: bool)
             ),
         },
     }
+
+
 _FEEDBACK_OBJECT_TYPE_BY_ROUTE: dict[RouteName, str] = {
     "gmail_triage": "email_triage",
     "business_research_analyst": "company_profile",

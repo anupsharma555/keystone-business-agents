@@ -300,11 +300,12 @@ def _mixed_meeting_grant_intent(lowered: str) -> bool:
         )
     )
     funding = any(
-        marker in lowered
-        for marker in ("grant", "grants", "funding", "funder", "nofo", "sbir")
+        marker in lowered for marker in ("grant", "grants", "funding", "funder", "nofo", "sbir")
     )
-    return meeting and funding and any(
-        marker in lowered for marker in ("1 ", "one ", "exactly", "each", " and ")
+    return (
+        meeting
+        and funding
+        and any(marker in lowered for marker in ("1 ", "one ", "exactly", "each", " and "))
     )
 
 

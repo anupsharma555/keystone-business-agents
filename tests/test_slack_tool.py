@@ -1082,8 +1082,7 @@ def test_kba_more_research_selects_current_candidate_from_button_payload(
     assert selected_titles == ["Theris"]
     events = store.list_work_item_events(item.id)
     assert any(
-        event.event_type == "artifact_selected"
-        and event.metadata["artifact_id"] == "38"
+        event.event_type == "artifact_selected" and event.metadata["artifact_id"] == "38"
         for event in events
     )
 
@@ -1381,9 +1380,7 @@ def test_slack_interactive_revise_leaves_work_item_blocked_with_feedback(tmp_pat
     result = handle_slack_approval_interaction(
         {
             "user": {"username": "reviewer"},
-            "actions": [
-                {"action_id": "keystone_approval_revise", "value": "approval-workitem"}
-            ],
+            "actions": [{"action_id": "keystone_approval_revise", "value": "approval-workitem"}],
             "state": {
                 "values": {
                     "feedback": {

@@ -173,8 +173,7 @@ def _print_output(payload: dict[str, Any], *, json_output: bool) -> None:
         print("Run again with --live and --vector-store-id or --create-vector-store to upload.")
         return
     print(
-        "Uploaded "
-        f"{payload['uploaded_count']} files to vector store {payload['vector_store_id']}."
+        f"Uploaded {payload['uploaded_count']} files to vector store {payload['vector_store_id']}."
     )
 
 

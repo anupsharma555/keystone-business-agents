@@ -221,9 +221,9 @@ def advance_work_item_with_optional_langgraph(
     return outcome.result
 
 
-def next_langgraph_node_for_result(result: WorkflowRunResult) -> Literal[
-    "approval_checkpoint", "done"
-]:
+def next_langgraph_node_for_result(
+    result: WorkflowRunResult,
+) -> Literal["approval_checkpoint", "done"]:
     """Return the next graph node implied by a WorkItem advancement result."""
 
     if _approval_checkpoint_reason(result):
@@ -261,9 +261,7 @@ def _approval_checkpoint_node(state: WorkItemGraphState) -> WorkItemGraphState:
         "work_item_id": result.work_item.id,
         "route": result.route.value,
         "status": result.status.value,
-        "next_action": (
-            result.next_action.model_dump(mode="json") if result.next_action else None
-        ),
+        "next_action": (result.next_action.model_dump(mode="json") if result.next_action else None),
         "blockers": [blocker.model_dump(mode="json") for blocker in result.blockers],
         "reason": state.get("checkpoint_reason", ""),
     }
@@ -309,10 +307,7 @@ def _next_action_requires_approval(next_action: WorkItemNextAction | None) -> bo
 def _next_action_reason(next_action: WorkItemNextAction | None) -> str:
     if next_action is None:
         return ""
-    return (
-        next_action.description
-        or "The next WorkItem action requires explicit human approval."
-    )
+    return next_action.description or "The next WorkItem action requires explicit human approval."
 
 
 def _record_langgraph_checkpoint_event(

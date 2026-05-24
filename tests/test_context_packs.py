@@ -270,7 +270,9 @@ def test_research_context_pack_hydrates_approved_prompt_safe_company_memory(tmp_
     assert "Unsafe NeuroFlow note" not in hydrated_titles
 
 
-def test_opportunity_context_pack_hydrates_prior_opportunities_without_satisfying_sources(tmp_path) -> None:
+def test_opportunity_context_pack_hydrates_prior_opportunities_without_satisfying_sources(
+    tmp_path,
+) -> None:
     store = SQLiteStore(_database_url(tmp_path))
     _save_memory(
         store,

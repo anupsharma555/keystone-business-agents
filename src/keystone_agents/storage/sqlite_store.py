@@ -1582,8 +1582,7 @@ class SQLiteStore:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as connection:
             rows = connection.execute(
-                f"SELECT spec_json FROM automation_specs {where} "
-                "ORDER BY name LIMIT ?",
+                f"SELECT spec_json FROM automation_specs {where} ORDER BY name LIMIT ?",
                 (*params, max(1, min(500, int(limit)))),
             ).fetchall()
         return [AutomationSpec.model_validate(_json_dict(row["spec_json"])) for row in rows]
@@ -1654,8 +1653,7 @@ class SQLiteStore:
                 (*params, max(1, min(500, int(limit)))),
             ).fetchall()
         return [
-            AutomationChannelBinding.model_validate(_json_dict(row["binding_json"]))
-            for row in rows
+            AutomationChannelBinding.model_validate(_json_dict(row["binding_json"])) for row in rows
         ]
 
     def save_automation_run(self, run: AutomationRun) -> str:
@@ -1805,9 +1803,7 @@ class SQLiteStore:
                 "ORDER BY created_at_utc DESC, id DESC LIMIT ?",
                 (*params, max(1, min(500, int(limit)))),
             ).fetchall()
-        return [
-            AutomationFinding.model_validate(_json_dict(row["finding_json"])) for row in rows
-        ]
+        return [AutomationFinding.model_validate(_json_dict(row["finding_json"])) for row in rows]
 
     def save(self, kind: str, payload: dict[str, Any]) -> int:
         """Backward-compatible generic save, stored as an agent run."""

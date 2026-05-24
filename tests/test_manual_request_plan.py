@@ -231,7 +231,10 @@ def test_cli_live_opportunity_scout_uses_script_retrieval_path(monkeypatch, caps
                 "opportunity_scout",
                 "--live-sdk",
                 "--json",
-                "Find 2 U.S.-relevant academic institutes. Use live SDK and live search. No outreach.",
+                (
+                    "Find 2 U.S.-relevant academic institutes. Use live SDK and live "
+                    "search. No outreach."
+                ),
             ]
         )
         == 0
@@ -418,7 +421,10 @@ def test_cli_live_gmail_priority_grouping_uses_agent_execution_plan(monkeypatch,
                 "gmail_triage",
                 "--live-sdk",
                 "--json",
-                "review recent Gmail threads from the last 7 days related to Keystone opportunities",
+                (
+                    "review recent Gmail threads from the last 7 days related to "
+                    "Keystone opportunities"
+                ),
             ]
         )
         == 0

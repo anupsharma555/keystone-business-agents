@@ -233,8 +233,7 @@ def test_zotero_collection_resolves_full_title_against_shorter_cached_title(
     result = advance_work_item(
         WorkflowRunRequest(
             request_text=(
-                "summarize the Zotero collection "
-                "'LH 01 - REACH-tDCS & Lindus Trial Context'"
+                "summarize the Zotero collection 'LH 01 - REACH-tDCS & Lindus Trial Context'"
             ),
             database_url=_database_url(tmp_path),
             save=True,
@@ -602,9 +601,7 @@ def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
                 "debug_notes": ["fake live retrieval"],
                 "retrieval_diagnostics": {
                     "provider_summary": "searxng",
-                    "retrieval_ladder": [
-                        {"rung": "search_discovery", "raw_result_count": 2}
-                    ],
+                    "retrieval_ladder": [{"rung": "search_discovery", "raw_result_count": 2}],
                 },
             },
         )
@@ -636,8 +633,7 @@ def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
     assert captured["search_plan"] is fake_plan
     assert "named-agent live search planning path" in " ".join(result.audit_notes)
     assert (
-        result.artifact_refs[0].metadata["retrieval_diagnostics"]["provider_summary"]
-        == "searxng"
+        result.artifact_refs[0].metadata["retrieval_diagnostics"]["provider_summary"] == "searxng"
     )
 
 
@@ -700,7 +696,8 @@ def test_live_sdk_opportunity_work_item_prefers_manual_primary_target(
                 "target_agent": "opportunity_scout",
                 "intent": "opportunity_search",
                 "primary_target": (
-                    "behavioral health AI partnership or advisory opportunities relevant to Keystone"
+                    "behavioral health AI partnership or advisory opportunities relevant "
+                    "to Keystone"
                 ),
                 "desired_count": 3,
             },
@@ -724,7 +721,9 @@ def test_business_research_work_item_prefers_manual_primary_target(
 
     def fake_retrieve_company_profile_live(*, company: str, **_: object):
         captured["company"] = company
-        return research_company_fixture(company_name=company), {"debug_notes": ["fake live retrieval"]}
+        return research_company_fixture(company_name=company), {
+            "debug_notes": ["fake live retrieval"]
+        }
 
     monkeypatch.setattr(
         "keystone_agents.workflow_runner.retrieve_company_profile_live",

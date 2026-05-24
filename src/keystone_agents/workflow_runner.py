@@ -350,9 +350,7 @@ def _apply_slack_selected_context(
     context_file_path: str,
 ) -> WorkItem:
     selected = (
-        context.get("selected_message")
-        if isinstance(context.get("selected_message"), dict)
-        else {}
+        context.get("selected_message") if isinstance(context.get("selected_message"), dict) else {}
     )
     selected_text = _compact_context_text(selected.get("text"), max_chars=900)
     channel_id = _compact_context_text(context.get("channel_id"), max_chars=80)
@@ -1027,9 +1025,7 @@ def _advance_zotero_article_research(
             "target_type": brief.target_type,
             "source_count": len(brief.sources),
             "article_summary_count": len(brief.article_summaries),
-            "retrieval": retrieval_metadata
-            if request.live_search or request.live_sdk
-            else {},
+            "retrieval": retrieval_metadata if request.live_search or request.live_sdk else {},
             "source_refs": [source.model_dump(mode="json") for source in brief.sources[:8]],
         },
     )
@@ -1132,9 +1128,7 @@ def _advance_opportunity(
         )
         audit_notes = ["Live opportunity retrieval executed.", *metadata.get("debug_notes", [])]
         if search_plan is not None:
-            audit_notes.append(
-                "Opportunity Scout used the named-agent live search planning path."
-            )
+            audit_notes.append("Opportunity Scout used the named-agent live search planning path.")
         retrieval_memory_id = _persist_retrieval_tool_memory(
             metadata,
             object_id=f"work_item_opportunity_scout:{topic}",
@@ -1323,10 +1317,7 @@ def _research_brief_human_summary(brief: ResearchBrief, paragraphs: list[str]) -
                     "- Methods/design: "
                     f"{article.methods_or_design or 'Not available from local metadata.'}"
                 ),
-                (
-                    "- Inclusion/exclusion: "
-                    + _eligibility_summary_from_brief(brief)
-                ),
+                ("- Inclusion/exclusion: " + _eligibility_summary_from_brief(brief)),
                 f"- Relevance: {article.relevance_to_goal or 'Not available from local metadata.'}",
             ]
         )
@@ -1426,9 +1417,7 @@ def _article_summary_lines_from_brief(brief: ResearchBrief) -> list[str]:
             parts.append("Limitation: " + article.limitations[0].rstrip("."))
         line = f"{index}. " + ". ".join(part for part in parts if part) + "."
         source_lines = _direct_source_link_lines(
-            source_by_id[source_id]
-            for source_id in article.source_ids
-            if source_id in source_by_id
+            source_by_id[source_id] for source_id in article.source_ids if source_id in source_by_id
         )
         if source_lines:
             line = "\n".join([line, *source_lines])
@@ -1485,10 +1474,7 @@ def _zotero_item_key(source_id: str) -> str:
 
 def _eligibility_summary_from_brief(brief: ResearchBrief) -> str:
     for unknown in brief.unknowns:
-        if any(
-            marker in unknown.lower()
-            for marker in ("inclusion", "exclusion", "eligibility")
-        ):
+        if any(marker in unknown.lower() for marker in ("inclusion", "exclusion", "eligibility")):
             return unknown
     return "Not available from local metadata."
 
@@ -1820,9 +1806,7 @@ def _blocked_human_summary(
 ) -> str:
     if not blockers:
         return "WorkItem advance blocked."
-    requirements = [
-        blocker.message.strip() for blocker in blockers if blocker.message.strip()
-    ]
+    requirements = [blocker.message.strip() for blocker in blockers if blocker.message.strip()]
     if not requirements:
         return "WorkItem advance blocked."
     agent_name = {
@@ -1834,9 +1818,8 @@ def _blocked_human_summary(
         WorkItemRoute.ORCHESTRATOR: "Orchestrator",
         WorkItemRoute.CLARIFICATION: "Orchestrator",
     }.get(route, route.value)
-    return (
-        f"{agent_name} did not have the required context to complete synthesis: "
-        + "; ".join(dict.fromkeys(requirements))
+    return f"{agent_name} did not have the required context to complete synthesis: " + "; ".join(
+        dict.fromkeys(requirements)
     )
 
 

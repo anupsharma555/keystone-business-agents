@@ -176,7 +176,10 @@ def test_shared_agent_operating_architecture_covers_schemas_tools_helpers() -> N
     ) in text
     assert "`structure_web_data_for_schema`" in text
     assert "`airtable_write_record`" in text
-    assert "no deletes, schema changes, attachment uploads, bulk overwrites, or silent mutations" in text
+    assert (
+        "no deletes, schema changes, attachment uploads, bulk overwrites, or silent mutations"
+        in text
+    )
     assert "use Playwright only as a read-only backend/headless diagnostic rendering helper" in text
     assert "`render_page`" in text
     assert "`capture_browser_diagnostics`" in text
@@ -186,7 +189,10 @@ def test_shared_agent_operating_architecture_covers_schemas_tools_helpers() -> N
     assert "does not open a user-screen browser" in text
     assert "temporary non-persistent profile" in text
     assert "gpt-5.4" in text
-    assert "no live side effects unless the relevant tool, live flag, and approval scope allow them" in text
+    assert (
+        "no live side effects unless the relevant tool, live flag, and approval scope allow them"
+        in text
+    )
     assert "Schema And Helper Backlog" in text
     assert "`AgentRunContextPack`" in text
     assert "`StructuredRecordSet`" in text

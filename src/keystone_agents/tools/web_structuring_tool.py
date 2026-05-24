@@ -174,7 +174,9 @@ def structure_web_data_for_schema_impl(
 ) -> WebDataSchemaMappingResult:
     """Normalize retrieved structured or unstructured web data to a target schema."""
 
-    schema_name, specs = _field_specs(_load_json(target_schema_json, field_name="target_schema_json"))
+    schema_name, specs = _field_specs(
+        _load_json(target_schema_json, field_name="target_schema_json")
+    )
     if not specs:
         return WebDataSchemaMappingResult(
             status="invalid_schema",
@@ -214,7 +216,13 @@ def structure_web_data_for_schema_impl(
     if not records:
         issues.append("No source records or text were available to structure.")
     record_issues = [issue for record in records for issue in record.issues]
-    status = "success" if records and not issues and not record_issues else "partial" if records else "no_data"
+    status = (
+        "success"
+        if records and not issues and not record_issues
+        else "partial"
+        if records
+        else "no_data"
+    )
     return WebDataSchemaMappingResult(
         status=status,
         source_type=source_type,  # type: ignore[arg-type]

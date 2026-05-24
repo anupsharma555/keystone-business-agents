@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from keystone_agents.agents.opportunity_scout import _build_live_query_specs
 from keystone_agents.opportunity_scout.scoring import (
     HANDOFF_PRIORITY_THRESHOLD,
     clean_signals,
@@ -18,7 +19,6 @@ from keystone_agents.opportunity_scout.state import (
     normalize_company_key,
     normalize_pipeline_status,
 )
-from keystone_agents.agents.opportunity_scout import _build_live_query_specs
 
 
 def test_scoring_module_normalizes_signals_and_scores_handoff_ready_candidate() -> None:
@@ -79,7 +79,9 @@ def test_search_plan_preserves_mixed_meeting_and_grant_lanes() -> None:
     assert plan.objectives == ["presentation_opportunity", "funding"]
     assert [lane.lane_type for lane in plan.lanes] == ["meeting_conference", "grant_funding"]
     assert plan.strict_targeting is True
-    assert any("generic conferences funding category" in item for item in plan.lanes[0].acceptance_criteria)
+    assert any(
+        "generic conferences funding category" in item for item in plan.lanes[0].acceptance_criteria
+    )
 
 
 def test_opportunity_scout_builds_mixed_meeting_and_grant_query_specs() -> None:
@@ -106,9 +108,7 @@ def test_search_plan_treats_bounded_company_requests_as_strict_company_only() ->
 
     assert plan.target_entity_types == ["company"]
     assert plan.strict_targeting is True
-    assert {"institute", "grant_program", "trial", "researcher"} <= set(
-        plan.exclude_entity_types
-    )
+    assert {"institute", "grant_program", "trial", "researcher"} <= set(plan.exclude_entity_types)
 
 
 def test_search_plan_maps_github_repo_requests_to_open_source_tooling() -> None:

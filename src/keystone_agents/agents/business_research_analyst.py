@@ -52,11 +52,11 @@ from keystone_agents.source_enrichment import (
     normalize_source_record,
 )
 from keystone_agents.tools.apify_tool import fetch_linkedin_or_profile_placeholder
-from keystone_agents.tools.browserless_tool import extract_company_signals, fetch_company_page
 from keystone_agents.tools.browser_diagnostics_tool import (
     capture_browser_diagnostics,
     summarize_rendered_page_diagnostics,
 )
+from keystone_agents.tools.browserless_tool import extract_company_signals, fetch_company_page
 from keystone_agents.tools.html_review_tool import extract_research_claims_from_html
 from keystone_agents.tools.internal_data_tools import (
     airtable_get_base_schema,

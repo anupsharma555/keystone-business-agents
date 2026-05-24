@@ -496,21 +496,13 @@ def _derive_contact_candidate(
     resolved_contact_email = (
         (contact_email or "").strip()
         or (best_candidate.email if best_candidate is not None else "")
-        or (
-            best_path.value
-            if best_path is not None and best_path.path_type == "email"
-            else ""
-        )
+        or (best_path.value if best_path is not None and best_path.path_type == "email" else "")
     ) or None
     resolved_linkedin_url = (
         (contact_linkedin_url or "").strip()
         or (best_candidate.linkedin_url if best_candidate is not None else "")
         or company_profile.linkedin_url
-        or (
-            best_path.url
-            if best_path is not None and best_path.path_type == "linkedin"
-            else ""
-        )
+        or (best_path.url if best_path is not None and best_path.path_type == "linkedin" else "")
     ).strip()
     source_url = (
         resolved_linkedin_url
@@ -1511,9 +1503,9 @@ def weekly_opportunity_workflow_markdown(
 ) -> str:
     """Render a human review packet for the weekly opportunity loop."""
 
-    providers_used = (
-        result.retrieval.get("provider_performance", {}).get("providers_used") or ["dry-run"]
-    )
+    providers_used = result.retrieval.get("provider_performance", {}).get("providers_used") or [
+        "dry-run"
+    ]
     lines = [
         "# Weekly Opportunity Workflow",
         "",
@@ -1592,9 +1584,7 @@ def weekly_opportunity_workflow_markdown(
                 lines.extend(f"  - {unknown}" for unknown in brief.unknowns[:3])
         profile_source = candidate.linkedin_url or candidate.source_url or "Needs confirmation"
         contact_path_label = (
-            candidate.contact_path_label
-            or candidate.contact_path_type
-            or "Needs confirmation"
+            candidate.contact_path_label or candidate.contact_path_type or "Needs confirmation"
         )
         contact_path_suffix = (
             f" ({candidate.contact_path_value})" if candidate.contact_path_value else ""

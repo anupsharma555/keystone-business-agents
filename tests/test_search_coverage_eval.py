@@ -214,7 +214,7 @@ def test_agents_web_search_provider_normalizes_structured_output() -> None:
                     date="2026-01-15",
                 )
             ]
-        )
+        ),
     )
 
     results = provider.search_structured(request)

@@ -12,8 +12,8 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
 )
-from keystone_agents.schemas.orchestrator import OrchestratorResult
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
+from keystone_agents.schemas.orchestrator import OrchestratorResult
 from keystone_agents.schemas.research import (
     ResearchArticleSummary,
     ResearchBrief,
@@ -31,7 +31,11 @@ def test_meeting_prep_caps_items_and_blocks_external_writes() -> None:
     payload = {
         "window": "Next 7 days",
         "events": [
-            {"title": "Grant proposal review", "start": "2026-05-25T09:00:00-04:00", "note": "deadline prep"},
+            {
+                "title": "Grant proposal review",
+                "start": "2026-05-25T09:00:00-04:00",
+                "note": "deadline prep",
+            },
             {"title": "Partner intro call", "start": "2026-05-26T10:00:00-04:00"},
             {"title": "Clinical AI strategy meeting", "start": "2026-05-27T11:00:00-04:00"},
             {"title": "Board prep", "start": "2026-05-28T12:00:00-04:00"},
@@ -130,7 +134,10 @@ def test_github_repo_opportunities_ranks_four_and_blocks_writes() -> None:
     assert "fit/value score:" in result.slack_text
     assert all(repo.keystone_fit for repo in result.repositories)
     assert all(repo.implementation_use_case for repo in result.repositories)
-    assert "Relevant to Keystone's business-agent stack because it may improve agent orchestration" not in result.slack_text
+    assert (
+        "Relevant to Keystone's business-agent stack because it may improve agent orchestration"
+        not in result.slack_text
+    )
     assert any("stale by pushed date" in note for note in result.learning_notes)
 
 
@@ -390,7 +397,11 @@ def test_github_repo_opportunities_live_search_uses_github_api_queries(monkeypat
     )
 
     result = run_github_repo_opportunities(
-        {"queries": ["business agents data analysis in:name,description,topics,readme stars:>=50 archived:false"]},
+        {
+            "queries": [
+                "business agents data analysis in:name,description,topics,readme stars:>=50 archived:false"
+            ]
+        },
         live_search=True,
     )
 
@@ -489,17 +500,25 @@ def test_github_repo_opportunities_live_sdk_runs_orchestrator_scout_then_researc
     )
 
     assert calls == ["orchestrator", "opportunity_scout", "business_research_analyst"]
-    assert "Agent chain: Orchestrator -> Opportunity Scout -> Business Research Analyst" in result.slack_text
+    assert (
+        "Agent chain: Orchestrator -> Opportunity Scout -> Business Research Analyst"
+        in result.slack_text
+    )
     assert "Orchestrator route: opportunity_scout" in result.slack_text
     assert "Keystone fit:" in result.slack_text
     assert "Use case:" in result.slack_text
-    assert "appears to address Python framework for building AI agents and workflows" in result.slack_text
+    assert (
+        "appears to address Python framework for building AI agents and workflows"
+        in result.slack_text
+    )
     assert result.agent_chain == ["orchestrator", "opportunity_scout", "business_research_analyst"]
     assert any("Only 1 repository candidate" in note for note in result.learning_notes)
     assert result.future_query_suggestions
     assert any("Orchestrator SDK routing completed" in item for item in result.diagnostics)
     assert any("Opportunity Scout SDK synthesis completed." in item for item in result.diagnostics)
-    assert any("Business Research Analyst SDK synthesis completed" in item for item in result.diagnostics)
+    assert any(
+        "Business Research Analyst SDK synthesis completed" in item for item in result.diagnostics
+    )
 
 
 def test_meeting_prep_live_sdk_uses_chief_of_staff(monkeypatch) -> None:
@@ -745,7 +764,10 @@ def test_announcements_research_reports_live_search_diagnostics(
     assert "Live search provider: searxng" in result.diagnostics
     assert "SearXNG base URL: http://127.0.0.1:18080" in result.diagnostics
     assert any("SearXNG reachability: failed" in item for item in result.diagnostics)
-    assert any("Search failed for `AI safety for mental health chatbots`" in item for item in result.diagnostics)
+    assert any(
+        "Search failed for `AI safety for mental health chatbots`" in item
+        for item in result.diagnostics
+    )
 
 
 def test_announcements_research_renders_search_evidence(monkeypatch) -> None:
@@ -880,7 +902,10 @@ def test_announcements_research_reads_selected_article_pages(monkeypatch) -> Non
     assert any(evidence.kind == "article" for evidence in result.summaries[0].evidence)
     assert "Read source:" in result.summaries[0].summary
     assert "validated clinical AI safety monitoring workflow" in result.summaries[0].summary
-    assert any("Read article for `AI safety for mental health chatbots`" in item for item in result.diagnostics)
+    assert any(
+        "Read article for `AI safety for mental health chatbots`" in item
+        for item in result.diagnostics
+    )
 
 
 def test_announcements_research_live_sdk_uses_business_research_analyst(monkeypatch) -> None:
@@ -961,5 +986,7 @@ def test_announcements_research_live_sdk_uses_business_research_analyst(monkeypa
     assert captured["live"] is True
     assert captured["typed_input"].target_type == "article_collection"
     assert "Source ID: announcement_1" in captured["typed_input"].source_context
-    assert any("Business Research Analyst SDK synthesis completed." in item for item in result.diagnostics)
+    assert any(
+        "Business Research Analyst SDK synthesis completed." in item for item in result.diagnostics
+    )
     assert "validated safety monitoring workflow" in result.summaries[0].summary

@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from keystone_agents.cli import main
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
 )
-from keystone_agents.cli import main
 from keystone_agents.slack_actions import (
     RUN_AGENT_MESSAGE_CALLBACK_ID,
     RUN_AGENT_TASK_ACTION_ID,
@@ -106,7 +106,6 @@ def test_message_action_creates_context_file_and_modal(tmp_path: Path) -> None:
     context_payload = json.loads(context_path.read_text(encoding="utf-8"))
     assert context_payload["permalink"] == "https://kni.slack.com/archives/C123/p1715366400000100"
     assert context_payload["selected_message"]["text"].startswith("Can someone research")
-
 
 
 def test_modal_submission_can_create_context_file_from_private_metadata(tmp_path: Path) -> None:

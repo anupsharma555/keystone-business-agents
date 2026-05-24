@@ -312,9 +312,13 @@ def airtable_read_records_impl(
     table_name = _airtable_table(table, config=config)
     record_limit = int(max_records or 0)
     if fetch_all:
-        record_limit = record_limit if record_limit > 0 else _airtable_int_env(
-            "AIRTABLE_READ_ALL_MAX_RECORDS",
-            5000,
+        record_limit = (
+            record_limit
+            if record_limit > 0
+            else _airtable_int_env(
+                "AIRTABLE_READ_ALL_MAX_RECORDS",
+                5000,
+            )
         )
         params: dict[str, str | int] = {"pageSize": 100}
     else:
@@ -449,8 +453,7 @@ def airtable_write_record_impl(
             return {
                 "status": "blocked",
                 "reason": (
-                    "Airtable updates require record_id or a deterministic "
-                    "match_filter_formula."
+                    "Airtable updates require record_id or a deterministic match_filter_formula."
                 ),
                 "table": table_name,
                 "send_enabled": False,
@@ -1088,9 +1091,7 @@ def google_sheet_create_impl(
     _assert_configured_google_account(drive_service)
     spreadsheet_body: dict[str, Any] = {"properties": {"title": cleaned_title}}
     if tabs:
-        spreadsheet_body["sheets"] = [
-            {"properties": {"title": tab_name}} for tab_name in tabs
-        ]
+        spreadsheet_body["sheets"] = [{"properties": {"title": tab_name}} for tab_name in tabs]
     created = sheets_service.spreadsheets().create(body=spreadsheet_body).execute()
     spreadsheet_id = str(created.get("spreadsheetId", ""))
     folder_id = _ensure_drive_folder_path(drive_service, target_folder_path)
@@ -1842,11 +1843,7 @@ def _airtable_alias_prefix(base_alias: str) -> str:
 
 
 def _airtable_csv_env(name: str) -> tuple[str, ...]:
-    return tuple(
-        item.strip()
-        for item in os.getenv(name, "").split(",")
-        if item.strip()
-    )
+    return tuple(item.strip() for item in os.getenv(name, "").split(",") if item.strip())
 
 
 def _airtable_int_env(name: str, default: int) -> int:
@@ -1885,15 +1882,15 @@ def _airtable_base_config(
         or (os.getenv(f"{prefix}_BASE_NAME", "").strip() if prefix else "")
         or os.getenv("AIRTABLE_BASE_NAME", "").strip()
     )
-    access_token = (
-        os.getenv(f"{prefix}_ACCESS_TOKEN", "").strip() if prefix else ""
-    ) or os.getenv("AIRTABLE_ACCESS_TOKEN", "").strip()
+    access_token = (os.getenv(f"{prefix}_ACCESS_TOKEN", "").strip() if prefix else "") or os.getenv(
+        "AIRTABLE_ACCESS_TOKEN", ""
+    ).strip()
     default_table = (
         os.getenv(f"{prefix}_DEFAULT_TABLE", "").strip() if prefix else ""
     ) or os.getenv("AIRTABLE_DEFAULT_TABLE", "").strip()
-    default_view = (
-        os.getenv(f"{prefix}_DEFAULT_VIEW", "").strip() if prefix else ""
-    ) or os.getenv("AIRTABLE_DEFAULT_VIEW", "").strip()
+    default_view = (os.getenv(f"{prefix}_DEFAULT_VIEW", "").strip() if prefix else "") or os.getenv(
+        "AIRTABLE_DEFAULT_VIEW", ""
+    ).strip()
     return {
         "base_alias": str(base_alias or "").strip(),
         "env_prefix": prefix,
@@ -2158,9 +2155,7 @@ def _assert_google_sheet_under_kniops(drive_service: Any, spreadsheet_id: str) -
 
 def _assert_drive_file_under_folder(drive_service: Any, file_id: str, root_folder_id: str) -> None:
     pending = [
-        str(parent)
-        for parent in _drive_file_parents(drive_service, file_id)
-        if str(parent).strip()
+        str(parent) for parent in _drive_file_parents(drive_service, file_id) if str(parent).strip()
     ]
     seen: set[str] = set()
     while pending:
@@ -2383,11 +2378,7 @@ def _read_sheet_values(
         .execute()
     )
     values = payload.get("values", []) if isinstance(payload, dict) else []
-    return [
-        [str(cell) for cell in row]
-        for row in values
-        if isinstance(row, list)
-    ]
+    return [[str(cell) for cell in row] for row in values if isinstance(row, list)]
 
 
 def _ensure_google_sheet_headers(

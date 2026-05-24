@@ -255,7 +255,10 @@ class GmailPriorityGroupingSDKInput:
             "Classify each source message into exactly one bucket.",
             self.draft_policy,
             "Do not include draft_reply for important, can_wait, or ignore messages.",
-            "Do not create Gmail drafts, send email, apply labels, or call live side-effect integrations.",
+            (
+                "Do not create Gmail drafts, send email, apply labels, or call live "
+                "side-effect integrations."
+            ),
             "Set send_enabled=false, sent=false, and live_side_effects_enabled=false.",
             f"Source label: {self.source_label}",
             f"Lookback days: {self.lookback_days}",

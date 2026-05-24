@@ -225,7 +225,11 @@ def _semantic_target_agent(
 ) -> ManualTargetAgent:
     lower = text.lower()
     if _looks_like_browser_diagnostics_only_request(text):
-        return requested_agent if requested_agent in {"chief_of_staff", "orchestrator"} else "chief_of_staff"
+        return (
+            requested_agent
+            if requested_agent in {"chief_of_staff", "orchestrator"}
+            else "chief_of_staff"
+        )
     if requested_agent and requested_agent != "orchestrator":
         return requested_agent
     if _looks_like_slack_operations_request(lower):
@@ -378,7 +382,9 @@ def _primary_target(text: str, *, target_agent: ManualTargetAgent) -> str:
     if target_agent == "opportunity_scout":
         if looks_like_opportunity_to_outreach_loop(cleaned):
             return _opportunity_to_outreach_topic(cleaned)
-        return _first_nonempty(_quoted_text(cleaned), _opportunity_search_target(cleaned), cleaned[:120])
+        return _first_nonempty(
+            _quoted_text(cleaned), _opportunity_search_target(cleaned), cleaned[:120]
+        )
     cleaned = _PREFIX_RE.sub("", _strip_operational_clauses(cleaned)).strip()
     if target_agent == "gmail_triage":
         return _first_nonempty(_quoted_text(cleaned), _subject_text(cleaned), cleaned[:120])

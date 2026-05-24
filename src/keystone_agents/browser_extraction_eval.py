@@ -353,7 +353,9 @@ class PlaywrightRenderedPageProvider:
             final_url=str(result.get("final_url") or url),
             status=str(result.get("status") or "error"),
             title=str(result.get("title") or ""),
-            text_or_markdown=_truncate(str(result.get("text_or_markdown") or ""), self.max_output_chars),
+            text_or_markdown=_truncate(
+                str(result.get("text_or_markdown") or ""), self.max_output_chars
+            ),
             links=[
                 RenderedLink(url=str(link.get("url") or ""), text=str(link.get("text") or ""))
                 for link in result.get("links", [])
@@ -680,9 +682,7 @@ def _score_with_baseline_improvement(
 def _summarize_case(runs: Sequence[BrowserExtractionRunResult]) -> dict[str, Any]:
     return {
         "providers_improved_over_baseline": sum(
-            1
-            for run in runs
-            if bool(run.score.improvement_over_baseline.get("improved"))
+            1 for run in runs if bool(run.score.improvement_over_baseline.get("improved"))
         ),
         "providers": _summarize_provider_runs(runs),
     }
@@ -822,9 +822,7 @@ def _repeatability(runs: Sequence[BrowserExtractionRunResult]) -> dict[str, Any]
     min_length = min(lengths) if lengths else 0
     length_delta_ratio = (max_length - min_length) / max(max_length, 1)
     stable = (
-        len(statuses) == 1
-        and (max(recalls) - min(recalls) <= 0.1)
-        and length_delta_ratio <= 0.25
+        len(statuses) == 1 and (max(recalls) - min(recalls) <= 0.1) and length_delta_ratio <= 0.25
     )
     return {
         "runs": len(runs),

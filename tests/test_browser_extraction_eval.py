@@ -60,9 +60,7 @@ def test_score_rendered_page_measures_agent_useful_signals() -> None:
         url=case.url,
         status="success",
         title="Clinical trial page",
-        text_or_markdown=(
-            "This clinical trial studies depression. Privacy policy. Cookie notice."
-        ),
+        text_or_markdown=("This clinical trial studies depression. Privacy policy. Cookie notice."),
         links=[
             RenderedLink(
                 url="https://example.com/trial/about",

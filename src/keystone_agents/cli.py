@@ -472,10 +472,10 @@ def _run_ask(args: argparse.Namespace) -> int:
             )
         if live_sdk and mention.explicit and mention.route is not None:
             route = str(mention.route)
-            if (
-                manual_plan.intent == "browser_diagnostics"
-                and manual_plan.target_agent in {"chief_of_staff", "orchestrator"}
-            ):
+            if manual_plan.intent == "browser_diagnostics" and manual_plan.target_agent in {
+                "chief_of_staff",
+                "orchestrator",
+            }:
                 route = manual_plan.target_agent
             if route == "orchestrator":
                 return _run_ask_orchestrator(
@@ -532,10 +532,10 @@ def _run_ask(args: argparse.Namespace) -> int:
             ),
         )
     if live_sdk:
-        if (
-            manual_plan.intent == "browser_diagnostics"
-            and manual_plan.target_agent in {"chief_of_staff", "orchestrator"}
-        ):
+        if manual_plan.intent == "browser_diagnostics" and manual_plan.target_agent in {
+            "chief_of_staff",
+            "orchestrator",
+        }:
             route = manual_plan.target_agent
             if route == "orchestrator":
                 return _run_ask_orchestrator(
@@ -1844,9 +1844,7 @@ def _print_work_item_result(
         payload = result.model_dump(mode="json")
         if graph_metadata is not None:
             payload["_langgraph"] = graph_metadata
-        print(
-            json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True)
-        )
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
         print(render_work_item_result_text(result))
         if graph_metadata is not None:

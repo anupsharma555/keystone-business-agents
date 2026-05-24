@@ -55,10 +55,8 @@ from keystone_agents.live_retrieval import (
     company_research_request_text as _live_company_research_request_text,
 )
 from keystone_agents.live_retrieval import (
-    retrieve_company_profile_live,
-)
-from keystone_agents.live_retrieval import (
     retrieval_diagnostics_from_metadata,
+    retrieve_company_profile_live,
 )
 from keystone_agents.live_retrieval import (
     search_provider_label as _live_search_provider_label,

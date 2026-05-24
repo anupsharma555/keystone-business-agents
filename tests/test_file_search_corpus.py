@@ -23,11 +23,7 @@ def _load_manifest() -> dict:
 
 
 def _manifest_local_files(manifest: dict) -> set[str]:
-    return {
-        path
-        for corpus in manifest["corpora"]
-        for path in corpus.get("local_files", [])
-    }
+    return {path for corpus in manifest["corpora"] for path in corpus.get("local_files", [])}
 
 
 def _load_ingest_script() -> ModuleType:
@@ -83,8 +79,7 @@ def test_public_vendor_corpus_contains_only_public_vendor_files() -> None:
     assert public_corpus["sensitivity"] == "public_reference"
     assert public_corpus["local_files"]
     assert all(
-        rel_path.startswith("docs/corpus/vendor/")
-        for rel_path in public_corpus["local_files"]
+        rel_path.startswith("docs/corpus/vendor/") for rel_path in public_corpus["local_files"]
     )
 
 
@@ -111,20 +106,13 @@ def test_ingest_client_uses_keystone_openai_key_not_generic_key(
 
 
 def test_vendored_official_docs_contain_relevant_agent_and_integration_contracts() -> None:
-    agents_tools = (
-        PROJECT_ROOT / "docs/corpus/vendor/openai-agents-python/tools.md"
-    ).read_text()
+    agents_tools = (PROJECT_ROOT / "docs/corpus/vendor/openai-agents-python/tools.md").read_text()
     agents_sessions = (
         PROJECT_ROOT / "docs/corpus/vendor/openai-agents-python/sessions-index.md"
     ).read_text()
-    openai_openapi = (
-        PROJECT_ROOT / "docs/corpus/vendor/openai-openapi/openapi.yaml"
-    ).read_text()
+    openai_openapi = (PROJECT_ROOT / "docs/corpus/vendor/openai-openapi/openapi.yaml").read_text()
     gmail_discovery = json.loads(
-        (
-            PROJECT_ROOT
-            / "docs/corpus/vendor/google-gmail-api/gmail-v1-discovery.json"
-        ).read_text()
+        (PROJECT_ROOT / "docs/corpus/vendor/google-gmail-api/gmail-v1-discovery.json").read_text()
     )
     slack_web_api = (
         PROJECT_ROOT

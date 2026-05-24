@@ -74,9 +74,7 @@ _URGENT_PAYMENT_PATTERN = re.compile(
 )
 _ADVICE_PATTERNS = (
     re.compile(r"\b(?:medical|legal|tax|regulatory)\s+advice\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:prescribe|treatment plan|liability opinion|tax strategy)\b", re.IGNORECASE
-    ),
+    re.compile(r"\b(?:prescribe|treatment plan|liability opinion|tax strategy)\b", re.IGNORECASE),
     re.compile(
         r"\bdiagnose\b[^.\n]{0,120}\b(?:patient|depression|anxiety|bipolar|"
         r"schizophrenia|psychiatric|medical|condition|illness|disorder)\b",

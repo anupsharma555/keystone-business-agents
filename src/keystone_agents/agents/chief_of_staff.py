@@ -46,6 +46,10 @@ from keystone_agents.tools.automation_inventory_tool import (
     list_recent_automation_runs,
     summarize_automation_health,
 )
+from keystone_agents.tools.browser_diagnostics_tool import (
+    capture_browser_diagnostics,
+    summarize_rendered_page_diagnostics,
+)
 from keystone_agents.tools.chief_of_staff_tool import (
     OFFICIAL_OPERATIONS_DOCS,
     _capability_for_topic,
@@ -79,10 +83,6 @@ from keystone_agents.tools.operations_publisher_tool import (
     publish_internal_artifact,
     publish_slack_summary,
     publish_table_mirror,
-)
-from keystone_agents.tools.browser_diagnostics_tool import (
-    capture_browser_diagnostics,
-    summarize_rendered_page_diagnostics,
 )
 from keystone_agents.tools.playwright_tool import render_page
 from keystone_agents.tools.serper_tool import search_web
@@ -228,19 +228,23 @@ def _looks_like_finance_tracker_request(text: str) -> bool:
     if any(marker in normalized for marker in markers):
         return True
     has_finance_metric = any(
-        marker in normalized
-        for marker in ("income", "expense", "expenses", "deduction", "spend")
+        marker in normalized for marker in ("income", "expense", "expenses", "deduction", "spend")
     )
     has_period = bool(re.search(r"\b(?:q[1-4]|quarter\s+[1-4]|20\d{2})\b", normalized))
     has_tax_metric = _looks_like_tax_payment_or_estimate_request(normalized)
     has_rank_metric = _looks_like_top_finance_record_request(normalized)
-    return (has_finance_metric or has_tax_metric) and has_period and (
-        _is_aggregate_request(normalized)
-        or _is_count_request(normalized)
+    return (
+        (has_finance_metric or has_tax_metric)
+        and has_period
+        and (
+            _is_aggregate_request(normalized)
+            or _is_count_request(normalized)
+            or has_rank_metric
+            or _looks_like_rolling_tax_summary_request(normalized)
+            or has_tax_metric
+        )
         or has_rank_metric
-        or _looks_like_rolling_tax_summary_request(normalized)
-        or has_tax_metric
-    ) or has_rank_metric
+    )
 
 
 def _looks_like_finance_tracker_mutation_request(text: str) -> bool:
@@ -442,12 +446,13 @@ def _plan_finance_tracker_artifact_workflow_request(text: str) -> ChiefOfStaffRe
         actions=[
             "Read finance_tax_tracker schema and Q1 records from the finance tables.",
             "Separate paid tax rows from rolling summary/helper rows in Tax Payments.",
-            "Create the requested KNIOps Drive folder and Google Doc only through typed Google Workspace tools.",
+            (
+                "Create the requested KNIOps Drive folder and Google Doc only through "
+                "typed Google Workspace tools."
+            ),
             "Return the Google Doc link, or the exact missing live-write configuration if blocked.",
         ],
-        command=(
-            "Create Q1 finance_tax_tracker tax analysis Google Doc from Airtable reads"
-        ),
+        command=("Create Q1 finance_tax_tracker tax analysis Google Doc from Airtable reads"),
         audit_notes=[
             "Finance/tax Google Doc request routed as a finance tracker artifact workflow.",
         ],
@@ -510,9 +515,7 @@ def _active_slack_followup_text(text: str) -> str:
         "follow-up request:",
     )
     marker_positions = [
-        (lowered.rfind(marker), marker)
-        for marker in markers
-        if lowered.rfind(marker) != -1
+        (lowered.rfind(marker), marker) for marker in markers if lowered.rfind(marker) != -1
     ]
     if not marker_positions:
         return raw
@@ -581,13 +584,9 @@ def _semantic_tables_for_topic(
         name = table.name.lower()
         if topic == "income" and "income" in name:
             selected.append(table)
-        elif topic == "expense" and (
-            "expense" in name or "deduction" in name or "spend" in name
-        ):
+        elif topic == "expense" and ("expense" in name or "deduction" in name or "spend" in name):
             selected.append(table)
-        elif topic == "payment" and "tax" in name and (
-            "payment" in name or "expense" in name
-        ):
+        elif topic == "payment" and "tax" in name and ("payment" in name or "expense" in name):
             selected.append(table)
     if topic == "expense" and "tax" not in normalized:
         selected = [table for table in selected if "tax payment" not in table.name.lower()]
@@ -604,8 +603,7 @@ def _looks_like_top_finance_record_request(normalized: str) -> bool:
         re.search(r"\b(top|highest|largest|biggest|max(?:imum)?|most expensive)\b", normalized)
     )
     has_finance_topic = any(
-        marker in normalized
-        for marker in ("income", "expense", "expenses", "deduction", "spend")
+        marker in normalized for marker in ("income", "expense", "expenses", "deduction", "spend")
     )
     return has_rank_word and has_finance_topic
 
@@ -716,9 +714,7 @@ def _money_amount(value: Any) -> Decimal | None:
 
 def _mentioned_fields(normalized: str, fields: tuple[str, ...]) -> list[str]:
     mentions = [
-        (normalized.index(field.lower()), field)
-        for field in fields
-        if field.lower() in normalized
+        (normalized.index(field.lower()), field) for field in fields if field.lower() in normalized
     ]
     return [field for _, field in sorted(mentions, key=lambda item: item[0])]
 
@@ -743,8 +739,7 @@ def _mentioned_metric_fields(normalized: str, fields: tuple[str, ...]) -> list[s
 
 def _requested_quarters(normalized: str) -> tuple[int, ...]:
     quarters = {
-        int(match.group(1))
-        for match in re.finditer(r"\bq([1-4])\b", normalized, flags=re.I)
+        int(match.group(1)) for match in re.finditer(r"\bq([1-4])\b", normalized, flags=re.I)
     }
     quarters.update(
         int(match.group(1))
@@ -754,9 +749,7 @@ def _requested_quarters(normalized: str) -> tuple[int, ...]:
 
 
 def _requested_years(normalized: str) -> tuple[int, ...]:
-    return tuple(
-        sorted({int(match.group(0)) for match in re.finditer(r"\b20\d{2}\b", normalized)})
-    )
+    return tuple(sorted({int(match.group(0)) for match in re.finditer(r"\b20\d{2}\b", normalized)}))
 
 
 def _finance_tracker_years(normalized: str) -> tuple[int, ...]:
@@ -846,8 +839,8 @@ def _record_matches_period(
     if explicit_quarter_values:
         return not quarters or any(quarter in quarters for quarter in explicit_quarter_values)
     quarter_values = date_quarter_values
-    quarter_ok = not quarters or not quarter_values or any(
-        quarter in quarters for quarter in quarter_values
+    quarter_ok = (
+        not quarters or not quarter_values or any(quarter in quarters for quarter in quarter_values)
     )
     year_ok = not years or not year_values or any(year in years for year in year_values)
     return quarter_ok and year_ok
@@ -1530,9 +1523,7 @@ def _plan_top_airtable_record_from_schema(
         return None
 
     topic = _aggregate_topic(normalized) or "expense"
-    selected_tables = _mentioned_tables(normalized, tables) or _semantic_tables(
-        normalized, tables
-    )
+    selected_tables = _mentioned_tables(normalized, tables) or _semantic_tables(normalized, tables)
     if not selected_tables:
         return _finance_tracker_result(
             text=text,
@@ -1645,9 +1636,7 @@ def _plan_top_airtable_record_from_schema(
     summary = (
         f"Top {topic or 'finance'} record in finance_tax_tracker{title_context}\n\n"
         f"The largest matching record I found is {_format_money(best_record.amount)}.\n\n"
-        "Detail\n\n"
-        + "\n".join(detail_lines)
-        + "\n\nChecks\n\n"
+        "Detail\n\n" + "\n".join(detail_lines) + "\n\nChecks\n\n"
         f"* Records checked: {table_summary}"
     )
     return _finance_tracker_result(
@@ -1714,9 +1703,7 @@ def _plan_airtable_aggregate_from_schema(
             )
         period = _aggregate_period_label(quarters=quarters, years=years)
         heading = (
-            f"{period} finance_tax_tracker Summary"
-            if period
-            else "finance_tax_tracker Summary"
+            f"{period} finance_tax_tracker Summary" if period else "finance_tax_tracker Summary"
         )
         intro = (
             f"For {period}, the finance_tax_tracker currently shows:"
@@ -1761,9 +1748,7 @@ def _plan_airtable_aggregate_from_schema(
             ],
         )
 
-    selected_tables = _mentioned_tables(normalized, tables) or _semantic_tables(
-        normalized, tables
-    )
+    selected_tables = _mentioned_tables(normalized, tables) or _semantic_tables(normalized, tables)
     if not selected_tables:
         return _finance_tracker_result(
             text=text,
@@ -1841,8 +1826,7 @@ def _plan_airtable_aggregate_from_schema(
     if _is_count_request(normalized) and not _is_aggregate_request(normalized):
         total_count = sum(table_counts.values())
         table_parts = [
-            f"{table_counts[table.name]} from `{table.name}`"
-            for table in selected_tables
+            f"{table_counts[table.name]} from `{table.name}`" for table in selected_tables
         ]
         summary = (
             f"I found {total_count} record{'s' if total_count != 1 else ''} in "
@@ -1854,8 +1838,7 @@ def _plan_airtable_aggregate_from_schema(
         table_parts = []
         for table in selected_tables:
             fields_used = (
-                ", ".join(sorted(field_usage[table.name]))
-                or "none with numeric values matched"
+                ", ".join(sorted(field_usage[table.name])) or "none with numeric values matched"
             )
             truncation_note = (
                 f"; read truncated at {read.get('record_limit')} records"
@@ -1897,7 +1880,10 @@ def _plan_airtable_aggregate_from_schema(
                 summary=summary,
                 command=command,
                 actions=[
-                    "Review the table, field, and quarter assumptions before relying on the result.",
+                    (
+                        "Review the table, field, and quarter assumptions before relying "
+                        "on the result."
+                    ),
                     (
                         "Live aggregate reads paginate through Airtable records up to "
                         "AIRTABLE_READ_ALL_MAX_RECORDS; export if any table reports truncation."
@@ -1916,8 +1902,7 @@ def _plan_airtable_aggregate_from_schema(
         summary = (
             f"Total {topic or 'amount'} in the `finance_tax_tracker` Airtable base is "
             f"{_format_money(total)}.\n\n"
-            "Detail\n"
-            + "\n".join(f"- {part}" for part in table_parts)
+            "Detail\n" + "\n".join(f"- {part}" for part in table_parts)
         )
         command = "Aggregate Airtable records from schema-selected tables"
 
@@ -2024,8 +2009,8 @@ def _plan_finance_tracker_request(text: str, *, live: bool) -> ChiefOfStaffResul
                 summary=summary,
                 command="Compare finance_tax_tracker and kni_ops Airtable base schemas",
                 actions=[
-                    "Use `base_alias=\"finance_tax_tracker\"` for finance/tax records.",
-                    "Use `base_alias=\"kni_ops\"` for operations records.",
+                    'Use `base_alias="finance_tax_tracker"` for finance/tax records.',
+                    'Use `base_alias="kni_ops"` for operations records.',
                     "Ask for clarification before reading or writing if the base is ambiguous.",
                 ],
                 audit_notes=["Live schema reads attempted for both configured Airtable bases."],
@@ -2231,8 +2216,7 @@ def _capabilities_for_request(text: str) -> list[str]:
     ):
         capabilities.append("channel_summary")
     if any(
-        term in lowered
-        for term in ("project", "context pack", "what do we know", "obtain context")
+        term in lowered for term in ("project", "context pack", "what do we know", "obtain context")
     ):
         capabilities.append("project_context")
     if any(
@@ -2281,9 +2265,7 @@ def _capabilities_for_request(text: str) -> list[str]:
     if any(
         term in lowered
         for term in ("portfolio", "priorities", "blocked projects", "stale opportunities")
-    ) or (
-        "weekly executive summary" in lowered and "project" in lowered
-    ):
+    ) or ("weekly executive summary" in lowered and "project" in lowered):
         capabilities.append("portfolio_oversight")
     if any(
         term in lowered
@@ -2433,8 +2415,7 @@ def _plan_slack_history_digest_request(text: str) -> ChiefOfStaffResult:
             command_text=f"Summarize supplied Slack history digest for {channel_id or channel}",
             target_channel=(channel.lstrip("#") or channel_id or "selected-channel"),
             rationale=(
-                "A bounded Slack message-history digest was supplied by the "
-                "KNI Slack runtime."
+                "A bounded Slack message-history digest was supplied by the KNI Slack runtime."
             ),
             requires_live_connector=False,
             requires_human_approval_before_post=True,
@@ -2744,15 +2725,11 @@ def _plan_reference_capture(text: str, *, database_url: str | None = None) -> Ch
     )
 
 
-def _plan_chief_memory_capture(
-    text: str, *, database_url: str | None = None
-) -> ChiefOfStaffResult:
+def _plan_chief_memory_capture(text: str, *, database_url: str | None = None) -> ChiefOfStaffResult:
     memory_type = _chief_memory_type_from_text(text)
     object_key = _extract_memory_object_key(text)
     title = _memory_title_from_text(text, memory_type, object_key)
-    summary = (
-        f"Operator-supplied Chief of Staff {memory_type.replace('_', ' ')}: {title}."
-    )
+    summary = f"Operator-supplied Chief of Staff {memory_type.replace('_', ' ')}: {title}."
     store = SQLiteStore(database_url or database_url_from_env())
     memory_item = chief_of_staff_memory_item(
         memory_type=memory_type,
@@ -2785,9 +2762,7 @@ def _plan_chief_memory_capture(
     return ChiefOfStaffResult(
         mode="deterministic",
         intent=text,
-        summary=(
-            f"Saved Chief of Staff {memory_type.replace('_', ' ')} memory: {title}."
-        ),
+        summary=(f"Saved Chief of Staff {memory_type.replace('_', ' ')} memory: {title}."),
         recommended_route=ChiefOfStaffRouteRecommendation(
             workflow_type="reference-capture",
             command_text="@KNI chief of staff remember this as strategic memory",
@@ -2821,9 +2796,7 @@ def _plan_chief_memory_capture(
     )
 
 
-def _plan_chief_memory_review(
-    text: str, *, database_url: str | None = None
-) -> ChiefOfStaffResult:
+def _plan_chief_memory_review(text: str, *, database_url: str | None = None) -> ChiefOfStaffResult:
     object_key = _extract_memory_object_key(text)
     memory_context = build_chief_of_staff_memory_context(
         query=text,
@@ -2877,10 +2850,7 @@ def _memory_action_lines(memory_context: Any) -> list[str]:
                 "assumptions when known."
             ),
         ]
-    return [
-        f"Use approved memory: {item.title}."
-        for item in memory_context.records[:5]
-    ]
+    return [f"Use approved memory: {item.title}." for item in memory_context.records[:5]]
 
 
 def _memory_source_refs(records: list[Any]) -> list[ChiefOfStaffSourceRef]:
@@ -2987,8 +2957,7 @@ def _plan_natural_language_operating_intent(
                 "missing evidence, and next actions."
             ),
             rationale=(
-                "Document review can summarize internal context but external claims "
-                "need approval."
+                "Document review can summarize internal context but external claims need approval."
             ),
             recommended_actions=[
                 "Use supplied files or allowlisted local context as the evidence base.",
@@ -3014,8 +2983,7 @@ def _plan_natural_language_operating_intent(
                 "items, approvals, and next actions."
             ),
             rationale=(
-                "Portfolio review is a summary and prioritization task unless a write "
-                "is approved."
+                "Portfolio review is a summary and prioritization task unless a write is approved."
             ),
             recommended_actions=[
                 "Inspect WorkItems, approvals, artifacts, memory, and selected Slack context.",
@@ -3046,8 +3014,7 @@ def _plan_natural_language_operating_intent(
                 "operating context."
             ),
             rationale=(
-                "Project context should identify known facts, gaps, blockers, and "
-                "next actions."
+                "Project context should identify known facts, gaps, blockers, and next actions."
             ),
             recommended_actions=[
                 (
@@ -3291,9 +3258,7 @@ def plan_chief_of_staff_request(
         return _plan_google_drive_management_request(text)
     if _looks_like_artifact_write_request(text):
         return _plan_business_artifact_write_request(text)
-    natural_intent = _plan_natural_language_operating_intent(
-        text, database_url=database_url
-    )
+    natural_intent = _plan_natural_language_operating_intent(text, database_url=database_url)
     if natural_intent is not None:
         return natural_intent
     if _looks_like_automation_inventory_request(text):
@@ -3446,8 +3411,7 @@ def _looks_like_automation_inventory_request(text: str) -> bool:
 def _looks_like_google_drive_management_request(text: str) -> bool:
     lowered = text.lower()
     has_drive_surface = any(
-        marker in lowered
-        for marker in ("google drive", "gdrive", "drive folder", "knio", "kniops")
+        marker in lowered for marker in ("google drive", "gdrive", "drive folder", "knio", "kniops")
     )
     has_management_intent = any(
         marker in lowered
@@ -3588,8 +3552,7 @@ def _plan_google_drive_management_request(text: str) -> ChiefOfStaffResult:
                 destination=AutomationWriteDestination.GOOGLE_DRIVE_FOLDER,
                 title="KNIOps Folder Management",
                 summary=(
-                    "Manage folders only within the configured KNIOps Google Drive "
-                    "folder tree."
+                    "Manage folders only within the configured KNIOps Google Drive folder tree."
                 ),
                 approval_required=True,
                 live_required=True,
@@ -3690,12 +3653,9 @@ def _write_requests_from_text(text: str) -> list[ChiefOfStaffWriteRequest]:
                 ),
             )
         )
-    if (
-        "folder" in lowered
-        and any(
-            marker in lowered
-            for marker in ("google drive", "gdrive", "drive", "google doc", "google docs")
-        )
+    if "folder" in lowered and any(
+        marker in lowered
+        for marker in ("google drive", "gdrive", "drive", "google doc", "google docs")
     ):
         requests.append(
             ChiefOfStaffWriteRequest(
@@ -3869,10 +3829,9 @@ def _plan_business_artifact_write_request(text: str) -> ChiefOfStaffResult:
             )
         )
     destinations = {request.destination for request in write_requests}
-    google_doc_text_only = (
-        destinations == {AutomationWriteDestination.GOOGLE_DOC}
-        and artifact_type not in {"company_profile", "contact_candidates"}
-    )
+    google_doc_text_only = destinations == {
+        AutomationWriteDestination.GOOGLE_DOC
+    } and artifact_type not in {"company_profile", "contact_candidates"}
     return ChiefOfStaffResult(
         mode="deterministic",
         intent=text,
@@ -3882,9 +3841,9 @@ def _plan_business_artifact_write_request(text: str) -> ChiefOfStaffResult:
             "and only create or update live Docs with an approval reference."
             if google_doc_text_only
             else (
-            "Plan a source-backed internal business artifact before any Airtable or "
-            "Google Docs write. Use Business Research Analyst or Opportunity Scout "
-            "for missing company/contact facts, then publish only reviewed structured fields."
+                "Plan a source-backed internal business artifact before any Airtable or "
+                "Google Docs write. Use Business Research Analyst or Opportunity Scout "
+                "for missing company/contact facts, then publish only reviewed structured fields."
             )
         ),
         time_window=_extract_time_window(text),
@@ -3903,8 +3862,8 @@ def _plan_business_artifact_write_request(text: str) -> ChiefOfStaffResult:
                 "Drive folder when the title/body and approval boundary are clear."
                 if google_doc_text_only
                 else (
-                "Company and contact artifacts need source-backed structured data before "
-                "mirroring to Airtable or Google Docs."
+                    "Company and contact artifacts need source-backed structured data before "
+                    "mirroring to Airtable or Google Docs."
                 )
             ),
             requires_live_connector=True,
@@ -3921,9 +3880,12 @@ def _plan_business_artifact_write_request(text: str) -> ChiefOfStaffResult:
             ]
             if google_doc_text_only
             else [
-            "Resolve the company/contact target and collect source-backed facts.",
-            "Create a structured artifact in SQLite as canonical state.",
-            "Mirror reviewed fields to Airtable or Google Docs only through typed publisher tools.",
+                "Resolve the company/contact target and collect source-backed facts.",
+                "Create a structured artifact in SQLite as canonical state.",
+                (
+                    "Mirror reviewed fields to Airtable or Google Docs only through typed "
+                    "publisher tools."
+                ),
             ]
         ),
         blocked_side_effects=BLOCKED_SIDE_EFFECTS,
@@ -4019,9 +3981,7 @@ def run_chief_of_staff_sdk(
             raw_result={"deterministic": "slack_history_digest"},
             live=live,
         )
-    finance_artifact_workflow = _looks_like_finance_tracker_artifact_workflow_request(
-        request_text
-    )
+    finance_artifact_workflow = _looks_like_finance_tracker_artifact_workflow_request(request_text)
     if finance_artifact_workflow and not live:
         return TypedAgentRunResult(
             agent_name="chief_of_staff",

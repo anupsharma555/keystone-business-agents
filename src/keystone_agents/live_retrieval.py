@@ -99,7 +99,9 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
     if provider_summary and provider_summary not in providers_used:
         providers_used = [*providers_used, *_split_provider_summary(provider_summary)]
 
-    quality = metadata.get("search_quality") if isinstance(metadata.get("search_quality"), dict) else {}
+    quality = (
+        metadata.get("search_quality") if isinstance(metadata.get("search_quality"), dict) else {}
+    )
     source_coverage = (
         metadata.get("source_coverage")
         if isinstance(metadata.get("source_coverage"), dict)
@@ -114,9 +116,7 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
     )
     timing = metadata.get("timing") if isinstance(metadata.get("timing"), dict) else {}
     provider_usage = (
-        metadata.get("provider_usage")
-        if isinstance(metadata.get("provider_usage"), dict)
-        else {}
+        metadata.get("provider_usage") if isinstance(metadata.get("provider_usage"), dict) else {}
     )
     diagnostics = {
         "mode": str(metadata.get("mode") or ""),
@@ -135,8 +135,7 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
         "precision_escalated": bool(metadata.get("precision_search_escalated")),
         "hosted_web_search_lane_used": "agents-web-search" in providers_used,
         "review_recommended": bool(
-            metadata.get("search_review_recommended")
-            or quality.get("needs_search_review")
+            metadata.get("search_review_recommended") or quality.get("needs_search_review")
         ),
         "website_extraction_summary": _compact_website_summary(website),
         "errors": _compact_retrieval_errors(metadata, website),
@@ -688,13 +687,13 @@ def retrieve_company_profile_live(
                 **website_stats,
                 "errors": website_errors[:5],
             },
-                "retrieval_ladder": [
-                    {
-                        "rung": "search_discovery",
-                        "providers": list(search_config.provider_sequence),
-                        "queries": len(queries),
-                        "raw_result_count": len(search_results),
-                        "seconds": round(search_seconds, 3),
+            "retrieval_ladder": [
+                {
+                    "rung": "search_discovery",
+                    "providers": list(search_config.provider_sequence),
+                    "queries": len(queries),
+                    "raw_result_count": len(search_results),
+                    "seconds": round(search_seconds, 3),
                     "useful": bool(search_results),
                 },
                 {
@@ -944,8 +943,8 @@ def build_shared_search_provider_config(
         fallback_provider=fallback_provider,
     )
     agents_enabled = _env_bool("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", default=True)
-    parallel_agents_enabled = (
-        agents_enabled and _env_bool("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", default=True)
+    parallel_agents_enabled = agents_enabled and _env_bool(
+        "KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", default=True
     )
     provider_sequence = _with_agents_web_search_parallel_lane(
         provider_sequence=provider_sequence,
@@ -1016,9 +1015,7 @@ def _deepening_search_providers(
         providers.append("agents-web-search")
     return tuple(
         dict.fromkeys(
-            provider_name
-            for provider_name in providers
-            if provider_name not in provider_sequence
+            provider_name for provider_name in providers if provider_name not in provider_sequence
         )
     )
 
@@ -1112,9 +1109,7 @@ def _run_searxng_lifecycle_command(command: str, *, check: bool = True) -> None:
     )
     if check and completed.returncode != 0:
         details = "\n".join(
-            part.strip()
-            for part in (completed.stdout, completed.stderr)
-            if part and part.strip()
+            part.strip() for part in (completed.stdout, completed.stderr) if part and part.strip()
         )
         raise RuntimeError(f"SearXNG transient {command} failed: {details}")
 
@@ -1470,10 +1465,7 @@ def run_opportunity_scout_live(
     with _maybe_transient_searxng_runtime(
         provider_sequence=provider_sequence,
         settings=settings,
-        enabled=(
-            effective_provider_builder is build_search_provider
-            and bool(provider_sequence)
-        ),
+        enabled=(effective_provider_builder is build_search_provider and bool(provider_sequence)),
     ) as searxng_runtime:
         result = scout_opportunities_live_search(
             topic=topic,

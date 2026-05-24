@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import os
 import base64
 import json
+import os
 import re
-from datetime import datetime, timezone
+import urllib.request
+from datetime import UTC, datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse, urlunparse
-import urllib.request
 
 from pydantic import BaseModel, Field
 
@@ -36,7 +36,6 @@ from keystone_agents.tools.website_extraction_tool import (
     WebsiteExtractionError,
     extract_website_content,
 )
-
 
 MAX_MEETING_PREP_ITEMS = 3
 MIN_ANNOUNCEMENT_ITEMS = 3
@@ -139,7 +138,17 @@ GITHUB_REPO_RELEVANCE_TERMS = {
     "slack",
     "workflow",
 }
-GITHUB_AGENT_TERMS = {"agent", "agents", "llm", "openai", "workflow", "automation", "orchestration", "handoff", "eval"}
+GITHUB_AGENT_TERMS = {
+    "agent",
+    "agents",
+    "llm",
+    "openai",
+    "workflow",
+    "automation",
+    "orchestration",
+    "handoff",
+    "eval",
+}
 GITHUB_WORKSPACE_TERMS = {"slack", "google", "drive", "sheets", "workspace", "integration"}
 GITHUB_DATA_TERMS = {"data", "analysis", "analytics", "dashboard", "pandas", "duckdb", "notebook"}
 GITHUB_CLINICAL_TERMS = {"psychiatry", "behavioral", "mental health", "clinical", "healthcare"}
@@ -434,9 +443,7 @@ def run_announcements_research_synthesis(
 
     sdk_brief: ResearchBrief | None = None
     if live_sdk and selected:
-        sdk_brief, sdk_diagnostics = _run_business_research_analyst_announcement_synthesis(
-            selected
-        )
+        sdk_brief, sdk_diagnostics = _run_business_research_analyst_announcement_synthesis(selected)
         diagnostics.extend(sdk_diagnostics)
 
     summaries = (
@@ -476,7 +483,13 @@ def run_announcements_research_synthesis(
         if sdk_brief is not None
         else "Source basis: supplied #announcements context plus bounded article/search evidence when enabled."
     )
-    lines.extend(["", basis_line, "No calendar writes, Gmail sends, CRM updates, or external publications were performed."])
+    lines.extend(
+        [
+            "",
+            basis_line,
+            "No calendar writes, Gmail sends, CRM updates, or external publications were performed.",
+        ]
+    )
     return AnnouncementResearchAutomationResult(
         status="ok",
         selected_count=len(summaries),
@@ -509,7 +522,9 @@ def run_github_repo_opportunities(
     repos = _github_repos_from_payload(payload)
     preselection_enriched = False
     if live_search and not repos:
-        discovered, discovery_diagnostics = _discover_github_repositories(payload, max_items=max_items)
+        discovered, discovery_diagnostics = _discover_github_repositories(
+            payload, max_items=max_items
+        )
         repos = discovered
         preselection_enriched = True
         diagnostics.extend(discovery_diagnostics)
@@ -583,9 +598,13 @@ def run_github_repo_opportunities(
             route_line += f" - {rationale}"
         lines.append(route_line)
     if sdk_result is not None:
-        lines.append("Opportunity Scout SDK synthesis completed over the selected repository evidence.")
+        lines.append(
+            "Opportunity Scout SDK synthesis completed over the selected repository evidence."
+        )
     if research_brief is not None:
-        lines.append("Business Research Analyst detail synthesis completed over the selected repository evidence.")
+        lines.append(
+            "Business Research Analyst detail synthesis completed over the selected repository evidence."
+        )
         if research_brief.summary:
             lines.append(_trim_words(research_brief.summary, 45))
         lines.append("")
@@ -608,11 +627,7 @@ def run_github_repo_opportunities(
         [
             "",
             "Source basis: GitHub repository metadata plus bounded Opportunity Scout synthesis when enabled.",
-            *(
-                ["Learning signal: " + " ".join(learning_notes[:2])]
-                if learning_notes
-                else []
-            ),
+            *(["Learning signal: " + " ".join(learning_notes[:2])] if learning_notes else []),
             "No GitHub writes, Slack broadcasts, Gmail sends, CRM updates, Calendar writes, Drive edits, or Airtable writes were performed.",
         ]
     )
@@ -664,11 +679,17 @@ def _discover_github_repositories(
             rows = _github_search_repositories(query, per_page=max(max_items * 3, 10))
         except Exception as exc:
             api_failed = True
-            diagnostics.append(f"GitHub API search failed for `{query}`: {type(exc).__name__}: {exc}")
+            diagnostics.append(
+                f"GitHub API search failed for `{query}`: {type(exc).__name__}: {exc}"
+            )
             break
-        candidates.extend(repo for row in rows if (repo := _github_repo_from_mapping(row)) is not None)
+        candidates.extend(
+            repo for row in rows if (repo := _github_repo_from_mapping(row)) is not None
+        )
     if candidates:
-        diagnostics.append(f"GitHub API repository search returned {len(candidates)} candidate row(s).")
+        diagnostics.append(
+            f"GitHub API repository search returned {len(candidates)} candidate row(s)."
+        )
         candidates, enrich_diagnostics = _enrich_github_repository_candidates(
             candidates,
             max_items=max_items,
@@ -686,7 +707,9 @@ def _discover_github_repositories(
         try:
             raw_results = provider.search_web(search_query, num_results=max(max_items * 2, 8))
         except Exception as exc:
-            diagnostics.append(f"Fallback web search failed for `{search_query}`: {type(exc).__name__}: {exc}")
+            diagnostics.append(
+                f"Fallback web search failed for `{search_query}`: {type(exc).__name__}: {exc}"
+            )
             continue
         for result in raw_results or []:
             candidate = _github_repo_from_search_result(result, search_query)
@@ -814,13 +837,19 @@ def _github_repo_from_search_result(
     result: Any,
     query: str,
 ) -> GitHubRepositoryOpportunity | None:
-    title = str(getattr(result, "title", "") or (result.get("title", "") if isinstance(result, dict) else "")).strip()
+    title = str(
+        getattr(result, "title", "")
+        or (result.get("title", "") if isinstance(result, dict) else "")
+    ).strip()
     url = str(
         getattr(result, "link", "")
         or getattr(result, "url", "")
         or (result.get("link") or result.get("url") if isinstance(result, dict) else "")
     ).strip()
-    snippet = str(getattr(result, "snippet", "") or (result.get("snippet", "") if isinstance(result, dict) else "")).strip()
+    snippet = str(
+        getattr(result, "snippet", "")
+        or (result.get("snippet", "") if isinstance(result, dict) else "")
+    ).strip()
     if "github.com/" not in url.lower():
         return None
     full_name = _github_full_name_from_url(url)
@@ -837,7 +866,9 @@ def _github_repo_from_search_result(
         relevance_score=0,
         why_useful="",
         quality_signals=["Found by GitHub-qualified fallback web search."],
-        caveats=["Repository metadata such as stars, forks, license, and pushed date was not available from fallback search."],
+        caveats=[
+            "Repository metadata such as stars, forks, license, and pushed date was not available from fallback search."
+        ],
         suggested_next_step="Open the repository and verify README, license, activity, and fit before adoption.",
         evidence=[
             SearchEvidence(
@@ -899,9 +930,13 @@ def _enrich_github_repository_candidates(
                 }
             )
     if failures:
-        diagnostics.append(f"GitHub enrichment failed for {failures} candidate(s); metadata-only scoring was retained for them.")
+        diagnostics.append(
+            f"GitHub enrichment failed for {failures} candidate(s); metadata-only scoring was retained for them."
+        )
     return [
-        enriched.get(repo.full_name.lower(), repo) if repo.full_name.lower() in preliminary_names else repo
+        enriched.get(repo.full_name.lower(), repo)
+        if repo.full_name.lower() in preliminary_names
+        else repo
         for repo in candidates
     ], diagnostics
 
@@ -935,7 +970,9 @@ def _deepen_selected_github_repositories(
         deepened.append(enriched)
     diagnostics = [f"Selected GitHub repository detail review inspected {len(selected)} repo(s)."]
     if failures:
-        diagnostics.append(f"Selected repository detail review failed for {failures} repo(s); preselection evidence was retained.")
+        diagnostics.append(
+            f"Selected repository detail review failed for {failures} repo(s); preselection evidence was retained."
+        )
     return _rank_github_repository_opportunities(deepened, max_items=len(selected)), diagnostics
 
 
@@ -994,7 +1031,9 @@ def _enrich_github_repository(
         )
     )
     if detailed:
-        enriched = enriched.model_copy(update={"detailed_review": _github_repo_detailed_review(enriched)})
+        enriched = enriched.model_copy(
+            update={"detailed_review": _github_repo_detailed_review(enriched)}
+        )
     return enriched
 
 
@@ -1048,7 +1087,9 @@ def _github_repo_community_signals(full_name: str) -> list[str]:
         if labels & {"help wanted", "good first issue", "documentation", "bug", "enhancement"}:
             signals.append("open issue labels: " + ", ".join(sorted(labels)[:5]))
         if issue_titles:
-            signals.append("active issue examples: " + " | ".join(title for title in issue_titles[:2] if title))
+            signals.append(
+                "active issue examples: " + " | ".join(title for title in issue_titles[:2] if title)
+            )
     comments = _github_api_json(
         f"/repos/{full_name}/issues/comments",
         params={"per_page": 5, "sort": "updated", "direction": "desc"},
@@ -1066,7 +1107,8 @@ def _github_repo_detailed_review(repo: GitHubRepositoryOpportunity) -> str:
         high_signal_paths = [
             path
             for path in repo.key_paths
-            if path.lower().rstrip("/") in {"examples", "docs", "src", "tests", "notebooks", "workflows", "integrations"}
+            if path.lower().rstrip("/")
+            in {"examples", "docs", "src", "tests", "notebooks", "workflows", "integrations"}
             or path.lower().endswith((".md", ".py", ".ts", ".js", ".ipynb", ".yml", ".yaml"))
         ]
         display_paths = high_signal_paths[:5] or repo.key_paths[:5]
@@ -1089,7 +1131,9 @@ def _score_github_repo(repo: GitHubRepositoryOpportunity) -> GitHubRepositoryOpp
         ]
     )
     lowered = text.lower()
-    relevance_hits = sorted(term for term in GITHUB_REPO_RELEVANCE_TERMS if _github_repo_text_has(lowered, term))
+    relevance_hits = sorted(
+        term for term in GITHUB_REPO_RELEVANCE_TERMS if _github_repo_text_has(lowered, term)
+    )
     keystone_fit_score = _github_repo_fit_score(lowered, relevance_hits)
     implementation_value_score = _github_repo_implementation_value_score(repo, lowered)
     score = keystone_fit_score + implementation_value_score
@@ -1124,7 +1168,9 @@ def _score_github_repo(repo: GitHubRepositoryOpportunity) -> GitHubRepositoryOpp
     if repo.archived:
         caveats.append("archived repository")
     if low_fit_domain:
-        caveats.append("domain appears outside Keystone's current agent, operations, data-analysis, or behavioral-health focus")
+        caveats.append(
+            "domain appears outside Keystone's current agent, operations, data-analysis, or behavioral-health focus"
+        )
     if not repo.license:
         caveats.append("license not visible in available metadata")
     if repo.pushed_at and not repo.pushed_at.startswith(("2026", "2025")):
@@ -1166,7 +1212,9 @@ def _github_repo_implementation_value_score(repo: GitHubRepositoryOpportunity, t
     score = 0
     if repo.language.lower() in {"python", "typescript", "javascript"}:
         score += 8
-    if _github_repo_has_any(text, {"python", "sdk", "api", "framework", "library", "workflow", "automation"}):
+    if _github_repo_has_any(
+        text, {"python", "sdk", "api", "framework", "library", "workflow", "automation"}
+    ):
         score += 7
     if repo.license:
         score += 7
@@ -1196,7 +1244,9 @@ def _github_repo_why_useful(repo: GitHubRepositoryOpportunity, relevance_hits: l
     if _github_repo_has_any(text, GITHUB_AGENT_TERMS):
         return "Potentially useful for improving Keystone business-agent orchestration or tool execution."
     if _github_repo_has_any(text, GITHUB_DATA_TERMS):
-        return "Potentially useful for structured data analysis, reporting, or operational dashboards."
+        return (
+            "Potentially useful for structured data analysis, reporting, or operational dashboards."
+        )
     if relevance_hits:
         return "Potentially useful because its public metadata matches Keystone operating themes."
     return "Potentially useful as an open-source repository candidate, pending manual fit review."
@@ -1205,7 +1255,9 @@ def _github_repo_why_useful(repo: GitHubRepositoryOpportunity, relevance_hits: l
 def _github_repo_keystone_fit(repo: GitHubRepositoryOpportunity, relevance_hits: list[str]) -> str:
     text = _github_repo_full_text(repo)
     name = repo.full_name.lower()
-    description = _trim_words(repo.description, 18) if repo.description else "its public repository metadata"
+    description = (
+        _trim_words(repo.description, 18) if repo.description else "its public repository metadata"
+    )
     if _github_repo_low_fit_domain(text):
         return (
             "Weak Keystone fit from available metadata: the repository appears domain-specific outside the current "
@@ -1261,7 +1313,9 @@ def _github_repo_keystone_fit(repo: GitHubRepositoryOpportunity, relevance_hits:
     return "Low-confidence fit from available metadata; keep only as a watchlist candidate until the README is reviewed."
 
 
-def _github_repo_implementation_use_case(repo: GitHubRepositoryOpportunity, relevance_hits: list[str]) -> str:
+def _github_repo_implementation_use_case(
+    repo: GitHubRepositoryOpportunity, relevance_hits: list[str]
+) -> str:
     text = _github_repo_full_text(repo)
     name = repo.full_name.lower()
     if _github_repo_low_fit_domain(text):
@@ -1412,9 +1466,7 @@ def _github_repo_learning_notes(
             f"{stale_count} candidate(s) appeared stale by pushed date; current recency filters should remain in place."
         )
     fallback_count = sum(
-        1
-        for repo in candidates
-        if any(evidence.status == "fallback" for evidence in repo.evidence)
+        1 for repo in candidates if any(evidence.status == "fallback" for evidence in repo.evidence)
     )
     if fallback_count:
         notes.append(
@@ -1455,7 +1507,9 @@ def _run_opportunity_scout_github_repo_synthesis(
     target: str,
     selected: list[GitHubRepositoryOpportunity],
 ) -> tuple[OpportunityScoutResult | None, list[str]]:
-    diagnostics = ["Opportunity Scout SDK path: enabled for GitHub repository opportunity synthesis."]
+    diagnostics = [
+        "Opportunity Scout SDK path: enabled for GitHub repository opportunity synthesis."
+    ]
     context = _github_repo_opportunity_context(selected)
     try:
         sdk_result = run_opportunity_scout_sdk(
@@ -1523,7 +1577,9 @@ def _run_business_research_analyst_github_repo_synthesis(
     target: str,
     selected: list[GitHubRepositoryOpportunity],
 ) -> tuple[ResearchBrief | None, list[str]]:
-    diagnostics = ["Business Research Analyst SDK path: enabled for GitHub repository detail synthesis."]
+    diagnostics = [
+        "Business Research Analyst SDK path: enabled for GitHub repository detail synthesis."
+    ]
     source_context = _github_repo_research_source_context(selected)
     try:
         sdk_result = run_business_research_analyst_research_brief_sdk(
@@ -1633,7 +1689,9 @@ def _calendar_events_from_payload(payload: dict[str, Any]) -> list[dict[str, Any
     return [dict(row) for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
-def _select_meeting_prep_items(events: list[dict[str, Any]], *, max_items: int) -> list[MeetingPrepItem]:
+def _select_meeting_prep_items(
+    events: list[dict[str, Any]], *, max_items: int
+) -> list[MeetingPrepItem]:
     ranked: list[tuple[int, str, MeetingPrepItem]] = []
     for row in events:
         text = " ".join(
@@ -1642,7 +1700,9 @@ def _select_meeting_prep_items(events: list[dict[str, Any]], *, max_items: int) 
         )
         score = _term_score(text, MEETING_PREP_TERMS) - _term_score(text, LOW_PREP_TERMS)
         title = str(row.get("title") or row.get("summary") or "(untitled event)").strip()
-        if score <= 0 and title.lower() not in {item.lower() for item in _string_list(row.get("prep_items"))}:
+        if score <= 0 and title.lower() not in {
+            item.lower() for item in _string_list(row.get("prep_items"))
+        }:
             continue
         start = str(row.get("start", ""))
         focus = _meeting_focus(title=title, note=str(row.get("note", "")), score=score)
@@ -1720,7 +1780,9 @@ def _summarize_announcement(item: AnnouncementLinkInput) -> AnnouncementResearch
     search = next((evidence for evidence in item.evidence if evidence.kind == "search"), None)
     evidence_note_text = ""
     if article is not None:
-        snippet = _trim_words(article.snippet, 40) if article.snippet else "no readable excerpt returned"
+        snippet = (
+            _trim_words(article.snippet, 40) if article.snippet else "no readable excerpt returned"
+        )
         evidence_note_text = (
             f" Read source: {article.title or item.title} via {article.source} "
             f"({article.status}, {article.char_count} chars). Key extracted passage: {snippet} "
@@ -1836,7 +1898,9 @@ def _summaries_from_research_brief(
     }
     for index, item in enumerate(selected, start=1):
         source_id = f"announcement_{index}"
-        article = article_by_source_id.get(source_id) or article_by_title.get(_normalize_text(item.title))
+        article = article_by_source_id.get(source_id) or article_by_title.get(
+            _normalize_text(item.title)
+        )
         if article is not None:
             parts = [
                 article.research_question,
@@ -1846,9 +1910,7 @@ def _summaries_from_research_brief(
                 article.relevance_to_goal,
             ]
         else:
-            facts = [
-                fact.text for fact in brief.facts if source_id in set(fact.source_ids)
-            ][:3]
+            facts = [fact.text for fact in brief.facts if source_id in set(fact.source_ids)][:3]
             parts = [*facts, *brief.inferences[:2]]
         source_basis = _announcement_summary_source_basis(item)
         summary_text = _trim_words(
@@ -1886,9 +1948,7 @@ def _attach_search_evidence(items: list[MeetingPrepItem]) -> list[str]:
             try:
                 evidence = _search_evidence(provider.search_web(query, num_results=3))
                 matching = [
-                    result
-                    for result in evidence
-                    if _meeting_search_result_matches(query, result)
+                    result for result in evidence if _meeting_search_result_matches(query, result)
                 ]
                 if matching:
                     item.evidence.extend(matching[:1])
@@ -1926,7 +1986,9 @@ def _attach_announcement_article_evidence(item: AnnouncementLinkInput) -> list[s
                 live=True,
             )
         except (WebsiteExtractionError, OSError) as exc:
-            diagnostics.append(f"Article read failed for `{item.title}` from {url}: {type(exc).__name__}: {exc}")
+            diagnostics.append(
+                f"Article read failed for `{item.title}` from {url}: {type(exc).__name__}: {exc}"
+            )
             continue
         text = extraction.text_or_markdown.strip()
         if len(text) < MIN_ARTICLE_READ_CHARS:
@@ -1952,7 +2014,9 @@ def _attach_announcement_article_evidence(item: AnnouncementLinkInput) -> list[s
         )
         return diagnostics
     if not diagnostics:
-        diagnostics.append(f"Article read skipped for `{item.title}`: no http(s) source URL available.")
+        diagnostics.append(
+            f"Article read skipped for `{item.title}`: no http(s) source URL available."
+        )
     return diagnostics
 
 
@@ -2021,7 +2085,9 @@ def _searxng_reachability_line(base_url: str) -> str:
 
 def _search_evidence(results: list[SearchResult]) -> list[SearchEvidence]:
     return [
-        SearchEvidence(title=result.title, url=result.link, snippet=result.snippet, source=result.source)
+        SearchEvidence(
+            title=result.title, url=result.link, snippet=result.snippet, source=result.source
+        )
         for result in results
         if result.title and result.link
     ]
@@ -2044,8 +2110,7 @@ def _meeting_focus(*, title: str, note: str, score: int) -> str:
 def _meeting_queries(title: str, row: dict[str, Any]) -> tuple[list[str], str]:
     supplied_urls = _urls_from_text(
         " ".join(
-            str(row.get(key, ""))
-            for key in ("url", "link", "description", "note", "location")
+            str(row.get(key, "")) for key in ("url", "link", "description", "note", "location")
         )
     )
     if supplied_urls:
@@ -2062,10 +2127,7 @@ def _meeting_queries(title: str, row: dict[str, Any]) -> tuple[list[str], str]:
 
 
 def _distinctive_meeting_terms(text: str) -> set[str]:
-    tokens = {
-        token.lower()
-        for token in re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", text)
-    }
+    tokens = {token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", text)}
     return {token for token in tokens if token not in MEETING_SEARCH_STOPWORDS}
 
 
@@ -2140,7 +2202,7 @@ def automation_payload_metadata() -> dict[str, str]:
     """Return stable read-only metadata for downstream logs."""
 
     return {
-        "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "generated_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "external_writes_enabled": "false",
         "calendar_writes_enabled": "false",
         "gmail_writes_enabled": "false",

@@ -212,7 +212,7 @@ def publish_internal_artifact(
     artifact_json: str,
     artifact_type: str = "business_artifact",
     title: str = "",
-    destinations_json: str = "[\"local_json\"]",
+    destinations_json: str = '["local_json"]',
     live: bool = False,
 ) -> str:
     """Create dry-run internal artifact refs for company/contact/business data."""

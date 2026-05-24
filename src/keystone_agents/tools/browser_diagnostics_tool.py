@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import time
 import json
+import time
 from collections import Counter
 from typing import Any
 
@@ -56,7 +56,9 @@ def capture_browser_diagnostics_impl(
 
     normalized_url = str(url or "").strip()
     if not _valid_http_url(normalized_url):
-        return _blocked_payload(normalized_url, reason="Only http/https URLs are allowed.", live=live)
+        return _blocked_payload(
+            normalized_url, reason="Only http/https URLs are allowed.", live=live
+        )
     timeout_ms = _bounded_timeout_ms(timeout_seconds)
     if not live:
         return {
@@ -147,7 +149,9 @@ def capture_browser_diagnostics_impl(
                 "url": str(getattr(request, "url", "") or "")[:500],
                 "method": str(getattr(request, "method", "") or ""),
                 "resource_type": str(getattr(request, "resource_type", "") or "unknown"),
-                "failure": _bounded_text(failure.get("errorText", "") if isinstance(failure, dict) else failure, 1_000),
+                "failure": _bounded_text(
+                    failure.get("errorText", "") if isinstance(failure, dict) else failure, 1_000
+                ),
             }
         )
 
@@ -243,11 +247,12 @@ def summarize_rendered_page_diagnostics_impl(diagnostics: dict[str, Any]) -> dic
     network = network if isinstance(network, dict) else {}
     console_messages = diagnostics.get("console_messages") if isinstance(diagnostics, dict) else []
     page_errors = diagnostics.get("page_errors") if isinstance(diagnostics, dict) else []
-    failed_requests = diagnostics.get("failed_requests") if isinstance(diagnostics, dict) else []
     console_count = len(console_messages) if isinstance(console_messages, list) else 0
     page_error_count = len(page_errors) if isinstance(page_errors, list) else 0
     failed_request_count = int(network.get("failed_request_count") or 0)
-    status = str(diagnostics.get("status") or "unknown") if isinstance(diagnostics, dict) else "unknown"
+    status = (
+        str(diagnostics.get("status") or "unknown") if isinstance(diagnostics, dict) else "unknown"
+    )
     status_code = int(diagnostics.get("status_code") or 0) if isinstance(diagnostics, dict) else 0
 
     issues: list[dict[str, Any]] = []

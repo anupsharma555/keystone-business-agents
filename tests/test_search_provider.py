@@ -192,16 +192,13 @@ def test_invalid_search_provider_name_fails_clearly() -> None:
 def test_search_provider_normalizer_accepts_agents_web_search_aliases() -> None:
     assert normalize_search_provider_name("tavily-search") == SearchProviderName.TAVILY
     assert (
-        normalize_search_provider_name("agents-web-search")
-        == SearchProviderName.AGENTS_WEB_SEARCH
+        normalize_search_provider_name("agents-web-search") == SearchProviderName.AGENTS_WEB_SEARCH
     )
     assert (
-        normalize_search_provider_name("openai-web-search")
-        == SearchProviderName.AGENTS_WEB_SEARCH
+        normalize_search_provider_name("openai-web-search") == SearchProviderName.AGENTS_WEB_SEARCH
     )
     assert (
-        normalize_search_provider_name("native_web_search")
-        == SearchProviderName.AGENTS_WEB_SEARCH
+        normalize_search_provider_name("native_web_search") == SearchProviderName.AGENTS_WEB_SEARCH
     )
 
 

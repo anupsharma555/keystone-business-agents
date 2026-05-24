@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -164,9 +164,7 @@ def test_run_script_allows_bounded_workspace_writes_for_explicit_doc_request() -
         "Create a folder and provide a link to the google doc"
     )
 
-    assert script._approval_reference_for_request(request).startswith(
-        "chief-of-staff-command:"
-    )
+    assert script._approval_reference_for_request(request).startswith("chief-of-staff-command:")
     policy = script._live_side_effect_policy(request)
 
     assert "Live internal Airtable reads are allowed" in policy
@@ -1772,8 +1770,7 @@ def test_supplied_slack_history_digest_renders_timestamped_answer() -> None:
     assert "Review `early psychosis prediction` from 2026-05-14 13:16 EDT" in result.summary
     assert "Review `esketamine bipolar` from 2026-05-14 13:00 EDT" in result.summary
     assert (
-        "Review `translational psychiatry | Score: 1` from 2026-05-14 12:43 EDT"
-        in result.summary
+        "Review `translational psychiatry | Score: 1` from 2026-05-14 12:43 EDT" in result.summary
     )
     assert "Metadata:" not in result.summary
     assert "run_123" not in result.summary
@@ -1873,10 +1870,7 @@ def test_run_chief_of_staff_sdk_uses_deterministic_finance_aggregate_even_when_f
 
 def test_reference_capture_request_saves_operator_memory(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'keystone.db'}"
-    url = (
-        "https://braininitiative.nih.gov/news-events/blog/"
-        "register-now-nih-brain-neuroai-workshop"
-    )
+    url = "https://braininitiative.nih.gov/news-events/blog/register-now-nih-brain-neuroai-workshop"
 
     result = plan_chief_of_staff_request(
         (

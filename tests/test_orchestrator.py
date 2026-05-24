@@ -361,9 +361,7 @@ def test_outreach_request_without_approved_profile_refuses() -> None:
 
 
 def test_research_then_outreach_request_routes_to_research_first() -> None:
-    result = route_request(
-        "Research Mentavi and prepare draft-only outreach only after approval"
-    )
+    result = route_request("Research Mentavi and prepare draft-only outreach only after approval")
 
     assert result.route == "business_research_analyst"
     assert result.target_agent == "Business Research Analyst"

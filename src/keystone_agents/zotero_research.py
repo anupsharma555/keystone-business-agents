@@ -359,8 +359,7 @@ def _zotero_web_search_context(
         return "", [f"Web search provider unavailable for Zotero research: {exc}"], metadata
 
     provider_name = (
-        _clean_text(getattr(provider, "provider_name", ""))
-        or provider.__class__.__name__
+        _clean_text(getattr(provider, "provider_name", "")) or provider.__class__.__name__
     )
     metadata["search_provider"] = provider_name
     metadata["provider_usage"] = {provider_name: {"requests_attempted": 0, "results_returned": 0}}
@@ -621,11 +620,7 @@ def _rank_zotero_items(
         data = _item_data(item)
         haystack = _item_haystack(data)
         title = _clean_text(data.get("title")).lower()
-        score = sum(
-            3.0 if token in title else 1.0
-            for token in tokens
-            if token in haystack
-        )
+        score = sum(3.0 if token in title else 1.0 for token in tokens if token in haystack)
         url = _source_url(data).lower()
         item_type = _clean_text(data.get("itemType")).lower()
         if "sooma" in tokens and "sooma" in haystack:

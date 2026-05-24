@@ -427,9 +427,7 @@ def assess_company_search_quality(
         needs_precision = True
         reasons.append("request needs higher-precision or more current evidence")
     if source_coverage.missing_lanes:
-        reasons.append(
-            "source coverage missing lanes: " + ", ".join(source_coverage.missing_lanes)
-        )
+        reasons.append("source coverage missing lanes: " + ", ".join(source_coverage.missing_lanes))
         if result_count < 4 or "company_site" in source_coverage.missing_lanes:
             needs_precision = True
     if source_coverage.missing_expected_domains:
@@ -516,9 +514,7 @@ def assess_opportunity_search_quality(
         needs_precision = True
         reasons.append("opportunity search lacks clear recency evidence")
     if source_coverage.missing_lanes:
-        reasons.append(
-            "source coverage missing lanes: " + ", ".join(source_coverage.missing_lanes)
-        )
+        reasons.append("source coverage missing lanes: " + ", ".join(source_coverage.missing_lanes))
         if source_coverage.expected_lane_recall < 0.5:
             needs_precision = True
 
@@ -607,9 +603,7 @@ def assess_role_search_quality(
         needs_precision = True
         reasons.append("role search lacks clear recency evidence")
     if source_coverage.missing_lanes:
-        reasons.append(
-            "source coverage missing lanes: " + ", ".join(source_coverage.missing_lanes)
-        )
+        reasons.append("source coverage missing lanes: " + ", ".join(source_coverage.missing_lanes))
         if "careers_jobs" in source_coverage.missing_lanes:
             needs_precision = True
 

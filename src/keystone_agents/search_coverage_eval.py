@@ -367,8 +367,10 @@ def score_search_results(
     ]
     signal_hits = _signal_hits(normalized_results, case.expected_signals)
     diagnosis = list(coverage.diagnosis)
-    if case.requires_extraction and normalized_results and not any(
-        str(result.get("content") or "").strip() for result in normalized_results
+    if (
+        case.requires_extraction
+        and normalized_results
+        and not any(str(result.get("content") or "").strip() for result in normalized_results)
     ):
         diagnosis.append("selected URL extraction required but provider returned snippets only")
     if error:
@@ -533,9 +535,7 @@ def _summarize_provider_runs(
             "average_primary_source_count": _average(
                 score.primary_source_count for score in scores
             ),
-            "average_unique_domain_count": _average(
-                score.unique_domain_count for score in scores
-            ),
+            "average_unique_domain_count": _average(score.unique_domain_count for score in scores),
             "average_useful_claim_count": _average(score.useful_claim_count for score in scores),
             "estimated_cost_units": sum(score.estimated_cost_units for score in scores),
             "latency_p50_ms": _percentile(latencies, 50),

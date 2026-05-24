@@ -236,8 +236,10 @@ def test_company_live_retrieval_can_agent_review_weak_html_extraction(
         company="Curebase",
         company_url="https://www.curebase.com",
         max_results=1,
-        profile_builder=lambda **kwargs: captured.update(kwargs)
-        or CompanyProfile(name="Curebase", website="https://www.curebase.com"),
+        profile_builder=lambda **kwargs: (
+            captured.update(kwargs)
+            or CompanyProfile(name="Curebase", website="https://www.curebase.com")
+        ),
     )
 
     website_inputs = captured["website_inputs"]

@@ -49,7 +49,9 @@ def normalize_quality_mode(
         return QualityMode(normalized)
     except ValueError as exc:
         allowed = ", ".join(mode.value for mode in QualityMode)
-        raise ValueError(f"Unsupported quality mode {value!r}; expected one of: {allowed}.") from exc
+        raise ValueError(
+            f"Unsupported quality mode {value!r}; expected one of: {allowed}."
+        ) from exc
 
 
 def chief_of_staff_quality_budget(
@@ -74,7 +76,9 @@ def chief_of_staff_quality_budget(
             notes.append("Quality mode inferred as balanced for live Chief of Staff SDK planning.")
         else:
             resolved = QualityMode.FAST
-            notes.append("Quality mode inferred as fast for simple deterministic Chief of Staff routing.")
+            notes.append(
+                "Quality mode inferred as fast for simple deterministic Chief of Staff routing."
+            )
     return _budget_for_mode(resolved, notes=notes)
 
 

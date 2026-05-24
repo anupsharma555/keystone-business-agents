@@ -272,10 +272,7 @@ def _live_workspace_checks(env: Mapping[str, str]) -> list[HealthCheck]:
         response = (
             drive.files()
             .list(
-                q=(
-                    f"'{root_id}' in parents and mimeType = '{DOC_MIME_TYPE}' "
-                    "and trashed = false"
-                ),
+                q=(f"'{root_id}' in parents and mimeType = '{DOC_MIME_TYPE}' and trashed = false"),
                 spaces="drive",
                 fields="files(id,name,webViewLink)",
                 pageSize=10,
@@ -286,9 +283,7 @@ def _live_workspace_checks(env: Mapping[str, str]) -> list[HealthCheck]:
         doc = files[0] if files else None
         if doc:
             metadata = (
-                docs.documents()
-                .get(documentId=str(doc["id"]), fields="documentId,title")
-                .execute()
+                docs.documents().get(documentId=str(doc["id"]), fields="documentId,title").execute()
             )
             checks.append(
                 HealthCheck(
@@ -453,12 +448,9 @@ def run_google_health_check(
     source = os.environ if env is None else env
     workspace_token = _path(_env(source, "GOOGLE_WORKSPACE_OAUTH_TOKEN_PATH"))
     workspace_secret = _path(_env(source, "GOOGLE_WORKSPACE_OAUTH_CLIENT_SECRET_PATH"))
-    gmail_token = _path(
-        _env(source, "GMAIL_OAUTH_TOKEN_PATH") or _env(source, "GOOGLE_TOKEN_FILE")
-    )
+    gmail_token = _path(_env(source, "GMAIL_OAUTH_TOKEN_PATH") or _env(source, "GOOGLE_TOKEN_FILE"))
     gmail_secret = _path(
-        _env(source, "GMAIL_OAUTH_CLIENT_SECRET_PATH")
-        or _env(source, "GOOGLE_CREDENTIALS_FILE")
+        _env(source, "GMAIL_OAUTH_CLIENT_SECRET_PATH") or _env(source, "GOOGLE_CREDENTIALS_FILE")
     )
     calendar_token = _path(_env(source, "CALENDAR_OAUTH_TOKEN_PATH"))
     calendar_secret = _path(_env(source, "CALENDAR_OAUTH_CLIENT_SECRET_PATH"))

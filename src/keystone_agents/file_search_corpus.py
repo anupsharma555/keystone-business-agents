@@ -132,8 +132,7 @@ def corpus_upload_plan_summary(plan: CorpusUploadPlan) -> dict[str, Any]:
 def _matches_blocked_pattern(path: str, blocked_patterns: tuple[str, ...]) -> bool:
     path_name = Path(path).name
     return any(
-        fnmatch(path, pattern) or fnmatch(path_name, pattern)
-        for pattern in blocked_patterns
+        fnmatch(path, pattern) or fnmatch(path_name, pattern) for pattern in blocked_patterns
     )
 
 

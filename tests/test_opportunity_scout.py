@@ -470,8 +470,7 @@ class FakeCoverageFollowupProvider:
                     title="AffectAI NIH SBIR grant project",
                     link="https://reporter.nih.gov/project-details/123",
                     snippet=(
-                        "NIH SBIR grant project supports behavioral health AI "
-                        "evidence generation."
+                        "NIH SBIR grant project supports behavioral health AI evidence generation."
                     ),
                     source="serper",
                 )
@@ -1589,9 +1588,7 @@ def test_company_search_rejects_listicle_and_roundup_titles_as_company_names() -
     assert "roundup" in scout_module._candidate_name_rejection_reason(
         "Mental Health Funding and News Roundup"
     )
-    assert "rundown" in scout_module._candidate_name_rejection_reason(
-        "Health Tech Weekly Rundown"
-    )
+    assert "rundown" in scout_module._candidate_name_rejection_reason("Health Tech Weekly Rundown")
     assert "trend article" in scout_module._candidate_name_rejection_reason(
         "Q1 2026 Healthtech VC Trends"
     )
@@ -2153,7 +2150,10 @@ def test_company_growth_plan_broadens_partnership_advisory_underfill() -> None:
                 SearchResult(
                     title="Artificial Intelligence for Mental Health Monitoring",
                     link="https://pmc.ncbi.nlm.nih.gov/articles/PMC12745907/",
-                    snippet="Publication article about artificial intelligence for mental health monitoring.",
+                    snippet=(
+                        "Publication article about artificial intelligence for mental "
+                        "health monitoring."
+                    ),
                     source="searxng",
                 )
             ][: request.num_results]
@@ -2168,7 +2168,10 @@ def test_company_growth_plan_broadens_partnership_advisory_underfill() -> None:
     )
 
     result = scout_opportunities_live_search(
-        topic="active behavioral health AI partnership or advisory opportunities relevant to Keystone",
+        topic=(
+            "active behavioral health AI partnership or advisory opportunities relevant "
+            "to Keystone"
+        ),
         max_results=3,
         search_plan=search_plan,
         search_provider=provider,
@@ -2177,7 +2180,9 @@ def test_company_growth_plan_broadens_partnership_advisory_underfill() -> None:
     assert len(result.records) == 1
     assert result.records[0].company_name == "Jimini Health"
     assert any("Underfilled search broadened" in note for note in result.audit_notes)
-    assert any("behavioral health technology" in request.query.lower() for request in provider.requests)
+    assert any(
+        "behavioral health technology" in request.query.lower() for request in provider.requests
+    )
 
 
 def test_live_search_passes_provider_specific_query_hints() -> None:

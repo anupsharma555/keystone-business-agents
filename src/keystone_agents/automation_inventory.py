@@ -36,8 +36,7 @@ DEFAULT_AUTOMATION_SPECS: tuple[AutomationSpec, ...] = (
         id="auto_gmail_triage",
         name="Gmail Triage",
         description=(
-            "Staged Gmail automation for label previews, label application, "
-            "and draft creation."
+            "Staged Gmail automation for label previews, label application, and draft creation."
         ),
         trigger_type=AutomationTriggerType.GMAIL_QUERY,
         schedule="operator-controlled",
@@ -70,7 +69,10 @@ DEFAULT_AUTOMATION_SPECS: tuple[AutomationSpec, ...] = (
         schedule="Mondays at 8:00 AM ET",
         target_agent="chief_of_staff",
         workflow="chief-of-staff-weekly-meeting-prep",
-        input_template="Review the next seven days of calendar context and prepare only salient meetings.",
+        input_template=(
+            "Review the next seven days of calendar context and prepare only salient "
+            "meetings."
+        ),
         default_channel="#meetings",
         live_flags=["--live-sdk", "--live-search"],
         metadata={
@@ -201,9 +203,7 @@ def automation_spec_for_command(command: str, *, stage: str = "") -> AutomationS
 
     normalized = str(command or "").strip()
     if normalized == "weekly-opportunity":
-        return DEFAULT_AUTOMATION_SPECS[0].model_copy(
-            update={"metadata": {"last_stage": stage}}
-        )
+        return DEFAULT_AUTOMATION_SPECS[0].model_copy(update={"metadata": {"last_stage": stage}})
     if normalized == "gmail-triage":
         return DEFAULT_AUTOMATION_SPECS[1].model_copy(update={"metadata": {"last_stage": stage}})
     if normalized == "chief-of-staff-weekly-meeting-prep":

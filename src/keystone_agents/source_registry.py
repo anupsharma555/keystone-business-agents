@@ -358,9 +358,7 @@ def _normalize_lanes(lanes: Sequence[str]) -> tuple[str, ...]:
     valid = set(SOURCE_LANES)
     return tuple(
         dict.fromkeys(
-            normalized
-            for lane in lanes
-            if (normalized := str(lane or "").strip().lower()) in valid
+            normalized for lane in lanes if (normalized := str(lane or "").strip().lower()) in valid
         )
     )
 

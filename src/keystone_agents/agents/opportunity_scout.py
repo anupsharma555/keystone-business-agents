@@ -73,6 +73,10 @@ from keystone_agents.source_registry import (
     assess_source_coverage,
     required_source_lanes_for_opportunity,
 )
+from keystone_agents.tools.browser_diagnostics_tool import (
+    capture_browser_diagnostics,
+    summarize_rendered_page_diagnostics,
+)
 from keystone_agents.tools.html_review_tool import (
     agent_html_review_enabled,
     agent_html_review_max_pages,
@@ -90,10 +94,6 @@ from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
     search_local_context,
-)
-from keystone_agents.tools.browser_diagnostics_tool import (
-    capture_browser_diagnostics,
-    summarize_rendered_page_diagnostics,
 )
 from keystone_agents.tools.memory_tool import (
     check_workflow_duplicate,
@@ -1244,20 +1244,14 @@ def _plan_is_conference_request(plan: OpportunitySearchPlan | None) -> bool:
 def _plan_is_journal_call_request(plan: OpportunitySearchPlan | None) -> bool:
     return plan is not None and (
         plan_targets_only(plan, "journal_call")
-        or (
-            len(plan.target_entity_types) <= 1
-            and plan_has_objective(plan, "journal_article_call")
-        )
+        or (len(plan.target_entity_types) <= 1 and plan_has_objective(plan, "journal_article_call"))
     )
 
 
 def _plan_is_contract_rfp_request(plan: OpportunitySearchPlan | None) -> bool:
     return plan is not None and (
         plan_targets_only(plan, "contract_rfp")
-        or (
-            len(plan.target_entity_types) <= 1
-            and plan_has_objective(plan, "contract_opportunity")
-        )
+        or (len(plan.target_entity_types) <= 1 and plan_has_objective(plan, "contract_opportunity"))
     )
 
 
@@ -1282,10 +1276,7 @@ def _plan_is_role_request(plan: OpportunitySearchPlan | None) -> bool:
 def _plan_is_github_repository_request(plan: OpportunitySearchPlan | None) -> bool:
     return plan is not None and (
         plan_targets_only(plan, "github_repository")
-        or (
-            len(plan.target_entity_types) <= 1
-            and plan_has_objective(plan, "open_source_tooling")
-        )
+        or (len(plan.target_entity_types) <= 1 and plan_has_objective(plan, "open_source_tooling"))
     )
 
 
@@ -1293,9 +1284,7 @@ def _plan_has_lane(plan: OpportunitySearchPlan | None, lane_type: str) -> bool:
     if plan is None:
         return False
     return any(
-        (
-            lane.get("lane_type") if isinstance(lane, dict) else getattr(lane, "lane_type", "")
-        )
+        (lane.get("lane_type") if isinstance(lane, dict) else getattr(lane, "lane_type", ""))
         == lane_type
         for lane in plan.lanes
     )
@@ -1482,10 +1471,7 @@ def _is_broad_multilane_request(topic: str | None) -> bool:
         "all lanes" in lowered or "multiple lanes" in lowered or lane_count >= 3
     ):
         return False
-    return (
-        any(marker in lowered for marker in broad_markers)
-        and lane_count >= 2
-    )
+    return any(marker in lowered for marker in broad_markers) and lane_count >= 2
 
 
 def _topic_search_context(topic: str | None) -> str:
@@ -1628,7 +1614,7 @@ def _build_live_query_specs(
                 lane="grant",
                 time_window="current",
                 query=(
-                    'site:grants.nih.gov (NIMH OR NIH) '
+                    "site:grants.nih.gov (NIMH OR NIH) "
                     '("digital mental health" OR neuroinformatics OR neuroscience) '
                     '("funding opportunity" OR NOFO OR "notice of funding")'
                 ),
@@ -1839,7 +1825,7 @@ def _build_live_query_specs(
                 time_window="current",
                 query=(
                     '"digital mental health" journal "call for papers" '
-                    '(psychiatry OR behavioral health OR implementation)'
+                    "(psychiatry OR behavioral health OR implementation)"
                 ),
                 entity_hint="journal_call",
             ),
@@ -2265,9 +2251,7 @@ def _build_live_query_specs(
     seen: set[str] = set()
     if _plan_is_strict_company_request(plan):
         specs = [
-            spec
-            for spec in specs
-            if spec.entity_hint == "company" and spec.lane not in {"role"}
+            spec for spec in specs if spec.entity_hint == "company" and spec.lane not in {"role"}
         ]
     deduped: list[_OpportunityQuerySpec] = []
     for spec in specs:
@@ -2517,7 +2501,7 @@ def _build_underfill_followup_query_specs(
                     time_window="current",
                     query=(
                         '"AI for mental health" journal "special issue" '
-                        '(submission OR submit OR manuscripts)'
+                        "(submission OR submit OR manuscripts)"
                     ),
                     entity_hint="journal_call",
                 ),
@@ -2703,9 +2687,7 @@ def _coverage_specs_for_source_lane(
             _OpportunityQuerySpec(
                 lane="company_growth",
                 time_window="recent",
-                query=(
-                    f'site:businesswire.com {context} ("funding" OR "partnership" OR launch)'
-                ),
+                query=(f'site:businesswire.com {context} ("funding" OR "partnership" OR launch)'),
                 entity_hint="company",
                 source="news",
             ),
@@ -2838,9 +2820,7 @@ def _build_result_deepening_query_specs(
     }
     specs: list[_OpportunityQuerySpec] = []
     seen: set[tuple[str, int]] = {
-        (spec.query.strip().lower(), spec.page)
-        for spec in existing_specs
-        if spec.page is not None
+        (spec.query.strip().lower(), spec.page) for spec in existing_specs if spec.page is not None
     }
     max_page = _result_deepening_max_page()
     for spec in existing_specs:
@@ -2926,17 +2906,21 @@ def _extract_company_name(title: str, url: str = "") -> str:
     for separator in (" | ", " - ", ":"):
         if separator in text:
             left, right = (part.strip() for part in text.split(separator, 1))
-            if left.lower().strip(".") in {
-                "blog",
-                "blogs",
-                "exclusive",
-                "insights",
-                "news",
-                "press",
-                "press release",
-                "press releases",
-                "resources",
-            } and right:
+            if (
+                left.lower().strip(".")
+                in {
+                    "blog",
+                    "blogs",
+                    "exclusive",
+                    "insights",
+                    "news",
+                    "press",
+                    "press release",
+                    "press releases",
+                    "resources",
+                }
+                and right
+            ):
                 text = right
             else:
                 text = left
@@ -3897,9 +3881,8 @@ def _strict_company_target_rejection_reason(*, company_name: str, haystack: str)
         and ".gov" in lowered_haystack
     ):
         return "strict company search rejected a government or agency entity"
-    if (
-        "breakthrough" in lowered_name
-        and re.search(r"\b(?:award winners?|awards program|annual awards)\b", lowered_haystack)
+    if "breakthrough" in lowered_name and re.search(
+        r"\b(?:award winners?|awards program|annual awards)\b", lowered_haystack
     ):
         return "strict company search rejected an awards program or media entity"
     return ""
@@ -4158,8 +4141,10 @@ def _has_behavioral_health_or_adjacent_healthcare_ai_relevance(haystack: str) ->
         )
     )
     has_non_clinical_focus = any(marker in haystack for marker in NON_CLINICAL_AI_MARKERS)
-    return has_adjacent_healthcare and (has_ai_signal or has_clinical_signal) and not (
-        has_non_clinical_focus
+    return (
+        has_adjacent_healthcare
+        and (has_ai_signal or has_clinical_signal)
+        and not (has_non_clinical_focus)
     )
 
 
@@ -6100,8 +6085,7 @@ def scout_opportunities_live_search(
                     "Mixed meeting/grant lane postprocess split combined source bundles into "
                     "separate lane records."
                 ]
-                if _plan_is_meeting_grant_request(resolved_search_plan)
-                and len(result.records) >= 2
+                if _plan_is_meeting_grant_request(resolved_search_plan) and len(result.records) >= 2
                 else []
             ),
             *(
@@ -6152,7 +6136,9 @@ def _split_mixed_meeting_grant_records(
             if not bundles:
                 continue
             primary = bundles[0]
-            sources = [source for bundle in bundles for source in bundle.sources] or list(record.sources)
+            sources = [source for bundle in bundles for source in bundle.sources] or list(
+                record.sources
+            )
             payload = record.model_dump(mode="python")
             payload.update(
                 {
@@ -6188,11 +6174,7 @@ def _split_mixed_meeting_grant_records(
                         dict.fromkeys(
                             [
                                 *record.missing_evidence,
-                                *[
-                                    item
-                                    for bundle in bundles
-                                    for item in bundle.missing_evidence
-                                ],
+                                *[item for bundle in bundles for item in bundle.missing_evidence],
                             ]
                         )
                     ),

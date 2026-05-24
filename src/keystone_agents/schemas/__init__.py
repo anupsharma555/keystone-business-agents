@@ -81,6 +81,10 @@ from keystone_agents.schemas.feedback import (
     OperatorFeedbackCaptureFields,
     OperatorFeedbackRequest,
 )
+from keystone_agents.schemas.gmail_execution_plan import (
+    GmailExecutionOperation,
+    GmailExecutionPlan,
+)
 from keystone_agents.schemas.handoff import (
     HandoffContractError,
     HandoffContractName,
@@ -101,10 +105,6 @@ from keystone_agents.schemas.manual_request_plan import (
     ManualTargetAgent,
     ManualTargetType,
 )
-from keystone_agents.schemas.gmail_execution_plan import (
-    GmailExecutionOperation,
-    GmailExecutionPlan,
-)
 from keystone_agents.schemas.memory import (
     ChiefOfStaffMemoryContext,
     MemoryItem,
@@ -120,10 +120,6 @@ from keystone_agents.schemas.opportunity import (
     OpportunitySignal,
     OpportunitySourceBundle,
     OpportunityStateDecision,
-)
-from keystone_agents.schemas.outreach_execution_plan import (
-    OutreachExecutionOperation,
-    OutreachExecutionPlan,
 )
 from keystone_agents.schemas.opportunity import (
     OpportunityRecord as ScoutOpportunityRecord,
@@ -165,6 +161,10 @@ from keystone_agents.schemas.outreach_examples import (
     OutreachExampleThread,
     RetrievedOutreachExample,
 )
+from keystone_agents.schemas.outreach_execution_plan import (
+    OutreachExecutionOperation,
+    OutreachExecutionPlan,
+)
 from keystone_agents.schemas.outreach_template import (
     OutreachTemplateBlock,
     OutreachTemplateRecord,
@@ -200,6 +200,11 @@ from keystone_agents.schemas.table_mirror import (
     TableMirrorProviderName,
     TableMirrorRecord,
 )
+from keystone_agents.schemas.web_data import (
+    StructuredWebRecord,
+    WebDataFieldSpec,
+    WebDataSchemaMappingResult,
+)
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
@@ -215,11 +220,6 @@ from keystone_agents.schemas.work_item import (
     WorkItemSourceRef,
     WorkItemStatus,
     WorkItemTarget,
-)
-from keystone_agents.schemas.web_data import (
-    StructuredWebRecord,
-    WebDataFieldSpec,
-    WebDataSchemaMappingResult,
 )
 
 OpportunityRecord = ScoutOpportunityRecord

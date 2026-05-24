@@ -326,10 +326,7 @@ def test_cli_ask_chief_of_staff_reference_capture_persists_memory(
     capsys,
 ) -> None:
     database_url = f"sqlite:///{tmp_path / 'keystone.db'}"
-    url = (
-        "https://braininitiative.nih.gov/news-events/blog/"
-        "register-now-nih-brain-neuroai-workshop"
-    )
+    url = "https://braininitiative.nih.gov/news-events/blog/register-now-nih-brain-neuroai-workshop"
 
     exit_code = main(
         [

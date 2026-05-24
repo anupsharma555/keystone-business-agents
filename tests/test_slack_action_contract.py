@@ -109,7 +109,9 @@ def test_action_and_selected_context_models_share_contract_schema_names() -> Non
         artifact_id="company_profile:42",
     )
     parsed = parse_business_agent_action_value(value)
-    context = SlackSelectedMessageContext(channel_id="C123", selected_message_ts="1715366400.000100")
+    context = SlackSelectedMessageContext(
+        channel_id="C123", selected_message_ts="1715366400.000100"
+    )
 
     assert parsed.schema_name == BUSINESS_AGENT_ACTION_SCHEMA
     assert parsed.intent == KBA_INTENT_MORE_RESEARCH

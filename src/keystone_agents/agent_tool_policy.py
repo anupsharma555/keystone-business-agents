@@ -104,8 +104,7 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
         | PLAYWRIGHT_RESEARCH_ALLOWED_TOOLS
         | BROWSER_DIAGNOSTIC_ALLOWED_TOOLS,
         rationale=(
-            "Scout agents may discover opportunities but should hand off research "
-            "before outreach."
+            "Scout agents may discover opportunities but should hand off research before outreach."
         ),
     ),
     "outreach_composer": AgentToolPolicy(
