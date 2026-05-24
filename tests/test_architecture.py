@@ -288,10 +288,15 @@ def test_runbook_documents_outreach_templates_and_private_example_rag() -> None:
 def test_no_obvious_repo_secrets_present() -> None:
     secret_patterns = (
         re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+        re.compile(r"ghp_[A-Za-z0-9]{36}"),
+        re.compile(r"github_pat_[A-Za-z0-9_]{82}"),
+        re.compile(r"xox[baprs]-[0-9A-Za-z-]{20,}", re.IGNORECASE),
+        re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+        re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"),
+        re.compile(r"\bya29\.[0-9A-Za-z\-_]+\b"),
         re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----"),
     )
     text_suffixes = {
-        ".env",
         ".example",
         ".json",
         ".md",
@@ -301,13 +306,15 @@ def test_no_obvious_repo_secrets_present() -> None:
         ".yaml",
         ".yml",
     }
+    text_filenames = {".env", ".envrc"}
 
     for path in PROJECT_ROOT.rglob("*"):
         if path.is_dir():
             continue
         if {".git", ".pytest_cache", ".venv", "__pycache__"} & set(path.parts):
             continue
-        if path.suffix not in text_suffixes:
+        is_env_style_file = path.name in text_filenames or path.name.startswith(".env.")
+        if path.suffix not in text_suffixes and not is_env_style_file:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         for pattern in secret_patterns:

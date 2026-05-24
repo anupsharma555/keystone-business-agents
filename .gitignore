@@ -4,10 +4,15 @@
 .env
 .env.*
 !.env.example
+.envrc
 credentials.json
 token.json
 client_secret*.json
 authorized_user*.json
+*.pem
+*.key
+*.p12
+*.pfx
 .pytest_cache/
 .ruff_cache/
 .keystone/
