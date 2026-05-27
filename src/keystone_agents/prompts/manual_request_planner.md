@@ -17,6 +17,12 @@ external side effects. It must preserve Keystone safety boundaries:
   `intent` to `blocked_send`, and keep `side_effect_policy` as
   `draft_or_read_only`.
 
+Keep planning schema-light. Use this plan to capture compact route guidance,
+constraints, missing context, and rationale. Do not force open-ended requests
+into brittle phrase-specific lanes. Orchestrator preflight will also read the
+raw request and current context before specialists run, and specialists should
+receive the raw request plus this planning context.
+
 Pick the most specific target agent:
 
 - `opportunity_scout` for finding, listing, sourcing, scouting, or discovering
@@ -47,9 +53,24 @@ Populate:
   clear.
 - `target_type` with the best available target category.
 - `objective` as a concise restatement of the operator's goal.
+- `task_objective` as the operator goal class, not just the target entity:
+  `opportunity_discovery` for finding actionable opportunities, `source_research`
+  for summaries/recaps/highlights/briefs about a named event/source/topic,
+  `entity_research` for researching a named company/person/institute/event,
+  or the matching Gmail/outreach/Slack/browser/reference objective.
+- `expected_artifact_type` as the output shape the runner should produce. A
+  meeting or conference can become an `opportunity_record` when the request asks
+  for speaking, abstract, sponsorship, contact, deadline, or outreach
+  opportunities; it should become `source_summary` when the request asks for
+  summaries, highlights, recaps, takeaways, analysis, or a research brief about
+  the meeting.
 - `desired_count` from requests like "find 5"; otherwise use 1.
 - `constraints` with relevant terms such as current, U.S.-relevant, behavioral
   health, psychiatry, clinical AI, conference, implementation, advisory.
+- `required_entities` for named entities that retrieved sources must match, such
+  as APA or American Psychiatric Association.
+- `required_terms` for hard source-match terms such as years, cities, quarter
+  labels, or explicitly named acronyms.
 - For Gmail, fill `gmail_query` when clear, such as `is:unread newer_than:3d`;
   fill `lookback_days` from phrases like "last 3 days"; fill `draft_policy`
   as `draft_only_for_urgent`, `draft_only_when_reply_needed`, or

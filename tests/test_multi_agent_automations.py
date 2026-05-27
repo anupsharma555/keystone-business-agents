@@ -50,6 +50,9 @@ def test_meeting_prep_caps_items_and_blocks_external_writes() -> None:
     assert result.calendar_writes_enabled is False
     assert result.gmail_writes_enabled is False
     assert result.crm_writes_enabled is False
+    assert result.orchestrator_review is not None
+    assert result.orchestrator_review.approval_boundary_ok is True
+    assert any("Orchestrator automation review:" in item for item in result.diagnostics)
     assert "No calendar writes" in result.slack_text
 
 
@@ -58,6 +61,7 @@ def test_meeting_prep_returns_no_prep_needed_backup() -> None:
 
     assert result.status == "no_prep_needed"
     assert result.selected_count == 0
+    assert result.orchestrator_review is not None
     assert "No high-salience meeting preparation" in result.slack_text
 
 
@@ -127,6 +131,8 @@ def test_github_repo_opportunities_ranks_four_and_blocks_writes() -> None:
     assert len(result.repositories) == 4
     assert all(repo.full_name != "stale/no-license" for repo in result.repositories)
     assert result.github_writes_enabled is False
+    assert result.orchestrator_review is not None
+    assert result.orchestrator_review.approval_boundary_ok is True
     assert "No GitHub writes" in result.slack_text
     assert "openai/openai-agents-python" in result.slack_text
     assert "Keystone fit:" in result.slack_text
@@ -704,6 +710,9 @@ def test_announcements_research_selects_three_to_five_and_keeps_summaries_bounde
     assert len(result.summaries) == result.selected_count
     assert all(summary.word_count <= 150 for summary in result.summaries)
     assert result.external_writes_enabled is False
+    assert result.orchestrator_review is not None
+    assert result.orchestrator_review.approval_boundary_ok is True
+    assert any("Orchestrator automation review:" in item for item in result.diagnostics)
     assert "Business Research Analyst weekly announcement synthesis" in result.slack_text
 
 

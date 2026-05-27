@@ -23,7 +23,7 @@ production adapters in this repo.
 Seed cases live in:
 
 ```bash
-evals/search_coverage_cases.jsonl
+evals/provider/search_coverage_cases.jsonl
 ```
 
 Rows include:
@@ -68,7 +68,7 @@ network execution:
 .venv/bin/python scripts/run_search_coverage_eval.py \
   --provider searxng \
   --provider serper \
-  --cases evals/search_coverage_cases.jsonl \
+  --cases evals/provider/search_coverage_cases.jsonl \
   --output artifacts/search_coverage_evals \
   --json
 ```
@@ -82,7 +82,7 @@ Live mode requires explicit live confirmation and provider configuration:
   --provider firecrawl \
   --provider tavily \
   --provider agents-web-search \
-  --cases evals/search_coverage_cases.jsonl \
+  --cases evals/provider/search_coverage_cases.jsonl \
   --output artifacts/search_coverage_evals/current-providers \
   --live --no-dry-run \
   --json

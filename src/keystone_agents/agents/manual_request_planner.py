@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,6 +66,8 @@ def resolve_manual_request_plan(
     live: bool = False,
     run_config: Any | None = None,
     model: str | None = None,
+    session: Any | None = None,
+    cost_callback: Callable[[Any], None] | None = None,
 ) -> ManualRequestPlan:
     """Return an LLM manual-request plan when requested, otherwise local fallback."""
 
@@ -87,6 +90,7 @@ def resolve_manual_request_plan(
                     run_config=run_config,
                     live=live,
                     config=config,
+                    session=session,
                     workflow_name="Keystone manual request planning",
                     tracing_disabled=True,
                 )
@@ -95,6 +99,8 @@ def resolve_manual_request_plan(
             suffix = f" ({captured})" if captured else ""
             errors.append(f"{config.provider}/{config.model}: {exc}{suffix}")
             continue
+        if cost_callback is not None:
+            cost_callback(result)
         return merge_manual_request_plan(
             fallback,
             result.output.model_copy(update={"source": "llm"}),

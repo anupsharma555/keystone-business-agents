@@ -3,7 +3,7 @@ prompt_name: keystone_profile
 prompt_version: 2026-04-21.1
 prompt_purpose: Shared Keystone positioning and target-fit context for all agents.
 prompt_safety_notes: Do not claim prior client experience unless explicitly provided.
-prompt_eval_datasets: tests/evals/*.json, evals/*.jsonl
+prompt_eval_datasets: evals/static/*.json, evals/local/*.jsonl
 -->
 
 # Keystone Profile

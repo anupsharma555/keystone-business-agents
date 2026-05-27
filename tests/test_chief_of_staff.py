@@ -18,11 +18,16 @@ from keystone_agents.agents.chief_of_staff import (
 from keystone_agents.memory import chief_of_staff_memory_item
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.quality_budget import QualityMode, chief_of_staff_quality_budget
+from keystone_agents.orchestrator.preflight_context import (
+    MANUAL_REQUEST_PLAN_ENV,
+    ORCHESTRATOR_PREFLIGHT_ENV,
+)
 from keystone_agents.schemas.airtable import airtable_base_schema_summary_from_metadata
 from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
 )
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.tools.chief_of_staff_tool import (
     list_chief_of_staff_context_sources,
@@ -107,6 +112,131 @@ def test_chief_of_staff_builder_matches_schema_and_policy() -> None:
     assert "search_official_operations_docs" in policy.allowed_tool_names
 
 
+def test_architecture_slack_history_does_not_trigger_tax_payment_shortcut() -> None:
+    request = (
+        "chief of staff I am deciding the next implementation pass for KNI. "
+        "Review recent work and produce an execution brief. "
+        "The channel also mentions APA 2026, the first next step, and summarize activity."
+    )
+    normalized = chief_of_staff_module._normalized_text(request)
+
+    assert chief_of_staff_module._looks_like_tax_payment_or_estimate_request(normalized) is False
+    assert chief_of_staff_module._looks_like_finance_tracker_request(request) is False
+
+
+def test_project_state_summary_does_not_trigger_tax_payment_shortcut() -> None:
+    request = "summarize the state of the KNI implementation pass for 2026 planning"
+    normalized = chief_of_staff_module._normalized_text(request)
+
+    assert chief_of_staff_module._looks_like_tax_payment_or_estimate_request(normalized) is False
+    assert chief_of_staff_module._looks_like_finance_tracker_request(request) is False
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        (
+            "same response: 2026 tax payments Total paid $5,500. "
+            "Let's see why above is posting -- were changes implemented in this run?"
+        ),
+        (
+            "the request and response are completely unrelated -- why is that? "
+            "2026 tax payments Federal $4,000 Pennsylvania $1,500"
+        ),
+        (
+            "should we run it again? same response -- 2026 tax payments Total paid "
+            "$5,500 Federal $4,000 Pennsylvania $1,500"
+        ),
+        "review Slack history and explain why @KNI keeps posting the same tax payment answer",
+    ],
+)
+def test_wrong_response_diagnostics_do_not_trigger_tax_payment_shortcut(request_text: str) -> None:
+    normalized = chief_of_staff_module._normalized_text(request_text)
+
+    assert chief_of_staff_module._looks_like_tax_payment_or_estimate_request(normalized) is False
+    assert chief_of_staff_module._looks_like_finance_tracker_request(request_text) is False
+
+
+def test_chief_of_staff_planner_blocks_unaligned_finance_shortcut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_typed_sdk_agent(**kwargs: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured.update(kwargs)
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary="Planner routed this as an implementation brief, not a tax summary.",
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="project-context-review",
+                target_channel="current Slack channel",
+            ),
+            audit_notes=[],
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="slack_operations",
+        primary_target="implementation pass",
+        target_type="slack_channel",
+        objective="Review the recent KNI architecture work and produce an execution brief.",
+        task_objective="slack_operations",
+        expected_artifact_type="slack_ops_summary",
+        rationale="The request asks for implementation planning, not finance arithmetic.",
+    )
+
+    monkeypatch.setattr(
+        "keystone_agents.agents.chief_of_staff.run_typed_sdk_agent",
+        fake_run_typed_sdk_agent,
+    )
+
+    result = run_chief_of_staff_sdk(
+        "calculate the Q2 taxes paid for the implementation pass",
+        live=True,
+        manual_request_plan=plan,
+    )
+
+    assert result.raw_result == {"sdk": "called"}
+    assert result.output.recommended_route.workflow_type == "project-context-review"
+    assert captured["typed_input"] == "calculate the Q2 taxes paid for the implementation pass"
+
+
+def test_chief_of_staff_deterministic_path_uses_planner_before_finance_shortcut() -> None:
+    plan = ManualRequestPlan(
+        source="parent_orchestrator",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="slack_operations",
+        primary_target="implementation pass",
+        target_type="slack_channel",
+        objective="Review the recent KNI architecture work and produce an execution brief.",
+        task_objective="slack_operations",
+        expected_artifact_type="slack_ops_summary",
+        rationale="The request asks for implementation planning, not tax arithmetic.",
+    )
+
+    result = plan_chief_of_staff_request(
+        "calculate the Q2 taxes paid for the implementation pass",
+        manual_request_plan=plan,
+    )
+
+    assert "finance_tax_tracker" not in result.summary
+    assert result.recommended_route.workflow_type != "finance-tax-tracker"
+    assert any(
+        "Manual request planner ran before Chief of Staff deterministic routing" in note
+        and "source=parent_orchestrator" in note
+        for note in result.audit_notes
+    )
+
+
 def test_run_script_does_not_inherit_sdk_session_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -155,6 +285,62 @@ def test_run_script_uses_explicit_sdk_session_arg(
         "components": ("direct-script", "local", str(Path.cwd())),
         "default_enabled": False,
     }
+
+
+def test_run_script_consumes_parent_orchestrator_preflight_env(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="parent_orchestrator",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="slack_operations",
+        primary_target="agent architecture",
+        target_type="slack_channel",
+        objective="Review agent architecture.",
+        task_objective="slack_operations",
+        expected_artifact_type="slack_ops_summary",
+    )
+    preflight = {
+        "advisory_only": True,
+        "selected_agent": "chief_of_staff",
+        "manual_request_plan": plan.model_dump(mode="json"),
+        "route_result": {"route": "chief_of_staff", "refused": False},
+    }
+
+    monkeypatch.setenv(MANUAL_REQUEST_PLAN_ENV, plan.model_dump_json())
+    monkeypatch.setenv(ORCHESTRATOR_PREFLIGHT_ENV, json.dumps(preflight))
+
+    assert script.main(["--json", "--input", "review agent architecture"]) == 0
+
+    payload = _payload(capsys.readouterr().out)
+    assert payload["manual_request_plan"]["source"] == "parent_orchestrator"
+    assert payload["orchestrator_preflight"]["advisory_only"] is True
+    assert payload["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
+
+
+def test_run_script_payload_includes_sdk_usage_cost_and_request_cache() -> None:
+    script = _load_run_chief_of_staff_script()
+    output = plan_chief_of_staff_request("review agent architecture")
+
+    payload = script._payload(
+        mode="live_sdk",
+        live_sdk=True,
+        model={"provider": "openai", "name": "gpt-5.4-mini"},
+        output=output,
+        input_text="review agent architecture",
+        usage={"available": True, "input_tokens": 100, "cached_input_tokens": 40},
+        cost={"amount_usd": 0.01, "currency": "USD"},
+        request_cache={"request_layout": "static_agent_prefix_then_dynamic_typed_input"},
+    )
+
+    assert payload["usage"]["cached_input_tokens"] == 40
+    assert payload["cost"]["amount_usd"] == 0.01
+    assert payload["request_cache"]["request_layout"] == (
+        "static_agent_prefix_then_dynamic_typed_input"
+    )
 
 
 def test_run_script_allows_bounded_workspace_writes_for_explicit_doc_request() -> None:
@@ -1825,6 +2011,58 @@ def test_run_chief_of_staff_sdk_passes_budget_to_typed_runner(
     assert result.output.approval_required is True
     assert result.output.send_enabled is False
     assert any("quality budget used: deep" in note for note in result.output.audit_notes)
+
+
+def test_run_chief_of_staff_sdk_prioritizes_latest_slack_followup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_typed_sdk_agent(**kwargs: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured.update(kwargs)
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary="Checklist ready.",
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="slack-follow-up-review",
+                target_channel="ai-agents-workflow",
+            ),
+            recommended_actions=[
+                "Confirm the initial Chief of Staff answer uses current evidence labels.",
+                "Run the same Chief of Staff prompt in a fresh Slack thread.",
+            ],
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"fake": True},
+            live=True,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.agents.chief_of_staff.run_typed_sdk_agent",
+        fake_run_typed_sdk_agent,
+    )
+
+    raw_request = (
+        "chief of staff continue this prior Slack thread.\n"
+        "Previous request: chief of staff review the current business-agent testing state.\n"
+        "Previous result: Business Research Analyst should be tested next.\n"
+        "User follow-up: Can you turn that into a concise ordered checklist and say "
+        "which agent we should test next?\n"
+        "Continue the same agent task."
+    )
+
+    result = run_chief_of_staff_sdk({"request": raw_request}, live=True)
+
+    typed_input = captured["typed_input"]
+    assert isinstance(typed_input, dict)
+    assert typed_input["request"].startswith("Can you turn that into")
+    assert typed_input["latest_operator_request"] == typed_input["request"]
+    assert typed_input["raw_slack_thread_request"] == raw_request
+    assert "checklist" in typed_input["response_shape_instruction"].lower()
+    assert "Business Research Analyst should be tested next" not in typed_input["request"]
+    assert result.output.recommended_actions
 
 
 def test_run_chief_of_staff_sdk_uses_deterministic_finance_aggregate_even_when_forced(

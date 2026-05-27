@@ -3,7 +3,7 @@ prompt_name: memory_policy
 prompt_version: 2026-04-25.1
 prompt_purpose: Shared pre-run memory and project-context policy for every Keystone agent.
 prompt_safety_notes: Approved prompt-safe memory only; no raw email bodies, secrets, PHI, or send enablement.
-prompt_eval_datasets: evals/safety_refusals.jsonl
+prompt_eval_datasets: evals/local/safety_refusals.jsonl
 -->
 
 # Memory And Pre-Run Context Policy

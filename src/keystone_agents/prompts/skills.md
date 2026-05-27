@@ -3,7 +3,7 @@ prompt_name: skills
 prompt_version: 2026-05-21.1
 prompt_purpose: Shared Keystone prompt-only instruction fragments and skill boundaries.
 prompt_safety_notes: Skills do not grant live integration access; approval gates and no-send rules remain mandatory.
-prompt_eval_datasets: tests/evals/gmail_triage_cases.json, tests/evals/business_research_analyst_cases.json, tests/evals/opportunity_scout_cases.json, tests/evals/outreach_composer_cases.json
+prompt_eval_datasets: evals/static/gmail_triage_cases.json, evals/static/business_research_analyst_cases.json, evals/static/opportunity_scout_cases.json, evals/static/outreach_composer_cases.json
 -->
 
 # Keystone Agent Skills

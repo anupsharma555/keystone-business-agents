@@ -19,6 +19,7 @@ from keystone_agents.memory import (
     chief_of_staff_memory_item,
     operator_reference_memory_item,
 )
+from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.quality_budget import (
     AgentQualityBudget,
@@ -36,6 +37,7 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffRouteRecommendation,
     ChiefOfStaffSourceRef,
 )
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.sdk import Agent, build_model_settings, build_sdk_agent, compose_instructions
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.automation_inventory_tool import (
@@ -140,6 +142,10 @@ SLACK_HISTORY_ITEM_RE = re.compile(
     r"^-\s+ts=(?P<ts>\S+)\s+author=(?P<author>\S+)"
     r"(?:\s+title=(?P<title>.*?))?:\s+(?P<body>.*)$"
 )
+SLACK_FOLLOWUP_MARKER_RE = re.compile(
+    r"(?:^|\n)\s*(?:User follow-up|Latest operator follow-up):\s*",
+    flags=re.I,
+)
 BLOCKED_SIDE_EFFECTS = [
     "unscoped_slack_post",
     "gmail_send",
@@ -204,9 +210,142 @@ class NormalizedFinanceRecord:
     amount_fields: tuple[str, ...]
 
 
+def _coerce_manual_request_plan(
+    value: ManualRequestPlan | Mapping[str, Any] | None,
+) -> ManualRequestPlan | None:
+    if value is None:
+        return None
+    if isinstance(value, ManualRequestPlan):
+        return value
+    try:
+        return ManualRequestPlan.model_validate(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _chief_request_plan(
+    request_text: str,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None,
+) -> ManualRequestPlan:
+    return _coerce_manual_request_plan(manual_request_plan) or infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+
+
+def _latest_slack_followup_request(request_text: str) -> str:
+    """Extract the newest operator ask from a Slack continuation wrapper."""
+
+    text = str(request_text or "")
+    matches = list(SLACK_FOLLOWUP_MARKER_RE.finditer(text))
+    if not matches:
+        return ""
+    start = matches[-1].end()
+    tail = text[start:].strip()
+    if not tail:
+        return ""
+    stop_markers = (
+        "\nPrevious request:",
+        "\nPrevious result:",
+        "\nLinked WorkItem:",
+        "\nContinue the same agent task",
+        "\nRead-only Slack",
+        "\nSlack thread context",
+    )
+    stop = len(tail)
+    lowered_tail = tail.lower()
+    for marker in stop_markers:
+        idx = lowered_tail.find(marker.lower())
+        if idx >= 0:
+            stop = min(stop, idx)
+    return tail[:stop].strip().strip('"')
+
+
+def _chief_of_staff_sdk_input_for_request(
+    typed_input: str | Mapping[str, Any],
+    *,
+    raw_request_text: str,
+) -> str | dict[str, Any]:
+    """Make Slack follow-up intent explicit before rendering the SDK prompt."""
+
+    latest_request = _latest_slack_followup_request(raw_request_text)
+    if not latest_request:
+        return typed_input
+
+    data: dict[str, Any]
+    if isinstance(typed_input, Mapping):
+        data = dict(typed_input)
+    else:
+        data = {"request": str(typed_input or "")}
+    data["request"] = latest_request
+    data["latest_operator_request"] = latest_request
+    data["raw_slack_thread_request"] = raw_request_text
+    data["request_priority_instruction"] = (
+        "Answer latest_operator_request directly. Use raw_slack_thread_request, "
+        "previous requests, prior results, and Slack thread context only as background. "
+        "Do not repeat stale prior-run conclusions unless they are necessary to answer "
+        "the latest operator request, and label Slack-observed state separately from "
+        "verified current repo/runtime state."
+    )
+    if re.search(r"\b(checklist|ordered|steps?|next\s+\d+|next\s+three)\b", latest_request, re.I):
+        data["response_shape_instruction"] = (
+            "The latest request asks for a checklist. Keep summary to one direct "
+            "sentence and put the checklist items in recommended_actions in the "
+            "requested order. Each action should be specific enough to run or verify."
+        )
+    return data
+
+
+def _manual_plan_allows_finance_tracker_shortcut(
+    plan: ManualRequestPlan,
+    request_text: str,
+) -> bool:
+    del request_text
+    if plan.target_agent not in {"chief_of_staff", "orchestrator"}:
+        return False
+    planner_text = " ".join(
+        str(part or "")
+        for part in (
+            plan.primary_target,
+            plan.objective,
+            " ".join(plan.constraints),
+            " ".join(plan.required_entities),
+            " ".join(plan.required_terms),
+        )
+    ).lower()
+    has_finance_context = bool(
+        re.search(
+            r"\b(?:finance|tax|taxes|airtable\s+tracker|finance_tax_tracker|"
+            r"business\s+income|business\s+expense|personal\s+income|personal\s+expense|"
+            r"tax\s+payments|estimated\s+tax|total\s+expenses|additional\s+taxes|"
+            r"amount|q[1-4])\b",
+            planner_text,
+        )
+    )
+    return has_finance_context
+
+
+def _with_manual_plan_audit(
+    result: ChiefOfStaffResult,
+    plan: ManualRequestPlan,
+    *,
+    action: str,
+) -> ChiefOfStaffResult:
+    note = (
+        f"Manual request planner ran before Chief of Staff deterministic routing: "
+        f"source={plan.source}; target_agent={plan.target_agent}; intent={plan.intent}; "
+        f"action={action}."
+    )
+    return result.model_copy(
+        update={"audit_notes": list(dict.fromkeys([note, *result.audit_notes]))}
+    )
+
+
 def _looks_like_finance_tracker_request(text: str) -> bool:
     normalized = " ".join(str(text or "").lower().split())
     if not normalized:
+        return False
+    if _looks_like_wrong_response_diagnostic_request(normalized):
         return False
     markers = (
         "finance_tax_tracker",
@@ -656,44 +795,47 @@ def _looks_like_rolling_tax_summary_request(normalized: str) -> bool:
 
 
 def _looks_like_tax_payment_or_estimate_request(normalized: str) -> bool:
+    if _looks_like_wrong_response_diagnostic_request(normalized):
+        return False
     if not re.search(r"\b(?:q[1-4]|quarter\s+[1-4]|20\d{2})\b", normalized):
         return False
-    has_tax_subject = any(
-        marker in normalized
-        for marker in (
-            "tax",
-            "taxes",
-            "irs",
-            "federal",
-            "state",
-            "pennsylvania",
-            "pa ",
-            "city",
-            "philadelphia",
-            "philly",
-            "birt",
-            "npt",
-            "sit",
+    has_tax_subject = bool(
+        re.search(
+            r"\b(?:tax|taxes|irs|pennsylvania|philadelphia|philly|birt|npt|sit)\b",
+            normalized,
         )
     )
-    has_task = any(
-        marker in normalized
-        for marker in (
-            "pay",
-            "paid",
-            "payment",
-            "due",
-            "owe",
-            "owed",
-            "estimate",
-            "estimated",
-            "calculate",
-            "calc",
-            "summarize",
-            "summary",
+    has_task = bool(
+        re.search(
+            r"\b(?:pay|paid|payment|payments|due|owe|owed|estimate|estimates|"
+            r"estimated|calculate|calc|summarize|summary)\b",
+            normalized,
         )
     )
     return has_tax_subject and has_task
+
+
+def _looks_like_wrong_response_diagnostic_request(normalized: str) -> bool:
+    text = " ".join(str(normalized or "").lower().split())
+    if not text:
+        return False
+    has_response_marker = bool(
+        re.search(
+            r"\b(?:same\s+response|wrong\s+(?:response|answer|lane)|"
+            r"unrelated\s+(?:response|answer|output)|request\s+and\s+response|"
+            r"keeps?\s+posting.*(?:answer|response)|"
+            r"why\s+(?:is|did)\s+(?:this|that|it).*(?:post|posting|respond|answer))\b",
+            text,
+        )
+    )
+    has_diagnostic_marker = bool(
+        re.search(
+            r"\b(?:why|debug|diagnose|figure\s+out|fix|implemented|changes|"
+            r"rerun|run\s+(?:it\s+)?again|keeps?\s+posting|keeps?\s+happening)\b",
+            text,
+        )
+    )
+    return has_response_marker and has_diagnostic_marker
 
 
 def _money_amount(value: Any) -> Decimal | None:
@@ -3235,36 +3377,76 @@ def plan_chief_of_staff_request(
     *,
     slack_repo_path: str | None = None,
     database_url: str | None = None,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
 ) -> ChiefOfStaffResult:
     """Build a deterministic Chief of Staff routing recommendation without side effects."""
 
     del slack_repo_path  # Reserved for parity with SDK tools and future deterministic repo checks.
     text = str(request_text or "").strip()
+    request_plan = _chief_request_plan(text, manual_request_plan)
+
+    def planned(result: ChiefOfStaffResult, *, action: str) -> ChiefOfStaffResult:
+        return _with_manual_plan_audit(result, request_plan, action=action)
+
     if _looks_like_slack_history_digest_request(text):
-        return _plan_slack_history_digest_request(text)
-    if _looks_like_finance_tracker_artifact_workflow_request(text):
-        return _plan_finance_tracker_artifact_workflow_request(text)
-    if _looks_like_finance_tracker_request(text):
-        return _plan_finance_tracker_request(text, live=False)
+        return planned(
+            _plan_slack_history_digest_request(text),
+            action="allowed_slack_history_digest_shortcut",
+        )
+    if (
+        _looks_like_finance_tracker_artifact_workflow_request(text)
+        and _manual_plan_allows_finance_tracker_shortcut(request_plan, text)
+    ):
+        return planned(
+            _plan_finance_tracker_artifact_workflow_request(text),
+            action="allowed_finance_artifact_workflow_shortcut",
+        )
+    if (
+        _looks_like_finance_tracker_request(text)
+        and _manual_plan_allows_finance_tracker_shortcut(request_plan, text)
+    ):
+        return planned(
+            _plan_finance_tracker_request(text, live=False),
+            action="allowed_finance_tracker_shortcut",
+        )
     if _looks_like_chief_memory_capture_request(text):
-        return _plan_chief_memory_capture(text, database_url=database_url)
+        return planned(
+            _plan_chief_memory_capture(text, database_url=database_url),
+            action="allowed_memory_capture_plan",
+        )
     if _looks_like_chief_memory_review_request(text):
-        return _plan_chief_memory_review(text, database_url=database_url)
+        return planned(
+            _plan_chief_memory_review(text, database_url=database_url),
+            action="allowed_memory_review_plan",
+        )
     if _looks_like_reference_capture_request(text):
-        return _plan_reference_capture(text, database_url=database_url)
+        return planned(
+            _plan_reference_capture(text, database_url=database_url),
+            action="allowed_reference_capture_plan",
+        )
     if _looks_like_google_sheets_management_request(text):
-        return _plan_google_sheets_management_request(text)
+        return planned(
+            _plan_google_sheets_management_request(text),
+            action="allowed_google_sheets_management_plan",
+        )
     if _looks_like_google_drive_management_request(text):
-        return _plan_google_drive_management_request(text)
+        return planned(
+            _plan_google_drive_management_request(text),
+            action="allowed_google_drive_management_plan",
+        )
     if _looks_like_artifact_write_request(text):
-        return _plan_business_artifact_write_request(text)
+        return planned(
+            _plan_business_artifact_write_request(text),
+            action="allowed_business_artifact_write_plan",
+        )
     natural_intent = _plan_natural_language_operating_intent(text, database_url=database_url)
     if natural_intent is not None:
-        return natural_intent
+        return planned(natural_intent, action="allowed_natural_language_operating_intent")
     if _looks_like_automation_inventory_request(text):
         report = build_automation_inventory_report(database_url=database_url)
         write_requests = _write_requests_from_text(text)
-        return ChiefOfStaffResult(
+        return planned(
+            ChiefOfStaffResult(
             mode="deterministic",
             intent=text,
             summary=report.summary,
@@ -3314,6 +3496,8 @@ def plan_chief_of_staff_request(
                 ),
                 "SQLite and WorkItems remain canonical.",
             ],
+            ),
+            action="allowed_automation_inventory_plan",
         )
     capability = _capability_for_topic(text)
     workflow_type = str(capability.get("workflow_type") or "clarification")
@@ -3360,7 +3544,8 @@ def plan_chief_of_staff_request(
         requires_live_connector=bool(capability.get("requires_live_connector")),
         requires_human_approval_before_post=True,
     )
-    return ChiefOfStaffResult(
+    return planned(
+        ChiefOfStaffResult(
         mode="deterministic",
         intent=text,
         summary=summary,
@@ -3392,6 +3577,8 @@ def plan_chief_of_staff_request(
             "KNI Slack repo is treated as read-only operational context.",
             "No Slack, Gmail, Calendar, CRM, or repo write was attempted.",
         ],
+        ),
+        action="allowed_general_route_plan",
     )
 
 
@@ -3963,13 +4150,22 @@ def run_chief_of_staff_sdk(
     quality_mode: QualityMode | str | None = None,
     quality_budget: AgentQualityBudget | None = None,
     force_sdk_interpretation: bool = False,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
 ) -> TypedAgentRunResult[ChiefOfStaffResult]:
     """Run Chief of Staff through the shared typed SDK harness."""
 
     if isinstance(typed_input, Mapping):
         request_text = str(typed_input.get("request") or "")
+        manual_request_plan = manual_request_plan or _coerce_manual_request_plan(
+            typed_input.get("manual_request_plan")
+        )
     else:
         request_text = str(typed_input or "")
+    typed_input_for_run = _chief_of_staff_sdk_input_for_request(
+        typed_input,
+        raw_request_text=request_text,
+    )
+    request_plan = _chief_request_plan(request_text, manual_request_plan)
     if (
         not force_sdk_interpretation
         and not live
@@ -3977,7 +4173,11 @@ def run_chief_of_staff_sdk(
     ):
         return TypedAgentRunResult(
             agent_name="chief_of_staff",
-            output=_plan_slack_history_digest_request(request_text),
+            output=_with_manual_plan_audit(
+                _plan_slack_history_digest_request(request_text),
+                request_plan,
+                action="allowed_slack_history_digest_shortcut",
+            ),
             raw_result={"deterministic": "slack_history_digest"},
             live=live,
         )
@@ -3985,7 +4185,11 @@ def run_chief_of_staff_sdk(
     if finance_artifact_workflow and not live:
         return TypedAgentRunResult(
             agent_name="chief_of_staff",
-            output=_plan_finance_tracker_artifact_workflow_request(request_text),
+            output=_with_manual_plan_audit(
+                _plan_finance_tracker_artifact_workflow_request(request_text),
+                request_plan,
+                action="allowed_finance_artifact_workflow_shortcut",
+            ),
             raw_result={"deterministic": "finance_tax_tracker_artifact_plan"},
             live=live,
         )
@@ -3993,10 +4197,15 @@ def run_chief_of_staff_sdk(
         _looks_like_finance_tracker_request(request_text)
         and not finance_artifact_workflow
         and not (live and _looks_like_finance_tracker_mutation_request(request_text))
+        and _manual_plan_allows_finance_tracker_shortcut(request_plan, request_text)
     ):
         return TypedAgentRunResult(
             agent_name="chief_of_staff",
-            output=_plan_finance_tracker_request(request_text, live=live),
+            output=_with_manual_plan_audit(
+                _plan_finance_tracker_request(request_text, live=live),
+                request_plan,
+                action="allowed_finance_tracker_shortcut",
+            ),
             raw_result={"deterministic": "finance_tax_tracker"},
             live=live,
         )
@@ -4012,7 +4221,7 @@ def run_chief_of_staff_sdk(
             quality_budget=budget,
             request_text=request_text,
         ),
-        typed_input=typed_input,
+        typed_input=typed_input_for_run,
         output_type=ChiefOfStaffResult,
         run_config=run_config,
         live=live,

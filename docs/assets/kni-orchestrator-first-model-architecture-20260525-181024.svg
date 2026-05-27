@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1050" viewBox="0 0 1600 1050" role="img" aria-labelledby="title desc">
+  <title id="title">KNI Orchestrator-first model architecture</title>
+  <desc id="desc">Architecture diagram showing Slack, CLI, automations, Orchestrator planning, deterministic gates, specialist agents, tools, review loops, and renderers.</desc>
+  <defs>
+    <style>
+      .bg { fill: #fbfaf7; }
+      .lane { fill: #ffffff; stroke: #d8d2c7; stroke-width: 2; }
+      .input { fill: #eef5f3; stroke: #5f8f84; stroke-width: 2; }
+      .orch { fill: #f28c28; stroke: #9a4d00; stroke-width: 3; }
+      .planner { fill: #fff2d7; stroke: #c98516; stroke-width: 2; }
+      .gate { fill: #f7f7f7; stroke: #4c4c4c; stroke-width: 2; }
+      .agent { fill: #e8efff; stroke: #476aa8; stroke-width: 2; }
+      .tool { fill: #edf7e8; stroke: #5b8c45; stroke-width: 2; }
+      .review { fill: #f6e9f7; stroke: #8d4d96; stroke-width: 2; }
+      .store { fill: #ece7dd; stroke: #786b58; stroke-width: 2; }
+      .render { fill: #e9f2fb; stroke: #3c6e9f; stroke-width: 2; }
+      .text { font-family: Inter, Arial, sans-serif; fill: #26231f; font-size: 24px; }
+      .small { font-family: Inter, Arial, sans-serif; fill: #3b3732; font-size: 19px; }
+      .tiny { font-family: Inter, Arial, sans-serif; fill: #4b4640; font-size: 16px; }
+      .title { font-family: Inter, Arial, sans-serif; fill: #201c18; font-size: 38px; font-weight: 700; }
+      .label { font-family: Inter, Arial, sans-serif; fill: #201c18; font-size: 24px; font-weight: 700; }
+      .arrow { stroke: #4b4640; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .dash { stroke: #7b7369; stroke-width: 3; fill: none; stroke-dasharray: 10 8; marker-end: url(#arrowhead); }
+    </style>
+    <marker id="arrowhead" markerWidth="12" markerHeight="8" refX="11" refY="4" orient="auto">
+      <path d="M0,0 L12,4 L0,8 Z" fill="#4b4640"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1050"/>
+  <text class="title" x="60" y="70">KNI Orchestrator-first model architecture</text>
+  <text class="small" x="60" y="105">Schema-light planning, raw request preserved for specialists, deterministic gates for safety and exactness.</text>
+
+  <rect class="lane" x="40" y="135" width="1520" height="850" rx="18"/>
+
+  <rect class="input" x="80" y="185" width="300" height="175" rx="12"/>
+  <text class="label" x="110" y="225">Inputs</text>
+  <text class="small" x="110" y="260">Slack @KNI + actions</text>
+  <text class="small" x="110" y="292">CLI / scripts</text>
+  <text class="small" x="110" y="324">Scheduled automations</text>
+
+  <rect class="planner" x="80" y="420" width="300" height="150" rx="12"/>
+  <text class="label" x="110" y="460">Schema-light planner</text>
+  <text class="small" x="110" y="496">ManualRequestPlan</text>
+  <text class="small" x="110" y="528">constraints + rationale</text>
+
+  <rect class="orch" x="480" y="180" width="420" height="355" rx="16"/>
+  <text class="label" x="520" y="225">Orchestrator Agent</text>
+  <text class="small" x="520" y="260">reads raw request first</text>
+  <text class="small" x="520" y="292">plus memory/context:</text>
+  <text class="tiny" x="545" y="324">recent Slack thread</text>
+  <text class="tiny" x="545" y="350">WorkItem state</text>
+  <text class="tiny" x="545" y="376">decision_trace + audit notes</text>
+  <text class="tiny" x="545" y="402">local memory + context packs</text>
+  <text class="tiny" x="545" y="428">prior agent runs</text>
+  <text class="small" x="520" y="472">outputs: route advice, blockers,</text>
+  <text class="small" x="520" y="502">retrieval hints, next safe action</text>
+
+  <rect class="store" x="990" y="180" width="250" height="165" rx="12"/>
+  <text class="label" x="1020" y="222">Memory / Audit</text>
+  <text class="small" x="1020" y="258">SQLite WorkItems</text>
+  <text class="small" x="1020" y="288">approval queue</text>
+  <text class="small" x="1020" y="318">run metadata</text>
+
+  <rect class="gate" x="465" y="620" width="450" height="165" rx="12"/>
+  <text class="label" x="500" y="660">Deterministic gates</text>
+  <text class="small" x="500" y="697">safety, approval, source sufficiency</text>
+  <text class="small" x="500" y="729">record identity, arithmetic, live flags</text>
+  <text class="small" x="500" y="761">write scopes and no-send boundaries</text>
+
+  <rect class="agent" x="1010" y="430" width="430" height="240" rx="12"/>
+  <text class="label" x="1045" y="472">Specialist SDK agents</text>
+  <text class="small" x="1045" y="510">Chief of Staff / Business Research</text>
+  <text class="small" x="1045" y="542">Opportunity Scout / Gmail Triage</text>
+  <text class="small" x="1045" y="574">Outreach Composer</text>
+  <text class="tiny" x="1045" y="614">Each reads raw request plus Orchestrator memo</text>
+  <text class="tiny" x="1045" y="642">and typed context packs.</text>
+
+  <rect class="tool" x="1010" y="740" width="430" height="150" rx="12"/>
+  <text class="label" x="1045" y="780">Tools and workflows</text>
+  <text class="small" x="1045" y="816">Slack, Gmail, Airtable, Google Workspace</text>
+  <text class="small" x="1045" y="848">search/retrieval, local DB, artifacts</text>
+
+  <rect class="review" x="465" y="835" width="450" height="110" rx="12"/>
+  <text class="label" x="500" y="878">Review and feedback loop</text>
+  <text class="small" x="500" y="914">Orchestrator output review, one repair/deepen pass, realtime Slack feedback</text>
+
+  <rect class="render" x="80" y="730" width="300" height="150" rx="12"/>
+  <text class="label" x="110" y="770">Renderers</text>
+  <text class="small" x="110" y="806">Slack modal / thread</text>
+  <text class="small" x="110" y="838">CLI JSON / Markdown</text>
+
+  <path class="arrow" d="M380 270 C430 270 430 270 480 270"/>
+  <path class="dash" d="M380 492 C425 492 435 425 480 425"/>
+  <path class="arrow" d="M900 280 C945 280 945 270 990 270"/>
+  <path class="arrow" d="M990 325 C930 385 925 460 900 485"/>
+  <path class="arrow" d="M690 535 L690 620"/>
+  <path class="arrow" d="M915 700 C965 690 965 560 1010 550"/>
+  <path class="arrow" d="M1225 670 L1225 740"/>
+  <path class="arrow" d="M1010 815 C965 815 955 875 915 890"/>
+  <path class="dash" d="M465 890 C405 890 395 810 380 805"/>
+  <path class="dash" d="M465 845 C390 770 398 565 480 500"/>
+  <path class="arrow" d="M465 705 C420 705 410 780 380 805"/>
+
+  <text class="tiny" x="410" y="255">raw request</text>
+  <text class="tiny" x="400" y="470">planner memo</text>
+  <text class="tiny" x="725" y="585">bounded orchestration</text>
+  <text class="tiny" x="930" y="675">allowed action only</text>
+  <text class="tiny" x="965" y="878">structured output</text>
+  <text class="tiny" x="300" y="910">human-facing result</text>
+
+  <rect class="gate" x="80" y="605" width="300" height="72" rx="10"/>
+  <text class="small" x="110" y="637">Open-ended requests</text>
+  <text class="tiny" x="110" y="663">reason over task shape</text>
+
+  <rect class="gate" x="80" y="625" width="300" height="72" rx="10" transform="translate(0 90)"/>
+  <text class="small" x="110" y="727">Deterministic requests</text>
+  <text class="tiny" x="110" y="753">exact tools and gates</text>
+</svg>

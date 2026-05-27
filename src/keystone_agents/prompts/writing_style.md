@@ -3,7 +3,7 @@ prompt_name: writing_style
 prompt_version: 2026-04-23.1
 prompt_purpose: Shared Keystone writing style and approved-example policy for every agent that drafts or evaluates user-facing text.
 prompt_safety_notes: Style guidance is not evidence; approved examples must not introduce private facts, PHI, secrets, or unsupported claims.
-prompt_eval_datasets: tests/evals/*.json, evals/outreach_copy_constraints.jsonl
+prompt_eval_datasets: evals/static/*.json, evals/local/outreach_copy_constraints.jsonl
 -->
 
 # Writing Style Policy

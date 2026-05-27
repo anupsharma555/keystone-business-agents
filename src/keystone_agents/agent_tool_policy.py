@@ -193,6 +193,7 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "search_web",
                 "extract_research_claims_from_html",
                 "business_research_analyst_research_brief",
+                "opportunity_scout_read_only",
             }
         )
         | GOOGLE_WORKSPACE_ALLOWED_TOOLS

@@ -320,7 +320,7 @@ def test_litellm_gateway_mode_does_not_add_python_litellm_dependency() -> None:
 def test_settings_expose_model_provider_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_model_env(monkeypatch)
     monkeypatch.setenv("MODEL_PROVIDER", "openai")
-    monkeypatch.setenv("KEYSTONE_OPENAI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("KEYSTONE_OPENAI_MODEL", "gpt-5.4")
     monkeypatch.setenv("KEYSTONE_OPENAI_BASE_URL", "https://openai-compatible.example/v1")
     monkeypatch.setenv("GEMINI_API_KEY", "unit-test-gemini-key")
     monkeypatch.setenv("LITELLM_BASE_URL", "http://localhost:4000/v1")
@@ -328,8 +328,8 @@ def test_settings_expose_model_provider_environment(monkeypatch: pytest.MonkeyPa
     settings = load_settings()
 
     assert settings.model_provider == "openai"
-    assert settings.default_model == "gpt-5.4-mini"
-    assert settings.openai_model == "gpt-5.4-mini"
+    assert settings.default_model == "gpt-5.4"
+    assert settings.openai_model == "gpt-5.4"
     assert settings.openai_base_url == "https://openai-compatible.example/v1"
     assert settings.gemini_api_key == "unit-test-gemini-key"
     assert settings.litellm_base_url == "http://localhost:4000/v1"
@@ -385,14 +385,14 @@ def test_legacy_model_env_vars_remain_explicit_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clear_model_env(monkeypatch)
-    monkeypatch.setenv("KEYSTONE_OPENAI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("KEYSTONE_OPENAI_MODEL", "gpt-5.4")
 
     config = get_model_config()
     settings = load_settings()
 
-    assert config.model == "gpt-5.4-mini"
-    assert settings.default_model == "gpt-5.4-mini"
-    assert settings.openai_model == "gpt-5.4-mini"
+    assert config.model == "gpt-5.4"
+    assert settings.default_model == "gpt-5.4"
+    assert settings.openai_model == "gpt-5.4"
 
 
 def test_runtime_agent_model_config_supports_gemini_for_gmail_and_outreach(

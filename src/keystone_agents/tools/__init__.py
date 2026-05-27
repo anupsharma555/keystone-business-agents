@@ -49,14 +49,13 @@ from keystone_agents.tools.outreach_template_tool import (
     list_outreach_templates,
     load_outreach_template,
 )
-from keystone_agents.tools.serper_tool import (
+from keystone_agents.tools.search_provider import (
     FirecrawlSearchProvider,
     SearchProviderName,
     SearchRequest,
     SearchResult,
     SearxngSearchProvider,
     SerperSearchProvider,
-    SerperTool,
     build_search_provider,
 )
 from keystone_agents.tools.storage_tool import StorageTool
@@ -114,3 +113,11 @@ __all__ = [
     "WebsiteExtractionTool",
     "extract_website_content",
 ]
+
+
+def __getattr__(name: str):
+    if name == "SerperTool":
+        from keystone_agents.tools.serper_tool import SerperTool
+
+        return SerperTool
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

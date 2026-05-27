@@ -39,6 +39,11 @@ from keystone_agents.config import (
     require_cli_live_confirmation,
     with_cli_environment,
 )
+from keystone_agents.orchestrator.preflight_context import (
+    apply_orchestrator_preflight_to_args,
+    attach_orchestrator_preflight_payload,
+    orchestrator_preflight_context_text,
+)
 from keystone_agents.feedback import build_operator_feedback_request
 from keystone_agents.founder_profile import (
     founder_drafting_context,
@@ -504,6 +509,32 @@ def _style_profile_context(value: Any | None) -> str:
     return json.dumps(value.model_dump(mode="json"), ensure_ascii=True, sort_keys=True)
 
 
+def _orchestrator_review_request_summary(
+    args: argparse.Namespace,
+    *,
+    fallback: str,
+) -> str:
+    request = str(getattr(args, "request", "") or "").strip()
+    if request:
+        return request
+    preflight = getattr(args, "orchestrator_preflight", None)
+    if isinstance(preflight, dict):
+        request_text = str(preflight.get("request_text") or "").strip()
+        if request_text:
+            return request_text
+        memo = preflight.get("preflight_memo")
+        if isinstance(memo, dict):
+            raw_request = str(memo.get("raw_request") or "").strip()
+            if raw_request:
+                return raw_request
+    plan = getattr(args, "manual_request_plan", None)
+    if isinstance(plan, dict):
+        objective = str(plan.get("objective") or "").strip()
+        if objective:
+            return objective
+    return fallback
+
+
 def _load_requested_style_profile(args: argparse.Namespace) -> Any | None:
     if args.email_style_profile_id and args.email_style_profile_fixture:
         raise SystemExit(
@@ -556,6 +587,7 @@ def _run_sdk_synthesis(
     )
     style_context = _style_profile_context(email_style_profile)
     founder_context = founder_drafting_context(founder_fit_profile)
+    preflight_context = orchestrator_preflight_context_text(args)
 
     def retrieve() -> GmailMessageEnvelope:
         if args.live_gmail:
@@ -587,8 +619,9 @@ def _run_sdk_synthesis(
 
     def normalize(envelope: GmailMessageEnvelope) -> GmailTriageSDKInput:
         typed_input = GmailTriageSDKInput.from_envelope(envelope)
-        if args.request:
-            typed_input = replace(typed_input, request=args.request)
+        request_context = "\n\n".join(item for item in (args.request, preflight_context) if item)
+        if request_context:
+            typed_input = replace(typed_input, request=request_context)
         if style_context or founder_context:
             return replace(
                 typed_input,
@@ -640,12 +673,13 @@ def _run_sdk_synthesis(
             run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
             agent_name="gmail_triage",
             output=outcome.final_output,
-            request_summary=args.request
-            or args.subject
-            or args.fixture
-            or "gmail triage SDK synthesis",
+            request_summary=_orchestrator_review_request_summary(
+                args,
+                fallback=args.subject or args.fixture or "gmail triage SDK synthesis",
+            ),
             run_type="live SDK" if live else "local SDK",
         )
+    attach_orchestrator_preflight_payload(payload, args)
     return payload
 
 
@@ -1031,6 +1065,8 @@ def _run_priority_grouping_sdk_synthesis(
     )
     style_context = _style_profile_context(email_style_profile)
     founder_context = founder_drafting_context(founder_fit_profile)
+    preflight_context = orchestrator_preflight_context_text(args)
+    request_context = _priority_grouping_request_context(args, preflight_context)
     source_label = _priority_grouping_source_label(args)
 
     def retrieve() -> list[GmailMessageEnvelope]:
@@ -1041,7 +1077,7 @@ def _run_priority_grouping_sdk_synthesis(
     def normalize(envelopes: list[GmailMessageEnvelope]) -> GmailPriorityGroupingSDKInput:
         return GmailPriorityGroupingSDKInput.from_envelopes(
             envelopes,
-            request=GT1_PRIORITY_GROUPING_PROMPT,
+            request=request_context,
             lookback_days=args.lookback_days,
             source_label=source_label,
             email_style_profile=style_context,
@@ -1058,7 +1094,7 @@ def _run_priority_grouping_sdk_synthesis(
         input_summary="gmail GT-1 priority grouping SDK synthesis",
         input_audit_payload={
             "priority_grouping": True,
-            "request": GT1_PRIORITY_GROUPING_PROMPT,
+            "request": request_context,
             "lookback_days": args.lookback_days,
             "source_label": source_label,
             "max_messages": args.max_messages,
@@ -1099,10 +1135,11 @@ def _run_priority_grouping_sdk_synthesis(
             run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
             agent_name="gmail_triage",
             output=outcome.final_output,
-            request_summary=GT1_PRIORITY_GROUPING_PROMPT,
+            request_summary=request_context,
             run_type="live SDK" if live else "local SDK",
         )
         payload["orchestrator_review"] = review_payload
+    attach_orchestrator_preflight_payload(payload, args)
     payload["priority_grouping"] = True
     report = _write_priority_grouping_test_pack_report(
         args=args,
@@ -1116,6 +1153,19 @@ def _run_priority_grouping_sdk_synthesis(
     if report:
         payload["test_pack_report"] = report
     return payload
+
+
+def _priority_grouping_request_context(args: argparse.Namespace, preflight_context: str) -> str:
+    operator_request = str(getattr(args, "request", "") or "").strip()
+    return "\n\n".join(
+        item
+        for item in (
+            f"Operator request: {operator_request}" if operator_request else "",
+            GT1_PRIORITY_GROUPING_PROMPT,
+            preflight_context,
+        )
+        if item
+    )
 
 
 def _run_live_thread_summary(
@@ -1194,7 +1244,9 @@ def _run_live_thread_summary(
 
 @with_cli_environment()
 def main() -> int:
-    args = _apply_live_test_defaults(build_parser().parse_args())
+    args = apply_orchestrator_preflight_to_args(
+        _apply_live_test_defaults(build_parser().parse_args())
+    )
     if args.max_messages < 1:
         raise SystemExit("--max-messages must be at least 1.")
     if args.lookback_days < 1:
@@ -1426,9 +1478,13 @@ def main() -> int:
                 run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
                 agent_name="gmail_triage",
                 output=payload,
-                request_summary=f"live Gmail triage for {label}",
+                request_summary=_orchestrator_review_request_summary(
+                    args,
+                    fallback=f"live Gmail triage for {label}",
+                ),
                 run_type="live Gmail",
             )
+        attach_orchestrator_preflight_payload(payload, args)
         if args.markdown:
             if payload.get("mode") == "live-gmail-thread-summary":
                 summary = _render_thread_summary_markdown(payload)
@@ -1468,13 +1524,17 @@ def main() -> int:
     data = result.model_dump()
     data["approval_decision"] = args.approval_decision
     data["approval_scope"] = args.approval_scope
+    attach_orchestrator_preflight_payload(data, args)
     if args.orchestrator_review:
         data["orchestrator_review"] = build_cli_orchestrator_review(
             args,
             run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
             agent_name="gmail_triage",
             output=result,
-            request_summary=args.subject or args.fixture or "gmail triage fixture run",
+            request_summary=_orchestrator_review_request_summary(
+                args,
+                fallback=args.subject or args.fixture or "gmail triage fixture run",
+            ),
             run_type="deterministic fixture",
         )
     if args.request_approval and (

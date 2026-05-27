@@ -15,8 +15,8 @@ from keystone_agents.sdk import (
     build_model_settings,
     build_sdk_agent,
     function_tool,
-    run_typed_sdk_sync,
 )
+from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.source_enrichment import extract_claim_candidates, extract_clean_text
 
 AGENT_HTML_REVIEW_PROVIDER = "agents-sdk-html-review"
@@ -203,16 +203,16 @@ def run_agent_html_review(
         model=model,
         model_settings=build_model_settings(reasoning_effort="low", verbosity="low"),
     )
-    _raw_result, typed = run_typed_sdk_sync(
-        agent,
-        prompt,
-        HtmlReviewResult,
+    result = run_typed_sdk_agent(
+        agent=agent,
+        typed_input=prompt,
+        output_type=HtmlReviewResult,
         live=True,
         workflow_name="Keystone agent HTML review",
         tracing_disabled=True,
         trace_include_sensitive_data=False,
     )
-    return typed
+    return result.output
 
 
 def _agent_html_review_prompt(payload: dict[str, Any]) -> str:

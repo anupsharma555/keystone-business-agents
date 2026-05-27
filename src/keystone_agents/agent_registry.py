@@ -39,6 +39,7 @@ class AgentSpec:
     # Prompt files are instruction fragments only. `skills.md` is not a runtime
     # capability registry and must not imply hidden routing or dynamic tools.
     tools: tuple[str, ...] = ()
+    optional_tools: tuple[str, ...] = ()
     live_flags_required: tuple[str, ...] = ()
     eval_datasets: tuple[str, ...] = ()
     validation_paths: tuple[str, ...] = ()
@@ -92,6 +93,7 @@ class AgentSpec:
             "output_schema": self.output_schema,
             "prompt_files": list(self.prompt_files),
             "tools": list(self.tools),
+            "optional_tools": list(self.optional_tools),
             "live_flags_required": list(self.live_flags_required),
             "eval_datasets": list(self.eval_datasets),
             "validation_paths": list(self.validation_paths),
@@ -140,7 +142,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             *GOOGLE_WORKSPACE_TOOL_NAMES,
         ),
         live_flags_required=("--live-gmail", "--no-dry-run", "--live-sdk"),
-        eval_datasets=("tests/evals/gmail_triage_cases.json", "evals/gmail_triage.jsonl"),
+        eval_datasets=("evals/static/gmail_triage_cases.json", "evals/local/gmail_triage.jsonl"),
         validation_paths=("tests/test_gmail_triage.py", "tests/test_sdk_execution.py"),
         handoff_description=(
             "Classify inbound email, recommend labels, flag risk, and request drafts only."
@@ -185,8 +187,8 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         live_flags_required=("--live-search", "--no-dry-run", "--live-sdk"),
         eval_datasets=(
-            "tests/evals/business_research_analyst_cases.json",
-            "evals/source_attribution.jsonl",
+            "evals/static/business_research_analyst_cases.json",
+            "evals/local/source_attribution.jsonl",
         ),
         validation_paths=("tests/test_business_research_analyst.py",),
         handoff_description=(
@@ -241,9 +243,9 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         live_flags_required=("--live-search", "--no-dry-run", "--live-sdk"),
         eval_datasets=(
-            "tests/evals/opportunity_scout_cases.json",
-            "evals/opportunity_scoring.jsonl",
-            "evals/source_attribution.jsonl",
+            "evals/static/opportunity_scout_cases.json",
+            "evals/local/opportunity_scoring.jsonl",
+            "evals/local/source_attribution.jsonl",
         ),
         validation_paths=("tests/test_opportunity_scout.py",),
         handoff_description=(
@@ -286,8 +288,8 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         live_flags_required=("--live-sdk",),
         eval_datasets=(
-            "tests/evals/outreach_composer_cases.json",
-            "evals/outreach_copy_constraints.jsonl",
+            "evals/static/outreach_composer_cases.json",
+            "evals/local/outreach_copy_constraints.jsonl",
         ),
         validation_paths=("tests/test_outreach_composer.py",),
         handoff_description=(
@@ -331,15 +333,30 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
         *BROWSER_DIAGNOSTIC_TOOL_NAMES,
         *GOOGLE_WORKSPACE_TOOL_NAMES,
     ),
+    optional_tools=(
+        "business_research_analyst_research_brief",
+        "opportunity_scout_read_only",
+    ),
     live_flags_required=("--live-sdk",),
-    eval_datasets=("evals/orchestrator_routing.jsonl", "evals/safety_refusals.jsonl"),
-    validation_paths=("tests/test_orchestrator.py", "tests/test_handoff_contracts.py"),
+    eval_datasets=("evals/local/orchestrator_routing.jsonl", "evals/local/safety_refusals.jsonl"),
+    validation_paths=(
+        "tests/test_orchestrator.py",
+        "tests/test_handoff_contracts.py",
+        "tests/test_orchestrator_preflight_context.py",
+        "tests/test_workflow_runner.py",
+        "tests/test_slack_action_contract.py",
+        "tests/test_slack_agent_actions.py",
+    ),
     handoff_description=(
-        "Route Keystone business-agent requests to the correct specialist while preserving "
-        "approval gates and no-send policy."
+        "Read raw Keystone requests first, plan or route to the correct specialist, "
+        "pass compact preflight context across Slack/child boundaries, and review "
+        "specialist outputs while preserving approval gates and no-send policy."
     ),
     safety_notes=(
         "Python safety gates remain authoritative",
+        "Planner/Orchestrator context is advisory for specialists, not approval",
+        "Child handoffs use compact preflight payloads instead of raw Slack state",
+        "Manager-loop reviews feed final response synthesis",
         "No specialist handoff may bypass approval policy",
         "Google Workspace writes require live flags and approval references",
     ),

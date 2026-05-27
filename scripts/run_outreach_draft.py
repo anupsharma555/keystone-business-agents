@@ -78,6 +78,11 @@ from keystone_agents.founder_profile import (
 )
 from keystone_agents.model_provider import GEMINI_PROVIDER, get_runtime_agent_model_config
 from keystone_agents.models import OutreachComposerSDKInput, RunMode, TypedAgentRunResult
+from keystone_agents.orchestrator.preflight_context import (
+    apply_orchestrator_preflight_to_args,
+    attach_orchestrator_preflight_payload,
+    orchestrator_preflight_context_text,
+)
 from keystone_agents.outreach_templates import (
     OutreachTemplateNotFoundError,
     load_outreach_template_context,
@@ -151,6 +156,29 @@ def _test_pack_input_source(args: argparse.Namespace) -> str:
     if args.research_brief_fixture:
         return f"Research brief fixture: {args.research_brief_fixture}."
     return f"Company fixture: {args.fixture}; opportunity fixture: {args.opportunity_fixture}."
+
+
+def _orchestrator_review_request_summary(
+    args: argparse.Namespace,
+    *,
+    fallback: str,
+) -> str:
+    preflight = getattr(args, "orchestrator_preflight", None)
+    if isinstance(preflight, dict):
+        request_text = str(preflight.get("request_text") or "").strip()
+        if request_text:
+            return request_text
+        memo = preflight.get("preflight_memo")
+        if isinstance(memo, dict):
+            raw_request = str(memo.get("raw_request") or "").strip()
+            if raw_request:
+                return raw_request
+    plan = getattr(args, "manual_request_plan", None)
+    if isinstance(plan, dict):
+        objective = str(plan.get("objective") or "").strip()
+        if objective:
+            return objective
+    return fallback
 
 
 def _test_pack_report_slug(payload: dict[str, Any]) -> str:
@@ -652,6 +680,8 @@ def _compact_gemini_outcome_to_outreach_draft(
         model_run_mode=outcome.model_run_mode,
         usage=outcome.usage,
         cost=outcome.cost,
+        budget_guard=outcome.budget_guard,
+        request_cache=outcome.request_cache,
         provider_usage_context=outcome.provider_usage_context,
         started_at_unix=outcome.started_at_unix,
         ended_at_unix=outcome.ended_at_unix,
@@ -693,7 +723,74 @@ def _aggregate_usage(items: list[dict[str, Any]]) -> dict[str, Any]:
                 summed[key] += int(item.get(key) or 0)
             except (TypeError, ValueError):
                 continue
+    input_tokens = int(summed.get("input_tokens") or 0)
+    cached_input_tokens = int(summed.get("cached_input_tokens") or 0)
+    summed["cache_hit_rate"] = (
+        round(min(input_tokens, max(0, cached_input_tokens)) / input_tokens, 4)
+        if input_tokens > 0
+        else 0.0
+    )
+    for key in ("prompt_cache_key_present", "prompt_cache_key_hash"):
+        values = [item.get(key) for item in items if item.get(key) not in (None, "")]
+        if key == "prompt_cache_key_present":
+            summed[key] = any(bool(value) for value in values)
+        elif values and len({str(value) for value in values}) == 1:
+            summed[key] = str(values[0])
     return summed
+
+
+def _aggregate_request_cache(items: list[dict[str, Any]]) -> dict[str, Any]:
+    caches = [dict(item) for item in items if isinstance(item, dict) and item]
+    if not caches:
+        return {}
+    if len(caches) == 1:
+        return dict(caches[0])
+    static_prefixes = {
+        str(cache.get("static_prefix_sha256") or "")
+        for cache in caches
+        if cache.get("static_prefix_sha256")
+    }
+    instruction_hashes = {
+        str(cache.get("instructions_sha256") or "")
+        for cache in caches
+        if cache.get("instructions_sha256")
+    }
+    tool_hashes = {
+        str(cache.get("tool_names_sha256") or "")
+        for cache in caches
+        if cache.get("tool_names_sha256")
+    }
+    schema_hashes = {
+        str(cache.get("output_schema_sha256") or "")
+        for cache in caches
+        if cache.get("output_schema_sha256")
+    }
+    dynamic_chars = [
+        int(cache.get("dynamic_prompt_chars") or 0)
+        for cache in caches
+        if cache.get("dynamic_prompt_chars") is not None
+    ]
+    return {
+        "request_layout": "aggregated_static_agent_prefix_then_dynamic_typed_input",
+        "static_prefix_sha256": next(iter(static_prefixes)) if len(static_prefixes) == 1 else "",
+        "instructions_sha256": next(iter(instruction_hashes)) if len(instruction_hashes) == 1 else "",
+        "tool_names_sha256": next(iter(tool_hashes)) if len(tool_hashes) == 1 else "",
+        "output_schema_sha256": next(iter(schema_hashes)) if len(schema_hashes) == 1 else "",
+        "tool_count": caches[0].get("tool_count"),
+        "dynamic_prompt_chars": sum(dynamic_chars),
+        "dynamic_prompt_chars_min": min(dynamic_chars) if dynamic_chars else 0,
+        "dynamic_prompt_chars_max": max(dynamic_chars) if dynamic_chars else 0,
+        "session_attached": all(bool(cache.get("session_attached")) for cache in caches),
+        "run_count": len(caches),
+        "static_prefix_stable": len(static_prefixes) == 1,
+        "instructions_stable": len(instruction_hashes) == 1,
+        "tool_order_stable": len(tool_hashes) == 1,
+        "output_schema_stable": len(schema_hashes) == 1,
+        "note": (
+            "Aggregated audit-safe prompt-cache diagnostics for multi-variant SDK runs; "
+            "raw prompt text and raw instructions are not stored."
+        ),
+    }
 
 
 def _aggregate_cost(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -830,6 +927,7 @@ def _outreach_sdk_input_from_context(
         if example_guidance
         else ""
     )
+    preflight_context = orchestrator_preflight_context_text(args)
     return OutreachComposerSDKInput(
         company_name=company_profile.name,
         contact_name=(
@@ -844,7 +942,9 @@ def _outreach_sdk_input_from_context(
         ),
         recent_signal=args.recent_signal,
         outreach_goal=objective,
-        approved_context=approved_context,
+        approved_context="\n\n".join(
+            item for item in (approved_context, preflight_context) if item
+        ),
         email_style_profile=style_context,
         outreach_template=template_context,
         example_guidance=example_context,
@@ -1194,6 +1294,9 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             },
             "usage": jsonable(usage),
             "cost": jsonable(cost),
+            "request_cache": jsonable(
+                _aggregate_request_cache([outcome.request_cache for outcome in outcomes])
+            ),
             "gemini_free_tier_usage": jsonable(
                 gemini_free_tier_usage_context(
                     provider=outcomes[0].model_provider,
@@ -1222,9 +1325,13 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
             agent_name="outreach_composer",
             output=payload["output"],
-            request_summary=args.goal or f"outreach SDK synthesis for {args.fixture}",
+            request_summary=_orchestrator_review_request_summary(
+                args,
+                fallback=args.goal or f"outreach SDK synthesis for {args.fixture}",
+            ),
             run_type="live SDK" if live else "local SDK",
         )
+    attach_orchestrator_preflight_payload(payload, args)
     report = (
         _write_oc1_test_pack_report(args=args, payload=payload) if args.max_variants == 1 else {}
     )
@@ -1235,7 +1342,9 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
 
 @with_cli_environment()
 def main() -> int:
-    args = _apply_live_test_defaults(build_parser().parse_args())
+    args = apply_orchestrator_preflight_to_args(
+        _apply_live_test_defaults(build_parser().parse_args())
+    )
     if args.create_outreach_tracking and not args.save:
         raise SystemExit("--create-outreach-tracking requires --save.")
     if args.max_variants > 1 and not sdk_execution_requested(args):
@@ -1265,6 +1374,7 @@ def main() -> int:
                 raise SystemExit(message) from exc
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
+        attach_orchestrator_preflight_payload(payload, args)
         if args.json or not args.markdown:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
@@ -1421,9 +1531,13 @@ def main() -> int:
             run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
             agent_name="outreach_composer",
             output=draft if draft is not None else payload,
-            request_summary=args.goal or f"outreach draft for {args.fixture}",
+            request_summary=_orchestrator_review_request_summary(
+                args,
+                fallback=args.goal or f"outreach draft for {args.fixture}",
+            ),
             run_type="deterministic fixture",
         )
+    attach_orchestrator_preflight_payload(payload, args)
     if args.save:
         storage = StorageTool(args.database_url)
         payload["storage"] = {}

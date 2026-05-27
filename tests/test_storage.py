@@ -861,6 +861,40 @@ def test_agent_run_logs_save(tmp_path) -> None:
     assert row["dry_run"] == 1
 
 
+def test_agent_run_actual_cost_annotation_updates_sdk_cost(tmp_path) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+    row_id = store.save_agent_run(
+        agent_name="orchestrator",
+        input_summary="cache experiment",
+        output={
+            "_sdk_cost": {
+                "source": "local_pricing_table",
+                "estimated_usd": 0.16,
+            },
+            "_sdk_usage": {
+                "input_tokens": 10_000,
+                "cached_input_tokens": 5_000,
+            },
+        },
+        model="sdk-live",
+        dry_run=False,
+    )
+
+    result = store.annotate_agent_run_actual_cost(
+        row_id,
+        actual_usd="0.15",
+        reference_id="platform-window-1",
+    )
+
+    output = json.loads(store.fetch_all("agent_runs")[0]["output_json"])
+    comparison = output["_sdk_cost"]["estimate_vs_actual"]
+    assert result["status"] == "updated"
+    assert output["_sdk_cost"]["actual_usd"] == 0.15
+    assert comparison["available"] is True
+    assert comparison["reference_id"] == "platform-window-1"
+    assert comparison["delta_usd"] == 0.01
+
+
 def test_agent_run_step_logs_save_and_query_redacted_summaries(tmp_path) -> None:
     store = SQLiteStore(_database_url(tmp_path))
 
@@ -1164,3 +1198,28 @@ def test_redact_email_content_summarizes_full_body() -> None:
     assert payload["api_key"] == "[REDACTED]"
     assert "line one" in payload["body_summary"]
     assert "draft line one" in payload["draft_reply_summary"]
+
+
+def test_redact_secrets_preserves_sdk_usage_token_counts() -> None:
+    payload = redact_secrets(
+        {
+            "_sdk_usage": {
+                "input_tokens": 1200,
+                "cached_input_tokens": 900,
+                "output_tokens": 300,
+                "reasoning_output_tokens": 40,
+                "total_tokens": 1540,
+                "cache_hit_rate": 0.75,
+                "prompt_cache_key_present": True,
+                "prompt_cache_key_hash": "abc123def456",
+            },
+            "api_token": "SHOULD_NOT_APPEAR_123456789",
+        }
+    )
+
+    assert payload["_sdk_usage"]["input_tokens"] == 1200
+    assert payload["_sdk_usage"]["cached_input_tokens"] == 900
+    assert payload["_sdk_usage"]["reasoning_output_tokens"] == 40
+    assert payload["_sdk_usage"]["cache_hit_rate"] == 0.75
+    assert payload["_sdk_usage"]["prompt_cache_key_hash"] == "abc123def456"
+    assert payload["api_token"] == "[REDACTED]"

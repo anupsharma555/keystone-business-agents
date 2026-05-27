@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820" role="img" aria-labelledby="title desc">
+  <title id="title">Alternative workflow: Manager with agents as tools</title>
+  <desc id="desc">A central SDK manager agent keeps the user conversation and calls specialist agents exposed as tools, then synthesizes the final answer.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#344054"/></marker>
+    <style>
+      .bg{fill:#f7f9fc}.box{fill:#fff;stroke:#c8d0dc;stroke-width:2}.mgr{fill:#e8f7f1;stroke:#079455;stroke-width:2}.tool{fill:#fff7e6;stroke:#d89b2b;stroke-width:2}.gate{fill:#fff1f3;stroke:#d92d20;stroke-width:2}.store{fill:#f2f4f7;stroke:#667085;stroke-width:2}.h{font:700 22px Arial;fill:#101828}.b{font:400 15px Arial;fill:#344054}.s{font:400 13px Arial;fill:#475467}.t{font:700 34px Arial;fill:#101828}.line{stroke:#344054;stroke-width:2;fill:none;marker-end:url(#arrow)}.dash{stroke-dasharray:7 5}
+    </style>
+  </defs>
+  <rect class="bg" width="1400" height="820"/>
+  <text class="t" x="54" y="62">SDK Pattern A: Manager Agent Calls Specialists As Tools</text>
+  <text class="s" x="56" y="92">Best when one agent should own the final answer while using specialist reasoning as bounded read-only subcalls.</text>
+
+  <rect class="box" x="60" y="155" width="220" height="115" rx="12"/>
+  <text class="h" x="88" y="192">User / Slack</text>
+  <text class="b" x="88" y="222">Single conversation</text>
+  <text class="b" x="88" y="246">One final reply surface</text>
+
+  <rect class="mgr" x="430" y="120" width="300" height="205" rx="14"/>
+  <text class="h" x="462" y="158">Manager Agent</text>
+  <text class="b" x="462" y="193">Instructions + tools</text>
+  <text class="b" x="462" y="218">Calls specialists via Agent.as_tool()</text>
+  <text class="b" x="462" y="243">Keeps conversation ownership</text>
+  <text class="b" x="462" y="268">Synthesizes final structured answer</text>
+  <text class="s" x="462" y="300">No specialist takes over the thread.</text>
+
+  <rect class="tool" x="905" y="80" width="210" height="95" rx="12"/>
+  <text class="h" x="932" y="118">Research Tool</text>
+  <text class="s" x="932" y="145">Agent as callable tool</text>
+
+  <rect class="tool" x="905" y="205" width="210" height="95" rx="12"/>
+  <text class="h" x="932" y="243">Scout Tool</text>
+  <text class="s" x="932" y="270">Agent as callable tool</text>
+
+  <rect class="tool" x="905" y="330" width="210" height="95" rx="12"/>
+  <text class="h" x="932" y="368">Gmail Tool</text>
+  <text class="s" x="932" y="395">Agent as callable tool</text>
+
+  <rect class="tool" x="905" y="455" width="210" height="95" rx="12"/>
+  <text class="h" x="932" y="493">Outreach Tool</text>
+  <text class="s" x="932" y="520">Draft-only subagent</text>
+
+  <rect class="gate" x="430" y="420" width="300" height="140" rx="14"/>
+  <text class="h" x="462" y="458">Manager Guardrails</text>
+  <text class="b" x="462" y="493">No-send and approval gates</text>
+  <text class="b" x="462" y="518">Tool output review</text>
+  <text class="b" x="462" y="543">Final answer validation</text>
+
+  <rect class="store" x="875" y="620" width="280" height="105" rx="12"/>
+  <text class="h" x="906" y="657">Schemas / State</text>
+  <text class="b" x="906" y="688">Structured output only</text>
+  <text class="b" x="906" y="713">Optional session memory</text>
+
+  <path class="line" d="M280 213 C345 213 365 218 430 220"/>
+  <path class="line" d="M730 205 C800 150 835 128 905 128"/>
+  <path class="line" d="M730 230 C800 245 835 252 905 252"/>
+  <path class="line" d="M730 255 C800 350 835 377 905 377"/>
+  <path class="line" d="M730 280 C800 455 835 502 905 502"/>
+  <path class="line dash" d="M1010 550 C950 590 900 610 875 650"/>
+  <path class="line" d="M580 325 L580 420"/>
+  <path class="line" d="M430 490 C300 490 235 380 210 270"/>
+  <text class="s" x="745" y="185">tool calls return summaries</text>
+  <text class="s" x="235" y="475">manager sends final reply</text>
+</svg>

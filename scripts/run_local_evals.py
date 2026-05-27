@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ from keystone_agents.agents.outreach_composer import (
     load_opportunity_record,
     load_style_profile,
 )
+from keystone_agents.benchmark_tracking import record_eval_summary
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.guardrails import assess_text_guardrails
 from keystone_agents.schemas.approval import (
@@ -41,7 +43,7 @@ from keystone_agents.sdk import prompt_metadata_for_files, prompt_version_refere
 from keystone_agents.storage.sqlite_store import SQLiteStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_EVAL_DIR = PROJECT_ROOT / "evals"
+DEFAULT_EVAL_DIR = PROJECT_ROOT / "evals" / "local"
 SPECIALIZED_EVAL_DATASETS = frozenset(
     {
         "browser_extraction_cases.jsonl",
@@ -912,6 +914,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dataset name or JSONL path. Can be passed more than once.",
     )
     parser.add_argument("--json", action="store_true", help="Print machine-readable summary.")
+    parser.add_argument(
+        "--record-benchmark",
+        action="store_true",
+        help="Record this eval run in the local benchmark SQLite store.",
+    )
+    parser.add_argument(
+        "--benchmark-db",
+        default=None,
+        help=(
+            "Optional benchmark SQLite path. Defaults to KEYSTONE_BENCHMARK_DB "
+            "or .keystone/state."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-label",
+        default="",
+        help="Optional label for comparing benchmark runs over time.",
+    )
     return parser
 
 
@@ -922,6 +942,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(summary.to_dict(), ensure_ascii=True, indent=2, sort_keys=True))
     else:
         print(format_summary(summary))
+    if args.record_benchmark:
+        record = record_eval_summary(
+            summary.to_dict(),
+            suite="local",
+            db_path=args.benchmark_db,
+            run_label=args.benchmark_label,
+            entrypoint="scripts/run_local_evals.py",
+            metadata={"datasets": args.dataset or ["all"]},
+        )
+        print(f"Recorded benchmark run {record.run_id} in {record.db_path}", file=sys.stderr)
     return 0 if summary.failed == 0 else 1
 
 

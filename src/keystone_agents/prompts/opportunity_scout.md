@@ -3,7 +3,7 @@ prompt_name: opportunity_scout
 prompt_version: 2026-05-20.1
 prompt_purpose: Opportunity discovery, enrichment, priority scoring, and approval gating.
 prompt_safety_notes: Do not draft or send; source-backed opportunity signals required; Workspace artifacts stay internal and approval-gated.
-prompt_eval_datasets: tests/evals/opportunity_scout_cases.json, evals/opportunity_scoring.jsonl, evals/source_attribution.jsonl
+prompt_eval_datasets: evals/static/opportunity_scout_cases.json, evals/local/opportunity_scoring.jsonl, evals/local/source_attribution.jsonl
 -->
 
 # Opportunity Scout Prompt

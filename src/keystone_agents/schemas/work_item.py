@@ -188,11 +188,18 @@ class WorkflowRunRequest(BaseModel):
     max_results: int = Field(default=3, ge=1, le=20)
     requested_route: WorkItemRoute | None = None
     manual_request_plan: dict[str, Any] | None = None
+    orchestrator_preflight: dict[str, Any] | None = None
     context_file_path: str = ""
     external_context: dict[str, Any] | None = None
     sdk_session_enabled: bool | None = None
     sdk_session_id: str = ""
     sdk_session_db_path: str = ""
+    cost_profile: str = "standard"
+    allow_manager_loop_repair: bool = True
+    include_contact_enrichment: bool = True
+    hosted_web_search_max_calls: int | None = Field(default=None, ge=0, le=20)
+    reuse_existing_research: bool = False
+    cost_tracking_requested: bool = False
 
 
 class WorkflowRunResult(BaseModel):
@@ -208,4 +215,5 @@ class WorkflowRunResult(BaseModel):
     human_summary: str = ""
     audit_notes: list[str] = Field(default_factory=list)
     manual_request_plan: dict[str, Any] | None = None
+    orchestrator_preflight: dict[str, Any] | None = None
     context_pack: dict[str, Any] | None = None

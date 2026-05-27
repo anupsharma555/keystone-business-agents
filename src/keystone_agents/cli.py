@@ -10,6 +10,7 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from keystone_agents.agent_mentions import parse_agent_mention
@@ -17,10 +18,12 @@ from keystone_agents.agent_registry import AGENT_REGISTRY, agent_cards
 from keystone_agents.agents.chief_of_staff import (
     plan_chief_of_staff_request,
 )
-from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
 from keystone_agents.agents.orchestrator import (
+    OrchestratorPreflight,
     build_orchestrator_agent,
+    review_specialist_output,
     route_request,
+    run_orchestrator_preflight,
     run_orchestrator_sdk,
 )
 from keystone_agents.automation_inventory import (
@@ -28,12 +31,18 @@ from keystone_agents.automation_inventory import (
     ensure_default_automation_inventory,
     render_automation_inventory_markdown,
 )
+from keystone_agents.child_process import run_isolated_child_process
 from keystone_agents.cli_sdk import add_sdk_session_arguments
 from keystone_agents.config import cli_default_live_research, cli_default_live_sdk, load_settings
+from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.evals import generate_eval_report, run_static_evals
 from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
 from keystone_agents.models import RunMode
+from keystone_agents.orchestrator.preflight_context import (
+    compact_orchestrator_preflight_payload,
+    orchestrator_preflight_env,
+)
 from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
 from keystone_agents.reporting import (
     render_markdown_table,
@@ -65,6 +74,7 @@ from keystone_agents.sdk_sessions import (
     sdk_session_env,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
+from keystone_agents.storage.sqlite_store import redact_secrets
 from keystone_agents.tools.slack_tool import SlackTool, slack_review_message_from_approval_item
 from keystone_agents.tools.storage_tool import StorageTool
 from keystone_agents.work_items import (
@@ -77,7 +87,7 @@ from keystone_agents.work_items import (
     select_artifact,
     set_next_action,
 )
-from keystone_agents.workflow_runner import advance_work_item
+from keystone_agents.workflow_runner import advance_work_item, advance_work_item_manager_loop
 from keystone_agents.workflows import (
     pipeline_markdown_report,
     run_keystone_pipeline,
@@ -150,6 +160,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ask.add_argument("--live-search", action="store_true", help="Use live search in WorkItem mode.")
     ask.add_argument("--max-results", type=int, default=3, help="Max WorkItem search results.")
+    ask.add_argument(
+        "--max-manager-steps",
+        type=int,
+        default=3,
+        help="Max bounded manager-loop WorkItem steps for @KNI ask mode.",
+    )
     ask.add_argument("--save", action="store_true", help="Save workflow artifacts when supported.")
     ask.add_argument(
         "--approval-channel",
@@ -272,6 +288,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use the optional LangGraph WorkItem orchestration wrapper.",
     )
     work_items_advance.add_argument("--max-results", type=int, default=3)
+    work_items_advance.add_argument(
+        "--max-manager-steps",
+        type=int,
+        default=3,
+        help="Max bounded manager-loop WorkItem steps.",
+    )
     work_items_advance.add_argument("--json", action="store_true", help="Print JSON.")
     work_items_advance.set_defaults(func=_run_work_items_advance)
 
@@ -437,18 +459,28 @@ def _run_ask(args: argparse.Namespace) -> int:
     raw_input = _ask_input(args)
     mention = parse_agent_mention(raw_input)
     input_text = raw_input if args.agent else mention.input_text
+    cost_directive = parse_cost_tracking_directive(input_text)
+    input_text = (cost_directive.cleaned_text or input_text).strip()
     live_sdk = _ask_live_sdk_enabled(args)
     live_manual_plan = args.live_manual_plan or live_sdk
     live_search = args.live_search or (live_sdk and cli_default_live_research())
     if live_manual_plan:
         load_settings(force_dotenv=True)
     requested_route = args.agent or (mention.route if mention.explicit else None)
-    if args.agent is None:
-        manual_plan = resolve_manual_request_plan(
+    orchestrator_preflight = run_orchestrator_preflight(
+        input_text,
+        requested_agent=requested_route,
+        live_manual_plan=live_manual_plan,
+        database_url=args.database_url,
+    )
+    manual_plan = orchestrator_preflight.manual_request_plan
+    if _preflight_blocks_execution(orchestrator_preflight):
+        return _print_ask_preflight_blocked(
             input_text,
-            requested_agent=requested_route,
-            live=live_manual_plan,
+            json_output=args.json,
+            orchestrator_preflight=orchestrator_preflight,
         )
+    if args.agent is None:
         if _should_run_opportunity_to_outreach_loop(
             manual_plan,
             explicit_route=mention.route if mention.explicit else None,
@@ -464,11 +496,13 @@ def _run_ask(args: argparse.Namespace) -> int:
                 request_approval=args.request_approval,
                 approval_channel=args.approval_channel,
                 live_slack=args.live_slack,
+                orchestrator_preflight=orchestrator_preflight,
                 sdk_session_spec=_sdk_session_spec_for_ask(
                     args,
                     route="orchestrator",
                     default_enabled=False,
                 ),
+                cost_tracking_requested=cost_directive.requested,
             )
         if live_sdk and mention.explicit and mention.route is not None:
             route = str(mention.route)
@@ -483,6 +517,7 @@ def _run_ask(args: argparse.Namespace) -> int:
                     live_sdk=True,
                     json_output=args.json,
                     manual_plan=manual_plan,
+                    orchestrator_preflight=orchestrator_preflight,
                     sdk_session_spec=_sdk_session_spec_for_ask(
                         args,
                         route="orchestrator",
@@ -494,11 +529,13 @@ def _run_ask(args: argparse.Namespace) -> int:
                 input_text,
                 json_output=args.json,
                 manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
                 sdk_session_spec=_sdk_session_spec_for_ask(
                     args,
                     route=route,
                     default_enabled=_ask_route_session_default(route),
                 ),
+                cost_tracking_requested=cost_directive.requested,
             )
         return _run_ask_work_item(
             input_text,
@@ -506,30 +543,30 @@ def _run_ask(args: argparse.Namespace) -> int:
             live_search=live_search,
             live_sdk=live_sdk,
             max_results=args.max_results,
+            max_manager_steps=args.max_manager_steps,
             json_output=args.json,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             context_file_path=args.context_file,
             sdk_session_enabled=args.sdk_session,
             sdk_session_id=args.sdk_session_id,
             sdk_session_db_path=args.sdk_session_db,
+            cost_tracking_requested=cost_directive.requested,
         )
     route = args.agent
-    manual_plan = resolve_manual_request_plan(
-        input_text,
-        requested_agent=route,
-        live=live_manual_plan,
-    )
     if route == "orchestrator":
         return _run_ask_orchestrator(
             input_text,
             live_sdk=live_sdk,
             json_output=args.json,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=_sdk_session_spec_for_ask(
                 args,
                 route="orchestrator",
                 default_enabled=False,
             ),
+            cost_tracking_requested=cost_directive.requested,
         )
     if live_sdk:
         if manual_plan.intent == "browser_diagnostics" and manual_plan.target_agent in {
@@ -543,28 +580,33 @@ def _run_ask(args: argparse.Namespace) -> int:
                     live_sdk=True,
                     json_output=args.json,
                     manual_plan=manual_plan,
+                    orchestrator_preflight=orchestrator_preflight,
                     sdk_session_spec=_sdk_session_spec_for_ask(
                         args,
                         route="orchestrator",
                         default_enabled=False,
                     ),
+                    cost_tracking_requested=cost_directive.requested,
                 )
         return _run_ask_specialist_live(
             route,
             input_text,
             json_output=args.json,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=_sdk_session_spec_for_ask(
                 args,
                 route=route,
                 default_enabled=_ask_route_session_default(route),
             ),
+            cost_tracking_requested=cost_directive.requested,
         )
     return _print_ask_dry_run(
         route,
         input_text,
         json_output=args.json,
         manual_plan=manual_plan,
+        orchestrator_preflight=orchestrator_preflight,
         database_url=args.database_url,
     )
 
@@ -603,6 +645,65 @@ def _ask_route_session_default(route: str) -> bool:
     return route == "chief_of_staff"
 
 
+def _preflight_blocks_execution(preflight: OrchestratorPreflight) -> bool:
+    return not bool(preflight.execution_allowed)
+
+
+def _orchestrator_preflight_payload(
+    preflight: OrchestratorPreflight | None,
+) -> dict[str, object] | None:
+    payload = compact_orchestrator_preflight_payload(preflight)
+    return payload or None
+
+
+def _print_ask_preflight_blocked(
+    input_text: str,
+    *,
+    json_output: bool,
+    orchestrator_preflight: OrchestratorPreflight,
+) -> int:
+    result = orchestrator_preflight.route_result
+    compact_preflight = _orchestrator_preflight_payload(orchestrator_preflight)
+    combined_reason = " ".join(
+        str(part or "")
+        for part in (
+            orchestrator_preflight.block_kind,
+            orchestrator_preflight.block_reason,
+            result.rationale,
+            result.stop_reason,
+            result.clarification_request,
+        )
+    ).lower()
+    requires_approved_context = (
+        "approved context" in combined_reason
+        or "approved company" in combined_reason
+        or "approved opportunity" in combined_reason
+        or "outreach drafting requires" in combined_reason
+    )
+    payload: dict[str, object] = {
+        "mode": "blocked",
+        "selected_agent": orchestrator_preflight.selected_agent,
+        "agent_name": _agent_display_name("orchestrator"),
+        "input": input_text,
+        "status": "blocked",
+        "send_enabled": False,
+        "block_kind": orchestrator_preflight.block_kind,
+        "block_reason": orchestrator_preflight.block_reason,
+        "manual_request_plan": orchestrator_preflight.manual_request_plan.model_dump(mode="json"),
+        "orchestrator_preflight": compact_preflight,
+        "message": result.clarification_request
+        or result.stop_reason
+        or "Orchestrator preflight blocked specialist execution.",
+        "output": (compact_preflight or {}).get("route_result", {}),
+    }
+    if requires_approved_context:
+        payload["requires_approved_context"] = True
+        payload["recommended_next_action"] = (
+            "Attach or approve source-backed context in a WorkItem before live drafting."
+        )
+    return _print_ask_live_payload(payload, json_output=json_output)
+
+
 def _should_run_opportunity_to_outreach_loop(
     manual_plan: ManualRequestPlan | None,
     *,
@@ -625,7 +726,9 @@ def _run_ask_opportunity_to_outreach_loop(
     request_approval: bool,
     approval_channel: str,
     live_slack: bool,
+    orchestrator_preflight: OrchestratorPreflight | None = None,
     sdk_session_spec: SDKSessionSpec | None = None,
+    cost_tracking_requested: bool = False,
 ) -> int:
     approval_requested = request_approval or _approval_requested_from_text(input_text)
     if live_slack and not approval_requested:
@@ -674,7 +777,9 @@ def _run_ask_opportunity_to_outreach_loop(
         "top_n": top_n,
         "send_enabled": False,
         "manual_request_plan": manual_plan.model_dump(mode="json"),
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
         "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
+        "cost_tracking_requested": cost_tracking_requested,
         "output_type": type(result).__name__,
         "output": result.model_dump(mode="json"),
     }
@@ -695,6 +800,45 @@ def _approval_requested_from_text(text: str) -> bool:
     )
 
 
+def _workflow_cost_options_for_request_context(
+    *,
+    request_text: str,
+    context_file_path: str = "",
+    work_item: WorkItem | None = None,
+) -> dict[str, Any]:
+    """Let the WorkItem runner choose route-aware Slack cost controls."""
+
+    if not _is_slack_workflow_context(context_file_path=context_file_path, work_item=work_item):
+        return {}
+    return {}
+
+
+def _is_slack_workflow_context(
+    *,
+    context_file_path: str = "",
+    work_item: WorkItem | None = None,
+) -> bool:
+    if _context_file_is_slack_context(context_file_path):
+        return True
+    if work_item is None:
+        return False
+    slack_context = getattr(work_item.target, "metadata", {}).get("slack_context")
+    return isinstance(slack_context, dict) and bool(slack_context)
+
+
+def _context_file_is_slack_context(context_file_path: str) -> bool:
+    if not context_file_path:
+        return False
+    try:
+        data = json.loads(Path(context_file_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    schema = str(data.get("schema") or data.get("schema_") or "").strip()
+    return schema.startswith("keystone.slack.")
+
+
 def _run_ask_work_item(
     input_text: str,
     *,
@@ -703,11 +847,14 @@ def _run_ask_work_item(
     live_sdk: bool,
     max_results: int,
     json_output: bool,
+    max_manager_steps: int = 3,
     manual_plan: ManualRequestPlan | None = None,
+    orchestrator_preflight: OrchestratorPreflight | None = None,
     context_file_path: str = "",
     sdk_session_enabled: bool | None = None,
     sdk_session_id: str = "",
     sdk_session_db_path: str = "",
+    cost_tracking_requested: bool = False,
 ) -> int:
     store = SQLiteStore(database_url or database_url_from_env())
     work_item_id = _resolve_continue_work_item_id(
@@ -716,7 +863,8 @@ def _run_ask_work_item(
         explicit_work_item_id=None,
         json_output=json_output,
     )
-    result = advance_work_item(
+    existing_work_item = store.get_work_item(work_item_id) if work_item_id else None
+    result = advance_work_item_manager_loop(
         WorkflowRunRequest(
             request_text=input_text,
             work_item_id=work_item_id,
@@ -726,13 +874,46 @@ def _run_ask_work_item(
             live_sdk=live_sdk,
             max_results=max_results,
             manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
+            orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
             context_file_path=context_file_path,
             sdk_session_enabled=sdk_session_enabled,
             sdk_session_id=sdk_session_id,
             sdk_session_db_path=sdk_session_db_path,
-        )
+            cost_tracking_requested=cost_tracking_requested,
+            **_workflow_cost_options_for_request_context(
+                request_text=input_text,
+                context_file_path=context_file_path,
+                work_item=existing_work_item,
+            ),
+        ),
+        max_steps=max_manager_steps,
+        feedback_callback=None if json_output else _print_manager_loop_feedback,
     )
     return _print_work_item_result(result, json_output=json_output)
+
+
+def _print_manager_loop_feedback(event_type: str, payload: dict[str, Any]) -> None:
+    """Print compact real-time manager feedback without changing result schemas."""
+
+    if event_type == "manager_loop_review":
+        decision = str(payload.get("review_decision") or "").strip()
+        label = (
+            "Manager review block"
+            if decision == "block" or payload.get("blocking") is True
+            else "Manager review warning"
+            if decision == "warn" or payload.get("advisory") is True
+            else "Manager review"
+        )
+        print(
+            f"{label}: "
+            f"step {payload.get('step')} {payload.get('route')} "
+            f"{payload.get('review_status')} ({payload.get('overall_score')}/100)"
+        )
+        next_step = str(payload.get("recommended_next_step") or "").strip()
+        if next_step:
+            print(f"Manager feedback: {next_step}")
+    elif event_type == "manager_loop_completed":
+        print(f"Manager loop: {payload.get('stop_reason')}")
 
 
 def _run_ask_orchestrator(
@@ -741,15 +922,19 @@ def _run_ask_orchestrator(
     live_sdk: bool,
     json_output: bool,
     manual_plan: ManualRequestPlan | None = None,
+    orchestrator_preflight: OrchestratorPreflight | None = None,
     sdk_session_spec: SDKSessionSpec | None = None,
+    cost_tracking_requested: bool = False,
 ) -> int:
+    sdk_result = None
     if live_sdk:
         load_settings(force_dotenv=True)
-        result = run_orchestrator_sdk(
+        sdk_result = run_orchestrator_sdk(
             input_text,
             live=True,
             session=build_sdk_session(sdk_session_spec) if sdk_session_spec else None,
-        ).output
+        )
+        result = sdk_result.output
     else:
         result = route_request(input_text, manual_plan=manual_plan)
     payload = {
@@ -761,9 +946,15 @@ def _run_ask_orchestrator(
         "target_agent": result.target_agent,
         "send_enabled": result.send_enabled,
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
         "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
+        "cost_tracking_requested": cost_tracking_requested,
         "output": result.model_dump(mode="json"),
     }
+    if sdk_result is not None:
+        payload["usage"] = sdk_result.usage
+        payload["cost"] = sdk_result.cost
+        payload["request_cache"] = sdk_result.request_cache
     if json_output:
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
@@ -782,11 +973,16 @@ def _print_ask_dry_run(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None = None,
+    orchestrator_preflight: OrchestratorPreflight | None = None,
     database_url: str | None = None,
 ) -> int:
     agent = AGENT_REGISTRY[route].build_agent()
     chief_of_staff_output = (
-        plan_chief_of_staff_request(input_text, database_url=database_url)
+        plan_chief_of_staff_request(
+            input_text,
+            database_url=database_url,
+            manual_request_plan=manual_plan,
+        )
         if route == "chief_of_staff"
         else None
     )
@@ -798,6 +994,7 @@ def _print_ask_dry_run(
         "input": input_text,
         "send_enabled": False,
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
         "output": (
             chief_of_staff_output.model_dump(mode="json") if chief_of_staff_output else None
         ),
@@ -837,7 +1034,9 @@ def _run_ask_specialist_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None = None,
+    orchestrator_preflight: OrchestratorPreflight | None = None,
     sdk_session_spec: SDKSessionSpec | None = None,
+    cost_tracking_requested: bool = False,
 ) -> int:
     load_settings(force_dotenv=True)
     if route == "business_research_analyst":
@@ -845,35 +1044,45 @@ def _run_ask_specialist_live(
             input_text,
             json_output=json_output,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            cost_tracking_requested=cost_tracking_requested,
         )
     elif route == "chief_of_staff":
         return _run_ask_chief_of_staff_live(
             input_text,
             json_output=json_output,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            cost_tracking_requested=cost_tracking_requested,
         )
     elif route == "opportunity_scout":
         return _run_ask_opportunity_scout_live(
             input_text,
             json_output=json_output,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            cost_tracking_requested=cost_tracking_requested,
         )
     elif route == "outreach_composer":
         return _run_ask_outreach_composer_live(
             input_text,
             json_output=json_output,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            cost_tracking_requested=cost_tracking_requested,
         )
     elif route == "gmail_triage":
         return _run_ask_gmail_triage_live(
             input_text,
             json_output=json_output,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            cost_tracking_requested=cost_tracking_requested,
         )
     else:
         raise SystemExit(f"Unsupported agent route: {route}")
@@ -884,7 +1093,9 @@ def _run_ask_company_research_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
+    cost_tracking_requested: bool,
 ) -> int:
     target = (manual_plan.primary_target if manual_plan else "") or input_text[:120]
     if not target.strip():
@@ -894,6 +1105,7 @@ def _run_ask_company_research_live(
             "Business Research Analyst needs a company, person, institute, URL, or topic target.",
             json_output=json_output,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
         )
     company_url = _manual_plan_url_target(manual_plan)
     company_name = _company_name_for_url_target(target.strip()) if company_url else target.strip()
@@ -920,7 +1132,9 @@ def _run_ask_company_research_live(
         command,
         json_output=json_output,
         manual_plan=manual_plan,
+        orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
+        cost_tracking_requested=cost_tracking_requested,
     )
 
 
@@ -942,7 +1156,9 @@ def _run_ask_chief_of_staff_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
+    cost_tracking_requested: bool,
 ) -> int:
     command = [
         sys.executable,
@@ -958,7 +1174,9 @@ def _run_ask_chief_of_staff_live(
         command,
         json_output=json_output,
         manual_plan=manual_plan,
+        orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
+        cost_tracking_requested=cost_tracking_requested,
     )
 
 
@@ -967,7 +1185,9 @@ def _run_ask_opportunity_scout_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
+    cost_tracking_requested: bool,
 ) -> int:
     max_results = manual_plan.desired_count if manual_plan else 3
     target = (manual_plan.primary_target if manual_plan else "") or input_text
@@ -990,7 +1210,9 @@ def _run_ask_opportunity_scout_live(
         command,
         json_output=json_output,
         manual_plan=manual_plan,
+        orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
+        cost_tracking_requested=cost_tracking_requested,
     )
 
 
@@ -999,9 +1221,12 @@ def _run_ask_gmail_triage_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
+    cost_tracking_requested: bool,
 ) -> int:
     gmail_plan = infer_gmail_execution_plan(input_text)
+    explicit_fixture_path = _gmail_direct_fixture_path(input_text)
     if gmail_plan.operation == "priority_grouping" and gmail_plan.live_read_required:
         command = [
             sys.executable,
@@ -1026,14 +1251,38 @@ def _run_ask_gmail_triage_live(
             command,
             json_output=json_output,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
             agent_execution_plan=gmail_plan.model_dump(mode="json"),
+            cost_tracking_requested=cost_tracking_requested,
+        )
+    if gmail_plan.operation == "draft_reply" and explicit_fixture_path is None:
+        return _print_ask_clarification(
+            "gmail_triage",
+            input_text,
+            (
+                "Gmail Triage needs a selected Gmail thread, message, or explicit email "
+                "fixture before drafting a reply. No synthetic email was created from the "
+                "operator request."
+            ),
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            extra={
+                "status": "blocked",
+                "block_kind": "missing_gmail_context",
+                "requires_gmail_context": True,
+                "recommended_next_action": (
+                    "Select the Gmail thread/message or provide an explicit fixture path, "
+                    "then rerun Gmail Triage."
+                ),
+                "agent_execution_plan": gmail_plan.model_dump(mode="json"),
+            },
         )
 
     temp_path: Path | None = None
-    fixture_path = Path(input_text).expanduser() if input_text and "\n" not in input_text else None
-    if fixture_path is not None and fixture_path.is_file():
-        selected_fixture = str(fixture_path)
+    if explicit_fixture_path is not None:
+        selected_fixture = str(explicit_fixture_path)
     else:
         with tempfile.NamedTemporaryFile(
             "w",
@@ -1065,8 +1314,10 @@ def _run_ask_gmail_triage_live(
             command,
             json_output=json_output,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
             agent_execution_plan=gmail_plan.model_dump(mode="json"),
+            cost_tracking_requested=cost_tracking_requested,
         )
     finally:
         if temp_path is not None:
@@ -1076,12 +1327,24 @@ def _run_ask_gmail_triage_live(
                 pass
 
 
+def _gmail_direct_fixture_path(input_text: str) -> Path | None:
+    if not input_text or "\n" in input_text:
+        return None
+    try:
+        path = Path(input_text).expanduser()
+    except (OSError, RuntimeError):
+        return None
+    return path if path.is_file() else None
+
+
 def _run_ask_outreach_composer_live(
     input_text: str,
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
+    cost_tracking_requested: bool,
 ) -> int:
     outreach_plan = infer_outreach_execution_plan(input_text)
     if not outreach_plan.use_default_approved_fixture_for_backend_test:
@@ -1089,6 +1352,7 @@ def _run_ask_outreach_composer_live(
             input_text,
             json_output=json_output,
             manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
             extra={
                 "agent_execution_plan": outreach_plan.model_dump(mode="json"),
             },
@@ -1113,8 +1377,10 @@ def _run_ask_outreach_composer_live(
         command,
         json_output=json_output,
         manual_plan=manual_plan,
+        orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
         agent_execution_plan=outreach_plan.model_dump(mode="json"),
+        cost_tracking_requested=cost_tracking_requested,
     )
 
 
@@ -1123,6 +1389,7 @@ def _print_ask_outreach_context_blocked(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None = None,
     extra: dict[str, object] | None = None,
 ) -> int:
     return _print_ask_clarification(
@@ -1134,6 +1401,7 @@ def _print_ask_outreach_context_blocked(
         ),
         json_output=json_output,
         manual_plan=manual_plan,
+        orchestrator_preflight=orchestrator_preflight,
         extra={
             "status": "blocked",
             "requires_approved_context": True,
@@ -1154,29 +1422,109 @@ def _run_ask_script_live(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None = None,
     sdk_session_spec: SDKSessionSpec | None = None,
     agent_execution_plan: dict[str, object] | None = None,
+    cost_tracking_requested: bool = False,
 ) -> int:
     env = None
+    child_env = orchestrator_preflight_env(orchestrator_preflight)
     if sdk_session_spec is not None:
-        env = {**os.environ, **sdk_session_env(sdk_session_spec)}
-    completed = subprocess.run(
-        command,
-        cwd=Path(__file__).resolve().parents[2],
-        text=True,
-        capture_output=True,
-        check=False,
-        env=env,
-    )
+        child_env = {**child_env, **sdk_session_env(sdk_session_spec)}
+    if child_env:
+        env = {**os.environ, **child_env}
+    timeout_seconds = _child_agent_timeout_seconds()
+    try:
+        completed = run_isolated_child_process(
+            command,
+            cwd=Path(__file__).resolve().parents[2],
+            env=env,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        payload = {
+            "mode": "live_sdk",
+            "selected_agent": route,
+            "agent_name": _agent_display_name(route),
+            "input": input_text,
+            "status": "timeout",
+            "timeout_seconds": timeout_seconds,
+            "send_enabled": False,
+            "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+            "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+            "agent_execution_plan": agent_execution_plan,
+            "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
+            "cost_tracking_requested": cost_tracking_requested,
+            "output": {
+                "summary": (
+                    f"{_agent_display_name(route)} timed out after "
+                    f"{timeout_seconds:.0f} seconds."
+                ),
+                "send_enabled": False,
+                "error_type": "timeout",
+            },
+        }
+        _print_ask_live_payload(payload, json_output=json_output)
+        return 1
     if completed.returncode != 0:
-        raise SystemExit((completed.stderr or completed.stdout or "Agent script failed.").strip())
+        payload = {
+            "mode": "live_sdk",
+            "selected_agent": route,
+            "agent_name": _agent_display_name(route),
+            "input": input_text,
+            "status": "failed",
+            "child_returncode": int(completed.returncode),
+            "send_enabled": False,
+            "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+            "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+            "agent_execution_plan": agent_execution_plan,
+            "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
+            "cost_tracking_requested": cost_tracking_requested,
+            "output": {
+                "summary": f"{_agent_display_name(route)} child process failed.",
+                "send_enabled": False,
+                "error_type": "child_process_failed",
+                "returncode": int(completed.returncode),
+                "stderr_excerpt": _redacted_child_output(completed.stderr),
+                "stdout_excerpt": _redacted_child_output(completed.stdout),
+            },
+        }
+        _print_ask_live_payload(payload, json_output=json_output)
+        return int(completed.returncode) or 1
     try:
         script_payload = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError as exc:
-        raise SystemExit(
-            f"Agent script returned non-JSON output: {completed.stdout[:500]}"
-        ) from exc
+        payload = {
+            "mode": "live_sdk",
+            "selected_agent": route,
+            "agent_name": _agent_display_name(route),
+            "input": input_text,
+            "status": "failed",
+            "child_returncode": int(completed.returncode),
+            "send_enabled": False,
+            "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+            "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+            "agent_execution_plan": agent_execution_plan,
+            "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
+            "cost_tracking_requested": cost_tracking_requested,
+            "output": {
+                "summary": f"{_agent_display_name(route)} returned malformed JSON.",
+                "send_enabled": False,
+                "error_type": "child_process_malformed_json",
+                "parse_error": str(exc),
+                "stderr_excerpt": _redacted_child_output(completed.stderr),
+                "stdout_excerpt": _redacted_child_output(completed.stdout),
+            },
+        }
+        _print_ask_live_payload(payload, json_output=json_output)
+        return 1
     output = script_payload.get("output") if isinstance(script_payload, dict) else None
+    review = review_specialist_output(
+        agent_name=route,
+        output=output if output is not None else script_payload,
+        request_summary=input_text,
+        run_type="live_sdk" if isinstance(script_payload, dict) else "live_sdk_unknown",
+    )
     payload = {
         "mode": "live_sdk",
         "selected_agent": route,
@@ -1184,14 +1532,17 @@ def _run_ask_script_live(
         "input": input_text,
         "send_enabled": _payload_send_enabled(script_payload),
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
         "agent_execution_plan": agent_execution_plan,
         "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
+        "cost_tracking_requested": cost_tracking_requested,
         "output_type": (
             str(script_payload.get("output_type") or type(output).__name__)
             if isinstance(script_payload, dict)
             else type(script_payload).__name__
         ),
         "missing_information": _payload_missing_information(script_payload),
+        "orchestrator_review": review.model_dump(mode="json"),
         "output": output if output is not None else script_payload,
         "script_payload": script_payload,
     }
@@ -1199,6 +1550,19 @@ def _run_ask_script_live(
     if retrieval_diagnostics:
         payload["retrieval_diagnostics"] = retrieval_diagnostics
     return _print_ask_live_payload(payload, json_output=json_output)
+
+
+def _child_agent_timeout_seconds() -> float:
+    raw = os.getenv("KEYSTONE_CHILD_AGENT_TIMEOUT_SECONDS") or os.getenv(
+        "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS"
+    )
+    if not raw:
+        return 180.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 180.0
+    return min(max(value, 1.0), 1800.0)
 
 
 def _payload_send_enabled(payload: object) -> bool:
@@ -1249,6 +1613,15 @@ def _payload_retrieval_diagnostics(payload: object) -> dict[str, object]:
     return {}
 
 
+def _redacted_child_output(value: str | None, *, max_chars: int = 1200) -> str:
+    redacted = redact_secrets(str(value or ""))
+    text = str(redacted if redacted is not None else "")
+    text = " ".join(text.replace("\x00", "").split())
+    if len(text) > max_chars:
+        return text[: max_chars - 1].rstrip() + "..."
+    return text
+
+
 def _print_ask_clarification(
     route: str,
     input_text: str,
@@ -1256,6 +1629,7 @@ def _print_ask_clarification(
     *,
     json_output: bool,
     manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None = None,
     extra: dict[str, object] | None = None,
 ) -> int:
     payload = {
@@ -1265,6 +1639,7 @@ def _print_ask_clarification(
         "input": input_text,
         "send_enabled": False,
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
         "message": message,
     }
     if extra:
@@ -1284,6 +1659,15 @@ def _print_ask_live_payload(payload: dict[str, object], *, json_output: bool) ->
             print(payload["message"])
         else:
             print(json.dumps(payload.get("output"), ensure_ascii=True, indent=2, sort_keys=True))
+        review = payload.get("orchestrator_review")
+        if isinstance(review, dict):
+            print(
+                "Orchestrator review: "
+                f"{review.get('status')} ({review.get('overall_score')}/100)"
+            )
+            next_step = str(review.get("recommended_next_step") or "").strip()
+            if next_step:
+                print(f"Orchestrator feedback: {next_step}")
         missing = payload.get("missing_information")
         if isinstance(missing, list) and missing:
             print("Missing information: " + "; ".join(str(item) for item in missing[:8]))
@@ -1571,6 +1955,25 @@ def _run_work_items_advance(args: argparse.Namespace) -> int:
         explicit_work_item_id=args.work_item_id,
         json_output=args.json,
     )
+    existing_work_item = store.get_work_item(work_item_id) if work_item_id else None
+    preflight_requested_agent = _work_item_preflight_requested_agent(existing_work_item)
+    substantive_request = str(input_text or "").strip().lower() not in {"", "continue", "resume"}
+    orchestrator_preflight = None
+    manual_plan = None
+    if substantive_request:
+        orchestrator_preflight = run_orchestrator_preflight(
+            input_text,
+            requested_agent=preflight_requested_agent,
+            live_manual_plan=bool(args.live_sdk),
+            database_url=args.database_url,
+        )
+        manual_plan = orchestrator_preflight.manual_request_plan
+        if _preflight_blocks_execution(orchestrator_preflight):
+            return _print_ask_preflight_blocked(
+                input_text,
+                json_output=args.json,
+                orchestrator_preflight=orchestrator_preflight,
+            )
     request = WorkflowRunRequest(
         request_text=input_text,
         work_item_id=work_item_id,
@@ -1580,9 +1983,16 @@ def _run_work_items_advance(args: argparse.Namespace) -> int:
         live_sdk=args.live_sdk,
         max_results=args.max_results,
         context_file_path=args.context_file,
+        manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
+        orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
         sdk_session_enabled=args.sdk_session,
         sdk_session_id=args.sdk_session_id,
         sdk_session_db_path=args.sdk_session_db,
+        **_workflow_cost_options_for_request_context(
+            request_text=input_text,
+            context_file_path=args.context_file,
+            work_item=existing_work_item,
+        ),
     )
     graph_metadata = None
     if args.langgraph:
@@ -1597,8 +2007,21 @@ def _run_work_items_advance(args: argparse.Namespace) -> int:
             result = outcome.result
             graph_metadata = _work_item_langgraph_metadata(outcome)
         else:
-            result = advance_work_item(request)
+            result = advance_work_item_manager_loop(
+                request,
+                max_steps=args.max_manager_steps,
+                feedback_callback=None if args.json else _print_manager_loop_feedback,
+            )
     return _print_work_item_result(result, json_output=args.json, graph_metadata=graph_metadata)
+
+
+def _work_item_preflight_requested_agent(work_item: WorkItem | None) -> str | None:
+    if work_item is None:
+        return None
+    route = work_item.current_route
+    if route in {WorkItemRoute.ORCHESTRATOR, WorkItemRoute.CLARIFICATION}:
+        return None
+    return route.value
 
 
 def _run_work_item_langgraph_for_request(request: WorkflowRunRequest):

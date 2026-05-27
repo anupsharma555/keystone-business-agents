@@ -33,6 +33,11 @@ from keystone_agents.config import (
     require_cli_live_confirmation,
     with_cli_environment,
 )
+from keystone_agents.orchestrator.preflight_context import (
+    apply_orchestrator_preflight_to_args,
+    attach_orchestrator_preflight_payload,
+    orchestrator_preflight_context_text,
+)
 from keystone_agents.founder_profile import (
     founder_profile_audit_payload,
     founder_search_context,
@@ -260,6 +265,7 @@ def _search_plan_for_run(args: argparse.Namespace) -> Any:
         args.topic,
         desired_count=args.max_results,
         live=bool(getattr(args, "live_search_plan", False)),
+        planner_context=orchestrator_preflight_context_text(args),
     )
 
 
@@ -308,6 +314,29 @@ def _scout_request_text(args: argparse.Namespace, *, os1_case: bool = False) -> 
         f"Find high-fit live opportunities for Keystone. Topic: {topic}. "
         "Prioritize current, well-sourced results and avoid padding weak matches."
     )
+
+
+def _orchestrator_review_request_summary(
+    args: argparse.Namespace,
+    *,
+    fallback: str,
+) -> str:
+    preflight = getattr(args, "orchestrator_preflight", None)
+    if isinstance(preflight, dict):
+        request_text = str(preflight.get("request_text") or "").strip()
+        if request_text:
+            return request_text
+        memo = preflight.get("preflight_memo")
+        if isinstance(memo, dict):
+            raw_request = str(memo.get("raw_request") or "").strip()
+            if raw_request:
+                return raw_request
+    plan = getattr(args, "manual_request_plan", None)
+    if isinstance(plan, dict):
+        objective = str(plan.get("objective") or "").strip()
+        if objective:
+            return objective
+    return fallback
 
 
 def _explicit_retrieval_hint(args: argparse.Namespace) -> RetrievalHint | None:
@@ -471,6 +500,7 @@ def _retrieve_os1_role_context(args: argparse.Namespace) -> dict[str, Any]:
     search_metadata: dict[str, Any] = {}
     founder_profile = load_founder_fit_profile(args.founder_fit_profile)
     founder_context = founder_search_context(founder_profile) if founder_profile else ""
+    preflight_context = orchestrator_preflight_context_text(args)
     if not role_sources and args.live_search:
         role_sources, search_metadata = _search_role_sources_live(args)
         retrieval_mode = "live_search"
@@ -507,6 +537,7 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     retrieval_metadata: dict[str, Any] = {}
     founder_profile = load_founder_fit_profile(args.founder_fit_profile)
     founder_context = founder_search_context(founder_profile) if founder_profile else ""
+    preflight_context = orchestrator_preflight_context_text(args)
 
     def retrieve() -> Any:
         if args.improvement_case == OS1_IMPROVEMENT_CASE_ID:
@@ -555,7 +586,7 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             return OpportunityScoutSDKInput(
                 topic=OS1_IMPROVEMENT_PROMPT,
                 max_results=5,
-                context=context,
+                context="\n\n".join(item for item in (context, preflight_context) if item),
                 retrieval_hint=_explicit_retrieval_hint(args),
             )
         live_retrieval_context = ""
@@ -619,7 +650,12 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             max_results=args.max_results,
             context="\n\n".join(
                 item
-                for item in (_opportunity_context(result), live_retrieval_context, founder_context)
+                for item in (
+                    _opportunity_context(result),
+                    live_retrieval_context,
+                    founder_context,
+                    preflight_context,
+                )
                 if item
             ),
             retrieval_hint=_explicit_retrieval_hint(args),
@@ -670,13 +706,17 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             "retrieval_diagnostics",
             retrieval_diagnostics_from_metadata(retrieval_metadata),
         )
+    attach_orchestrator_preflight_payload(payload, args)
     if args.orchestrator_review:
         payload["orchestrator_review"] = build_cli_orchestrator_review(
             args,
             run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
             agent_name="opportunity_scout",
             output=outcome.final_output,
-            request_summary=args.topic or OS1_IMPROVEMENT_PROMPT,
+            request_summary=_orchestrator_review_request_summary(
+                args,
+                fallback=args.topic or OS1_IMPROVEMENT_PROMPT,
+            ),
             run_type="live SDK" if live else "local SDK",
         )
     return payload
@@ -684,7 +724,9 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
 
 @with_cli_environment()
 def main() -> int:
-    args = _apply_live_test_defaults(build_parser().parse_args())
+    args = apply_orchestrator_preflight_to_args(
+        _apply_live_test_defaults(build_parser().parse_args())
+    )
 
     if args.improvement_case and not sdk_execution_requested(args):
         raise SystemExit("--improvement-case requires --run-sdk or --live-sdk.")
@@ -785,6 +827,7 @@ def main() -> int:
             "retrieval_diagnostics",
             retrieval_diagnostics_from_metadata(retrieval_metadata),
         )
+    attach_orchestrator_preflight_payload(payload, args)
     if agent_descriptor is not None:
         payload["agent"] = agent_descriptor
     if args.orchestrator_review:
@@ -793,7 +836,10 @@ def main() -> int:
             run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
             agent_name="opportunity_scout",
             output=result,
-            request_summary=args.topic or "opportunity scout fixture run",
+            request_summary=_orchestrator_review_request_summary(
+                args,
+                fallback=args.topic or "opportunity scout fixture run",
+            ),
             run_type="live search" if args.live_search else "deterministic fixture",
         )
     if args.save:

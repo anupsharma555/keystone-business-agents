@@ -98,6 +98,96 @@ def test_company_live_retrieval_defaults_to_searxng_with_hosted_parallel_lane(
     assert diagnostics["search_quality_summary"]["official_source_present"] is True
 
 
+def test_retrieval_diagnostics_keeps_partial_provider_errors_backend_only() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    diagnostics = live_retrieval.retrieval_diagnostics_from_metadata(
+        {
+            "mode": "live_search",
+            "live_search": True,
+            "search_providers_attempted": ["searxng", "agents-web-search"],
+            "search_providers_used": ["searxng"],
+            "raw_search_result_count": 2,
+            "provider_usage": {
+                "searxng": {"requests_attempted": 1, "requests_succeeded": 1},
+                "agents-web-search": {"requests_attempted": 1, "requests_succeeded": 0},
+            },
+            "search_provider_errors": [
+                {
+                    "provider": "agents-web-search",
+                    "error_type": "SearchProviderError",
+                    "message": "hosted web search timed out",
+                }
+            ],
+        }
+    )
+
+    assert diagnostics["errors"] == []
+
+
+def test_retrieval_diagnostics_compacts_source_coverage_assessment_shape() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    diagnostics = live_retrieval.retrieval_diagnostics_from_metadata(
+        {
+            "mode": "live_search",
+            "live_search": True,
+            "search_provider": "searxng",
+            "source_coverage": {
+                "observed_lanes": ("company_site", "press_news"),
+                "missing_lanes": ("careers_jobs",),
+                "lane_counts": {"company_site": 2, "press_news": 1},
+                "observed_domains": ("openevidence.com", "techcrunch.com"),
+                "primary_source_count": 2,
+                "useful_unique_domain_count": 2,
+            },
+        }
+    )
+
+    coverage = diagnostics["source_coverage_summary"]
+    assert coverage["selected_source_count"] == 2
+    assert coverage["credible_source_count"] == 2
+    assert coverage["official_source_count"] == 2
+    assert coverage["observed_lane_count"] == 2
+    assert coverage["observed_lanes"] == ["company_site", "press_news"]
+    assert coverage["missing_lanes"] == ["careers_jobs"]
+    assert coverage["observed_domain_count"] == 2
+
+
+def test_retrieval_diagnostics_surfaces_only_universal_search_failure() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    diagnostics = live_retrieval.retrieval_diagnostics_from_metadata(
+        {
+            "mode": "live_search",
+            "live_search": True,
+            "search_providers_attempted": ["searxng", "agents-web-search"],
+            "search_providers_used": [],
+            "raw_search_result_count": 0,
+            "provider_usage": {
+                "searxng": {"requests_attempted": 1, "requests_succeeded": 0},
+                "agents-web-search": {"requests_attempted": 1, "requests_succeeded": 0},
+            },
+            "search_provider_errors": [
+                {
+                    "provider": "searxng",
+                    "error_type": "TimeoutError",
+                    "message": "timed out",
+                },
+                {
+                    "provider": "agents-web-search",
+                    "error_type": "SearchProviderError",
+                    "message": "timed out",
+                },
+            ],
+        }
+    )
+
+    assert diagnostics["errors"] == [
+        "Live search failed across all attempted providers; backend retrieval telemetry has provider details."
+    ]
+
+
 def test_company_live_retrieval_can_enrich_official_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -317,6 +407,64 @@ def test_company_live_retrieval_can_fallback_to_firecrawl(
 
     assert metadata["website_extraction"]["page_count"] == 1
     assert profile.description == "firecrawl"
+
+
+def test_company_live_retrieval_skips_failed_website_extraction_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+    from keystone_agents.tools.website_extraction_tool import WebsiteExtractionError
+
+    class FakeProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="OpenEvidence profile",
+                    link="https://sacra.com/c/openevidence/",
+                    snippet="Profile page temporarily unavailable.",
+                    source="searxng",
+                )
+            ]
+
+    def fake_extract(url, *, provider, **_kwargs):
+        if provider == "trafilatura":
+            raise WebsiteExtractionError("Website extraction failed with HTTP 503.")
+        raise RuntimeError("fallback provider unavailable")
+
+    monkeypatch.setenv("KEYSTONE_ENABLE_WEBSITE_EXTRACTION", "true")
+    monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", "firecrawl")
+    monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES", "1")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng", website_extractor="trafilatura"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_company_research_queries",
+        lambda *_args: ["OpenEvidence company profile"],
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: FakeProvider(),
+    )
+    monkeypatch.setattr(live_retrieval, "extract_website_content", fake_extract)
+
+    profile, metadata = live_retrieval.retrieve_company_profile_live(
+        company="OpenEvidence",
+        max_results=1,
+        profile_builder=lambda **kwargs: CompanyProfile(
+            name="OpenEvidence",
+            description=f"website_inputs={len(kwargs['website_inputs'])}",
+        ),
+    )
+
+    assert profile.description == "website_inputs=0"
+    assert metadata["website_extraction"]["page_count"] == 0
+    assert "fallback firecrawl: fallback provider unavailable" in metadata[
+        "website_extraction"
+    ]["errors"][0]
 
 
 def test_opportunity_live_retrieval_fans_out_provider_ladder_for_multi_lane_results(

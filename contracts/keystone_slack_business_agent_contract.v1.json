@@ -22,6 +22,12 @@
     "run_agent_message": "keystone_run_agent_message",
     "run_agent_view": "keystone_run_agent_submit"
   },
+  "capabilities": [
+    "feedback_jsonl",
+    "selected_context_prior_agent_runs",
+    "selected_context_embedded_fallback",
+    "write_gate_no_send"
+  ],
   "input_action_ids": {
     "revision_feedback": "kba_revision_feedback",
     "run_agent_task": "keystone_agent_task",
@@ -55,6 +61,30 @@
     "The contract is side-effect free and does not authorize Slack, Gmail, calendar, CRM, or external writes."
   ],
   "payload_json_schemas": {
+    "agent_feedback_event": {
+      "description": "JSONL-safe progress event emitted while a Slack agent run executes.",
+      "properties": {
+        "event_type": {
+          "title": "Event Type",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "schema": {
+          "default": "keystone.slack.agent_feedback_event.v1",
+          "title": "Schema",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_type"
+      ],
+      "title": "SlackAgentFeedbackEvent",
+      "type": "object"
+    },
     "business_agent_action": {
       "description": "JSON value carried by first-class business-agent Slack buttons.",
       "properties": {
@@ -176,6 +206,14 @@
           "title": "Permalink",
           "type": "string"
         },
+        "prior_agent_runs": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Prior Agent Runs",
+          "type": "array"
+        },
         "schema": {
           "const": "keystone.slack.selected_message_context.v1",
           "default": "keystone.slack.selected_message_context.v1",
@@ -290,6 +328,7 @@
   },
   "schema": "keystone.business_agent_slack_contract.v1",
   "schemas": {
+    "agent_feedback_event": "keystone.slack.agent_feedback_event.v1",
     "business_agent_action": "keystone.business_agent_action.v1",
     "selected_message_context": "keystone.slack.selected_message_context.v1",
     "write_gate": "keystone.business_agent_write_request.v1"

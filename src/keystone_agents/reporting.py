@@ -566,6 +566,14 @@ def render_local_operator_dashboard(
         "",
         render_markdown_table(["Area", "Rows"], _dashboard_summary_rows(store)),
         "",
+        "## SDK Cost Summary",
+        "",
+        render_markdown_table(["Metric", "Value"], _sdk_cost_summary_rows(store, limit)),
+        "",
+        "## SDK Cost By Agent",
+        "",
+        render_markdown_table(*_sdk_cost_by_agent_rows(store, limit)),
+        "",
     ]
     sections = (
         ("Approval Queue", _approval_queue_rows(store, limit)),
@@ -3660,8 +3668,11 @@ def render_test_pack_case2_slack_text(
 def _usage_cost_lines(payload: dict[str, Any]) -> list[str]:
     usage = _as_report_dict(payload.get("usage"))
     cost = _as_report_dict(payload.get("cost"))
+    request_cache = _as_report_dict(payload.get("request_cache")) or _as_report_dict(
+        payload.get("_sdk_request_cache")
+    )
     gemini = _as_report_dict(payload.get("gemini_free_tier_usage"))
-    if not usage and not cost and not gemini:
+    if not usage and not cost and not request_cache and not gemini:
         return ["- Usage: not available", "- Cost: not available"]
 
     lines = [
@@ -3670,6 +3681,7 @@ def _usage_cost_lines(payload: dict[str, Any]) -> list[str]:
             f"requests={_clean(usage.get('requests')) or 'n/a'}, "
             f"input={_clean(usage.get('input_tokens')) or 'n/a'}, "
             f"cached_input={_clean(usage.get('cached_input_tokens')) or 'n/a'}, "
+            f"cache_hit_rate={_clean(usage.get('cache_hit_rate')) or 'n/a'}, "
             f"output={_clean(usage.get('output_tokens')) or 'n/a'}, "
             f"reasoning_output={_clean(usage.get('reasoning_output_tokens')) or 'n/a'}, "
             f"total={_clean(usage.get('total_tokens')) or 'n/a'}"
@@ -3684,6 +3696,18 @@ def _usage_cost_lines(payload: dict[str, Any]) -> list[str]:
             f"${_clean(amount)} "
             f"({_clean(cost.get('source')) or 'source unavailable'})"
         )
+    component_line = _cost_component_line(cost)
+    if component_line:
+        lines.append(component_line)
+    comparison_line = _cost_comparison_line(cost)
+    if comparison_line:
+        lines.append(comparison_line)
+    cache_note = _cache_note_line(payload, usage)
+    if cache_note:
+        lines.append(cache_note)
+    request_cache_line = _request_cache_line(request_cache)
+    if request_cache_line:
+        lines.append(request_cache_line)
     if gemini.get("available"):
         lines.append(
             "- Gemini free-tier request context: "
@@ -3699,6 +3723,91 @@ def _usage_cost_lines(payload: dict[str, Any]) -> list[str]:
             f"{_yes_no(bool(gemini.get('used_to_improve_products')))}"
         )
     return lines
+
+
+def _request_cache_line(request_cache: dict[str, Any]) -> str:
+    if not request_cache:
+        return ""
+    return (
+        "- Request cache diagnostics: "
+        f"layout={_clean(request_cache.get('request_layout')) or 'unknown'}, "
+        f"static_prefix={_clean(request_cache.get('static_prefix_sha256'))[:12] or 'n/a'}, "
+        f"dynamic_prompt={_clean(request_cache.get('dynamic_prompt_sha256'))[:12] or 'n/a'}, "
+        f"dynamic_chars={_clean(request_cache.get('dynamic_prompt_chars')) or 'n/a'}, "
+        f"tools={_clean(request_cache.get('tool_count')) or '0'}, "
+        f"session_attached={_yes_no(bool(request_cache.get('session_attached')))}"
+    )
+
+
+def _cost_component_line(cost: dict[str, Any]) -> str:
+    components = _as_report_dict(cost.get("components_usd"))
+    tokens = _as_report_dict(cost.get("billable_tokens"))
+    if not components and not tokens:
+        return ""
+    component_parts = []
+    for key in ("input", "cached_input", "output"):
+        value = components.get(key)
+        if value is not None and value != "":
+            component_parts.append(f"{key}=${_clean(value)}")
+    token_parts = []
+    for key in ("input_tokens", "cached_input_tokens", "output_tokens"):
+        value = tokens.get(key)
+        if value is not None and value != "":
+            token_parts.append(f"{key}={_clean(value)}")
+    if component_parts and token_parts:
+        return "- Cost components: " + ", ".join(component_parts) + "; " + ", ".join(token_parts)
+    if component_parts:
+        return "- Cost components: " + ", ".join(component_parts)
+    return "- Billable tokens: " + ", ".join(token_parts)
+
+
+def _cost_comparison_line(cost: dict[str, Any]) -> str:
+    comparison = _as_report_dict(cost.get("estimate_vs_actual"))
+    if not comparison.get("available"):
+        return ""
+    delta = comparison.get("delta_usd")
+    percent = comparison.get("delta_percent_of_actual")
+    percent_text = f", {percent}% of actual" if percent is not None else ""
+    return (
+        "- OpenAI Platform comparison: "
+        f"actual=${_clean(comparison.get('actual_usd'))}, "
+        f"estimated=${_clean(comparison.get('estimated_usd'))}, "
+        f"delta=${_clean(delta)}{percent_text}"
+    )
+
+
+def _cache_note_line(payload: dict[str, Any], usage: dict[str, Any]) -> str:
+    cache_expected = bool(
+        payload.get("cache_expected")
+        or payload.get("slack_thread_follow_up")
+        or usage.get("cache_expected")
+        or usage.get("slack_thread_follow_up")
+    )
+    if not cache_expected:
+        return ""
+    hit_rate = _float_or_none(usage.get("cache_hit_rate"))
+    input_tokens = _int_or_zero(usage.get("input_tokens"))
+    if hit_rate is None or input_tokens < 1024 or hit_rate >= 0.10:
+        return ""
+    return (
+        "- Cache note: cached input is unexpectedly low for a repeated thread run; "
+        "check for volatile metadata, regenerated schemas, or retrieved context before "
+        "the stable prompt prefix."
+    )
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def render_company_profile_report(profile: CompanyProfile | dict[str, Any]) -> str:
@@ -4549,6 +4658,90 @@ def _dashboard_summary_rows(store: SQLiteStore) -> list[list[Any]]:
     ]
 
 
+def _sdk_cost_summary_rows(store: SQLiteStore, limit: int) -> list[list[Any]]:
+    rows = _latest(store.fetch_all("agent_runs"), limit)
+    sdk_rows = [_agent_run_sdk_metrics(row) for row in rows]
+    sdk_rows = [row for row in sdk_rows if row["usage_available"] or row["cost_available"]]
+    input_tokens = sum(row["input_tokens"] for row in sdk_rows)
+    cached_input_tokens = sum(row["cached_input_tokens"] for row in sdk_rows)
+    output_tokens = sum(row["output_tokens"] for row in sdk_rows)
+    reasoning_output_tokens = sum(row["reasoning_output_tokens"] for row in sdk_rows)
+    estimated_total = sum(row["estimated_usd"] for row in sdk_rows)
+    cache_hit_rate = cached_input_tokens / input_tokens if input_tokens else None
+    session_count = sum(1 for row in sdk_rows if row["session_attached"])
+    return [
+        ["Runs with SDK usage/cost", len(sdk_rows)],
+        ["Estimated cost total", _format_money(estimated_total) if sdk_rows else "n/a"],
+        ["Aggregate cache hit rate", _format_percent(cache_hit_rate)],
+        ["Input tokens", input_tokens],
+        ["Cached input tokens", cached_input_tokens],
+        ["Output tokens", output_tokens],
+        ["Reasoning output tokens", reasoning_output_tokens],
+        ["Runs with SDK session", session_count],
+    ]
+
+
+def _sdk_cost_by_agent_rows(store: SQLiteStore, limit: int) -> tuple[list[str], list[list[Any]]]:
+    agent_totals: dict[str, dict[str, Any]] = {}
+    for row in _latest(store.fetch_all("agent_runs"), limit):
+        metrics = _agent_run_sdk_metrics(row)
+        if not metrics["usage_available"] and not metrics["cost_available"]:
+            continue
+        agent_name = _clean(row.get("agent_name")) or "unknown"
+        totals = agent_totals.setdefault(
+            agent_name,
+            {
+                "runs": 0,
+                "estimated_usd": 0.0,
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "sessions": 0,
+            },
+        )
+        totals["runs"] += 1
+        totals["estimated_usd"] += metrics["estimated_usd"]
+        totals["input_tokens"] += metrics["input_tokens"]
+        totals["cached_input_tokens"] += metrics["cached_input_tokens"]
+        totals["output_tokens"] += metrics["output_tokens"]
+        totals["reasoning_output_tokens"] += metrics["reasoning_output_tokens"]
+        if metrics["session_attached"]:
+            totals["sessions"] += 1
+
+    rows = []
+    for agent_name, totals in sorted(
+        agent_totals.items(),
+        key=lambda item: (-item[1]["estimated_usd"], item[0]),
+    ):
+        input_tokens = totals["input_tokens"]
+        cache_hit_rate = totals["cached_input_tokens"] / input_tokens if input_tokens else None
+        rows.append(
+            [
+                agent_name,
+                totals["runs"],
+                _format_money(totals["estimated_usd"]),
+                _format_percent(cache_hit_rate),
+                input_tokens,
+                totals["cached_input_tokens"],
+                totals["output_tokens"],
+                totals["reasoning_output_tokens"],
+                totals["sessions"],
+            ]
+        )
+    return [
+        "Agent",
+        "Runs",
+        "Est. Cost",
+        "Cache Hit",
+        "Input",
+        "Cached Input",
+        "Output",
+        "Reasoning",
+        "Sessions",
+    ], rows
+
+
 def _opportunity_rows(store: SQLiteStore, limit: int) -> tuple[list[str], list[list[Any]]]:
     rows = [
         [
@@ -4698,12 +4891,26 @@ def _audit_rows(store: SQLiteStore, limit: int) -> tuple[list[str], list[list[An
             row.get("status"),
             "yes" if row.get("dry_run") else "no",
             _agent_run_review_label(row),
+            _agent_run_cache_hit_rate(row),
+            _agent_run_estimated_cost(row),
+            _agent_run_request_cache_label(row),
             row.get("input_summary"),
             row.get("created_at_et") or row.get("created_at"),
         ]
         for row in _latest(store.fetch_all("agent_runs"), limit)
     ]
-    return ["ID", "Agent", "Status", "Dry Run", "Review", "Input Summary", "Created ET"], rows
+    return [
+        "ID",
+        "Agent",
+        "Status",
+        "Dry Run",
+        "Review",
+        "Cache Hit",
+        "Est. Cost",
+        "Request Cache",
+        "Input Summary",
+        "Created ET",
+    ], rows
 
 
 def _agent_run_review_label(row: dict[str, Any]) -> str:
@@ -4714,6 +4921,67 @@ def _agent_run_review_label(row: dict[str, Any]) -> str:
     status = _clean(review.get("status"))
     score = _clean(review.get("overall_score"))
     return f"{status} {score}/100" if score else status
+
+
+def _agent_run_cache_hit_rate(row: dict[str, Any]) -> str:
+    value = _agent_run_sdk_metrics(row)["cache_hit_rate"]
+    if value in (None, ""):
+        return "n/a"
+    return _format_percent(value)
+
+
+def _agent_run_estimated_cost(row: dict[str, Any]) -> str:
+    metrics = _agent_run_sdk_metrics(row)
+    if not metrics["cost_available"]:
+        return "n/a"
+    return _format_money(metrics["estimated_usd"])
+
+
+def _agent_run_request_cache_label(row: dict[str, Any]) -> str:
+    output = _safe_json_load(row.get("output_json"))
+    request_cache = _as_report_dict(output.get("_sdk_request_cache")) or _as_report_dict(
+        output.get("request_cache")
+    )
+    if not request_cache:
+        return "n/a"
+    static_prefix = _clean(request_cache.get("static_prefix_sha256"))[:12] or "no-prefix"
+    session = "session" if request_cache.get("session_attached") else "no-session"
+    dynamic_chars = _clean(request_cache.get("dynamic_prompt_chars")) or "0"
+    return f"{static_prefix}; {session}; chars={dynamic_chars}"
+
+
+def _agent_run_sdk_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    output = _safe_json_load(row.get("output_json"))
+    usage = _as_report_dict(output.get("_sdk_usage")) or _as_report_dict(output.get("usage"))
+    cost = _as_report_dict(output.get("_sdk_cost")) or _as_report_dict(output.get("cost"))
+    request_cache = _as_report_dict(output.get("_sdk_request_cache")) or _as_report_dict(
+        output.get("request_cache")
+    )
+    return {
+        "usage_available": bool(usage),
+        "cost_available": bool(cost.get("estimated_usd", cost.get("amount_usd")) is not None),
+        "input_tokens": _int_or_zero(usage.get("input_tokens")),
+        "cached_input_tokens": _int_or_zero(usage.get("cached_input_tokens")),
+        "output_tokens": _int_or_zero(usage.get("output_tokens")),
+        "reasoning_output_tokens": _int_or_zero(usage.get("reasoning_output_tokens")),
+        "cache_hit_rate": _float_or_none(usage.get("cache_hit_rate")),
+        "estimated_usd": _float_or_none(cost.get("estimated_usd", cost.get("amount_usd"))) or 0.0,
+        "session_attached": bool(request_cache.get("session_attached")),
+    }
+
+
+def _format_percent(value: Any) -> str:
+    numeric = _float_or_none(value)
+    if numeric is None:
+        return "n/a"
+    return f"{numeric:.1%}"
+
+
+def _format_money(value: Any) -> str:
+    numeric = _float_or_none(value)
+    if numeric is None:
+        return "n/a"
+    return f"${numeric:.6f}".rstrip("0").rstrip(".")
 
 
 def _bullet_list(values: list[Any] | tuple[Any, ...] | None) -> str:

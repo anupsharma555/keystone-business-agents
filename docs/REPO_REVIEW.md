@@ -206,9 +206,9 @@ tests:
 
 The repo has two local eval surfaces:
 
-- `scripts/run_evals.py`: static JSON evals in `tests/evals/` for the four business
+- `scripts/run_evals.py`: static JSON evals in `evals/static/` for the four business
   specialist agents.
-- `scripts/run_local_evals.py`: JSONL seed evals in `evals/` with prompt version traceability.
+- `scripts/run_local_evals.py`: JSONL seed evals in `evals/local/` with prompt version traceability.
 
 Both are deterministic and offline. They do not call model APIs, Gmail, Slack,
 SearXNG, hosted web search, Serper, Apify, Browserless, or other live services.

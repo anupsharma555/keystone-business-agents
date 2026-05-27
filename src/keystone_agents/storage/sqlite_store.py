@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel
 
 from keystone_agents.config import default_database_url
+from keystone_agents.costing import compare_estimated_to_actual_cost
 from keystone_agents.schemas.approval import (
     ApprovalDecisionRecord,
     ApprovalQueueItem,
@@ -64,6 +65,20 @@ TOOL_EVENT_SUMMARY_CHARS = 240
 SECRET_KEY_RE = re.compile(
     r"(api[_-]?key|secret|token|password|credential|authorization|auth[_-]?token)", re.I
 )
+NON_SECRET_USAGE_KEYS = {
+    "cache_hit_rate",
+    "cached_input_tokens",
+    "input_cached_tokens",
+    "input_tokens",
+    "output_tokens",
+    "prompt_cache_key_hash",
+    "prompt_cache_key_present",
+    "prompt_token_count",
+    "prompt_tokens",
+    "reasoning_output_tokens",
+    "total_token_count",
+    "total_tokens",
+}
 SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", re.I),
@@ -847,6 +862,12 @@ def redact_secrets(value: Any, *, summarize_email_content: bool = False) -> Any:
         for key, item in value.items():
             key_text = str(key)
             key_lookup = key_text.lower()
+            if key_lookup in NON_SECRET_USAGE_KEYS:
+                result[key_text] = redact_secrets(
+                    item,
+                    summarize_email_content=summarize_email_content,
+                )
+                continue
             if SECRET_KEY_RE.search(key_text):
                 result[key_text] = REDACTION_MARKER
                 continue
@@ -2194,6 +2215,62 @@ class SQLiteStore:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def annotate_agent_run_actual_cost(
+        self,
+        run_id: str | int,
+        *,
+        actual_usd: float | str,
+        source: str = "operator_openai_platform",
+        reference_id: str = "",
+    ) -> dict[str, Any]:
+        """Attach operator-provided actual platform cost to a saved SDK run."""
+
+        row_id = int(run_id)
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT output_json FROM agent_runs WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"agent_run not found: {run_id}")
+            output = _json_dict(row["output_json"])
+            sdk_cost = output.get("_sdk_cost")
+            regular_cost = output.get("cost")
+            cost = (
+                dict(sdk_cost)
+                if isinstance(sdk_cost, Mapping)
+                else _json_dict(sdk_cost)
+            ) or (
+                dict(regular_cost)
+                if isinstance(regular_cost, Mapping)
+                else _json_dict(regular_cost)
+            )
+            if not cost:
+                cost = {"source": "operator_openai_platform_actual"}
+            comparison = compare_estimated_to_actual_cost(
+                cost=cost,
+                actual_usd=actual_usd,
+                source=source,
+                reference_id=reference_id,
+            )
+            cost["actual_usd"] = comparison.get("actual_usd")
+            cost["estimate_vs_actual"] = comparison
+            if "_sdk_cost" in output or "cost" not in output:
+                output["_sdk_cost"] = cost
+            else:
+                output["cost"] = cost
+            connection.execute(
+                "UPDATE agent_runs SET output_json = ? WHERE id = ?",
+                (stable_json(output, summarize_email_content=True), row_id),
+            )
+        return {
+            "status": "updated",
+            "table": "agent_runs",
+            "id": row_id,
+            "actual_usd": comparison.get("actual_usd"),
+            "comparison_available": bool(comparison.get("available")),
+        }
 
     def save_email(self, triage: Any, *, gmail_message_id: str | None = None) -> int:
         payload = _as_dict(triage)

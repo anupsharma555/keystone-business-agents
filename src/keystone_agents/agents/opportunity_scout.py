@@ -588,6 +588,10 @@ class _OpportunityHardFilters:
     exclude_onsite: bool = False
     exclude_unpaid: bool = False
     exclude_practicing_clinician: bool = False
+    require_remote: bool = False
+    require_us: bool = False
+    require_part_time_or_fractional: bool = False
+    required_role_markers: tuple[str, ...] = ()
 
     @property
     def strict_verification(self) -> bool:
@@ -597,6 +601,10 @@ class _OpportunityHardFilters:
                 self.exclude_onsite,
                 self.exclude_unpaid,
                 self.exclude_practicing_clinician,
+                self.require_remote,
+                self.require_us,
+                self.require_part_time_or_fractional,
+                bool(self.required_role_markers),
             ]
         )
 
@@ -3408,6 +3416,7 @@ def _parse_hard_filters(topic: str | None) -> _OpportunityHardFilters:
     if not topic:
         return _OpportunityHardFilters()
     lowered = topic.lower()
+    role_focused = _is_role_search(topic)
     employee_threshold = None
     match = re.search(r"under\s+(\d+)\s+employees", lowered)
     if match is not None:
@@ -3419,7 +3428,29 @@ def _parse_hard_filters(topic: str | None) -> _OpportunityHardFilters:
         exclude_practicing_clinician=(
             "full-time practicing clinician" in lowered or "practicing clinician" in lowered
         ),
+        require_remote=role_focused and bool(re.search(r"\bremote\b", lowered)),
+        require_us=role_focused
+        and bool(re.search(r"\b(?:u\.?s\.?|united states|us-based|u\.s\.-based)\b", lowered)),
+        require_part_time_or_fractional=role_focused
+        and bool(re.search(r"\b(?:part[- ]time|fractional|advisory|advisor|contract)\b", lowered)),
+        required_role_markers=_requested_role_markers(lowered) if role_focused else (),
     )
+
+
+def _requested_role_markers(lowered_topic: str) -> tuple[str, ...]:
+    markers: list[str] = []
+    if "chief medical officer" in lowered_topic or re.search(r"\bcmo\b", lowered_topic):
+        markers.extend(["chief medical officer", "cmo"])
+    if "medical director" in lowered_topic:
+        markers.append("medical director")
+    has_clinical_advisor = "clinical advisor" in lowered_topic or "clinical adviser" in lowered_topic
+    if has_clinical_advisor:
+        markers.extend(["clinical advisor", "clinical adviser"])
+    if not has_clinical_advisor and ("advisor" in lowered_topic or "adviser" in lowered_topic):
+        markers.extend(["advisor", "adviser"])
+    if "fractional" in lowered_topic:
+        markers.append("fractional")
+    return tuple(dict.fromkeys(markers))
 
 
 def _apply_hard_filters_to_hits(
@@ -3437,6 +3468,17 @@ def _apply_hard_filters_to_hits(
     excluded_count = 0
     for hit in hits:
         role = _role_evidence_from_hit(hit)
+        haystack = " ".join(
+            str(value or "")
+            for value in (
+                hit.get("company_name"),
+                hit.get("source_title") or hit.get("title"),
+                hit.get("source_url") or hit.get("url"),
+                hit.get("signal") or hit.get("snippet"),
+                role.role_title,
+                role.role_location,
+            )
+        ).lower()
         enriched = dict(hit)
         enriched.update(
             {
@@ -3461,10 +3503,29 @@ def _apply_hard_filters_to_hits(
                     reasons.append(f"company size may be under {threshold} employees")
         if filters.exclude_onsite and role.role_remote is not True:
             reasons.append("remote status was not verified as remote")
+        if filters.require_remote and role.role_remote is not True:
+            reasons.append("requested remote status was not verified")
+        if filters.require_us and role.role_country != "United States" and not re.search(
+            r"\b(?:u\.?s\.?|united states|us-based|u\.s\.-based)\b", haystack
+        ):
+            reasons.append("requested U.S. location or eligibility was not verified")
         if filters.exclude_unpaid and role.unpaid is not False:
             reasons.append("compensation was not verified as paid")
         if filters.exclude_practicing_clinician and role.practicing_clinician_required is True:
             reasons.append("role requires a full-time practicing clinician")
+        if filters.require_part_time_or_fractional and not re.search(
+            r"\b(?:part[- ]time|fractional|advisory|advisor|adviser|contract)\b", haystack
+        ):
+            reasons.append(
+                "source lacks requested part-time, fractional, advisory, or contract evidence"
+            )
+        if filters.required_role_markers and not any(
+            marker in haystack for marker in filters.required_role_markers
+        ):
+            reasons.append(
+                "source lacks requested role-title evidence: "
+                + ", ".join(filters.required_role_markers[:4])
+            )
         if reasons:
             excluded_count += 1
             company_name = str(hit.get("company_name") or "Unknown company")
@@ -6217,6 +6278,18 @@ def _constraint_relaxation_suggestion(
     if not text:
         return ""
     suggestions = (
+        (
+            "last 1 week",
+            "Relax recency from the last 1 week to the last 30 days.",
+        ),
+        (
+            "last one week",
+            "Relax recency from the last 1 week to the last 30 days.",
+        ),
+        (
+            "last 7 days",
+            "Relax recency from the last 7 days to the last 30 days.",
+        ),
         (
             "last 48 hours",
             "Relax recency from the last 48 hours to the last 7 days.",

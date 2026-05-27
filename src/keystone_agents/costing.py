@@ -101,6 +101,101 @@ def estimate_usage_cost(
     }
 
 
+def compare_estimated_to_actual_cost(
+    *,
+    cost: dict[str, Any],
+    actual_usd: Decimal | float | str | None,
+    source: str = "operator_openai_platform",
+    reference_id: str = "",
+) -> dict[str, Any]:
+    """Compare a local per-run estimate to an operator-supplied platform cost."""
+
+    estimated = _cost_amount(cost)
+    actual = _money_decimal(actual_usd)
+    if estimated is None or actual is None:
+        return {
+            "available": False,
+            "source": source,
+            "reference_id": reference_id,
+            "estimated_usd": _money_float(estimated) if estimated is not None else None,
+            "actual_usd": _money_float(actual) if actual is not None else None,
+            "note": (
+                "Estimated and actual dollar amounts are both required for a per-run "
+                "cost comparison."
+            ),
+        }
+
+    delta = estimated - actual
+    actual_minus_estimate = actual - estimated
+    percent_delta = None
+    if actual > Decimal("0"):
+        percent_delta = float(
+            (delta * Decimal("100") / actual).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+        )
+    coverage_rate = None
+    if actual > Decimal("0"):
+        coverage_rate = float(
+            (estimated / actual).quantize(
+                Decimal("0.0001"),
+                rounding=ROUND_HALF_UP,
+            )
+        )
+    return {
+        "available": True,
+        "source": source,
+        "reference_id": reference_id,
+        "estimated_usd": _money_float(estimated),
+        "actual_usd": _money_float(actual),
+        "delta_usd": _money_float(delta),
+        "actual_minus_estimate_usd": _money_float(actual_minus_estimate),
+        "delta_percent_of_actual": percent_delta,
+        "estimate_coverage_rate": coverage_rate,
+        "note": (
+            "Comparison uses a local token-price estimate and an operator-supplied "
+            "OpenAI Platform cost. Small differences can come from price-table drift, "
+            "rounding, aggregate billing windows, retries, or hidden provider-side "
+            "accounting."
+        ),
+    }
+
+
+def summarize_cache_experiment(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize repeated-run cache behavior from locally logged usage/cost payloads."""
+
+    normalized = [_cache_experiment_run(index + 1, run) for index, run in enumerate(runs)]
+    comparable = [run for run in normalized if run["usage_available"]]
+    if not comparable:
+        return {
+            "available": False,
+            "run_count": len(runs),
+            "runs": normalized,
+            "note": "No runs had usable SDK token usage metadata.",
+        }
+
+    first = comparable[0]
+    last = comparable[-1]
+    return {
+        "available": True,
+        "run_count": len(runs),
+        "comparable_run_count": len(comparable),
+        "runs": normalized,
+        "first_cache_hit_rate": first["cache_hit_rate"],
+        "last_cache_hit_rate": last["cache_hit_rate"],
+        "cache_hit_rate_delta": _float_delta(last["cache_hit_rate"], first["cache_hit_rate"]),
+        "first_estimated_usd": first["estimated_usd"],
+        "last_estimated_usd": last["estimated_usd"],
+        "estimated_usd_delta": _float_delta(last["estimated_usd"], first["estimated_usd"]),
+        "note": (
+            "A repeated Slack-thread follow-up should usually show higher cached input "
+            "tokens after the first comparable live run when the prompt prefix remains "
+            "stable and the new request is appended."
+        ),
+    }
+
+
 def configured_agent_run_budget_usd(env: dict[str, str] | None = None) -> Decimal:
     """Return the centralized per-agent SDK run budget."""
 
@@ -426,6 +521,15 @@ def _decimal(value: Any) -> Decimal:
     return Decimal(str(value or "0"))
 
 
+def _money_decimal(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return max(Decimal("0"), Decimal(str(value)))
+    except (InvalidOperation, ValueError):
+        return None
+
+
 def _token_cost(tokens: int, per_1m_rate: Decimal) -> Decimal:
     return (Decimal(tokens) * per_1m_rate) / Decimal("1000000")
 
@@ -433,6 +537,35 @@ def _token_cost(tokens: int, per_1m_rate: Decimal) -> Decimal:
 def _money_float(value: Decimal) -> float:
     rounded = value.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
     return float(rounded)
+
+
+def _float_delta(later: float | None, earlier: float | None) -> float | None:
+    if later is None or earlier is None:
+        return None
+    return round(later - earlier, 8)
+
+
+def _cache_experiment_run(index: int, run: dict[str, Any]) -> dict[str, Any]:
+    usage = run.get("usage") if isinstance(run.get("usage"), dict) else run
+    cost = run.get("cost") if isinstance(run.get("cost"), dict) else {}
+    estimated = _cost_amount(cost) if cost else None
+    input_tokens = _int_value(usage.get("input_tokens"))
+    cached_input_tokens = min(input_tokens, _int_value(usage.get("cached_input_tokens")))
+    cache_hit_rate = None
+    if input_tokens:
+        cache_hit_rate = round(cached_input_tokens / input_tokens, 4)
+    return {
+        "index": index,
+        "usage_available": bool(usage.get("available", True)) and input_tokens > 0,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "cache_hit_rate": cache_hit_rate,
+        "output_tokens": _int_value(usage.get("output_tokens")),
+        "reasoning_output_tokens": _int_value(usage.get("reasoning_output_tokens")),
+        "estimated_usd": _money_float(estimated) if estimated is not None else None,
+        "model": run.get("model") or usage.get("model") or "",
+        "run_id": run.get("run_id") or run.get("id") or "",
+    }
 
 
 def _ratio_percent(numerator: int, denominator: int) -> float:

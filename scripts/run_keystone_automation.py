@@ -15,6 +15,7 @@ from keystone_agents.automation_inventory import (
     automation_spec_for_command,
     ensure_default_automation_inventory,
 )
+from keystone_agents.child_process import run_isolated_child_process
 from keystone_agents.health import (
     SEVERITY_ERROR,
     SEVERITY_HIGH,
@@ -216,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
         summary = _automation_summary(args, child)
         _record_automation_summary(args, child, summary)
         _notify_failure(args, child)
+        if args.json:
+            print(json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True))
         _print_child_failure(child)
         return child.returncode
 
@@ -401,14 +404,22 @@ def _gmail_command(args: argparse.Namespace) -> list[str]:
 
 
 def _run_child(command: list[str], *, env: dict[str, str], timeout_seconds: int) -> ChildRun:
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=timeout_seconds,
-    )
+    try:
+        completed = run_isolated_child_process(
+            command,
+            env=env,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.output if isinstance(exc.output, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        message = f"Child command timed out after {timeout_seconds} seconds."
+        return ChildRun(
+            command=command,
+            returncode=124,
+            stdout=stdout,
+            stderr=f"{message}\n{stderr}".strip(),
+        )
     return ChildRun(
         command=command,
         returncode=completed.returncode,

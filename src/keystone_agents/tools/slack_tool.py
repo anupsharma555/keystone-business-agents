@@ -812,7 +812,7 @@ def _business_agent_card_for_approval_item(
                 metadata=action_context,
             ),
             BusinessAgentCardAction(
-                label="More research",
+                label="Retry source pass",
                 action_id=KBA_MORE_RESEARCH,
                 intent=KBA_INTENT_MORE_RESEARCH,
                 work_item_id=work_item_id,

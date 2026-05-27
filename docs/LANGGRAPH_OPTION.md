@@ -34,6 +34,11 @@ LangGraph is used at the WorkItem orchestration boundary, not inside specialist
 agents. The graph receives a typed `WorkflowRunRequest`, calls the existing
 WorkItem runner, records node-path and checkpoint metadata, and returns the same
 `WorkflowRunResult` shape used by the CLI, Slack handlers, tests, and renderers.
+It is downstream of Orchestrator preflight: Keystone captures the raw request
+and compact context, obtains Orchestrator route advice/review context, then
+passes that memo into the typed `WorkflowRunRequest`. LangGraph may checkpoint
+or resume the run, but it does not replace Orchestrator planning, specialist
+SDK agents, deterministic safety gates, or output review.
 
 CLI usage:
 
@@ -58,6 +63,12 @@ before invoking this repo, so no bridge code change is required for the flag to
 reach KBA. Existing live flags still control model execution, search, Slack
 posting, and Gmail drafts independently.
 
+Slack direct WorkItem actions keep their explicit action semantics when
+LangGraph is enabled, but the request still carries Orchestrator preflight
+context and records `orchestrator_action_review` metadata after the run. The
+graph is a resumable execution wrapper; the Orchestrator remains the model
+control plane.
+
 ## Why SDK First
 
 The SDK agents are the stable unit of behavior. They own prompts, output schemas, tool access, and guardrails. This keeps each agent testable without a larger workflow engine and prevents orchestration concerns from leaking into specialist prompts.
@@ -75,7 +86,7 @@ Keeping the SDK layer first also supports:
 LangGraph improves orchestration rather than individual agent reasoning:
 
 - It creates explicit node boundaries around WorkItem advancement.
-- It gives the project a durable checkpoint seam before approval-gated next actions.
+- It gives the project a durable checkpoint point before approval-gated next actions.
 - It lets future Slack or scheduled runs resume from a graph thread id instead of rerouting.
 - It can add retry policies per node without changing specialist agents.
 - It can support branching workflows for inbound Gmail, account research, opportunity scoring, and outreach.

@@ -44,15 +44,15 @@ DATABASE_URL=sqlite:///keystone_agents.db
 MODEL_PROVIDER=openai
 KEYSTONE_OPENAI_MODEL=gpt-5.4-mini
 KEYSTONE_AGENT_RUN_BUDGET_USD=0.25
-KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER=gemini
-KEYSTONE_GMAIL_TRIAGE_MODEL=gemini-2.5-flash
+KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER=openai
+KEYSTONE_GMAIL_TRIAGE_MODEL=gpt-5.4-mini
 KEYSTONE_GMAIL_TRIAGE_BASE_URL=
-KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL=gpt-5.4
-KEYSTONE_OPPORTUNITY_SCOUT_MODEL=gpt-5.4
-KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER=gemini
-KEYSTONE_OUTREACH_COMPOSER_MODEL=gemini-2.5-flash
+KEYSTONE_BUSINESS_RESEARCH_ANALYST_MODEL=gpt-5.4-mini
+KEYSTONE_OPPORTUNITY_SCOUT_MODEL=gpt-5.4-mini
+KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER=openai
+KEYSTONE_OUTREACH_COMPOSER_MODEL=gpt-5.4-mini
 KEYSTONE_CHIEF_OF_STAFF_MODEL_PROVIDER=openai
-KEYSTONE_CHIEF_OF_STAFF_MODEL=gpt-5.4
+KEYSTONE_CHIEF_OF_STAFF_MODEL=gpt-5.4-mini
 KEYSTONE_TRACE_INCLUDE_SENSITIVE_DATA=false
 ```
 
@@ -597,7 +597,7 @@ Audit review should confirm source attribution, approval state, reviewer notes w
 - Use `--max-messages 1` for live Gmail checks.
 - Do not pass `--sdk` unless intentionally validating SDK construction or live model behavior.
 - Keep global `KEYSTONE_OPENAI_MODEL=gpt-5.4-mini` unless a model change is
-  being tested deliberately. Main operating agents default to OpenAI `gpt-5.4`,
+  being tested deliberately. Main operating agents default to OpenAI `gpt-5.4-mini`,
   including Gmail Triage and Outreach Composer.
 - Keep `KEYSTONE_AGENT_RUN_BUDGET_USD=0.25` unless intentionally testing a
   different per-agent SDK run budget. The shared SDK runner estimates cost from

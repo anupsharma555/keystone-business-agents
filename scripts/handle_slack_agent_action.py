@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
+from keystone_agents.slack_action_contract import slack_agent_feedback_event
 from keystone_agents.slack_actions import handle_run_agent_interaction
 from keystone_agents.storage.sqlite_store import database_url_from_env
 
@@ -33,12 +35,53 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional warning to record when the Slack runtime could not fetch thread replies.",
     )
+    parser.add_argument(
+        "--feedback-jsonl",
+        action="store_true",
+        help="Stream Slack agent feedback events as JSONL to stderr while the run executes.",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     return parser
 
 
+def _stream_feedback_jsonl(event_type: str, payload: dict) -> None:
+    event = slack_agent_feedback_event(event_type, payload)
+    print(json.dumps(event, ensure_ascii=True, sort_keys=True), file=sys.stderr, flush=True)
+
+
 def main() -> int:
     args = build_parser().parse_args()
+    try:
+        return _main(args)
+    except Exception as exc:
+        error_payload = {
+            "stage": "work_item",
+            "callback_id": "",
+            "status": "error",
+            "route": "",
+            "send_enabled": False,
+            "error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            },
+        }
+        if args.feedback_jsonl:
+            _stream_feedback_jsonl(
+                "agent_error",
+                {
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                    "send_enabled": False,
+                },
+            )
+        if args.json:
+            print(json.dumps(error_payload, ensure_ascii=True, indent=2, sort_keys=True))
+        else:
+            print(f"Keystone Slack agent action failed: {type(exc).__name__}: {exc}")
+        return 1
+
+
+def _main(args: argparse.Namespace) -> int:
     payload = json.loads(Path(args.payload_file).read_text(encoding="utf-8"))
     result = handle_run_agent_interaction(
         payload,
@@ -48,6 +91,7 @@ def main() -> int:
         live_sdk=args.live_sdk,
         max_results=args.max_results,
         thread_fetch_error=args.thread_fetch_error,
+        feedback_callback=_stream_feedback_jsonl if args.feedback_jsonl else None,
     )
     payload_out = result.model_dump(mode="json")
     if args.json:

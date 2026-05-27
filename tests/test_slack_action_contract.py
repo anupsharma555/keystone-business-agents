@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from keystone_agents.slack_action_contract import (
     BUSINESS_AGENT_ACTION_SCHEMA,
+    BUSINESS_AGENT_SLACK_CONTRACT_CAPABILITIES,
     BUSINESS_AGENT_SLACK_CONTRACT_SCHEMA,
     BUSINESS_AGENT_WRITE_GATE_ACTION_ID,
     BUSINESS_AGENT_WRITE_GATE_INTENT,
@@ -17,10 +18,13 @@ from keystone_agents.slack_action_contract import (
     KBA_INTENT_MORE_RESEARCH,
     KBA_MORE_RESEARCH,
     RUN_AGENT_MESSAGE_CALLBACK_ID,
+    SLACK_AGENT_FEEDBACK_EVENT_SCHEMA,
     SLACK_SELECTED_CONTEXT_SCHEMA,
+    SlackAgentFeedbackEvent,
     BusinessAgentWriteGatePayload,
     business_agent_action_value,
     business_agent_slack_contract,
+    slack_agent_feedback_event,
     business_agent_write_gate_value,
     parse_business_agent_action_value,
     parse_business_agent_write_gate_value,
@@ -70,7 +74,9 @@ def test_business_agent_slack_contract_exports_action_and_context_metadata() -> 
     contract = business_agent_slack_contract()
 
     assert contract["schema"] == BUSINESS_AGENT_SLACK_CONTRACT_SCHEMA
+    assert set(contract["capabilities"]) == set(BUSINESS_AGENT_SLACK_CONTRACT_CAPABILITIES)
     assert contract["schemas"]["business_agent_action"] == BUSINESS_AGENT_ACTION_SCHEMA
+    assert contract["schemas"]["agent_feedback_event"] == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
     assert contract["schemas"]["selected_message_context"] == SLACK_SELECTED_CONTEXT_SCHEMA
     assert contract["schemas"]["write_gate"] == BUSINESS_AGENT_WRITE_GATE_SCHEMA
     assert KBA_MORE_RESEARCH in contract["action_ids"]
@@ -80,8 +86,13 @@ def test_business_agent_slack_contract_exports_action_and_context_metadata() -> 
     assert contract["callback_ids"]["run_agent_message"] == RUN_AGENT_MESSAGE_CALLBACK_ID
 
     action_schema = contract["payload_json_schemas"]["business_agent_action"]
+    feedback_schema = contract["payload_json_schemas"]["agent_feedback_event"]
+    selected_context_schema = contract["payload_json_schemas"]["selected_message_context"]
     write_gate_schema = contract["payload_json_schemas"]["write_gate"]
     assert "intent" in action_schema["required"]
+    assert "event_type" in feedback_schema["required"]
+    assert selected_context_schema["properties"]["schema"]["const"] == SLACK_SELECTED_CONTEXT_SCHEMA
+    assert "prior_agent_runs" in selected_context_schema["properties"]
     assert "request_text" in write_gate_schema["required"]
 
 
@@ -91,8 +102,16 @@ def test_generated_slack_contract_artifact_matches_canonical_contract_shape() ->
     payload = json.loads(artifact.read_text(encoding="utf-8"))
 
     assert payload["schema"] == BUSINESS_AGENT_SLACK_CONTRACT_SCHEMA
+    assert set(payload["capabilities"]) == set(BUSINESS_AGENT_SLACK_CONTRACT_CAPABILITIES)
+    assert set(payload["payload_json_schemas"]) == set(
+        business_agent_slack_contract()["payload_json_schemas"]
+    )
     assert payload["action_ids"] == sorted(KBA_ACTION_IDS)
+    assert payload["schemas"]["agent_feedback_event"] == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
     assert payload["schemas"]["selected_message_context"] == SLACK_SELECTED_CONTEXT_SCHEMA
+    assert payload["payload_json_schemas"]["agent_feedback_event"]["properties"]["schema"][
+        "default"
+    ] == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
     assert (
         payload["payload_json_schemas"]["selected_message_context"]["properties"]["schema"]["const"]
         == SLACK_SELECTED_CONTEXT_SCHEMA
@@ -116,3 +135,16 @@ def test_action_and_selected_context_models_share_contract_schema_names() -> Non
     assert parsed.schema_name == BUSINESS_AGENT_ACTION_SCHEMA
     assert parsed.intent == KBA_INTENT_MORE_RESEARCH
     assert context.model_dump(mode="json", by_alias=True)["schema"] == SLACK_SELECTED_CONTEXT_SCHEMA
+
+
+def test_slack_agent_feedback_event_has_contract_schema() -> None:
+    event = slack_agent_feedback_event(
+        "orchestrator_preflight",
+        {"selected_agent": "chief_of_staff", "blocked_by_orchestrator": False},
+    )
+
+    parsed = SlackAgentFeedbackEvent.model_validate(event)
+
+    assert parsed.schema_name == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
+    assert parsed.event_type == "orchestrator_preflight"
+    assert parsed.payload["selected_agent"] == "chief_of_staff"

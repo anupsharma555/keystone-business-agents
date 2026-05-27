@@ -3,7 +3,7 @@ prompt_name: safety_policy
 prompt_version: 2026-04-21.1
 prompt_purpose: Shared non-negotiable safety and approval policy for Keystone agents.
 prompt_safety_notes: Blocks PHI, auto-send behavior, unsupported claims, and unsafe advice.
-prompt_eval_datasets: evals/safety_refusals.jsonl, evals/outreach_copy_constraints.jsonl
+prompt_eval_datasets: evals/local/safety_refusals.jsonl, evals/local/outreach_copy_constraints.jsonl
 -->
 
 # Keystone Safety Policy

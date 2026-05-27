@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from keystone_agents.agent_registry import SPECIALIST_AGENT_SPECS, specialist_handoff_specs
 from keystone_agents.feedback import build_operator_feedback_request
@@ -29,16 +29,16 @@ from keystone_agents.orchestrator.routing import (
     RESEARCH_RE as _RESEARCH_RE,
 )
 from keystone_agents.orchestrator.routing import (
-    RESUME_RE as _RESUME_RE,
-)
-from keystone_agents.orchestrator.routing import (
-    SEND_RE as _SEND_RE,
-)
-from keystone_agents.orchestrator.routing import (
     looks_like_company as _looks_like_company,
 )
 from keystone_agents.orchestrator.routing import (
     looks_like_email as _looks_like_email,
+)
+from keystone_agents.orchestrator.routing import (
+    looks_like_resume_request as _looks_like_resume_request,
+)
+from keystone_agents.orchestrator.routing import (
+    looks_like_send_side_effect as _looks_like_send_side_effect,
 )
 from keystone_agents.orchestrator.routing import (
     mapping_value as _mapping_value,
@@ -74,7 +74,6 @@ from keystone_agents.sdk import (
     build_sdk_agent,
     compose_instructions,
     function_tool,
-    run_typed_sdk_sync,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
 from keystone_agents.tools.browser_diagnostics_tool import (
@@ -105,6 +104,7 @@ ORCHESTRATOR_REVIEW_VERBOSITY = "low"
 ORCHESTRATOR_REVIEW_MAX_TOKENS = 1800
 ORCHESTRATOR_SPECIALIST_TOOLS_ENV = "KEYSTONE_ORCHESTRATOR_SPECIALIST_TOOLS"
 BUSINESS_RESEARCH_TOOL_NAME = "business_research_analyst_research_brief"
+OPPORTUNITY_SCOUT_TOOL_NAME = "opportunity_scout_read_only"
 
 
 _HANDOFF_BY_ROUTE = {handoff.route: handoff for handoff in INTENDED_HANDOFFS}
@@ -147,13 +147,21 @@ _FEEDBACK_OBJECT_TYPE_BY_ROUTE: dict[RouteName, str] = {
     "outreach_composer": "outreach_draft",
     "clarification": "other",
 }
-_HARD_REFUSAL_FLAGS = frozenset({"possible_phi", "security", "legal_review", "professional_advice"})
+_HARD_REFUSAL_FLAGS = frozenset({"possible_phi", "security", "professional_advice"})
 _APPROVED_CONTEXT_OBJECT_TYPES = frozenset({"company_profile", "opportunity"})
 _SAFE_STATE_TEXT_CHARS = 140
 _REVIEW_TEXT_CHARS = 5000
 _REVIEW_FIELD_CHARS = 700
 _REVIEW_LIST_ITEMS = 8
 _REVIEW_MAPPING_KEYS = 60
+_FOLLOWUP_MARKERS = (
+    "user follow-up:",
+    "follow-up:",
+    "follow up:",
+    "latest request:",
+    "current request:",
+    "new request:",
+)
 _SEND_SIDE_EFFECT_KEYS = frozenset(
     {
         "send_enabled",
@@ -191,6 +199,32 @@ _NON_HUMAN_METADATA_KEYS = frozenset(
         "opportunity_json",
     }
 )
+_CRM_WRITE_RE = re.compile(
+    r"\b(?:save|write|add|sync|push|update|create|log)\b.*\b(?:crm|airtable|salesforce|hubspot)\b"
+    r"|\b(?:crm|airtable|salesforce|hubspot)\b.*"
+    r"\b(?:save|write|add|sync|push|update|create|log)\b",
+    re.I,
+)
+_NO_CRM_WRITE_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|no)\s+"
+    r"(?:save|write|add|sync|push|update|create|log)\b"
+    r"[\s\S]{0,80}\b(?:crm|airtable|salesforce|hubspot|external\s+systems?)\b"
+    r"|\bwithout\s+(?:saving|writing|adding|syncing|pushing|updating|creating|logging)\b"
+    r"[\s\S]{0,80}\b(?:crm|airtable|salesforce|hubspot|external\s+systems?)\b",
+    re.I,
+)
+_DISCOVERY_OUTREACH_WORKFLOW_RE = re.compile(
+    r"\b(?:find|identify|search|scout|source|discover|list)\b[\s\S]*?"
+    r"\b(?:outreach|emails?|messages?|companies|targets?|leads?|opportunities?)\b[\s\S]*?"
+    r"\b(?:draft|write|compose|prepare|send|outreach|emails?|messages?|companies|targets?|leads?)\b",
+    re.I,
+)
+_EXPLICIT_RESEARCH_BEFORE_OUTREACH_RE = re.compile(
+    r"\b(?:research|profile|assess|evaluate|look\s+into|check\s+out|"
+    r"source[- ]backed\s+research|prepare\s+(?:a\s+)?research|"
+    r"create\s+(?:a\s+)?research|build\s+(?:a\s+)?research)\b",
+    re.I,
+)
 _FULL_BODY_KEYS = frozenset(
     {
         "body",
@@ -225,8 +259,161 @@ _READ_ONLY_BUSINESS_RESEARCH_TOOL_NAMES = frozenset(
         "compare_company_profiles_for_decision",
     }
 )
+_READ_ONLY_OPPORTUNITY_SCOUT_TOOL_NAMES = frozenset(
+    {
+        "list_local_context_sources",
+        "search_local_context",
+        "read_local_context_file",
+        "retrieve_memory",
+        "check_workflow_duplicate",
+        "search_web",
+        "structure_web_data_for_schema",
+        "render_page",
+        "capture_browser_diagnostics",
+        "summarize_rendered_page_diagnostics",
+        "search_opportunity_sources_placeholder",
+        "load_existing_opportunity_state",
+        "search_funding_news_sources",
+        "search_job_posting_sources",
+        "search_clinical_trials_sources",
+        "search_grant_sources",
+        "search_conference_publication_sources",
+        "search_journal_call_sources",
+        "search_contract_rfp_sources",
+        "search_company_page_sources",
+        "extract_research_claims_from_html",
+        "score_opportunity",
+        "handoff_to_business_research_analyst_placeholder",
+    }
+)
 
 LLMRouter = Callable[[str, Mapping[str, Any]], OrchestratorResult | Mapping[str, Any]]
+
+
+class OrchestratorPreflight(BaseModel):
+    """Orchestrator-owned front-door interpretation for manual agent execution."""
+
+    request_text: str = ""
+    requested_agent: str | None = None
+    advisory_only: bool = False
+    selected_agent: str = ""
+    blocked_by_orchestrator: bool = False
+    execution_allowed: bool = True
+    block_kind: str = ""
+    block_reason: str = ""
+    manual_request_plan: ManualRequestPlan
+    route_result: OrchestratorResult
+    sdk_usage_events: list[dict[str, Any]] = Field(default_factory=list)
+
+
+def run_orchestrator_preflight(
+    request_text: str | Mapping[str, Any] | None,
+    *,
+    requested_agent: str | None = None,
+    live_manual_plan: bool = False,
+    run_config: Any | None = None,
+    model: str | None = None,
+    session: Any | None = None,
+    database_url: str | None = None,
+    workflow_state: Mapping[str, Any] | None = None,
+) -> OrchestratorPreflight:
+    """Resolve the manual plan as an Orchestrator-owned preflight step.
+
+    Explicit specialist mentions are advisory-only: this records the
+    Orchestrator interpretation and safety posture, while callers keep the named
+    specialist unless the Orchestrator returns a hard refusal/blocker.
+    """
+
+    from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
+
+    text = _payload_text(request_text)
+    sdk_usage_events: list[dict[str, Any]] = []
+
+    def record_planner_cost(sdk_result: Any) -> None:
+        sdk_usage_events.append(
+            _preflight_sdk_usage_event_payload(
+                sdk_result,
+                agent_name="manual_request_planner",
+                run_stage="orchestrator_preflight.manual_request_planner",
+            )
+        )
+
+    manual_plan = resolve_manual_request_plan(
+        text,
+        requested_agent=requested_agent,
+        live=live_manual_plan,
+        run_config=run_config,
+        model=model,
+        session=session,
+        cost_callback=record_planner_cost,
+    )
+    route_result = route_request(
+        text,
+        manual_plan=manual_plan,
+        database_url=database_url,
+        workflow_state=workflow_state,
+    )
+    explicit_agent = manual_plan.requested_agent
+    advisory_only = explicit_agent not in {None, "orchestrator"}
+    selected_agent = str(explicit_agent or route_result.route)
+    block_kind, block_reason = _preflight_block(route_result)
+    execution_allowed = not bool(block_kind)
+    return OrchestratorPreflight(
+        request_text=text,
+        requested_agent=explicit_agent,
+        advisory_only=advisory_only,
+        selected_agent=selected_agent,
+        blocked_by_orchestrator=not execution_allowed,
+        execution_allowed=execution_allowed,
+        block_kind=block_kind,
+        block_reason=block_reason,
+        manual_request_plan=manual_plan,
+        route_result=route_result,
+        sdk_usage_events=sdk_usage_events,
+    )
+
+
+def _preflight_sdk_usage_event_payload(
+    sdk_result: Any,
+    *,
+    agent_name: str,
+    run_stage: str,
+) -> dict[str, Any]:
+    """Return audit-safe SDK usage metadata for WorkItem cost accounting."""
+
+    return {
+        "agent_name": agent_name,
+        "run_stage": run_stage,
+        "usage": dict(getattr(sdk_result, "usage", None) or {}),
+        "cost": dict(getattr(sdk_result, "cost", None) or {}),
+        "request_cache": dict(getattr(sdk_result, "request_cache", None) or {}),
+    }
+
+
+def _preflight_block(result: OrchestratorResult) -> tuple[str, str]:
+    """Return an explicit execution block for front-door Orchestrator refusals."""
+
+    if not result.refused:
+        return "", ""
+    combined = " ".join(
+        str(part or "")
+        for part in (
+            result.rationale,
+            result.stop_reason,
+            result.clarification_request,
+            " ".join(result.audit_notes),
+        )
+    ).lower()
+    if "send gate" in combined or "email sending is not allowed" in combined:
+        kind = "send"
+    elif "safety gate" in combined or "phi" in combined or "security" in combined:
+        kind = "safety"
+    elif "approval" in combined:
+        kind = "approval"
+    else:
+        kind = "refusal"
+    reason = result.stop_reason or result.clarification_request or result.rationale
+    return kind, str(reason or "Blocked by Orchestrator preflight.")
 
 
 def _handoff_specs() -> list[HandoffSpec]:
@@ -404,6 +591,10 @@ def _normalize_workflow_state(value: Mapping[str, Any] | None) -> dict[str, Any]
             "opportunities": [],
             "outreach_drafts": [],
             "prior_route_decisions": [],
+            "recent_slack_thread": [],
+            "prior_agent_runs": [],
+            "channel_automations": [],
+            "slack_context": {},
             "approved_context_available": False,
             "send_enabled": False,
         }
@@ -426,12 +617,57 @@ def _normalize_workflow_state(value: Mapping[str, Any] | None) -> dict[str, Any]
         "opportunities": list(context.get("opportunities") or []),
         "outreach_drafts": list(context.get("outreach_drafts") or []),
         "prior_route_decisions": list(context.get("prior_route_decisions") or []),
+        "recent_slack_thread": list(context.get("recent_slack_thread") or []),
+        "prior_agent_runs": list(context.get("prior_agent_runs") or []),
+        "channel_automations": list(context.get("channel_automations") or []),
+        "slack_context": dict(context.get("slack_context") or {}),
         "send_enabled": False,
     }
     normalized["approved_context_available"] = bool(
         context.get("approved_context_available") or _state_has_approved_context(normalized)
     )
     return normalized
+
+
+def _merge_workflow_state_context(
+    base: Mapping[str, Any] | None,
+    overlay: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge persisted workflow state with caller-supplied context."""
+
+    normalized_base = _normalize_workflow_state(base)
+    if not overlay:
+        return normalized_base
+    normalized_overlay = _normalize_workflow_state(overlay)
+    merged = dict(normalized_base)
+    merged["counts"] = {
+        **dict(normalized_base.get("counts") or {}),
+        **dict(normalized_overlay.get("counts") or {}),
+    }
+    for key in (
+        "pending_approvals",
+        "approved_approval_items",
+        "companies",
+        "opportunities",
+        "outreach_drafts",
+        "prior_route_decisions",
+        "recent_slack_thread",
+        "prior_agent_runs",
+        "channel_automations",
+    ):
+        merged[key] = [
+            *list(normalized_overlay.get(key) or []),
+            *list(normalized_base.get(key) or []),
+        ]
+    if normalized_overlay.get("slack_context"):
+        merged["slack_context"] = normalized_overlay["slack_context"]
+    merged["approved_context_available"] = bool(
+        normalized_base.get("approved_context_available")
+        or normalized_overlay.get("approved_context_available")
+        or _state_has_approved_context(merged)
+    )
+    merged["send_enabled"] = False
+    return _normalize_workflow_state(merged)
 
 
 def _workflow_state_is_empty(state: Mapping[str, Any] | None) -> bool:
@@ -446,8 +682,11 @@ def _workflow_state_is_empty(state: Mapping[str, Any] | None) -> bool:
             "opportunities",
             "outreach_drafts",
             "prior_route_decisions",
+            "recent_slack_thread",
+            "prior_agent_runs",
+            "channel_automations",
         )
-    ) and not bool(state.get("counts"))
+    ) and not bool(state.get("counts")) and not bool(state.get("slack_context"))
 
 
 def _state_has_pending_approval(state: Mapping[str, Any]) -> bool:
@@ -518,10 +757,11 @@ def _result(
     workflow_state: Mapping[str, Any] | None = None,
     audit_notes: list[str] | None = None,
     retrieval_hint: RetrievalHint | None = None,
+    workflow: list[str] | None = None,
 ) -> OrchestratorResult:
     handoff = _HANDOFF_BY_ROUTE.get(route)
     artifacts = {artifact[0]: artifact[1]} if artifact else {}
-    workflow = [route] if route != "clarification" else []
+    workflow_steps = workflow if workflow is not None else ([route] if route != "clarification" else [])
     state_summary = dict(workflow_state or {})
     notes = [
         "Fixture-mode Python routing fallback is available.",
@@ -536,7 +776,7 @@ def _result(
     return OrchestratorResult(
         route=route,
         target_agent=handoff.agent_name if handoff else None,
-        workflow=workflow,
+        workflow=workflow_steps,
         routing_mode=routing_mode,
         rationale=rationale,
         clarification_request=clarification_request,
@@ -574,6 +814,60 @@ def _result(
         ),
         audit_notes=notes,
     )
+
+
+def _looks_like_crm_write_request(text: str) -> bool:
+    cleaned = str(text or "")
+    if _NO_CRM_WRITE_RE.search(cleaned):
+        return False
+    return bool(_CRM_WRITE_RE.search(cleaned))
+
+
+def _with_crm_write_boundary(
+    result: OrchestratorResult,
+    *,
+    request_text: str,
+) -> OrchestratorResult:
+    if not _looks_like_crm_write_request(request_text):
+        return result
+    payload = result.model_dump(mode="json")
+    payload["workflow"] = list(
+        dict.fromkeys([*(payload.get("workflow") or []), "crm_preflight"])
+    )
+    payload["forbidden_actions"] = list(
+        dict.fromkeys(
+            [*(payload.get("forbidden_actions") or []), "save_to_crm", "crm_write"]
+        )
+    )
+    payload["approval_required"] = True
+    payload["approval_scope"] = ApprovalScope.EXTERNAL_USE.value
+    payload["external_use_approval_required"] = True
+    payload["send_enabled"] = False
+    payload["can_send_email"] = False
+    payload["approval_rationale"] = (
+        "The request asks to save or write to CRM; Orchestrator converted that into "
+        "draft-only CRM-ready fields pending explicit external-use approval."
+    )
+    note = (
+        "CRM save/write request treated as draft-only approval-gated boundary; "
+        "no CRM write was performed."
+    )
+    payload["audit_notes"] = list(dict.fromkeys([*(payload.get("audit_notes") or []), note]))
+    decision_trace = payload.get("decision_trace") or {}
+    if isinstance(decision_trace, dict):
+        decision_trace["safety_gates_applied"] = list(
+            dict.fromkeys(
+                [
+                    *(decision_trace.get("safety_gates_applied") or []),
+                    "crm_write_blocked_pending_approval",
+                ]
+            )
+        )
+        decision_trace["notes"] = list(
+            dict.fromkeys([*(decision_trace.get("notes") or []), note])
+        )
+        payload["decision_trace"] = decision_trace
+    return OrchestratorResult.model_validate(payload)
 
 
 def _operator_feedback_object_id(result: OrchestratorResult) -> str:
@@ -701,6 +995,156 @@ def _send_refusal(
     )
 
 
+def _looks_like_discovery_outreach_workflow(text: str) -> bool:
+    return bool(_DISCOVERY_OUTREACH_WORKFLOW_RE.search(str(text or "")))
+
+
+def _gmail_cross_agent_workflow(text: str) -> list[str]:
+    lower = str(text or "").lower()
+    if not re.search(r"\b(?:gmail|email|inquiry|thread|reply|response)\b", lower):
+        return []
+    workflow = ["gmail_triage"]
+    has_research = bool(
+        re.search(
+            r"\b(?:research\s+(?:the\s+)?company|research\s+it|company\s+research|"
+            r"company\s+profile|source-backed|source\s+backed|evidence-backed)\b",
+            lower,
+        )
+    )
+    has_opportunity = bool(
+        re.search(
+            r"\b(?:create|save|add|prepare|record)\b[^.\n]{0,160}"
+            r"\b(?:opportunit|crm|record|pipeline)\b",
+            lower,
+        )
+        or re.search(r"\bopportunity record\b", lower)
+    )
+    has_draft_after_context = bool(
+        re.search(r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,160}\boutreach\b", lower)
+        or (
+            (has_research or has_opportunity)
+            and re.search(r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,160}\b(?:response|reply)\b", lower)
+        )
+    )
+    if has_research:
+        workflow.append("business_research_analyst")
+    if has_opportunity:
+        workflow.append("opportunity_scout")
+    if has_draft_after_context:
+        workflow.append("outreach_composer")
+    return list(dict.fromkeys(workflow)) if len(workflow) > 1 else []
+
+
+def _requested_cross_agent_workflow(text: str, *, start_route: str) -> list[str]:
+    lower = str(text or "").lower()
+    workflow: list[str] = []
+    if re.search(r"\b(?:gmail|email)\s+context\b|\bcheck\s+recent\s+gmail\b", lower):
+        workflow.append("gmail_triage")
+    if re.search(
+        r"\b(?:company\s+research|research\s+(?:it|the\s+company|company)|"
+        r"research\s+summary|research\s+brief|source[- ]backed|profile\s+company)\b",
+        lower,
+    ):
+        workflow.append("business_research_analyst")
+    if re.search(
+        r"\b(?:opportunit|active\s+roles?|advisory\s+openings?|"
+        r"partnership\s+angles?|opportunity\s+scan|similar\s+companies)\b",
+        lower,
+    ):
+        workflow.append("opportunity_scout")
+    if re.search(
+        r"\b(?:draft|write|compose|prepare)\b[\s\S]{0,160}\b"
+        r"(?:outreach|email|reply|response|follow-up|followup)\b"
+        r"|\boutreach\s+(?:recommendation|draft)\b",
+        lower,
+    ):
+        workflow.append("outreach_composer")
+    if re.search(r"\b(?:scorecard|score\s+the\s+workflow|approval\s+checklist)\b", lower):
+        workflow.append("chief_of_staff")
+    if not workflow:
+        return []
+    if start_route not in workflow and start_route != "clarification":
+        workflow.insert(0, start_route)
+    return list(dict.fromkeys(workflow))
+
+
+def _requires_research_before_outreach(text: str) -> bool:
+    cleaned = str(text or "")
+    lower = cleaned.lower()
+    if "attached research brief" in lower or "provided research brief" in lower:
+        return False
+    normalized = re.sub(
+        r"\b(?:same\s+company\s+research\s+brief|company\s+research\s+brief|"
+        r"research\s+brief|clinical\s+research|outcomes\s+research)\b",
+        " ",
+        cleaned,
+        flags=re.I,
+    )
+    return bool(_EXPLICIT_RESEARCH_BEFORE_OUTREACH_RE.search(normalized))
+
+
+def _safe_discovery_outreach_workflow_result(
+    *,
+    request_text: str,
+    approved_context_present: bool,
+    workflow_state: Mapping[str, Any],
+) -> OrchestratorResult:
+    send_blocked = _looks_like_send_side_effect(request_text)
+    result = _result(
+        route="opportunity_scout",
+        rationale=(
+            "The request combines opportunity discovery with outreach. Orchestrator "
+            "will start with Opportunity Scout and preserve the downstream research and "
+            "draft-only outreach steps while blocking any send action."
+        ),
+        approved_context_present=approved_context_present,
+        approval_scope=ApprovalScope.EXTERNAL_USE,
+        approval_rationale=(
+            "Discovery and draft preparation may proceed as a draft-only workflow; "
+            "external sending remains forbidden and requires separate human action."
+        ),
+        workflow_state=workflow_state,
+        audit_notes=[
+            "Compound discovery/outreach request preserved as a draft-only workflow.",
+            "Automatic sending remains blocked.",
+        ],
+        retrieval_hint=_route_retrieval_hint(
+            "opportunity_scout",
+            request_text=request_text,
+        ),
+    )
+    payload = result.model_dump(mode="json")
+    workflow = ["opportunity_scout", "business_research_analyst", "outreach_composer"]
+    if send_blocked:
+        workflow.append("send_blocked")
+    payload["workflow"] = workflow
+    payload["forbidden_actions"] = list(
+        dict.fromkeys([*(payload.get("forbidden_actions") or []), "send_email"])
+    )
+    payload["send_enabled"] = False
+    payload["can_send_email"] = False
+    decision_trace = payload.get("decision_trace") or {}
+    if isinstance(decision_trace, dict):
+        decision_trace["safety_gates_applied"] = list(
+            dict.fromkeys(
+                [
+                    *(decision_trace.get("safety_gates_applied") or []),
+                    "send_blocked_draft_only_workflow_preserved",
+                ]
+            )
+        )
+        decision_trace["notes"] = list(
+            dict.fromkeys(
+                [
+                    *(decision_trace.get("notes") or []),
+                    "Safe workflow sequence preserved: scout, research, draft-only outreach.",
+                ]
+            )
+        )
+        payload["decision_trace"] = decision_trace
+    return OrchestratorResult.model_validate(payload)
+
+
 def _missing_outreach_context_refusal(
     *,
     workflow_state: Mapping[str, Any],
@@ -730,7 +1174,9 @@ def _resume_from_state_result(
     *,
     workflow_state: Mapping[str, Any],
 ) -> OrchestratorResult | None:
-    if not _RESUME_RE.search(text):
+    if not _looks_like_resume_request(text):
+        return None
+    if _has_non_resume_followup_request(text):
         return None
     if _state_has_pending_approval(workflow_state):
         return _result(
@@ -772,6 +1218,32 @@ def _resume_from_state_result(
                 audit_notes=["Resume-from-state reused an explicit prior route decision."],
             )
     return None
+
+
+def _latest_followup_request_text(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    lower = value.lower()
+    best_index = -1
+    best_marker = ""
+    for marker in _FOLLOWUP_MARKERS:
+        index = lower.rfind(marker)
+        if index > best_index:
+            best_index = index
+            best_marker = marker
+    if best_index < 0:
+        return value
+    latest = value[best_index + len(best_marker) :].strip()
+    return latest or value
+
+
+def _has_non_resume_followup_request(text: str) -> bool:
+    latest = _latest_followup_request_text(text)
+    value = str(text or "").strip()
+    if not latest or latest == value:
+        return False
+    return not _looks_like_resume_request(latest)
 
 
 def _llm_route_prompt(
@@ -1294,7 +1766,209 @@ def _readability_review(data: Mapping[str, Any], text: str) -> OrchestratorOutpu
     )
 
 
-def _relevance_review(agent_key: str, data: Mapping[str, Any]) -> OrchestratorOutputReviewScore:
+_REQUEST_ALIGNMENT_STOPWORDS = frozenset(
+    {
+        "about",
+        "above",
+        "after",
+        "agent",
+        "agents",
+        "also",
+        "before",
+        "brief",
+        "call",
+        "can",
+        "channel",
+        "chief",
+        "create",
+        "current",
+        "did",
+        "draft",
+        "drafts",
+        "external",
+        "externally",
+        "for",
+        "from",
+        "have",
+        "identify",
+        "into",
+        "kni",
+        "keep",
+        "next",
+        "not",
+        "outside",
+        "post",
+        "practical",
+        "produce",
+        "reply",
+        "request",
+        "requests",
+        "review",
+        "schedule",
+        "send",
+        "slack",
+        "staff",
+        "summarize",
+        "the",
+        "this",
+        "tool",
+        "use",
+        "what",
+        "which",
+        "with",
+        "work",
+        "write",
+    }
+)
+
+
+def _request_alignment_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_]{3,}", str(text or "").lower())
+        if token not in _REQUEST_ALIGNMENT_STOPWORDS
+    }
+
+
+_ALIGNMENT_CONCEPT_TERMS: dict[str, frozenset[str]] = {
+    "planning": frozenset({"planner", "planning", "orchestrator", "executor", "control"}),
+    "routing": frozenset({"route", "routes", "routing", "handoff", "handoffs", "capability", "specialist"}),
+    "context": frozenset({"context", "memory", "workitem", "workitems", "slack", "thread"}),
+    "quality": frozenset({"eval", "evals", "evaluate", "evaluation", "feedback", "review", "validation", "verify"}),
+    "safety": frozenset({"approval", "approvals", "gate", "gates", "safety", "deterministic"}),
+}
+
+
+def _alignment_concepts(text: str) -> set[str]:
+    tokens = set(re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", str(text or "").lower()))
+    return {
+        concept
+        for concept, terms in _ALIGNMENT_CONCEPT_TERMS.items()
+        if tokens & set(terms)
+    }
+
+
+def _request_alignment_gap(
+    *,
+    request_summary: str,
+    output_text: str,
+) -> tuple[int | None, list[str]]:
+    diagnostic_gap = _diagnostic_alignment_gap(
+        request_summary=request_summary,
+        output_text=output_text,
+    )
+    if diagnostic_gap[0] is not None:
+        return diagnostic_gap
+    request_terms = _request_alignment_terms(request_summary)
+    if len(request_terms) < 4:
+        return None, []
+    output_terms = _request_alignment_terms(output_text)
+    if not output_terms:
+        return 35, ["Request/output term overlap is low; output may be unrelated."]
+    overlap = request_terms & output_terms
+    ratio = len(overlap) / max(min(len(request_terms), 12), 1)
+    if ratio >= 0.25:
+        return None, []
+    concept_overlap = _alignment_concepts(request_summary) & _alignment_concepts(output_text)
+    if len(concept_overlap) >= 2:
+        return None, []
+    missing = sorted(request_terms - output_terms)[:6]
+    return (
+        45 if ratio < 0.1 else 65,
+        [
+            (
+                "Request/output term overlap is low; output may be unrelated. "
+                f"Missing request terms include: {', '.join(missing)}."
+            )
+        ],
+    )
+
+
+def _diagnostic_alignment_gap(
+    *,
+    request_summary: str,
+    output_text: str,
+) -> tuple[int | None, list[str]]:
+    request_text = " ".join(str(request_summary or "").lower().split())
+    if not re.search(
+        r"\b(?:same\s+response|wrong\s+(?:response|answer|lane)|"
+        r"unrelated\s+(?:response|answer|output)|request\s+and\s+response|"
+        r"keeps?\s+posting.*(?:answer|response)|"
+        r"why\s+(?:is|did)\s+(?:this|that|it).*(?:post|posting|respond|answer))\b",
+        request_text,
+    ):
+        return None, []
+    if not re.search(
+        r"\b(?:why|debug|diagnose|cause|reason|because|fix|implemented|changes|"
+        r"rerun|run\s+(?:it\s+)?again|keeps?\s+posting|keeps?\s+happening)\b",
+        request_text,
+    ):
+        return None, []
+    output = " ".join(str(output_text or "").lower().split())
+    if re.search(
+        r"\b(?:unrelated|mismatch|wrong|stale|prior|previous|context|route|routing|"
+        r"orchestrator|planner|request|response|diagnos|cause|reason|fix|"
+        r"implemented|changed|rerun)\b",
+        output,
+    ):
+        return None, []
+    return (
+        35,
+        [
+            (
+                "The request asks to diagnose a wrong or unrelated prior response, "
+                "but the output does not address response mismatch, routing, context, "
+                "or corrective action."
+            )
+        ],
+    )
+
+
+_ALIGNMENT_ECHO_KEYS = frozenset(
+    {
+        "input",
+        "input_summary",
+        "intent",
+        "original_request",
+        "prompt",
+        "query",
+        "request",
+        "request_summary",
+        "request_text",
+        "task",
+        "topic",
+        "user_request",
+    }
+)
+
+
+def _alignment_review_text(value: Any, *, parent_key: str = "") -> str:
+    if value is None:
+        return ""
+    if isinstance(value, BaseModel):
+        return _alignment_review_text(value.model_dump(mode="json"), parent_key=parent_key)
+    if isinstance(value, Mapping):
+        parts: list[str] = []
+        for key, child in value.items():
+            key_text = str(key or "").strip()
+            normalized_key = key_text.lower()
+            if normalized_key in _ALIGNMENT_ECHO_KEYS:
+                continue
+            parts.append(_alignment_review_text(child, parent_key=normalized_key))
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, list | tuple | set):
+        return "\n".join(_alignment_review_text(item, parent_key=parent_key) for item in value)
+    if parent_key:
+        return str(value or "").strip()
+    return ""
+
+
+def _relevance_review(
+    agent_key: str,
+    data: Mapping[str, Any],
+    *,
+    request_summary: str = "",
+) -> OrchestratorOutputReviewScore:
     metadata_score, metadata_gaps = _human_metadata_score(data)
     if agent_key == "gmail_triage":
         if any(bucket in data for bucket in ("urgent", "important", "can_wait", "ignore")):
@@ -1374,12 +2048,21 @@ def _relevance_review(agent_key: str, data: Mapping[str, Any]) -> OrchestratorOu
     else:
         checks = [_field_present(data, "summary", "audit_notes")]
     score = min(int(sum(bool(check) for check in checks) / len(checks) * 100), metadata_score)
+    alignment_cap, alignment_gaps = _request_alignment_gap(
+        request_summary=request_summary,
+        output_text=_alignment_review_text(data),
+    )
+    if alignment_cap is not None:
+        score = min(score, alignment_cap)
     if metadata_gaps:
-        suggestions = metadata_gaps
+        suggestions = [*metadata_gaps, *alignment_gaps]
     elif score >= 85:
         suggestions = []
     else:
-        suggestions = ["Tie the output more directly to the request and evidence."]
+        suggestions = [
+            *(alignment_gaps or []),
+            "Tie the output more directly to the request and evidence.",
+        ]
     return _review_score(
         "relevance",
         score,
@@ -1420,7 +2103,7 @@ def review_specialist_output(
     structure = _structure_review(agent_key, data)
     tone = _tone_review(agent_key, data, text)
     readability = _readability_review(data, text)
-    relevance = _relevance_review(agent_key, data)
+    relevance = _relevance_review(agent_key, data, request_summary=request_summary)
     dimensions = [structure, tone, readability, relevance]
     overall = int(round(sum(dimension.score for dimension in dimensions) / len(dimensions)))
     observed_gaps = [
@@ -1670,10 +2353,10 @@ def review_specialist_output_llm(
         run_type=run_type,
         deterministic_review=deterministic_review,
     )
-    _, candidate = run_typed_sdk_sync(
-        build_orchestrator_review_agent(model=model),
-        json.dumps(payload, ensure_ascii=True, sort_keys=True),
-        OrchestratorOutputReview,
+    sdk_result = run_typed_sdk_agent(
+        agent=build_orchestrator_review_agent(model=model),
+        typed_input=json.dumps(payload, ensure_ascii=True, sort_keys=True),
+        output_type=OrchestratorOutputReview,
         run_config=run_config,
         live=live,
         workflow_name="Keystone orchestrator LLM output review",
@@ -1683,6 +2366,7 @@ def review_specialist_output_llm(
             "reviewed_agent": _review_agent_key(agent_name),
         },
     )
+    candidate = sdk_result.output
     candidate.review_mode = "llm"
     candidate.reviewed_by = "orchestrator"
     candidate.agent_name = _review_agent_key(candidate.agent_name or agent_name)
@@ -1704,6 +2388,7 @@ def review_specialist_output_llm(
         "Deterministic baseline review was included before the LLM review.",
         "Review payload was compacted and full body fields were omitted to limit cost.",
         "Python validation preserved no-send fields after LLM review.",
+        *_sdk_cost_audit_notes(sdk_result),
     ]
     return _hybridize_llm_review(
         deterministic_review=deterministic_review,
@@ -1764,6 +2449,102 @@ def _post_process_llm_route(
     return candidate
 
 
+def _sdk_cost_audit_notes(result: TypedAgentRunResult[Any]) -> list[str]:
+    """Return compact SDK cost/cache notes without raw prompt or session data."""
+
+    usage = result.usage or {}
+    cost = result.cost or {}
+    request_cache = result.request_cache or {}
+    notes = [
+        (
+            "SDK usage: "
+            f"input_tokens={usage.get('input_tokens')}; "
+            f"cached_input_tokens={usage.get('cached_input_tokens')}; "
+            f"cache_hit_rate={usage.get('cache_hit_rate')}; "
+            f"output_tokens={usage.get('output_tokens')}; "
+            f"reasoning_output_tokens={usage.get('reasoning_output_tokens')}."
+        ),
+        (
+            "SDK estimated cost: "
+            f"estimated_usd={cost.get('estimated_usd', cost.get('amount_usd'))}; "
+            f"source={cost.get('source')}."
+        ),
+    ]
+    if request_cache:
+        static_prefix = str(request_cache.get("static_prefix_sha256") or "")[:12]
+        dynamic_prompt = str(request_cache.get("dynamic_prompt_sha256") or "")[:12]
+        notes.append(
+            "SDK request cache diagnostics: "
+            f"static_prefix={static_prefix}; "
+            f"dynamic_prompt={dynamic_prompt}; "
+            f"dynamic_chars={request_cache.get('dynamic_prompt_chars')}; "
+            f"session_attached={bool(request_cache.get('session_attached'))}."
+        )
+    return notes
+
+
+def _looks_like_chief_of_staff_operational_request(lower: str) -> bool:
+    if "chief of staff" in lower or "slack ops" in lower or "slack operations" in lower:
+        return True
+    action_markers = (
+        "audit",
+        "review",
+        "inspect",
+        "diagnose",
+        "debug",
+        "evaluate",
+        "assess",
+        "recommend",
+        "propose",
+        "identify",
+        "summarize",
+        "list",
+        "check",
+    )
+    if not any(marker in lower for marker in action_markers):
+        return False
+    if "slack" in lower and any(
+        marker in lower
+        for marker in (
+            "thread",
+            "selected message",
+            "selected slack",
+            "operator request",
+            "unresolved",
+            "follow-up",
+            "follow up",
+            "summarize",
+            "channel",
+            "route",
+            "routing",
+            "socket",
+            "post",
+        )
+    ):
+        return True
+    operational_markers = (
+        "business-agent architecture",
+        "business agent architecture",
+        "agent architecture",
+        "architecture changes",
+        "orchestrator",
+        "planner",
+        "manager loop",
+        "implementation step",
+        "implementation steps",
+        "automation",
+        "automations",
+        "workitem",
+        "work item",
+        "bridge",
+        "runtime state",
+        "operator request",
+        "operator requests",
+        "backlog",
+    )
+    return any(marker in lower for marker in operational_markers)
+
+
 def _route_ambiguous_with_llm(
     request: str | Mapping[str, Any] | None,
     *,
@@ -1786,15 +2567,17 @@ def _route_ambiguous_with_llm(
         )
     if run_config is None and not live:
         return None
-    _, candidate = run_typed_sdk_sync(
-        build_orchestrator_agent(model=model),
-        prompt,
-        OrchestratorResult,
+    sdk_result = run_typed_sdk_agent(
+        agent=build_orchestrator_agent(model=model),
+        typed_input=prompt,
+        output_type=OrchestratorResult,
         run_config=run_config,
         live=live,
         workflow_name="Keystone orchestrator LLM routing",
         trace_metadata={"agent": "orchestrator", "routing_mode": "llm"},
     )
+    candidate = sdk_result.output
+    candidate.audit_notes = [*candidate.audit_notes, *_sdk_cost_audit_notes(sdk_result)]
     return _post_process_llm_route(
         candidate,
         request_text=request_text,
@@ -1872,7 +2655,20 @@ def _route_from_manual_plan(
         "opportunity_scout",
         "chief_of_staff",
     }:
-        return _result(
+        if route == "opportunity_scout" and _looks_like_discovery_outreach_workflow(request_text):
+            result = _safe_discovery_outreach_workflow_result(
+                request_text=request_text,
+                approved_context_present=approved_context_present,
+                workflow_state=workflow_state,
+            )
+            result.audit_notes = [*result.audit_notes, *audit_notes]
+            return result
+        workflow = None
+        if route == "gmail_triage":
+            workflow = _gmail_cross_agent_workflow(request_text) or None
+        elif workflow is None and plan.requested_agent == "orchestrator":
+            workflow = _requested_cross_agent_workflow(request_text, start_route=route) or None
+        result = _result(
             route=route,
             rationale=plan.objective
             or f"The manual request plan selected {route} for this request.",
@@ -1886,7 +2682,9 @@ def _route_from_manual_plan(
                 route,
                 request_text=request_text,
             ),
+            workflow=workflow,
         )
+        return _with_crm_write_boundary(result, request_text=request_text)
     return None
 
 
@@ -1910,11 +2708,8 @@ def route_request(
 
     text = _payload_text(request)
     lower_text = text.lower()
-    state_context = (
-        load_workflow_state_context(database_url=database_url)
-        if database_url
-        else _normalize_workflow_state(workflow_state)
-    )
+    loaded_state_context = load_workflow_state_context(database_url=database_url) if database_url else None
+    state_context = _merge_workflow_state_context(loaded_state_context, workflow_state)
     profile_context = approved_company_profile or _mapping_value(
         request,
         "approved_company_profile",
@@ -1948,11 +2743,20 @@ def route_request(
 
     def finish(result: OrchestratorResult) -> OrchestratorResult:
         return _with_operator_feedback_request(
-            result,
+            _with_crm_write_boundary(result, request_text=text),
             include=include_operator_feedback_request,
         )
 
-    if _SEND_RE.search(lower_text):
+    if _looks_like_send_side_effect(text) and _looks_like_discovery_outreach_workflow(text):
+        return finish(
+            _safe_discovery_outreach_workflow_result(
+                request_text=text,
+                approved_context_present=approved_context_present,
+                workflow_state=state_context,
+            )
+        )
+
+    if _looks_like_send_side_effect(text):
         return finish(
             _send_refusal(
                 approved_context_present=approved_context_present,
@@ -1981,8 +2785,41 @@ def route_request(
     if planned_result is not None:
         return finish(planned_result)
 
+    if _looks_like_chief_of_staff_operational_request(lower_text):
+        return finish(
+            _result(
+                route="chief_of_staff",
+                rationale=(
+                    "The request asks for internal operational planning, architecture review, "
+                    "Slack-thread follow-up, automation audit, or WorkItem/bridge diagnostics."
+                ),
+                artifact=("input_type", "slack_channel"),
+                workflow_state=state_context,
+            )
+        )
+
+    if _looks_like_email(request, text):
+        return finish(
+            _result(
+                route="gmail_triage",
+                rationale="The request asks for Gmail or email-thread triage.",
+                artifact=("input_type", "email"),
+                workflow_state=state_context,
+                workflow=_gmail_cross_agent_workflow(text) or None,
+            )
+        )
+
+    if _looks_like_discovery_outreach_workflow(text):
+        return finish(
+            _safe_discovery_outreach_workflow_result(
+                request_text=text,
+                approved_context_present=approved_context_present,
+                workflow_state=state_context,
+            )
+        )
+
     if _OUTREACH_RE.search(lower_text):
-        if _RESEARCH_RE.search(lower_text) and not approved_context_present:
+        if _requires_research_before_outreach(text) and not approved_context_present:
             return finish(
                 _result(
                     route="business_research_analyst",
@@ -2019,13 +2856,23 @@ def route_request(
             )
         )
 
-    if _looks_like_email(request, text):
+    if _looks_like_company(text) and re.search(
+        r"\b(?:research\s+brief|company\s+research|company\s+profile|"
+        r"source-attributed|source\s+attributed|confirmed\s+facts)\b",
+        lower_text,
+    ):
         return finish(
             _result(
-                route="gmail_triage",
-                rationale="The request contains email-like fields or message formatting.",
-                artifact=("input_type", "email"),
+                route="business_research_analyst",
+                rationale=(
+                    "The request asks for a source-backed company research brief; "
+                    "partnership or outreach language is context, not a Scout handoff."
+                ),
                 workflow_state=state_context,
+                retrieval_hint=_route_retrieval_hint(
+                    "business_research_analyst",
+                    request_text=text,
+                ),
             )
         )
 
@@ -2125,6 +2972,7 @@ def _build_read_only_specialist_tools() -> list[Any]:
     from keystone_agents.agents.business_research_analyst import (
         build_business_research_analyst_research_brief_agent,
     )
+    from keystone_agents.agents.opportunity_scout import build_opportunity_scout_agent
 
     business_research_agent = build_business_research_analyst_research_brief_agent()
     business_research_agent.tools = [
@@ -2133,22 +2981,43 @@ def _build_read_only_specialist_tools() -> list[Any]:
         if _tool_name(tool) in _READ_ONLY_BUSINESS_RESEARCH_TOOL_NAMES
     ]
 
-    as_tool = getattr(business_research_agent, "as_tool", None)
-    if not callable(as_tool):
-        return []
-
-    return [
-        as_tool(
-            tool_name=BUSINESS_RESEARCH_TOOL_NAME,
-            tool_description=(
-                "Run the Business Research Analyst for internal, source-attributed "
-                "research synthesis only. This tool is read-only and cannot send, publish, "
-                "schedule, create approval items, or persist memory; Python gates and "
-                "approval policy remain authoritative."
-            ),
-            max_turns=6,
+    tools: list[Any] = []
+    research_as_tool = getattr(business_research_agent, "as_tool", None)
+    if callable(research_as_tool):
+        tools.append(
+            research_as_tool(
+                tool_name=BUSINESS_RESEARCH_TOOL_NAME,
+                tool_description=(
+                    "Run the Business Research Analyst for internal, source-attributed "
+                    "research synthesis only. This tool is read-only and cannot send, publish, "
+                    "schedule, create approval items, or persist memory; Python gates and "
+                    "approval policy remain authoritative."
+                ),
+                max_turns=6,
+            )
         )
+
+    opportunity_agent = build_opportunity_scout_agent()
+    opportunity_agent.tools = [
+        tool
+        for tool in opportunity_agent.tools
+        if _tool_name(tool) in _READ_ONLY_OPPORTUNITY_SCOUT_TOOL_NAMES
     ]
+    opportunity_as_tool = getattr(opportunity_agent, "as_tool", None)
+    if callable(opportunity_as_tool):
+        tools.append(
+            opportunity_as_tool(
+                tool_name=OPPORTUNITY_SCOUT_TOOL_NAME,
+                tool_description=(
+                    "Run Opportunity Scout for read-only discovery, ranking, and internal "
+                    "candidate synthesis. This tool cannot save opportunities, persist memory, "
+                    "write Airtable/Google Workspace records, send, post, schedule, or create "
+                    "approval items."
+                ),
+                max_turns=6,
+            )
+        )
+    return tools
 
 
 def build_orchestrator_agent(

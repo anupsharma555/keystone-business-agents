@@ -13,7 +13,17 @@ The project centers on four business specialist agents:
 - Opportunity Scout Agent: finds or updates opportunity records, scores priority, and preserves approval gates before outreach.
 - Outreach Composer Agent: drafts email or LinkedIn copy only from approved context and marks all output for human approval.
 
-An Orchestrator Agent routes requests to those specialists and preserves an SDK handoff contract. A KNI Chief of Staff Agent plans Slack operations routing and coordinates bounded internal review writes for automation audits, Google Doc dry-runs, Airtable-shaped mirrors, and private/admin Slack summaries. The first end-to-end dry-run workflow calls the specialists in sequence without replacing them. For the two search-heavy routes, `keystone_agents.workflows.run_orchestrated_search_handoff(...)` now carries the orchestrator's `retrieval_hint` directly into Business Research Analyst or Opportunity Scout execution.
+An Orchestrator Agent is the first model control plane for natural-language
+`@KNI`, Slack, WorkItem, scheduled-automation, and explicit named-agent
+requests. It reads the raw request plus compact memory/context, produces route
+advice and blockers, then passes a memo to the selected specialist; explicit
+agent mentions are advisory and do not bypass safety gates. A KNI Chief of
+Staff Agent handles broad operational synthesis and Slack/workflow coordination.
+The first end-to-end dry-run workflow calls the specialists in sequence without
+replacing them. For the two search-heavy routes,
+`keystone_agents.workflows.run_orchestrated_search_handoff(...)` carries the
+orchestrator's `retrieval_hint` directly into Business Research Analyst or
+Opportunity Scout execution.
 
 WorkItem workflows use a typed context-pack layer before specialist execution.
 Research, opportunity, outreach, and Gmail context packs are derived from the
@@ -24,6 +34,9 @@ clarification, research, or approval, but they cannot bypass approval, source,
 recipient, thread, or no-send gates. Each pack also exposes `can_synthesize`,
 `missing_requirements`, and `limitation_notes` so a blocked or partial run says
 which context was unavailable instead of filling gaps.
+
+Current architecture visual:
+`docs/assets/kni-agent-routing-architecture-orchestrator-first-20260525-181618.svg`.
 
 ## Agents SDK Architecture
 
@@ -236,10 +249,12 @@ default dry-run environment, calls without `--agent` use WorkItem mode and save
 local SQLite WorkItem/artifact state plus the `ManualRequestPlan`; direct
 `--agent` calls resolve the named specialist without model execution. In
 `live-test` / `full-live` mode, explicit named-agent calls through `--agent` or
-`@KNI <agent>` auto-enable live SDK model execution unless `--no-live-sdk` is
-passed. Direct live manual calls use the reviewed script-backed paths for
-Business Research Analyst, Opportunity Scout, and Gmail Triage; Outreach
-Composer blocks until approved WorkItem/source context is available.
+`@KNI <agent>` auto-enable live SDK model execution and still use
+Orchestrator-first interpretation before specialist execution unless
+`--no-live-sdk` is passed. Direct live manual calls use the reviewed
+script-backed paths for Business Research Analyst, Opportunity Scout, Gmail
+Triage, and Chief of Staff; Outreach Composer blocks until approved
+WorkItem/source context is available.
 
 WorkItem mode provides the stateful natural-language workflow path:
 

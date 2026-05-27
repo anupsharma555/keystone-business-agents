@@ -54,7 +54,7 @@ def test_weekly_dry_run_uses_save_without_live_flags(
         calls.append({"command": command, "env": kwargs["env"]})
         return _Completed(stdout=_child_payload())
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(automation, "run_isolated_child_process", fake_run)
 
     assert (
         automation.main(
@@ -117,8 +117,8 @@ def test_weekly_blocks_pending_approval_backlog_before_child_run(
         )
     )
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        automation,
+        "run_isolated_child_process",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("child command must not run with pending approvals")
         ),
@@ -146,7 +146,7 @@ def test_gmail_label_preview_is_live_read_with_preview_only(
         calls.append({"command": command, "env": kwargs["env"]})
         return _Completed(stdout=json.dumps({"mode": "live-gmail", "messages": []}))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(automation, "run_isolated_child_process", fake_run)
 
     assert (
         automation.main(
@@ -220,8 +220,8 @@ def test_existing_lock_blocks_automation_before_child_run(
     lock_file = tmp_path / "automation.lock"
     lock_file.write_text("pid=123\n", encoding="utf-8")
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        automation,
+        "run_isolated_child_process",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("child command must not run while locked")
         ),
@@ -246,8 +246,8 @@ def test_child_failure_is_redacted_and_returns_child_code(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        automation,
+        "run_isolated_child_process",
         lambda *_args, **_kwargs: _Completed(
             stderr="failed with token=sk-" + ("x" * 24),
             returncode=7,
@@ -270,3 +270,32 @@ def test_child_failure_is_redacted_and_returns_child_code(
     assert "[REDACTED]" in captured.err
     runs = SQLiteStore(_db_url(tmp_path / "weekly.db")).list_automation_runs(status="failed")
     assert runs[0].status.value == "failed"
+
+
+def test_child_timeout_returns_failed_automation_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def timeout_run(command: list[str], **kwargs: Any) -> _Completed:
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 1), output="", stderr="")
+
+    monkeypatch.setattr(automation, "run_isolated_child_process", timeout_run)
+
+    code = automation.main(
+        [
+            *_base_args(tmp_path),
+            "--timeout-seconds",
+            "1",
+            "weekly-opportunity",
+            "--database-url",
+            _db_url(tmp_path / "weekly.db"),
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert code == 124
+    assert output["automation"]["returncode"] == 124
+    runs = SQLiteStore(_db_url(tmp_path / "weekly.db")).list_automation_runs(status="failed")
+    assert runs[0].status.value == "failed"
+    assert "timed out after 1 seconds" in runs[0].failure_summary

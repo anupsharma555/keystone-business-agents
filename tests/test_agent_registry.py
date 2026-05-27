@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -18,15 +20,74 @@ from keystone_agents.agent_tool_policy import (
     tool_policy_for_agent,
 )
 from keystone_agents.agents.orchestrator import INTENDED_HANDOFFS, build_orchestrator_agent
-from keystone_agents.sdk import Agent, build_sdk_agent, prompt_metadata_for_files
+from keystone_agents.sdk import Agent, build_model_settings, build_sdk_agent, prompt_metadata_for_files
 from keystone_agents.tools.gmail_tool import get_gmail_message
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROMPTS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "prompts"
 
+STATIC_PREFIX_FINGERPRINTS = {
+    "gmail_triage": {
+        "instructions_sha256": "fa176767488c1c8a785efc9f06604a2658d3c24dc070e54366938e7e7f8ede02",
+        "tool_names_sha256": "7f8aa859104bbb74f20effcc9ea3df828444a7a5e6ee333faaa4308f214a7b1a",
+        "output_schema_sha256": "563358d4e138654b23fb9567b06c639a66127dcfd6a3182a497b20a32dc166de",
+    },
+    "business_research_analyst": {
+        "instructions_sha256": "1aec6df1526b588cf0ecea99ab8a677da6e58f88d9a6e18b2d5fbf58b6a3953b",
+        "tool_names_sha256": "dc99c3bef9ef99b28c0fefeb017783195c895dc2c819670275e860e8b2fc16fa",
+        "output_schema_sha256": "b8218a333d85d2f3850203f5ee48b7ec535a6f924a8851c513f1f2b2afeef6e0",
+    },
+    "opportunity_scout": {
+        "instructions_sha256": "b43bd24fcd19ae5ea4ec969982e26645477d866881ccb3df7b8e316ea832a809",
+        "tool_names_sha256": "cfd3e659bff1d1d5a9d2c9d3ed823f9261df6f5e5197fd50d51d96c069b34e66",
+        "output_schema_sha256": "22c09ac037393656df1fefd353d96d9bec9ab1660a2e5f982d38931d6f853f1d",
+    },
+    "outreach_composer": {
+        "instructions_sha256": "bfdee60a885271b37e843dc98ec5efe090501365a947bc5f25f1e77e91fd93db",
+        "tool_names_sha256": "ef26ea7d5fdaaa5e435c8e4d6dee0521dd07a8ddf663dc12bcec3116a9592585",
+        "output_schema_sha256": "5e4058860ec6e78c237e2237926b047ed619f985c10bb65e0d6f11bc78833866",
+    },
+    "orchestrator": {
+        "instructions_sha256": "25d403e757aeb29a1eb3aff7caa7f76f21854270ec2a39b4137ba9efbb4496ce",
+        "tool_names_sha256": "1c2bf4210e21e89f1381c3fc9e33b1480130220b362593845c47475e93b2f925",
+        "output_schema_sha256": "89d3c6cd618bcd2546fd63fdbd9de221cf4db20af407030347d7f64c0a646e8b",
+    },
+    "chief_of_staff": {
+        "instructions_sha256": "952988dd6552a42a8c26ea039f7008551ef06d6a942817e4e48f157342be1cd2",
+        "tool_names_sha256": "7eb39fa7ca936b8307f679537f03f155e6a41e71280a9d22b0c9ea46ad881d63",
+        "output_schema_sha256": "f49f2a14aa9cc2731a480fb6b88725550a47dfec19248ee18de2791e6b9005ce",
+    },
+}
+
 
 def _tool_names(agent: Agent) -> set[str]:
     return {getattr(tool, "name", "") for tool in agent.tools}
+
+
+def _ordered_tool_names(agent: Agent) -> list[str]:
+    return [str(getattr(tool, "name", getattr(tool, "__name__", "")) or "") for tool in agent.tools]
+
+
+def _sha256(value: object) -> str:
+    if isinstance(value, str):
+        payload = value.encode("utf-8")
+    else:
+        payload = json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _static_prefix_fingerprint(agent: Agent) -> dict[str, str]:
+    schema = agent.output_type.model_json_schema() if agent.output_type is not None else {}
+    return {
+        "instructions_sha256": _sha256(str(agent.instructions)),
+        "tool_names_sha256": _sha256(_ordered_tool_names(agent)),
+        "output_schema_sha256": _sha256(schema),
+    }
 
 
 def test_registry_has_canonical_agents() -> None:
@@ -77,6 +138,59 @@ def test_registered_builders_match_declared_schema_and_tools() -> None:
         assert agent.output_guardrails
 
 
+def test_build_model_settings_defaults_to_usage_and_prompt_cache(monkeypatch) -> None:
+    monkeypatch.delenv("KEYSTONE_SDK_INCLUDE_USAGE", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_PROMPT_CACHE_RETENTION", raising=False)
+
+    settings = build_model_settings(reasoning_effort="low", max_tokens=500)
+
+    assert getattr(settings, "include_usage", None) is True
+    assert getattr(settings, "prompt_cache_retention", None) == "24h"
+
+
+def test_build_sdk_agent_applies_cache_friendly_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("KEYSTONE_SDK_INCLUDE_USAGE", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_PROMPT_CACHE_RETENTION", raising=False)
+
+    agent = build_sdk_agent(
+        name="cache_default_test",
+        instructions="Keystone test agent.",
+        output_type=None,
+        tools=[],
+        policy_agent_name=None,
+    )
+
+    assert getattr(agent.model_settings, "include_usage", None) is True
+    assert getattr(agent.model_settings, "prompt_cache_retention", None) == "24h"
+
+
+def test_build_sdk_agent_allows_cache_defaults_to_be_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("KEYSTONE_SDK_INCLUDE_USAGE", "false")
+    monkeypatch.setenv("KEYSTONE_SDK_PROMPT_CACHE_RETENTION", "off")
+
+    agent = build_sdk_agent(
+        name="cache_disabled_test",
+        instructions="Keystone test agent.",
+        output_type=None,
+        tools=[],
+        policy_agent_name=None,
+    )
+
+    assert getattr(agent.model_settings, "include_usage", None) is False
+    assert getattr(agent.model_settings, "prompt_cache_retention", None) is None
+
+
+def test_registered_agents_use_cache_friendly_model_settings(monkeypatch) -> None:
+    monkeypatch.delenv("KEYSTONE_SDK_INCLUDE_USAGE", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_PROMPT_CACHE_RETENTION", raising=False)
+
+    for spec in REGISTERED_AGENT_SPECS:
+        agent = spec.build_agent()
+
+        assert getattr(agent.model_settings, "include_usage", None) is True
+        assert getattr(agent.model_settings, "prompt_cache_retention", None) == "24h"
+
+
 def test_registered_agent_tools_follow_controlled_tool_policy() -> None:
     for spec in REGISTERED_AGENT_SPECS:
         policy = tool_policy_for_agent(spec.route_name)
@@ -88,6 +202,56 @@ def test_registered_agent_tools_follow_controlled_tool_policy() -> None:
     assert outreach_policy is not None
     assert "search_web" in outreach_policy.allowed_tool_names
     assert "get_gmail_message" not in outreach_policy.allowed_tool_names
+
+
+def test_registered_agent_static_prefix_fingerprints_are_stable(monkeypatch) -> None:
+    """Guard the cache-sensitive prompt prefix: instructions, tools, and schema."""
+
+    monkeypatch.delenv("KEYSTONE_ORCHESTRATOR_SPECIALIST_TOOLS", raising=False)
+    assert set(STATIC_PREFIX_FINGERPRINTS) == {spec.route_name for spec in REGISTERED_AGENT_SPECS}
+
+    for spec in REGISTERED_AGENT_SPECS:
+        first_agent = spec.build_agent()
+        second_agent = spec.build_agent()
+
+        assert _static_prefix_fingerprint(first_agent) == STATIC_PREFIX_FINGERPRINTS[
+            spec.route_name
+        ]
+        assert _static_prefix_fingerprint(first_agent) == _static_prefix_fingerprint(second_agent)
+        assert _ordered_tool_names(first_agent) == _ordered_tool_names(second_agent)
+        assert "<!-- AGENTS.md -->" in str(first_agent.instructions)
+        assert "<!-- safety_policy.md -->" in str(first_agent.instructions)
+
+
+def test_orchestrator_registry_declares_read_only_specialist_tools() -> None:
+    spec = AGENT_REGISTRY["orchestrator"]
+    policy = tool_policy_for_agent("orchestrator")
+    default_agent = build_orchestrator_agent()
+    opted_in_agent = build_orchestrator_agent(include_handoffs=False, include_specialist_tools=True)
+    default_tool_names = _tool_names(default_agent)
+    opted_in_tool_names = _tool_names(opted_in_agent)
+
+    for tool_name in (
+        "business_research_analyst_research_brief",
+        "opportunity_scout_read_only",
+    ):
+        assert tool_name in spec.optional_tools
+        assert policy is not None and tool_name in policy.allowed_tool_names
+        assert tool_name not in default_tool_names
+        assert tool_name in opted_in_tool_names
+
+
+def test_orchestrator_registry_declares_control_plane_bridge_coverage() -> None:
+    spec = AGENT_REGISTRY["orchestrator"]
+
+    assert "raw Keystone requests first" in spec.handoff_description
+    assert "compact preflight context" in spec.handoff_description
+    assert "review specialist outputs" in spec.handoff_description
+    assert "tests/test_orchestrator_preflight_context.py" in spec.validation_paths
+    assert "tests/test_workflow_runner.py" in spec.validation_paths
+    assert "tests/test_slack_action_contract.py" in spec.validation_paths
+    assert "tests/test_slack_agent_actions.py" in spec.validation_paths
+    assert "Manager-loop reviews feed final response synthesis" in spec.safety_notes
 
 
 def test_runtime_tool_policy_rejects_disallowed_tools() -> None:
@@ -130,6 +294,7 @@ def test_agent_cards_are_json_safe_extension_metadata() -> None:
     for card in cards:
         assert isinstance(card["prompt_files"], list)
         assert isinstance(card["tools"], list)
+        assert isinstance(card["optional_tools"], list)
         assert isinstance(card["safety_notes"], list)
         assert "skills.md" in card["prompt_files"]
         assert "skills" not in card

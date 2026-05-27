@@ -1049,6 +1049,8 @@ def test_gmail_gt1_priority_grouping_cli_uses_llm_batch_pipeline(
             str(FIXTURES / "sample_email_collaboration.txt"),
             str(FIXTURES / "sample_email_newsletter.txt"),
             str(FIXTURES / "sample_email_vendor.txt"),
+            "--request",
+            "Prioritize emails for partnership follow-up and ignore vendor newsletters.",
             "--run-sdk",
             "--test-pack-report-dir",
             str(tmp_path),
@@ -1070,6 +1072,7 @@ def test_gmail_gt1_priority_grouping_cli_uses_llm_batch_pipeline(
     assert payload["priority_grouping"] is True
     assert payload["output_type"] == "GmailPriorityGroupingResult"
     assert len(typed_input.messages) == 4
+    assert "Operator request: Prioritize emails for partnership follow-up" in prompt
     assert "Review my emails from the last 3 days" in prompt
     assert "Draft replies only for urgent items" in prompt
     assert "founder_fit_test" in prompt
