@@ -6,6 +6,15 @@ workflows. Slack is the request and review surface. SQLite remains the audit
 record. Keystone still does not send external email, publish outbound copy, or
 approve work automatically.
 
+The current path is Orchestrator-first. The bridge passes the raw Slack request,
+selected-message context, compact thread replies, prior same-thread run
+summaries, WorkItem metadata, and channel automation hints into Keystone before
+specialist execution. Orchestrator preflight reads that context and writes
+route advice, blockers, retrieval hints, and planner rationale. Specialists
+then receive the raw request plus the Orchestrator memo/context; deterministic
+Python gates still own approvals, exact record identity, source sufficiency,
+and side-effect blocking.
+
 ## Safe Operating Model
 
 - Dry-run is the default in this repo.
@@ -83,6 +92,9 @@ tokens, or verbose traces.
 5. `@KNI workitem continue <work_item_id>` advances an existing WorkItem. With
    `KNI_BUSINESS_AGENTS_LANGGRAPH=true`, the same command records a
    `langgraph_orchestration` timeline event and a stable graph thread key.
+   Direct Slack WorkItem actions keep the deterministic target WorkItem/route,
+   attach Orchestrator preflight context, and record an
+   `orchestrator_action_review` event after execution.
 6. A human approval updates SQLite approval state. If
    `KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS=true`, an approved email item may
    create a Gmail draft only when the approval card says it is for saving a
@@ -104,6 +116,7 @@ required local config or declared Slack scopes.
 The bridge has fixture-mode smoke coverage for the highest-risk cross-repo
 contracts: status command construction, natural-language WorkItem creation,
 WorkItem continuation, selected Slack context handoff, approval actions that do
-not send externally, child-process environment propagation, and live flag
-defaults. These tests should stay deterministic and must not depend on network,
-real Slack APIs, real Gmail, or live model calls.
+not send externally, Orchestrator preflight/review metadata on Slack actions,
+child-process environment propagation, and live flag defaults. These tests
+should stay deterministic and must not depend on network, real Slack APIs, real
+Gmail, or live model calls.

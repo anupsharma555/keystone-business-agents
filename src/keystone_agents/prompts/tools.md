@@ -3,7 +3,7 @@ prompt_name: tools
 prompt_version: 2026-05-20.1
 prompt_purpose: Shared Keystone SDK tool policy, registry, and future tool backlog.
 prompt_safety_notes: Tools must be explicit wrappers with guardrails, dry-run defaults, source attribution, redaction, and no send path.
-prompt_eval_datasets: tests/evals/gmail_triage_cases.json, tests/evals/business_research_analyst_cases.json, tests/evals/opportunity_scout_cases.json, tests/evals/outreach_composer_cases.json
+prompt_eval_datasets: evals/static/gmail_triage_cases.json, evals/static/business_research_analyst_cases.json, evals/static/opportunity_scout_cases.json, evals/static/outreach_composer_cases.json
 -->
 
 # Keystone Agent Tools

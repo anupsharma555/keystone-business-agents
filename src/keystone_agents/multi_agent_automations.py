@@ -19,12 +19,12 @@ from keystone_agents.agents.business_research_analyst import (
 )
 from keystone_agents.agents.chief_of_staff import run_chief_of_staff_sdk
 from keystone_agents.agents.opportunity_scout import run_opportunity_scout_sdk
-from keystone_agents.agents.orchestrator import run_orchestrator_sdk
+from keystone_agents.agents.orchestrator import review_specialist_output, run_orchestrator_sdk
 from keystone_agents.config import load_settings
 from keystone_agents.models import OpportunityScoutSDKInput, ResearchSDKInput
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
-from keystone_agents.schemas.orchestrator import OrchestratorResult
+from keystone_agents.schemas.orchestrator import OrchestratorOutputReview, OrchestratorResult
 from keystone_agents.schemas.research import ResearchBrief
 from keystone_agents.tools.search_provider import (
     SearchProviderConfigurationError,
@@ -193,6 +193,7 @@ class MeetingPrepAutomationResult(BaseModel):
     gmail_writes_enabled: bool = False
     crm_writes_enabled: bool = False
     slack_post_allowed: bool = True
+    orchestrator_review: OrchestratorOutputReview | None = None
 
 
 class AnnouncementLinkInput(BaseModel):
@@ -239,6 +240,7 @@ class AnnouncementResearchAutomationResult(BaseModel):
             "business_research_analyst",
         ]
     )
+    orchestrator_review: OrchestratorOutputReview | None = None
 
 
 class GitHubRepositoryOpportunity(BaseModel):
@@ -293,6 +295,7 @@ class GitHubRepoOpportunityAutomationResult(BaseModel):
             "business_research_analyst",
         ]
     )
+    orchestrator_review: OrchestratorOutputReview | None = None
 
 
 def run_meeting_prep_automation(
@@ -324,13 +327,18 @@ def run_meeting_prep_automation(
             f"No high-salience meeting preparation items were found for {window}. "
             "I did not write to Calendar, Gmail, CRM, or any external system."
         )
-        return MeetingPrepAutomationResult(
+        result = MeetingPrepAutomationResult(
             status="no_prep_needed",
             window=window,
             slack_text=text,
             diagnostics=diagnostics or ["No prep-worthy calendar items selected."],
             live_sdk_requested=bool(live_sdk),
             live_search_requested=bool(live_search),
+        )
+        return _attach_automation_orchestrator_review(
+            result,
+            agent_name="chief_of_staff",
+            request_summary=f"Scheduled meeting prep automation for {window}",
         )
 
     lines = [
@@ -359,7 +367,7 @@ def run_meeting_prep_automation(
             "No calendar writes, Gmail sends, CRM updates, or external publications were performed.",
         ]
     )
-    return MeetingPrepAutomationResult(
+    result = MeetingPrepAutomationResult(
         status="ok",
         window=window,
         selected_count=len(selected),
@@ -368,6 +376,11 @@ def run_meeting_prep_automation(
         diagnostics=diagnostics,
         live_sdk_requested=bool(live_sdk),
         live_search_requested=bool(live_search),
+    )
+    return _attach_automation_orchestrator_review(
+        result,
+        agent_name="chief_of_staff",
+        request_summary=f"Scheduled meeting prep automation for {window}",
     )
 
 
@@ -457,12 +470,17 @@ def run_announcements_research_synthesis(
             "No sufficiently relevant announcement links were found in the supplied seven-day context. "
             "No external writes were performed."
         )
-        return AnnouncementResearchAutomationResult(
+        result = AnnouncementResearchAutomationResult(
             status="empty",
             slack_text=text,
             diagnostics=diagnostics or ["No announcement links were available for synthesis."],
             live_sdk_requested=bool(live_sdk),
             live_search_requested=bool(live_search),
+        )
+        return _attach_automation_orchestrator_review(
+            result,
+            agent_name="business_research_analyst",
+            request_summary="Scheduled announcements research synthesis",
         )
 
     if len(summaries) < min_items:
@@ -490,7 +508,7 @@ def run_announcements_research_synthesis(
             "No calendar writes, Gmail sends, CRM updates, or external publications were performed.",
         ]
     )
-    return AnnouncementResearchAutomationResult(
+    result = AnnouncementResearchAutomationResult(
         status="ok",
         selected_count=len(summaries),
         summaries=summaries,
@@ -498,6 +516,11 @@ def run_announcements_research_synthesis(
         diagnostics=diagnostics,
         live_sdk_requested=bool(live_sdk),
         live_search_requested=bool(live_search),
+    )
+    return _attach_automation_orchestrator_review(
+        result,
+        agent_name="business_research_analyst",
+        request_summary="Scheduled announcements research synthesis",
     )
 
 
@@ -574,7 +597,7 @@ def run_github_repo_opportunities(
             "No GitHub writes, Slack broadcasts, Gmail sends, CRM updates, Calendar writes, "
             "Drive edits, or Airtable writes were performed."
         )
-        return GitHubRepoOpportunityAutomationResult(
+        result = GitHubRepoOpportunityAutomationResult(
             status="empty",
             slack_text=text,
             diagnostics=diagnostics or ["No repository candidates were available."],
@@ -582,6 +605,11 @@ def run_github_repo_opportunities(
             live_search_requested=bool(live_search),
             learning_notes=learning_notes,
             future_query_suggestions=future_query_suggestions,
+        )
+        return _attach_automation_orchestrator_review(
+            result,
+            agent_name="opportunity_scout",
+            request_summary=f"Scheduled GitHub repository opportunity scan for {target}",
         )
 
     lines = [
@@ -631,7 +659,7 @@ def run_github_repo_opportunities(
             "No GitHub writes, Slack broadcasts, Gmail sends, CRM updates, Calendar writes, Drive edits, or Airtable writes were performed.",
         ]
     )
-    return GitHubRepoOpportunityAutomationResult(
+    result = GitHubRepoOpportunityAutomationResult(
         status="ok",
         selected_count=len(selected),
         repositories=selected,
@@ -641,6 +669,38 @@ def run_github_repo_opportunities(
         live_search_requested=bool(live_search),
         learning_notes=learning_notes,
         future_query_suggestions=future_query_suggestions,
+    )
+    return _attach_automation_orchestrator_review(
+        result,
+        agent_name="opportunity_scout",
+        request_summary=f"Scheduled GitHub repository opportunity scan for {target}",
+    )
+
+
+def _attach_automation_orchestrator_review(
+    result: Any,
+    *,
+    agent_name: str,
+    request_summary: str,
+) -> Any:
+    """Attach deterministic Orchestrator review metadata to Slack-facing automation output."""
+
+    payload = result.model_dump(mode="json", exclude={"orchestrator_review"})
+    review = review_specialist_output(
+        agent_name=agent_name,
+        output=payload,
+        request_summary=request_summary,
+        run_type=f"scheduled_{payload.get('kind', 'automation')}",
+    )
+    diagnostics = list(getattr(result, "diagnostics", []) or [])
+    diagnostics.append(
+        f"Orchestrator automation review: {review.status} ({review.overall_score}/100)."
+    )
+    return result.model_copy(
+        update={
+            "orchestrator_review": review,
+            "diagnostics": diagnostics,
+        }
     )
 
 

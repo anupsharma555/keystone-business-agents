@@ -573,6 +573,7 @@ class AgentsWebSearchProvider:
     external_web_access: bool = True
     model: str | None = None
     runner: Callable[[str, SearchRequest], Any] | None = None
+    _last_credit_usage: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     @property
     def provider_name(self) -> str:
@@ -602,6 +603,7 @@ class AgentsWebSearchProvider:
             return enforce_tool_output_guardrails("agents_web_search", [])
         prompt = _agents_web_search_prompt(request)
         if self.runner is not None:
+            object.__setattr__(self, "_last_credit_usage", {})
             output = self.runner(prompt, request)
         else:
             self._validate_live_configuration()
@@ -642,7 +644,8 @@ class AgentsWebSearchProvider:
     def _run_live(self, prompt: str) -> Any:
         try:
             from keystone_agents.model_provider import get_model_config
-            from keystone_agents.sdk import WebSearchTool, build_sdk_agent, run_sdk_sync
+            from keystone_agents.run import run_typed_sdk_agent
+            from keystone_agents.sdk import WebSearchTool, build_sdk_agent
 
             model_config = get_model_config()
             if self.model is not None:
@@ -664,21 +667,43 @@ class AgentsWebSearchProvider:
                 ],
                 model=self.model,
             )
-            run_result = run_sdk_sync(
-                agent,
-                prompt,
+            run_result = run_typed_sdk_agent(
+                agent=agent,
+                typed_input=prompt,
+                output_type=AgentsWebSearchOutput,
+                live=True,
                 config=model_config,
                 workflow_name="Keystone hosted web search fallback",
                 tracing_disabled=True,
                 trace_include_sensitive_data=False,
             )
-            return getattr(run_result, "final_output", run_result)
+            usage = dict(run_result.usage or {})
+            cost = dict(run_result.cost or {})
+            object.__setattr__(
+                self,
+                "_last_credit_usage",
+                {
+                    "request_credits": 1,
+                    "usage_source": "agents_sdk_usage",
+                    "input_tokens": usage.get("input_tokens"),
+                    "cached_input_tokens": usage.get("cached_input_tokens"),
+                    "output_tokens": usage.get("output_tokens"),
+                    "reasoning_output_tokens": usage.get("reasoning_output_tokens"),
+                    "cache_hit_rate": usage.get("cache_hit_rate"),
+                    "estimated_usd": cost.get("estimated_usd", cost.get("amount_usd")),
+                    "cost_source": cost.get("source"),
+                },
+            )
+            return run_result.output
         except SearchProviderConfigurationError:
             raise
         except Exception as exc:
             raise AgentsWebSearchError(
                 f"Agents SDK hosted web search failed: {type(exc).__name__}: {exc}"
             ) from exc
+
+    def last_credit_usage(self) -> dict[str, Any]:
+        return dict(self._last_credit_usage)
 
 
 def build_search_provider(

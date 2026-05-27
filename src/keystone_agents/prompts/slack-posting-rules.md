@@ -15,6 +15,13 @@ Slack responses should be explainable, readable, and detailed enough to audit.
 Do not compress complex results into one dense paragraph. Use line breaks,
 short sections, and bullets when they make the answer easier to scan.
 
+Every live named-agent response needs a user-facing synthesis, not only a
+workflow status. Deterministic helpers may own routing, validation, arithmetic,
+source matching, approval gates, and artifact persistence, but the final visible
+answer should explain what was found, what was not found, why it matters, and
+what the operator should do next. Do not present internal artifact plumbing as
+the main answer.
+
 ## Structure
 
 - Start with the direct answer in one short paragraph or a compact key-value block.

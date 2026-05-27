@@ -175,6 +175,21 @@ def test_research_sdk_input_describes_zotero_collection_contract() -> None:
     assert "Do not invent authors" in prompt
 
 
+def test_retrieved_research_context_stays_out_of_agent_instructions() -> None:
+    marker = "RUN-SPECIFIC-RETRIEVED-CONTEXT-MARKER"
+    agent = build_business_research_analyst_research_brief_agent()
+    prompt = ResearchSDKInput(
+        target_name="Cache safety review",
+        target_type="topic",
+        research_goal="Confirm retrieved context placement.",
+        source_context=f"{marker}: retrieved source bundle for this run only.",
+    ).to_prompt()
+
+    assert marker not in agent.instructions
+    assert marker in prompt
+    assert prompt.index("Target: Cache safety review") < prompt.index(marker)
+
+
 def test_research_brief_schema_supports_article_collection_summary() -> None:
     brief = ResearchBrief(
         target_name="Ketamine depression Zotero collection",
@@ -888,6 +903,43 @@ def test_source_bundle_synthesis_uses_only_source_records() -> None:
     assert profile.description == "BundleTrial builds clinical AI software for evidence generation."
     assert "proven results" not in "\n".join(profile.evidence).lower()
     assert all(claim.source_id == "company:about" for claim in profile.claims)
+
+
+def test_source_bundle_serialization_is_deterministic_for_identical_inputs() -> None:
+    source_payloads = [
+        {
+            "source_id": "company:about",
+            "url": "https://www.bundletrial.example/about",
+            "title": "BundleTrial About",
+            "source_type": "website",
+            "claims": ["BundleTrial builds clinical AI software for evidence generation."],
+        },
+        {
+            "source_id": "news:launch",
+            "url": "https://www.reuters.com/example/bundletrial-launch",
+            "title": "BundleTrial launch",
+            "source_type": "news",
+            "published_at": "2026-04-01",
+            "claims": ["BundleTrial announced a clinical validation partnership."],
+        },
+    ]
+
+    first = build_source_bundle_for_synthesis(
+        company_name="BundleTrial",
+        company_url="https://www.bundletrial.example",
+        source_payloads=source_payloads,
+    )
+    second = build_source_bundle_for_synthesis(
+        company_name="BundleTrial",
+        company_url="https://www.bundletrial.example",
+        source_payloads=source_payloads,
+    )
+
+    assert json.dumps(first, ensure_ascii=True, sort_keys=True) == json.dumps(
+        second,
+        ensure_ascii=True,
+        sort_keys=True,
+    )
 
 
 def test_multi_source_research_aggregation_scores_high_confidence() -> None:

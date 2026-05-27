@@ -278,6 +278,7 @@ def sdk_synthesis_payload(
         "sdk_synthesis_seconds": sdk_seconds,
         "usage": jsonable(outcome.usage),
         "cost": jsonable(outcome.cost),
+        "request_cache": jsonable(outcome.request_cache),
         "budget_guard": jsonable(outcome.budget_guard),
         "gemini_free_tier_usage": jsonable(
             outcome.provider_usage_context

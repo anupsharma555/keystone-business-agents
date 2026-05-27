@@ -16,6 +16,7 @@ from keystone_agents.sdk_sessions import (
     context_file_session_components,
     derive_sdk_session_id,
     resolve_sdk_session_spec,
+    session_audit_metadata,
     sdk_session_env,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore
@@ -60,6 +61,31 @@ def test_slack_context_file_can_scope_session_without_raw_values(tmp_path: Path)
     assert "C456" not in spec.session_id
 
 
+def test_slack_history_context_file_scopes_session_to_thread(tmp_path: Path) -> None:
+    context_path = tmp_path / "slack-history.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C456",
+                "thread_ts": "1715366400.000100",
+                "request_ts": "1715366460.000200",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    scope, components = context_file_session_components(context_path) or ("", ())
+    spec = resolve_sdk_session_spec(scope=scope, components=components, default_enabled=True)
+
+    assert scope == "slack"
+    assert components == ("", "C456", "1715366400.000100")
+    assert spec.enabled is True
+    assert spec.scope == "slack"
+    assert "C456" not in spec.session_id
+    assert "1715366400" not in spec.session_id
+
+
 def test_build_sdk_session_from_env_uses_explicit_env(monkeypatch, tmp_path: Path) -> None:
     calls: list[tuple[str, str]] = []
 
@@ -72,13 +98,19 @@ def test_build_sdk_session_from_env_uses_explicit_env(monkeypatch, tmp_path: Pat
         fake_build_sqlite_session,
     )
     monkeypatch.setenv(SDK_SESSIONS_ENABLED_ENV, "true")
-    monkeypatch.setenv(SDK_SESSION_ID_ENV, "kba_ask_abc123")
+    session_id = derive_sdk_session_id("ask", ("abc123",))
+    monkeypatch.setenv(SDK_SESSION_ID_ENV, session_id)
     monkeypatch.setenv(SDK_SESSION_DB_ENV, str(tmp_path / "sessions.sqlite3"))
 
     session = build_sdk_session_from_env()
 
     assert session is not None
-    assert calls == [("kba_ask_abc123", str(tmp_path / "sessions.sqlite3"))]
+    assert calls == [(session_id, str(tmp_path / "sessions.sqlite3"))]
+    metadata = session_audit_metadata(session)
+    assert metadata["scope"] == "ask"
+    assert metadata["source"] == "env"
+    assert metadata["session_id_hash"]
+    assert "abc123" not in json.dumps(metadata)
 
 
 def test_sdk_session_from_args_honors_default_enabled_without_flags(

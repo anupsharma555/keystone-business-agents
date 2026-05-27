@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,11 +20,18 @@ class OpportunitySearchPlannerInput:
     request_text: str
     desired_count: int = 5
     fallback_plan: OpportunitySearchPlan | None = None
+    planner_context: str = ""
 
     def to_prompt(self) -> str:
         fallback = self.fallback_plan or infer_opportunity_search_plan(
             self.request_text,
             desired_count=self.desired_count,
+        )
+        planner_context = (
+            "Orchestrator and WorkItem context for this planning pass:\n"
+            f"{self.planner_context}\n\n"
+            if self.planner_context
+            else ""
         )
         return (
             "Plan Opportunity Scout retrieval for this operator request.\n\n"
@@ -31,6 +39,7 @@ class OpportunitySearchPlannerInput:
             f"Operator request: {self.request_text}\n\n"
             "Local fallback plan for reference:\n"
             f"{fallback.model_dump_json(indent=2)}\n\n"
+            f"{planner_context}"
             "Return only a valid OpportunitySearchPlan."
         )
 
@@ -60,6 +69,8 @@ def resolve_opportunity_search_plan(
     live: bool = False,
     run_config: Any | None = None,
     model: str | None = None,
+    planner_context: str = "",
+    cost_callback: Callable[[Any], None] | None = None,
 ) -> OpportunitySearchPlan:
     """Return an LLM search plan when requested, otherwise the local fallback."""
 
@@ -73,6 +84,7 @@ def resolve_opportunity_search_plan(
                 request_text=str(request_text or ""),
                 desired_count=desired_count,
                 fallback_plan=fallback,
+                planner_context=planner_context,
             ),
             output_type=OpportunitySearchPlan,
             run_config=run_config,
@@ -80,6 +92,8 @@ def resolve_opportunity_search_plan(
             workflow_name="Keystone opportunity search planning",
             tracing_disabled=True,
         )
+        if cost_callback is not None:
+            cost_callback(result)
     except Exception as exc:
         return fallback.model_copy(
             update={

@@ -3,7 +3,7 @@ prompt_name: gmail_triage
 prompt_version: 2026-05-20.1
 prompt_purpose: Inbound Gmail classification, labeling, safety triage, and draft guidance.
 prompt_safety_notes: Draft-only replies; no PHI processing; human approval required; Workspace artifacts stay internal and approval-gated.
-prompt_eval_datasets: tests/evals/gmail_triage_cases.json, evals/gmail_triage.jsonl
+prompt_eval_datasets: evals/static/gmail_triage_cases.json, evals/local/gmail_triage.jsonl
 -->
 
 # Gmail Triage Agent

@@ -12,7 +12,7 @@ import inspect
 import json
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from functools import wraps
 from importlib import resources
 from pathlib import Path
@@ -95,6 +95,10 @@ DEFAULT_LIVE_MODEL_TIMEOUT_SECONDS = 45.0
 DEFAULT_LIVE_MODEL_MAX_RETRIES = 0
 LIVE_MODEL_TIMEOUT_SECONDS_ENV = "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS"
 LIVE_MODEL_MAX_RETRIES_ENV = "KEYSTONE_LIVE_MODEL_MAX_RETRIES"
+SDK_INCLUDE_USAGE_ENV = "KEYSTONE_SDK_INCLUDE_USAGE"
+SDK_PROMPT_CACHE_RETENTION_ENV = "KEYSTONE_SDK_PROMPT_CACHE_RETENTION"
+DEFAULT_PROMPT_CACHE_RETENTION = "24h"
+_FALSE_ENV_VALUES = {"", "0", "false", "no", "off", "disabled"}
 
 if _SDK_IMPORT_ERROR is not None:
     _SANDBOX_IMPORT_ERROR: ImportError | None = _SDK_IMPORT_ERROR
@@ -649,7 +653,7 @@ def build_sdk_agent(
             instructions=instructions,
             handoff_description=handoff_description,
             model=selected_model,
-            model_settings=model_settings,
+            model_settings=_cache_friendly_model_settings(model_settings),
             tools=tools_list,
             handoffs=handoffs_list,
             output_type=output_type,
@@ -662,7 +666,7 @@ def build_sdk_agent(
         handoff_description=handoff_description,
         instructions=instructions,
         model=selected_model,
-        model_settings=model_settings or ModelSettings(),
+        model_settings=_cache_friendly_model_settings(model_settings),
         tools=sdk_tools_list,
         handoffs=handoffs_list,
         output_type=output_type,
@@ -711,17 +715,58 @@ def build_model_settings(
     """Build Agents SDK model settings when the installed SDK supports them."""
 
     if _SDK_IMPORT_ERROR is not None:
-        return {
-            "reasoning": {"effort": reasoning_effort} if reasoning_effort else None,
-            "verbosity": verbosity,
-            "max_tokens": max_tokens,
-        }
+        return _cache_friendly_model_settings(
+            {
+                "reasoning": {"effort": reasoning_effort} if reasoning_effort else None,
+                "verbosity": verbosity,
+                "max_tokens": max_tokens,
+            }
+        )
     reasoning = Reasoning(effort=reasoning_effort) if reasoning_effort else None
-    return ModelSettings(
-        reasoning=reasoning,
-        verbosity=verbosity,
-        max_tokens=max_tokens,
+    return _cache_friendly_model_settings(
+        ModelSettings(
+            reasoning=reasoning,
+            verbosity=verbosity,
+            max_tokens=max_tokens,
+        )
     )
+
+
+def _cache_friendly_model_settings(model_settings: Any | None = None) -> Any:
+    """Apply repo-wide cache/cost telemetry defaults to SDK model settings."""
+
+    include_usage = _sdk_include_usage_enabled()
+    retention = _sdk_prompt_cache_retention()
+    if _SDK_IMPORT_ERROR is not None:
+        settings = dict(model_settings or {})
+        settings.setdefault("include_usage", include_usage)
+        if retention is not None:
+            settings.setdefault("prompt_cache_retention", retention)
+        return settings
+    settings = model_settings or ModelSettings()
+    updates: dict[str, Any] = {}
+    if getattr(settings, "include_usage", None) is None:
+        updates["include_usage"] = include_usage
+    if retention is not None and getattr(settings, "prompt_cache_retention", None) is None:
+        updates["prompt_cache_retention"] = retention
+    return dataclass_replace(settings, **updates) if updates else settings
+
+
+def _sdk_include_usage_enabled() -> bool:
+    raw = os.getenv(SDK_INCLUDE_USAGE_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _FALSE_ENV_VALUES
+
+
+def _sdk_prompt_cache_retention() -> str | None:
+    raw = os.getenv(SDK_PROMPT_CACHE_RETENTION_ENV)
+    value = DEFAULT_PROMPT_CACHE_RETENTION if raw is None else raw.strip().lower()
+    if value in _FALSE_ENV_VALUES:
+        return None
+    if value in {"in_memory", "24h"}:
+        return value
+    return DEFAULT_PROMPT_CACHE_RETENTION
 
 
 def _live_model_timeout_seconds() -> float:

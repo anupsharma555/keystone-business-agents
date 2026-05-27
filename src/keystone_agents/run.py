@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from json import JSONDecodeError, loads
+from hashlib import sha256
+from json import JSONDecodeError, dumps, loads
 from typing import Any, TypeVar
 from zoneinfo import ZoneInfo
 
@@ -29,7 +30,7 @@ from keystone_agents.model_provider import (
 )
 from keystone_agents.models import AgentRunRequest, AgentRunResult, RunMode, TypedAgentRunResult
 from keystone_agents.sdk import AgentLike, run_typed_sdk_sync
-from keystone_agents.sdk_sessions import build_sdk_session_from_env
+from keystone_agents.sdk_sessions import build_sdk_session_from_env, session_audit_metadata
 
 TOutput = TypeVar("TOutput")
 TRaw = TypeVar("TRaw")
@@ -51,6 +52,7 @@ class SDKSynthesisOutcome:
     usage: dict[str, Any] = field(default_factory=dict)
     cost: dict[str, Any] = field(default_factory=dict)
     budget_guard: dict[str, Any] = field(default_factory=dict)
+    request_cache: dict[str, Any] = field(default_factory=dict)
     provider_usage_context: dict[str, Any] = field(default_factory=dict)
     started_at_unix: float | None = None
     ended_at_unix: float | None = None
@@ -89,6 +91,10 @@ def prompt_from_typed_input(value: Any) -> str:
     to_prompt = getattr(value, "to_prompt", None)
     if callable(to_prompt):
         return str(to_prompt())
+    if isinstance(value, Mapping):
+        return dumps(value, ensure_ascii=True, sort_keys=True, default=str)
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return dumps(value, ensure_ascii=True, default=str)
     return str(value)
 
 
@@ -126,9 +132,15 @@ def run_typed_sdk_agent(
         model_provider = model_config.provider
         model_name = model_config.model
     resolved_session = session or build_sdk_session_from_env()
+    prompt = prompt_from_typed_input(typed_input)
+    request_cache = _sdk_request_cache_metadata(
+        agent=agent,
+        prompt=prompt,
+        session=resolved_session,
+    )
     raw_result, output = run_typed_sdk_sync(
         agent,
-        prompt_from_typed_input(typed_input),
+        prompt,
         output_type,
         run_config=run_config,
         live=live,
@@ -159,6 +171,7 @@ def run_typed_sdk_agent(
         usage=usage,
         cost=cost,
         budget_guard=budget_guard,
+        request_cache=request_cache,
     )
 
 
@@ -227,6 +240,7 @@ def _extract_token_detail(value: Any, field_name: str) -> int:
 def _extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
     """Return safe request/token usage metadata when the SDK exposes it."""
 
+    prompt_cache_metadata = _prompt_cache_metadata(raw_result)
     usage = getattr(raw_result, "usage", None)
     if usage is None and isinstance(raw_result, Mapping):
         usage = raw_result.get("usage")
@@ -242,6 +256,8 @@ def _extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
             "total_tokens": None,
             "cached_input_tokens": None,
             "reasoning_output_tokens": None,
+            "cache_hit_rate": None,
+            **prompt_cache_metadata,
         }
 
     input_details = _first_attr(
@@ -254,13 +270,26 @@ def _extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
         "output_tokens_details",
         "completion_tokens_details",
     )
+    input_tokens = _first_usage_int(
+        usage,
+        ("input_tokens", "prompt_tokens", "prompt_token_count", "promptTokenCount"),
+    )
+    cached_input_tokens = max(
+        _extract_token_detail(input_details, "cached_tokens"),
+        _first_usage_int(
+            usage,
+            (
+                "input_cached_tokens",
+                "cached_input_tokens",
+                "cached_content_token_count",
+                "cachedContentTokenCount",
+            ),
+        ),
+    )
     return {
         "available": True,
         "requests": _first_usage_int(usage, ("requests", "num_model_requests"), default=1),
-        "input_tokens": _first_usage_int(
-            usage,
-            ("input_tokens", "prompt_tokens", "prompt_token_count", "promptTokenCount"),
-        ),
+        "input_tokens": input_tokens,
         "output_tokens": _first_usage_int(
             usage,
             (
@@ -274,23 +303,120 @@ def _extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
             usage,
             ("total_tokens", "total_token_count", "totalTokenCount"),
         ),
-        "cached_input_tokens": max(
-            _extract_token_detail(input_details, "cached_tokens"),
-            _first_usage_int(
-                usage,
-                (
-                    "input_cached_tokens",
-                    "cached_input_tokens",
-                    "cached_content_token_count",
-                    "cachedContentTokenCount",
-                ),
-            ),
-        ),
+        "cached_input_tokens": cached_input_tokens,
         "reasoning_output_tokens": max(
             _extract_token_detail(output_details, "reasoning_tokens"),
             _first_usage_int(usage, ("thoughts_token_count", "thoughtsTokenCount")),
         ),
+        "cache_hit_rate": _cache_hit_rate(input_tokens, cached_input_tokens),
+        **prompt_cache_metadata,
     }
+
+
+def _cache_hit_rate(input_tokens: int | None, cached_input_tokens: int | None) -> float | None:
+    try:
+        total = int(input_tokens or 0)
+        cached = int(cached_input_tokens or 0)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return 0.0
+    return round(min(total, max(0, cached)) / total, 4)
+
+
+def _prompt_cache_metadata(raw_result: Any) -> dict[str, Any]:
+    key = getattr(raw_result, "_generated_prompt_cache_key", None)
+    if not key and isinstance(raw_result, Mapping):
+        key = raw_result.get("generated_prompt_cache_key")
+    if not key:
+        state = getattr(raw_result, "state", None)
+        key = getattr(state, "_generated_prompt_cache_key", None)
+    if not key:
+        return {
+            "prompt_cache_key_present": False,
+            "prompt_cache_key_hash": "",
+        }
+    digest = sha256(str(key).encode("utf-8")).hexdigest()[:12]
+    return {
+        "prompt_cache_key_present": True,
+        "prompt_cache_key_hash": digest,
+    }
+
+
+def _sdk_request_cache_metadata(
+    *,
+    agent: AgentLike,
+    prompt: str,
+    session: Any | None,
+) -> dict[str, Any]:
+    """Return audit-safe fingerprints for cache-sensitive SDK request layout."""
+
+    instructions = str(getattr(agent, "instructions", "") or "")
+    tool_names = _ordered_tool_names(getattr(agent, "tools", []) or [])
+    output_schema = _output_schema_payload(getattr(agent, "output_type", None))
+    static_payload = {
+        "instructions_sha256": _sha256(instructions),
+        "tool_names": tool_names,
+        "output_schema_sha256": _sha256_dumps(output_schema),
+    }
+    session_metadata = _session_audit_metadata(session)
+    return {
+        "request_layout": "static_agent_prefix_then_dynamic_typed_input",
+        "static_prefix_sha256": _sha256_dumps(static_payload),
+        "instructions_sha256": static_payload["instructions_sha256"],
+        "tool_names_sha256": _sha256_dumps(tool_names),
+        "tool_count": len(tool_names),
+        "output_schema_sha256": static_payload["output_schema_sha256"],
+        "dynamic_prompt_sha256": _sha256(prompt),
+        "dynamic_prompt_chars": len(prompt),
+        "session_attached": session is not None,
+        **session_metadata,
+        "note": (
+            "Fingerprints are audit-safe diagnostics for prompt-cache behavior; raw "
+            "instructions, tool schemas, session ids, and prompt text are not stored here."
+        ),
+    }
+
+
+def _session_audit_metadata(session: Any | None) -> dict[str, Any]:
+    if session is None:
+        return {
+            "session_scope": "",
+            "session_source": "",
+            "session_id_hash": "",
+        }
+    metadata = session_audit_metadata(session)
+    return {
+        "session_scope": str(metadata.get("scope") or ""),
+        "session_source": str(metadata.get("source") or ""),
+        "session_id_hash": str(metadata.get("session_id_hash") or ""),
+    }
+
+
+def _ordered_tool_names(tools: Sequence[Any]) -> list[str]:
+    return [
+        str(getattr(tool, "name", getattr(tool, "__name__", type(tool).__name__)) or "")
+        for tool in tools
+    ]
+
+
+def _output_schema_payload(output_type: Any) -> Any:
+    if hasattr(output_type, "model_json_schema"):
+        try:
+            return output_type.model_json_schema()
+        except Exception:
+            return str(output_type)
+    return str(output_type or "")
+
+
+def _sha256(value: str) -> str:
+    return sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _sha256_dumps(value: Any) -> str:
+    return sha256(
+        dumps(value, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
 
 
 def _first_attr(value: Any, *names: str) -> Any:
@@ -332,6 +458,7 @@ def _sdk_audit_output(
     usage: dict[str, Any],
     cost: dict[str, Any],
     budget_guard: dict[str, Any],
+    request_cache: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "result": output,
@@ -343,6 +470,7 @@ def _sdk_audit_output(
         "_sdk_usage": usage,
         "_sdk_cost": cost,
         "_sdk_budget_guard": budget_guard,
+        "_sdk_request_cache": request_cache,
     }
 
 
@@ -551,6 +679,7 @@ def run_retrieved_sdk_synthesis(
             usage=typed_result.usage,
             cost=typed_result.cost,
             budget_guard=typed_result.budget_guard,
+            request_cache=typed_result.request_cache,
         )
         usage = typed_result.usage or _extract_sdk_usage(typed_result.raw_result)
         cost = typed_result.cost or estimate_usage_cost(
@@ -577,6 +706,7 @@ def run_retrieved_sdk_synthesis(
                 usage=usage,
                 cost=cost,
                 budget_guard=typed_result.budget_guard,
+                request_cache=typed_result.request_cache,
             )
             storage_results["agent_run"] = storage.save_agent_run(
                 agent_name=agent.name,
@@ -627,6 +757,7 @@ def run_retrieved_sdk_synthesis(
         usage=usage,
         cost=cost,
         budget_guard=typed_result.budget_guard,
+        request_cache=typed_result.request_cache,
         provider_usage_context=provider_usage_context,
         started_at_unix=started_at,
         ended_at_unix=time.time(),

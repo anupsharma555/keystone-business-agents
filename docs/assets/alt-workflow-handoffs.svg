@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820" role="img" aria-labelledby="title desc">
+  <title id="title">Alternative workflow: SDK handoffs</title>
+  <desc id="desc">A triage agent chooses a specialist handoff. The selected specialist takes over the conversation and produces the final structured output.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#344054"/></marker>
+    <style>
+      .bg{fill:#f7f9fc}.box{fill:#fff;stroke:#c8d0dc;stroke-width:2}.triage{fill:#eef4ff;stroke:#528bdb;stroke-width:2}.agent{fill:#fff7e6;stroke:#d89b2b;stroke-width:2}.gate{fill:#fff1f3;stroke:#d92d20;stroke-width:2}.schema{fill:#f3edff;stroke:#9e77ed;stroke-width:2}.h{font:700 22px Arial;fill:#101828}.b{font:400 15px Arial;fill:#344054}.s{font:400 13px Arial;fill:#475467}.t{font:700 34px Arial;fill:#101828}.line{stroke:#344054;stroke-width:2;fill:none;marker-end:url(#arrow)}.dash{stroke-dasharray:7 5}
+    </style>
+  </defs>
+  <rect class="bg" width="1400" height="820"/>
+  <text class="t" x="54" y="62">SDK Pattern B: Triage Agent Handoffs</text>
+  <text class="s" x="56" y="92">Best when a specialist should take over the conversation after routing, using SDK handoff descriptions and history transfer.</text>
+
+  <rect class="box" x="70" y="175" width="210" height="105" rx="12"/>
+  <text class="h" x="100" y="212">User / Slack</text>
+  <text class="b" x="100" y="242">Natural request</text>
+  <text class="s" x="100" y="267">Conversation starts here</text>
+
+  <rect class="triage" x="405" y="145" width="260" height="165" rx="14"/>
+  <text class="h" x="435" y="183">Triage Agent</text>
+  <text class="b" x="435" y="215">Reads request + history</text>
+  <text class="b" x="435" y="240">Chooses one handoff target</text>
+  <text class="b" x="435" y="265">Transfers conversation control</text>
+  <text class="s" x="435" y="292">No central final synthesis.</text>
+
+  <rect class="agent" x="840" y="70" width="240" height="95" rx="12"/>
+  <text class="h" x="872" y="108">Booking / Research</text>
+  <text class="s" x="872" y="135">Specialist takes over</text>
+
+  <rect class="agent" x="840" y="205" width="240" height="95" rx="12"/>
+  <text class="h" x="872" y="243">Refund / Scout</text>
+  <text class="s" x="872" y="270">Specialist takes over</text>
+
+  <rect class="agent" x="840" y="340" width="240" height="95" rx="12"/>
+  <text class="h" x="872" y="378">Support / Gmail</text>
+  <text class="s" x="872" y="405">Specialist takes over</text>
+
+  <rect class="agent" x="840" y="475" width="240" height="95" rx="12"/>
+  <text class="h" x="872" y="513">Writer / Outreach</text>
+  <text class="s" x="872" y="540">Specialist takes over</text>
+
+  <rect class="gate" x="405" y="430" width="260" height="120" rx="14"/>
+  <text class="h" x="435" y="468">Input Guardrails</text>
+  <text class="b" x="435" y="500">Safety before handoff</text>
+  <text class="b" x="435" y="525">Approval state check</text>
+
+  <rect class="schema" x="840" y="645" width="300" height="105" rx="12"/>
+  <text class="h" x="872" y="682">Specialist Output</text>
+  <text class="b" x="872" y="713">Each target owns final schema</text>
+  <text class="b" x="872" y="738">No manager rewrite by default</text>
+
+  <path class="line" d="M280 228 C340 228 350 228 405 228"/>
+  <path class="line" d="M665 220 C735 125 770 118 840 118"/>
+  <path class="line" d="M665 236 C735 252 770 252 840 252"/>
+  <path class="line" d="M665 252 C735 375 770 388 840 388"/>
+  <path class="line" d="M665 268 C735 520 770 522 840 522"/>
+  <path class="line dash" d="M960 570 L990 645"/>
+  <path class="line" d="M535 310 L535 430"/>
+  <text class="s" x="690" y="195">one handoff wins</text>
+  <text class="s" x="1015" y="610">final output owned by specialist</text>
+</svg>

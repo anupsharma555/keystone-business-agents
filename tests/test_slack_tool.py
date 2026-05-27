@@ -11,6 +11,7 @@ from keystone_agents.schemas.work_item import (
     WorkItem,
     WorkItemApprovalGate,
     WorkItemArtifactRef,
+    WorkItemBlocker,
     WorkItemKind,
     WorkItemRoute,
     WorkItemStatus,
@@ -33,6 +34,7 @@ from keystone_agents.slack_action_contract import (
     KBA_REVISE_DRAFT,
     KBA_REVISE_DRAFT_VIEW_CALLBACK_ID,
     business_agent_action_value,
+    parse_business_agent_action_value,
 )
 from keystone_agents.slack_interactions import (
     handle_slack_approval_interaction,
@@ -397,7 +399,7 @@ def test_slack_review_message_for_gmail_draft_save_names_button_scope(
     assert action_texts == [
         "Create Gmail draft",
         "Revise draft",
-        "More research",
+        "Retry source pass",
         "Find contact",
     ]
     assert action_ids == [
@@ -912,7 +914,7 @@ def test_kba_revise_draft_modal_submission_records_feedback_and_queues_agent(
     item = _save_linked_work_item_approval(store)
     calls: list[object] = []
 
-    def fake_advance(request):
+    def fake_advance(request, **_kwargs):
         calls.append(request)
         loaded = SQLiteStore(database_url).get_work_item(item.id)
         assert loaded is not None
@@ -924,7 +926,7 @@ def test_kba_revise_draft_modal_submission_records_feedback_and_queues_agent(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.slack_interactions.advance_work_item_with_optional_langgraph",
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
         fake_advance,
     )
     click = handle_slack_approval_interaction(
@@ -969,10 +971,57 @@ def test_kba_revise_draft_modal_submission_records_feedback_and_queues_agent(
     assert submitted.queued_route == WorkItemRoute.OUTREACH_COMPOSER.value
     assert submitted.slack_view_response_payload is not None
     assert len(calls) == 1
+    request = calls[0]
+    assert request.manual_request_plan["source"] == "slack_business_agent_action"
+    assert request.manual_request_plan["intent"] == "revise_draft"
+    assert request.orchestrator_preflight["request_text"].startswith(
+        "Revise the outreach draft"
+    )
+    assert request.orchestrator_preflight["manual_request_plan"]["requested_agent"] == (
+        WorkItemRoute.OUTREACH_COMPOSER.value
+    )
     assert updated is not None
     assert updated.status == WorkItemStatus.BLOCKED
     assert queue_item is not None
     assert queue_item.metadata["operator_feedback_for_agent"] == "Use a softer CTA."
+
+
+def test_kba_revise_draft_modal_metadata_stays_valid_with_oversized_action_payload(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
+    store = SQLiteStore(database_url)
+    item = _save_linked_work_item_approval(store)
+    value = business_agent_action_value(
+        intent="revise_draft",
+        approval_id="approval-workitem",
+        work_item_id=item.id,
+        gate_scope="external_use",
+        metadata={
+            "approval_title": "Email draft",
+            "source_context": "x" * 6000,
+        },
+    )
+
+    click = handle_slack_approval_interaction(
+        {
+            "user": {"id": "U123", "username": "anup"},
+            "channel": {"id": "C123", "name": "approvals"},
+            "container": {"message_ts": "1710000000.000100"},
+            "actions": [{"action_id": KBA_REVISE_DRAFT, "value": value}],
+        },
+        database_url=database_url,
+    )
+    private_metadata = click.modal_view["private_metadata"]
+    parsed = parse_business_agent_action_value(private_metadata)
+
+    assert click.stage == "modal"
+    assert len(private_metadata) < 2900
+    assert parsed.intent == "revise_draft"
+    assert parsed.approval_id == "approval-workitem"
+    assert parsed.work_item_id == item.id
+    assert parsed.metadata == {"approval_title": "Email draft"}
+    assert "source_context" not in private_metadata
 
 
 def test_kba_more_research_records_event_and_duplicate_is_idempotent(
@@ -982,9 +1031,13 @@ def test_kba_more_research_records_event_and_duplicate_is_idempotent(
     database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
     store = SQLiteStore(database_url)
     item = _save_linked_work_item_approval(store)
+    item = item.model_copy(
+        update={"target": WorkItemTarget(name="OpenEvidence", object_type="company")}
+    )
+    store.save_work_item(item)
     calls: list[object] = []
 
-    def fake_advance(request):
+    def fake_advance(request, **_kwargs):
         calls.append(request)
         loaded = SQLiteStore(database_url).get_work_item(item.id)
         assert loaded is not None
@@ -996,7 +1049,7 @@ def test_kba_more_research_records_event_and_duplicate_is_idempotent(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.slack_interactions.advance_work_item_with_optional_langgraph",
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
         fake_advance,
     )
     payload = _kba_payload(
@@ -1009,12 +1062,61 @@ def test_kba_more_research_records_event_and_duplicate_is_idempotent(
     first = handle_slack_approval_interaction(payload, database_url=database_url)
     duplicate = handle_slack_approval_interaction(payload, database_url=database_url)
 
-    assert first.outcome == "research_queued"
+    assert first.outcome == "research_retry_completed"
     assert first.queued_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert calls
+    assert "independent current-year source pass for OpenEvidence" in calls[0].request_text
+    assert "funding, partnerships, product updates, hiring, roadmap signals" in (
+        calls[0].request_text
+    )
     assert duplicate.idempotent is True
     assert len(calls) == 1
     events = store.list_work_item_events(item.id)
     assert any(event.event_type == "slack_action_intent" for event in events)
+
+
+def test_kba_more_research_reports_still_blocked_after_retry(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
+    store = SQLiteStore(database_url)
+    item = _save_linked_work_item_approval(store)
+
+    def fake_advance(request, **_kwargs):
+        loaded = SQLiteStore(database_url).get_work_item(item.id)
+        assert loaded is not None
+        return WorkflowRunResult(
+            work_item=loaded,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=WorkItemStatus.BLOCKED,
+            advanced=True,
+            blockers=[
+                WorkItemBlocker(
+                    code="manager_loop_review_failed",
+                    message="Independent sources are still insufficient.",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
+        fake_advance,
+    )
+
+    result = handle_slack_approval_interaction(
+        _kba_payload(
+            action_id=KBA_MORE_RESEARCH,
+            intent=KBA_INTENT_MORE_RESEARCH,
+            approval_id="approval-workitem",
+            work_item_id=item.id,
+        ),
+        database_url=database_url,
+    )
+
+    assert result.outcome == "research_retry_still_blocked"
+    assert "still blocked" in result.followup_text
+    assert "manager_loop_review_failed" in result.followup_text
 
 
 def test_kba_more_research_selects_current_candidate_from_button_payload(
@@ -1051,7 +1153,7 @@ def test_kba_more_research_selects_current_candidate_from_button_payload(
     store.save_work_item(item)
     selected_titles: list[str] = []
 
-    def fake_advance(request):
+    def fake_advance(request, **_kwargs):
         loaded = SQLiteStore(database_url).get_work_item(item.id)
         assert loaded is not None
         selected_titles.extend(ref.title for ref in loaded.artifact_refs if ref.selected)
@@ -1063,7 +1165,7 @@ def test_kba_more_research_selects_current_candidate_from_button_payload(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.slack_interactions.advance_work_item_with_optional_langgraph",
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
         fake_advance,
     )
 
@@ -1078,7 +1180,7 @@ def test_kba_more_research_selects_current_candidate_from_button_payload(
         database_url=database_url,
     )
 
-    assert result.outcome == "research_queued"
+    assert result.outcome in {"research_retry_completed", "research_retry_still_blocked"}
     assert selected_titles == ["Theris"]
     events = store.list_work_item_events(item.id)
     assert any(
@@ -1119,7 +1221,7 @@ def test_kba_more_research_dedupes_per_candidate_artifact(
     store.save_work_item(item)
     selected_titles: list[str] = []
 
-    def fake_advance(request):
+    def fake_advance(request, **_kwargs):
         loaded = SQLiteStore(database_url).get_work_item(item.id)
         assert loaded is not None
         selected_titles.extend(ref.title for ref in loaded.artifact_refs if ref.selected)
@@ -1131,7 +1233,7 @@ def test_kba_more_research_dedupes_per_candidate_artifact(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.slack_interactions.advance_work_item_with_optional_langgraph",
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
         fake_advance,
     )
 
@@ -1146,7 +1248,7 @@ def test_kba_more_research_dedupes_per_candidate_artifact(
             ),
             database_url=database_url,
         )
-        assert result.outcome == "research_queued"
+        assert result.outcome == "research_retry_completed"
 
     assert selected_titles == ["Theris", "ARPA-H"]
 
@@ -1183,7 +1285,7 @@ def test_kba_research_all_candidates_runs_each_attached_opportunity(
     store.save_work_item(item)
     selected_titles: list[str] = []
 
-    def fake_advance(request):
+    def fake_advance(request, **_kwargs):
         loaded = SQLiteStore(database_url).get_work_item(item.id)
         assert loaded is not None
         selected_titles.extend(ref.title for ref in loaded.artifact_refs if ref.selected)
@@ -1196,7 +1298,7 @@ def test_kba_research_all_candidates_runs_each_attached_opportunity(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.slack_interactions.advance_work_item_with_optional_langgraph",
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
         fake_advance,
     )
 
@@ -1238,9 +1340,14 @@ def test_kba_more_research_uses_langgraph_when_enabled(
 
     events = store.list_work_item_events(item.id)
     graph_event = next(event for event in events if event.event_type == "langgraph_orchestration")
+    review_event = next(
+        event for event in events if event.event_type == "orchestrator_action_review"
+    )
 
-    assert result.outcome == "research_queued"
+    assert result.outcome in {"research_retry_completed", "research_retry_still_blocked"}
     assert result.send_enabled is False
+    assert review_event.metadata["intent"] == KBA_INTENT_MORE_RESEARCH
+    assert review_event.metadata["route"] == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
     assert graph_event.metadata["checkpoint_key"] == f"work-item:{item.id}"
     assert graph_event.metadata["runtime"] in {"langgraph", "dependency_free_fallback"}
     assert graph_event.metadata["node_path"][0] == "advance_work_item"
@@ -1276,10 +1383,24 @@ def test_kba_continue_work_item_uses_langgraph_thread_when_enabled(
 
     events = store.list_work_item_events(item.id)
     graph_event = next(event for event in events if event.event_type == "langgraph_orchestration")
+    advance_event = next(event for event in events if event.event_type == "advance_started")
+    review_event = next(
+        event for event in events if event.event_type == "orchestrator_action_review"
+    )
 
     assert result.outcome == "continued"
     assert result.work_item_id == item.id
     assert result.send_enabled is False
+    assert review_event.metadata["intent"] == KBA_INTENT_CONTINUE_WORK_ITEM
+    assert review_event.metadata["route"] == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert advance_event.metadata["orchestrator_preflight"]["request_text"] == "continue"
+    assert advance_event.metadata["orchestrator_preflight"]["advisory_only"] is True
+    assert (
+        advance_event.metadata["orchestrator_preflight"]["manual_request_plan"][
+            "requested_agent"
+        ]
+        == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    )
     assert graph_event.metadata["checkpoint_key"] == f"work-item:{item.id}"
     assert graph_event.metadata["runtime"] in {"langgraph", "dependency_free_fallback"}
 

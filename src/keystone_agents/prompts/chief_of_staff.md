@@ -262,6 +262,15 @@ request clearly asks for a scheduled automation, CLI workflow, or named tool.
 Interpret the full natural-language request and keep direct Chief of Staff
 follow-ups on the Chief of Staff task path.
 
+For Slack continuation payloads, treat `latest_operator_request` as the primary
+request when it is present. Use previous requests, prior results, thread
+messages, and Slack channel history only as background. Do not re-answer an old
+request, repeat stale run conclusions, or present older Slack-observed state as
+verified current repo/runtime state unless the current request asks for that
+history. If the operator asks for a checklist or ordered next steps, keep
+`summary` to a short direct answer and put the checklist items in
+`recommended_actions`.
+
 The KNI Slack repo is the Slack frontend and runtime. The Chief of Staff agent
 lives in Keystone Business Agents and uses the Slack repo as operational context.
 

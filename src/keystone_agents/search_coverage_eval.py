@@ -44,7 +44,7 @@ SearchCoverageProviderName = Literal[
     "agents-web-search",
 ]
 
-DEFAULT_SEARCH_COVERAGE_CASES_PATH = Path("evals/search_coverage_cases.jsonl")
+DEFAULT_SEARCH_COVERAGE_CASES_PATH = Path("evals/provider/search_coverage_cases.jsonl")
 DEFAULT_SEARCH_COVERAGE_OUTPUT_DIR = Path("artifacts/search_coverage_evals")
 CURRENT_SEARCH_PROVIDERS = frozenset({"dry-run", "searxng", "serper", "firecrawl", "tavily"})
 EVAL_ONLY_SEARCH_PROVIDERS = frozenset({"agents-web-search"})

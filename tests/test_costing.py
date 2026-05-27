@@ -8,11 +8,13 @@ import requests
 from keystone_agents.costing import (
     AgentRunBudgetExceededError,
     agent_run_budget_guard,
+    compare_estimated_to_actual_cost,
     configured_agent_run_budget_usd,
     enforce_agent_run_budget,
     estimate_usage_cost,
     fetch_provider_cost_window,
     gemini_free_tier_usage_context,
+    summarize_cache_experiment,
 )
 
 
@@ -39,6 +41,55 @@ def test_estimate_usage_cost_uses_local_pricing_table_for_openai() -> None:
         "cached_input": 0.000015,
         "output": 0.00225,
     }
+
+
+def test_compare_estimated_to_actual_cost_reports_delta_without_secret_inputs() -> None:
+    comparison = compare_estimated_to_actual_cost(
+        cost={"source": "local_pricing_table", "estimated_usd": 0.16},
+        actual_usd="0.150000",
+        reference_id="openai-platform-run-copy",
+    )
+
+    assert comparison["available"] is True
+    assert comparison["estimated_usd"] == 0.16
+    assert comparison["actual_usd"] == 0.15
+    assert comparison["delta_usd"] == 0.01
+    assert comparison["delta_percent_of_actual"] == 6.67
+    assert comparison["reference_id"] == "openai-platform-run-copy"
+
+
+def test_summarize_cache_experiment_compares_repeated_runs() -> None:
+    summary = summarize_cache_experiment(
+        [
+            {
+                "run_id": "first",
+                "usage": {
+                    "available": True,
+                    "input_tokens": 10_000,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 1_000,
+                },
+                "cost": {"estimated_usd": 0.16},
+            },
+            {
+                "run_id": "repeat",
+                "usage": {
+                    "available": True,
+                    "input_tokens": 11_000,
+                    "cached_input_tokens": 8_800,
+                    "output_tokens": 700,
+                },
+                "cost": {"estimated_usd": 0.06},
+            },
+        ]
+    )
+
+    assert summary["available"] is True
+    assert summary["first_cache_hit_rate"] == 0.0
+    assert summary["last_cache_hit_rate"] == 0.8
+    assert summary["cache_hit_rate_delta"] == 0.8
+    assert summary["estimated_usd_delta"] == -0.1
+    assert summary["runs"][1]["run_id"] == "repeat"
 
 
 def test_estimate_usage_cost_does_not_assume_free_gemini() -> None:

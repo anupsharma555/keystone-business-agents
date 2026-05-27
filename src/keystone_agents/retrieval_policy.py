@@ -26,6 +26,13 @@ from keystone_agents.tools.search_provider import (
     build_search_provider,
 )
 
+_RECOVERABLE_PROVIDER_EXCEPTIONS = (
+    SearchProviderConfigurationError,
+    SearchProviderError,
+    TimeoutError,
+    ConnectionError,
+)
+
 _AGGREGATOR_DOMAINS = frozenset(
     {
         "crunchbase.com",
@@ -237,6 +244,11 @@ class RetrievalProviderUsage:
     requests_succeeded: int = 0
     raw_result_count: int = 0
     credits_used: int = 0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    estimated_usd: float = 0.0
     total_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -734,7 +746,7 @@ class HybridSearchProvider:
             return self._search_structured_parallel_provider_fanout(request)
 
         merged: list[Any] = []
-        last_error: SearchProviderConfigurationError | SearchProviderError | None = None
+        last_error: Exception | None = None
         recovered_from_error = False
         last_assessment: RetrievalQualityAssessment | None = None
 
@@ -746,7 +758,7 @@ class HybridSearchProvider:
             started_at = perf_counter()
             try:
                 results = self._provider_search(provider, request)
-            except (SearchProviderConfigurationError, SearchProviderError) as exc:
+            except _RECOVERABLE_PROVIDER_EXCEPTIONS as exc:
                 self._record_provider_elapsed(provider_name, perf_counter() - started_at)
                 last_error = exc
                 self._provider_errors.append(
@@ -788,8 +800,6 @@ class HybridSearchProvider:
             if recovered_from_error:
                 self._provider_error_fallback_used = True
             return merged
-        if last_error is not None:
-            raise last_error
         return []
 
     def _search_web_parallel_provider_fanout(self, query: str, num_results: int = 5) -> list[Any]:
@@ -803,7 +813,7 @@ class HybridSearchProvider:
         """Run all configured providers for one provider-aware query and merge in order."""
 
         result_groups: dict[str, list[Any]] = {}
-        last_error: SearchProviderConfigurationError | SearchProviderError | None = None
+        last_error: Exception | None = None
 
         def run_provider(
             provider_name: str,
@@ -819,7 +829,7 @@ class HybridSearchProvider:
                     self._provider_credit_usage_context(provider),
                     None,
                 )
-            except (SearchProviderConfigurationError, SearchProviderError) as exc:
+            except _RECOVERABLE_PROVIDER_EXCEPTIONS as exc:
                 return provider_name, [], perf_counter() - started_at, {}, exc
 
         runnable_providers: list[str] = []
@@ -864,8 +874,6 @@ class HybridSearchProvider:
         ]
         merged = merge_search_results(*ordered_result_groups)
         if not merged:
-            if last_error is not None and not result_groups:
-                raise last_error
             return []
 
         assessment = self._quality_assessor(merged, request.query)
@@ -913,7 +921,7 @@ class HybridSearchProvider:
             started_at = perf_counter()
             try:
                 results = self._provider_search(provider, request)
-            except (SearchProviderConfigurationError, SearchProviderError) as exc:
+            except _RECOVERABLE_PROVIDER_EXCEPTIONS as exc:
                 self._record_provider_elapsed(provider_name, perf_counter() - started_at)
                 with self._lock:
                     self._provider_errors.append(
@@ -1067,6 +1075,11 @@ class HybridSearchProvider:
                     if field_name == "credits_used"
                     else usage.credits_used
                 ),
+                input_tokens=usage.input_tokens,
+                cached_input_tokens=usage.cached_input_tokens,
+                output_tokens=usage.output_tokens,
+                reasoning_output_tokens=usage.reasoning_output_tokens,
+                estimated_usd=usage.estimated_usd,
                 total_seconds=usage.total_seconds,
             )
 
@@ -1078,6 +1091,11 @@ class HybridSearchProvider:
                 requests_succeeded=usage.requests_succeeded,
                 raw_result_count=usage.raw_result_count,
                 credits_used=usage.credits_used,
+                input_tokens=usage.input_tokens,
+                cached_input_tokens=usage.cached_input_tokens,
+                output_tokens=usage.output_tokens,
+                reasoning_output_tokens=usage.reasoning_output_tokens,
+                estimated_usd=usage.estimated_usd,
                 total_seconds=round(usage.total_seconds + max(0.0, elapsed_seconds), 3),
             )
 
@@ -1110,6 +1128,27 @@ class HybridSearchProvider:
                     requests_succeeded=usage.requests_succeeded,
                     raw_result_count=usage.raw_result_count,
                     credits_used=usage.credits_used + credits,
+                    input_tokens=usage.input_tokens + _usage_context_int(
+                        usage_context,
+                        "input_tokens",
+                    ),
+                    cached_input_tokens=usage.cached_input_tokens + _usage_context_int(
+                        usage_context,
+                        "cached_input_tokens",
+                    ),
+                    output_tokens=usage.output_tokens + _usage_context_int(
+                        usage_context,
+                        "output_tokens",
+                    ),
+                    reasoning_output_tokens=(
+                        usage.reasoning_output_tokens
+                        + _usage_context_int(usage_context, "reasoning_output_tokens")
+                    ),
+                    estimated_usd=round(
+                        usage.estimated_usd
+                        + _usage_context_float(usage_context, "estimated_usd"),
+                        8,
+                    ),
                     total_seconds=usage.total_seconds,
                 )
             if usage_context:
@@ -1181,6 +1220,24 @@ def _credit_usage_count(usage_context: Mapping[str, Any] | None) -> int:
         if value > 0:
             return value
     return 0
+
+
+def _usage_context_int(usage_context: Mapping[str, Any] | None, key: str) -> int:
+    if not usage_context:
+        return 0
+    try:
+        return max(0, int(float(usage_context.get(key) or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_context_float(usage_context: Mapping[str, Any] | None, key: str) -> float:
+    if not usage_context:
+        return 0.0
+    try:
+        return max(0.0, float(usage_context.get(key) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _dedupe_sequence(items: Sequence[str]) -> list[str]:

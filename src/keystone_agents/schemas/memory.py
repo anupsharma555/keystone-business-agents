@@ -30,6 +30,7 @@ MemoryType = Literal[
     "blocked_fact",
     "risk_flag",
     "retrieval_tool_performance",
+    "manager_loop_efficiency",
     "workflow_dedup",
     "operator_reference",
 ]

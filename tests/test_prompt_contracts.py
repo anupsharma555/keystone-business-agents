@@ -188,7 +188,7 @@ def test_shared_agent_operating_architecture_covers_schemas_tools_helpers() -> N
     assert "disabled by default" in text
     assert "does not open a user-screen browser" in text
     assert "temporary non-persistent profile" in text
-    assert "gpt-5.4" in text
+    assert "gpt-5.4-mini" in text
     assert (
         "no live side effects unless the relevant tool, live flag, and approval scope allow them"
         in text

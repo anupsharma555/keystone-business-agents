@@ -15,6 +15,7 @@ from keystone_agents.memory import (
     opportunity_memory_items,
     outreach_dedup_memory_items,
     outreach_example_memory_item,
+    manager_loop_efficiency_memory_item,
     retrieval_tool_performance_memory_item,
 )
 from keystone_agents.outreach_examples import retrieve_outreach_examples_local
@@ -589,6 +590,43 @@ def test_retrieval_tool_performance_memory_item_is_prompt_safe() -> None:
     assert item.safe_for_prompt is True
     assert item.content["website_extraction"]["claim_count"] == 6
     assert "search discovery" in item.summary
+
+
+def test_manager_loop_efficiency_memory_item_is_prompt_safe() -> None:
+    item = manager_loop_efficiency_memory_item(
+        {
+            "schema": "keystone.manager_loop_efficiency.v1",
+            "metric_name": "keystone.manager_loop.efficiency",
+            "metric_version": "v1",
+            "elapsed_seconds": 7.25,
+            "latency_bucket": "5_to_15s",
+            "step_count": 2,
+            "specialist_step_count": 1,
+            "repair_count": 1,
+            "repair_rate": 0.5,
+            "repair_attempts_by_route": {"business-research-analyst": 1},
+            "route_sequence": ["business-research-analyst", "business-research-analyst"],
+            "final_route": "business-research-analyst",
+            "final_status": "active",
+            "advanced": True,
+            "artifact_count": 2,
+            "blocker_count": 0,
+            "live_search": True,
+            "live_sdk": True,
+            "final_synthesis_executed": True,
+            "seconds_per_specialist_step": 7.25,
+            "completion_without_blockers": True,
+            "efficiency_signal": "completed_after_repair",
+        },
+        object_id="work_item:wi_example",
+    )
+
+    assert item is not None
+    assert item.memory_type == "manager_loop_efficiency"
+    assert item.safe_for_prompt is True
+    assert item.content["metric_name"] == "keystone.manager_loop.efficiency"
+    assert item.content["efficiency_signal"] == "completed_after_repair"
+    assert "7.250s" in item.summary
 
 
 def test_chief_of_staff_memory_context_excludes_expired_and_superseded(

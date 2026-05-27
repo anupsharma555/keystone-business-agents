@@ -32,6 +32,34 @@ ManualRequestIntent = Literal[
     "clarification",
 ]
 
+ManualTaskObjective = Literal[
+    "route_or_continue",
+    "entity_research",
+    "source_research",
+    "opportunity_discovery",
+    "contact_discovery",
+    "outreach_draft",
+    "gmail_triage",
+    "slack_operations",
+    "browser_diagnostics",
+    "reference_capture",
+    "blocked_side_effect",
+    "clarification",
+]
+
+ManualExpectedArtifactType = Literal[
+    "none",
+    "research_brief",
+    "source_summary",
+    "opportunity_record",
+    "contact_candidates",
+    "outreach_draft",
+    "gmail_triage_report",
+    "slack_ops_summary",
+    "browser_diagnostics_report",
+    "reference_note",
+]
+
 ManualTargetType = Literal[
     "company",
     "person",
@@ -60,8 +88,12 @@ class ManualRequestPlan(BaseModel):
     primary_target: str = ""
     target_type: ManualTargetType = "unknown"
     objective: str = ""
+    task_objective: ManualTaskObjective = "clarification"
+    expected_artifact_type: ManualExpectedArtifactType = "none"
     desired_count: int = Field(default=1, ge=1, le=10)
     constraints: list[str] = Field(default_factory=list)
+    required_entities: list[str] = Field(default_factory=list)
+    required_terms: list[str] = Field(default_factory=list)
     gmail_query: str = ""
     lookback_days: int | None = None
     draft_policy: str = ""
@@ -101,7 +133,13 @@ class ManualRequestPlan(BaseModel):
         except (TypeError, ValueError):
             return None
 
-    @field_validator("constraints", "planner_warnings", mode="before")
+    @field_validator(
+        "constraints",
+        "required_entities",
+        "required_terms",
+        "planner_warnings",
+        mode="before",
+    )
     @classmethod
     def _clean_list(cls, value: object) -> list[str]:
         if value is None:

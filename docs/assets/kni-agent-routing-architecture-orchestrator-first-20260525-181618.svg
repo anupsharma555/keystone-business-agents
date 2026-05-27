@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1250" viewBox="0 0 1600 1250" role="img" aria-labelledby="title desc">
+  <title id="title">Updated KNI architecture: Orchestrator-first routing</title>
+  <desc id="desc">Detailed KNI architecture diagram showing Slack, CLI, automations, Orchestrator-first raw request interpretation, schema-light planning, specialist agents, deterministic gates, tools, memory, Slack, Airtable, Google Workspace, Gmail, and WorkItem workflow boundaries.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#3f3f3f"/>
+    </marker>
+    <marker id="arrowStart" markerWidth="10" markerHeight="10" refX="1" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M9,0 L9,6 L0,3 z" fill="#3f3f3f"/>
+    </marker>
+    <marker id="gateArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#d97706"/>
+    </marker>
+    <style>
+      .bg { fill: #fbfaf5; }
+      .panel { fill: #ffffff; stroke: #d6d3cc; stroke-width: 2; }
+      .lane { fill: #fff8df; stroke: #e0a21a; stroke-width: 2; }
+      .planner { fill: #e8f7f1; stroke: #69b090; stroke-width: 2; }
+      .orch { fill: #fff1df; stroke: #f97316; stroke-width: 3; }
+      .orchHead { fill: #f97316; }
+      .agent { fill: #fff7e6; stroke: #d89b2b; stroke-width: 2; }
+      .specialist { fill: #ecfdf3; stroke: #14804a; stroke-width: 2; }
+      .schema { fill: #fff8df; stroke: #d89b2b; stroke-width: 2; }
+      .tool { fill: #ecfdf3; stroke: #14804a; stroke-width: 2; }
+      .gate { fill: #fff3d0; stroke: #d97706; stroke-width: 2; }
+      .store { fill: #fff8df; stroke: #b7791f; stroke-width: 2; }
+      .render { fill: #fff7e6; stroke: #d89b2b; stroke-width: 2; }
+      .title { font: 700 34px Arial, sans-serif; fill: #1f1f1f; }
+      .subtitle { font: 400 16px Arial, sans-serif; fill: #525252; }
+      .h { font: 700 18px Arial, sans-serif; fill: #1f1f1f; }
+      .hWhite { font: 700 19px Arial, sans-serif; fill: #ffffff; }
+      .cardH { font: 700 16px Arial, sans-serif; fill: #1f1f1f; }
+      .body { font: 400 14px Arial, sans-serif; fill: #3f3f3f; }
+      .small { font: 400 12px Arial, sans-serif; fill: #525252; }
+      .tiny { font: 400 11px Arial, sans-serif; fill: #737373; }
+      .label { font: 700 12px Arial, sans-serif; fill: #3f3f3f; }
+      .line { stroke: #3f3f3f; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .bi { stroke: #3f3f3f; stroke-width: 2; fill: none; marker-start: url(#arrowStart); marker-end: url(#arrow); }
+      .soft { stroke: #a3a3a3; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .gateLine { stroke: #d97706; stroke-width: 2; fill: none; marker-end: url(#gateArrow); }
+      .dash { stroke-dasharray: 7 5; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1250"/>
+  <text class="title" x="48" y="58">KNI Agent Architecture: Request Interpretation to Guarded Workflow Execution</text>
+  <text class="subtitle" x="50" y="86">Slack, CLI, and automation requests flow through Orchestrator preflight, specialist agents, review feedback, and approval-gated tools.</text>
+
+  <rect class="panel" x="36" y="115" width="1528" height="1085" rx="14"/>
+
+  <!-- Intake -->
+  <rect class="lane" x="60" y="150" width="245" height="205" rx="12"/>
+  <text class="h" x="88" y="182">1. Start with the request</text>
+  <text class="body" x="88" y="216">Open-ended asks need reasoning</text>
+  <text class="small" x="108" y="240">architecture review, next-step plan</text>
+  <text class="small" x="108" y="261">Slack synthesis, diagnostics</text>
+  <text class="body" x="88" y="294">Exact asks need verification</text>
+  <text class="small" x="108" y="318">totals, records, approvals, status</text>
+  <text class="small" x="108" y="339">draft-only replies or artifacts</text>
+
+  <rect class="lane" x="60" y="390" width="245" height="155" rx="12"/>
+  <text class="h" x="88" y="422">Carry context forward</text>
+  <text class="body" x="88" y="454">Slack posts and threads</text>
+  <text class="body" x="88" y="477">Airtable and Gmail context</text>
+  <text class="body" x="88" y="500">Google Drive, Docs, Sheets</text>
+  <text class="small" x="88" y="526">WorkItems, KNI docs, prior runs</text>
+
+  <!-- Control plane -->
+  <rect class="orch" x="365" y="145" width="780" height="295" rx="14"/>
+  <rect class="orchHead" x="365" y="145" width="780" height="54" rx="14"/>
+  <text class="hWhite" x="398" y="180">2. Orchestrator interprets the raw request before routing</text>
+  <text class="body" x="400" y="226">Understand the operator goal</text>
+  <text class="body" x="400" y="250">Choose a capability, not a phrase lane</text>
+  <text class="body" x="400" y="274">Name blockers and missing context</text>
+  <text class="body" x="400" y="298">Set retrieval and safety posture</text>
+  <text class="body" x="400" y="322">Define what the final answer must satisfy</text>
+  <text class="small" x="400" y="352">Explicit agent mention = advisory requested route</text>
+  <text class="small" x="400" y="374">Raw request is preserved for every specialist</text>
+
+  <rect class="planner" x="675" y="220" width="205" height="160" rx="10"/>
+  <text class="h" x="697" y="250">Planner memo</text>
+  <text class="body" x="697" y="278">ManualRequestPlan</text>
+  <text class="body" x="697" y="301">goal, target, constraints</text>
+  <text class="body" x="697" y="324">assumptions and gaps</text>
+  <text class="small" x="697" y="354">Guidance, not a hard lane</text>
+
+  <rect class="store" x="915" y="220" width="200" height="160" rx="10"/>
+  <text class="h" x="937" y="250">Memory and context</text>
+  <text class="body" x="937" y="278">Slack posts + threads</text>
+  <text class="body" x="937" y="301">WorkItems + decision_trace</text>
+  <text class="body" x="937" y="324">Airtable, Gmail, Google files</text>
+  <text class="body" x="937" y="347">KNI docs + prior runs</text>
+
+  <rect class="agent" x="365" y="470" width="780" height="95" rx="12"/>
+  <text class="h" x="392" y="502">3. Manager loop takes one safe step at a time</text>
+  <text class="body" x="392" y="530">Route, gather context, run one specialist, review output, then optionally repair or deepen once</text>
+  <text class="small" x="392" y="552">Stops at done, blocker, approval gate, missing context, or max steps; streams feedback when Slack asks for it.</text>
+
+  <!-- Specialists -->
+  <rect class="specialist" x="250" y="620" width="930" height="190" rx="12"/>
+  <text class="h" x="278" y="650">4. Specialists solve the domain-specific part</text>
+  <text class="small" x="278" y="672">Each agent receives the raw request, Orchestrator memo, typed context pack, and declared tools.</text>
+  <text class="small" x="278" y="688">The model synthesizes; helpers verify facts, records, approvals, and calculations.</text>
+
+  <rect class="specialist" x="280" y="705" width="160" height="75" rx="10"/>
+  <text class="cardH" x="300" y="725">Chief of Staff</text>
+  <text class="small" x="300" y="748">ops synthesis</text>
+  <text class="small" x="300" y="766">Slack + WorkItems</text>
+
+  <rect class="specialist" x="460" y="705" width="160" height="75" rx="10"/>
+  <text class="cardH" x="480" y="725">Research</text>
+  <text class="small" x="480" y="748">source-backed</text>
+  <text class="small" x="480" y="766">briefs</text>
+
+  <rect class="specialist" x="640" y="705" width="160" height="75" rx="10"/>
+  <text class="cardH" x="660" y="725">Opportunity</text>
+  <text class="small" x="660" y="748">discovery</text>
+  <text class="small" x="660" y="766">scoring + dedup</text>
+
+  <rect class="specialist" x="820" y="705" width="160" height="75" rx="10"/>
+  <text class="cardH" x="840" y="725">Gmail Triage</text>
+  <text class="small" x="840" y="748">read/classify</text>
+  <text class="small" x="840" y="766">draft-only</text>
+
+  <rect class="specialist" x="1000" y="705" width="160" height="75" rx="10"/>
+  <text class="cardH" x="1020" y="725">Outreach</text>
+  <text class="small" x="1020" y="748">approved context</text>
+  <text class="small" x="1020" y="766">no-send drafts</text>
+
+  <!-- Right side review/rendering -->
+  <rect class="render" x="1215" y="145" width="300" height="250" rx="12"/>
+  <text class="h" x="1245" y="178">5. Review before display</text>
+  <text class="body" x="1245" y="216">Does it answer this request?</text>
+  <text class="body" x="1245" y="242">Did it stay in the right lane?</text>
+  <text class="body" x="1245" y="268">Should it repair or deepen once?</text>
+  <text class="body" x="1245" y="294">Should it stop for approval?</text>
+  <text class="small" x="1245" y="335">Orchestrator can evaluate CoS</text>
+  <text class="small" x="1245" y="354">and specialist outputs.</text>
+
+  <rect class="render" x="1215" y="430" width="300" height="295" rx="12"/>
+  <text class="h" x="1245" y="463">6. Render the reviewed result</text>
+  <text class="body" x="1245" y="500">Slack response / modal updates</text>
+  <text class="body" x="1245" y="530">route, status, blockers, artifacts</text>
+  <text class="body" x="1245" y="560">Gmail draft-only boundary</text>
+  <text class="body" x="1245" y="590">Airtable / Google draft fields</text>
+  <text class="body" x="1245" y="620">WorkItem events + audit notes</text>
+  <text class="small" x="1245" y="665">Context was already used upstream</text>
+  <text class="small" x="1245" y="684">by preflight, packs, and specialists.</text>
+
+  <!-- Gates and tools -->
+  <rect class="gate" x="60" y="845" width="640" height="110" rx="12"/>
+  <text class="h" x="88" y="878">Python gates verify what the model proposes</text>
+  <text class="body" x="88" y="907">approval gates, exact arithmetic, record identity, source sufficiency, schema reads</text>
+  <text class="body" x="88" y="930">provider boundaries, no send/post/write without approval, PHI/legal/security blockers</text>
+
+  <rect class="tool" x="735" y="845" width="780" height="110" rx="12"/>
+  <text class="h" x="763" y="878">Context packs and tools provide inspectable evidence</text>
+  <text class="body" x="763" y="907">Slack posts/threads, Airtable rows, Gmail, Google Drive/Docs/Sheets, KNI docs</text>
+  <text class="body" x="763" y="930">WorkItems, memory, retrieval/search, read-only diagnostics, specialist-as-tool calls</text>
+  <text class="small" x="763" y="947">These feed Orchestrator preflight and specialist context before realtime output is rendered.</text>
+
+  <rect class="schema" x="60" y="985" width="1455" height="55" rx="12"/>
+  <text class="h" x="88" y="1018">Stable schemas</text>
+  <text class="body" x="235" y="1018">Use schemas for safety, tools, and outputs; keep open-ended planning in reasoning, traces, audit notes, and WorkItem events.</text>
+
+  <!-- Detail panels -->
+  <rect class="planner" x="60" y="1060" width="460" height="125" rx="12"/>
+  <text class="h" x="88" y="1093">What each agent is for</text>
+  <text class="small" x="88" y="1118">Chief of Staff: operational synthesis, Slack bridge, automation audits</text>
+  <text class="small" x="88" y="1139">Research: source-backed briefs, comparisons, source-bundle analysis</text>
+  <text class="small" x="88" y="1160">Opportunity: discovery, scoring, dedup, research handoff</text>
+  <text class="small" x="88" y="1181">Gmail + Outreach: read/classify/draft-only, approved-context copy</text>
+
+  <rect class="tool" x="555" y="1060" width="515" height="125" rx="12"/>
+  <text class="h" x="583" y="1093">What passes between agents</text>
+  <text class="small" x="583" y="1118">OrchestratorResult: route, blockers, retrieval_hint, safety posture</text>
+  <text class="small" x="583" y="1139">ManualRequestPlan: objective, target, constraints, requested_agent</text>
+  <text class="small" x="583" y="1160">WorkflowRunRequest: raw request, preflight memo, context_file_path</text>
+  <text class="small" x="583" y="1181">WorkItem events: decision_trace, audit notes, review metadata, feedback</text>
+
+  <rect class="gate" x="1105" y="1060" width="410" height="125" rx="12"/>
+  <text class="h" x="1133" y="1093">Who is allowed to do what</text>
+  <text class="small" x="1133" y="1118">Model can reason from supplied Slack/Airtable/Google/Gmail/KNI context.</text>
+  <text class="small" x="1133" y="1139">Python gates verify approvals, record identity, sources, live flags.</text>
+  <text class="small" x="1133" y="1160">Renderers own Slack/CLI layout and suppress raw internal JSON.</text>
+  <text class="small" x="1133" y="1181">No send/post/write/schedule without explicit scoped approval.</text>
+
+  <!-- Flow arrows -->
+  <path class="line" d="M305 250 C330 250 335 250 365 250"/>
+  <text class="label" x="323" y="236">raw request</text>
+  <path class="line" d="M305 468 C330 468 330 340 365 340"/>
+  <text class="label" x="316" y="435">thread/prior-run context</text>
+  <path class="line" d="M755 440 L755 470"/>
+  <text class="label" x="770" y="458">memo/context</text>
+  <path class="bi" d="M755 565 L755 620"/>
+  <text class="label" x="770" y="598">raw request + context pack</text>
+  <path class="gateLine" d="M575 845 C575 825 575 825 575 810"/>
+  <text class="label" x="590" y="832">gates constrain</text>
+  <path class="soft dash" d="M1080 620 C1135 540 1165 278 1215 268"/>
+  <text class="label" x="1115" y="470">review output</text>
+  <path class="line" d="M1310 620 C1330 760 1070 830 1040 845"/>
+  <text class="label" x="1192" y="800">tool/state writes gated</text>
+  <path class="line" d="M1310 395 L1310 430"/>
+  <text class="label" x="1325" y="417">final status</text>
+  <path class="soft dash" d="M1215 530 C1160 560 1130 600 1080 620"/>
+  <text class="label" x="1100" y="580">rendered from structure</text>
+  <path class="bi dash" d="M1040 845 C985 815 980 810 970 780"/>
+  <text class="label" x="980" y="832">tool evidence</text>
+  <path class="bi dash" d="M1145 305 C1190 300 1195 268 1215 268"/>
+</svg>

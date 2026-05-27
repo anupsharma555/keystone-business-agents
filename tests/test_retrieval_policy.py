@@ -312,6 +312,71 @@ def test_hybrid_search_provider_keeps_parallel_optional_errors_nonfatal() -> Non
     assert telemetry["search_provider_errors"][0]["provider"] == "agents-web-search"
 
 
+def test_hybrid_search_provider_degrades_when_all_parallel_providers_timeout() -> None:
+    class TimingOutSearxngProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            raise TimeoutError(f"searxng timed out for {query}")
+
+    class TimingOutAgentsWebSearchProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            raise SearchProviderError(f"hosted search timed out for {query}")
+
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng", "agents-web-search"),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=False,
+        ),
+        provider_factory=lambda provider_name: (
+            TimingOutSearxngProvider()
+            if provider_name == "searxng"
+            else TimingOutAgentsWebSearchProvider()
+        ),
+        parallel_provider_fanout=True,
+    )
+
+    assert provider.search_web("OpenEvidence 2026", num_results=3) == []
+    telemetry = provider.telemetry()
+
+    assert telemetry["search_providers_attempted"] == ["searxng", "agents-web-search"]
+    assert telemetry["search_providers_used"] == []
+    assert sorted(
+        error["error_type"] for error in telemetry["search_provider_errors"]
+    ) == ["SearchProviderError", "TimeoutError"]
+
+
+def test_hybrid_search_provider_degrades_when_all_sequential_providers_fail() -> None:
+    class BrokenPrimaryProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            raise SearchProviderError(f"primary failed for {query}")
+
+    class BrokenBackupProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            raise TimeoutError(f"backup timed out for {query}")
+
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng", "serper"),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=True,
+        ),
+        provider_factory=lambda provider_name: (
+            BrokenPrimaryProvider() if provider_name == "searxng" else BrokenBackupProvider()
+        ),
+    )
+
+    assert provider.search_web("OpenEvidence 2026", num_results=3) == []
+    telemetry = provider.telemetry()
+
+    assert telemetry["search_providers_attempted"] == ["searxng", "serper"]
+    assert telemetry["search_providers_used"] == []
+    assert [
+        error["error_type"] for error in telemetry["search_provider_errors"]
+    ] == ["SearchProviderError", "TimeoutError"]
+
+
 def test_hybrid_search_provider_runs_deepening_provider_only_after_weak_fast_results() -> None:
     calls: list[str] = []
 
@@ -365,6 +430,49 @@ def test_hybrid_search_provider_runs_deepening_provider_only_after_weak_fast_res
     assert telemetry["search_deepening_provider_sequence"] == ["agents-web-search"]
     assert telemetry["search_providers_used"] == ["searxng", "agents-web-search"]
     assert telemetry["agents_web_search_estimated_calls_used"] == 1
+
+
+def test_hybrid_search_provider_records_provider_token_cost_usage() -> None:
+    class CostedProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Official source",
+                    link="https://example.test/source",
+                    snippet="Source-backed result.",
+                    source="agents-web-search",
+                )
+            ]
+
+        def last_credit_usage(self) -> dict[str, object]:
+            return {
+                "request_credits": 1,
+                "input_tokens": 1200,
+                "cached_input_tokens": 800,
+                "output_tokens": 200,
+                "reasoning_output_tokens": 50,
+                "estimated_usd": 0.0123,
+            }
+
+    provider = HybridSearchProvider(
+        provider_sequence=("agents-web-search",),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=False,
+        ),
+        provider_factory=lambda _provider_name: CostedProvider(),
+    )
+
+    provider.search_web("Spring Health 2026", num_results=3)
+    usage = provider.telemetry()["provider_usage"]["agents-web-search"]
+
+    assert usage["credits_used"] == 1
+    assert usage["input_tokens"] == 1200
+    assert usage["cached_input_tokens"] == 800
+    assert usage["output_tokens"] == 200
+    assert usage["reasoning_output_tokens"] == 50
+    assert usage["estimated_usd"] == 0.0123
 
 
 def test_hybrid_search_provider_deepens_when_structured_enrichment_is_needed() -> None:

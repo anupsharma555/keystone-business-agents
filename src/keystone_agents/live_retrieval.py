@@ -52,7 +52,6 @@ from keystone_agents.tools.html_review_tool import (
 )
 from keystone_agents.tools.serper_tool import build_search_provider
 from keystone_agents.tools.website_extraction_tool import (
-    WebsiteExtractionError,
     default_company_page_urls,
     discover_company_page_urls,
     extract_website_content,
@@ -165,6 +164,12 @@ def _compact_provider_usage(provider_usage: Mapping[str, Any]) -> dict[str, dict
             "requests_attempted": int(_safe_float(usage.get("requests_attempted"))),
             "requests_succeeded": int(_safe_float(usage.get("requests_succeeded"))),
             "requests_failed": int(_safe_float(usage.get("requests_failed"))),
+            "credits_used": int(_safe_float(usage.get("credits_used"))),
+            "input_tokens": int(_safe_float(usage.get("input_tokens"))),
+            "cached_input_tokens": int(_safe_float(usage.get("cached_input_tokens"))),
+            "output_tokens": int(_safe_float(usage.get("output_tokens"))),
+            "reasoning_output_tokens": int(_safe_float(usage.get("reasoning_output_tokens"))),
+            "estimated_usd": round(_safe_float(usage.get("estimated_usd")), 8),
             "total_seconds": round(_safe_float(usage.get("total_seconds")), 3),
         }
     return compact
@@ -209,11 +214,46 @@ def _compact_quality_summary(quality: Mapping[str, Any]) -> dict[str, Any]:
 def _compact_source_coverage(source_coverage: Mapping[str, Any]) -> dict[str, Any]:
     if not source_coverage:
         return {}
+    lane_counts = (
+        source_coverage.get("lane_counts")
+        if isinstance(source_coverage.get("lane_counts"), dict)
+        else {}
+    )
+    observed_lanes = source_coverage.get("observed_lanes")
+    missing_lanes = source_coverage.get("missing_lanes")
+    observed_domains = source_coverage.get("observed_domains")
     return {
-        "selected_source_count": int(_safe_float(source_coverage.get("selected_source_count"))),
-        "credible_source_count": int(_safe_float(source_coverage.get("credible_source_count"))),
-        "official_source_count": int(_safe_float(source_coverage.get("official_source_count"))),
+        "selected_source_count": int(
+            _safe_float(
+                source_coverage.get("selected_source_count")
+                or source_coverage.get("primary_source_count")
+            )
+        ),
+        "credible_source_count": int(
+            _safe_float(
+                source_coverage.get("credible_source_count")
+                or source_coverage.get("primary_source_count")
+            )
+        ),
+        "official_source_count": int(
+            _safe_float(
+                source_coverage.get("official_source_count")
+                or lane_counts.get("company_site")
+            )
+        ),
         "sufficiency_status": str(source_coverage.get("sufficiency_status") or ""),
+        "primary_source_count": int(_safe_float(source_coverage.get("primary_source_count"))),
+        "useful_unique_domain_count": int(
+            _safe_float(source_coverage.get("useful_unique_domain_count"))
+        ),
+        "observed_lane_count": (
+            len(observed_lanes) if isinstance(observed_lanes, list | tuple) else 0
+        ),
+        "observed_lanes": [str(item) for item in (observed_lanes or [])][:8],
+        "missing_lanes": [str(item) for item in (missing_lanes or [])][:8],
+        "observed_domain_count": (
+            len(observed_domains) if isinstance(observed_domains, list | tuple) else 0
+        ),
     }
 
 
@@ -242,6 +282,9 @@ def _compact_retrieval_errors(
     website: Mapping[str, Any],
 ) -> list[str]:
     errors: list[str] = []
+    universal_search_failure = _universal_search_failure_summary(metadata)
+    if universal_search_failure:
+        errors.append(universal_search_failure)
     for key in ("errors", "warnings"):
         value = metadata.get(key)
         if isinstance(value, list):
@@ -250,6 +293,37 @@ def _compact_retrieval_errors(
     if isinstance(website_errors, list):
         errors.extend(str(item) for item in website_errors if str(item).strip())
     return errors[:8]
+
+
+def _universal_search_failure_summary(metadata: Mapping[str, Any]) -> str | None:
+    provider_errors = metadata.get("search_provider_errors")
+    if not isinstance(provider_errors, list) or not provider_errors:
+        return None
+    if int(_safe_float(metadata.get("raw_search_result_count"))) > 0:
+        return None
+    attempted = [
+        str(item).strip()
+        for item in (metadata.get("search_providers_attempted") or [])
+        if str(item).strip()
+    ]
+    if not attempted:
+        return None
+    provider_usage = (
+        metadata.get("provider_usage") if isinstance(metadata.get("provider_usage"), Mapping) else {}
+    )
+    succeeded = 0
+    for provider_name in attempted:
+        usage = provider_usage.get(provider_name)
+        if isinstance(usage, Mapping):
+            succeeded += int(_safe_float(usage.get("requests_succeeded")))
+    failed_providers = {
+        str(error.get("provider")).strip()
+        for error in provider_errors
+        if isinstance(error, Mapping) and str(error.get("provider")).strip()
+    }
+    if succeeded > 0 or not set(attempted).issubset(failed_providers):
+        return None
+    return "Live search failed across all attempted providers; backend retrieval telemetry has provider details."
 
 
 def _compact_timing(timing: Mapping[str, Any]) -> dict[str, Any]:
@@ -517,6 +591,8 @@ def retrieve_company_profile_live(
     company_url: str | None = None,
     requested_provider: str | None = None,
     max_results: int = 5,
+    agents_web_search_max_calls: int | None = None,
+    agents_web_search_parallel: bool | None = None,
     retrieval_hint: RetrievalHint | None = None,
     settings_loader: Callable[[], Any] | None = None,
     query_builder: Callable[[str, str | None], list[str]] | None = None,
@@ -540,6 +616,8 @@ def retrieve_company_profile_live(
     search_config = build_shared_search_provider_config(
         requested_provider=requested_provider,
         configured_provider=settings.search_provider,
+        agents_web_search_max_calls=agents_web_search_max_calls,
+        agents_web_search_parallel=agents_web_search_parallel,
     )
 
     def build_client() -> HybridSearchProvider:
@@ -763,7 +841,7 @@ def _extract_company_website_inputs(
                 provider=provider,
                 live=True,
             )
-        except WebsiteExtractionError as exc:
+        except Exception as exc:
             if not fallback_provider:
                 errors.append(f"{url}: {exc}")
                 continue
@@ -774,7 +852,7 @@ def _extract_company_website_inputs(
                     provider=fallback_provider,
                     live=True,
                 )
-            except WebsiteExtractionError as fallback_exc:
+            except Exception as fallback_exc:
                 errors.append(f"{url}: {exc}; fallback {fallback_provider}: {fallback_exc}")
                 continue
         if not result.claims and result.provider != "firecrawl":
@@ -786,7 +864,7 @@ def _extract_company_website_inputs(
                         provider=fallback_provider,
                         live=True,
                     )
-                except WebsiteExtractionError as exc:
+                except Exception as exc:
                     errors.append(
                         f"{url}: empty {result.provider}; fallback {fallback_provider}: {exc}"
                     )
@@ -934,6 +1012,8 @@ def build_shared_search_provider_config(
     requested_provider: str | None,
     configured_provider: str | None = None,
     fallback_provider: str | None = None,
+    agents_web_search_max_calls: int | None = None,
+    agents_web_search_parallel: bool | None = None,
 ) -> SharedSearchProviderConfig:
     """Resolve the shared live-search policy for search-heavy Keystone agents."""
 
@@ -943,8 +1023,10 @@ def build_shared_search_provider_config(
         fallback_provider=fallback_provider,
     )
     agents_enabled = _env_bool("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", default=True)
-    parallel_agents_enabled = agents_enabled and _env_bool(
-        "KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", default=True
+    parallel_agents_enabled = agents_enabled and (
+        agents_web_search_parallel
+        if agents_web_search_parallel is not None
+        else _env_bool("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", default=True)
     )
     provider_sequence = _with_agents_web_search_parallel_lane(
         provider_sequence=provider_sequence,
@@ -959,7 +1041,10 @@ def build_shared_search_provider_config(
     return SharedSearchProviderConfig(
         provider_sequence=provider_sequence,
         deepening_provider_sequence=deepening_provider_sequence,
-        provider_request_budget=_agents_web_search_request_budget(enabled=agents_enabled),
+        provider_request_budget=_agents_web_search_request_budget(
+            enabled=agents_enabled,
+            max_calls=agents_web_search_max_calls,
+        ),
         parallel_provider_fanout=_parallel_provider_fanout_enabled(
             requested_provider=requested_provider,
             provider_sequence=provider_sequence,
@@ -1020,14 +1105,21 @@ def _deepening_search_providers(
     )
 
 
-def _agents_web_search_request_budget(*, enabled: bool) -> ProviderRequestBudget | None:
+def _agents_web_search_request_budget(
+    *,
+    enabled: bool,
+    max_calls: int | None = None,
+) -> ProviderRequestBudget | None:
     if not enabled:
         return None
-    raw = os.getenv("KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN", "").strip()
-    try:
-        cap = int(raw) if raw else DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN
-    except ValueError:
-        cap = DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN
+    if max_calls is None:
+        raw = os.getenv("KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN", "").strip()
+        try:
+            cap = int(raw) if raw else DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN
+        except ValueError:
+            cap = DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN
+    else:
+        cap = int(max_calls)
     return ProviderRequestBudget({"agents-web-search": max(0, cap)})
 
 
@@ -1202,6 +1294,11 @@ def _merge_company_search_telemetry(
                         "requests_succeeded": 0,
                         "raw_result_count": 0,
                         "credits_used": 0,
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "estimated_usd": 0.0,
                         "total_seconds": 0.0,
                     },
                 )
@@ -1210,8 +1307,17 @@ def _merge_company_search_telemetry(
                     "requests_succeeded",
                     "raw_result_count",
                     "credits_used",
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "output_tokens",
+                    "reasoning_output_tokens",
                 ):
                     target[key] = int(target[key]) + int(float(usage.get(key) or 0))
+                target["estimated_usd"] = round(
+                    float(target.get("estimated_usd") or 0.0)
+                    + float(usage.get("estimated_usd") or 0.0),
+                    8,
+                )
                 target["total_seconds"] = round(
                     float(target["total_seconds"]) + float(usage.get("total_seconds") or 0),
                     3,

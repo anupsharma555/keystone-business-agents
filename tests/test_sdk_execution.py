@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from collections.abc import AsyncIterator
@@ -30,6 +31,7 @@ from keystone_agents.agents.business_research_analyst import (
     run_business_research_analyst_focused_brief_sdk,
     run_business_research_analyst_sdk,
 )
+from keystone_agents.agents.chief_of_staff import run_chief_of_staff_sdk
 from keystone_agents.agents.gmail_triage import (
     build_gmail_triage_agent,
     run_gmail_priority_grouping_sdk,
@@ -63,8 +65,10 @@ from keystone_agents.models import (
     GmailTriageSDKInput,
     OpportunityScoutSDKInput,
     OutreachComposerSDKInput,
+    TypedAgentRunResult,
 )
-from keystone_agents.run import run_retrieved_sdk_synthesis
+from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
+from keystone_agents.run import prompt_from_typed_input, run_retrieved_sdk_synthesis
 from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
 from keystone_agents.schemas.email_triage import EmailTriageResult, GmailPriorityGroupingResult
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
@@ -421,6 +425,43 @@ def _orchestrator_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+def _chief_of_staff_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "agent_name": "chief_of_staff",
+        "mode": "llm",
+        "intent": "slack_operations",
+        "summary": "Fake model produced an operations review plan.",
+        "time_window": "current",
+        "target_channels": ["ai-agents-workflow"],
+        "operating_capabilities": ["planning", "review"],
+        "recommended_route": {
+            "workflow_type": "slack-runtime-review",
+            "command_text": "@KNI chief of staff review agent runtime",
+            "target_channel": "ai-agents-workflow",
+            "rationale": "Operator asked for planning and review.",
+            "requires_live_connector": False,
+            "requires_human_approval_before_post": True,
+        },
+        "recommended_actions": ["Review cost telemetry after the next Slack run."],
+        "blocked_side_effects": ["gmail_send", "slack_post"],
+        "approval_required": True,
+        "human_review_required": True,
+        "send_enabled": False,
+        "slack_post_allowed": False,
+        "slack_post_policy": "not_allowed",
+        "slack_target_channel": "",
+        "slack_post_reason": "No explicit post approval.",
+        "sources": [],
+        "context_sources_considered": ["operator_request"],
+        "repo_context_used": [],
+        "write_requests": [],
+        "artifact_refs": [],
+        "audit_notes": ["Fake model CoS result."],
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _orchestrator_output_review_payload(**overrides: Any) -> dict[str, Any]:
     payload = {
         "reviewed_by": "orchestrator",
@@ -498,6 +539,22 @@ def _model_input_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
+
+
+def test_prompt_from_typed_input_renders_structured_context_as_json() -> None:
+    prompt = prompt_from_typed_input(
+        {
+            "request": "chief of staff review this Slack request",
+            "manual_request_plan": {"target_agent": "chief_of_staff"},
+            "orchestrator_preflight": {"selected_agent": "chief_of_staff"},
+        }
+    )
+
+    parsed = json.loads(prompt)
+    assert parsed["request"] == "chief of staff review this Slack request"
+    assert parsed["manual_request_plan"]["target_agent"] == "chief_of_staff"
+    assert parsed["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
+    assert "'target_agent'" not in prompt
 
 
 def _tool_call(name: str, arguments: dict[str, Any]) -> ResponseFunctionToolCall:
@@ -667,6 +724,9 @@ def test_all_specialist_agents_run_with_fake_model_without_openai_key(
 ) -> None:
     monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSIONS", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSION_ID", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSION_DB", raising=False)
     model = FakeModel(outputs=[[_structured_message(payload)]])
 
     result = _run_with_fake_model(builder(), model, prompt)
@@ -714,6 +774,25 @@ def test_all_specialist_agents_run_with_fake_model_without_openai_key(
             _outreach_draft_payload(),
             OutreachDraft,
         ),
+        (
+            run_chief_of_staff_sdk,
+            {
+                "request": "review agent runtime cost telemetry",
+                "manual_request_plan": {
+                    "source": "test",
+                    "requested_agent": "chief_of_staff",
+                    "target_agent": "chief_of_staff",
+                    "intent": "slack_operations",
+                    "primary_target": "agent runtime cost telemetry",
+                    "target_type": "slack_channel",
+                    "objective": "Review agent runtime cost telemetry.",
+                    "task_objective": "slack_operations",
+                    "expected_artifact_type": "slack_ops_summary",
+                },
+            },
+            _chief_of_staff_payload(),
+            ChiefOfStaffResult,
+        ),
     ],
 )
 def test_typed_specialist_runtime_harness_uses_fake_model_without_openai_key(
@@ -730,10 +809,19 @@ def test_typed_specialist_runtime_harness_uses_fake_model_without_openai_key(
 
     result = runner(typed_input, run_config=build_local_run_config(provider))
 
+    assert isinstance(result, TypedAgentRunResult)
     assert isinstance(result.final_output, output_type)
     assert result.output is result.final_output
     assert result.live is False
     assert result.agent_name
+    assert result.usage["available"] is True
+    assert result.usage["requests"] == 1
+    assert "cache_hit_rate" in result.usage
+    assert "source" in result.cost
+    assert result.budget_guard["status"]
+    assert result.request_cache["request_layout"] == "static_agent_prefix_then_dynamic_typed_input"
+    assert len(result.request_cache["static_prefix_sha256"]) == 64
+    assert len(result.request_cache["dynamic_prompt_sha256"]) == 64
     assert model.calls
 
 
@@ -981,6 +1069,9 @@ def test_retrieved_sdk_synthesis_harness_validates_and_audits(
 ) -> None:
     monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSIONS", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSION_ID", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSION_DB", raising=False)
     raw_context = {
         "message_id": "fake-message-1",
         "subject": "Potential consulting project",
@@ -1033,9 +1124,17 @@ def test_retrieved_sdk_synthesis_harness_validates_and_audits(
         "total_tokens": 0,
         "cached_input_tokens": 0,
         "reasoning_output_tokens": 0,
+        "cache_hit_rate": 0.0,
+        "prompt_cache_key_present": False,
+        "prompt_cache_key_hash": "",
     }
     assert outcome.cost["amount_usd"] is None
     assert outcome.cost["source"] == "pricing_table_no_match"
+    assert outcome.request_cache["request_layout"] == "static_agent_prefix_then_dynamic_typed_input"
+    assert outcome.request_cache["session_attached"] is False
+    assert outcome.request_cache["tool_count"] > 0
+    assert len(outcome.request_cache["static_prefix_sha256"]) == 64
+    assert len(outcome.request_cache["dynamic_prompt_sha256"]) == 64
     assert outcome.storage["agent_run"] == {"status": "saved", "id": 1}
     assert len(storage.agent_runs) == 1
     saved = storage.agent_runs[0]
@@ -1048,7 +1147,50 @@ def test_retrieved_sdk_synthesis_harness_validates_and_audits(
     assert "body" not in saved["input_payload"]
     assert isinstance(saved["output"]["result"], EmailTriageResult)
     assert saved["output"]["_sdk_usage"]["requests"] == 1
+    assert saved["output"]["_sdk_request_cache"]["dynamic_prompt_chars"] > 0
     assert model.calls
+
+
+def test_retrieved_sdk_synthesis_records_prompt_cache_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_model_env(monkeypatch)
+
+    class RawResult:
+        usage = {
+            "requests": 1,
+            "input_tokens": 10_000,
+            "cached_input_tokens": 7_500,
+            "output_tokens": 600,
+            "total_tokens": 10_600,
+        }
+        _generated_prompt_cache_key = "keystone:gmail_triage:slack-thread:1715366400.000100"
+
+    def fake_run_typed_sdk_sync(*_args: Any, **_kwargs: Any) -> tuple[RawResult, dict[str, Any]]:
+        return RawResult(), _email_triage_payload()
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fake_run_typed_sdk_sync)
+
+    outcome = run_retrieved_sdk_synthesis(
+        agent=build_gmail_triage_agent(include_tools=False),
+        output_type=EmailTriageResult,
+        retrieve=lambda: {
+            "subject": "Potential consulting project",
+            "body": "Could we discuss consulting support?",
+            "message_id": "fake-message-1",
+        },
+        normalize=lambda value: GmailTriageSDKInput(**value),
+        input_summary="prompt cache metadata smoke test",
+        config=ModelConfig(provider="openai", model="gpt-5.4-mini"),
+    )
+
+    expected_hash = hashlib.sha256(
+        b"keystone:gmail_triage:slack-thread:1715366400.000100"
+    ).hexdigest()[:12]
+    assert outcome.usage["cache_hit_rate"] == 0.75
+    assert outcome.usage["prompt_cache_key_present"] is True
+    assert outcome.usage["prompt_cache_key_hash"] == expected_hash
+    assert "1715366400" not in outcome.usage["prompt_cache_key_hash"]
 
 
 def test_retrieved_sdk_synthesis_reports_gemini_free_tier_context(
@@ -1081,6 +1223,9 @@ def test_retrieved_sdk_synthesis_reports_gemini_free_tier_context(
 
     assert payload["model"]["provider"] == "gemini"
     assert payload["model"]["name"] == "gemini-2.5-flash"
+    assert payload["request_cache"]["request_layout"] == (
+        "static_agent_prefix_then_dynamic_typed_input"
+    )
     assert payload["gemini_free_tier_usage"]["available"] is True
     assert payload["gemini_free_tier_usage"]["requests_this_run"] == 1
     assert payload["gemini_free_tier_usage"]["requests_observed_today"] == 1
@@ -1402,6 +1547,8 @@ def test_orchestrator_llm_output_review_uses_fake_model_with_cost_guard(
         "structure, relevance, human readability, professional tone"
     )
     assert review.send_enabled is False
+    assert any("SDK usage:" in note for note in review.audit_notes)
+    assert any("SDK request cache diagnostics:" in note for note in review.audit_notes)
     assert "SHOULD_NOT_APPEAR" not in prompt
     assert "Full body with token" not in prompt
     assert "full body is not included in orchestrator review" in prompt

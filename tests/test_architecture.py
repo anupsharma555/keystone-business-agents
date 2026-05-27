@@ -122,6 +122,44 @@ def test_agents_guide_exists() -> None:
     assert "not a plain scripting project" in text
 
 
+def test_agent_modules_use_centralized_cost_tracked_sdk_runner() -> None:
+    """Agent modules should not bypass usage/cost/request-cache instrumentation."""
+
+    offenders: list[str] = []
+    for path in (KEYSTONE_AGENTS_ROOT / "agents").glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "keystone_agents.sdk":
+                imported = {alias.name for alias in node.names}
+                if {"run_typed_sdk_sync", "run_sdk_sync", "Runner"} & imported:
+                    offenders.append(path.name)
+            if isinstance(node, ast.Attribute) and node.attr in {"run", "run_sync"}:
+                if isinstance(node.value, ast.Name) and node.value.id == "Runner":
+                    offenders.append(path.name)
+
+    assert offenders == []
+
+
+def test_non_sdk_modules_do_not_call_raw_agents_runner() -> None:
+    """Raw SDK execution belongs behind the shared cost-tracked wrappers."""
+
+    allowed = {
+        Path("src/keystone_agents/sdk.py"),
+        Path("src/keystone_agents/run.py"),
+        Path("src/keystone_agents/sandboxing.py"),
+    }
+    offenders: list[str] = []
+    for path in (KEYSTONE_AGENTS_ROOT).rglob("*.py"):
+        relative = path.relative_to(PROJECT_ROOT)
+        if relative in allowed:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "Runner.run" in text or "run_typed_sdk_sync" in text or "run_sdk_sync(" in text:
+            offenders.append(str(relative))
+
+    assert offenders == []
+
+
 def test_agents_sdk_conformance_doc_maps_structural_boundaries() -> None:
     guide = PROJECT_ROOT / "docs" / "AGENTS_SDK_CONFORMANCE.md"
 

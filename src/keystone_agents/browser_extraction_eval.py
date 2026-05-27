@@ -36,7 +36,7 @@ BrowserProviderName = Literal[
     "crawl4ai",
 ]
 
-DEFAULT_BROWSER_EVAL_CASES_PATH = Path("evals/browser_extraction_cases.jsonl")
+DEFAULT_BROWSER_EVAL_CASES_PATH = Path("evals/provider/browser_extraction_cases.jsonl")
 DEFAULT_BROWSER_EVAL_OUTPUT_DIR = Path("artifacts/browser_extraction_evals")
 BASELINE_BROWSER_PROVIDER: BrowserProviderName = "trafilatura"
 DEFAULT_RENDERED_PAGE_TIMEOUT_SECONDS = 15

@@ -46,6 +46,11 @@ from keystone_agents.config import (
     require_cli_live_confirmation,
     with_cli_environment,
 )
+from keystone_agents.orchestrator.preflight_context import (
+    apply_orchestrator_preflight_to_args,
+    attach_orchestrator_preflight_payload,
+    orchestrator_preflight_context_text,
+)
 from keystone_agents.founder_profile import (
     founder_profile_audit_payload,
     founder_search_context,
@@ -248,6 +253,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _apply_manual_request_plan(args: argparse.Namespace) -> argparse.Namespace:
+    args = apply_orchestrator_preflight_to_args(args)
+    if getattr(args, "manual_request_plan", None):
+        plan = args.manual_request_plan
+        if isinstance(plan, dict) and plan.get("target_agent") == "business_research_analyst":
+            primary_target = str(plan.get("primary_target") or "").strip()
+            if primary_target:
+                args.company = primary_target
+        return args
     request_text = str(args.request_text or "").strip()
     args.manual_request_plan = None
     if not request_text:
@@ -272,6 +285,30 @@ def _manual_plan_objective(args: argparse.Namespace) -> str:
     if isinstance(plan, dict):
         return str(plan.get("objective") or "").strip()
     return ""
+
+
+def _orchestrator_review_request_summary(
+    args: argparse.Namespace,
+    *,
+    fallback: str,
+) -> str:
+    """Use the raw/manual request as the review basis before target labels."""
+
+    request_text = str(getattr(args, "request_text", "") or "").strip()
+    if request_text:
+        return request_text
+    preflight = getattr(args, "orchestrator_preflight", None)
+    if isinstance(preflight, dict):
+        preflight_request = str(preflight.get("request_text") or "").strip()
+        if preflight_request:
+            return preflight_request
+        memo = preflight.get("preflight_memo")
+        if isinstance(memo, dict):
+            memo_request = str(memo.get("raw_request") or "").strip()
+            if memo_request:
+                return memo_request
+    objective = _manual_plan_objective(args)
+    return objective or fallback
 
 
 def _apply_live_test_defaults(args: argparse.Namespace) -> argparse.Namespace:
@@ -459,6 +496,7 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     )
     founder_profile = load_founder_fit_profile(args.founder_fit_profile)
     founder_context = founder_search_context(founder_profile) if founder_profile else ""
+    preflight_context = orchestrator_preflight_context_text(args)
 
     retrieval_state: dict[str, Any] = {}
 
@@ -482,7 +520,10 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             company_url=args.company_url,
             lead_name=args.lead_name,
             linkedin_url=args.linkedin_url,
-            context=_company_context(profile, founder_context),
+            context=_company_context(
+                profile,
+                "\n\n".join(item for item in (founder_context, preflight_context) if item),
+            ),
             retrieval_hint=_explicit_retrieval_hint(args),
         )
 
@@ -501,7 +542,23 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
                 company_name=typed_input.company_name,
                 company_url=typed_input.company_url,
                 source_context="\n\n".join(
-                    item for item in (typed_input.source_context, founder_context) if item
+                    item
+                    for item in (
+                        typed_input.source_context,
+                        founder_context,
+                        preflight_context,
+                    )
+                    if item
+                ),
+                brief_goal=typed_input.brief_goal,
+                retrieval_hint=_explicit_retrieval_hint(args),
+            )
+        if preflight_context:
+            return BusinessResearchFocusedBriefSDKInput(
+                company_name=typed_input.company_name,
+                company_url=typed_input.company_url,
+                source_context="\n\n".join(
+                    item for item in (typed_input.source_context, preflight_context) if item
                 ),
                 brief_goal=typed_input.brief_goal,
                 retrieval_hint=_explicit_retrieval_hint(args),
@@ -531,7 +588,25 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
                 decision_criteria=typed_input.decision_criteria,
                 requested_output_format=typed_input.requested_output_format,
                 source_context="\n\n".join(
-                    item for item in (typed_input.source_context, founder_context) if item
+                    item
+                    for item in (
+                        typed_input.source_context,
+                        founder_context,
+                        preflight_context,
+                    )
+                    if item
+                ),
+                retrieval_hint=typed_input.retrieval_hint,
+            )
+        if preflight_context:
+            return BusinessResearchComparisonSDKInput(
+                company_a=typed_input.company_a,
+                company_b=typed_input.company_b,
+                decision_goal=typed_input.decision_goal,
+                decision_criteria=typed_input.decision_criteria,
+                requested_output_format=typed_input.requested_output_format,
+                source_context="\n\n".join(
+                    item for item in (typed_input.source_context, preflight_context) if item
                 ),
                 retrieval_hint=typed_input.retrieval_hint,
             )
@@ -618,6 +693,7 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     payload["retrieval_diagnostics"] = payload["retrieval"].get("retrieval_diagnostics")
     if getattr(args, "manual_request_plan", None):
         payload["manual_request_plan"] = args.manual_request_plan
+    attach_orchestrator_preflight_payload(payload, args)
     _save_retrieval_tool_performance_memory(args, payload)
     if args.orchestrator_review:
         payload["orchestrator_review"] = build_cli_orchestrator_review(
@@ -625,10 +701,13 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
             agent_name="business_research_analyst",
             output=outcome.final_output,
-            request_summary=(
-                f"{args.company} vs {args.compare_company}"
-                if comparison_requested
-                else args.company
+            request_summary=_orchestrator_review_request_summary(
+                args,
+                fallback=(
+                    f"{args.company} vs {args.compare_company}"
+                    if comparison_requested
+                    else args.company
+                ),
             ),
             run_type=(
                 "live SDK + live search"
@@ -736,6 +815,7 @@ def main() -> int:
                 payload["retrieval_diagnostics"] = primary.get("retrieval_diagnostics")
         if getattr(args, "manual_request_plan", None):
             payload["manual_request_plan"] = args.manual_request_plan
+        attach_orchestrator_preflight_payload(payload, args)
         if agent_descriptor is not None:
             payload["agent"] = agent_descriptor
         if args.orchestrator_review:
@@ -744,7 +824,10 @@ def main() -> int:
                 run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
                 agent_name="business_research_analyst",
                 output=comparison,
-                request_summary=f"{args.company} vs {args.compare_company}",
+                request_summary=_orchestrator_review_request_summary(
+                    args,
+                    fallback=f"{args.company} vs {args.compare_company}",
+                ),
                 run_type="live search" if args.live_search else "deterministic fixture",
             )
         if args.save:
@@ -799,6 +882,7 @@ def main() -> int:
     payload["retrieval_diagnostics"] = retrieval.get("retrieval_diagnostics")
     if getattr(args, "manual_request_plan", None):
         payload["manual_request_plan"] = args.manual_request_plan
+    attach_orchestrator_preflight_payload(payload, args)
     if args.output_format:
         payload["requested_output_format"] = args.output_format
     if agent_descriptor is not None:
@@ -809,7 +893,10 @@ def main() -> int:
             run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
             agent_name="business_research_analyst",
             output=profile,
-            request_summary=args.company,
+            request_summary=_orchestrator_review_request_summary(
+                args,
+                fallback=args.company,
+            ),
             run_type="live search" if args.live_search else "deterministic fixture",
         )
     if args.save:

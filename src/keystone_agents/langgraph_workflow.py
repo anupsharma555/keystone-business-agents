@@ -22,7 +22,7 @@ from keystone_agents.schemas.work_item import (
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.work_items import record_event
-from keystone_agents.workflow_runner import advance_work_item
+from keystone_agents.workflow_runner import advance_work_item, advance_work_item_manager_loop
 
 LANGGRAPH_WORKITEM_ENV_KEYS = (
     "KNI_BUSINESS_AGENTS_LANGGRAPH",
@@ -50,6 +50,8 @@ class WorkItemGraphState(TypedDict, total=False):
     human_checkpoint_payload: dict[str, Any]
     human_decision: Any
     improvements: list[str]
+    manager_loop: bool
+    max_manager_steps: int
 
 
 class LangGraphWorkflowOutcome(BaseModel):
@@ -147,6 +149,8 @@ def run_work_item_langgraph(
     thread_id: str | None = None,
     require_langgraph: bool = False,
     enable_interrupts: bool = False,
+    manager_loop: bool = False,
+    max_manager_steps: int = 3,
 ) -> LangGraphWorkflowOutcome:
     """Advance a WorkItem through the optional LangGraph orchestration layer."""
 
@@ -155,6 +159,8 @@ def run_work_item_langgraph(
         "node_path": [],
         "enable_interrupts": enable_interrupts,
         "improvements": langgraph_functionality_improvements(),
+        "manager_loop": bool(manager_loop),
+        "max_manager_steps": max(1, min(5, int(max_manager_steps or 3))),
     }
     checkpoint_key = thread_id or f"work-item-graph-{uuid4().hex}"
     if langgraph_available():
@@ -221,6 +227,30 @@ def advance_work_item_with_optional_langgraph(
     return outcome.result
 
 
+def advance_work_item_manager_loop_with_optional_langgraph(
+    request: WorkflowRunRequest,
+    *,
+    max_steps: int = 3,
+    use_langgraph: bool | None = None,
+    thread_id: str | None = None,
+    require_langgraph: bool = False,
+) -> WorkflowRunResult:
+    """Run the integrated manager loop directly or through LangGraph opt-in."""
+
+    enabled = work_item_langgraph_enabled() if use_langgraph is None else bool(use_langgraph)
+    if not enabled:
+        return advance_work_item_manager_loop(request, max_steps=max_steps)
+    graph_thread_id = thread_id or work_item_graph_thread_id(request.work_item_id or "")
+    outcome = run_work_item_langgraph(
+        request,
+        thread_id=graph_thread_id or None,
+        require_langgraph=require_langgraph,
+        manager_loop=True,
+        max_manager_steps=max_steps,
+    )
+    return outcome.result
+
+
 def next_langgraph_node_for_result(
     result: WorkflowRunResult,
 ) -> Literal["approval_checkpoint", "done"]:
@@ -240,7 +270,13 @@ def _run_dependency_free_graph(state: WorkItemGraphState) -> WorkItemGraphState:
 
 def _advance_work_item_node(state: WorkItemGraphState) -> WorkItemGraphState:
     request = WorkflowRunRequest.model_validate(state.get("request") or {})
-    result = advance_work_item(request)
+    if state.get("manager_loop"):
+        result = advance_work_item_manager_loop(
+            request,
+            max_steps=max(1, min(5, int(state.get("max_manager_steps") or 3))),
+        )
+    else:
+        result = advance_work_item(request)
     checkpoint_reason = _approval_checkpoint_reason(result)
     return {
         **state,

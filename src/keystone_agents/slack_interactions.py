@@ -10,11 +10,18 @@ from urllib.parse import parse_qs
 from pydantic import BaseModel
 
 from keystone_agents.agent_mentions import parse_agent_mention
+from keystone_agents.agents.orchestrator import (
+    review_specialist_output,
+    run_orchestrator_preflight,
+)
 from keystone_agents.agents.outreach_composer import build_outreach_composer_compact_synthesis_agent
 from keystone_agents.automation_inventory import build_automation_inventory_report
-from keystone_agents.langgraph_workflow import advance_work_item_with_optional_langgraph
+from keystone_agents.langgraph_workflow import (
+    advance_work_item_manager_loop_with_optional_langgraph,
+)
 from keystone_agents.models import OutreachComposerSDKInput
 from keystone_agents.natural_interaction import resolve_natural_followup
+from keystone_agents.orchestrator.preflight_context import compact_orchestrator_preflight_payload
 from keystone_agents.run import run_retrieved_sdk_synthesis
 from keystone_agents.schemas.approval import ApprovalQueueObjectType, ApprovalQueueStatus
 from keystone_agents.schemas.outreach import OutreachLLMDraftPayload
@@ -26,6 +33,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemStatus,
 )
 from keystone_agents.slack_action_contract import (
+    BUSINESS_AGENT_ACTION_SCHEMA,
     KBA_ACTION_IDS,
     KBA_APPROVE_EXTERNAL_USE,
     KBA_COS_AUDIT_AUTOMATIONS,
@@ -656,16 +664,11 @@ def _handle_kba_steering_action(
         database_url=database_url,
         route=route,
     )
-    outcome = {
-        KBA_INTENT_MORE_RESEARCH: "research_queued",
-        KBA_INTENT_FIND_CONTACT: "contact_search_queued",
-        KBA_INTENT_RUN_AGAIN: "run_again_queued",
-    }.get(intent, "agent_step_queued")
-    followup = {
-        KBA_INTENT_MORE_RESEARCH: "Research queued",
-        KBA_INTENT_FIND_CONTACT: "Contact search queued",
-        KBA_INTENT_RUN_AGAIN: "Run again queued",
-    }.get(intent, "Agent step queued")
+    outcome, followup = _steering_action_outcome_and_followup(
+        intent,
+        result=advance,
+        work_item_id=work_item.id,
+    )
     return _kba_result(
         action_payload,
         action_id=action_id,
@@ -678,6 +681,45 @@ def _handle_kba_steering_action(
         queued_route=advance.route.value,
         queued_command=_queued_command(work_item.id, advance.route.value),
         agent_activity_result=_agent_activity_payload(advance),
+    )
+
+
+def _steering_action_outcome_and_followup(
+    intent: str,
+    *,
+    result: Any,
+    work_item_id: str,
+) -> tuple[str, str]:
+    if intent == KBA_INTENT_MORE_RESEARCH:
+        if result.status == WorkItemStatus.BLOCKED:
+            blockers = ", ".join(blocker.code for blocker in result.blockers[:3])
+            suffix = f" Blocker(s): {blockers}." if blockers else ""
+            return (
+                "research_retry_still_blocked",
+                (
+                    "Independent source retry ran but the WorkItem is still blocked; "
+                    f"do not treat the research as decision-ready yet.{suffix}"
+                ),
+            )
+        return (
+            "research_retry_completed",
+            (
+                "Independent source retry completed for "
+                f"WorkItem `{work_item_id}` with status `{result.status.value}`."
+            ),
+        )
+    if intent == KBA_INTENT_FIND_CONTACT:
+        return "contact_search_completed", (
+            f"Contact search completed for WorkItem `{work_item_id}` "
+            f"with status `{result.status.value}`."
+        )
+    if intent == KBA_INTENT_RUN_AGAIN:
+        return "run_again_completed", (
+            f"Run-again action completed for WorkItem `{work_item_id}` "
+            f"with status `{result.status.value}`."
+        )
+    return "agent_step_completed", (
+        f"Agent step completed for WorkItem `{work_item_id}` with status `{result.status.value}`."
     )
 
 
@@ -851,13 +893,39 @@ def _handle_chief_of_staff_action(
                 slack_channel_id=channel,
                 slack_message_ts=action_payload.source_message_ts,
             )
-        advance = advance_work_item_with_optional_langgraph(
+        existing_item = store.get_work_item(work_item_id)
+        requested_agent = (
+            existing_item.current_route.value
+            if existing_item is not None
+            and existing_item.current_route
+            not in {WorkItemRoute.ORCHESTRATOR, WorkItemRoute.CLARIFICATION}
+            else "orchestrator"
+        )
+        orchestrator_preflight = run_orchestrator_preflight(
+            "continue",
+            requested_agent=requested_agent,
+            live_manual_plan=_slack_work_item_live_sdk_enabled(
+                default=_slack_work_item_live_search_enabled()
+            ),
+            database_url=database_url,
+        )
+        advance = advance_work_item_manager_loop_with_optional_langgraph(
             WorkflowRunRequest(
                 request_text="continue",
                 work_item_id=work_item_id,
                 save=True,
                 database_url=database_url,
+                orchestrator_preflight=compact_orchestrator_preflight_payload(
+                    orchestrator_preflight
+                ),
+                **_slack_action_cost_conservation_request_options(intent),
             )
+        )
+        advance = _record_slack_action_orchestrator_review(
+            advance,
+            request_text="continue",
+            intent=intent,
+            database_url=database_url,
         )
         return SlackApprovalInteractionResult(
             approval_id=action_payload.approval_id,
@@ -1094,18 +1162,14 @@ def _build_revision_modal(
     metadata = item.metadata or {}
     company = str(metadata.get("company_name") or "this draft").strip()
     summary = str(item.summary or item.title or "").strip()
-    private_metadata = json.dumps(
-        action_payload.model_dump(mode="json", by_alias=True),
-        ensure_ascii=True,
-        sort_keys=True,
-    )
+    private_metadata = _revision_modal_private_metadata(action_payload, item)
     return {
         "type": "modal",
         "callback_id": KBA_REVISE_DRAFT_VIEW_CALLBACK_ID,
         "title": {"type": "plain_text", "text": "Revise draft"},
         "submit": {"type": "plain_text", "text": "Queue revision"},
         "close": {"type": "plain_text", "text": "Cancel"},
-        "private_metadata": private_metadata[:2900],
+        "private_metadata": private_metadata,
         "blocks": [
             {
                 "type": "section",
@@ -1135,6 +1199,52 @@ def _build_revision_modal(
     }
 
 
+def _revision_modal_private_metadata(
+    action_payload: BusinessAgentActionPayload,
+    item: Any,
+) -> str:
+    item_metadata = item.metadata if isinstance(getattr(item, "metadata", None), dict) else {}
+    action_metadata = action_payload.metadata if isinstance(action_payload.metadata, dict) else {}
+    approval_title = _clean_modal_scalar(
+        action_metadata.get("approval_title")
+        or item_metadata.get("approval_title")
+        or getattr(item, "title", ""),
+        160,
+    )
+    payload = {
+        "schema": BUSINESS_AGENT_ACTION_SCHEMA,
+        "intent": KBA_INTENT_REVISE_DRAFT,
+        "work_item_id": _clean_modal_scalar(
+            action_payload.work_item_id or item_metadata.get("work_item_id"),
+            160,
+        ),
+        "approval_id": _clean_modal_scalar(action_payload.approval_id, 160),
+        "gate_scope": _clean_modal_scalar(
+            action_payload.gate_scope or item_metadata.get("approval_scope"),
+            120,
+        ),
+        "artifact_id": _clean_modal_scalar(action_payload.artifact_id, 160),
+        "source_channel_id": _clean_modal_scalar(action_payload.source_channel_id, 120),
+        "source_message_ts": _clean_modal_scalar(action_payload.source_message_ts, 120),
+        "source_thread_ts": _clean_modal_scalar(action_payload.source_thread_ts, 120),
+        "metadata": {"approval_title": approval_title} if approval_title else {},
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    if len(encoded) > 2900:
+        payload["metadata"] = {}
+        encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    if len(encoded) > 2900:
+        raise ValueError("KBA revision modal metadata exceeds Slack private_metadata limit.")
+    return encoded
+
+
+def _clean_modal_scalar(value: Any, max_chars: int) -> str:
+    text = " ".join(str(value or "").strip().split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3].rstrip()}..."
+
+
 def _advance_work_item_for_intent(
     *,
     work_item_id: str,
@@ -1145,9 +1255,24 @@ def _advance_work_item_for_intent(
     route: WorkItemRoute | None = None,
 ) -> Any:
     resolved_route = route or _route_for_revision_intent(intent)
-    request_text = _request_text_for_intent(intent, feedback=feedback)
+    existing_work_item = None
+    if work_item_id:
+        existing_work_item = SQLiteStore(database_url or database_url_from_env()).get_work_item(
+            work_item_id
+        )
+    request_text = _request_text_for_intent(
+        intent,
+        feedback=feedback,
+        work_item=existing_work_item,
+    )
     live_search = _slack_work_item_live_search_enabled()
     live_sdk = _slack_work_item_live_sdk_enabled(default=live_search)
+    orchestrator_preflight = run_orchestrator_preflight(
+        request_text,
+        requested_agent=resolved_route.value,
+        live_manual_plan=live_sdk,
+        database_url=database_url,
+    )
     manual_plan = {
         "source": "slack_business_agent_action",
         "requested_agent": resolved_route.value,
@@ -1159,7 +1284,7 @@ def _advance_work_item_for_intent(
         "side_effect_policy": "draft_only_no_send_no_publish_no_schedule",
         "reviewer": reviewer,
     }
-    return advance_work_item_with_optional_langgraph(
+    result = advance_work_item_manager_loop_with_optional_langgraph(
         WorkflowRunRequest(
             request_text=request_text,
             work_item_id=work_item_id,
@@ -1169,7 +1294,158 @@ def _advance_work_item_for_intent(
             live_sdk=live_sdk,
             requested_route=resolved_route,
             manual_request_plan=manual_plan,
+            orchestrator_preflight=compact_orchestrator_preflight_payload(
+                orchestrator_preflight
+            ),
+            **_slack_action_cost_conservation_request_options(intent),
         )
+    )
+    return _record_slack_action_orchestrator_review(
+        result,
+        request_text=request_text,
+        intent=intent,
+        database_url=database_url,
+    )
+
+
+def _record_slack_action_orchestrator_review(
+    result: Any,
+    *,
+    request_text: str,
+    intent: str,
+    database_url: str | None,
+) -> Any:
+    """Attach an Orchestrator review event for direct Slack WorkItem actions."""
+
+    work_item = getattr(result, "work_item", None)
+    route = getattr(result, "route", None)
+    if work_item is None or route is None:
+        return result
+    target_metadata = dict(work_item.target.metadata)
+    prior_reviews = [
+        item
+        for item in target_metadata.get("orchestrator_reviews", [])
+        if isinstance(item, dict)
+    ]
+    latest_manager_review = next(
+        (
+            item
+            for item in reversed(prior_reviews)
+            if item.get("step") is not None and item.get("route") == route.value
+        ),
+        None,
+    )
+    if latest_manager_review is not None:
+        review_context = {
+            "intent": intent,
+            "route": route.value,
+            "status": latest_manager_review.get("review_status", ""),
+            "overall_score": latest_manager_review.get("overall_score", 0),
+            "approval_boundary_ok": latest_manager_review.get("approval_boundary_ok", True),
+            "observed_gaps": list(latest_manager_review.get("observed_gaps") or [])[:6],
+            "recommended_next_step": latest_manager_review.get("recommended_next_step", ""),
+            "review_decision": latest_manager_review.get("review_decision", "pass"),
+            "source": "manager_loop_integrated_review",
+        }
+        note = (
+            "Slack action used integrated Orchestrator manager review: "
+            f"{review_context['status']} ({review_context['overall_score']}/100)."
+        )
+        reviewed_item = work_item.model_copy(
+            update={
+                "audit_notes": list(dict.fromkeys([*work_item.audit_notes, note])),
+            }
+        ).touch()
+        store = SQLiteStore(database_url or database_url_from_env())
+        record_event(
+            reviewed_item,
+            event_type="orchestrator_action_review",
+            actor="orchestrator",
+            summary=note,
+            metadata=review_context,
+            store=store,
+        )
+        store.save_work_item(reviewed_item)
+        audit_notes = list(dict.fromkeys([*getattr(result, "audit_notes", []), note]))
+        return result.model_copy(
+            update={
+                "work_item": reviewed_item,
+                "audit_notes": audit_notes,
+            }
+        )
+    review_payload = {
+        "status": getattr(getattr(result, "status", None), "value", ""),
+        "advanced": bool(getattr(result, "advanced", False)),
+        "human_summary": str(getattr(result, "human_summary", "") or ""),
+        "artifact_refs": [
+            {
+                "artifact_type": ref.artifact_type,
+                "source_agent": ref.source_agent,
+                "approval_state": ref.approval_state,
+                "title": ref.title,
+                "summary": ref.summary,
+            }
+            for ref in list(getattr(result, "artifact_refs", []) or [])[:8]
+        ],
+        "blockers": [
+            {
+                "code": blocker.code,
+                "message": blocker.message,
+                "severity": blocker.severity,
+            }
+            for blocker in list(getattr(result, "blockers", []) or [])[:6]
+        ],
+        "next_action": (
+            result.next_action.model_dump(mode="json")
+            if getattr(result, "next_action", None) is not None
+            else None
+        ),
+        "send_enabled": False,
+        "can_send_email": False,
+    }
+    review = review_specialist_output(
+        agent_name=route.value,
+        output=review_payload,
+        request_summary=request_text,
+        run_type="slack_work_item_action",
+    )
+    review_context = {
+        "intent": intent,
+        "route": route.value,
+        "status": review.status,
+        "overall_score": review.overall_score,
+        "approval_boundary_ok": review.approval_boundary_ok,
+        "observed_gaps": review.observed_gaps[:6],
+        "recommended_next_step": review.recommended_next_step,
+        "review_decision": "pass" if review.status == "pass" else "warn",
+    }
+    target_metadata["orchestrator_reviews"] = [*prior_reviews, review_context][-5:]
+    note = (
+        "Slack action Orchestrator review: "
+        f"{review.status} ({review.overall_score}/100)."
+    )
+    reviewed_item = work_item.model_copy(
+        update={
+            "target": work_item.target.model_copy(update={"metadata": target_metadata}),
+            "audit_notes": list(dict.fromkeys([*work_item.audit_notes, note])),
+        }
+    ).touch()
+    store = SQLiteStore(database_url or database_url_from_env())
+    record_event(
+        reviewed_item,
+        event_type="orchestrator_action_review",
+        actor="orchestrator",
+        summary=note,
+        metadata=review_context,
+        store=store,
+    )
+    store.save_work_item(reviewed_item)
+    audit_notes = list(dict.fromkeys([*getattr(result, "audit_notes", []), note]))
+    return result.model_copy(
+        update={
+            "work_item": reviewed_item,
+            "audit_notes": audit_notes,
+        }
     )
 
 
@@ -1182,6 +1458,26 @@ def _slack_work_item_live_sdk_enabled(*, default: bool) -> bool:
     if explicit is not None:
         return _truthy_string(explicit, default=default)
     return _env_truthy("KNI_BUSINESS_AGENTS_LIVE_SDK", default=default)
+
+
+def _slack_action_cost_conservation_request_options(intent: str) -> dict[str, Any]:
+    """Return Slack WorkItem action cost controls without changing safety gates."""
+
+    deep_research = intent in {
+        KBA_INTENT_MORE_RESEARCH,
+        KBA_INTENT_RESEARCH_ALL_CANDIDATES,
+        KBA_INTENT_FIND_CONTACT,
+        KBA_INTENT_RUN_AGAIN,
+    }
+    if not deep_research:
+        return {}
+    return {
+        "cost_profile": "slack_research_deep",
+        "allow_manager_loop_repair": True,
+        "include_contact_enrichment": intent == KBA_INTENT_FIND_CONTACT,
+        "hosted_web_search_max_calls": 2,
+        "reuse_existing_research": False,
+    }
 
 
 def _env_truthy(name: str, *, default: bool = False) -> bool:
@@ -1221,18 +1517,48 @@ def _route_for_steering_intent(intent: str, work_item: Any) -> WorkItemRoute:
     return WorkItemRoute.BUSINESS_RESEARCH_ANALYST
 
 
-def _request_text_for_intent(intent: str, *, feedback: str) -> str:
+def _request_text_for_intent(
+    intent: str,
+    *,
+    feedback: str,
+    work_item: Any | None = None,
+) -> str:
     if intent == KBA_INTENT_REVISE_DRAFT:
         return f"Revise the outreach draft using this Slack feedback: {feedback}"
     if intent == KBA_INTENT_FIND_CONTACT:
         return "Find a better source-backed contact or destination for this outreach WorkItem."
     if intent == KBA_INTENT_MORE_RESEARCH:
-        return "Run deeper source-backed business research for this WorkItem."
+        target = _work_item_research_target_for_retry(work_item)
+        target_phrase = f" for {target}" if target else " for this WorkItem"
+        return (
+            "Retry the independent current-year source pass"
+            f"{target_phrase}. Search specifically for 2026 third-party validation, "
+            "funding, partnerships, product updates, hiring, roadmap signals, and "
+            "independent coverage. Do not repeat a generic company-site or press-release "
+            "pass; if independent sources remain insufficient, report that the blocker "
+            "still stands instead of implying the research is complete."
+        )
     if intent == KBA_INTENT_RESEARCH_ALL_CANDIDATES:
         return "Run source-backed business research for each attached opportunity candidate."
     if intent == KBA_INTENT_RUN_AGAIN:
         return "Run this WorkItem route again with the same request context."
     return "Advance this WorkItem from a Slack business-agent action."
+
+
+def _work_item_research_target_for_retry(work_item: Any | None) -> str:
+    if work_item is None:
+        return ""
+    target = getattr(work_item, "target", None)
+    name = str(getattr(target, "name", "") or "").strip()
+    if name:
+        return name
+    artifact_refs = getattr(work_item, "artifact_refs", []) or []
+    for artifact in reversed(artifact_refs):
+        if getattr(artifact, "artifact_type", "") == "company_profile":
+            title = str(getattr(artifact, "title", "") or "").strip()
+            if title:
+                return title
+    return ""
 
 
 def _record_kba_action_event(

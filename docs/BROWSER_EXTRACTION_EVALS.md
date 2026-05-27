@@ -47,7 +47,7 @@ Current eval provider boundaries:
 Seed cases live in:
 
 ```bash
-evals/browser_extraction_cases.jsonl
+evals/provider/browser_extraction_cases.jsonl
 ```
 
 Rows include:
@@ -75,7 +75,7 @@ network or browser execution:
 ```bash
 .venv/bin/python scripts/run_browser_extraction_eval.py \
   --provider browserless \
-  --cases evals/browser_extraction_cases.jsonl \
+  --cases evals/provider/browser_extraction_cases.jsonl \
   --output artifacts/browser_extraction_evals \
   --json
 ```
@@ -86,7 +86,7 @@ Compare current configured providers:
 .venv/bin/python scripts/run_browser_extraction_eval.py \
   --provider firecrawl \
   --provider browserless \
-  --cases evals/browser_extraction_cases.jsonl \
+  --cases evals/provider/browser_extraction_cases.jsonl \
   --output artifacts/browser_extraction_evals/current-providers \
   --live --no-dry-run \
   --json

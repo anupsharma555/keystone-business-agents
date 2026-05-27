@@ -67,7 +67,7 @@ requires `SERPER_API_KEY` only when explicitly selected, Firecrawl requires
 
 Search coverage is measured separately from page extraction. `scripts/run_search_coverage_eval.py`
 compares query-level provider results against expected source lanes and domains in
-`evals/search_coverage_cases.jsonl`. Use it to decide whether broader search, longer search,
+`evals/provider/search_coverage_cases.jsonl`. Use it to decide whether broader search, longer search,
 or a future provider is likely to find websites the current retrieval ladder misses.
 
 Search provider environment names:

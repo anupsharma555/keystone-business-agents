@@ -1104,6 +1104,16 @@ def test_cli_run_sdk_can_return_multiple_validated_variants(monkeypatch, capsys)
                 },
                 "components_usd": {"input": 0.0005, "cached_input": 0.0, "output": 0.0005},
             },
+            request_cache={
+                "request_layout": "static_agent_prefix_then_dynamic_typed_input",
+                "static_prefix_sha256": "a" * 64,
+                "instructions_sha256": "b" * 64,
+                "tool_names_sha256": "c" * 64,
+                "output_schema_sha256": "d" * 64,
+                "tool_count": 8,
+                "dynamic_prompt_chars": 1000,
+                "session_attached": False,
+            },
         )
 
     monkeypatch.setattr(cli, "SDK_RUN_CONFIG_FACTORY", lambda: object())
@@ -1133,6 +1143,10 @@ def test_cli_run_sdk_can_return_multiple_validated_variants(monkeypatch, capsys)
     assert len(payload["output"]["variants"]) == 3
     assert payload["output"]["variants"][0]["draft"]["approval_required"] is True
     assert payload["output"]["variants"][0]["draft"]["send_enabled"] is False
+    assert payload["usage"]["cache_hit_rate"] == 0.0
+    assert payload["request_cache"]["run_count"] == 3
+    assert payload["request_cache"]["static_prefix_stable"] is True
+    assert payload["request_cache"]["dynamic_prompt_chars"] == 3000
     assert len(calls) == 3
     assert all(live is False for _, _, live in calls)
 
@@ -1196,6 +1210,12 @@ def test_cli_live_sdk_uses_single_pass_variant_synthesis(monkeypatch, capsys) ->
                 "reasoning_output_tokens": 0,
             },
             cost={"source": "local_pricing_table", "amount_usd": 0.001},
+            request_cache={
+                "request_layout": "static_agent_prefix_then_dynamic_typed_input",
+                "static_prefix_sha256": "e" * 64,
+                "dynamic_prompt_chars": 1200,
+                "session_attached": False,
+            },
         )
 
     monkeypatch.setattr(
@@ -1224,6 +1244,7 @@ def test_cli_live_sdk_uses_single_pass_variant_synthesis(monkeypatch, capsys) ->
 
     assert calls == [(True, variant_labels)]
     assert payload["usage"]["requests"] == 1
+    assert payload["request_cache"]["static_prefix_sha256"] == "e" * 64
     assert payload["audit_notes"][0] == "Generated 3 constrained outreach variants in one SDK call."
     assert len(payload["output"]["variants"]) == 3
 

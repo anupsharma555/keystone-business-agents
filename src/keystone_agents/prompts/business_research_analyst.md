@@ -3,7 +3,7 @@ prompt_name: business_research_analyst
 prompt_version: 2026-05-20.1
 prompt_purpose: Source-attributed research across companies, institutions, conferences, topics, and article collections.
 prompt_safety_notes: No hallucinated facts; source attribution and claim evidence required; Workspace artifacts stay internal and approval-gated.
-prompt_eval_datasets: tests/evals/business_research_analyst_cases.json, evals/source_attribution.jsonl
+prompt_eval_datasets: evals/static/business_research_analyst_cases.json, evals/local/source_attribution.jsonl
 -->
 
 # Business Research Analyst Prompt

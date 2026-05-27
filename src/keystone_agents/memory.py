@@ -91,6 +91,9 @@ CHIEF_OF_STAFF_ROUTE_MEMORY_TYPES: dict[str, tuple[str, ...]] = {
     "memory-review": CHIEF_OF_STAFF_MEMORY_TYPES,
 }
 
+MANAGER_LOOP_EFFICIENCY_METRIC_NAME = "keystone.manager_loop.efficiency"
+MANAGER_LOOP_EFFICIENCY_METRIC_VERSION = "v1"
+
 
 def company_profile_memory_items(
     profile: CompanyProfile | dict[str, Any],
@@ -897,6 +900,88 @@ def retrieval_tool_performance_memory_item(
     )
 
 
+def manager_loop_efficiency_memory_item(
+    metrics: dict[str, Any],
+    *,
+    object_id: str,
+    approval_state: ApprovalState | str = ApprovalState.APPROVED_FOR_RESEARCH,
+) -> MemoryItem | None:
+    """Build prompt-safe memory for comparing manager-loop efficiency over time."""
+
+    if not metrics:
+        return None
+    metric_name = _bounded_text(
+        metrics.get("metric_name") or MANAGER_LOOP_EFFICIENCY_METRIC_NAME,
+        max_chars=100,
+    )
+    metric_version = _bounded_text(
+        metrics.get("metric_version") or MANAGER_LOOP_EFFICIENCY_METRIC_VERSION,
+        max_chars=20,
+    )
+    final_route = _bounded_text(metrics.get("final_route"), max_chars=80)
+    final_status = _bounded_text(metrics.get("final_status"), max_chars=40)
+    elapsed_seconds = _bounded_float(metrics.get("elapsed_seconds"))
+    step_count = _bounded_int(metrics.get("step_count"))
+    repair_count = _bounded_int(metrics.get("repair_count"))
+    blocker_count = _bounded_int(metrics.get("blocker_count"))
+    efficiency_signal = _bounded_text(metrics.get("efficiency_signal"), max_chars=60)
+    summary = (
+        f"{metric_name} {metric_version}: {final_route or 'unknown route'} "
+        f"ended {final_status or 'unknown'} in {elapsed_seconds:.3f}s with "
+        f"{step_count} step(s), {repair_count} repair(s), "
+        f"{blocker_count} blocker(s)."
+    )
+    if efficiency_signal:
+        summary = f"{summary} Signal: {efficiency_signal}."
+    return MemoryItem(
+        memory_type="manager_loop_efficiency",
+        object_type="workflow",
+        object_id=object_id,
+        object_key=normalize_memory_key(f"manager loop efficiency {object_id}"),
+        title=f"Manager loop efficiency: {object_id}",
+        summary=summary,
+        content={
+            "metric_name": metric_name,
+            "metric_version": metric_version,
+            "schema": _bounded_text(metrics.get("schema"), max_chars=120),
+            "elapsed_seconds": elapsed_seconds,
+            "latency_bucket": _bounded_text(metrics.get("latency_bucket"), max_chars=40),
+            "step_count": step_count,
+            "specialist_step_count": _bounded_int(metrics.get("specialist_step_count")),
+            "repair_count": repair_count,
+            "repair_rate": _bounded_float(metrics.get("repair_rate")),
+            "repair_attempts_by_route": _bounded_mapping(metrics.get("repair_attempts_by_route")),
+            "route_sequence": _bounded_text_list(
+                metrics.get("route_sequence"),
+                max_items=8,
+                max_chars=80,
+            ),
+            "final_route": final_route,
+            "final_status": final_status,
+            "advanced": bool(metrics.get("advanced")),
+            "artifact_count": _bounded_int(metrics.get("artifact_count")),
+            "blocker_count": blocker_count,
+            "live_search": bool(metrics.get("live_search")),
+            "live_sdk": bool(metrics.get("live_sdk")),
+            "final_synthesis_executed": bool(metrics.get("final_synthesis_executed")),
+            "seconds_per_specialist_step": _bounded_float(
+                metrics.get("seconds_per_specialist_step")
+            ),
+            "completion_without_blockers": bool(metrics.get("completion_without_blockers")),
+            "efficiency_signal": efficiency_signal,
+        },
+        source_ids=["local:manager_loop_efficiency"],
+        approval_state=approval_state,
+        confidence=0.8 if blocker_count == 0 else 0.55,
+        sensitivity="internal",
+        metadata={
+            "source": "manager_loop_metrics",
+            "metric_name": metric_name,
+            "metric_version": metric_version,
+        },
+    )
+
+
 def _retrieval_providers(retrieval_metadata: dict[str, Any]) -> list[str]:
     providers: list[str] = []
     for provider in retrieval_metadata.get("search_providers_used") or []:
@@ -910,6 +995,37 @@ def _retrieval_providers(retrieval_metadata: dict[str, Any]) -> list[str]:
             if text:
                 providers.append(text)
     return list(dict.fromkeys(providers))
+
+
+def _bounded_float(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number < 0:
+        return 0.0
+    if number > 86_400:
+        return 86_400.0
+    return round(number, 3)
+
+
+def _bounded_int(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(10_000, number))
+
+
+def _bounded_mapping(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    bounded: dict[str, int] = {}
+    for key, raw_value in list(value.items())[:12]:
+        clean_key = _bounded_text(key, max_chars=80)
+        if clean_key:
+            bounded[clean_key] = _bounded_int(raw_value)
+    return bounded
 
 
 def _source_ids_from_company(profile: CompanyProfile) -> list[str]:

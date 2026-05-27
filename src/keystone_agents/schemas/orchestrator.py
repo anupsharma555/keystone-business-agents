@@ -145,6 +145,12 @@ class OrchestratorWorkflowStateItem(BaseModel):
     next_step: str = ""
     route: str = ""
     target_agent: str = ""
+    automation_id: str = ""
+    workflow: str = ""
+    schedule: str = ""
+    channel: str = ""
+    default_channel: str = ""
+    purpose: str = ""
     created_at: str = ""
     fit_summary: str = ""
     subject: str = ""
@@ -168,6 +174,12 @@ class OrchestratorWorkflowStateItem(BaseModel):
         "next_step",
         "route",
         "target_agent",
+        "automation_id",
+        "workflow",
+        "schedule",
+        "channel",
+        "default_channel",
+        "purpose",
         "created_at",
         "fit_summary",
         "subject",
@@ -180,6 +192,82 @@ class OrchestratorWorkflowStateItem(BaseModel):
         return str(value or "").replace("\u2014", "-").strip()
 
 
+class OrchestratorSlackContextMessage(BaseModel):
+    """One compact Slack message reference in orchestrator-visible context."""
+
+    ts: str = ""
+    author: str = ""
+    text: str = ""
+    permalink: str = ""
+
+    @field_validator("ts", "author", "text", "permalink", mode="before")
+    @classmethod
+    def _clean_text(cls, value: object) -> str:
+        return str(value or "").replace("\u2014", "-").strip()
+
+
+class OrchestratorSlackContext(BaseModel):
+    """Strict-schema Slack context summary for Orchestrator SDK output."""
+
+    channel_id: str = ""
+    channel_name: str = ""
+    message_ts: str = ""
+    thread_ts: str = ""
+    selected_message_ts: str = ""
+    permalink: str = ""
+    latest_user_follow_up: str = ""
+    thread_fetch_status: str = ""
+    thread_transcript: str = ""
+    read_context: str = ""
+    channel_history_policy: str = ""
+    context_window_days: int | None = None
+    warnings: list[str] = Field(default_factory=list)
+    selected_message: OrchestratorSlackContextMessage | None = None
+    thread_messages: list[OrchestratorSlackContextMessage] = Field(default_factory=list)
+
+    @field_validator(
+        "channel_id",
+        "channel_name",
+        "message_ts",
+        "thread_ts",
+        "selected_message_ts",
+        "permalink",
+        "latest_user_follow_up",
+        "thread_fetch_status",
+        "thread_transcript",
+        "read_context",
+        "channel_history_policy",
+        mode="before",
+    )
+    @classmethod
+    def _clean_text(cls, value: object) -> str:
+        return str(value or "").replace("\u2014", "-").strip()
+
+    @field_validator("warnings", mode="before")
+    @classmethod
+    def _clean_warnings(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        values = list(value) if isinstance(value, list | tuple | set) else [value]
+        return [
+            str(item).replace("\u2014", "-").strip() for item in values if str(item or "").strip()
+        ]
+
+    @field_validator("thread_messages", mode="before")
+    @classmethod
+    def _clean_thread_messages(cls, value: object) -> list[object]:
+        if value is None:
+            return []
+        if isinstance(value, list | tuple):
+            return list(value)
+        if isinstance(value, Mapping):
+            return [value]
+        return [{"text": value}]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
 class OrchestratorWorkflowStateSummary(BaseModel):
     """Strict-schema summary of local workflow state available to the orchestrator."""
 
@@ -190,6 +278,10 @@ class OrchestratorWorkflowStateSummary(BaseModel):
     opportunities: list[OrchestratorWorkflowStateItem] = Field(default_factory=list)
     outreach_drafts: list[OrchestratorWorkflowStateItem] = Field(default_factory=list)
     prior_route_decisions: list[OrchestratorWorkflowStateItem] = Field(default_factory=list)
+    recent_slack_thread: list[OrchestratorWorkflowStateItem] = Field(default_factory=list)
+    prior_agent_runs: list[OrchestratorWorkflowStateItem] = Field(default_factory=list)
+    channel_automations: list[OrchestratorWorkflowStateItem] = Field(default_factory=list)
+    slack_context: OrchestratorSlackContext = Field(default_factory=OrchestratorSlackContext)
     approved_context_available: bool = False
     send_enabled: bool = False
 
@@ -209,6 +301,9 @@ class OrchestratorWorkflowStateSummary(BaseModel):
         "opportunities",
         "outreach_drafts",
         "prior_route_decisions",
+        "recent_slack_thread",
+        "prior_agent_runs",
+        "channel_automations",
         mode="before",
     )
     @classmethod

@@ -29,7 +29,7 @@ from keystone_agents.sdk import prompt_metadata_for_files, prompt_version_refere
 EvalAgent = Literal["all", "gmail", "company", "scout", "outreach"]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_EVAL_DIR = PROJECT_ROOT / "tests" / "evals"
+DEFAULT_EVAL_DIR = PROJECT_ROOT / "evals" / "static"
 
 AGENT_CASE_FILES: dict[str, str] = {
     "gmail": "gmail_triage_cases.json",

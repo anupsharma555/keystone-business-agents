@@ -10,7 +10,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 BUSINESS_AGENT_ACTION_SCHEMA = "keystone.business_agent_action.v1"
 BUSINESS_AGENT_SLACK_CONTRACT_SCHEMA = "keystone.business_agent_slack_contract.v1"
 BUSINESS_AGENT_SLACK_CONTRACT_VERSION = "1"
+BUSINESS_AGENT_SLACK_CONTRACT_CAPABILITIES = (
+    "feedback_jsonl",
+    "selected_context_prior_agent_runs",
+    "selected_context_embedded_fallback",
+    "write_gate_no_send",
+)
 SLACK_SELECTED_CONTEXT_SCHEMA = "keystone.slack.selected_message_context.v1"
+SLACK_AGENT_FEEDBACK_EVENT_SCHEMA = "keystone.slack.agent_feedback_event.v1"
 
 KBA_CREATE_GMAIL_DRAFT = "kba_create_gmail_draft"
 KBA_APPROVE_EXTERNAL_USE = "kba_approve_external_use"
@@ -206,6 +213,49 @@ def parse_business_agent_action_value(
     )
 
 
+class SlackAgentFeedbackEvent(BaseModel):
+    """JSONL-safe progress event emitted while a Slack agent run executes."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_name: str = Field(default=SLACK_AGENT_FEEDBACK_EVENT_SCHEMA, alias="schema")
+    event_type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("schema_name", "event_type", mode="before")
+    @classmethod
+    def _clean_scalar(cls, value: Any) -> str:
+        return " ".join(str(value or "").strip().split())
+
+    @field_validator("schema_name")
+    @classmethod
+    def _validate_schema_name(cls, value: str) -> str:
+        if value != SLACK_AGENT_FEEDBACK_EVENT_SCHEMA:
+            raise ValueError(f"Unsupported Slack agent feedback schema: {value or 'missing'}")
+        return value
+
+    @field_validator("event_type")
+    @classmethod
+    def _validate_event_type(cls, value: str) -> str:
+        if not value:
+            raise ValueError("Slack agent feedback event_type is required")
+        return value
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def _clean_payload(cls, value: Any) -> dict[str, Any]:
+        return dict(value) if isinstance(value, dict) else {}
+
+
+def slack_agent_feedback_event(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a JSON-safe Slack agent feedback event."""
+
+    return SlackAgentFeedbackEvent(
+        event_type=event_type,
+        payload=payload,
+    ).model_dump(mode="json", by_alias=True)
+
+
 class BusinessAgentWriteGatePayload(BaseModel):
     """JSON value carried by Slack's business-agent write request gate."""
 
@@ -292,14 +342,24 @@ def parse_business_agent_write_gate_value(value: Any) -> BusinessAgentWriteGateP
     return BusinessAgentWriteGatePayload.model_validate(data)
 
 
+def selected_message_context_json_schema() -> dict[str, Any]:
+    """Return the canonical selected Slack context JSON schema."""
+
+    from keystone_agents.slack_actions import SlackSelectedMessageContext
+
+    return SlackSelectedMessageContext.model_json_schema()
+
+
 def business_agent_slack_contract() -> dict[str, Any]:
     """Return the side-effect-free Slack action/context contract metadata."""
 
     return {
         "schema": BUSINESS_AGENT_SLACK_CONTRACT_SCHEMA,
         "version": BUSINESS_AGENT_SLACK_CONTRACT_VERSION,
+        "capabilities": list(BUSINESS_AGENT_SLACK_CONTRACT_CAPABILITIES),
         "schemas": {
             "business_agent_action": BUSINESS_AGENT_ACTION_SCHEMA,
+            "agent_feedback_event": SLACK_AGENT_FEEDBACK_EVENT_SCHEMA,
             "selected_message_context": SLACK_SELECTED_CONTEXT_SCHEMA,
             "write_gate": BUSINESS_AGENT_WRITE_GATE_SCHEMA,
         },
@@ -327,6 +387,8 @@ def business_agent_slack_contract() -> dict[str, Any]:
         },
         "payload_json_schemas": {
             "business_agent_action": BusinessAgentActionPayload.model_json_schema(),
+            "agent_feedback_event": SlackAgentFeedbackEvent.model_json_schema(),
+            "selected_message_context": selected_message_context_json_schema(),
             "write_gate": BusinessAgentWriteGatePayload.model_json_schema(),
         },
         "notes": [

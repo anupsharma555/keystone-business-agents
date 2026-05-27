@@ -21,6 +21,7 @@ DEFAULT_SESSION_DB_PATH = ".keystone/sdk_sessions.sqlite3"
 _FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 _SAFE_SCOPE_RE = re.compile(r"[^a-z0-9_]+")
+_SESSION_AUDIT_METADATA_BY_OBJECT_ID: dict[int, dict[str, Any]] = {}
 
 
 @dataclass(frozen=True)
@@ -138,7 +139,8 @@ def build_sdk_session(spec: SDKSessionSpec) -> Any | None:
 
     if not spec.enabled:
         return None
-    return build_sqlite_session(spec.session_id, spec.database_path)
+    session = build_sqlite_session(spec.session_id, spec.database_path)
+    return _annotate_session(session, spec.log_metadata())
 
 
 def build_sdk_session_from_env() -> Any | None:
@@ -147,7 +149,33 @@ def build_sdk_session_from_env() -> Any | None:
     session_id = os.environ.get(SDK_SESSION_ID_ENV, "").strip()
     if not session_id or not sdk_sessions_enabled(default=True):
         return None
-    return build_sqlite_session(session_id, default_session_database_path())
+    database_path = default_session_database_path()
+    session = build_sqlite_session(session_id, database_path)
+    return _annotate_session(
+        session,
+        {
+            "enabled": True,
+            "scope": _scope_from_session_id(session_id),
+            "source": "env",
+            "session_id_hash": _short_hash(session_id),
+            "database_path": database_path,
+        },
+    )
+
+
+def session_audit_metadata(session: Any | None) -> dict[str, Any]:
+    """Return audit-safe metadata attached to a locally built SDK session."""
+
+    if session is None:
+        return {}
+    metadata = _SESSION_AUDIT_METADATA_BY_OBJECT_ID.get(id(session), {})
+    if metadata:
+        return dict(metadata)
+    return {
+        "scope": str(getattr(session, "_keystone_scope", "") or ""),
+        "source": str(getattr(session, "_keystone_source", "") or ""),
+        "session_id_hash": str(getattr(session, "_keystone_session_id_hash", "") or ""),
+    }
 
 
 def context_file_session_components(
@@ -164,11 +192,16 @@ def context_file_session_components(
     if not isinstance(data, dict):
         return None
     schema = str(data.get("schema") or data.get("schema_") or "").strip()
-    if schema != SLACK_SELECTED_CONTEXT_SCHEMA:
+    if not schema.startswith("keystone.slack."):
         return None
     team_id = str(data.get("team_id") or "").strip()
     channel_id = str(data.get("channel_id") or "").strip()
-    thread_ts = str(data.get("thread_ts") or data.get("selected_message_ts") or "").strip()
+    thread_ts = str(
+        data.get("thread_ts")
+        or data.get("selected_message_ts")
+        or data.get("request_ts")
+        or ""
+    ).strip()
     if not (team_id or channel_id or thread_ts):
         return None
     return "slack", (team_id, channel_id, thread_ts)
@@ -184,6 +217,21 @@ def default_cli_ask_session_components(route: str = "") -> tuple[str, ...]:
 def _safe_scope(scope: str) -> str:
     safe = _SAFE_SCOPE_RE.sub("_", str(scope or "session").strip().lower()).strip("_")
     return safe or "session"
+
+
+def _scope_from_session_id(session_id: str) -> str:
+    match = re.match(r"^kba_(?P<scope>.+)_[0-9a-f]{32}$", session_id)
+    return match.group("scope") if match else "session"
+
+
+def _annotate_session(session: Any, metadata: dict[str, Any]) -> Any:
+    _SESSION_AUDIT_METADATA_BY_OBJECT_ID[id(session)] = dict(metadata)
+    for key, value in metadata.items():
+        try:
+            setattr(session, f"_keystone_{key}", value)
+        except Exception:
+            continue
+    return session
 
 
 def _short_hash(value: str) -> str:

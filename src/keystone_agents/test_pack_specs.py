@@ -662,10 +662,10 @@ LIVE_LLM_TEST_PACK_SPECS: tuple[TestPackSpec, ...] = (
         natural_prompt=_prompt(
             """
             Find active part-time remote U.S. chief medical officer or fractional medical director
-            roles in behavioral health AI posted in the last 48 hours.
+            roles in behavioral health AI posted in the last 1 week.
 
             Use strict criteria:
-            1. posted or refreshed within 48 hours
+            1. posted or refreshed within the last 1 week
             2. remote U.S.
             3. part-time, fractional, advisory, or contract
             4. behavioral health, psychiatry, mental health, AI, clinical research, or digital
@@ -678,7 +678,7 @@ LIVE_LLM_TEST_PACK_SPECS: tuple[TestPackSpec, ...] = (
         ),
         primary_evaluation_target="No-result honesty, adjacent fallback, recency enforcement.",
         pass_criteria=(
-            "Enforces 48-hour recency and exact criteria.",
+            "Enforces one-week recency and exact criteria.",
             "Clearly says when no strong matches exist.",
             "Separates adjacent matches from exact matches.",
             "Explains which criteria each adjacent match misses.",

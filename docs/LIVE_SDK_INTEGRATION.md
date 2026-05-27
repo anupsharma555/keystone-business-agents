@@ -62,7 +62,7 @@ Constrained Gmail SDK validation must cover:
 - `draft_reply` implies `needs_reply=true` and `approval_required=true`.
 - no automatic send fields or Gmail send tools.
 - style profile use only when approved aggregate style context is present.
-- eval compatibility with `tests/evals/gmail_triage_cases.json`.
+- eval compatibility with `evals/static/gmail_triage_cases.json`.
 
 ### Researcher / Account Research
 
@@ -99,14 +99,23 @@ Constrained Outreach SDK validation must cover:
 - approved source-backed `facts_used` and `source_ids_used`.
 - unsupported Keystone prior-experience or outcome claims rejected by guardrails.
 - approved aggregate style-profile behavior.
-- eval compatibility with `tests/evals/outreach_composer_cases.json`.
+- eval compatibility with `evals/static/outreach_composer_cases.json`.
 
 ### Orchestrator
 
-Deterministic `route_request(...)` remains the default router and runs hard safety gates
-first. Optional LLM routing can synthesize `OrchestratorResult` only from sanitized request
-and workflow-state summaries. Post-processing forces approval gates, no-send fields, and
+Orchestrator preflight is the first model control-plane step for
+natural-language Slack, CLI, WorkItem, scheduled-automation, and explicit
+named-agent paths. It reads the raw request plus sanitized workflow state,
+memory/context packs, prior run summaries, and Slack/thread context when
+available. Optional LLM routing synthesizes `OrchestratorResult` from that
+bounded context. Post-processing forces approval gates, no-send fields, and
 intended handoff metadata before any caller sees the route.
+
+Deterministic `route_request(...)` and Python post-processing remain
+authoritative for hard safety gates, direct send/write blocks, exact route
+fallbacks, and fixture-mode behavior. The Orchestrator may advise a route,
+blocker, retrieval hint, repair pass, or specialist output review; it does not
+approve external side effects.
 
 For the search-heavy routes, the control-plane helper
 `run_orchestrated_search_handoff(...)` can execute Researcher/company research or Opportunity Scout

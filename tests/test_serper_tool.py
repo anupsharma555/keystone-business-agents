@@ -151,6 +151,61 @@ def test_search_web_defaults_to_live_searxng_when_live_research_enabled(
     ]
 
 
+def test_search_web_default_live_policy_includes_hosted_agents_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            calls.append(f"{self.provider_name}:{request.query}:{request.num_results}")
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://example.com/{self.provider_name}",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+            ]
+
+        def search_web(self, query: str, num_results: int = 5):
+            calls.append(f"{self.provider_name}:{query}:{num_results}")
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://example.com/{self.provider_name}",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", "true")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    results = search_web("Curebase", num_results=2)
+
+    assert {
+        "searxng:Curebase:2",
+        "agents-web-search:Curebase:2",
+    } <= set(calls)
+    assert [result.source for result in results] == ["searxng", "agents-web-search"]
+
+
 def test_search_web_uses_live_serper_when_explicitly_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

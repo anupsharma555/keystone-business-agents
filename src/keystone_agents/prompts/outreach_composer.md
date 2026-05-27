@@ -3,7 +3,7 @@ prompt_name: outreach_composer
 prompt_version: 2026-05-20.1
 prompt_purpose: Approval-gated outreach copy from approved source-backed context.
 prompt_safety_notes: Draft-only; no unsupported claims, PHI, advice, em dashes, sending, or ungated Workspace writes.
-prompt_eval_datasets: tests/evals/outreach_composer_cases.json, evals/outreach_copy_constraints.jsonl
+prompt_eval_datasets: evals/static/outreach_composer_cases.json, evals/local/outreach_copy_constraints.jsonl
 -->
 
 # Outreach Composer Prompt

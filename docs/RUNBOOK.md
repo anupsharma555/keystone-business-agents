@@ -141,7 +141,7 @@ Run one suite:
 .venv/bin/python scripts/run_evals.py --agent outreach --markdown
 ```
 
-Eval cases live in `tests/evals/`:
+Eval cases live in `evals/static/`:
 
 - `gmail_triage_cases.json`
 - `business_research_analyst_cases.json`
@@ -193,6 +193,22 @@ timeline, including `can_synthesize`, `missing_requirements`, and
 `keystone ask` without `--agent` is the preferred natural-language
 entrypoint because it also records the `ManualRequestPlan` in WorkItem metadata,
 timeline event metadata, and JSON output.
+
+Current architecture is Orchestrator-first and schema-light. For normal
+natural-language asks, Keystone captures the raw request and compact context,
+runs Orchestrator preflight, applies Python safety/source/approval gates, then
+calls the selected specialist with both the raw request and Orchestrator memo.
+The Orchestrator can also review the specialist output and feed back one repair
+or deepening pass when the manager loop permits it. Planning notes should stay
+in existing `ManualRequestPlan`, `OrchestratorResult`, WorkItem timeline events,
+`decision_trace`, audit notes, and context packs rather than new broad intent
+schemas.
+
+Specialists should remain close to the user request. The Orchestrator memo is
+context and control-plane guidance, not a replacement for the raw operator text.
+Explicit `@KNI <agent>` mentions are treated as advisory route signals; they do
+not skip Orchestrator preflight, deterministic gates, approval checks, or
+specialist output review.
 
 ```bash
 DB_URL=sqlite:////tmp/keystone-context-pack-smoke.db
@@ -251,7 +267,14 @@ For Slack parity, new `@KNI workitem "..."` starts should route through
 `continue`, `show`, `timeline`, `select`, and `approve-context` remain direct
 `work-items` subcommands. Set `KNI_BUSINESS_AGENTS_LANGGRAPH=true` in the
 `keystone-slack` environment to route Slack WorkItem advancement through the
-same optional graph wrapper.
+same optional graph wrapper. Slack button actions such as continue, run again,
+more research, find contact, and revise draft now attach Orchestrator preflight
+context before advancing the WorkItem and record `orchestrator_action_review`
+metadata after execution. When the Slack bridge invokes
+`scripts/handle_slack_agent_action.py --feedback-jsonl`, progress events include
+Orchestrator preflight, manager-loop review, repair/deepening decisions, and
+completion status; feedback events are read-only and do not approve side
+effects.
 
 Use live SDK synthesis over local Gmail fixtures for GT-1 priority grouping. This calls the
 model but does not read Gmail, create Gmail drafts, apply labels, send email, or post Slack:
@@ -482,7 +505,7 @@ Coverage follow-up is controlled by `KEYSTONE_ENABLE_SEARCH_COVERAGE_FOLLOWUP`
 and `KEYSTONE_SEARCH_COVERAGE_FOLLOWUP_QUERY_CAP`.
 
 Run `scripts/run_search_coverage_eval.py` against
-`evals/search_coverage_cases.jsonl` when deciding whether current providers miss
+`evals/provider/search_coverage_cases.jsonl` when deciding whether current providers miss
 useful websites. This eval measures source-lane and expected-domain recall; use
 browser extraction evals only after URLs have already been discovered.
 
@@ -1049,11 +1072,12 @@ From an uninstalled checkout, use:
 
 `keystone ask` never sends, posts, schedules, or writes externally. In the
 default dry-run environment, calls with no `--agent` run WorkItem mode and save
-local SQLite WorkItem/artifact state plus the manual plan; direct `--agent`
-calls only resolve the named specialist and skip model execution. In
-`live-test` / `full-live` mode, explicit named-agent calls through `--agent` or
-`@KNI <agent>` auto-enable live SDK model execution. Use `--no-live-sdk` to
-force the dry-run / WorkItem path.
+local SQLite WorkItem/artifact state plus the manual plan. Direct `--agent`
+mentions still pass through the Orchestrator-first interpretation path when
+live planning/model execution is enabled: the named agent is a requested route,
+not a hard bypass. In `live-test` / `full-live` mode, explicit named-agent calls
+through `--agent` or `@KNI <agent>` auto-enable live SDK model execution. Use
+`--no-live-sdk` to force the dry-run / WorkItem path.
 
 `@KNI keystone ask ...` is accepted as a Slack-friendly alias for the same
 natural-language entrypoint. With live SDK enabled, Chief of Staff `ask` runs
@@ -1067,8 +1091,11 @@ history somewhere else with `--sdk-session-db`, or disable it with
 artifacts remain the canonical audit state.
 
 Use `--live-manual-plan` when you want the LLM planner to interpret a flexible
-manual request before execution. If the planner cannot run, Keystone falls back
-to local structured planning. The provider policy is controlled by
+manual request before execution. The planner and Orchestrator cooperate as the
+control plane: planner output is compact guidance for routing and constraints,
+while Orchestrator preflight reads the raw request and current context before
+specialists run. If the planner cannot run, Keystone falls back to local
+structured planning. The provider policy is controlled by
 `KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY`:
 
 - `target_with_openai_fallback`: try the target agent provider first, then

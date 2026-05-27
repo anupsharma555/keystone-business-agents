@@ -18,7 +18,7 @@ concept in an explicit local boundary.
 | Handoffs and orchestration | `src/keystone_agents/agents/orchestrator.py` |
 | Results, local state, and audit storage | `src/keystone_agents/run.py`, `src/keystone_agents/storage/` |
 | Optional LangGraph WorkItem orchestration | `src/keystone_agents/langgraph_workflow.py`, `docs/LANGGRAPH_OPTION.md` |
-| Evals and regression tests | `tests/`, `tests/evals/`, `evals/` |
+| Evals and regression tests | `tests/`, `evals/` |
 | Future improvement test pack | `docs/AGENT_IMPROVEMENT_TEST_PACK.md` |
 | MCP servers | Not added yet; use only when a live provider needs an MCP boundary |
 | Optional sandbox agent scaffolding and execution wrapper | `src/keystone_agents/sandboxing.py`, `docs/SANDBOX_AGENTS.md` |
@@ -40,8 +40,13 @@ concept in an explicit local boundary.
   guarded function wrappers.
 - Storage and approval state are local-first and do not create send, schedule, or
   publish side effects.
+- Orchestrator preflight is the first model control-plane step for
+  natural-language Slack, CLI, WorkItem, scheduled-automation, and explicit
+  named-agent paths. Specialists still receive the raw request plus compact
+  Orchestrator memo/context.
 - LangGraph is an optional orchestration wrapper around WorkItems. It must call
-  existing typed runners and preserve SDK specialists as the behavior boundary.
+  existing typed runners, carry Orchestrator preflight context, and preserve SDK
+  specialists as the behavior boundary.
 - Sandbox execution is explicit. `run_sandbox_workspace_review(...)` defaults to
   setup preview, and real execution requires `execute=True` with either
   credential-gated `live=True` or an injected fake/local runner for tests.

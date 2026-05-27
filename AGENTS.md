@@ -32,6 +32,21 @@ card source for navigation, CLI inspection, and extension tests. Keep registry
 metadata current when adding prompts, tools, schemas, live flags, or eval
 coverage.
 
+The Orchestrator is the first LLM control plane for natural-language `@KNI`,
+Slack, WorkItem, scheduled-automation, and explicit named-agent requests. It
+reads the raw request, compact Slack/thread context, WorkItem state,
+`decision_trace`, audit notes, local memory, context packs, and prior agent-run
+summaries before deterministic routes or specialist calls execute. Explicit
+agent mentions are routing advice, not authority to bypass Orchestrator
+preflight, specialist ownership, approval gates, or deterministic safety checks.
+
+Keep the planning layer schema-light. Reuse `ManualRequestPlan`,
+`OrchestratorResult`, WorkItems, context packs, specialist output schemas, audit
+events, and `decision_trace` entries. Do not add broad intent taxonomies or
+large route-specific execution schemas for every new natural-language request.
+Planner rationale belongs in compact trace/event metadata and should describe
+the assumptions, missing context, selected capability, and next safe action.
+
 Agent capabilities should be schema-first and tool-general, not narrow
 deterministic lanes for individual natural-language requests. Deterministic
 intent classification is acceptable when it is a bounded routing hint, safety
@@ -128,9 +143,10 @@ environment and retrieval policy own the `18080` runtime and degrade with
 runner diagnostics if that endpoint is unavailable.
 
 Scheduled Business Agent automations that include research must preserve the
-same agent path used by manual `@KNI` runs: deterministic retrieval first,
-specialist SDK synthesis second, and renderer-owned Slack output last. Do not
-replace specialist agents with template-only summaries. Live search should
+same agent path used by manual `@KNI` runs: Orchestrator preflight/planning,
+deterministic retrieval, specialist SDK synthesis, Orchestrator output review,
+and renderer-owned Slack output. Do not replace specialist agents with
+template-only summaries. Live search should
 record provider and reachability diagnostics, pass source context into the
 appropriate specialist, read selected article URLs when available, and avoid
 presenting weak generic search results as research leads.
@@ -185,6 +201,33 @@ clarification, more research, or approval, but it must not bypass these gates:
 Keep legacy context helpers as compatibility shims only if needed; new code
 should prefer `build_context_pack_for_route()` or the route-specific typed pack
 builders.
+
+## Orchestrator-First Execution
+
+Every natural-language entrypoint should preserve this order unless a narrower
+deterministic health/status command is being handled:
+
+1. Capture the raw request and available context without rewriting away the
+   operator's wording.
+2. Run Orchestrator preflight to produce route advice, planner rationale,
+   blockers, safety notes, retrieval hints, and compact context for downstream
+   agents.
+3. Let Python apply deterministic gates for safety, approvals, arithmetic,
+   record identity, source sufficiency, live-provider boundaries, and exact
+   write scopes.
+4. Call the selected specialist with the raw request plus the Orchestrator memo
+   and typed context pack. Specialists must still read the original request.
+5. Review specialist output through Orchestrator or deterministic review before
+   rendering. Slack and CLI feedback may stream preflight, review, repair, and
+   completion events in real time.
+
+Direct Slack WorkItem actions such as continue, run again, more research, find
+contact, and revise draft keep their deterministic route and optional LangGraph
+wrapper, but they must attach Orchestrator preflight context and record
+`orchestrator_action_review` metadata after specialist execution. Direct
+send/post/share wording should route to the owning specialist's approval gate,
+usually Outreach Composer, and remain draft-only or blocked unless a scoped
+approval explicitly permits the requested non-send action.
 
 ## Runtime Model Policy
 
@@ -241,6 +284,15 @@ authoritative for schema validation, safety gates, source attribution,
 approval/no-send rules, and side-effect blocking. The LLM may vary copy inside
 bounded fields such as `draft_reply`, `email_body`, `linkedin_note`, summaries,
 rationales, and recommendations, but not the canonical output shape.
+
+For live named-agent runs, every user-facing response should combine
+deterministic tool/helper output with an LLM synthesis layer. Tools and helpers
+provide the source-backed facts, search results, schema reads, calculations,
+record matches, validation failures, and approval state. The live LLM then
+synthesizes the answer, explains relevance, filters weak or off-target evidence,
+states what was and was not found, and writes the response in clear operator
+language. Do not post raw artifact lists, route metadata, or workflow status as
+the main answer unless the user explicitly asked for debugging details.
 
 Outbound email fields must be plain text, draft-only, approval-gated, and source
 backed. Approved aggregate email style profiles may guide greetings, paragraph

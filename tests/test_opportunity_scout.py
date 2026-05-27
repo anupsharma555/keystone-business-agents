@@ -183,6 +183,48 @@ def test_strict_company_plan_uses_company_only_live_query_lanes() -> None:
     )
 
 
+def test_strict_role_live_search_does_not_pad_with_weak_adjacent_result() -> None:
+    class WeakRoleProvider:
+        provider_name = "searxng"
+        dry_run = False
+
+        def validate_configuration(self) -> None:
+            return None
+
+        def search_web(self, query: str, *, num_results: int = 10) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Medical Science Liaison, Neuropsychiatry (NYC) | LinkedIn",
+                    link="https://www.linkedin.com/jobs/view/medical-science-liaison-neuropsychiatry-nyc",
+                    snippet=(
+                        "Current MSL or clinical practice experience in psychiatry, mental "
+                        "health. Medical Advisor jobs. New York City."
+                    ),
+                    source="searxng",
+                )
+            ][:num_results]
+
+    result = scout_opportunities_live_search(
+        topic=(
+            "find active part-time or fractional remote U.S. chief medical officer "
+            "or clinical advisor roles in behavioral health AI posted in the last 1 week"
+        ),
+        max_results=1,
+        search_provider=WeakRoleProvider(),
+    )
+
+    assert result.records == []
+    reasons = {
+        reason
+        for candidate in result.filtered_candidates
+        for reason in candidate.reasons
+    }
+    assert "requested remote status was not verified" in reasons
+    assert "requested U.S. location or eligibility was not verified" in reasons
+    assert any("requested role-title evidence" in reason for reason in reasons)
+    assert "Constraint to relax next" in " ".join(result.audit_notes)
+
+
 class FakeSearxngProvider:
     def __init__(self) -> None:
         self.queries: list[str] = []

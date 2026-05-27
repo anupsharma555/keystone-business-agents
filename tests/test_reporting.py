@@ -274,6 +274,74 @@ def test_gmail_priority_grouping_test_pack_report_includes_human_draft_output() 
     assert "Orchestrator Review" in markdown
 
 
+def test_usage_cost_report_surfaces_components_actual_comparison_and_cache_note() -> None:
+    payload = build_test_pack_case2_payload(
+        "GT-2",
+        {
+            "subject": "Cache experiment",
+            "draft_reply": "Draft reply for review.",
+            "draft_created": True,
+            "approval_required": True,
+            "send_enabled": False,
+            "sent": False,
+        },
+        run_type="live SDK",
+        model="openai/gpt-5.5",
+        input_source="Slack thread follow-up replay.",
+        usage={
+            "requests": 1,
+            "input_tokens": 10_000,
+            "cached_input_tokens": 250,
+            "cache_hit_rate": 0.025,
+            "output_tokens": 900,
+            "reasoning_output_tokens": 100,
+            "total_tokens": 10_900,
+            "slack_thread_follow_up": True,
+        },
+        cost={
+            "source": "local_pricing_table",
+            "estimated_usd": 0.16,
+            "billable_tokens": {
+                "input_tokens": 9_750,
+                "cached_input_tokens": 250,
+                "output_tokens": 900,
+            },
+            "components_usd": {
+                "input": 0.08,
+                "cached_input": 0.001,
+                "output": 0.079,
+            },
+            "estimate_vs_actual": {
+                "available": True,
+                "estimated_usd": 0.16,
+                "actual_usd": 0.15,
+                "delta_usd": 0.01,
+                "delta_percent_of_actual": 6.67,
+            },
+        },
+    )
+    payload["request_cache"] = {
+        "request_layout": "static_agent_prefix_then_dynamic_typed_input",
+        "static_prefix_sha256": "a" * 64,
+        "dynamic_prompt_sha256": "b" * 64,
+        "dynamic_prompt_chars": 4200,
+        "tool_count": 6,
+        "session_attached": True,
+    }
+
+    markdown = render_test_pack_case2_report(payload)
+
+    assert "cache_hit_rate=0.025" in markdown
+    assert "Cost components" in markdown
+    assert "cached_input=$0.001" in markdown
+    assert "OpenAI Platform comparison" in markdown
+    assert "actual=$0.15" in markdown
+    assert "cached input is unexpectedly low" in markdown
+    assert "Request cache diagnostics" in markdown
+    assert "static_prefix=aaaaaaaaaaaa" in markdown
+    assert "session_attached=yes" in markdown
+
+
 def test_outreach_oc1_test_pack_report_includes_output_usage_and_safety() -> None:
     draft = compose_outreach_draft_fixture(
         company_profile=load_company_profile("sample_company_curebase"),
@@ -1413,7 +1481,28 @@ def test_local_operator_dashboard_omits_sensitive_full_content(tmp_path) -> None
     store.save_agent_run(
         agent_name="outreach_composer",
         input_summary="draft export review",
-        output={"email_body": "Agent body token=SHOULD_NOT_APPEAR_444444444."},
+        output={
+            "email_body": "Agent body token=SHOULD_NOT_APPEAR_444444444.",
+            "_sdk_usage": {
+                "input_tokens": 10_000,
+                "cached_input_tokens": 7_500,
+                "cache_hit_rate": 0.75,
+                "output_tokens": 500,
+            },
+            "_sdk_cost": {
+                "estimated_usd": 0.06,
+                "components_usd": {
+                    "input": 0.02,
+                    "cached_input": 0.001,
+                    "output": 0.039,
+                },
+            },
+            "_sdk_request_cache": {
+                "static_prefix_sha256": "abcdef1234567890",
+                "dynamic_prompt_chars": 1200,
+                "session_attached": True,
+            },
+        },
     )
 
     markdown = render_local_operator_dashboard(store)
@@ -1429,12 +1518,24 @@ def test_local_operator_dashboard_omits_sensitive_full_content(tmp_path) -> None
     assert "Feedback" in markdown
     assert "Audit Records" in markdown
     assert "Recent Agent Runs" in markdown
+    assert "SDK Cost Summary" in markdown
+    assert "SDK Cost By Agent" in markdown
     assert "| Approval Queue | 1 |" in markdown
     assert "| Opportunities | 1 |" in markdown
     assert "| Company Profiles | 1 |" in markdown
     assert "| Outreach Drafts | 1 |" in markdown
     assert "| Outreach Tracking | 1 |" in markdown
     assert "| Recent Agent Runs | 1 |" in markdown
+    assert "| Runs with SDK usage/cost | 1 |" in markdown
+    assert "| Estimated cost total | $0.06 |" in markdown
+    assert "| Aggregate cache hit rate | 75.0% |" in markdown
+    assert "| Cached input tokens | 7500 |" in markdown
+    assert "| Runs with SDK session | 1 |" in markdown
+    assert "| outreach_composer | 1 | $0.06 | 75.0% | 10000 | 7500 | 500 | 0 | 1 |" in markdown
+    assert "Cache Hit" in markdown
+    assert "75.0%" in markdown
+    assert "$0.06" in markdown
+    assert "abcdef123456; session; chars=1200" in markdown
     assert "Full email and draft bodies are omitted" in markdown
     assert "Curebase" in markdown
     assert "SHOULD_NOT_APPEAR" not in markdown
@@ -1454,6 +1555,8 @@ def test_local_operator_dashboard_empty_database_is_readable(tmp_path) -> None:
     assert "| Outreach Drafts | 0 |" in markdown
     assert "| Outreach Tracking | 0 |" in markdown
     assert "| Recent Agent Runs | 0 |" in markdown
+    assert "| Runs with SDK usage/cost | 0 |" in markdown
+    assert "SDK Cost By Agent" in markdown
     assert "| none |" in markdown
 
 

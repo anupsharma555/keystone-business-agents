@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820" role="img" aria-labelledby="title desc">
+  <title id="title">Alternative workflow: Planner executor evaluator loop</title>
+  <desc id="desc">A planner creates a compact plan, an executor runs specialist tools or agents, and an evaluator reviews output before one repair or final answer.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#344054"/></marker>
+    <style>
+      .bg{fill:#f7f9fc}.box{fill:#fff;stroke:#c8d0dc;stroke-width:2}.plan{fill:#e8f7f1;stroke:#079455;stroke-width:2}.exec{fill:#fff7e6;stroke:#d89b2b;stroke-width:2}.eval{fill:#f3edff;stroke:#9e77ed;stroke-width:2}.gate{fill:#fff1f3;stroke:#d92d20;stroke-width:2}.h{font:700 22px Arial;fill:#101828}.b{font:400 15px Arial;fill:#344054}.s{font:400 13px Arial;fill:#475467}.t{font:700 34px Arial;fill:#101828}.line{stroke:#344054;stroke-width:2;fill:none;marker-end:url(#arrow)}.dash{stroke-dasharray:7 5}
+    </style>
+  </defs>
+  <rect class="bg" width="1400" height="820"/>
+  <text class="t" x="54" y="62">Alternative Pattern D: Planner - Executor - Evaluator Loop</text>
+  <text class="s" x="56" y="92">Best for quality improvement on diverse asks: reason first, execute a bounded step, review, optionally repair once, then stop.</text>
+
+  <rect class="box" x="70" y="170" width="210" height="105" rx="12"/>
+  <text class="h" x="98" y="207">User Request</text>
+  <text class="b" x="98" y="237">Open-ended ask</text>
+  <text class="s" x="98" y="262">May be ambiguous</text>
+
+  <rect class="plan" x="390" y="140" width="260" height="150" rx="14"/>
+  <text class="h" x="420" y="178">Planner</text>
+  <text class="b" x="420" y="210">Compact rationale</text>
+  <text class="b" x="420" y="235">Assumptions and missing context</text>
+  <text class="b" x="420" y="260">Chosen next action</text>
+
+  <rect class="exec" x="790" y="125" width="270" height="185" rx="14"/>
+  <text class="h" x="820" y="163">Executor</text>
+  <text class="b" x="820" y="195">Calls one specialist or tool</text>
+  <text class="b" x="820" y="220">Retrieves context</text>
+  <text class="b" x="820" y="245">Runs deterministic helpers</text>
+  <text class="b" x="820" y="270">Produces structured output</text>
+
+  <rect class="eval" x="790" y="430" width="270" height="160" rx="14"/>
+  <text class="h" x="820" y="468">Evaluator</text>
+  <text class="b" x="820" y="500">Relevance and completeness</text>
+  <text class="b" x="820" y="525">Safety and approval checks</text>
+  <text class="b" x="820" y="550">Repair or deepen once</text>
+
+  <rect class="gate" x="390" y="445" width="260" height="130" rx="14"/>
+  <text class="h" x="420" y="483">Stop Conditions</text>
+  <text class="b" x="420" y="515">Done, blocker, approval gate</text>
+  <text class="b" x="420" y="540">missing context, max steps</text>
+
+  <rect class="box" x="1135" y="310" width="210" height="125" rx="12"/>
+  <text class="h" x="1165" y="348">Final Answer</text>
+  <text class="b" x="1165" y="378">Renderer-owned text</text>
+  <text class="b" x="1165" y="403">Structured audit record</text>
+
+  <path class="line" d="M280 222 C330 222 340 222 390 222"/>
+  <path class="line" d="M650 220 C705 220 735 218 790 218"/>
+  <path class="line" d="M925 310 L925 430"/>
+  <path class="line" d="M790 510 C725 510 705 510 650 510"/>
+  <path class="line" d="M1060 510 C1110 460 1120 410 1135 372"/>
+  <path class="line dash" d="M520 445 C520 365 520 330 520 290"/>
+  <path class="line dash" d="M790 550 C700 640 520 642 520 575"/>
+  <text class="s" x="690" y="205">plan selects capability</text>
+  <text class="s" x="945" y="370">review output</text>
+  <text class="s" x="540" y="375">optional repair loop</text>
+</svg>

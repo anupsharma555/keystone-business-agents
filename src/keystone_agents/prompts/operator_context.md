@@ -3,7 +3,7 @@ prompt_name: operator_context
 prompt_version: 2026-04-26.2
 prompt_purpose: Shared approved operator identity, routing preferences, and agent-specific business context.
 prompt_safety_notes: Approved context supports search, routing, scoring, and draft preparation only; never bypass approval, no-send, PHI, legal, finance, or confidentiality boundaries.
-prompt_eval_datasets: tests/evals/gmail_triage_cases.json, tests/evals/business_research_analyst_cases.json, tests/evals/opportunity_scout_cases.json, tests/evals/outreach_composer_cases.json, evals/orchestrator_routing.jsonl
+prompt_eval_datasets: evals/static/gmail_triage_cases.json, evals/static/business_research_analyst_cases.json, evals/static/opportunity_scout_cases.json, evals/static/outreach_composer_cases.json, evals/local/orchestrator_routing.jsonl
 -->
 
 # Operator Context
