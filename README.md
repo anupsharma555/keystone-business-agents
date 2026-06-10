@@ -38,6 +38,10 @@ which context was unavailable instead of filling gaps.
 Current architecture visual:
 `docs/assets/kni-agent-routing-architecture-orchestrator-first-20260525-181618.svg`.
 
+Search and extraction architecture visual:
+`docs/assets/web-search-agent-architecture.svg`, with a rendered PNG export at
+`docs/assets/web-search-agent-architecture.png`.
+
 ## Agents SDK Architecture
 
 OpenAI Agents SDK usage is centralized in `keystone_agents.sdk`. Agent builders return SDK Agent objects through the shared `build_sdk_agent()` helper, load markdown prompts, attach tools and guardrails, and use Pydantic output schemas.
@@ -69,6 +73,18 @@ Each SDK agent run also has a centralized cost guard.
 cost from provider usage and the local pricing table, then stops before
 persistence or downstream workflow steps if an agent run exceeds that budget.
 True live runs also block when cost cannot be verified.
+
+Agent instructions now use repo-local `SKILL.md` bundles for reusable reasoning
+contracts such as source triage, evidence attribution, tool-result resilience,
+specialist handoff packaging, and output-quality review. The older monolithic
+prompt contract remains compatibility context, but registered agents should use
+selected skills plus compact runtime instructions for normal execution.
+
+Search-capable agents are expected to produce an `Answer` plus a `Detailed
+Summary` when source-backed synthesis is useful. The detailed summary should be
+the main narrative synthesis: it should summarize read or extracted source
+content across selected links, keep provider diagnostics in metadata, and state
+when the available evidence is snippet-only.
 
 ## Package
 
@@ -131,6 +147,9 @@ This repo is operated local-first by default. Use `docs/DEPLOYMENT.md` for setup
 health checks, dry-run commands, live search/Gmail/Slack enablement, rollback,
 audit review, security checks, cost controls, and daily or weekly routines.
 Use `docs/RUNBOOK.md` as the shorter operator checklist.
+Use `docs/GITHUB_UPDATE_RUNBOOK.md` when publishing validated local changes to
+GitHub; it captures the fast path, CI-parity gate, secret scan, staging rules,
+and post-push verification steps.
 
 Use the operator mode switcher to move between dry-run, live-test, and
 full-live without hand-editing the repo `.env`:
@@ -169,6 +188,16 @@ The intended retrieval ladder for live research is:
   safety constraints. They do not select providers; Business Research Analyst,
   Opportunity Scout, Orchestrator handoffs, and Chief of Staff delegated
   research use the shared retrieval policy above.
+
+Exa usage can be checked locally with:
+
+```bash
+.venv/bin/python scripts/check_exa_usage.py
+```
+
+When Exa's service-key API is available, the script reports API-side usage. In
+normal local runs it also reports Keystone's local monthly estimate against the
+1,000-credit/month free-tier assumption.
 
 For local live search, this repo owns a separate SearXNG runtime from
 `keystone-slack`:
@@ -343,8 +372,13 @@ Implemented:
 - Shared OpenAI Agents SDK helper layer and model-provider configuration.
 - Four business specialist SDK agent builders, plus Orchestrator and KNI Chief
   of Staff agent builders.
-- Shared `skills.md` and `tools.md` prompt contracts that document agent capabilities,
-  current tools, future tool gaps, and safe tool-addition rules.
+- Repo-local `SKILL.md` bundles for reusable agent reasoning contracts,
+  including source triage, evidence attribution, handoff packaging, output
+  review, context permission gating, action boundaries, and specialist
+  contracts.
+- Compact runtime prompt profiles plus compatibility prompt contracts that
+  document agent capabilities, current tools, future tool gaps, and safe
+  tool-addition rules.
 - Guarded local helper tools for approved contact/CRM context lookup, approval queue
   inspection, and draft-only approval item creation.
 - Typed SDK runtime harnesses for Gmail triage, business research, opportunity scouting, and outreach composition. Fake/local run configs work without API keys; live SDK execution is credential-gated.
@@ -372,6 +406,15 @@ Implemented:
   through `SearchProvider`. Default live research uses SearXNG plus capped
   hosted web search, with Exa/Tavily available as capped deepening lanes through
   shared retrieval policy. Serper is disabled while API credits are unavailable.
+- Provider diagnostics for search-heavy runs, including attempted/used lanes,
+  provider usage, top result samples, source-focus notes, extraction status, and
+  compact metadata for Slack-facing answers.
+- Source triage, visible source selection, and source-aware final synthesis
+  helpers that keep the main answer substantive while preserving evidence links
+  and provider diagnostics.
+- `Answer` and `Detailed Summary` output conventions for web-search and
+  document-retrieval work. The detailed summary is the main enriched synthesis
+  and should be based on retrieved source content rather than route metadata.
 - Live-gated website extraction for selected company pages through Trafilatura
   by default or Firecrawl when explicitly configured, with optional fallback
   between those two extractors.
@@ -379,6 +422,12 @@ Implemented:
   exposed to Business Research Analyst, Opportunity Scout, Chief of Staff, and
   Orchestrator as `extract_research_claims_from_html`.
 - Explicit live Slack approval notifications.
+- Optional LangGraph-backed WorkItem orchestration with a dependency-free
+  fallback path and `langgraph_orchestration` timeline diagnostics.
+- Exa usage helper for API-side usage checks when service-key access is
+  available and local monthly estimate reporting otherwise.
+- GitHub update runbook for fast, repeatable local-to-GitHub publishes with
+  staged secret scans, Ruff, pytest, and post-push divergence checks.
 - GitHub Actions CI for Python 3.11, ruff, pytest, and dependency audit.
 
 Not implemented:
@@ -389,5 +438,4 @@ Not implemented:
 - Live Apify, Browserless, Airtable, Google Sheets, CRM, or Google Docs writes
   as automatic production side effects. Chief of Staff exposes dry-run/internal
   review publishing surfaces; live providers must be added as reviewed adapters.
-- LangGraph orchestration.
 - Server-backed storage.
