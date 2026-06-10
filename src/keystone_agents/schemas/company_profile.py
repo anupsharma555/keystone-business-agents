@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from keystone_agents.source_quality import (
     ResearchCompletenessScore,
@@ -194,6 +195,7 @@ class SourceRecord(BaseModel):
         "user_provided",
     ]
     supported_claims: list[str] = Field(default_factory=list)
+    evidence_excerpt: str = ""
     confidence: float = Field(ge=0.0, le=1.0)
     published_at: str | None = None
     source_quality: SourceQualityScore | None = None
@@ -291,6 +293,7 @@ class CompanyResearchFocusedBrief(BaseModel):
     sources: list[CompanyBriefSourceCitation] = Field(default_factory=list)
     raw_source_content_included: bool = False
     send_enabled: bool = False
+    retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
 
     @field_validator(
         "company_name",
@@ -398,6 +401,7 @@ class CompanyResearchComparison(BaseModel):
     evidence_gaps: list[str] = Field(default_factory=list)
     next_step: str = ""
     requested_output_format: str | None = None
+    retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
 
     @field_validator("decision_goal", "recommendation", "next_step", mode="before")
     @classmethod

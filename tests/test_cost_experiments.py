@@ -7,8 +7,8 @@ from keystone_agents.cost_experiments import (
     annotate_actual_costs_for_database_selection,
     compare_sdk_cost_records,
     list_sdk_session_run_groups,
-    load_work_item_cost_summary,
     load_sdk_cost_records_from_database,
+    load_work_item_cost_summary,
     render_sdk_cost_comparison_markdown,
     render_sdk_session_groups_markdown,
     render_work_item_cost_summary_markdown,
@@ -136,8 +136,7 @@ def test_compare_sdk_cost_records_flags_static_prefix_drift() -> None:
     assert summary["cache_readiness"]["status"] == "warn"
     assert "Static prompt prefix changed between runs." in summary["cache_readiness"]["issues"]
     assert any(
-        "Keep agent instructions" in item
-        for item in summary["cache_readiness"]["recommendations"]
+        "Keep agent instructions" in item for item in summary["cache_readiness"]["recommendations"]
     )
 
 

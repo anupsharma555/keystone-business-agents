@@ -16,46 +16,61 @@ from keystone_agents.agent_registry import (
 )
 from keystone_agents.agent_tool_policy import (
     AgentToolPolicyError,
+    ToolTier,
+    allowed_tool_names_for_tier,
     disallowed_tool_names,
     tool_policy_for_agent,
+    unclassified_tool_names,
 )
+from keystone_agents.agents.business_research_analyst import (
+    build_business_research_analyst_research_brief_agent,
+)
+from keystone_agents.agents.opportunity_scout import build_opportunity_scout_agent
 from keystone_agents.agents.orchestrator import INTENDED_HANDOFFS, build_orchestrator_agent
-from keystone_agents.sdk import Agent, build_model_settings, build_sdk_agent, prompt_metadata_for_files
+from keystone_agents.sdk import (
+    Agent,
+    build_model_settings,
+    build_sdk_agent,
+    prompt_metadata_for_files,
+    skill_metadata_for_files,
+)
+from keystone_agents.skill_sets import AGENT_SKILL_NAMES
 from keystone_agents.tools.gmail_tool import get_gmail_message
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROMPTS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "prompts"
+SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "fa176767488c1c8a785efc9f06604a2658d3c24dc070e54366938e7e7f8ede02",
+        "instructions_sha256": "2d51d6da5d6927bbb6a033f9b4524706aae9cd8bdad9899b814c1f16ca4311d9",
         "tool_names_sha256": "7f8aa859104bbb74f20effcc9ea3df828444a7a5e6ee333faaa4308f214a7b1a",
         "output_schema_sha256": "563358d4e138654b23fb9567b06c639a66127dcfd6a3182a497b20a32dc166de",
     },
     "business_research_analyst": {
-        "instructions_sha256": "1aec6df1526b588cf0ecea99ab8a677da6e58f88d9a6e18b2d5fbf58b6a3953b",
+        "instructions_sha256": "d188c6135295be2acbb85ce872aea619ee188660dffb8b3df5e49c43f1c384f7",
         "tool_names_sha256": "dc99c3bef9ef99b28c0fefeb017783195c895dc2c819670275e860e8b2fc16fa",
         "output_schema_sha256": "b8218a333d85d2f3850203f5ee48b7ec535a6f924a8851c513f1f2b2afeef6e0",
     },
     "opportunity_scout": {
-        "instructions_sha256": "b43bd24fcd19ae5ea4ec969982e26645477d866881ccb3df7b8e316ea832a809",
+        "instructions_sha256": "856054f0f8ea6e3d592e7861cd84f8db42c413109a4b298bd9c550e8edaf6a95",
         "tool_names_sha256": "cfd3e659bff1d1d5a9d2c9d3ed823f9261df6f5e5197fd50d51d96c069b34e66",
-        "output_schema_sha256": "22c09ac037393656df1fefd353d96d9bec9ab1660a2e5f982d38931d6f853f1d",
+        "output_schema_sha256": "2e91674be427e59361cfb5a9c275a048bf4166fbcd9f88f6e06405a235ab59e8",
     },
     "outreach_composer": {
-        "instructions_sha256": "bfdee60a885271b37e843dc98ec5efe090501365a947bc5f25f1e77e91fd93db",
+        "instructions_sha256": "c3c802afb1bd3eacf069e36299b767467bc4aefc9cbf8f49ca90ccf04331f497",
         "tool_names_sha256": "ef26ea7d5fdaaa5e435c8e4d6dee0521dd07a8ddf663dc12bcec3116a9592585",
-        "output_schema_sha256": "5e4058860ec6e78c237e2237926b047ed619f985c10bb65e0d6f11bc78833866",
+        "output_schema_sha256": "167da45f0bb07c0a255c4115b52e9510272a22cc1c479abe9e97c88693d44b34",
     },
     "orchestrator": {
-        "instructions_sha256": "25d403e757aeb29a1eb3aff7caa7f76f21854270ec2a39b4137ba9efbb4496ce",
+        "instructions_sha256": "3a425283ff544b95eca56539ee6d4192f26f5c03d7e00f835dd89e9df98cc042",
         "tool_names_sha256": "1c2bf4210e21e89f1381c3fc9e33b1480130220b362593845c47475e93b2f925",
         "output_schema_sha256": "89d3c6cd618bcd2546fd63fdbd9de221cf4db20af407030347d7f64c0a646e8b",
     },
     "chief_of_staff": {
-        "instructions_sha256": "952988dd6552a42a8c26ea039f7008551ef06d6a942817e4e48f157342be1cd2",
+        "instructions_sha256": "5f6004b0df94b3e342367e3de636dc6a2af0a5881dc7647b94410be9927de6ed",
         "tool_names_sha256": "7eb39fa7ca936b8307f679537f03f155e6a41e71280a9d22b0c9ea46ad881d63",
-        "output_schema_sha256": "f49f2a14aa9cc2731a480fb6b88725550a47dfec19248ee18de2791e6b9005ce",
+        "output_schema_sha256": "132332f59ebca8c234b91d6f51380f7e18effd7dc623c77d104774f1003cbe3f",
     },
 }
 
@@ -122,6 +137,20 @@ def test_registered_agents_have_builders_schemas_prompts_and_validation() -> Non
         metadata = prompt_metadata_for_files(spec.prompt_files)
         assert all(item["name"] for item in metadata)
         assert all(item["version"] for item in metadata)
+
+        skill_metadata = skill_metadata_for_files(spec.skills)
+        assert spec.skills == AGENT_SKILL_NAMES[spec.route_name]
+        assert len(skill_metadata) == len(spec.skills)
+        for skill_name, item in zip(spec.skills, skill_metadata, strict=True):
+            assert (SKILLS_ROOT / skill_name / "SKILL.md").exists()
+            assert item["skill_id"] == skill_name
+            assert item["version"]
+            assert item["purpose"]
+            assert item["safety_notes"]
+            assert spec.route_name in item["applies_to"]
+            assert item["eval_datasets"] or item["validation_paths"]
+            for eval_path in (*item["eval_datasets"], *item["validation_paths"]):
+                assert (PROJECT_ROOT / eval_path).exists(), eval_path
 
         for eval_path in (*spec.eval_datasets, *spec.validation_paths):
             assert (PROJECT_ROOT / eval_path).exists(), eval_path
@@ -204,6 +233,85 @@ def test_registered_agent_tools_follow_controlled_tool_policy() -> None:
     assert "get_gmail_message" not in outreach_policy.allowed_tool_names
 
 
+def test_registered_tool_policies_have_complete_tier_classification() -> None:
+    for spec in REGISTERED_AGENT_SPECS:
+        policy = tool_policy_for_agent(spec.route_name)
+        assert policy is not None
+        assert unclassified_tool_names(policy.allowed_tool_names) == []
+
+
+def test_tool_tiers_keep_search_and_write_surfaces_separate() -> None:
+    research_core = allowed_tool_names_for_tier(
+        "business_research_analyst",
+        ToolTier.CORE_READ,
+    )
+    research_web = allowed_tool_names_for_tier(
+        "business_research_analyst",
+        ToolTier.WEB_SEARCH,
+    )
+    research_deep = allowed_tool_names_for_tier(
+        "business_research_analyst",
+        ToolTier.DEEP_RETRIEVAL,
+    )
+    scout_diagnostic = allowed_tool_names_for_tier(
+        "opportunity_scout",
+        ToolTier.DIAGNOSTIC,
+    )
+
+    assert "search_web" not in research_core
+    assert "search_web" in research_web
+    assert "fetch_company_page" not in research_web
+    assert "extract_research_claims_from_html" in research_deep
+    assert "airtable_write_record" not in research_deep
+    assert "google_sheet_append_rows" not in research_deep
+    assert "render_page" in scout_diagnostic
+    assert "save_opportunity_memory" not in scout_diagnostic
+
+
+def test_search_heavy_agent_builders_support_tiered_tool_attachment() -> None:
+    research_core = build_business_research_analyst_research_brief_agent(tool_tier="core_read")
+    research_deep = build_business_research_analyst_research_brief_agent(tool_tier="deep_retrieval")
+    scout_web = build_opportunity_scout_agent(tool_tier="web_search")
+    scout_diagnostic = build_opportunity_scout_agent(tool_tier="diagnostic")
+
+    research_core_tools = _tool_names(research_core)
+    research_deep_tools = _tool_names(research_deep)
+    scout_web_tools = _tool_names(scout_web)
+    scout_diagnostic_tools = _tool_names(scout_diagnostic)
+
+    assert "search_web" not in research_core_tools
+    assert "search_web" in research_deep_tools
+    assert "extract_research_claims_from_html" in research_deep_tools
+    assert "airtable_write_record" not in research_deep_tools
+    assert "search_web" in scout_web_tools
+    assert "render_page" not in scout_web_tools
+    assert "render_page" in scout_diagnostic_tools
+    assert "save_opportunity_memory" not in scout_diagnostic_tools
+
+
+def test_search_capable_agents_load_shared_search_contract_prompt() -> None:
+    search_capable = [spec for spec in REGISTERED_AGENT_SPECS if "search_web" in spec.tools]
+
+    assert {spec.route_name for spec in search_capable} == {
+        "gmail_triage",
+        "business_research_analyst",
+        "opportunity_scout",
+        "outreach_composer",
+        "orchestrator",
+        "chief_of_staff",
+    }
+    for spec in search_capable:
+        assert "tools.md" in spec.prompt_files
+        instructions = str(spec.build_agent().instructions)
+        normalized = " ".join(instructions.split())
+        assert "Shared Web Search Contract" in instructions
+        assert "should not choose providers directly" in instructions
+        assert "Serper remains disabled while credits are unavailable" in normalized
+        assert "The quality bar is higher than generic LLM search" in instructions
+        assert "produce an enriched but succinct synthesis from that source context" in instructions
+        assert "provider diagnostics only in the final metadata section" in instructions
+
+
 def test_registered_agent_static_prefix_fingerprints_are_stable(monkeypatch) -> None:
     """Guard the cache-sensitive prompt prefix: instructions, tools, and schema."""
 
@@ -214,12 +322,13 @@ def test_registered_agent_static_prefix_fingerprints_are_stable(monkeypatch) -> 
         first_agent = spec.build_agent()
         second_agent = spec.build_agent()
 
-        assert _static_prefix_fingerprint(first_agent) == STATIC_PREFIX_FINGERPRINTS[
-            spec.route_name
-        ]
+        assert (
+            _static_prefix_fingerprint(first_agent) == STATIC_PREFIX_FINGERPRINTS[spec.route_name]
+        )
         assert _static_prefix_fingerprint(first_agent) == _static_prefix_fingerprint(second_agent)
         assert _ordered_tool_names(first_agent) == _ordered_tool_names(second_agent)
-        assert "<!-- AGENTS.md -->" in str(first_agent.instructions)
+        assert "<!-- repo_runtime_policy.md -->" in str(first_agent.instructions)
+        assert "<!-- AGENTS.md -->" not in str(first_agent.instructions)
         assert "<!-- safety_policy.md -->" in str(first_agent.instructions)
 
 
@@ -293,13 +402,18 @@ def test_agent_cards_are_json_safe_extension_metadata() -> None:
     assert cards[0]["route_name"] == "gmail_triage"
     for card in cards:
         assert isinstance(card["prompt_files"], list)
+        assert isinstance(card["skills"], list)
         assert isinstance(card["tools"], list)
         assert isinstance(card["optional_tools"], list)
         assert isinstance(card["safety_notes"], list)
-        assert "skills.md" in card["prompt_files"]
-        assert "skills" not in card
+        assert "skills.md" not in card["prompt_files"]
+        assert tuple(card["skills"]) == AGENT_SKILL_NAMES[card["route_name"]]
+        assert "evidence_attribution_and_claim_mapping" in card["skills"]
         assert "capabilities" not in card
         assert "builder" in card
         assert "output_schema" in card
         assert card["tool_policy"] is not None
         assert isinstance(card["tool_policy"]["allowed_tool_names"], list)
+        assert isinstance(card["tool_policy"]["tool_tiers"], dict)
+        assert "core_read" in card["tool_policy"]["tool_tiers"]
+        assert "internal_write" in card["tool_policy"]["tool_tiers"]

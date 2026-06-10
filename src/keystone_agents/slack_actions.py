@@ -384,7 +384,9 @@ def _modal_embedded_context(
 ) -> dict[str, Any]:
     """Return a deliberately tiny fallback context for Slack private_metadata."""
 
-    selected_text = _clean_text(context.selected_message.text, max_chars=500) if include_text else ""
+    selected_text = (
+        _clean_text(context.selected_message.text, max_chars=500) if include_text else ""
+    )
     return {
         "schema": context.schema_,
         "source": context.source,
@@ -569,8 +571,7 @@ def handle_run_agent_interaction(
         )
         if run_provenance["validation_errors"]:
             raise ValueError(
-                "Slack run provenance mismatch: "
-                + "; ".join(run_provenance["validation_errors"])
+                "Slack run provenance mismatch: " + "; ".join(run_provenance["validation_errors"])
             )
         result_payload = result.model_dump(mode="json")
         result_payload["slack_run_provenance"] = run_provenance
@@ -640,13 +641,11 @@ def _blocked_slack_agent_result(
         "send_enabled": False,
         "block_kind": orchestrator_preflight.block_kind,
         "block_reason": orchestrator_preflight.block_reason,
-        "orchestrator_preflight": compact_orchestrator_preflight_payload(
-            orchestrator_preflight
-        ),
+        "orchestrator_preflight": compact_orchestrator_preflight_payload(orchestrator_preflight),
         "slack_run_provenance": run_provenance,
-        "output": compact_orchestrator_preflight_payload(
-            orchestrator_preflight
-        ).get("route_result", {}),
+        "output": compact_orchestrator_preflight_payload(orchestrator_preflight).get(
+            "route_result", {}
+        ),
     }
     return SlackAgentActionResult(
         stage="work_item",
@@ -791,9 +790,7 @@ def _channel_automation_context(
     if not database_url:
         return []
     channel_candidates = [
-        value
-        for value in (context.channel_name, context.channel_id)
-        if str(value or "").strip()
+        value for value in (context.channel_name, context.channel_id) if str(value or "").strip()
     ]
     if not channel_candidates:
         return []
@@ -840,7 +837,11 @@ def _slack_context_sdk_session(
         return None
     spec = resolve_sdk_session_spec(
         scope="slack",
-        components=(context.team_id, context.channel_id, context.thread_ts or context.selected_message_ts),
+        components=(
+            context.team_id,
+            context.channel_id,
+            context.thread_ts or context.selected_message_ts,
+        ),
         default_enabled=True,
     )
     return build_sdk_session(spec)
@@ -848,7 +849,9 @@ def _slack_context_sdk_session(
 
 def _compact_prior_agent_run(item: dict[str, Any]) -> dict[str, Any]:
     summary = _clean_text(item.get("result_summary") or item.get("result_text"), max_chars=320)
-    feedback = item.get("operator_feedback") if isinstance(item.get("operator_feedback"), list) else []
+    feedback = (
+        item.get("operator_feedback") if isinstance(item.get("operator_feedback"), list) else []
+    )
     feedback_summaries = [
         _clean_text(entry.get("text"), max_chars=180)
         for entry in feedback[:3]

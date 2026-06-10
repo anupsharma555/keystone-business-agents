@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from keystone_agents.agent_registry import SPECIALIST_AGENT_SPECS, specialist_handoff_specs
+from keystone_agents.agent_tool_policy import filter_tools_for_tier
 from keystone_agents.feedback import build_operator_feedback_request
 from keystone_agents.guardrails import (
     assess_text_guardrails,
@@ -26,9 +27,6 @@ from keystone_agents.orchestrator.routing import (
     OUTREACH_RE as _OUTREACH_RE,
 )
 from keystone_agents.orchestrator.routing import (
-    RESEARCH_RE as _RESEARCH_RE,
-)
-from keystone_agents.orchestrator.routing import (
     looks_like_company as _looks_like_company,
 )
 from keystone_agents.orchestrator.routing import (
@@ -41,11 +39,15 @@ from keystone_agents.orchestrator.routing import (
     looks_like_send_side_effect as _looks_like_send_side_effect,
 )
 from keystone_agents.orchestrator.routing import (
+    looks_like_thread_local_draft_request as _looks_like_thread_local_draft_request,
+)
+from keystone_agents.orchestrator.routing import (
     mapping_value as _mapping_value,
 )
 from keystone_agents.orchestrator.routing import (
     payload_text as _payload_text,
 )
+from keystone_agents.quality_budget import business_research_quality_budget
 from keystone_agents.retrieval_policy import derive_request_autonomy_hint
 from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.approval import (
@@ -75,6 +77,7 @@ from keystone_agents.sdk import (
     compose_instructions,
     function_tool,
 )
+from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
 from keystone_agents.tools.browser_diagnostics_tool import (
     capture_browser_diagnostics,
@@ -161,6 +164,16 @@ _FOLLOWUP_MARKERS = (
     "latest request:",
     "current request:",
     "new request:",
+)
+_PURE_RESUME_REQUEST_RE = re.compile(
+    r"^\s*(?:@\S+\s+)?(?:(?:chief of staff|business research analyst|"
+    r"opportunity scout|outreach composer|gmail triage|orchestrator)\s+)?"
+    r"(?:workitem\s+|work item\s+)?(?:continue|resume|pick up|what'?s next)"
+    r"(?:\s+(?:this|the|prior|current|existing|saved|latest|previous|same|"
+    r"last|from|step|workflow|workitem|work item|run|case|thread|slack thread|"
+    r"prior slack thread))*"
+    r"[\s.?!]*$",
+    re.I,
 )
 _SEND_SIDE_EFFECT_KEYS = frozenset(
     {
@@ -673,20 +686,24 @@ def _merge_workflow_state_context(
 def _workflow_state_is_empty(state: Mapping[str, Any] | None) -> bool:
     if not state:
         return True
-    return not any(
-        state.get(key)
-        for key in (
-            "pending_approvals",
-            "approved_approval_items",
-            "companies",
-            "opportunities",
-            "outreach_drafts",
-            "prior_route_decisions",
-            "recent_slack_thread",
-            "prior_agent_runs",
-            "channel_automations",
+    return (
+        not any(
+            state.get(key)
+            for key in (
+                "pending_approvals",
+                "approved_approval_items",
+                "companies",
+                "opportunities",
+                "outreach_drafts",
+                "prior_route_decisions",
+                "recent_slack_thread",
+                "prior_agent_runs",
+                "channel_automations",
+            )
         )
-    ) and not bool(state.get("counts")) and not bool(state.get("slack_context"))
+        and not bool(state.get("counts"))
+        and not bool(state.get("slack_context"))
+    )
 
 
 def _state_has_pending_approval(state: Mapping[str, Any]) -> bool:
@@ -761,7 +778,9 @@ def _result(
 ) -> OrchestratorResult:
     handoff = _HANDOFF_BY_ROUTE.get(route)
     artifacts = {artifact[0]: artifact[1]} if artifact else {}
-    workflow_steps = workflow if workflow is not None else ([route] if route != "clarification" else [])
+    workflow_steps = (
+        workflow if workflow is not None else ([route] if route != "clarification" else [])
+    )
     state_summary = dict(workflow_state or {})
     notes = [
         "Fixture-mode Python routing fallback is available.",
@@ -831,13 +850,9 @@ def _with_crm_write_boundary(
     if not _looks_like_crm_write_request(request_text):
         return result
     payload = result.model_dump(mode="json")
-    payload["workflow"] = list(
-        dict.fromkeys([*(payload.get("workflow") or []), "crm_preflight"])
-    )
+    payload["workflow"] = list(dict.fromkeys([*(payload.get("workflow") or []), "crm_preflight"]))
     payload["forbidden_actions"] = list(
-        dict.fromkeys(
-            [*(payload.get("forbidden_actions") or []), "save_to_crm", "crm_write"]
-        )
+        dict.fromkeys([*(payload.get("forbidden_actions") or []), "save_to_crm", "crm_write"])
     )
     payload["approval_required"] = True
     payload["approval_scope"] = ApprovalScope.EXTERNAL_USE.value
@@ -863,9 +878,7 @@ def _with_crm_write_boundary(
                 ]
             )
         )
-        decision_trace["notes"] = list(
-            dict.fromkeys([*(decision_trace.get("notes") or []), note])
-        )
+        decision_trace["notes"] = list(dict.fromkeys([*(decision_trace.get("notes") or []), note]))
         payload["decision_trace"] = decision_trace
     return OrchestratorResult.model_validate(payload)
 
@@ -1023,7 +1036,10 @@ def _gmail_cross_agent_workflow(text: str) -> list[str]:
         re.search(r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,160}\boutreach\b", lower)
         or (
             (has_research or has_opportunity)
-            and re.search(r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,160}\b(?:response|reply)\b", lower)
+            and re.search(
+                r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,160}\b(?:response|reply)\b",
+                lower,
+            )
         )
     )
     if has_research:
@@ -1176,7 +1192,7 @@ def _resume_from_state_result(
 ) -> OrchestratorResult | None:
     if not _looks_like_resume_request(text):
         return None
-    if _has_non_resume_followup_request(text):
+    if _has_non_resume_followup_request(text) or not _looks_like_pure_resume_request(text):
         return None
     if _state_has_pending_approval(workflow_state):
         return _result(
@@ -1244,6 +1260,10 @@ def _has_non_resume_followup_request(text: str) -> bool:
     if not latest or latest == value:
         return False
     return not _looks_like_resume_request(latest)
+
+
+def _looks_like_pure_resume_request(text: str) -> bool:
+    return bool(_PURE_RESUME_REQUEST_RE.match(str(text or "").strip()))
 
 
 def _llm_route_prompt(
@@ -1832,20 +1852,20 @@ def _request_alignment_terms(text: str) -> set[str]:
 
 _ALIGNMENT_CONCEPT_TERMS: dict[str, frozenset[str]] = {
     "planning": frozenset({"planner", "planning", "orchestrator", "executor", "control"}),
-    "routing": frozenset({"route", "routes", "routing", "handoff", "handoffs", "capability", "specialist"}),
+    "routing": frozenset(
+        {"route", "routes", "routing", "handoff", "handoffs", "capability", "specialist"}
+    ),
     "context": frozenset({"context", "memory", "workitem", "workitems", "slack", "thread"}),
-    "quality": frozenset({"eval", "evals", "evaluate", "evaluation", "feedback", "review", "validation", "verify"}),
+    "quality": frozenset(
+        {"eval", "evals", "evaluate", "evaluation", "feedback", "review", "validation", "verify"}
+    ),
     "safety": frozenset({"approval", "approvals", "gate", "gates", "safety", "deterministic"}),
 }
 
 
 def _alignment_concepts(text: str) -> set[str]:
     tokens = set(re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", str(text or "").lower()))
-    return {
-        concept
-        for concept, terms in _ALIGNMENT_CONCEPT_TERMS.items()
-        if tokens & set(terms)
-    }
+    return {concept for concept, terms in _ALIGNMENT_CONCEPT_TERMS.items() if tokens & set(terms)}
 
 
 def _request_alignment_gap(
@@ -2354,7 +2374,10 @@ def review_specialist_output_llm(
         deterministic_review=deterministic_review,
     )
     sdk_result = run_typed_sdk_agent(
-        agent=build_orchestrator_review_agent(model=model),
+        agent=build_orchestrator_review_agent(
+            model=model,
+            request_text=skill_request_text(payload),
+        ),
         typed_input=json.dumps(payload, ensure_ascii=True, sort_keys=True),
         output_type=OrchestratorOutputReview,
         run_config=run_config,
@@ -2486,6 +2509,8 @@ def _sdk_cost_audit_notes(result: TypedAgentRunResult[Any]) -> list[str]:
 def _looks_like_chief_of_staff_operational_request(lower: str) -> bool:
     if "chief of staff" in lower or "slack ops" in lower or "slack operations" in lower:
         return True
+    if _looks_like_source_link_followup(lower):
+        return True
     action_markers = (
         "audit",
         "review",
@@ -2545,6 +2570,24 @@ def _looks_like_chief_of_staff_operational_request(lower: str) -> bool:
     return any(marker in lower for marker in operational_markers)
 
 
+def _looks_like_source_link_followup(lower: str) -> bool:
+    normalized = " ".join(str(lower or "").lower().split())
+    if not normalized:
+        return False
+    if not re.search(r"\b(?:summari[sz]e|explain|read|review|describe)\b", normalized):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:link|source|url)\s*(?:#?\d+|one|two|three|first|second|third)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:first|second|third|1st|2nd|3rd)\s+(?:link|source|url)\b",
+            normalized,
+        )
+    )
+
+
 def _route_ambiguous_with_llm(
     request: str | Mapping[str, Any] | None,
     *,
@@ -2568,7 +2611,7 @@ def _route_ambiguous_with_llm(
     if run_config is None and not live:
         return None
     sdk_result = run_typed_sdk_agent(
-        agent=build_orchestrator_agent(model=model),
+        agent=build_orchestrator_agent(model=model, request_text=request_text),
         typed_input=prompt,
         output_type=OrchestratorResult,
         run_config=run_config,
@@ -2629,15 +2672,20 @@ def _route_from_manual_plan(
     if route in {"orchestrator", "clarification"}:
         return None
     if route == "outreach_composer":
-        if not approved_context_present:
+        thread_local_draft = _looks_like_thread_local_draft_request(request_text)
+        if not approved_context_present and not thread_local_draft:
             result = _missing_outreach_context_refusal(workflow_state=workflow_state)
             result.audit_notes = [*result.audit_notes, *audit_notes]
             return result
         return _result(
             route="outreach_composer",
             rationale=plan.objective
-            or "The manual request plan selected draft-only outreach from approved context.",
-            approved_context_present=True,
+            or (
+                "The manual request plan selected thread-local draft-only outreach."
+                if thread_local_draft
+                else "The manual request plan selected draft-only outreach from approved context."
+            ),
+            approved_context_present=approved_context_present,
             approval_scope=ApprovalScope.EXTERNAL_USE,
             approval_rationale=(
                 "Manual request plan selected outreach; any draft remains pending "
@@ -2708,7 +2756,9 @@ def route_request(
 
     text = _payload_text(request)
     lower_text = text.lower()
-    loaded_state_context = load_workflow_state_context(database_url=database_url) if database_url else None
+    loaded_state_context = (
+        load_workflow_state_context(database_url=database_url) if database_url else None
+    )
     state_context = _merge_workflow_state_context(loaded_state_context, workflow_state)
     profile_context = approved_company_profile or _mapping_value(
         request,
@@ -3025,15 +3075,22 @@ def build_orchestrator_agent(
     *,
     include_handoffs: bool = True,
     include_specialist_tools: bool | None = None,
+    request_text: str = "",
+    include_all_skills: bool = False,
+    tool_tier: str | int | None = None,
 ) -> Agent:
     """Build the orchestrator agent with subordinate agent handoffs."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "orchestrator.md",
+        skill_files=select_agent_skill_names(
+            "orchestrator",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     handoffs = [spec.build_agent() for spec in SPECIALIST_AGENT_SPECS] if include_handoffs else []
     specialist_tools = (
@@ -3045,30 +3102,33 @@ def build_orchestrator_agent(
         )
         else []
     )
+    tools = [
+        list_local_context_sources,
+        search_local_context,
+        read_local_context_file,
+        retrieve_memory,
+        airtable_get_base_schema,
+        airtable_read_records,
+        airtable_write_record,
+        search_web,
+        structure_web_data_for_schema,
+        render_page,
+        capture_browser_diagnostics,
+        summarize_rendered_page_diagnostics,
+        route_request_placeholder,
+        load_orchestrator_workflow_state,
+        load_pending_approval_items,
+        extract_research_claims_from_html,
+        *specialist_tools,
+        *google_workspace_tools(),
+    ]
+    if tool_tier is not None:
+        tools = filter_tools_for_tier("orchestrator", tools, tool_tier)
     agent = build_sdk_agent(
         name="orchestrator",
         instructions=instructions,
         output_type=OrchestratorResult,
-        tools=[
-            list_local_context_sources,
-            search_local_context,
-            read_local_context_file,
-            retrieve_memory,
-            airtable_get_base_schema,
-            airtable_read_records,
-            airtable_write_record,
-            search_web,
-            structure_web_data_for_schema,
-            render_page,
-            capture_browser_diagnostics,
-            summarize_rendered_page_diagnostics,
-            route_request_placeholder,
-            load_orchestrator_workflow_state,
-            load_pending_approval_items,
-            extract_research_claims_from_html,
-            *specialist_tools,
-            *google_workspace_tools(),
-        ],
+        tools=tools,
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="orchestrator",
@@ -3085,15 +3145,24 @@ def build_orchestrator_agent(
     return _attach_handoff_metadata(agent)
 
 
-def build_orchestrator_review_agent(model: str | None = None) -> Agent:
+def build_orchestrator_review_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+    include_all_skills: bool = False,
+) -> Agent:
     """Build the orchestrator in output-review mode."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "orchestrator.md",
+        skill_files=select_agent_skill_names(
+            "orchestrator",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     return build_sdk_agent(
         name="orchestrator",
@@ -3128,18 +3197,40 @@ def run_orchestrator_sdk(
     model: str | None = None,
     session: Any | None = None,
     include_specialist_tools: bool | None = None,
+    tool_tier: str | int | None = None,
 ) -> TypedAgentRunResult[OrchestratorResult]:
     """Run the orchestrator through the shared typed SDK harness."""
 
+    typed_input_for_run = _orchestrator_sdk_input(typed_input, live=live)
+    resolved_tool_tier = tool_tier or _default_orchestrator_sdk_tool_tier(
+        typed_input,
+        live=live,
+    )
     return run_typed_sdk_agent(
         agent=build_orchestrator_agent(
             model=model,
             include_handoffs=False,
             include_specialist_tools=include_specialist_tools,
+            request_text=skill_request_text(typed_input),
+            tool_tier=resolved_tool_tier,
         ),
-        typed_input=_orchestrator_sdk_input(typed_input, live=live),
+        typed_input=typed_input_for_run,
         output_type=OrchestratorResult,
         run_config=run_config,
         live=live,
         session=session,
     )
+
+
+def _default_orchestrator_sdk_tool_tier(
+    typed_input: str | Mapping[str, Any],
+    *,
+    live: bool,
+) -> str:
+    """Infer a conservative default tool tier for Orchestrator SDK runs."""
+
+    budget = business_research_quality_budget(
+        request_text=skill_request_text(typed_input),
+        live_search=live,
+    )
+    return budget.tool_tier or "core_read"

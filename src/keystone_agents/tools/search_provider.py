@@ -1,10 +1,11 @@
-"""Search provider implementations for dry-run, Serper, SearXNG, Firecrawl, and SDK search."""
+"""Search provider implementations for dry-run, Exa, Serper, SearXNG, Firecrawl, and SDK search."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urljoin
@@ -27,6 +28,7 @@ from keystone_agents.tavily_usage import (
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
 SERPER_NEWS_URL = "https://google.serper.dev/news"
 SERPER_IMAGES_URL = "https://google.serper.dev/images"
+EXA_SEARCH_PATH = "/search"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
 
@@ -34,6 +36,7 @@ class SearchProviderName(StrEnum):
     """Supported live search provider names."""
 
     DRY_RUN = "dry-run"
+    EXA = "exa"
     SERPER = "serper"
     SEARXNG = "searxng"
     FIRECRAWL = "firecrawl"
@@ -63,6 +66,14 @@ class SearxngConfigurationError(SearchProviderConfigurationError):
 
 class SearxngSearchError(SearchProviderError):
     """Raised when SearXNG returns an error or malformed response."""
+
+
+class ExaConfigurationError(SearchProviderConfigurationError):
+    """Raised when live Exa search is requested without required configuration."""
+
+
+class ExaSearchError(SearchProviderError):
+    """Raised when Exa returns an error or malformed response."""
 
 
 class FirecrawlConfigurationError(SearchProviderConfigurationError):
@@ -334,6 +345,82 @@ class SerperSearchProvider:
                 "results": [_result_to_legacy_dict(result) for result in results],
             }
         return results
+
+
+@dataclass(frozen=True)
+class ExaSearchProvider:
+    """Exa-backed AI search provider with optional bounded page contents."""
+
+    live: bool = False
+    api_key: str | None = None
+    base_url: str | None = None
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    _last_credit_usage: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+
+    @property
+    def dry_run(self) -> bool:
+        return not self.live
+
+    def _settings(self) -> Any:
+        return load_settings()
+
+    def _api_key(self) -> str:
+        key = self.api_key or self._settings().exa_api_key
+        if not key:
+            raise ExaConfigurationError(
+                "EXA_API_KEY is required for live Exa search. "
+                "Set it in the environment or .env, or run without --live-search."
+            )
+        return key
+
+    def _base_url(self) -> str:
+        return (self.base_url or self._settings().exa_base_url).rstrip("/")
+
+    def validate_configuration(self) -> None:
+        """Validate live Exa credentials without making a network call."""
+
+        self._api_key()
+
+    def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+        return self.search_structured(SearchRequest(query=query, num_results=num_results))
+
+    def search_structured(self, request: SearchRequest) -> list[SearchResult]:
+        _guard_search_input(
+            tool_name="exa_search",
+            query=request.query,
+            num_results=request.num_results,
+            live=self.live,
+        )
+        if not self.live:
+            return enforce_tool_output_guardrails("exa_search", [])
+        results = _search_exa_live(
+            request=request,
+            api_key=self._api_key(),
+            base_url=self._base_url(),
+            timeout_seconds=self.timeout_seconds,
+        )
+        object.__setattr__(
+            self,
+            "_last_credit_usage",
+            {"request_credits": 1, "usage_source": "provider_request_estimate"},
+        )
+        return _filter_unsafe_search_results("exa_search", results)
+
+    @property
+    def last_credit_usage(self) -> dict[str, Any]:
+        """Return the most recent local Exa request accounting context."""
+
+        return dict(self._last_credit_usage)
+
+    def search(
+        self,
+        query: str,
+        num_results: int = 5,
+        *,
+        max_results: int | None = None,
+    ) -> list[SearchResult]:
+        result_count = max_results if max_results is not None else num_results
+        return self.search_web(query, num_results=result_count)
 
 
 @dataclass(frozen=True)
@@ -715,6 +802,7 @@ def build_search_provider(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> (
     DryRunSearchProvider
+    | ExaSearchProvider
     | SerperSearchProvider
     | SearxngSearchProvider
     | FirecrawlSearchProvider
@@ -732,16 +820,29 @@ def build_search_provider(
     explicit_provider = provider or settings.search_provider
     if explicit_provider is None or not str(explicit_provider).strip():
         raise LiveSearchProviderRequiredError(
-            "Live search requires --search-provider serper, searxng, firecrawl, "
+            "Live search requires --search-provider exa, serper, searxng, firecrawl, "
             "tavily, or agents-web-search, or SEARCH_PROVIDER set to one of those values."
         )
     provider_name = normalize_search_provider_name(explicit_provider)
     if provider_name == SearchProviderName.DRY_RUN:
         raise LiveSearchProviderRequiredError(
-            "Live search requires --search-provider serper, searxng, firecrawl, "
+            "Live search requires --search-provider exa, serper, searxng, firecrawl, "
             "tavily, or agents-web-search, or SEARCH_PROVIDER set to one of those values."
         )
+    if provider_name == SearchProviderName.EXA:
+        return ExaSearchProvider(
+            live=True,
+            api_key=api_key or settings.exa_api_key,
+            base_url=settings.exa_base_url,
+            timeout_seconds=timeout_seconds,
+        )
     if provider_name == SearchProviderName.SERPER:
+        if not settings.serper_enabled:
+            raise SerperConfigurationError(
+                "Serper search is disabled because API credits are unavailable. "
+                "Use SearXNG, agents-web-search, Exa, or Tavily; set "
+                "KEYSTONE_SERPER_ENABLED=true only after credits are restored."
+            )
         return SerperSearchProvider(
             live=True,
             api_key=api_key or settings.serper_api_key,
@@ -825,6 +926,66 @@ def _search_serper_live(
             snippet=item.get("snippet"),
             source="serper",
             date=item.get("date"),
+        )
+        if result is not None:
+            results.append(result)
+        if len(results) >= request.num_results:
+            break
+    return results
+
+
+def _search_exa_live(
+    *,
+    request: SearchRequest,
+    api_key: str,
+    base_url: str,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    http_post: Callable[..., Any] | None = None,
+) -> list[SearchResult]:
+    resolved_query = _validate_query(request.query, request.num_results)
+    if not resolved_query:
+        return []
+
+    post = http_post or requests.post
+    contents: dict[str, Any] = {"highlights": True}
+    if request.scrape:
+        contents["text"] = {"maxCharacters": 12000}
+    payload: dict[str, Any] = {
+        "query": resolved_query,
+        "type": "auto",
+        "numResults": min(request.num_results, 20),
+        "contents": contents,
+    }
+    start_published_date = _exa_start_published_date(request.time_range)
+    if start_published_date:
+        payload["startPublishedDate"] = start_published_date
+    try:
+        response = post(
+            urljoin(f"{base_url.rstrip('/')}/", EXA_SEARCH_PATH.lstrip("/")),
+            headers={
+                "x-api-key": api_key,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=timeout_seconds,
+        )
+    except requests.Timeout as exc:
+        raise ExaSearchError(f"Exa search timed out after {timeout_seconds:.1f} seconds.") from exc
+    except requests.RequestException as exc:
+        raise ExaSearchError("Exa search request failed.") from exc
+
+    data = _response_json(response, provider_name="Exa", error_type=ExaSearchError)
+    results: list[SearchResult] = []
+    for item in data.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        result = _search_result_from_fields(
+            title=item.get("title"),
+            link=item.get("url"),
+            snippet=_exa_snippet(item),
+            source="exa",
+            date=item.get("publishedDate") or item.get("published_date"),
+            content=item.get("text"),
         )
         if result is not None:
             results.append(result)
@@ -1114,6 +1275,41 @@ def _tavily_country(country: str | None) -> str | None:
         "uk": "united kingdom",
     }
     return mapping.get(normalized, normalized or None)
+
+
+def _exa_start_published_date(time_range: str | None) -> str | None:
+    normalized = str(time_range or "").strip().lower()
+    days_by_range = {
+        "day": 1,
+        "d": 1,
+        "week": 7,
+        "w": 7,
+        "recent": 31,
+        "month": 31,
+        "m": 31,
+        "current": 366,
+        "year": 366,
+        "y": 366,
+    }
+    days = days_by_range.get(normalized)
+    if days is None:
+        return None
+    return (datetime.now(UTC) - timedelta(days=days)).date().isoformat()
+
+
+def _exa_snippet(item: dict[str, Any]) -> str:
+    highlights = item.get("highlights")
+    if isinstance(highlights, list):
+        joined = " ".join(str(highlight).strip() for highlight in highlights if highlight)
+        if joined.strip():
+            return joined[:1000]
+    summary = item.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()[:1000]
+    text = item.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()[:1000]
+    return str(item.get("snippet") or "").strip()
 
 
 def _agents_web_search_output_to_results(output: Any, *, provider: str) -> list[SearchResult]:

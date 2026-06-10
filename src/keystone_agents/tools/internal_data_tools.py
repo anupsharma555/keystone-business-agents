@@ -22,7 +22,10 @@ from keystone_agents.schemas.airtable import (
 )
 from keystone_agents.sdk import function_tool
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
-from keystone_agents.tools.website_extraction_tool import extract_website_content
+from keystone_agents.tools.website_extraction_tool import (
+    WebsiteExtractionError,
+    extract_website_content,
+)
 
 GOOGLE_WORKSPACE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
@@ -94,11 +97,20 @@ def google_workspace_tools() -> list[Any]:
 
 
 def explicit_full_article_read_requested(text: str) -> bool:
-    """Return true only when the operator asks to open or read full linked content."""
+    """Return true when the operator asks to read linked source content."""
 
     lowered = str(text or "").lower()
-    if not any(marker in lowered for marker in ("article", "link", "url", "page", "source")):
-        return False
+    has_source_target = any(
+        marker in lowered for marker in ("article", "link", "url", "page", "source", "web")
+    )
+    if has_source_target and re.search(
+        r"\b(?:read|extract|fetch|open)\s*/\s*(?:read|extract|fetch|open)\b"
+        r"|\b(?:read|extract|fetch|open)\b.{0,80}\b(?:urls?|links?|sources?|pages?|articles?)\b"
+        r"|\b(?:urls?|links?|sources?|pages?|articles?)\b.{0,80}\b(?:read|extract|fetch|open)\b",
+        lowered,
+        flags=re.S,
+    ):
+        return True
     explicit_markers = (
         "read the full",
         "read full",
@@ -118,7 +130,51 @@ def explicit_full_article_read_requested(text: str) -> bool:
         "read the source",
         "read source",
     )
-    return any(marker in lowered for marker in explicit_markers)
+    if has_source_target and any(marker in lowered for marker in explicit_markers):
+        return True
+    deep_source_markers = (
+        "deeper search",
+        "deeper read-only search",
+        "deepened search",
+        "deep search",
+        "detailed search",
+        "source-backed",
+        "source backed",
+        "source-aware",
+        "source aware",
+        "source data",
+        "source links",
+        "source urls",
+        "summarizes the source",
+        "summarize the source",
+        "detailed summary",
+        "detailed synthesis",
+        "detailed brief",
+        "readable brief",
+        "fuller brief",
+    )
+    if has_source_target and any(marker in lowered for marker in deep_source_markers):
+        return True
+    return bool(
+        has_source_target
+        and re.search(r"\bdeep(?:er|ened)?\b.{0,40}\bsearch\b", lowered)
+        and re.search(r"\b(?:synthesis|summary|summari[sz]e|brief|source data)\b", lowered)
+    )
+
+
+def _live_source_read_enabled_from_env() -> bool:
+    raw_live_mode = os.getenv("KEYSTONE_LIVE_MODE")
+    if raw_live_mode is None or not parse_bool(raw_live_mode):
+        return False
+    raw_dry_run = os.getenv("KEYSTONE_DRY_RUN")
+    if raw_dry_run is not None and parse_bool(raw_dry_run):
+        return False
+    raw_live_research = os.getenv("KEYSTONE_ENABLE_LIVE_RESEARCH")
+    if raw_live_research is None and raw_dry_run is None:
+        return False
+    if raw_live_research is not None and not parse_bool(raw_live_research):
+        return False
+    return True
 
 
 def read_linked_article_impl(
@@ -142,7 +198,8 @@ def read_linked_article_impl(
         }
     normalized_url = _normalize_http_url(url)
     bounded_chars = min(max(int(max_chars or 6000), 1000), 12000)
-    if not live:
+    live_enabled = bool(live) or _live_source_read_enabled_from_env()
+    if not live_enabled:
         return {
             "status": "dry-run",
             "url": normalized_url,
@@ -150,12 +207,25 @@ def read_linked_article_impl(
             "planned_provider": os.getenv("KEYSTONE_WEBSITE_EXTRACTOR", "trafilatura"),
             "send_enabled": False,
         }
-    result = extract_website_content(
-        normalized_url,
-        company_name="article",
-        provider=os.getenv("KEYSTONE_WEBSITE_EXTRACTOR") or "trafilatura",
-        live=True,
-    )
+    provider = os.getenv("KEYSTONE_WEBSITE_EXTRACTOR") or "trafilatura"
+    try:
+        result = extract_website_content(
+            normalized_url,
+            company_name="article",
+            provider=provider,
+            live=True,
+        )
+    except WebsiteExtractionError as exc:
+        return {
+            "status": "extraction_failed",
+            "url": normalized_url,
+            "provider": provider,
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:500],
+            "text_or_markdown": "",
+            "claims": [],
+            "send_enabled": False,
+        }
     text = result.text_or_markdown[:bounded_chars]
     return {
         "status": result.status,
@@ -177,7 +247,7 @@ def read_linked_article(
     max_chars: int = 6000,
     live: bool = False,
 ) -> str:
-    """Extract full linked article text only for explicit full-read requests."""
+    """Extract linked source text for explicit full-read or deep source-backed requests."""
 
     return json.dumps(
         read_linked_article_impl(

@@ -54,7 +54,11 @@ def test_dry_run_profile_updates_known_keys_and_preserves_unrelated_content(tmp_
     assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
     assert "SEARXNG_BASE_URL=http://127.0.0.1:18080" in text
     assert "KEYSTONE_SEARXNG_TRANSIENT=true" in text
+    assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text
+    assert "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2" in text
+    assert "KEYSTONE_SERPER_ENABLED=false" in text
     assert "KEYSTONE_TAVILY_SEARCH_FALLBACK=false" in text
+    assert "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW=false" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2" in text
     assert "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS=120" in text
@@ -90,7 +94,11 @@ def test_live_test_profile_replaces_existing_serper_default_with_searxng(tmp_pat
     assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
     assert "SEARXNG_BASE_URL=http://127.0.0.1:18080" in text
     assert "KEYSTONE_SEARXNG_TRANSIENT=true" in text
+    assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text
+    assert "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2" in text
+    assert "KEYSTONE_SERPER_ENABLED=false" in text
     assert "KEYSTONE_TAVILY_SEARCH_FALLBACK=false" in text
+    assert "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW=true" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2" in text
     assert "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS=120" in text
@@ -98,18 +106,22 @@ def test_live_test_profile_replaces_existing_serper_default_with_searxng(tmp_pat
     assert "AUTO_SEND_EMAIL=false" in text
 
 
-def test_live_test_profile_can_explicitly_select_serper(tmp_path) -> None:
+def test_live_test_profile_can_explicitly_select_exa(tmp_path) -> None:
     module = load_module()
     env_file = tmp_path / ".env"
 
-    module.main(["live-test", "--env-file", str(env_file), "--search-provider", "serper"])
+    module.main(["live-test", "--env-file", str(env_file), "--search-provider", "exa"])
 
     text = env_file.read_text(encoding="utf-8")
-    assert "SEARCH_PROVIDER=serper" in text
+    assert "SEARCH_PROVIDER=exa" in text
     assert "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true" in text
     assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
     assert "SEARXNG_BASE_URL=http://127.0.0.1:18080" in text
+    assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text
+    assert "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2" in text
+    assert "KEYSTONE_SERPER_ENABLED=false" in text
     assert "KEYSTONE_TAVILY_SEARCH_FALLBACK=false" in text
+    assert "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW=true" in text
 
 
@@ -131,7 +143,11 @@ def test_full_live_profile_creates_missing_env_file_with_expected_values(tmp_pat
     assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
     assert "SEARXNG_BASE_URL=http://127.0.0.1:18080" in text
     assert "KEYSTONE_SEARXNG_TRANSIENT=true" in text
+    assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text
+    assert "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2" in text
+    assert "KEYSTONE_SERPER_ENABLED=false" in text
     assert "KEYSTONE_TAVILY_SEARCH_FALLBACK=false" in text
+    assert "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW=true" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2" in text
     assert "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS=120" in text

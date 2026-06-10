@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from keystone_agents.schemas.approval import (
     ApprovalScope,
@@ -578,6 +579,7 @@ class OutreachDraft(BaseModel):
     can_send_email: bool = False
     subject: str | None = None
     body: str | None = None
+    retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -846,6 +848,7 @@ class OutreachDraftStatusResult(BaseModel):
     approval_scope: ApprovalScope = ApprovalScope.EXTERNAL_USE
     send_enabled: bool = False
     draft_created: bool = False
+    retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
 
     @field_validator(
         "reason",

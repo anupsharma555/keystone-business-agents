@@ -46,11 +46,6 @@ from keystone_agents.config import (
     require_cli_live_confirmation,
     with_cli_environment,
 )
-from keystone_agents.orchestrator.preflight_context import (
-    apply_orchestrator_preflight_to_args,
-    attach_orchestrator_preflight_payload,
-    orchestrator_preflight_context_text,
-)
 from keystone_agents.founder_profile import (
     founder_profile_audit_payload,
     founder_search_context,
@@ -71,6 +66,11 @@ from keystone_agents.models import (
     BusinessResearchComparisonSDKInput,
     BusinessResearchFocusedBriefSDKInput,
     BusinessResearchSDKInput,
+)
+from keystone_agents.orchestrator.preflight_context import (
+    apply_orchestrator_preflight_to_args,
+    attach_orchestrator_preflight_payload,
+    orchestrator_preflight_context_text,
 )
 from keystone_agents.reporting import (
     render_company_comparison_report,
@@ -428,6 +428,15 @@ def _retrieve_company_profile(
         profile, metadata = retrieve_company_profile_live(
             company=resolved_company,
             company_url=resolved_company_url,
+            request_text=" ".join(
+                part
+                for part in (
+                    getattr(args, "research_goal", ""),
+                    getattr(args, "notes", ""),
+                )
+                if str(part or "").strip()
+            )
+            or None,
             requested_provider=args.search_provider,
             max_results=args.max_results,
             retrieval_hint=_explicit_retrieval_hint(args),

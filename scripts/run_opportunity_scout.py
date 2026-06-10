@@ -33,11 +33,6 @@ from keystone_agents.config import (
     require_cli_live_confirmation,
     with_cli_environment,
 )
-from keystone_agents.orchestrator.preflight_context import (
-    apply_orchestrator_preflight_to_args,
-    attach_orchestrator_preflight_payload,
-    orchestrator_preflight_context_text,
-)
 from keystone_agents.founder_profile import (
     founder_profile_audit_payload,
     founder_search_context,
@@ -50,6 +45,11 @@ from keystone_agents.live_retrieval import (
 )
 from keystone_agents.memory import retrieval_tool_performance_memory_item
 from keystone_agents.models import OpportunityScoutSDKInput
+from keystone_agents.orchestrator.preflight_context import (
+    apply_orchestrator_preflight_to_args,
+    attach_orchestrator_preflight_payload,
+    orchestrator_preflight_context_text,
+)
 from keystone_agents.reporting import (
     render_opportunity_scout_report,
     render_orchestrator_output_review,
@@ -500,7 +500,6 @@ def _retrieve_os1_role_context(args: argparse.Namespace) -> dict[str, Any]:
     search_metadata: dict[str, Any] = {}
     founder_profile = load_founder_fit_profile(args.founder_fit_profile)
     founder_context = founder_search_context(founder_profile) if founder_profile else ""
-    preflight_context = orchestrator_preflight_context_text(args)
     if not role_sources and args.live_search:
         role_sources, search_metadata = _search_role_sources_live(args)
         retrieval_mode = "live_search"

@@ -19,6 +19,7 @@ def test_orchestrated_search_handoff_passes_hint_to_company_research(
         *,
         company: str,
         company_url: str | None = None,
+        request_text: str | None = None,
         requested_provider: str | None = None,
         max_results: int = 5,
         retrieval_hint=None,
@@ -27,6 +28,7 @@ def test_orchestrated_search_handoff_passes_hint_to_company_research(
             {
                 "company": company,
                 "company_url": company_url,
+                "request_text": request_text,
                 "requested_provider": requested_provider,
                 "max_results": max_results,
                 "retrieval_hint": retrieval_hint,
@@ -57,6 +59,7 @@ def test_orchestrated_search_handoff_passes_hint_to_company_research(
     assert result.specialist_output_type == "CompanyProfile"
     assert captured["company"] == "Neuroflow"
     assert captured["company_url"] == "https://www.neuroflow.com"
+    assert captured["request_text"] == "https://www.neuroflow.com"
     assert result.specialist_request["company_name"] == "Neuroflow"
     retrieval_hint = captured["retrieval_hint"]
     assert retrieval_hint is not None

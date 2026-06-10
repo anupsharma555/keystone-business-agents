@@ -12,9 +12,9 @@ from keystone_agents.cost_experiments import (
     annotate_actual_costs_for_database_selection,
     compare_sdk_cost_records,
     list_sdk_session_run_groups,
-    load_work_item_cost_summary,
     load_sdk_cost_records_from_database,
     load_sdk_cost_records_from_payload_files,
+    load_work_item_cost_summary,
     render_sdk_cost_comparison_markdown,
     render_sdk_session_groups_markdown,
     render_work_item_cost_summary_markdown,
@@ -159,7 +159,9 @@ def main() -> int:
             summary = load_work_item_cost_summary(
                 database_url=args.database_url or None,
                 work_item_id=args.work_item_id,
-                actual_usd=args.actual_usd[0] if args.actual_usd and not args.save_actuals else None,
+                actual_usd=args.actual_usd[0]
+                if args.actual_usd and not args.save_actuals
+                else None,
                 actual_source=args.actual_source,
                 actual_reference_id=args.actual_reference_id,
             )

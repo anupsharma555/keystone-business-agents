@@ -18,9 +18,9 @@ from keystone_agents.schemas.manual_request_plan import (
     ManualExpectedArtifactType,
     ManualRequestIntent,
     ManualRequestPlan,
-    ManualTaskObjective,
     ManualTargetAgent,
     ManualTargetType,
+    ManualTaskObjective,
 )
 from keystone_agents.zotero_research import (
     extract_zotero_article_query,
@@ -34,6 +34,8 @@ _AGENT_ALIASES: dict[str, ManualTargetAgent] = {
     "orchestrator agent": "orchestrator",
     "business research analyst": "business_research_analyst",
     "business agent analyst": "business_research_analyst",
+    "research analyst": "business_research_analyst",
+    "analyst": "business_research_analyst",
     "account researcher": "business_research_analyst",
     "company research agent": "business_research_analyst",
     "company research": "business_research_analyst",
@@ -68,8 +70,10 @@ _ROUTE_TARGET_TYPE: dict[ManualTargetAgent, ManualTargetType] = {
     "clarification": "unknown",
 }
 _COUNT_RE = re.compile(
-    r"\b(?:find|return|list|top|show|identify|source)\s+(?:up\s+to\s+)?(?P<count>\d{1,2})\b"
+    r"\b(?:compare|discover|find|return|list|top|show|identify|source)\s+"
+    r"(?:up\s+to\s+)?(?P<count>\d{1,2})\b"
     r"|\b(?P<count2>\d{1,2})\s+"
+    r"(?:[a-z][\w-]*\s+){0,4}"
     r"(?:opportunities|companies|institutes|researchers|conferences|people|leads|emails|"
     r"roles|jobs|positions|postings|openings)\b",
     re.I,
@@ -87,10 +91,11 @@ _COUNT_WORDS = {
     "ten": 10,
 }
 _COUNT_WORD_RE = re.compile(
-    r"\b(?:find|return|list|top|show|identify|source|best)\s+"
+    r"\b(?:compare|discover|find|return|list|top|show|identify|source|best)\s+"
     r"(?:up\s+to\s+|the\s+)?"
     r"(?P<count_word>one|two|three|four|five|six|seven|eight|nine|ten)\b"
     r"|\b(?P<count_word2>one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+    r"(?:[a-z][\w-]*\s+){0,4}"
     r"(?:opportunities|companies|institutes|researchers|conferences|people|leads|emails|"
     r"roles|jobs|positions|postings|openings)\b",
     re.I,
@@ -194,7 +199,7 @@ def infer_manual_request_plan(
     """Infer a bounded semantic plan without model execution."""
 
     text = payload_text(request)
-    normalized_agent = normalize_manual_agent(requested_agent)
+    normalized_agent = normalize_manual_agent(requested_agent) or _direct_agent_prefix_agent(text)
     desired_count = _desired_count(text)
     target_agent = _semantic_target_agent(request, text, requested_agent=normalized_agent)
     workflow_allowed = normalized_agent in {None, "orchestrator"}
@@ -270,9 +275,7 @@ def merge_manual_request_plan(
     explicit_agent = base.requested_agent not in {None, "", "orchestrator"}
     if explicit_agent and plan.target_agent != base.target_agent:
         warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
-        warnings.append(
-            "Ignored planner override that rerouted an explicit named-agent request."
-        )
+        warnings.append("Ignored planner override that rerouted an explicit named-agent request.")
         return base.model_copy(
             update={
                 "source": plan.source or base.source,
@@ -324,6 +327,10 @@ def _semantic_target_agent(
             if requested_agent in {"chief_of_staff", "orchestrator"}
             else "chief_of_staff"
         )
+    if requested_agent == "business_research_analyst" and _looks_like_unnamed_company_set_discovery(
+        text
+    ):
+        return "opportunity_scout"
     if requested_agent and requested_agent != "orchestrator":
         return requested_agent
     if _looks_like_chief_of_staff_operational_request(lower):
@@ -649,12 +656,17 @@ def _opportunity_search_target(text: str) -> str:
     cleaned = re.sub(r"https?://\S+|www\.\S+", " ", cleaned)
     cleaned = _strip_opportunity_output_tail(cleaned)
     cleaned = re.sub(
-        r"^\s*(?:please\s+)?(?:find|identify|source|search\s+for|look\s+for|list|return|show)\s+",
+        r"^\s*(?:please\s+)?(?:compare|discover|find|identify|source|search\s+for|look\s+for|list|return|show)\s+",
         " ",
         cleaned,
         flags=re.I,
     )
-    cleaned = re.sub(r"^\s*(?:top\s+)?\d{1,2}\s+", " ", cleaned, flags=re.I)
+    cleaned = re.sub(
+        r"^\s*(?:top\s+)?(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\s+",
+        " ",
+        cleaned,
+        flags=re.I,
+    )
     cleaned = re.sub(
         r"\b(?:opportunit(?:y|ies)|leads|targets)\b\s*$",
         "opportunities",
@@ -667,6 +679,14 @@ def _opportunity_search_target(text: str) -> str:
 
 def _strip_opportunity_output_tail(text: str) -> str:
     cleaned = str(text or "")
+    cleaned = re.split(
+        r"\s+(?:please\s+)?(?:give|provide|return|show|include)\s+(?:me\s+)?"
+        r"(?:a\s+|an\s+|the\s+)?(?:compact|short|small|brief|readable|ranked|formatted|"
+        r"visible|source|metadata|synthesis|comparison|table)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
     cleaned = re.sub(
         r"\s*(?:,?\s*(?:and|with|plus)\s+"
         r"(?:recommend|include|list|provide|return|show|summari[sz]e)\b"
@@ -735,6 +755,8 @@ def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetT
     if target_agent == "opportunity_scout":
         if looks_like_opportunity_to_outreach_loop(text):
             return "opportunity"
+        if _looks_like_unnamed_company_set_discovery(text):
+            return "topic"
         if _ROLE_DISCOVERY_RE.search(text):
             return "opportunity"
         if any(
@@ -814,18 +836,13 @@ def _task_objective(
     if intent == "opportunity_to_outreach_loop":
         return "opportunity_discovery"
     if intent == "company_research":
-        return (
-            "source_research"
-            if _looks_like_source_summary_request(lower)
-            else "entity_research"
-        )
+        return "source_research" if _looks_like_source_summary_request(lower) else "entity_research"
     if intent == "research_brief":
         return "source_research"
     if intent == "opportunity_search":
-        if (
-            _looks_like_source_summary_request(lower)
-            and not _looks_like_actionable_opportunity_request(lower)
-        ):
+        if _looks_like_source_summary_request(
+            lower
+        ) and not _looks_like_actionable_opportunity_request(lower):
             return "source_research"
         return "opportunity_discovery"
     if target_agent == "clarification":
@@ -1008,6 +1025,20 @@ def _company_comparison_target(text: str) -> str:
     return f"{company_a} vs {company_b}"
 
 
+def _looks_like_unnamed_company_set_discovery(text: str) -> bool:
+    if _company_comparison_target(text):
+        return False
+    lower = str(text or "").lower()
+    return bool(
+        re.search(r"\b(?:compare|find|identify|discover|list|source)\b", lower)
+        and re.search(r"\b(?:companies|vendors|platforms|tools)\b", lower)
+        and (
+            _desired_count(text) > 1
+            or re.search(r"\b(?:three|four|five|several|multiple)\b", lower)
+        )
+    )
+
+
 def _clean_company_candidate(value: str) -> str:
     cleaned = " ".join(str(value or "").split()).strip(" .,:;-[]")
     cleaned = re.split(
@@ -1055,6 +1086,20 @@ def _constraints(text: str) -> list[str]:
         constraints.append("us-relevant")
     if re.search(r"\blast\s+\d+\s+days?\b", lower):
         constraints.append("recent")
+    if re.search(r"\b(?:deep|deeper|deepened|detailed)\s+(?:web\s+)?search\b", lower):
+        constraints.append("deeper-search")
+    if re.search(r"\bsource[- ]backed\b", lower):
+        constraints.append("source-backed")
+    if re.search(r"\bvisible\s+source\s+urls?\b|\bsource\s+urls?\b", lower):
+        constraints.append("visible-source-urls")
+    if re.search(r"\bprovider\s+(?:diagnostics|comparison|usage|metadata)\b", lower):
+        constraints.append("provider-diagnostics")
+    if re.search(r"\b(?:metadata|providers?\s+used|lane\s+status)\b", lower):
+        constraints.append("metadata-section")
+    if re.search(r"\b(?:comparison|compare|table|matrix)\b", lower):
+        constraints.append("comparison-format")
+    if re.search(r"\banswer\b", lower) and re.search(r"\bsynthesis\b", lower):
+        constraints.append("answer-and-synthesis")
     constraints.extend(_exclusion_constraints(text))
     return constraints
 
@@ -1087,8 +1132,25 @@ def _strip_direct_agent_prefix(text: str) -> str:
     lowered = cleaned.lower()
     for alias in sorted(_AGENT_ALIASES, key=len, reverse=True):
         if lowered.startswith(alias + " "):
-            return cleaned[len(alias) :].strip()
+            return _strip_wrapping_quotes(cleaned[len(alias) :].strip())
+    return _strip_wrapping_quotes(cleaned)
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    cleaned = str(text or "").strip()
+    quote_pairs = {('"', '"'), ("'", "'"), ("“", "”")}
+    for start, end in quote_pairs:
+        if cleaned.startswith(start) and cleaned.endswith(end) and len(cleaned) >= 2:
+            return cleaned[1:-1].strip()
     return cleaned
+
+
+def _direct_agent_prefix_agent(text: str) -> ManualTargetAgent | None:
+    cleaned = " ".join(str(text or "").split()).strip().lower()
+    for alias in sorted(_AGENT_ALIASES, key=len, reverse=True):
+        if cleaned.startswith(alias + " "):
+            return _AGENT_ALIASES[alias]
+    return None
 
 
 def _opportunity_to_outreach_topic(text: str) -> str:

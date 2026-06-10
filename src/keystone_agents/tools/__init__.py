@@ -50,6 +50,7 @@ from keystone_agents.tools.outreach_template_tool import (
     load_outreach_template,
 )
 from keystone_agents.tools.search_provider import (
+    ExaSearchProvider,
     FirecrawlSearchProvider,
     SearchProviderName,
     SearchRequest,
@@ -103,6 +104,7 @@ __all__ = [
     "SearchResult",
     "SearchRequest",
     "SearchProviderName",
+    "ExaSearchProvider",
     "FirecrawlSearchProvider",
     "SearxngSearchProvider",
     "SerperSearchProvider",

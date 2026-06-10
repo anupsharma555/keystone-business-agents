@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-
 _COST_TRACKING_DIRECTIVE_RE = re.compile(
     r"(?:^|\b)(?:also\s+)?(?:keep|track|include|show|record|report)\s+"
     r"(?:track\s+of\s+)?(?:this\s+run\s+)?costs?\b"

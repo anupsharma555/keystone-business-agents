@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from keystone_agents.agent_tool_policy import filter_tools_for_tier
 from keystone_agents.guardrails import keystone_guardrails, keystone_tool_guardrail_kwargs
 from keystone_agents.models import OpportunityScoutSDKInput, TypedAgentRunResult
 from keystone_agents.opportunity_scout.scoring import (
@@ -50,6 +51,7 @@ from keystone_agents.opportunity_scout.state import (
 from keystone_agents.opportunity_scout.state import (
     state_items_from_payload as _state_items_from_payload,
 )
+from keystone_agents.quality_budget import opportunity_scout_quality_budget
 from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.decision_trace import DecisionTrace
 from keystone_agents.schemas.opportunity import (
@@ -64,7 +66,14 @@ from keystone_agents.schemas.opportunity import (
     OpportunityType,
 )
 from keystone_agents.schemas.opportunity_search_plan import OpportunitySearchPlan
-from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions, function_tool
+from keystone_agents.sdk import (
+    Agent,
+    ToolGuardrailViolation,
+    build_sdk_agent,
+    compose_instructions,
+    function_tool,
+)
+from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.source_quality import (
     score_source_quality,
     summarize_source_quality,
@@ -112,6 +121,7 @@ from keystone_agents.tools.serper_tool import search_web
 from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
 from keystone_agents.tools.website_extraction_tool import (
     WebsiteExtractionError,
+    WebsiteExtractionResult,
     extract_website_content,
 )
 
@@ -978,6 +988,7 @@ def _source_from_hit(hit: dict[str, Any], signal: str) -> OpportunitySource:
         url=source_url,
         source_type=source_quality.source_type,
         supported_signal=signal,
+        evidence_excerpt=str(hit.get("verified_excerpt") or "")[:1000],
         source_quality=source_quality,
     )
 
@@ -1272,8 +1283,8 @@ def _plan_is_institute_request(plan: OpportunitySearchPlan | None) -> bool:
 
 
 def _plan_is_broad_request(plan: OpportunitySearchPlan | None) -> bool:
-    return plan is not None and (
-        plan_has_objective(plan, "broad_discovery") or len(plan.target_entity_types) > 2
+    return bool(
+        plan is not None and not plan.strict_targeting and len(plan.target_entity_types) > 2
     )
 
 
@@ -1300,6 +1311,15 @@ def _plan_has_lane(plan: OpportunitySearchPlan | None, lane_type: str) -> bool:
 
 def _plan_is_meeting_grant_request(plan: OpportunitySearchPlan | None) -> bool:
     return _plan_has_lane(plan, "meeting_conference") and _plan_has_lane(plan, "grant_funding")
+
+
+def _plan_is_formal_opportunity_request(plan: OpportunitySearchPlan | None) -> bool:
+    return (
+        plan is not None
+        and _plan_has_lane(plan, "grant_funding")
+        and _plan_has_lane(plan, "procurement_rfp")
+        and (_plan_has_lane(plan, "pilot_partnership") or _plan_has_lane(plan, "proposal_call"))
+    )
 
 
 def _is_institute_discovery_request(topic: str | None) -> bool:
@@ -1524,6 +1544,138 @@ def _is_broad_digital_health_request(topic: str | None) -> bool:
     )
 
 
+def _researcher_query_specs() -> list[_OpportunityQuerySpec]:
+    return [
+        _OpportunityQuerySpec(
+            lane="researcher",
+            time_window="current",
+            query=(
+                'site:.edu psychiatry "artificial intelligence" "principal investigator" '
+                '("digital mental health" OR "behavioral health")'
+            ),
+            entity_hint="researcher",
+        ),
+        _OpportunityQuerySpec(
+            lane="researcher",
+            time_window="current",
+            query=(
+                'site:.edu ("digital mental health" OR "behavioral health AI") '
+                "faculty researcher psychiatry neuroscience collaboration"
+            ),
+            entity_hint="researcher",
+        ),
+        _OpportunityQuerySpec(
+            lane="trial",
+            time_window="current",
+            query=(
+                'site:clinicaltrials.gov psychiatry "artificial intelligence" '
+                '"principal investigator" recruiting United States'
+            ),
+            entity_hint="researcher",
+        ),
+        _OpportunityQuerySpec(
+            lane="grant",
+            time_window="current",
+            query=(
+                'site:reporter.nih.gov psychiatry "artificial intelligence" '
+                "principal investigator grant digital mental health"
+            ),
+            entity_hint="researcher",
+        ),
+        _OpportunityQuerySpec(
+            lane="researcher",
+            time_window="evergreen",
+            query=(
+                'site:pubmed.ncbi.nlm.nih.gov ("digital mental health" OR '
+                '"behavioral health") "artificial intelligence" psychiatry investigator'
+            ),
+            entity_hint="researcher",
+        ),
+    ]
+
+
+def _broad_multilane_query_specs(context: str) -> list[_OpportunityQuerySpec]:
+    return [
+        _OpportunityQuerySpec(
+            lane="company_growth",
+            time_window="recent",
+            query=(
+                '"behavioral health AI" '
+                '("raises" OR "raised" OR "funding round" OR "seed" OR "Series A") '
+                "2026"
+            ),
+            entity_hint="company",
+            source="news",
+        ),
+        _OpportunityQuerySpec(
+            lane="company_growth",
+            time_window="recent",
+            query=(
+                '"digital mental health" ("AI" OR "artificial intelligence") '
+                '("raises" OR "funding" OR "launches" OR "partners") 2026'
+            ),
+            entity_hint="company",
+            source="news",
+        ),
+        _OpportunityQuerySpec(
+            lane="collaboration",
+            time_window="recent",
+            query=(
+                '"behavioral health" "AI" '
+                '("partnership" OR "partners with" OR "pilot" OR "validation study") '
+                "2026"
+            ),
+            entity_hint="company",
+            source="news",
+        ),
+        _OpportunityQuerySpec(
+            lane="researcher",
+            time_window="current",
+            query=(
+                f"site:.edu {context} investigator lab collaboration "
+                "psychiatry neuroscience United States"
+            ),
+            entity_hint="researcher",
+        ),
+        _OpportunityQuerySpec(
+            lane="institute",
+            time_window="current",
+            query=(
+                f"site:.edu {context} institute center program digital mental health "
+                "clinical AI United States"
+            ),
+            entity_hint="institute",
+        ),
+        _OpportunityQuerySpec(
+            lane="conference",
+            time_window="recent",
+            query=f"{context} conference symposium abstract sponsor workshop United States 2026",
+            entity_hint="conference",
+        ),
+        _OpportunityQuerySpec(
+            lane="grant",
+            time_window="current",
+            query=f"site:reporter.nih.gov {context} NIH SBIR grant psychiatry neuroscience",
+            entity_hint="grant_program",
+        ),
+        _OpportunityQuerySpec(
+            lane="contract_rfp",
+            time_window="current",
+            query=(
+                f'site:sam.gov {context} ("RFP" OR solicitation OR "sources sought") '
+                "behavioral health"
+            ),
+            entity_hint="contract_rfp",
+        ),
+        _OpportunityQuerySpec(
+            lane="trial",
+            time_window="recent",
+            query=f"site:clinicaltrials.gov {context} study sponsor recruiting United States 2026",
+            entity_hint="trial",
+        ),
+    ]
+
+
 def _build_live_query_specs(
     topic: str | None = None,
     *,
@@ -1636,6 +1788,105 @@ def _build_live_query_specs(
                     '("artificial intelligence" OR informatics) grant'
                 ),
                 entity_hint="grant_program",
+            ),
+        ]
+    elif _plan_is_researcher_request(plan) or _is_researcher_discovery_request(topic):
+        specs = _researcher_query_specs()
+    elif _plan_is_broad_request(plan) or _is_broad_multilane_request(topic):
+        specs = _broad_multilane_query_specs(context)
+    elif _plan_is_formal_opportunity_request(plan):
+        specs = [
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="current",
+                query=(
+                    'site:grants.gov ("mental health" OR "behavioral health" OR psychiatry) '
+                    '("artificial intelligence" OR AI OR analytics OR "digital health") '
+                    '("funding opportunity" OR NOFO OR "posted" OR "closing date")'
+                ),
+                entity_hint="grant_program",
+            ),
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="current",
+                query=(
+                    "site:grants.nih.gov (NIMH OR NIH) "
+                    '("digital mental health" OR "behavioral health" OR psychiatry) '
+                    '("artificial intelligence" OR informatics OR "data science") '
+                    '("notice of funding" OR NOFO OR FOA OR RFA)'
+                ),
+                entity_hint="grant_program",
+            ),
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="current",
+                query=(
+                    'site:sbir.gov ("mental health" OR "behavioral health" OR psychiatry) '
+                    '("AI" OR "artificial intelligence" OR analytics) (SBIR OR STTR)'
+                ),
+                entity_hint="grant_program",
+            ),
+            _OpportunityQuerySpec(
+                lane="contract_rfp",
+                time_window="current",
+                query=(
+                    'site:sam.gov ("mental health" OR "behavioral health") '
+                    '("AI" OR "artificial intelligence" OR analytics OR evaluation) '
+                    '("sources sought" OR solicitation OR RFP OR RFI)'
+                ),
+                entity_hint="contract_rfp",
+            ),
+            _OpportunityQuerySpec(
+                lane="contract_rfp",
+                time_window="current",
+                query=(
+                    'site:.gov ("behavioral health" OR "mental health") '
+                    '("request for proposals" OR RFP OR procurement OR solicitation) '
+                    '("vendor" OR contractor OR evaluator OR implementation)'
+                ),
+                entity_hint="contract_rfp",
+            ),
+            _OpportunityQuerySpec(
+                lane="collaboration",
+                time_window="current",
+                query=(
+                    '("behavioral health" OR "mental health") '
+                    '("AI" OR "artificial intelligence" OR analytics OR "digital health") '
+                    '("pilot program" OR "innovation challenge" OR accelerator OR '
+                    '"implementation partner")'
+                ),
+                entity_hint="institute",
+            ),
+            _OpportunityQuerySpec(
+                lane="collaboration",
+                time_window="current",
+                query=(
+                    'site:.edu ("mental health" OR psychiatry OR "behavioral health") '
+                    '("AI" OR "digital health") ("industry partner" OR "partner with us" OR '
+                    '"pilot" OR collaboration)'
+                ),
+                entity_hint="institute",
+            ),
+            _OpportunityQuerySpec(
+                lane="conference",
+                time_window="current",
+                query=(
+                    '("behavioral health" OR "mental health" OR psychiatry) '
+                    '("AI" OR "artificial intelligence" OR "digital health") '
+                    '("call for proposals" OR CFP OR "call for abstracts" OR '
+                    '"call for speakers") 2026'
+                ),
+                entity_hint="conference",
+            ),
+            _OpportunityQuerySpec(
+                lane="journal_call",
+                time_window="current",
+                query=(
+                    '("mental health" OR psychiatry OR "behavioral health") '
+                    '("AI" OR "artificial intelligence" OR "digital health") '
+                    '("call for papers" OR "special issue" OR "call for manuscripts")'
+                ),
+                entity_hint="journal_call",
             ),
         ]
     elif _plan_is_role_request(plan) or _is_role_search(topic):
@@ -2751,6 +3002,20 @@ def _coverage_specs_for_source_lane(
                 query=f"site:grants.gov {context} funding opportunity",
                 entity_hint="grant_program",
             ),
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="current",
+                query=(
+                    f'site:grants.nih.gov {context} ("notice of funding" OR NOFO OR FOA OR RFA)'
+                ),
+                entity_hint="grant_program",
+            ),
+            _OpportunityQuerySpec(
+                lane="grant",
+                time_window="current",
+                query=f"site:sbir.gov {context} SBIR STTR funding opportunity",
+                entity_hint="grant_program",
+            ),
         )
     if lane == "literature":
         return (
@@ -2767,6 +3032,15 @@ def _coverage_specs_for_source_lane(
                 lane="contract_rfp",
                 time_window="current",
                 query=f'site:sam.gov {context} ("RFP" OR solicitation OR "sources sought")',
+                entity_hint="contract_rfp",
+            ),
+            _OpportunityQuerySpec(
+                lane="contract_rfp",
+                time_window="current",
+                query=(
+                    f'{context} ("request for proposals" OR RFP OR RFI) '
+                    '("vendor" OR contractor OR evaluator OR implementation)'
+                ),
                 entity_hint="contract_rfp",
             ),
         )
@@ -3443,7 +3717,9 @@ def _requested_role_markers(lowered_topic: str) -> tuple[str, ...]:
         markers.extend(["chief medical officer", "cmo"])
     if "medical director" in lowered_topic:
         markers.append("medical director")
-    has_clinical_advisor = "clinical advisor" in lowered_topic or "clinical adviser" in lowered_topic
+    has_clinical_advisor = (
+        "clinical advisor" in lowered_topic or "clinical adviser" in lowered_topic
+    )
     if has_clinical_advisor:
         markers.extend(["clinical advisor", "clinical adviser"])
     if not has_clinical_advisor and ("advisor" in lowered_topic or "adviser" in lowered_topic):
@@ -3505,8 +3781,10 @@ def _apply_hard_filters_to_hits(
             reasons.append("remote status was not verified as remote")
         if filters.require_remote and role.role_remote is not True:
             reasons.append("requested remote status was not verified")
-        if filters.require_us and role.role_country != "United States" and not re.search(
-            r"\b(?:u\.?s\.?|united states|us-based|u\.s\.-based)\b", haystack
+        if (
+            filters.require_us
+            and role.role_country != "United States"
+            and not re.search(r"\b(?:u\.?s\.?|united states|us-based|u\.s\.-based)\b", haystack)
         ):
             reasons.append("requested U.S. location or eligibility was not verified")
         if filters.exclude_unpaid and role.unpaid is not False:
@@ -3811,6 +4089,13 @@ def _candidate_acceptance_rejection_reasons(
     ) or _is_conference_discovery_request(topic)
     reasons: list[str] = []
 
+    negative_result_reason = _search_result_page_rejection_reason(
+        title=title,
+        url=url,
+        snippet=snippet,
+    )
+    if negative_result_reason:
+        reasons.append(negative_result_reason)
     name_reason = _candidate_name_rejection_reason(company_name)
     if name_reason:
         reasons.append(name_reason)
@@ -3855,6 +4140,32 @@ def _candidate_acceptance_rejection_reasons(
     if not active_reasons:
         reasons.append("source lacks active opportunity evidence")
     return list(dict.fromkeys(reasons))
+
+
+def _search_result_page_rejection_reason(*, title: str, url: str, snippet: str) -> str:
+    haystack = " ".join([title, url, snippet]).lower()
+    if not haystack.strip():
+        return ""
+    negative_markers = (
+        "no results found",
+        "no matching results",
+        "no indexed results",
+        "no opportunities found",
+        "your search did not match",
+        "returned no results",
+        "returned no indexed results",
+    )
+    if any(marker in haystack for marker in negative_markers):
+        return "negative search-results page rather than an actionable opportunity"
+    lowered_title = title.strip().lower()
+    lowered_url = url.strip().lower()
+    if (
+        lowered_title in {"search", "search results", "search | simpler.grants.gov"}
+        or "/search?" in lowered_url
+        or "search-results.html" in lowered_url
+    ):
+        return "search-results page rather than a specific opportunity record"
+    return ""
 
 
 def _entity_kind_allowed_by_topic(
@@ -3962,6 +4273,7 @@ def _candidate_acceptance_review_reasons(
         "URL/title noise",
         "PDF, book, thesis, or dissertation",
         "generic research page",
+        "negative search-results page",
     )
     if any(
         any(marker in reason for marker in blocked_noise_markers) for reason in rejection_reasons
@@ -4666,8 +4978,10 @@ def _source_hit_key(hit: dict[str, Any]) -> str:
     return f"{title}|{signal}"
 
 
-def _opportunity_verification_cap() -> int:
-    if not _env_flag("KEYSTONE_ENABLE_OPPORTUNITY_SOURCE_VERIFICATION"):
+def _opportunity_verification_cap(*, enabled: bool | None = None) -> int:
+    if enabled is False:
+        return 0
+    if enabled is None and not _env_flag("KEYSTONE_ENABLE_OPPORTUNITY_SOURCE_VERIFICATION"):
         return 0
     raw = os.getenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "4").strip()
     try:
@@ -4677,15 +4991,20 @@ def _opportunity_verification_cap() -> int:
     return max(0, min(8, value))
 
 
-def _verify_source_hits(hits: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+def _verify_source_hits(
+    hits: list[dict[str, Any]],
+    *,
+    verify_source_pages: bool | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Optionally verify top candidate pages with capped clean-text extraction."""
 
-    cap = _opportunity_verification_cap()
+    cap = _opportunity_verification_cap(enabled=verify_source_pages)
     if cap <= 0:
         return hits, []
 
     verified: list[dict[str, Any]] = []
     notes: list[str] = [f"Verified up to {cap} source page(s) with capped extraction."]
+    fallback_providers = _opportunity_verification_fallback_providers()
     attempts = 0
     html_review_attempts = 0
     for hit in hits:
@@ -4693,15 +5012,21 @@ def _verify_source_hits(hits: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
         url = str(hit.get("source_url") or "").strip()
         if attempts < cap and url.startswith(("http://", "https://")):
             attempts += 1
+            company_name = str(hit.get("company_name") or "candidate")
             try:
-                extraction = extract_website_content(
+                extraction = _extract_opportunity_verification_page(
                     url,
-                    company_name=str(hit.get("company_name") or "candidate"),
-                    live=True,
+                    company_name=company_name,
+                    fallback_providers=fallback_providers,
                 )
             except WebsiteExtractionError as exc:
                 notes.append(f"Verification failed for {hit.get('company_name') or url}: {exc}")
             else:
+                if extraction.provider != os.getenv("KEYSTONE_WEBSITE_EXTRACTOR", "trafilatura"):
+                    notes.append(
+                        f"Verification used {extraction.provider} for "
+                        f"{hit.get('company_name') or url}."
+                    )
                 text = extraction.text_or_markdown.strip()
                 if text:
                     excerpt = text[:1000]
@@ -4763,6 +5088,52 @@ def _verify_source_hits(hits: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
                     notes.append(f"Verified source page for {hit.get('company_name') or url}.")
         verified.append(enriched)
     return verified, list(dict.fromkeys(note for note in notes if note))
+
+
+def _opportunity_verification_fallback_providers() -> tuple[str, ...]:
+    configured = os.getenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", "").strip().lower()
+    if configured in {"crawl-4-ai", "crawl_4_ai"}:
+        configured = "crawl4ai"
+    providers = [configured] if configured else ["crawl4ai", "firecrawl"]
+    return tuple(
+        dict.fromkeys(
+            provider
+            for provider in providers
+            if provider in {"crawl4ai", "firecrawl", "trafilatura"}
+            and provider != os.getenv("KEYSTONE_WEBSITE_EXTRACTOR", "trafilatura").strip().lower()
+        )
+    )
+
+
+def _extract_opportunity_verification_page(
+    url: str,
+    *,
+    company_name: str,
+    fallback_providers: tuple[str, ...],
+) -> WebsiteExtractionResult:
+    errors: list[str] = []
+    primary_provider = os.getenv("KEYSTONE_WEBSITE_EXTRACTOR", "trafilatura").strip().lower()
+    if primary_provider in {"crawl-4-ai", "crawl_4_ai"}:
+        primary_provider = "crawl4ai"
+    for provider in (primary_provider, *fallback_providers):
+        try:
+            result = extract_website_content(
+                url,
+                company_name=company_name,
+                provider=provider,
+                guardrail_context="public_opportunity_source",
+                live=True,
+            )
+        except WebsiteExtractionError as exc:
+            errors.append(f"{provider}: {exc}")
+            continue
+        except ToolGuardrailViolation as exc:
+            errors.append(f"{provider}: guardrail blocked extraction: {exc}")
+            continue
+        if result.text_or_markdown.strip() or result.claims:
+            return result
+        errors.append(f"{provider}: empty extraction")
+    raise WebsiteExtractionError("; ".join(errors) or f"No extractor returned text for {url}.")
 
 
 def _filter_and_dedupe_candidate_hits(
@@ -4831,6 +5202,7 @@ def _process_candidate_hits(
     *,
     topic: str | None,
     search_plan: OpportunitySearchPlan | None = None,
+    verify_source_pages: bool | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -4840,7 +5212,10 @@ def _process_candidate_hits(
     list[str],
 ]:
     deduped_hits = _dedupe_source_hits(hits)
-    verified_hits, verification_notes = _verify_source_hits(deduped_hits)
+    verified_hits, verification_notes = _verify_source_hits(
+        deduped_hits,
+        verify_source_pages=verify_source_pages,
+    )
     (
         deduped,
         filtered_hits,
@@ -5873,6 +6248,7 @@ def scout_opportunities_live_search(
     serper_tool: Any | None = None,
     save: bool = False,
     existing_state: Any = None,
+    verify_source_pages: bool | None = None,
 ) -> OpportunityScoutResult:
     """Run explicit live search, then score and rank candidates locally."""
 
@@ -5899,7 +6275,12 @@ def scout_opportunities_live_search(
         acceptance_review_candidates,
         candidate_audit_notes,
         verification_audit_notes,
-    ) = _process_candidate_hits(hits, topic=topic, search_plan=resolved_search_plan)
+    ) = _process_candidate_hits(
+        hits,
+        topic=topic,
+        search_plan=resolved_search_plan,
+        verify_source_pages=verify_source_pages,
+    )
 
     coverage_audit_notes: list[str] = []
     coverage_specs, source_coverage = _build_coverage_followup_query_specs(
@@ -5927,6 +6308,7 @@ def scout_opportunities_live_search(
             hits,
             topic=topic,
             search_plan=resolved_search_plan,
+            verify_source_pages=verify_source_pages,
         )
         query_specs = [*query_specs, *coverage_specs]
         queries = [spec.query for spec in query_specs]
@@ -5973,6 +6355,7 @@ def scout_opportunities_live_search(
             hits,
             topic=topic,
             search_plan=resolved_search_plan,
+            verify_source_pages=verify_source_pages,
         )
         query_specs = [*query_specs, *adaptive_specs]
         queries = [spec.query for spec in query_specs]
@@ -6021,6 +6404,7 @@ def scout_opportunities_live_search(
             hits,
             topic=topic,
             search_plan=resolved_search_plan,
+            verify_source_pages=verify_source_pages,
         )
         query_specs = [*query_specs, *deepening_specs]
         queries = [spec.query for spec in query_specs]
@@ -6067,6 +6451,7 @@ def scout_opportunities_live_search(
             hits,
             topic=topic,
             search_plan=resolved_search_plan,
+            verify_source_pages=verify_source_pages,
         )
         query_specs = [*query_specs, *underfill_specs]
         queries = [spec.query for spec in query_specs]
@@ -6370,52 +6755,65 @@ def opportunity_scout_markdown(result: OpportunityScoutResult) -> str:
     return "\n".join(lines)
 
 
-def build_opportunity_scout_agent(model: str | None = None) -> Agent:
+def build_opportunity_scout_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+    include_all_skills: bool = False,
+    tool_tier: str | int | None = None,
+) -> Agent:
     """Build the opportunity scout agent."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "opportunity_scout.md",
+        skill_files=select_agent_skill_names(
+            "opportunity_scout",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
+    tools = [
+        list_local_context_sources,
+        search_local_context,
+        read_local_context_file,
+        retrieve_memory,
+        check_workflow_duplicate,
+        airtable_get_base_schema,
+        airtable_read_records,
+        airtable_write_record,
+        search_web,
+        structure_web_data_for_schema,
+        render_page,
+        capture_browser_diagnostics,
+        summarize_rendered_page_diagnostics,
+        search_opportunity_sources_placeholder,
+        load_existing_opportunity_state,
+        search_funding_news_sources,
+        search_job_posting_sources,
+        search_clinical_trials_sources,
+        search_grant_sources,
+        search_conference_publication_sources,
+        search_journal_call_sources,
+        search_contract_rfp_sources,
+        search_company_page_sources,
+        extract_research_claims_from_html,
+        score_opportunity,
+        handoff_to_business_research_analyst_placeholder,
+        save_opportunity_placeholder,
+        save_entity_memory,
+        save_opportunity_memory,
+        *google_workspace_tools(),
+    ]
+    if tool_tier is not None:
+        tools = filter_tools_for_tier("opportunity_scout", tools, tool_tier)
     return build_sdk_agent(
         name="opportunity_scout",
         instructions=instructions,
         output_type=OpportunityScoutResult,
-        tools=[
-            list_local_context_sources,
-            search_local_context,
-            read_local_context_file,
-            retrieve_memory,
-            check_workflow_duplicate,
-            airtable_get_base_schema,
-            airtable_read_records,
-            airtable_write_record,
-            search_web,
-            structure_web_data_for_schema,
-            render_page,
-            capture_browser_diagnostics,
-            summarize_rendered_page_diagnostics,
-            search_opportunity_sources_placeholder,
-            load_existing_opportunity_state,
-            search_funding_news_sources,
-            search_job_posting_sources,
-            search_clinical_trials_sources,
-            search_grant_sources,
-            search_conference_publication_sources,
-            search_journal_call_sources,
-            search_contract_rfp_sources,
-            search_company_page_sources,
-            extract_research_claims_from_html,
-            score_opportunity,
-            handoff_to_business_research_analyst_placeholder,
-            save_opportunity_placeholder,
-            save_entity_memory,
-            save_opportunity_memory,
-            *google_workspace_tools(),
-        ],
+        tools=tools,
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="opportunity_scout",
@@ -6433,14 +6831,37 @@ def run_opportunity_scout_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    tool_tier: str | int | None = None,
 ) -> TypedAgentRunResult[OpportunityScoutResult]:
     """Run Opportunity Scout through the typed SDK harness."""
 
+    resolved_tool_tier = tool_tier or _default_opportunity_scout_sdk_tool_tier(
+        typed_input,
+        live=live,
+    )
     return run_typed_sdk_agent(
-        agent=build_opportunity_scout_agent(model=model),
+        agent=build_opportunity_scout_agent(
+            model=model,
+            request_text=skill_request_text(typed_input),
+            tool_tier=resolved_tool_tier,
+        ),
         typed_input=typed_input,
         output_type=OpportunityScoutResult,
         run_config=run_config,
         live=live,
         session=session,
     )
+
+
+def _default_opportunity_scout_sdk_tool_tier(
+    typed_input: OpportunityScoutSDKInput | str,
+    *,
+    live: bool,
+) -> str:
+    """Infer a read-only tool tier for default Opportunity Scout SDK runs."""
+
+    budget = opportunity_scout_quality_budget(
+        request_text=skill_request_text(typed_input),
+        live_search=live,
+    )
+    return budget.tool_tier or "core_read"

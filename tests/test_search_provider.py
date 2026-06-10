@@ -13,6 +13,8 @@ from keystone_agents.tools.search_provider import (
     AgentsWebSearchProvider,
     AgentsWebSearchResult,
     DryRunSearchProvider,
+    ExaConfigurationError,
+    ExaSearchProvider,
     FirecrawlSearchProvider,
     LiveSearchProviderRequiredError,
     SearchProviderName,
@@ -122,6 +124,23 @@ class SearxngMixedSafetyResponse:
         }
 
 
+class ExaSearchResponse:
+    status_code = 200
+
+    def json(self) -> dict[str, object]:
+        return {
+            "results": [
+                {
+                    "title": "Mentavi Health careers",
+                    "url": "https://mentavi.com/careers/",
+                    "publishedDate": "2026-05-01T00:00:00.000Z",
+                    "highlights": ["Official careers page for Mentavi Health."],
+                    "text": "Full careers page text.",
+                }
+            ]
+        }
+
+
 class FirecrawlSearchResponse:
     status_code = 200
 
@@ -190,6 +209,7 @@ def test_invalid_search_provider_name_fails_clearly() -> None:
 
 
 def test_search_provider_normalizer_accepts_agents_web_search_aliases() -> None:
+    assert normalize_search_provider_name("exa") == SearchProviderName.EXA
     assert normalize_search_provider_name("tavily-search") == SearchProviderName.TAVILY
     assert (
         normalize_search_provider_name("agents-web-search") == SearchProviderName.AGENTS_WEB_SEARCH
@@ -242,6 +262,23 @@ def test_build_search_provider_can_build_tavily_provider(
     assert isinstance(dry_provider, DryRunSearchProvider)
     assert dry_provider.provider_name == "tavily"
     assert isinstance(live_provider, TavilySearchProvider)
+
+
+def test_build_search_provider_can_build_exa_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "keystone_agents.tools.search_provider.load_settings",
+        lambda: Settings(exa_api_key="test-exa-key"),
+    )
+
+    dry_provider = build_search_provider("exa", live=False)
+    live_provider = build_search_provider("exa", live=True)
+
+    assert isinstance(dry_provider, DryRunSearchProvider)
+    assert dry_provider.provider_name == "exa"
+    assert isinstance(live_provider, ExaSearchProvider)
+    live_provider.validate_configuration()
 
 
 def test_agents_web_search_provider_normalizes_runner_output() -> None:
@@ -329,6 +366,68 @@ def test_serper_provider_parses_mocked_response(monkeypatch: pytest.MonkeyPatch)
     ]
     assert calls[0]["json"] == {"q": "Curebase clinical trial software", "num": 1}
     assert calls[0]["timeout"] == 3.0
+
+
+def test_exa_provider_requires_key_before_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+
+    def fail_network(*args: object, **_kwargs: object) -> None:
+        calls.append(args)
+        raise AssertionError("live credential test must not make a network request")
+
+    monkeypatch.setattr("keystone_agents.tools.search_provider.requests.post", fail_network)
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+
+    with pytest.raises(ExaConfigurationError, match="EXA_API_KEY is required"):
+        ExaSearchProvider(live=True).search_web("Mentavi Health", num_results=1)
+
+    assert calls == []
+
+
+def test_exa_provider_parses_highlights_and_sends_bounded_contents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url: str, *, headers: dict[str, str], json: dict[str, object], timeout: float):
+        calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return ExaSearchResponse()
+
+    monkeypatch.setattr("keystone_agents.tools.search_provider.requests.post", fake_post)
+
+    provider = ExaSearchProvider(
+        live=True,
+        api_key="test-exa-key",
+        base_url="https://api.exa.ai",
+        timeout_seconds=4.0,
+    )
+    results = provider.search_structured(
+        SearchRequest(query="Mentavi Health careers", num_results=1, scrape=True)
+    )
+
+    assert results == [
+        SearchResult(
+            title="Mentavi Health careers",
+            link="https://mentavi.com/careers/",
+            snippet="Official careers page for Mentavi Health.",
+            source="exa",
+            date="2026-05-01T00:00:00.000Z",
+            content="Full careers page text.",
+        )
+    ]
+    assert calls[0]["url"] == "https://api.exa.ai/search"
+    assert calls[0]["headers"]["x-api-key"] == "test-exa-key"
+    assert calls[0]["json"] == {
+        "query": "Mentavi Health careers",
+        "type": "auto",
+        "numResults": 1,
+        "contents": {"highlights": True, "text": {"maxCharacters": 12000}},
+    }
+    assert calls[0]["timeout"] == 4.0
+    assert provider.last_credit_usage == {
+        "request_credits": 1,
+        "usage_source": "provider_request_estimate",
+    }
 
 
 def test_serper_structured_search_passes_recency_geo_and_news_endpoint(

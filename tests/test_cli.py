@@ -13,12 +13,13 @@ from keystone_agents.orchestrator.preflight_context import (
     ORCHESTRATOR_ROUTE_RESULT_ENV,
 )
 from keystone_agents.schemas.work_item import (
+    WorkflowRunResult,
     WorkItem,
     WorkItemKind,
     WorkItemRoute,
     WorkItemStatus,
-    WorkflowRunResult,
 )
+from keystone_agents.sdk import ToolGuardrailViolation
 from keystone_agents.storage.sqlite_store import SQLiteStore
 
 
@@ -624,6 +625,91 @@ def test_cli_ask_agent_override_auto_live_sdk_in_live_mode(
     assert "--live-sdk" in calls[0]
 
 
+def test_cli_ask_live_explicit_mention_honors_manual_plan_reroute(
+    monkeypatch,
+    capsys,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_orchestrator_preflight(
+        request_text,
+        *,
+        requested_agent=None,
+        live_manual_plan=False,
+        **kwargs,
+    ):
+        assert live_manual_plan is True
+        return _fake_orchestrator_preflight(
+            request_text,
+            requested_agent=requested_agent,
+            live_manual_plan=live_manual_plan,
+            **kwargs,
+        )
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "output_type": "OpportunityScoutResult",
+                    "send_enabled": False,
+                    "output": {
+                        "summary": "three-company comparison",
+                        "ranked_opportunities": [],
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_run_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "@KNI",
+            "business",
+            "research",
+            "analyst",
+            "Compare",
+            "three",
+            "software-first",
+            "companies",
+            "with",
+            "measurement-based",
+            "care",
+            "or",
+            "digital",
+            "psychiatry",
+            "tools",
+            "for",
+            "behavioral",
+            "health",
+            "clinics.",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_agent"] == "opportunity_scout"
+    assert payload["manual_request_plan"]["target_agent"] == "opportunity_scout"
+    assert calls
+    command = calls[0]
+    assert "scripts/run_opportunity_scout.py" in command
+    assert "--topic" in command
+    topic = command[command.index("--topic") + 1]
+    assert topic == (
+        "software-first companies with measurement-based care or digital psychiatry tools "
+        "for behavioral health clinics"
+    )
+    assert command[command.index("--max-results") + 1] == "3"
+
+
 def test_cli_ask_cost_tracking_directive_is_recorded_without_reaching_child(
     monkeypatch,
     capsys,
@@ -987,6 +1073,8 @@ def test_cli_ask_live_child_timeout_returns_structured_payload(
     assert payload["timeout_seconds"] == 2.0
     assert payload["send_enabled"] is False
     assert payload["output"]["error_type"] == "timeout"
+    assert payload["output"]["failure"]["schema"] == "keystone.operator_failure.v1"
+    assert payload["output"]["failure"]["kind"] == "provider_timeout"
 
 
 def test_cli_ask_live_child_failure_returns_redacted_structured_payload(
@@ -1025,9 +1113,94 @@ def test_cli_ask_live_child_failure_returns_redacted_structured_payload(
     assert payload["send_enabled"] is False
     assert payload["output"]["error_type"] == "child_process_failed"
     assert payload["output"]["returncode"] == 7
+    assert payload["output"]["failure"]["schema"] == "keystone.operator_failure.v1"
+    assert payload["output"]["failure"]["kind"] == "unknown_error"
     assert "sk-" + ("x" * 24) not in payload_text
     assert "sk-" + ("y" * 20) not in payload_text
     assert "[REDACTED]" in payload_text
+
+
+def test_cli_ask_live_child_failure_prefers_operator_failure_payload(
+    monkeypatch,
+    capsys,
+) -> None:
+    def failed_run(_command, **_kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "status": "failed",
+                    "output": {
+                        "failure": {
+                            "schema": "keystone.operator_failure.v1",
+                            "kind": "missing_credentials",
+                            "summary": "A required live-provider credential is unavailable.",
+                            "reason": "OPENAI_API_KEY=<missing-test-openai-key>",
+                            "next_step": "Configure or disable the live provider, then rerun.",
+                            "retryable": False,
+                            "safe_to_continue": True,
+                        }
+                    },
+                }
+            ),
+            stderr="Traceback should not become the summary",
+        )
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_isolated_child_process", failed_run)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--json",
+            "review the agent architecture",
+        ]
+    )
+
+    payload_text = capsys.readouterr().out
+    payload = json.loads(payload_text)
+    assert exit_code == 1
+    assert payload["output"]["failure"]["kind"] == "missing_credentials"
+    assert payload["output"]["summary"] == "A required live-provider credential is unavailable."
+    assert "sk-test-secret" not in payload_text
+
+
+def test_cli_ask_work_item_failure_returns_clear_json_and_stderr(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    def failed_work_item(*_args, **_kwargs):
+        raise ToolGuardrailViolation("blocked by safety guardrail")
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    monkeypatch.setattr(cli, "advance_work_item_manager_loop", failed_work_item)
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'workitems.sqlite'}",
+            "@KNI opportunity scout find source-backed grants",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 1
+    assert payload["status"] == "failed"
+    assert payload["output"]["error_type"] == "ToolGuardrailViolation"
+    assert "safety guardrail" in payload["output"]["summary"]
+    assert payload["output"]["failure"]["schema"] == "keystone.operator_failure.v1"
+    assert payload["output"]["failure"]["kind"] == "guardrail_block"
+    assert payload["output"]["failure"]["safe_to_continue"] is True
+    assert "Business Agents run failed" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_cli_ask_live_child_malformed_json_returns_redacted_structured_payload(
@@ -1065,6 +1238,8 @@ def test_cli_ask_live_child_malformed_json_returns_redacted_structured_payload(
     assert payload["child_returncode"] == 0
     assert payload["send_enabled"] is False
     assert payload["output"]["error_type"] == "child_process_malformed_json"
+    assert payload["output"]["failure"]["schema"] == "keystone.operator_failure.v1"
+    assert payload["output"]["failure"]["kind"] == "schema_or_parse_error"
     assert "parse_error" in payload["output"]
     assert "sk-" + ("x" * 24) not in payload_text
     assert "sk-" + ("y" * 20) not in payload_text

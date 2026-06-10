@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
 from keystone_agents.agents.chief_of_staff import (
@@ -14,17 +15,20 @@ from keystone_agents.agents.chief_of_staff import (
     run_chief_of_staff_sdk,
 )
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
-from keystone_agents.agents.orchestrator import review_specialist_output
+from keystone_agents.agents.orchestrator import review_specialist_output, run_orchestrator_preflight
 from keystone_agents.cli_sdk import add_sdk_session_arguments, sdk_session_from_args
 from keystone_agents.config import load_settings
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
+from keystone_agents.operator_failures import known_exception_to_operator_failure
 from keystone_agents.orchestrator.preflight_context import (
+    compact_orchestrator_preflight_payload,
     load_manual_request_plan_from_env,
     load_orchestrator_preflight_from_env,
 )
 from keystone_agents.quality_budget import AgentQualityBudget, chief_of_staff_quality_budget
+from keystone_agents.visible_sources import append_visible_source_urls_to_output
 
 
 def _chief_of_staff_session_from_args(args: argparse.Namespace) -> object | None:
@@ -260,6 +264,39 @@ def _review_detected_unrelated_output(review: object) -> bool:
     return any("Request/output term overlap is low" in str(gap) for gap in gaps)
 
 
+def _reference_capture_mismatch(input_text: str, output: object) -> bool:
+    route = getattr(output, "recommended_route", None)
+    workflow_type = str(getattr(route, "workflow_type", "") or "")
+    if workflow_type != "reference-capture":
+        return False
+    lowered = str(input_text or "").lower()
+    explicit_capture_markers = (
+        "keep this for future reference",
+        "for future reference",
+        "remember this",
+        "save this",
+        "save for later",
+        "bookmark this",
+        "note this",
+        "store this",
+        "add this to memory",
+        "keep this",
+    )
+    if any(marker in lowered for marker in explicit_capture_markers):
+        return False
+    question_or_search_markers = (
+        "what is",
+        "what are",
+        "search",
+        "brief",
+        "synthesize",
+        "find",
+        "research",
+        "source",
+    )
+    return any(marker in lowered for marker in question_or_search_markers)
+
+
 def _fallback_after_unrelated_live_output(
     *,
     input_text: str,
@@ -285,6 +322,46 @@ def _fallback_after_unrelated_live_output(
     return result
 
 
+def _should_fallback_after_live_sdk_exception(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "invalid json when parsing",
+            "could not be validated",
+            "validation error",
+            "model_validate_json",
+            "structured output",
+        )
+    )
+
+
+def _fallback_after_live_sdk_exception(
+    *,
+    input_text: str,
+    slack_repo_path: str | None,
+    database_url: str | None,
+    manual_request_plan: object | None = None,
+    exc: Exception,
+) -> object:
+    result = plan_chief_of_staff_request(
+        input_text,
+        slack_repo_path=slack_repo_path,
+        database_url=database_url,
+        manual_request_plan=manual_request_plan,
+    )
+    audit_notes = [
+        *getattr(result, "audit_notes", []),
+        (
+            "Live SDK structured output could not be parsed or validated; "
+            f"deterministic Chief of Staff fallback was rendered instead ({type(exc).__name__})."
+        ),
+    ]
+    if hasattr(result, "model_copy"):
+        return result.model_copy(update={"audit_notes": audit_notes})
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.mode == RunMode.LIVE.value and not args.live_sdk:
@@ -301,58 +378,87 @@ def main(argv: list[str] | None = None) -> int:
     if args.live_sdk:
         load_settings(force_dotenv=True)
         model_config = get_runtime_agent_model_config("chief_of_staff", model_override=args.model)
-        manual_plan = parent_manual_plan or resolve_manual_request_plan(
-            input_text,
-            requested_agent="chief_of_staff",
-            live=True,
-            model=args.model,
-        )
+        sdk_session = _chief_of_staff_session_from_args(args)
+        if parent_manual_plan is not None:
+            manual_plan = parent_manual_plan
+        else:
+            preflight = run_orchestrator_preflight(
+                input_text,
+                requested_agent="chief_of_staff",
+                live_manual_plan=True,
+                model=args.model,
+                session=sdk_session,
+                database_url=args.database_url,
+            )
+            manual_plan = preflight.manual_request_plan
+            orchestrator_preflight = compact_orchestrator_preflight_payload(preflight)
         budget = chief_of_staff_quality_budget(
             args.quality,
             request_text=input_text,
             live_sdk=True,
         )
-        typed_result = run_chief_of_staff_sdk(
-            {
-                "request": input_text,
-                "slack_repo_path": args.slack_repo_path,
-                "approval_reference": _approval_reference_for_request(input_text),
-                "side_effect_policy": _live_side_effect_policy(input_text),
-                "manual_request_plan": manual_plan.model_dump(mode="json"),
-                "orchestrator_preflight": orchestrator_preflight,
-            },
-            live=True,
-            model=args.model,
-            quality_budget=budget,
-            session=_chief_of_staff_session_from_args(args),
-            force_sdk_interpretation=True,
-            manual_request_plan=manual_plan,
-        )
-        result = typed_result.output
-        result = _with_cost_tracking_note(
-            result,
-            requested=cost_directive.requested,
-            usage=typed_result.usage,
-            cost=typed_result.cost,
-        )
-        review = _chief_of_staff_output_review(
-            input_text=input_text,
-            output=result,
-            run_type="live_sdk",
-        )
+        typed_result = None
         original_review = None
-        if _review_detected_unrelated_output(review):
-            original_review = review
-            result = _fallback_after_unrelated_live_output(
-                input_text=input_text,
-                slack_repo_path=args.slack_repo_path,
-                database_url=args.database_url,
+        try:
+            typed_result = run_chief_of_staff_sdk(
+                {
+                    "request": input_text,
+                    "slack_repo_path": args.slack_repo_path,
+                    "approval_reference": _approval_reference_for_request(input_text),
+                    "side_effect_policy": _live_side_effect_policy(input_text),
+                    "manual_request_plan": manual_plan.model_dump(mode="json"),
+                    "orchestrator_preflight": orchestrator_preflight,
+                },
+                live=True,
+                model=args.model,
+                quality_budget=budget,
+                session=sdk_session,
+                force_sdk_interpretation=True,
                 manual_request_plan=manual_plan,
+            )
+            result = typed_result.output
+            result = append_visible_source_urls_to_output(result)
+            result = _with_cost_tracking_note(
+                result,
+                requested=cost_directive.requested,
+                usage=typed_result.usage,
+                cost=typed_result.cost,
             )
             review = _chief_of_staff_output_review(
                 input_text=input_text,
                 output=result,
-                run_type="deterministic_fallback_after_live_review",
+                run_type="live_sdk",
+            )
+            if _review_detected_unrelated_output(review) or _reference_capture_mismatch(
+                input_text, result
+            ):
+                original_review = review
+                result = _fallback_after_unrelated_live_output(
+                    input_text=input_text,
+                    slack_repo_path=args.slack_repo_path,
+                    database_url=args.database_url,
+                    manual_request_plan=manual_plan,
+                )
+                review = _chief_of_staff_output_review(
+                    input_text=input_text,
+                    output=result,
+                    run_type="deterministic_fallback_after_live_review",
+                )
+        except Exception as exc:
+            if not _should_fallback_after_live_sdk_exception(exc):
+                raise
+            result = _fallback_after_live_sdk_exception(
+                input_text=input_text,
+                slack_repo_path=args.slack_repo_path,
+                database_url=args.database_url,
+                manual_request_plan=manual_plan,
+                exc=exc,
+            )
+            result = append_visible_source_urls_to_output(result)
+            review = _chief_of_staff_output_review(
+                input_text=input_text,
+                output=result,
+                run_type="deterministic_fallback_after_live_exception",
             )
         payload = _payload(
             mode="live_sdk",
@@ -365,9 +471,9 @@ def main(argv: list[str] | None = None) -> int:
             orchestrator_preflight=orchestrator_preflight,
             orchestrator_review=review,
             original_orchestrator_review=original_review,
-            usage=typed_result.usage,
-            cost=typed_result.cost,
-            request_cache=typed_result.request_cache,
+            usage=typed_result.usage if typed_result is not None else None,
+            cost=typed_result.cost if typed_result is not None else None,
+            request_cache=typed_result.request_cache if typed_result is not None else None,
         )
     else:
         if args.mode != RunMode.DRY_RUN.value:
@@ -388,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
             database_url=args.database_url,
             manual_request_plan=manual_plan,
         )
+        result = append_visible_source_urls_to_output(result)
         result = _with_cost_tracking_note(
             result,
             requested=cost_directive.requested,
@@ -418,5 +525,32 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _handle_uncaught_exception(exc: Exception, argv: list[str] | None = None) -> int:
+    failure = known_exception_to_operator_failure(exc, context="Chief of Staff run")
+    if "--json" in set(argv or []):
+        print(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "output": {
+                        "failure": failure.to_dict(),
+                        "summary": failure.summary,
+                        "next_step": failure.next_step,
+                    },
+                },
+                ensure_ascii=True,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    print(failure.summary, file=sys.stderr)
+    print(f"Reason: {failure.reason}", file=sys.stderr)
+    print(f"Next step: {failure.next_step}", file=sys.stderr)
+    return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        raise SystemExit(_handle_uncaught_exception(exc, sys.argv[1:])) from exc

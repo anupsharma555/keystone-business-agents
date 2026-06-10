@@ -17,17 +17,19 @@ from keystone_agents.slack_action_contract import (
     KBA_COS_AUDIT_AUTOMATIONS,
     KBA_INTENT_MORE_RESEARCH,
     KBA_MORE_RESEARCH,
+    OPERATOR_FAILURE_SCHEMA,
     RUN_AGENT_MESSAGE_CALLBACK_ID,
     SLACK_AGENT_FEEDBACK_EVENT_SCHEMA,
     SLACK_SELECTED_CONTEXT_SCHEMA,
-    SlackAgentFeedbackEvent,
     BusinessAgentWriteGatePayload,
+    OperatorFailurePayload,
+    SlackAgentFeedbackEvent,
     business_agent_action_value,
     business_agent_slack_contract,
-    slack_agent_feedback_event,
     business_agent_write_gate_value,
     parse_business_agent_action_value,
     parse_business_agent_write_gate_value,
+    slack_agent_feedback_event,
 )
 from keystone_agents.slack_actions import SlackSelectedMessageContext
 
@@ -77,6 +79,7 @@ def test_business_agent_slack_contract_exports_action_and_context_metadata() -> 
     assert set(contract["capabilities"]) == set(BUSINESS_AGENT_SLACK_CONTRACT_CAPABILITIES)
     assert contract["schemas"]["business_agent_action"] == BUSINESS_AGENT_ACTION_SCHEMA
     assert contract["schemas"]["agent_feedback_event"] == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
+    assert contract["schemas"]["operator_failure"] == OPERATOR_FAILURE_SCHEMA
     assert contract["schemas"]["selected_message_context"] == SLACK_SELECTED_CONTEXT_SCHEMA
     assert contract["schemas"]["write_gate"] == BUSINESS_AGENT_WRITE_GATE_SCHEMA
     assert KBA_MORE_RESEARCH in contract["action_ids"]
@@ -89,8 +92,11 @@ def test_business_agent_slack_contract_exports_action_and_context_metadata() -> 
     feedback_schema = contract["payload_json_schemas"]["agent_feedback_event"]
     selected_context_schema = contract["payload_json_schemas"]["selected_message_context"]
     write_gate_schema = contract["payload_json_schemas"]["write_gate"]
+    failure_schema = contract["payload_json_schemas"]["operator_failure"]
     assert "intent" in action_schema["required"]
     assert "event_type" in feedback_schema["required"]
+    assert "kind" in failure_schema["required"]
+    assert failure_schema["properties"]["schema"]["default"] == OPERATOR_FAILURE_SCHEMA
     assert selected_context_schema["properties"]["schema"]["const"] == SLACK_SELECTED_CONTEXT_SCHEMA
     assert "prior_agent_runs" in selected_context_schema["properties"]
     assert "request_text" in write_gate_schema["required"]
@@ -108,16 +114,22 @@ def test_generated_slack_contract_artifact_matches_canonical_contract_shape() ->
     )
     assert payload["action_ids"] == sorted(KBA_ACTION_IDS)
     assert payload["schemas"]["agent_feedback_event"] == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
+    assert payload["schemas"]["operator_failure"] == OPERATOR_FAILURE_SCHEMA
     assert payload["schemas"]["selected_message_context"] == SLACK_SELECTED_CONTEXT_SCHEMA
-    assert payload["payload_json_schemas"]["agent_feedback_event"]["properties"]["schema"][
-        "default"
-    ] == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
+    assert (
+        payload["payload_json_schemas"]["agent_feedback_event"]["properties"]["schema"]["default"]
+        == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
+    )
     assert (
         payload["payload_json_schemas"]["selected_message_context"]["properties"]["schema"]["const"]
         == SLACK_SELECTED_CONTEXT_SCHEMA
     )
     assert payload["payload_json_schemas"]["write_gate"]["properties"]["schema"]["default"] == (
         BUSINESS_AGENT_WRITE_GATE_SCHEMA
+    )
+    assert (
+        payload["payload_json_schemas"]["operator_failure"]["properties"]["schema"]["default"]
+        == OPERATOR_FAILURE_SCHEMA
     )
 
 
@@ -148,3 +160,18 @@ def test_slack_agent_feedback_event_has_contract_schema() -> None:
     assert parsed.schema_name == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
     assert parsed.event_type == "orchestrator_preflight"
     assert parsed.payload["selected_agent"] == "chief_of_staff"
+
+
+def test_operator_failure_payload_has_contract_schema() -> None:
+    payload = OperatorFailurePayload(
+        kind="schema_or_parse_error",
+        summary="The Slack bridge run returned data that could not be validated.",
+        reason="Invalid JSON",
+        next_step="Keep the WorkItem blocked and rerun after fixing the malformed payload.",
+        retryable=True,
+        safe_to_continue=True,
+    ).model_dump(mode="json", by_alias=True)
+
+    assert payload["schema"] == OPERATOR_FAILURE_SCHEMA
+    assert payload["kind"] == "schema_or_parse_error"
+    assert payload["retryable"] is True

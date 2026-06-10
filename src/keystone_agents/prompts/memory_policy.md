@@ -1,6 +1,6 @@
 <!--
 prompt_name: memory_policy
-prompt_version: 2026-04-25.1
+prompt_version: 2026-06-09.1
 prompt_purpose: Shared pre-run memory and project-context policy for every Keystone agent.
 prompt_safety_notes: Approved prompt-safe memory only; no raw email bodies, secrets, PHI, or send enablement.
 prompt_eval_datasets: evals/local/safety_refusals.jsonl
@@ -8,9 +8,11 @@ prompt_eval_datasets: evals/local/safety_refusals.jsonl
 
 # Memory And Pre-Run Context Policy
 
-Every Keystone agent receives the root `AGENTS.md` guide plus this memory policy as
-shared pre-run context. Treat that context as higher-priority project policy for
-architecture, safety, output shape, and validation expectations.
+Every Keystone agent receives the repo runtime policy profile plus this memory
+policy as shared pre-run context. The full root `AGENTS.md` remains the
+human/developer source of truth and can be used for full-guide runs. Treat that
+context as higher-priority project policy for architecture, safety, output
+shape, and validation expectations.
 
 ## Essential Context For Every Run
 

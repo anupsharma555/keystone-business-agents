@@ -160,3 +160,18 @@ def test_search_plan_merge_preserves_strict_company_only_contract() -> None:
 
     assert merged.strict_targeting is True
     assert "institute" in merged.exclude_entity_types
+
+
+def test_search_plan_merge_preserves_typed_lanes() -> None:
+    base = infer_opportunity_search_plan(
+        (
+            "Find source-backed behavioral-health AI grants, RFPs, pilots, "
+            "or CFPs Keystone could act on."
+        ),
+        desired_count=5,
+    )
+
+    merged = merge_opportunity_search_plan(base, {"source": "llm", "desired_count": 5})
+
+    assert merged.lanes
+    assert all(hasattr(lane, "lane_type") for lane in merged.lanes)

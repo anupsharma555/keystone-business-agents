@@ -11,6 +11,7 @@ concept in an explicit local boundary.
 | Shared SDK wrapper | `src/keystone_agents/sdk.py` |
 | Live SDK integration bridge | `src/keystone_agents/run.py`, `docs/LIVE_SDK_INTEGRATION.md` |
 | Instructions and prompt fragments | `src/keystone_agents/prompts/` |
+| Repo-local reasoning skills | `src/keystone_agents/skills/*/SKILL.md` |
 | Shared pre-run context | `AGENTS.md`, `src/keystone_agents/prompts/memory_policy.md` |
 | Function tools and integration boundaries | `src/keystone_agents/tools/` |
 | Structured output types | `src/keystone_agents/schemas/` |
@@ -26,8 +27,8 @@ concept in an explicit local boundary.
 ## Structural Rules
 
 - Agent modules expose `build_*_agent()` functions that return SDK agents.
-- Agent builders load instructions from markdown files instead of embedding long
-  prompts in Python.
+- Agent builders load instructions from markdown files and declared repo-local
+  skill bundles instead of embedding long prompts in Python.
 - Specialist agents include `handoff_description` so orchestrators have SDK-native
   delegation hints.
 - Tool modules own external integration boundaries. Agent modules compose tools.
@@ -73,11 +74,18 @@ checks, source attribution rules, and approval gates for any write-capable tool.
 
 ## Naming Notes
 
-`skills.md` and `tools.md` are instruction fragments, not separate SDK primitives.
-Keystone skills are prompt-only reasoning and output patterns unless
-an existing explicit runtime capability surface is used. Do not add hidden skill
-routing, dynamic tool attachment, or implicit live integrations behind a skill
-name.
+`skills.md` is now a compatibility instruction fragment for legacy or auxiliary
+agents that have not yet migrated to repo-local skill bundles. Registered
+Keystone business agents declare reusable capabilities in
+`src/keystone_agents/skills/<skill_id>/SKILL.md`; see
+`docs/SKILLS_ARCHITECTURE.md`.
+
+Keystone skills are bounded reasoning and output contracts, not separate SDK primitives.
+They are not tool calls, approval gates, hidden routers, dynamic tool attachment
+paths, or live integrations. Agent builders and the `AgentSpec` registry declare
+which skills are part of an agent's static instruction surface. Tool access,
+approval checks, live flags, source sufficiency, and schema validation remain in
+explicit SDK tools, guardrails, Python gates, and Pydantic schemas.
 
 The SDK-native surface remains agent `instructions`, attached `tools`,
 `handoffs`, `output_type`, guardrails, WorkItem gates, and tracing-ready

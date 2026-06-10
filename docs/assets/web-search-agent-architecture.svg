@@ -1,25 +1,25 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980" role="img" aria-labelledby="title desc">
-  <title id="title">Keystone Agent Web Search Architecture</title>
-  <desc id="desc">Educational diagram showing how Keystone agents use search providers, coverage gates, credit tracking, extraction providers, and sandbox review.</desc>
+  <title id="title">Keystone Web Search Provider Architecture</title>
+  <desc id="desc">Diagram showing Keystone business agents using primary discovery, capped deepening, selected-page extraction, provider diagnostics, and Friday usage monitoring.</desc>
   <defs>
     <style>
       .bg { fill: #f7f8fb; }
       .panel { fill: #ffffff; stroke: #c8d0df; stroke-width: 2; rx: 8; }
       .agent { fill: #eef6ff; stroke: #6d91c7; stroke-width: 2; rx: 8; }
-      .gate { fill: #fff7e6; stroke: #d69b2d; stroke-width: 2; rx: 8; }
-      .provider { fill: #edf8f0; stroke: #61a476; stroke-width: 2; rx: 8; }
+      .policy { fill: #fff7e6; stroke: #d69b2d; stroke-width: 2; rx: 8; }
+      .primary { fill: #edf8f0; stroke: #5a9e70; stroke-width: 2; rx: 8; }
       .deep { fill: #f1efff; stroke: #8878d8; stroke-width: 2; rx: 8; }
       .extract { fill: #fef1f1; stroke: #ca6d6d; stroke-width: 2; rx: 8; }
-      .future { fill: #f2f3f5; stroke: #8a93a3; stroke-width: 2; stroke-dasharray: 8 6; rx: 8; }
+      .disabled { fill: #f2f3f5; stroke: #8a93a3; stroke-width: 2; stroke-dasharray: 8 6; rx: 8; }
       .output { fill: #eaf7f7; stroke: #4e9b9b; stroke-width: 2; rx: 8; }
       .title { font: 700 28px Arial, sans-serif; fill: #172033; }
       .section { font: 700 21px Arial, sans-serif; fill: #172033; }
       .label { font: 700 18px Arial, sans-serif; fill: #172033; }
       .small { font: 15px Arial, sans-serif; fill: #344055; }
       .tiny { font: 13px Arial, sans-serif; fill: #546077; }
+      .note { font: 14px Arial, sans-serif; fill: #697386; }
       .arrow { stroke: #526078; stroke-width: 3; fill: none; marker-end: url(#arrow); }
       .dash { stroke: #7b8496; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; marker-end: url(#arrow); }
-      .note { font: 14px Arial, sans-serif; fill: #697386; }
     </style>
     <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
       <path d="M2,2 L10,6 L2,10 Z" fill="#526078" />
@@ -27,96 +27,90 @@
   </defs>
 
   <rect class="bg" x="0" y="0" width="1600" height="980" />
-  <text class="title" x="70" y="58">Keystone Agent Web Search: Coverage-Aware Retrieval</text>
-  <text class="note" x="70" y="88">Search providers discover URLs. Extraction providers read selected URLs. Deterministic gates decide when backups are worth using.</text>
+  <text class="title" x="70" y="58">Keystone Web Search: Primary Lanes, Deepening, Extraction</text>
+  <text class="note" x="70" y="88">Agents call one shared search tool. Python retrieval policy chooses provider lanes, records diagnostics, and preserves dry-run and credit limits.</text>
 
-  <rect class="panel" x="60" y="125" width="310" height="250" />
-  <text class="section" x="88" y="160">Agents</text>
-  <rect class="agent" x="88" y="185" width="250" height="48" />
-  <text class="label" x="110" y="216">Orchestrator</text>
-  <text class="tiny" x="110" y="238">advisory RetrievalHint</text>
-  <rect class="agent" x="88" y="254" width="250" height="48" />
-  <text class="label" x="110" y="285">Business Research Analyst</text>
-  <rect class="agent" x="88" y="323" width="250" height="38" />
-  <text class="label" x="110" y="348">Opportunity Scout</text>
+  <rect class="panel" x="60" y="125" width="310" height="280" />
+  <text class="section" x="88" y="160">All Search-Capable Agents</text>
+  <rect class="agent" x="88" y="188" width="250" height="44" />
+  <text class="label" x="110" y="216">Chief of Staff</text>
+  <rect class="agent" x="88" y="246" width="250" height="44" />
+  <text class="label" x="110" y="274">Business Research</text>
+  <rect class="agent" x="88" y="304" width="250" height="44" />
+  <text class="label" x="110" y="332">Opportunity Scout</text>
+  <rect class="agent" x="88" y="362" width="250" height="28" />
+  <text class="small" x="110" y="382">Gmail, Outreach, Orchestrator</text>
 
-  <rect class="gate" x="430" y="138" width="330" height="224" />
-  <text class="section" x="460" y="174">Retrieval Policy</text>
-  <text class="small" x="460" y="207">Quality and coverage gates</text>
-  <text class="small" x="460" y="235">Lane quotas from source registry</text>
-  <text class="small" x="460" y="263">Backup trigger reasons:</text>
-  <text class="tiny" x="480" y="291">too few results, low domain diversity</text>
-  <text class="tiny" x="480" y="316">missing lanes, thin snippets, review needed</text>
-  <text class="tiny" x="480" y="341">structured enrichment still missing</text>
+  <rect class="policy" x="430" y="136" width="330" height="252" />
+  <text class="section" x="460" y="172">Shared Retrieval Policy</text>
+  <text class="small" x="460" y="205">One `search_web` tool contract</text>
+  <text class="small" x="460" y="233">Dry-run unless live-enabled</text>
+  <text class="small" x="460" y="261">Quality gate after first pass</text>
+  <text class="small" x="460" y="289">Explicit deeper-search prompts</text>
+  <text class="small" x="460" y="317">force capped deepening lanes</text>
+  <text class="tiny" x="460" y="351">Serper disabled until credits return</text>
 
-  <rect class="panel" x="825" y="112" width="700" height="316" />
-  <text class="section" x="855" y="148">Search Providers</text>
-  <rect class="provider" x="855" y="176" width="200" height="72" />
-  <text class="label" x="882" y="207">SearXNG</text>
-  <text class="tiny" x="882" y="230">default broad recall</text>
-  <rect class="provider" x="1082" y="176" width="200" height="72" />
-  <text class="label" x="1110" y="207">Serper</text>
-  <text class="tiny" x="1110" y="230">explicit override only</text>
-  <rect class="provider" x="1308" y="176" width="180" height="72" />
-  <text class="label" x="1333" y="207">Firecrawl</text>
-  <text class="tiny" x="1333" y="230">explicit search</text>
+  <rect class="panel" x="825" y="105" width="705" height="355" />
+  <text class="section" x="855" y="142">Primary Discovery Lanes</text>
+  <rect class="primary" x="855" y="170" width="195" height="76" />
+  <text class="label" x="880" y="202">SearXNG</text>
+  <text class="tiny" x="880" y="226">broad local recall</text>
+  <rect class="primary" x="1072" y="170" width="205" height="76" />
+  <text class="label" x="1096" y="202">Agents Web Search</text>
+  <text class="tiny" x="1096" y="226">hosted capped lane</text>
+  <rect class="deep" x="1298" y="170" width="195" height="76" />
+  <text class="label" x="1323" y="202">Exa</text>
+  <text class="tiny" x="1323" y="226">semantic precision</text>
 
-  <rect class="deep" x="855" y="276" width="255" height="94" />
-  <text class="label" x="882" y="307">Tavily</text>
-  <text class="tiny" x="882" y="330">semantic deepening fallback</text>
-  <text class="tiny" x="882" y="352">budget-aware: 1,000 credits/mo</text>
-  <rect class="deep" x="1138" y="276" width="255" height="94" />
-  <text class="label" x="1165" y="307">Agents SDK Web Search</text>
-  <text class="tiny" x="1165" y="330">native hosted web search</text>
-  <text class="tiny" x="1165" y="352">capped parallel lane</text>
-  <rect class="future" x="1418" y="276" width="70" height="94" />
-  <text class="tiny" x="1436" y="318">future</text>
-  <text class="tiny" x="1433" y="342">Exa</text>
+  <text class="section" x="855" y="286">Deepening Lanes</text>
+  <rect class="deep" x="855" y="314" width="262" height="82" />
+  <text class="label" x="882" y="346">Exa</text>
+  <text class="tiny" x="882" y="370">default capped semantic deepening</text>
+  <rect class="deep" x="1143" y="314" width="262" height="82" />
+  <text class="label" x="1170" y="346">Tavily</text>
+  <text class="tiny" x="1170" y="370">deeper research and breadth lane</text>
+  <rect class="disabled" x="1430" y="314" width="63" height="82" />
+  <text class="tiny" x="1443" y="350">Serper</text>
+  <text class="tiny" x="1444" y="372">off</text>
+  <text class="tiny" x="855" y="430">Exa/Tavily caps default to 2 calls per run. Explicit provider-comparison prompts attempt both when configured.</text>
 
-  <rect class="gate" x="856" y="396" width="632" height="48" />
-  <text class="small" x="884" y="426">Tavily credit ledger: provider usage first, depth estimate fallback, warn by default</text>
+  <rect class="panel" x="60" y="485" width="700" height="238" />
+  <text class="section" x="90" y="522">Secondary Extraction Layer</text>
+  <rect class="extract" x="90" y="552" width="200" height="72" />
+  <text class="label" x="118" y="583">Trafilatura</text>
+  <text class="tiny" x="118" y="606">default local extraction</text>
+  <rect class="extract" x="320" y="552" width="200" height="72" />
+  <text class="label" x="348" y="583">Firecrawl</text>
+  <text class="tiny" x="348" y="606">configured paid fallback</text>
+  <rect class="extract" x="550" y="552" width="180" height="72" />
+  <text class="label" x="578" y="583">Crawl4AI</text>
+  <text class="tiny" x="578" y="606">local/heavier fallback</text>
+  <text class="small" x="90" y="664">Extraction reads selected URLs after discovery.</text>
+  <text class="small" x="90" y="692">It does not replace primary search or perform browser-side writes.</text>
 
-  <rect class="panel" x="60" y="472" width="700" height="256" />
-  <text class="section" x="90" y="508">Extraction Providers</text>
-  <rect class="extract" x="90" y="538" width="200" height="72" />
-  <text class="label" x="118" y="569">Trafilatura</text>
-  <text class="tiny" x="118" y="592">local selected-page text</text>
-  <rect class="extract" x="320" y="538" width="200" height="72" />
-  <text class="label" x="348" y="569">Firecrawl Scrape</text>
-  <text class="tiny" x="348" y="592">configured fallback</text>
-  <rect class="future" x="550" y="538" width="180" height="72" />
-  <text class="label" x="578" y="569">Browserless</text>
-  <text class="tiny" x="578" y="592">future renderer</text>
-  <rect class="future" x="90" y="634" width="200" height="58" />
-  <text class="label" x="118" y="670">Apify</text>
-  <text class="tiny" x="118" y="690">future enrichment</text>
-  <text class="small" x="320" y="654">Extraction runs only after discovery selects URLs.</text>
-  <text class="small" x="320" y="681">No authenticated pages, PHI, or stealth bypass.</text>
+  <rect class="panel" x="825" y="500" width="705" height="223" />
+  <text class="section" x="855" y="536">Diagnostics And Outputs</text>
+  <rect class="output" x="855" y="566" width="300" height="82" />
+  <text class="label" x="884" y="598">Slack Metadata</text>
+  <text class="tiny" x="884" y="621">query, top URLs, lane status, usage, errors</text>
+  <rect class="output" x="1185" y="566" width="308" height="82" />
+  <text class="label" x="1214" y="598">Source Bundle</text>
+  <text class="tiny" x="1214" y="621">deduped URLs, claims, source quality</text>
+  <rect class="output" x="1016" y="672" width="318" height="40" />
+  <text class="label" x="1044" y="699">Source-backed answer</text>
 
-  <rect class="panel" x="825" y="500" width="700" height="228" />
-  <text class="section" x="855" y="536">Second-Pass Review And Outputs</text>
-  <rect class="deep" x="855" y="566" width="282" height="82" />
-  <text class="label" x="884" y="597">Sandbox Web Search Review</text>
-  <text class="tiny" x="884" y="620">optional hosted reviewer over staged packets</text>
-  <rect class="output" x="1170" y="566" width="318" height="82" />
-  <text class="label" x="1198" y="597">Structured Source Bundle</text>
-  <text class="tiny" x="1198" y="620">deduped URLs, claims, lanes, source quality</text>
-  <rect class="output" x="1014" y="674" width="318" height="42" />
-  <text class="label" x="1042" y="701">Source-backed agent answer</text>
+  <rect class="panel" x="60" y="780" width="1468" height="125" />
+  <text class="section" x="90" y="816">Friday API Usage Automation</text>
+  <text class="small" x="90" y="850">Tracks OpenAI, Tavily, Exa, Apify, Firecrawl, Browserless, and Google Cloud snapshots.</text>
+  <text class="small" x="90" y="878">Exa uses `EXA_SERVICE_API_KEY` plus `EXA_API_KEY_ID` or `EXA_API_KEY_NAME=default` and estimates free-tier remaining credits.</text>
+  <text class="small" x="90" y="906">SearXNG, Trafilatura, and Crawl4AI are reported as open-source/local providers rather than paid API lanes.</text>
 
-  <rect class="panel" x="60" y="780" width="1465" height="122" />
-  <text class="section" x="90" y="815">Backup Policy</text>
-  <text class="small" x="90" y="850">1. Run default discovery: SearXNG broad recall plus capped Agents hosted web search.</text>
-  <text class="small" x="90" y="878">2. If coverage remains weak, deepen with Tavily when enabled; Serper is explicit-only.</text>
-  <text class="small" x="90" y="906">3. Extract selected URLs with Trafilatura first and configured Firecrawl fallback; send staged packets to sandbox review only when warranted.</text>
-
-  <path class="arrow" d="M370 248 C390 248 405 248 430 248" />
-  <path class="arrow" d="M760 248 C785 248 805 248 825 248" />
-  <path class="arrow" d="M1175 428 L1175 500" />
-  <path class="arrow" d="M410 472 L520 362" />
-  <path class="arrow" d="M760 600 C790 600 810 600 825 600" />
-  <path class="arrow" d="M1137 607 C1150 607 1160 607 1170 607" />
-  <path class="arrow" d="M1328 648 L1215 674" />
-  <path class="dash" d="M996 648 C990 698 1030 742 1170 780" />
-  <path class="arrow" d="M1173 716 L1173 780" />
+  <path class="arrow" d="M370 262 C392 262 410 262 430 262" />
+  <path class="arrow" d="M760 262 C788 262 806 262 825 262" />
+  <path class="arrow" d="M1175 460 L1175 500" />
+  <path class="arrow" d="M410 485 L520 388" />
+  <path class="arrow" d="M760 604 C790 604 810 604 825 604" />
+  <path class="arrow" d="M1155 607 C1165 607 1175 607 1185 607" />
+  <path class="arrow" d="M1334 648 L1215 672" />
+  <path class="dash" d="M1175 723 L1175 780" />
 </svg>

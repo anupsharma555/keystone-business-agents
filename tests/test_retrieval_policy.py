@@ -341,9 +341,10 @@ def test_hybrid_search_provider_degrades_when_all_parallel_providers_timeout() -
 
     assert telemetry["search_providers_attempted"] == ["searxng", "agents-web-search"]
     assert telemetry["search_providers_used"] == []
-    assert sorted(
-        error["error_type"] for error in telemetry["search_provider_errors"]
-    ) == ["SearchProviderError", "TimeoutError"]
+    assert sorted(error["error_type"] for error in telemetry["search_provider_errors"]) == [
+        "SearchProviderError",
+        "TimeoutError",
+    ]
 
 
 def test_hybrid_search_provider_degrades_when_all_sequential_providers_fail() -> None:
@@ -372,9 +373,10 @@ def test_hybrid_search_provider_degrades_when_all_sequential_providers_fail() ->
 
     assert telemetry["search_providers_attempted"] == ["searxng", "serper"]
     assert telemetry["search_providers_used"] == []
-    assert [
-        error["error_type"] for error in telemetry["search_provider_errors"]
-    ] == ["SearchProviderError", "TimeoutError"]
+    assert [error["error_type"] for error in telemetry["search_provider_errors"]] == [
+        "SearchProviderError",
+        "TimeoutError",
+    ]
 
 
 def test_hybrid_search_provider_runs_deepening_provider_only_after_weak_fast_results() -> None:

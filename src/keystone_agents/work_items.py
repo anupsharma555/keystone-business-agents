@@ -625,6 +625,11 @@ def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
+        source_context_status=_source_context_status(work_item),
+        source_context_sample=_source_context_sample(work_item),
+        source_context_focus=_source_context_focus(work_item),
+        source_triage=_source_triage_summary(work_item),
+        ordered_sources=_ordered_sources_for_context_pack(work_item),
         selected_artifacts=selected_artifacts(work_item),
         blockers=_open_blockers(work_item),
         approval_gates=work_item.approval_gates,
@@ -659,6 +664,11 @@ def build_opportunity_context_pack(work_item: WorkItem) -> OpportunityContextPac
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
+        source_context_status=_source_context_status(work_item),
+        source_context_sample=_source_context_sample(work_item),
+        source_context_focus=_source_context_focus(work_item),
+        source_triage=_source_triage_summary(work_item),
+        ordered_sources=_ordered_sources_for_context_pack(work_item),
         selected_artifacts=selected_artifacts(work_item),
         blockers=_open_blockers(work_item),
         approval_gates=work_item.approval_gates,
@@ -715,6 +725,11 @@ def build_outreach_context_pack(work_item: WorkItem) -> OutreachContextPack:
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
+        source_context_status=_source_context_status(work_item),
+        source_context_sample=_source_context_sample(work_item),
+        source_context_focus=_source_context_focus(work_item),
+        source_triage=_source_triage_summary(work_item),
+        ordered_sources=_ordered_sources_for_context_pack(work_item),
         selected_artifacts=selected_artifacts(work_item),
         blockers=_open_blockers(work_item),
         approval_gates=work_item.approval_gates,
@@ -757,6 +772,11 @@ def build_gmail_context_pack(work_item: WorkItem) -> GmailContextPack:
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
+        source_context_status=_source_context_status(work_item),
+        source_context_sample=_source_context_sample(work_item),
+        source_context_focus=_source_context_focus(work_item),
+        source_triage=_source_triage_summary(work_item),
+        ordered_sources=_ordered_sources_for_context_pack(work_item),
         selected_artifacts=selected_artifacts(work_item),
         blockers=_open_blockers(work_item),
         approval_gates=work_item.approval_gates,
@@ -1508,6 +1528,340 @@ def _source_bundle_summary(
     if source_backed_artifact_count:
         parts.append(f"{source_backed_artifact_count} source-backed artifact refs")
     return ", ".join(parts)
+
+
+def _source_context_status(work_item: WorkItem) -> dict[str, Any]:
+    """Summarize whether selected WorkItem sources carry readable evidence."""
+
+    refs = _selected_source_context_refs(work_item)
+    selected_url_count = len(refs)
+    extracted_url_count = sum(1 for ref in refs if _source_ref_is_extracted(ref))
+    evidence_url_count = sum(1 for ref in refs if _source_ref_has_evidence(ref))
+    statuses = list(
+        dict.fromkeys(
+            status
+            for status in (_source_ref_value(ref, "extraction_status").strip() for ref in refs)
+            if status
+        )
+    )
+    return {
+        "selected_url_count": selected_url_count,
+        "extracted_url_count": extracted_url_count,
+        "evidence_url_count": evidence_url_count,
+        "snippet_only_url_count": max(evidence_url_count - extracted_url_count, 0),
+        "statuses": statuses[:8],
+    }
+
+
+def _source_context_sample(work_item: WorkItem) -> list[dict[str, Any]]:
+    """Return bounded source evidence for specialist reasoning prompts."""
+
+    sample: list[dict[str, Any]] = []
+    for ref, artifact_title in _selected_source_context_refs_with_artifact(work_item):
+        key_facts = _source_ref_key_facts(ref)
+        sample.append(
+            {
+                "title": _compact_source_context_value(_source_ref_value(ref, "title"), 140),
+                "url": _source_ref_value(ref, "url").strip(),
+                "source_type": _source_ref_value(ref, "source_type"),
+                "provider": _source_ref_value(ref, "provider"),
+                "extraction_status": _source_ref_value(ref, "extraction_status"),
+                "supported_claim": _compact_source_context_value(
+                    _source_ref_value(ref, "supported_claim"),
+                    260,
+                ),
+                "key_facts": [
+                    _compact_source_context_value(item, 220)
+                    for item in key_facts[:3]
+                    if str(item or "").strip()
+                ],
+                "evidence_excerpt": _compact_source_context_value(
+                    _source_ref_value(ref, "evidence_excerpt"),
+                    420,
+                ),
+                "artifact_title": _compact_source_context_value(artifact_title, 120),
+            }
+        )
+        if len(sample) >= 8:
+            break
+    return sample
+
+
+def _ordered_sources_for_context_pack(work_item: WorkItem) -> list[dict[str, Any]]:
+    """Return a bounded, order-preserving source list for natural follow-ups."""
+
+    ordered: list[dict[str, Any]] = []
+    for index, source in enumerate(_source_context_sample(work_item), start=1):
+        ordered.append(
+            {
+                "index": index,
+                "reference": f"source {index}",
+                "title": source.get("title") or "",
+                "url": source.get("url") or "",
+                "source_type": source.get("source_type") or "",
+                "extraction_status": source.get("extraction_status") or "",
+                "supported_claim": source.get("supported_claim") or "",
+                "evidence_excerpt": source.get("evidence_excerpt") or "",
+            }
+        )
+    return ordered
+
+
+def _source_context_focus(work_item: WorkItem) -> dict[str, Any]:
+    """Summarize whether sampled source evidence overlaps the current request focus."""
+
+    sample = _source_context_sample(work_item)
+    terms = _source_context_focus_terms(work_item)
+    if not sample:
+        return {
+            "status": "no_source_context_sample",
+            "terms": terms,
+            "sample_count": 0,
+            "matching_sample_count": 0,
+            "matching_urls": [],
+        }
+    if not terms:
+        return {
+            "status": "no_focus_terms",
+            "terms": [],
+            "sample_count": len(sample),
+            "matching_sample_count": 0,
+            "matching_urls": [],
+        }
+    matching_urls: list[str] = []
+    for source in sample:
+        haystack = _source_context_sample_text(source)
+        if any(term in haystack for term in terms):
+            matching_urls.append(str(source.get("url") or ""))
+    matching_urls = [url for url in matching_urls if url]
+    return {
+        "status": ("matched_sample_sources" if matching_urls else "no_sample_source_matches_focus"),
+        "terms": terms,
+        "sample_count": len(sample),
+        "matching_sample_count": len(matching_urls),
+        "matching_urls": matching_urls[:5],
+    }
+
+
+def _source_context_focus_terms(work_item: WorkItem, *, max_terms: int = 6) -> list[str]:
+    text = " ".join(
+        str(part or "")
+        for part in (
+            work_item.request_text,
+            work_item.target.name,
+            work_item.title,
+        )
+    )
+    stopwords = {
+        "about",
+        "above",
+        "agent",
+        "answer",
+        "brief",
+        "business",
+        "chief",
+        "clear",
+        "context",
+        "deep",
+        "deeper",
+        "detailed",
+        "draft",
+        "first",
+        "follow",
+        "follow-up",
+        "from",
+        "give",
+        "keystone",
+        "link",
+        "please",
+        "read",
+        "research",
+        "search",
+        "source",
+        "staff",
+        "summarize",
+        "synthesis",
+        "that",
+        "this",
+        "what",
+        "with",
+    }
+    terms: list[str] = []
+    for match in re.finditer(r"\b[a-z][a-z0-9-]{3,}\b", text.lower()):
+        term = match.group(0)
+        if term in stopwords or re.fullmatch(r"20\d{2}", term):
+            continue
+        if term.endswith("ies") and len(term) > 6:
+            term = f"{term[:-3]}y"
+        elif term.endswith("s") and len(term) > 5:
+            term = term[:-1]
+        terms.append(term)
+    return list(dict.fromkeys(terms))[:max_terms]
+
+
+def _source_triage_summary(work_item: WorkItem) -> dict[str, Any]:
+    """Return compact source-triage state from retrieval diagnostics."""
+
+    triage = _latest_source_triage_payload(work_item)
+    if not isinstance(triage, dict):
+        return {}
+    decisions = triage.get("decisions")
+    decision_counts: dict[str, int] = {}
+    compact_decisions: list[dict[str, Any]] = []
+    if isinstance(decisions, list):
+        for item in decisions:
+            if not isinstance(item, dict):
+                continue
+            decision = str(item.get("decision") or "").strip()
+            if decision:
+                decision_counts[decision] = decision_counts.get(decision, 0) + 1
+            if len(compact_decisions) < 8:
+                compact_decisions.append(
+                    {
+                        "source_id": str(item.get("source_id") or "")[:120],
+                        "title": _compact_source_context_value(item.get("title"), 160),
+                        "url": _compact_source_context_value(item.get("url"), 500),
+                        "decision": decision,
+                        "relevance_score": int(_safe_context_int(item.get("relevance_score"))),
+                        "directness_score": int(_safe_context_int(item.get("directness_score"))),
+                        "rationale": _compact_source_context_value(item.get("rationale"), 260),
+                    }
+                )
+    return {
+        "mode": str(triage.get("mode") or ""),
+        "recommended_action": str(triage.get("recommended_action") or ""),
+        "needs_broaden_or_deepen": bool(triage.get("needs_broaden_or_deepen")),
+        "decision_counts": decision_counts,
+        "retained_source_ids": [
+            str(item) for item in (triage.get("retained_source_ids") or [])[:8]
+        ],
+        "review_source_ids": [str(item) for item in (triage.get("review_source_ids") or [])[:8]],
+        "rejected_source_ids": [
+            str(item) for item in (triage.get("rejected_source_ids") or [])[:8]
+        ],
+        "deepen_source_ids": [str(item) for item in (triage.get("deepen_source_ids") or [])[:8]],
+        "recall_gaps": [str(item) for item in (triage.get("recall_gaps") or [])[:6]],
+        "decisions": compact_decisions,
+    }
+
+
+def _latest_source_triage_payload(work_item: WorkItem) -> dict[str, Any]:
+    artifacts = [*selected_artifacts(work_item), *work_item.artifact_refs[-6:]]
+    for artifact in reversed(artifacts):
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {}
+        triage = metadata.get("source_triage")
+        if isinstance(triage, dict):
+            return triage
+        retrieval_diagnostics = metadata.get("retrieval_diagnostics")
+        if isinstance(retrieval_diagnostics, dict):
+            nested = retrieval_diagnostics.get("source_triage")
+            if isinstance(nested, dict) and nested:
+                return nested
+        retrieval = metadata.get("retrieval")
+        if isinstance(retrieval, dict):
+            nested_diagnostics = retrieval.get("retrieval_diagnostics")
+            if isinstance(nested_diagnostics, dict):
+                nested = nested_diagnostics.get("source_triage")
+                if isinstance(nested, dict) and nested:
+                    return nested
+            nested = retrieval.get("source_triage")
+            if isinstance(nested, dict):
+                return nested
+    return {}
+
+
+def _safe_context_int(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _source_context_sample_text(source: dict[str, Any]) -> str:
+    key_facts = source.get("key_facts")
+    return " ".join(
+        str(part or "").lower()
+        for part in (
+            source.get("title"),
+            source.get("url"),
+            source.get("source_type"),
+            source.get("supported_claim"),
+            source.get("evidence_excerpt"),
+            " ".join(str(item or "") for item in key_facts if isinstance(key_facts, list)),
+        )
+    )
+
+
+def _selected_source_context_refs(work_item: WorkItem) -> list[WorkItemSourceRef | dict[str, Any]]:
+    return [ref for ref, _artifact_title in _selected_source_context_refs_with_artifact(work_item)]
+
+
+def _selected_source_context_refs_with_artifact(
+    work_item: WorkItem,
+) -> list[tuple[WorkItemSourceRef | dict[str, Any], str]]:
+    with_artifact: list[tuple[WorkItemSourceRef | dict[str, Any], str]] = []
+    seen_urls: set[str] = set()
+
+    def add_ref(ref: WorkItemSourceRef | dict[str, Any], *, artifact_title: str = "") -> None:
+        url = _source_ref_value(ref, "url").strip()
+        if not url or url in seen_urls:
+            return
+        seen_urls.add(url)
+        with_artifact.append((ref, artifact_title))
+
+    for source in work_item.sources:
+        add_ref(source)
+    for artifact in selected_artifacts(work_item):
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {}
+        source_refs = metadata.get("source_refs")
+        if not isinstance(source_refs, list):
+            continue
+        for source_ref in source_refs:
+            if isinstance(source_ref, dict):
+                add_ref(source_ref, artifact_title=artifact.title)
+    return with_artifact[:24]
+
+
+def _source_ref_value(ref: WorkItemSourceRef | dict[str, Any], key: str) -> str:
+    if isinstance(ref, WorkItemSourceRef):
+        return str(getattr(ref, key, "") or "")
+    return str(ref.get(key) or "")
+
+
+def _source_ref_key_facts(ref: WorkItemSourceRef | dict[str, Any]) -> list[str]:
+    value = ref.key_facts if isinstance(ref, WorkItemSourceRef) else ref.get("key_facts")
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item or "").strip()]
+    if value is None:
+        return []
+    return [str(value)] if str(value).strip() else []
+
+
+def _compact_source_context_value(value: Any, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3].rstrip()}..."
+
+
+def _source_ref_has_evidence(ref: WorkItemSourceRef | dict[str, Any]) -> bool:
+    if _source_ref_value(ref, "evidence_excerpt").strip():
+        return True
+    if _source_ref_value(ref, "supported_claim").strip():
+        return True
+    return any(str(item or "").strip() for item in _source_ref_key_facts(ref))
+
+
+def _source_ref_is_extracted(ref: WorkItemSourceRef | dict[str, Any]) -> bool:
+    status = _source_ref_value(ref, "extraction_status").strip().lower()
+    return status in {
+        "success",
+        "extracted",
+        "read",
+        "extracted/read",
+        "article_read",
+        "page_read",
+    }
 
 
 def _selected_outreach_artifacts(

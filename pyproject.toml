@@ -51,6 +51,7 @@ where = ["src"]
 keystone_agents = [
   "pricing/*.json",
   "prompts/*.md",
+  "skills/*/SKILL.md",
   "templates/outreach/*.json",
 ]
 
@@ -81,5 +82,18 @@ extend-exclude = ["artifacts"]
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
+"scripts/compare_agent_run_costs.py" = ["E501"]
+"src/keystone_agents/agents/chief_of_staff.py" = ["E501"]
+"src/keystone_agents/context_sources.py" = ["E501"]
+"src/keystone_agents/cost_experiments.py" = ["E501"]
+"src/keystone_agents/response_synthesis.py" = ["E501"]
+"src/keystone_agents/workflow_runner.py" = ["E501"]
 "src/keystone_agents/multi_agent_automations.py" = ["E501"]
+"tests/test_chief_of_staff.py" = ["E501"]
+"tests/test_live_retrieval_integration.py" = ["E501"]
+"tests/test_manual_request_plan.py" = ["E501"]
+"tests/test_orchestrator.py" = ["E501"]
+"tests/test_prompt_contracts.py" = ["E501"]
+"tests/test_response_synthesis.py" = ["E501"]
 "tests/test_multi_agent_automations.py" = ["E501"]
+"tests/test_workflow_runner.py" = ["E501"]

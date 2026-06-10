@@ -40,6 +40,9 @@ def infer_opportunity_search_plan(
     if _broad_intent(lowered):
         return _broad_search_plan(plan)
 
+    if _formal_opportunity_intent(lowered):
+        return _formal_opportunity_search_plan(plan)
+
     if _github_repository_intent(lowered):
         plan.target_entity_types = ["github_repository"]
         plan.objectives = ["open_source_tooling"]
@@ -218,6 +221,83 @@ def _meeting_grant_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearch
     return plan
 
 
+def _formal_opportunity_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearchPlan:
+    plan.target_entity_types = ["grant_program", "contract_rfp", "conference", "institute"]
+    plan.objectives = [
+        "funding",
+        "contract_opportunity",
+        "presentation_opportunity",
+        "institute_partnership",
+    ]
+    plan.must_include_terms = [
+        "behavioral health",
+        "mental health",
+        "AI",
+        "grant",
+        "RFP",
+        "pilot",
+        "call for proposals",
+        "deadline",
+        "eligibility",
+    ]
+    plan.exclude_entity_types = ["role", "github_repository"]
+    plan.strict_targeting = True
+    plan.desired_count = max(3, plan.desired_count)
+    plan.lanes = [
+        OpportunitySearchLane(
+            lane_type="grant_funding",
+            desired_count=2,
+            target_entity_type="grant_program",
+            objective="funding",
+            required_fields=["title", "funder", "deadline_or_status", "eligibility", "source_url"],
+            acceptance_criteria=[
+                "specific active grant, NOFO, FOA, RFA, SBIR/STTR, or funding program",
+                "must include due date, posted date, open status, or cycle timing when available",
+                "must preserve business eligibility gaps instead of assuming Keystone qualifies",
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="procurement_rfp",
+            desired_count=2,
+            target_entity_type="contract_rfp",
+            objective="contract_opportunity",
+            required_fields=["title", "buyer", "deadline_or_status", "vendor_path", "source_url"],
+            acceptance_criteria=[
+                "specific solicitation, RFP, RFI, sources-sought notice, or procurement page",
+                "must show a vendor, subcontractor, evaluator, or implementation partner path",
+                "must not satisfy with generic policy, news, or expired-award pages alone",
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="pilot_partnership",
+            desired_count=1,
+            target_entity_type="institute",
+            objective="institute_partnership",
+            required_fields=["title", "sponsor", "application_or_partner_path", "source_url"],
+            acceptance_criteria=[
+                "specific pilot, innovation program, partner call, accelerator, "
+                "or implementation call",
+                "must show how an external small business, vendor, evaluator, or partner can act",
+                "must flag if timing or eligibility is not source-visible",
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="proposal_call",
+            desired_count=1,
+            target_entity_type="conference",
+            objective="presentation_opportunity",
+            required_fields=["title", "organizer", "deadline_or_status", "source_url"],
+            acceptance_criteria=[
+                "specific call for proposals, abstracts, speakers, applications, or presentations",
+                "must include deadline, event date, cycle timing, or active submission "
+                "status when available",
+                "must not treat broad content pages as actionable opportunities",
+            ],
+        ),
+    ]
+    return plan
+
+
 def merge_opportunity_search_plan(
     base: OpportunitySearchPlan,
     candidate: OpportunitySearchPlan | dict[str, Any] | None,
@@ -231,8 +311,10 @@ def merge_opportunity_search_plan(
         if isinstance(candidate, OpportunitySearchPlan)
         else OpportunitySearchPlan.model_validate(candidate)
     )
-    update = plan.model_dump(mode="json")
-    merged = base.model_copy(update=update)
+    update = plan.model_dump(mode="python")
+    merged_payload = base.model_dump(mode="python")
+    merged_payload.update(update)
+    merged = OpportunitySearchPlan.model_validate(merged_payload)
     if not merged.target_entity_types:
         merged.target_entity_types = list(base.target_entity_types)
     if not merged.objectives:
@@ -385,6 +467,55 @@ def _contract_rfp_intent(lowered: str) -> bool:
             "procurement",
             "sam.gov",
             "government contract",
+        )
+    )
+
+
+def _formal_opportunity_intent(lowered: str) -> bool:
+    if not lowered:
+        return False
+    formal_markers = (
+        "grant",
+        "grants",
+        "funding opportunity",
+        "nofo",
+        "foa",
+        "rfa",
+        "sbir",
+        "sttr",
+        "rfp",
+        "rfps",
+        "request for proposal",
+        "request for proposals",
+        "solicitation",
+        "procurement",
+        "pilot",
+        "pilots",
+        "pilot program",
+        "call for proposals",
+        "call-for-proposals",
+        "calls for proposals",
+        "call for applications",
+        "cfp",
+        "cfps",
+    )
+    if sum(1 for marker in formal_markers if marker in lowered) < 2:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "keystone",
+            "company",
+            "companies",
+            "vendor",
+            "partner",
+            "partners",
+            "act on",
+            "actionable",
+            "apply",
+            "source-backed",
+            "source backed",
+            "exact",
         )
     )
 

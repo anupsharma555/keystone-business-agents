@@ -5,21 +5,28 @@ from pathlib import Path
 
 import pytest
 
-import keystone_agents.workflow_runner as workflow_runner
 import keystone_agents.response_synthesis as response_synthesis
-from keystone_agents.agents.orchestrator import run_orchestrator_preflight
+import keystone_agents.workflow_runner as workflow_runner
 from keystone_agents.agents.business_research_analyst import research_company_fixture
 from keystone_agents.agents.opportunity_scout import scout_opportunities_fixture
+from keystone_agents.agents.orchestrator import run_orchestrator_preflight
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.orchestrator.preflight_context import compact_orchestrator_preflight_payload
 from keystone_agents.reporting import render_work_item_result_text
 from keystone_agents.schemas.approval import ApprovalState
+from keystone_agents.schemas.chief_of_staff import (
+    ChiefOfStaffResult,
+    ChiefOfStaffRouteRecommendation,
+    ChiefOfStaffSourceRef,
+)
 from keystone_agents.schemas.company_profile import SourceRecord
 from keystone_agents.schemas.memory import MemoryItem
 from keystone_agents.schemas.opportunity import (
     FilteredOpportunityCandidate,
+    OpportunityRecord,
     OpportunityScoutResult,
+    OpportunitySource,
 )
 from keystone_agents.schemas.research import (
     ResearchArticleSummary,
@@ -29,19 +36,23 @@ from keystone_agents.schemas.research import (
 )
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
+    WorkflowRunResult,
     WorkItem,
+    WorkItemApprovalGate,
     WorkItemArtifactRef,
     WorkItemKind,
     WorkItemNextAction,
     WorkItemRoute,
+    WorkItemSourceRef,
     WorkItemStatus,
     WorkItemTarget,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore
-from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResult
 from keystone_agents.test_pack_specs import get_test_pack_spec
+from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResult
 from keystone_agents.work_items import (
     approve_artifact_context,
+    build_context_pack_for_route,
     drafting_ready,
     normalize_target_text,
     select_artifact,
@@ -63,6 +74,116 @@ def test_normalize_target_text_strips_named_agent_prefixes() -> None:
         )
         == "3 active behavioral health AI partnership opportunities"
     )
+
+
+def test_natural_source_backed_synthesis_requests_selected_page_context() -> None:
+    assert workflow_runner._request_requires_selected_web_source_context(
+        "chief of staff what is OpenAI doing about mental health right now? "
+        "Please give a clear Answer, a useful Detailed Summary that summarizes the "
+        "source data first, key source URLs, and compact Metadata."
+    )
+    assert workflow_runner._request_requires_selected_web_source_context(
+        "opportunity scout compare active behavioral health AI opportunities "
+        "with source evidence, a compact table, visible URLs, and a synthesis "
+        "that summarizes what the sources say."
+    )
+    assert workflow_runner._request_requires_selected_web_source_context(
+        "chief of staff can you do a deeper read-only search on one focused "
+        "question? Please give a concise Answer and a Detailed Summary that "
+        "synthesizes what the retrieved link content says across sources before "
+        "listing links. If the links were only snippets, say so; otherwise "
+        "read/extract and summarize the source content."
+    )
+
+
+def test_lightweight_source_list_does_not_force_selected_page_context() -> None:
+    assert not workflow_runner._request_requires_selected_web_source_context(
+        "chief of staff find a few source URLs about OpenAI mental health."
+    )
+
+
+def test_requested_opportunity_comparison_gets_artifact_aligned_table() -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="opportunity",
+        artifact_id="1",
+        source_agent="opportunity_scout",
+        title="Sagent Behavioral Health",
+        summary="Scaled measurement-based care across behavioral health clinics.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Sagent partners with Greenspace",
+                    "url": "https://example.com/sagent",
+                    "supported_claim": "Sagent scaled measurement-based care.",
+                    "evidence_excerpt": (
+                        "Sagent and Greenspace describe measurement-based care deployment "
+                        "across behavioral health clinics."
+                    ),
+                    "key_facts": [
+                        "The source names behavioral health clinic implementation as the setting."
+                    ],
+                }
+            ],
+            "retrieval_diagnostics": {"provider_summary": "searxng+agents-web-search+exa"},
+        },
+    )
+    artifact_two = WorkItemArtifactRef(
+        artifact_type="opportunity",
+        artifact_id="2",
+        source_agent="opportunity_scout",
+        title="Eleos",
+        summary="AI workflow tools for behavioral health settings.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Eleos raises Series C",
+                    "url": "https://example.com/eleos",
+                    "supported_claim": "Eleos expands AI tools in behavioral health.",
+                    "evidence_excerpt": (
+                        "Eleos says its AI workflow tools support documentation and care "
+                        "operations in behavioral health settings."
+                    ),
+                }
+            ]
+        },
+    )
+    work_item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="Opportunity scan",
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        artifact_refs=[artifact, artifact_two],
+    )
+    result = WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact, artifact_two],
+        human_summary="Brief synthesis without a table.",
+        manual_request_plan={"desired_count": 2},
+    )
+
+    text = workflow_runner._ensure_requested_opportunity_comparison_table(
+        "Brief synthesis without a table.",
+        result=result,
+        request_text="Compare these in a compact comparison table with source URLs.",
+    )
+
+    assert text.startswith("Behavioral health clinic software comparison")
+    assert "Brief synthesis without a table." not in text
+    assert "Answer\nThe strongest source-backed matches surfaced" in text
+    assert "Detailed Summary\n" in text
+    assert "measurement-based care deployment across behavioral health clinics" in text
+    assert "behavioral health clinic implementation as the setting" in text
+    assert "AI workflow tools support documentation" in text
+    assert text.index("Detailed Summary") < text.index("Keystone relevance")
+    assert "| Company | Relevant signal | Source |" in text
+    assert "| Sagent Behavioral Health |" in text
+    assert "[Source](https://example.com/sagent)" in text
+    assert "[Source](https://example.com/eleos)" in text
+    assert "Source evidence\n* Sagent Behavioral Health / Sagent partners with Greenspace" in text
+    assert "Metadata\n* Search providers: searxng+agents-web-search+exa" in text
+    assert text.rfind("Metadata") > text.rfind("Run notes")
     assert (
         normalize_target_text(
             "business research analyst research Big Health",
@@ -70,6 +191,1615 @@ def test_normalize_target_text_strips_named_agent_prefixes() -> None:
         )
         == "Big Health"
     )
+
+
+def test_opportunity_synthesis_failure_uses_source_backed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="opportunity",
+        artifact_id="224",
+        source_agent="opportunity_scout",
+        title="State behavioral health AI pilot RFP",
+        summary="Pilot RFP for AI-enabled behavioral health implementation.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Behavioral Health Clinical AI Tools RFP",
+                    "url": "https://example.gov/behavioral-health-ai-rfp",
+                    "supported_claim": (
+                        "The RFP seeks vendors for behavioral health clinical AI tools."
+                    ),
+                    "evidence_excerpt": (
+                        "The source describes an active behavioral health clinical AI "
+                        "pilot procurement with implementation and evaluation requirements."
+                    ),
+                }
+            ],
+            "retrieval_diagnostics": {"provider_summary": "searxng+tavily+exa"},
+        },
+    )
+    artifact_two = WorkItemArtifactRef(
+        artifact_type="opportunity",
+        artifact_id="225",
+        source_agent="opportunity_scout",
+        title="Digital psychiatry grant",
+        summary="Grant opportunity for digital psychiatry implementation research.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Digital Psychiatry Funding Opportunity",
+                    "url": "https://example.nih.gov/digital-psychiatry-grant",
+                    "supported_claim": (
+                        "The funding announcement supports digital psychiatry evaluation."
+                    ),
+                    "evidence_excerpt": (
+                        "The source asks for measurement-based digital mental health "
+                        "projects with partner implementation sites."
+                    ),
+                }
+            ],
+        },
+    )
+    work_item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="Opportunity scan",
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+    )
+    result = WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact, artifact_two],
+        human_summary="Opportunity Scout attached 2 source-backed opportunity record(s).",
+    )
+
+    def fail_synthesis(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("synthetic test failure")
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "synthesize_user_facing_work_item_response_sdk_result",
+        fail_synthesis,
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text=(
+                "opportunity scout find pilot, RFP, or grant opportunities in "
+                "AI-enabled behavioral health. Please include a compact comparison table."
+            ),
+            live_sdk=True,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary.startswith("Behavioral health opportunity comparison")
+    assert "Answer\nThe strongest source-backed matches surfaced" in updated.human_summary
+    assert "Detailed Summary\n" in updated.human_summary
+    assert "| Opportunity | Relevant signal | Source |" in updated.human_summary
+    assert "https://example.gov/behavioral-health-ai-rfp" in updated.human_summary
+    assert "Source evidence\n* State behavioral health AI pilot RFP" in updated.human_summary
+    assert "Metadata\n* Search providers: searxng+tavily+exa" in updated.human_summary
+    assert "User-facing response synthesis failed: RuntimeError" in " ".join(updated.audit_notes)
+    assert "Deterministic user-facing response fallback executed." in updated.audit_notes
+
+
+def test_opportunity_no_live_sdk_uses_source_backed_user_facing_fallback() -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="opportunity",
+        artifact_id="224",
+        source_agent="opportunity_scout",
+        title="State behavioral health AI pilot RFP",
+        summary="Pilot RFP for AI-enabled behavioral health implementation.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Behavioral Health Clinical AI Tools RFP",
+                    "url": "https://example.gov/behavioral-health-ai-rfp",
+                    "supported_claim": (
+                        "The RFP seeks vendors for behavioral health clinical AI tools."
+                    ),
+                    "evidence_excerpt": (
+                        "The source describes an active behavioral health clinical AI "
+                        "pilot procurement with implementation and evaluation requirements."
+                    ),
+                }
+            ],
+            "retrieval_diagnostics": {"provider_summary": "searxng+tavily+exa"},
+        },
+    )
+    artifact_two = WorkItemArtifactRef(
+        artifact_type="opportunity",
+        artifact_id="225",
+        source_agent="opportunity_scout",
+        title="Digital psychiatry grant",
+        summary="Grant opportunity for digital psychiatry implementation research.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Digital Psychiatry Funding Opportunity",
+                    "url": "https://example.nih.gov/digital-psychiatry-grant",
+                    "supported_claim": (
+                        "The funding announcement supports digital psychiatry evaluation."
+                    ),
+                }
+            ],
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.OPPORTUNITY,
+            title="Opportunity scan",
+            current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        ),
+        route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact, artifact_two],
+        human_summary="Opportunity Scout attached 2 source-backed opportunity record(s).",
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text=(
+                "opportunity scout find active pilot, RFP, or grant opportunities "
+                "around AI-enabled behavioral health."
+            ),
+            live_sdk=False,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary.startswith("Behavioral health opportunity comparison")
+    assert "Answer\nThe strongest source-backed matches surfaced" in updated.human_summary
+    assert "Detailed Summary\n" in updated.human_summary
+    assert "| Opportunity | Relevant signal | Source |" in updated.human_summary
+    assert "Source evidence\n* State behavioral health AI pilot RFP" in updated.human_summary
+    assert "Opportunity Scout attached 2 source-backed opportunity record(s)." not in (
+        updated.human_summary
+    )
+    assert "Deterministic user-facing response fallback executed." in updated.audit_notes
+
+
+def test_opportunity_live_sdk_artifact_only_output_uses_source_backed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="opportunity",
+        artifact_id="224",
+        source_agent="opportunity_scout",
+        title="State behavioral health AI pilot RFP",
+        summary="Pilot RFP for AI-enabled behavioral health implementation.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Behavioral Health Clinical AI Tools RFP",
+                    "url": "https://example.gov/behavioral-health-ai-rfp",
+                    "supported_claim": (
+                        "The RFP seeks vendors for behavioral health clinical AI tools."
+                    ),
+                    "evidence_excerpt": (
+                        "The source describes an active behavioral health clinical AI "
+                        "pilot procurement with implementation and evaluation requirements."
+                    ),
+                }
+            ],
+            "retrieval_diagnostics": {"provider_summary": "searxng+tavily+exa"},
+        },
+    )
+    artifact_two = WorkItemArtifactRef(
+        artifact_type="opportunity",
+        artifact_id="225",
+        source_agent="opportunity_scout",
+        title="Digital psychiatry grant",
+        summary="Grant opportunity for digital psychiatry implementation research.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Digital Psychiatry Funding Opportunity",
+                    "url": "https://example.nih.gov/digital-psychiatry-grant",
+                    "supported_claim": (
+                        "The funding announcement supports digital psychiatry evaluation."
+                    ),
+                }
+            ],
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.OPPORTUNITY,
+            title="Opportunity scan",
+            current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        ),
+        route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact, artifact_two],
+        human_summary="Opportunity Scout attached 2 source-backed opportunity record(s).",
+    )
+
+    class ArtifactOnlySynthesis:
+        title = "Business Agents WorkItem Advanced"
+        answer = "Opportunity Scout attached 2 source-backed opportunity record(s)."
+        synthesis = ""
+        source_evidence = []
+        terms = []
+        recommended_actions = []
+        key_points = []
+        caveats = []
+        next_step = "review_opportunities"
+
+    class FakeSDKResult:
+        output = ArtifactOnlySynthesis()
+        usage = {}
+        cost = {}
+        request_cache = {}
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "synthesize_user_facing_work_item_response_sdk_result",
+        lambda *_args, **_kwargs: FakeSDKResult(),
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text=(
+                "opportunity scout find active pilot, RFP, or grant opportunities "
+                "around AI-enabled behavioral health."
+            ),
+            live_sdk=True,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary.startswith("Behavioral health opportunity comparison")
+    assert "Answer\nThe strongest source-backed matches surfaced" in updated.human_summary
+    assert "Detailed Summary\n" in updated.human_summary
+    assert "Business Agents WorkItem Advanced" not in updated.human_summary
+    assert "Deterministic user-facing response fallback executed." in updated.audit_notes
+    assert "Live user-facing response synthesis executed." not in updated.audit_notes
+
+
+def test_opportunity_live_sdk_metadata_like_synthesis_uses_source_backed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="opportunity",
+        artifact_id="224",
+        source_agent="opportunity_scout",
+        title="State behavioral health AI pilot RFP",
+        summary="Pilot RFP for AI-enabled behavioral health implementation.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Behavioral Health Clinical AI Tools RFP",
+                    "url": "https://example.gov/behavioral-health-ai-rfp",
+                    "supported_claim": (
+                        "The RFP seeks vendors for behavioral health clinical AI tools."
+                    ),
+                    "evidence_excerpt": (
+                        "The source describes an active behavioral health clinical AI "
+                        "pilot procurement with implementation and evaluation requirements."
+                    ),
+                }
+            ],
+            "retrieval_diagnostics": {"provider_summary": "searxng+tavily+exa"},
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.OPPORTUNITY,
+            title="Opportunity scan",
+            current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        ),
+        route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="Opportunity Scout attached 1 source-backed opportunity record(s).",
+    )
+
+    class MetadataLikeSynthesis:
+        title = "Ranked behavioral health AI opportunity signals"
+        answer = "Source-backed shortlist from the current read-only run."
+        synthesis = (
+            "The ranked items are limited to retained artifacts whose title, "
+            "summary, or attached source refs match the prompt's signal shape. "
+            "This keeps the Slack answer focused on requested opportunity evidence "
+            "instead of using generic source-backed artifacts as filler."
+        )
+        source_evidence = []
+        terms = []
+        recommended_actions = []
+        key_points = []
+        caveats = []
+        next_step = "review_opportunities"
+
+    class FakeSDKResult:
+        output = MetadataLikeSynthesis()
+        usage = {}
+        cost = {}
+        request_cache = {}
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "synthesize_user_facing_work_item_response_sdk_result",
+        lambda *_args, **_kwargs: FakeSDKResult(),
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text=(
+                "opportunity scout find active pilot, RFP, or grant opportunities "
+                "around AI-enabled behavioral health. Include a useful synthesis."
+            ),
+            live_sdk=True,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary.startswith("Behavioral health opportunity comparison")
+    assert "Detailed Summary\n" in updated.human_summary
+    assert "active behavioral health clinical AI pilot procurement" in updated.human_summary
+    assert "retained artifacts whose title" not in updated.human_summary
+    assert "Deterministic user-facing response fallback executed." in updated.audit_notes
+    assert "Live user-facing response synthesis executed." not in updated.audit_notes
+
+
+def test_business_research_no_live_sdk_uses_source_backed_user_facing_fallback() -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="company_profile",
+        artifact_id="openai",
+        source_agent="business_research_analyst",
+        title="OpenAI",
+        summary="AI research and deployment company.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "OpenAI mental health work update",
+                    "url": "https://openai.com/index/update-on-mental-health-related-work/",
+                    "supported_claim": (
+                        "OpenAI describes mental-health-related safety work for ChatGPT."
+                    ),
+                    "evidence_excerpt": (
+                        "OpenAI says it is improving sensitive-conversation handling "
+                        "and consulting external experts."
+                    ),
+                    "extraction_status": "article_read",
+                },
+                {
+                    "title": "OpenAI Trusted Contact",
+                    "url": "https://openai.com/index/introducing-trusted-contact-in-chatgpt/",
+                    "supported_claim": (
+                        "OpenAI introduced Trusted Contact for adult ChatGPT users."
+                    ),
+                    "extraction_status": "snippet_only",
+                },
+            ],
+            "retrieval_diagnostics": {"provider_summary": "searxng+exa+agents-web-search"},
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.COMPANY_RESEARCH,
+            title="OpenAI research",
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        ),
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary=(
+            "Business Research Analyst attached a source-backed company profile for OpenAI."
+        ),
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text=(
+                "business research analyst what is OpenAI doing about mental health "
+                "and what is relevant for Keystone?"
+            ),
+            live_sdk=False,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary.startswith("OpenAI source-backed brief")
+    assert "Answer\nOpenAI has source-backed company context" in updated.human_summary
+    assert "Detailed Summary\n" in updated.human_summary
+    assert "improving sensitive-conversation handling" in updated.human_summary
+    assert "Source evidence\n* OpenAI mental health work update" in updated.human_summary
+    assert "Metadata\n* Search providers: searxng+exa+agents-web-search" in (updated.human_summary)
+    assert "Business Research Analyst attached" not in updated.human_summary
+    assert "Deterministic user-facing response fallback executed." in updated.audit_notes
+
+
+def test_business_research_live_sdk_artifact_only_output_uses_source_backed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="company_profile",
+        artifact_id="openai",
+        source_agent="business_research_analyst",
+        title="OpenAI",
+        summary="AI research and deployment company.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "OpenAI mental health work update",
+                    "url": "https://openai.com/index/update-on-mental-health-related-work/",
+                    "supported_claim": (
+                        "OpenAI describes mental-health-related safety work for ChatGPT."
+                    ),
+                    "evidence_excerpt": (
+                        "OpenAI says it is improving sensitive-conversation handling "
+                        "and consulting external experts."
+                    ),
+                    "extraction_status": "article_read",
+                },
+            ],
+            "retrieval_diagnostics": {"provider_summary": "searxng+exa"},
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.COMPANY_RESEARCH,
+            title="OpenAI research",
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        ),
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary=(
+            "Business Research Analyst attached a source-backed company profile for OpenAI."
+        ),
+    )
+
+    class ArtifactOnlySynthesis:
+        title = "Business Agents WorkItem Advanced"
+        answer = "Business Research Analyst attached a source-backed company profile for OpenAI."
+        synthesis = ""
+        source_evidence = []
+        terms = []
+        recommended_actions = []
+        key_points = []
+        caveats = []
+        next_step = "review_company_profile"
+
+    class FakeSDKResult:
+        output = ArtifactOnlySynthesis()
+        usage = {}
+        cost = {}
+        request_cache = {}
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "synthesize_user_facing_work_item_response_sdk_result",
+        lambda *_args, **_kwargs: FakeSDKResult(),
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text="business research analyst summarize OpenAI mental health work",
+            live_sdk=True,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary.startswith("OpenAI source-backed brief")
+    assert "Detailed Summary\n" in updated.human_summary
+    assert "Business Agents WorkItem Advanced" not in updated.human_summary
+    assert "Deterministic user-facing response fallback executed." in updated.audit_notes
+    assert "Live user-facing response synthesis executed." not in updated.audit_notes
+
+
+def test_business_research_raw_result_is_source_backed_before_final_synthesis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_retrieve_company_profile_live(*, company: str, **_: object):
+        profile = research_company_fixture(company_name=company).model_copy(
+            update={
+                "sources": [
+                    SourceRecord(
+                        source_id="company:mental-health-update",
+                        title="OpenAI mental health work update",
+                        url="https://openai.com/index/update-on-mental-health-related-work/",
+                        source_type="company_site",
+                        supported_claims=[
+                            "OpenAI describes mental-health-related safety work for ChatGPT."
+                        ],
+                        confidence=0.9,
+                    )
+                ]
+            }
+        )
+        return profile, {
+            "debug_notes": ["fake current retrieval"],
+            "retrieval_diagnostics": {"provider_summary": "searxng+exa"},
+        }
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.retrieve_company_profile_live",
+        fake_retrieve_company_profile_live,
+    )
+
+    result = workflow_runner._advance_work_item_one_step(
+        WorkflowRunRequest(
+            request_text=(
+                "business research analyst what is OpenAI doing about mental health "
+                "right now? Give a source-backed synthesis."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            manual_request_plan={
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "OpenAI",
+            },
+        ),
+        synthesize_user_response=False,
+    )
+
+    assert result.human_summary.startswith("OpenAI source-backed brief")
+    assert "Answer\nOpenAI has source-backed company context" in result.human_summary
+    assert "Detailed Summary\n" in result.human_summary
+    assert "https://openai.com/index/update-on-mental-health-related-work/" in result.human_summary
+    assert "Business Research Analyst attached" not in result.human_summary
+    assert "Deterministic business research source-backed summary rendered." in result.audit_notes
+    source_ref = result.artifact_refs[0].metadata["source_refs"][0]
+    assert source_ref["supported_claim"] == (
+        "OpenAI describes mental-health-related safety work for ChatGPT."
+    )
+    assert source_ref["extraction_status"] == "snippet_only"
+    assert source_ref["key_facts"] == [
+        "OpenAI describes mental-health-related safety work for ChatGPT."
+    ]
+    assert result.artifact_refs[0].metadata["source_context_status"] == {
+        "selected_url_count": 1,
+        "extracted_url_count": 0,
+        "evidence_url_count": 1,
+        "snippet_only_url_count": 1,
+        "statuses": ["snippet_only"],
+    }
+
+
+def test_chief_no_live_sdk_uses_source_backed_user_facing_fallback() -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="chief_of_staff_plan",
+        artifact_id="chief-openai",
+        source_agent="chief_of_staff",
+        title="Chief of Staff plan",
+        summary="Search completed.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "OpenAI mental health update",
+                    "url": "https://openai.com/index/update-on-mental-health-related-work/",
+                    "supported_claim": (
+                        "OpenAI describes mental-health-related safety work for ChatGPT."
+                    ),
+                    "evidence_excerpt": (
+                        "OpenAI says it is improving emotionally sensitive conversation "
+                        "handling, adding Trusted Contact workflows, and consulting clinicians."
+                    ),
+                    "extraction_status": "success",
+                },
+                {
+                    "title": "OpenAI Trusted Contact",
+                    "url": "https://openai.com/index/introducing-trusted-contact-in-chatgpt/",
+                    "supported_claim": (
+                        "OpenAI introduced Trusted Contact for adult ChatGPT users."
+                    ),
+                    "extraction_status": "source_linked",
+                },
+            ],
+            "retrieval_diagnostics": {"provider_summary": "searxng+agents-web-search+exa"},
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="OpenAI mental health",
+            current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        ),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="Search completed.",
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text=(
+                "chief of staff what is OpenAI doing about mental health, "
+                "and what is relevant for Keystone?"
+            ),
+            live_sdk=False,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary.startswith("Chief of Staff source-backed brief")
+    assert "Answer\nThe run found source-backed context" in updated.human_summary
+    assert "Detailed Summary\n" in updated.human_summary
+    assert "emotionally sensitive conversation handling" in updated.human_summary
+    assert "Source evidence\n* OpenAI mental health update" in updated.human_summary
+    assert "Metadata\n* Search providers: searxng+agents-web-search+exa" in (updated.human_summary)
+    assert updated.human_summary.count("Search completed.") == 0
+    assert "Deterministic user-facing response fallback executed." in updated.audit_notes
+
+
+def test_chief_live_sdk_plan_only_output_uses_source_backed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="chief_of_staff_plan",
+        artifact_id="chief-openai",
+        source_agent="chief_of_staff",
+        title="Chief of Staff plan",
+        summary="Chief of Staff plan.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "OpenAI mental health update",
+                    "url": "https://openai.com/index/update-on-mental-health-related-work/",
+                    "supported_claim": (
+                        "OpenAI describes mental-health-related safety work for ChatGPT."
+                    ),
+                    "evidence_excerpt": (
+                        "OpenAI says it is improving emotionally sensitive conversation "
+                        "handling and adding Trusted Contact workflows."
+                    ),
+                    "extraction_status": "success",
+                }
+            ],
+            "retrieval_diagnostics": {
+                "provider_result_samples": {
+                    "exa": [
+                        {
+                            "title": "OpenAI mental health update",
+                            "url": "https://openai.com/index/update-on-mental-health-related-work/",
+                            "snippet": "OpenAI describes mental-health-related safety work.",
+                        }
+                    ]
+                }
+            },
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="OpenAI mental health",
+            current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        ),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="Chief of Staff plan.",
+    )
+
+    class PlanOnlySynthesis:
+        title = "Business Agents Chief of Staff"
+        answer = "Chief of Staff plan."
+        synthesis = ""
+        source_evidence = []
+        terms = []
+        recommended_actions = []
+        key_points = []
+        caveats = []
+        next_step = "review_chief_of_staff_plan"
+
+    class FakeSDKResult:
+        output = PlanOnlySynthesis()
+        usage = {}
+        cost = {}
+        request_cache = {}
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "synthesize_user_facing_work_item_response_sdk_result",
+        lambda *_args, **_kwargs: FakeSDKResult(),
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text="chief of staff summarize OpenAI mental health work",
+            live_sdk=True,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary.startswith("Chief of Staff source-backed brief")
+    assert "Detailed Summary\n" in updated.human_summary
+    assert "emotionally sensitive conversation handling" in updated.human_summary
+    assert "Business Agents Chief of Staff" not in updated.human_summary
+    assert "Deterministic user-facing response fallback executed." in updated.audit_notes
+    assert "Live user-facing response synthesis executed." not in updated.audit_notes
+
+
+def test_chief_live_sdk_thin_synthesis_uses_source_backed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="chief_of_staff_plan",
+        artifact_id="chief-ambient-scribes",
+        source_agent="chief_of_staff",
+        title="Chief of Staff plan",
+        summary=(
+            "There are public signals that ambient documentation is being evaluated "
+            "in behavioral health."
+        ),
+        metadata={
+            "source_refs": [
+                {
+                    "title": "American Psychiatric Association AI Scribe Tools",
+                    "url": "https://www.psychiatry.org/psychiatrists/practice/artificial-intelligence/ai-scribe-tools",
+                    "supported_claim": (
+                        "APA provides psychiatrist-facing guidance on AI scribe tools."
+                    ),
+                    "evidence_excerpt": (
+                        "The guidance discusses documentation assistance, consent, "
+                        "privacy, and clinical responsibility for AI-generated notes."
+                    ),
+                    "key_facts": [
+                        "Psychiatry practices are being advised to evaluate privacy and consent before adopting AI scribes.",
+                        "Clinicians remain responsible for reviewing and correcting generated notes.",
+                    ],
+                    "extraction_status": "article_read",
+                },
+                {
+                    "title": "Becker's Behavioral Health on Cleveland Clinic AI scribes",
+                    "url": "https://www.beckersbehavioralhealth.com/ai-2/liberating-cleveland-clinics-experience-with-ai-scribes-in-behavioral-health/",
+                    "supported_claim": (
+                        "Becker's reports Cleveland Clinic experience with AI scribes in behavioral health."
+                    ),
+                    "key_facts": [
+                        "The article frames AI scribes as reducing documentation burden in behavioral health encounters.",
+                        "The signal is implementation-oriented rather than a formal RFP or grant opportunity.",
+                    ],
+                    "extraction_status": "snippet_only",
+                },
+            ],
+            "retrieval_diagnostics": {
+                "provider_summary": "searxng+agents-web-search+exa",
+            },
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="Behavioral health AI scribes",
+            current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        ),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="Chief of Staff plan.",
+    )
+
+    class ThinSynthesis:
+        title = "Behavioral health ambient documentation"
+        answer = "Yes, there are signals."
+        synthesis = "The source set indicates ambient scribes are being evaluated."
+        source_evidence = []
+        terms = []
+        recommended_actions = []
+        key_points = []
+        caveats = []
+        next_step = ""
+
+    class FakeSDKResult:
+        output = ThinSynthesis()
+        usage = {}
+        cost = {}
+        request_cache = {}
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "synthesize_user_facing_work_item_response_sdk_result",
+        lambda *_args, **_kwargs: FakeSDKResult(),
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text=(
+                "chief of staff do a deeper search on AI scribes or ambient "
+                "documentation tools in behavioral health clinics. Give Answer "
+                "and Detailed Summary that summarizes the source data first."
+            ),
+            live_sdk=True,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary.startswith("Chief of Staff source-backed brief")
+    assert "Psychiatry practices are being advised to evaluate privacy and consent" in (
+        updated.human_summary
+    )
+    assert "Clinicians remain responsible for reviewing and correcting generated notes" in (
+        updated.human_summary
+    )
+    assert "reducing documentation burden in behavioral health encounters" in (
+        updated.human_summary
+    )
+    assert "Deterministic user-facing response fallback executed." in updated.audit_notes
+    assert "Live user-facing response synthesis executed." not in updated.audit_notes
+
+
+def test_chief_fallback_uses_source_triage_retained_sources_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="chief_of_staff_plan",
+        artifact_id="chief-safety",
+        source_agent="chief_of_staff",
+        title="Chief of Staff plan",
+        summary="Search completed.",
+        metadata={
+            "source_refs": [
+                {
+                    "source_id": "selected:1",
+                    "title": "Retained safety source",
+                    "url": "https://example.com/retained-safety",
+                    "supported_claim": "The source describes escalation workflows.",
+                    "evidence_excerpt": (
+                        "The retained source describes trusted-contact escalation "
+                        "and youth safety controls."
+                    ),
+                    "extraction_status": "success",
+                },
+                {
+                    "title": "Rejected infrastructure source",
+                    "url": "https://example.com/rejected-cloud",
+                    "supported_claim": "The source describes cloud infrastructure.",
+                    "evidence_excerpt": (
+                        "The rejected source discusses enterprise cloud infrastructure "
+                        "rather than mental health safety."
+                    ),
+                    "extraction_status": "success",
+                },
+            ],
+            "retrieval_diagnostics": {
+                "provider_summary": "searxng+exa",
+                "source_triage": {
+                    "recommended_action": "synthesize_from_retained_sources",
+                    "retained_source_ids": ["selected:1"],
+                    "rejected_urls": ["https://example.com/rejected-cloud"],
+                    "decision_counts": {"retain": 1, "reject": 1},
+                },
+            },
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="Mental health AI safety",
+            current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        ),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="Chief of Staff plan.",
+    )
+
+    class ThinSynthesis:
+        title = "Business Agents WorkItem Advanced"
+        answer = "Search completed."
+        synthesis = ""
+        source_evidence = []
+        terms = []
+        recommended_actions = []
+        key_points = []
+        caveats = []
+        next_step = ""
+
+    class FakeSDKResult:
+        output = ThinSynthesis()
+        usage = {}
+        cost = {}
+        request_cache = {}
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "synthesize_user_facing_work_item_response_sdk_result",
+        lambda *_args, **_kwargs: FakeSDKResult(),
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text=(
+                "chief of staff do a deeper source-backed search on mental health "
+                "AI safety. Give Answer and Detailed Summary."
+            ),
+            live_sdk=True,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert "trusted-contact escalation and youth safety controls" in updated.human_summary
+    assert "https://example.com/retained-safety" in updated.human_summary
+    assert "cloud infrastructure" not in updated.human_summary
+    assert "https://example.com/rejected-cloud" not in updated.human_summary
+    assert "Deterministic user-facing response fallback executed." in updated.audit_notes
+
+
+def test_chief_raw_result_is_source_backed_before_final_synthesis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_plan_chief_of_staff_request(*_args: object, **_kwargs: object) -> ChiefOfStaffResult:
+        return ChiefOfStaffResult(
+            intent="research_brief",
+            summary="Search completed.",
+            sources=[
+                ChiefOfStaffSourceRef(
+                    title="OpenAI mental health update",
+                    url="https://openai.com/index/update-on-mental-health-related-work/",
+                    source_type="company_site",
+                    note=(
+                        "OpenAI describes mental-health-related safety work for ChatGPT, "
+                        "including sensitive-conversation handling."
+                    ),
+                )
+            ],
+            retrieval_diagnostics={"provider_summary": "searxng+agents-web-search+exa"},
+            audit_notes=["fake chief planner"],
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "plan_chief_of_staff_request",
+        fake_plan_chief_of_staff_request,
+    )
+
+    result = workflow_runner._advance_work_item_one_step(
+        WorkflowRunRequest(
+            request_text=(
+                "chief of staff what is OpenAI doing about mental health right now? "
+                "Give a source-backed synthesis."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+        ),
+        synthesize_user_response=False,
+    )
+
+    assert result.human_summary.startswith("Chief of Staff source-backed brief")
+    assert "Answer\nThe run found source-backed context" in result.human_summary
+    assert "Detailed Summary\n" in result.human_summary
+    assert "sensitive-conversation handling" in result.human_summary
+    assert "https://openai.com/index/update-on-mental-health-related-work/" in result.human_summary
+    assert result.human_summary.count("Search completed.") == 0
+    assert "Deterministic Chief of Staff source-backed summary rendered." in result.audit_notes
+
+
+def test_slack_history_context_promotes_visible_links_as_ordered_sources() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Thread follow-up",
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+    )
+
+    updated = workflow_runner._apply_slack_history_context(
+        work_item,
+        {
+            "schema": "keystone.slack.history_context.v1",
+            "channel_id": "C123",
+            "thread_ts": "1781026340.935439",
+            "read_context": (
+                "Source evidence:\n"
+                "- APA advisory: <https://www.apa.org/topics/artificial-intelligence-machine-learning/health-advisory-chatbots-wellness-apps>\n"
+                "- RAND youth usage press release: <https://www.rand.org/news/press/2025/11/one-in-eight-adolescents-and-young-adults-use-ai-chatbots.html>\n"
+            ),
+        },
+        context_file_path="/tmp/slack-context.json",
+    )
+
+    link_sources = [
+        source for source in updated.sources if source.source_type == "slack_thread_link"
+    ]
+
+    assert [source.title for source in link_sources] == [
+        "APA advisory",
+        "RAND youth usage press release",
+    ]
+    assert link_sources[0].url == (
+        "https://www.apa.org/topics/artificial-intelligence-machine-learning/"
+        "health-advisory-chatbots-wellness-apps"
+    )
+    assert link_sources[0].source_id.endswith(":1")
+    assert "Link 1 appeared" in link_sources[0].supported_claim
+
+
+def test_chief_link_followup_summarizes_ordered_slack_source_without_new_search(
+    monkeypatch,
+) -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Thread follow-up",
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+    )
+    work_item = workflow_runner._apply_slack_history_context(
+        work_item,
+        {
+            "schema": "keystone.slack.history_context.v1",
+            "channel_id": "C123",
+            "thread_ts": "1781027229.914959",
+            "read_context": (
+                "Source evidence\n"
+                "* APA advisory: Health advisory: Use of generative AI chatbots and wellness applications for mental health - "
+                "<https://www.apa.org/topics/artificial-intelligence-machine-learning/health-advisory-chatbots-wellness-apps> - "
+                "Primary APA advisory page; supports the core warning about evidence, oversight, and safety.\n"
+            ),
+        },
+        context_file_path="/tmp/slack-context.json",
+    )
+
+    def fake_read_linked_article_impl(*_args, **_kwargs):
+        return {
+            "status": "success",
+            "title": "APA advisory",
+            "provider": "trafilatura",
+            "text_or_markdown": (
+                "APA says generative AI chatbots and wellness applications are being used "
+                "for mental health needs faster than evidence and safeguards can support. "
+                "The advisory warns clinicians and consumers to evaluate privacy and safety."
+            ),
+        }
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.read_linked_article_impl",
+        fake_read_linked_article_impl,
+    )
+
+    result = workflow_runner._advance_chief_of_staff(
+        work_item,
+        request=WorkflowRunRequest(
+            request_text="chief of staff Follow-up: can you summarize link 1 from above?",
+            live_search=True,
+            live_sdk=False,
+        ),
+        store=None,
+    )
+
+    assert result.status == WorkItemStatus.DONE
+    assert "Link 1 summary" in result.human_summary
+    assert "APA says generative AI chatbots" in result.human_summary
+    assert "Search providers: not used for this narrow source follow-up" in result.human_summary
+    assert "Deterministic source-link follow-up summary executed." in result.audit_notes
+    source_ref = result.artifact_refs[0].metadata["source_refs"][0]
+    assert source_ref["url"].startswith("https://www.apa.org/")
+    assert source_ref["extraction_status"] == "success"
+
+
+def test_link_followup_with_pending_approval_gate_completes_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Thread follow-up",
+        request_text="chief of staff source-backed research",
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.NEEDS_APPROVAL,
+        target=WorkItemTarget(name="thread", object_type="slack_thread"),
+        approval_gates=[
+            WorkItemApprovalGate(
+                scope="external_use",
+                state="pending",
+                required=True,
+                rationale="Prior draft still needs external-use approval.",
+                approval_id="approval-1",
+            )
+        ],
+        sources=[
+            WorkItemSourceRef(
+                title="APA advisory",
+                url=(
+                    "https://www.apa.org/topics/artificial-intelligence-machine-learning/"
+                    "health-advisory-chatbots-wellness-apps"
+                ),
+                source_type="slack_thread_link",
+                supported_claim="Link 1 appeared in prior Slack thread context.",
+                evidence_excerpt="APA advisory source from the prior Slack brief.",
+            )
+        ],
+    )
+    store.save_work_item(work_item)
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "read_linked_article_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "title": "APA advisory",
+            "provider": "trafilatura",
+            "text_or_markdown": (
+                "APA cautions that AI chatbots and wellness apps used for mental health "
+                "need evidence review, privacy safeguards, and clinician oversight."
+            ),
+        },
+    )
+
+    result = workflow_runner.advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text="can u summarize link 1",
+            work_item_id=work_item.id,
+            save=True,
+            database_url=database_url,
+            live_search=True,
+            live_sdk=False,
+        )
+    )
+
+    assert result.status == WorkItemStatus.DONE
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert "Link 1 summary" in result.human_summary
+    assert "AI chatbots and wellness apps" in result.human_summary
+    assert "Key source details:" in result.human_summary
+    assert "privacy safeguards" in result.human_summary
+    assert "Use in this thread:" in result.human_summary
+    assert "Search providers: not used for this narrow source follow-up" in result.human_summary
+    assert "Deterministic source-link follow-up summary executed." in result.audit_notes
+    assert result.work_item.approval_gates[0].state == "pending"
+
+
+def test_slack_continue_link_followup_with_pending_approval_gate_completes_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Slack thread source follow-up",
+        request_text="chief of staff source-backed research",
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.NEEDS_APPROVAL,
+        target=WorkItemTarget(name="thread", object_type="slack_thread"),
+        approval_gates=[
+            WorkItemApprovalGate(
+                scope="external_use",
+                state="pending",
+                required=True,
+                rationale="Prior draft still needs external-use approval.",
+                approval_id="approval-1",
+            )
+        ],
+        sources=[
+            WorkItemSourceRef(
+                title="Trusted contact article",
+                url="https://example.com/trusted-contact",
+                source_type="slack_thread_link",
+                supported_claim="Link 1 appeared in prior Slack thread context.",
+                evidence_excerpt="The article describes trusted-contact escalation.",
+            )
+        ],
+    )
+    store.save_work_item(work_item)
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "read_linked_article_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "title": "Trusted contact article",
+            "provider": "trafilatura",
+            "text_or_markdown": (
+                "The article explains trusted-contact escalation, high-risk signals, "
+                "and support notifications for safety workflows."
+            ),
+        },
+    )
+
+    result = workflow_runner.advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                "chief of staff continue this prior Slack thread. can u summarize link 1"
+            ),
+            work_item_id=work_item.id,
+            save=True,
+            database_url=database_url,
+            live_search=True,
+            live_sdk=False,
+        )
+    )
+
+    assert result.status == WorkItemStatus.DONE
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert "Link 1 summary" in result.human_summary
+    assert "trusted-contact escalation" in result.human_summary
+    assert "support notifications for safety workflows" in result.human_summary
+    assert "Pending approval gate must be resolved" not in result.human_summary
+    assert "Deterministic source-link follow-up summary executed." in result.audit_notes
+    assert result.work_item.approval_gates[0].state == "pending"
+
+
+def test_source_link_followup_summary_uses_multiple_extracted_facts(tmp_path: Path) -> None:
+    database_url = _database_url(tmp_path)
+    item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Ambient scribe thread",
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        sources=[
+            WorkItemSourceRef(
+                title="Psychiatric ambient scribe evaluation",
+                url="https://example.org/psychiatry-ambient-scribe",
+                source_type="literature",
+                supported_claim="The study evaluates documentation quality in psychiatric consultations.",
+                evidence_excerpt=(
+                    "The study evaluates an ambient artificial intelligence scribe in "
+                    "psychiatric consultations. It focuses on documentation quality, "
+                    "clinician efficiency, and whether drafted notes remain suitable "
+                    "for clinician review. The evidence is simulation-based, so it is "
+                    "a workflow signal rather than a real-world implementation result."
+                ),
+                extraction_status="article_read",
+                key_facts=[
+                    "Psychiatry-specific evaluation signal for ambient documentation tools.",
+                    "The source focuses on documentation quality and clinician efficiency.",
+                    "The study design is simulation-based, limiting implementation claims.",
+                ],
+            )
+        ],
+    )
+    SQLiteStore(database_url).save_work_item(item)
+
+    result = workflow_runner.advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text="chief of staff continue this prior Slack thread. summarize URL 1",
+            work_item_id=item.id,
+            save=True,
+            database_url=database_url,
+            live_search=False,
+            live_sdk=False,
+        )
+    )
+
+    assert result.status == WorkItemStatus.DONE
+    assert "Psychiatry-specific evaluation signal" in result.human_summary
+    assert "documentation quality and clinician efficiency" in result.human_summary
+    assert "simulation-based" in result.human_summary
+    assert "Key source details:" in result.human_summary
+    assert "Search providers: not used for this narrow source follow-up" in result.human_summary
+
+
+def test_chief_link_followup_live_sdk_uses_read_only_source_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Thread follow-up",
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        sources=[
+            WorkItemSourceRef(
+                title="APA advisory",
+                url=(
+                    "https://www.apa.org/topics/artificial-intelligence-machine-learning/"
+                    "health-advisory-chatbots-wellness-apps"
+                ),
+                source_type="slack_thread_link",
+                supported_claim=(
+                    "APA advisory source from the prior Slack brief about mental health "
+                    "chatbots and wellness applications."
+                ),
+                evidence_excerpt=(
+                    "APA warns that generative AI chatbots and wellness applications "
+                    "are being used faster than evidence and safeguards can support."
+                ),
+                extraction_status="article_read",
+            )
+        ],
+    )
+
+    def fail_run_chief_of_staff_sdk(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("narrow source-link follow-up should not call Chief SDK")
+
+    def fake_read_linked_article_impl(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "status": "success",
+            "title": "APA advisory",
+            "provider": "trafilatura",
+            "text_or_markdown": (
+                "APA warns that generative AI chatbots and wellness applications "
+                "are being used faster than evidence and safeguards can support. "
+                "The advisory emphasizes privacy, safety, and clinician oversight."
+            ),
+        }
+
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fail_run_chief_of_staff_sdk)
+    monkeypatch.setattr(
+        workflow_runner,
+        "read_linked_article_impl",
+        fake_read_linked_article_impl,
+    )
+
+    result = workflow_runner._advance_chief_of_staff(
+        work_item,
+        request=WorkflowRunRequest(
+            request_text="chief of staff Follow-up: can you summarize link 1 from above?",
+            live_search=True,
+            live_sdk=True,
+        ),
+        store=None,
+    )
+
+    assert result.status == WorkItemStatus.DONE
+    assert "Link 1 summary" in result.human_summary
+    assert "generative AI chatbots" in result.human_summary
+    assert "Search providers: not used for this narrow source follow-up" in result.human_summary
+    assert "Deterministic source-link follow-up summary executed." in result.audit_notes
+    assert result.artifact_refs[0].metadata["source_context_status"]["extracted_url_count"] == 1
+
+
+def test_source_link_followup_works_for_business_research_route(tmp_path: Path) -> None:
+    database_url = _database_url(tmp_path)
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="OpenAI mental health brief",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.NEEDS_APPROVAL,
+        sources=[
+            WorkItemSourceRef(
+                title="OpenAI mental health update",
+                url="https://openai.com/index/update-on-mental-health-related-work/",
+                source_type="company_site",
+                supported_claim=("OpenAI describes mental-health-related safety work in ChatGPT."),
+                evidence_excerpt=(
+                    "OpenAI says it is improving responses in emotionally sensitive "
+                    "conversations and working with clinicians and researchers."
+                ),
+                extraction_status="extracted",
+            )
+        ],
+    )
+    SQLiteStore(database_url).save_work_item(item)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="business research analyst Follow-up: summarize the first link from above",
+            work_item_id=item.id,
+            database_url=database_url,
+            save=True,
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            live_sdk=False,
+        )
+    )
+
+    assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.status == WorkItemStatus.DONE
+    assert result.work_item.last_agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert result.artifact_refs[0].artifact_type == "source_link_summary"
+    assert result.artifact_refs[0].source_agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert "emotionally sensitive conversations" in result.human_summary
+    assert result.next_action is not None
+    assert result.next_action.agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert "Deterministic source-link follow-up summary executed." in result.audit_notes
+
+
+def test_source_link_followup_uses_business_research_artifact_source_refs(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="OpenAI mental health brief",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.NEEDS_APPROVAL,
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="openai",
+                source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                title="OpenAI",
+                summary="OpenAI source-backed profile.",
+                metadata={
+                    "source_refs": [
+                        {
+                            "title": "OpenAI mental health update",
+                            "url": (
+                                "https://openai.com/index/update-on-mental-health-related-work/"
+                            ),
+                            "source_type": "company_site",
+                            "supported_claim": (
+                                "OpenAI describes mental-health-related safety work for ChatGPT."
+                            ),
+                            "evidence_excerpt": (
+                                "OpenAI says it is improving emotionally sensitive "
+                                "conversation handling."
+                            ),
+                            "extraction_status": "article_read",
+                        }
+                    ]
+                },
+            )
+        ],
+    )
+    SQLiteStore(database_url).save_work_item(item)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="business research analyst summarize source 1 from above",
+            work_item_id=item.id,
+            database_url=database_url,
+            save=True,
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            live_sdk=True,
+        )
+    )
+
+    assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.status == WorkItemStatus.DONE
+    assert result.artifact_refs[0].artifact_type == "source_link_summary"
+    assert result.artifact_refs[0].source_agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert "Link 1 summary" in result.human_summary
+    assert "emotionally sensitive conversation handling" in result.human_summary
+    assert "Search providers: not used for this narrow source follow-up" in result.human_summary
+    assert "Deterministic source-link follow-up summary executed." in result.audit_notes
+
+
+def test_source_link_followup_uses_opportunity_artifact_source_refs(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="Behavioral health opportunity scan",
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        status=WorkItemStatus.NEEDS_APPROVAL,
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="opportunity",
+                artifact_id="224",
+                source_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                title="Behavioral Health Clinical AI Tools RFP",
+                summary="RFP for behavioral-health clinical AI tools.",
+                metadata={
+                    "source_refs": [
+                        {
+                            "title": "Behavioral Health Clinical AI Tools RFP",
+                            "url": "https://example.gov/behavioral-health-ai-rfp",
+                            "source_type": "government",
+                            "supported_signal": (
+                                "The RFP seeks vendors for behavioral health clinical AI tools."
+                            ),
+                            "evidence_excerpt": (
+                                "The source describes a pilot procurement with "
+                                "implementation and evaluation requirements."
+                            ),
+                            "extraction_status": "article_read",
+                        }
+                    ]
+                },
+            )
+        ],
+    )
+    SQLiteStore(database_url).save_work_item(item)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="opportunity scout can you summarize link 1",
+            work_item_id=item.id,
+            database_url=database_url,
+            save=True,
+            requested_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+            live_sdk=True,
+        )
+    )
+
+    assert result.route == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert result.status == WorkItemStatus.DONE
+    assert result.artifact_refs[0].artifact_type == "source_link_summary"
+    assert result.artifact_refs[0].source_agent == WorkItemRoute.OPPORTUNITY_SCOUT.value
+    assert "Link 1 summary" in result.human_summary
+    assert "pilot procurement" in result.human_summary
+    assert "Search providers: not used for this narrow source follow-up" in result.human_summary
+    assert "Deterministic source-link follow-up summary executed." in result.audit_notes
+
+
+def test_business_research_current_query_focus_keeps_domain_terms() -> None:
+    request = WorkflowRunRequest(
+        request_text=(
+            "business research analyst Can you give me a source-backed brief on what "
+            "OpenAI is doing around mental health right now, and what seems relevant "
+            "for Keystone? Please do a deeper read-only search."
+        )
+    )
+
+    builder = workflow_runner._business_research_query_builder_for_request(request)
+    assert builder is not None
+
+    queries = builder("OpenAI")
+
+    assert queries[0] == "OpenAI 2026 mental health"
+    assert "OpenAI mental health independent coverage 2026" in queries[:3]
+    assert not any("give source backed brief" in query for query in queries[:3])
+
+
+def test_chief_link_followup_skips_generic_user_response_synthesis(monkeypatch) -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Thread follow-up",
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+    )
+    result = WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary="Link 1 summary",
+        audit_notes=["Deterministic source-link follow-up summary executed."],
+    )
+
+    def fail_synthesis(*_args, **_kwargs):
+        raise AssertionError("generic synthesis should not run")
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.synthesize_user_facing_work_item_response_sdk_result",
+        fail_synthesis,
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(request_text="summarize link 1", live_sdk=True),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary == "Link 1 summary"
+    assert "Skipped generic user-facing response synthesis" in " ".join(updated.audit_notes)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("can you summarize link 1", 1),
+        ("please summarize link #2", 2),
+        ("can you summarize the first link", 1),
+        ("review source two from above", 2),
+        ("summarize URL 1", 1),
+        ("read the 3rd source", 3),
+    ],
+)
+def test_source_link_followup_index_accepts_natural_ordinals(
+    text: str,
+    expected: int,
+) -> None:
+    assert workflow_runner._source_link_followup_index(text) == expected
 
 
 def test_advance_work_item_research_creates_case_and_company_artifact(tmp_path: Path) -> None:
@@ -98,9 +1828,38 @@ def test_advance_work_item_research_creates_case_and_company_artifact(tmp_path: 
     assert result.work_item.sources
     assert result.context_pack is not None
     assert result.context_pack["retrieved_sources"]
+    assert result.context_pack["source_context_status"]["selected_url_count"] >= 1
+    assert result.context_pack["source_context_status"]["evidence_url_count"] >= 1
     assert loaded is not None
     assert loaded.artifact_refs[0].artifact_id == result.artifact_refs[0].artifact_id
     assert store.list_work_item_artifacts(result.work_item.id)[0].artifact_type == "company_profile"
+    events = store.list_work_item_events(result.work_item.id)
+    event_types = [event.event_type for event in events]
+    skills_event = next(event for event in events if event.event_type == "skills_selected")
+    assert event_types.index("advance_started") < event_types.index("skills_selected")
+    assert event_types.index("skills_selected") < event_types.index("artifact_attached")
+    assert event_types.index("artifact_attached") < event_types.index(
+        "skill_contract_gates_checked"
+    )
+    assert skills_event.metadata["schema"] == "keystone.skills_selected.v1"
+    assert skills_event.metadata["agent_name"] == "business_research_analyst"
+    assert "business_research_specialist_contracts" in skills_event.metadata["selected_skills"]
+    assert "evidence_attribution_and_claim_mapping" in skills_event.metadata["selected_skills"]
+    assert "outreach_composer_specialist_contracts" not in skills_event.metadata["selected_skills"]
+    assert skills_event.metadata["selection_reasons"]["business_research_specialist_contracts"] == [
+        "specialist"
+    ]
+    assert skills_event.metadata["selector_input_sha256"]
+    gate_event = next(
+        event for event in events if event.event_type == "skill_contract_gates_checked"
+    )
+    assert gate_event.metadata["schema"] == "keystone.skill_contract_gates.v1"
+    assert gate_event.metadata["agent_name"] == "business_research_analyst"
+    assert gate_event.metadata["counts"]["passed"] >= 1
+    gate = gate_event.metadata["gates"][0]
+    assert gate["gate_id"] == "business_research_claim_gate"
+    assert gate["status"] == "passed"
+    assert "business_research.claim_gate" in gate_event.metadata["eval_labels"]
 
 
 def test_requested_context_sources_are_added_to_context_pack(tmp_path: Path) -> None:
@@ -131,6 +1890,70 @@ def test_requested_context_sources_are_added_to_context_pack(tmp_path: Path) -> 
         assert sources[source]["requested"] is True
         assert sources[source]["status"] == "requested_available_as_tool"
         assert sources[source]["tools"]
+
+
+def test_context_pack_source_status_counts_extracted_read_statuses() -> None:
+    item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="OpenAI mental health brief",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        sources=[
+            WorkItemSourceRef(
+                title="OpenAI sensitive conversations update",
+                url="https://openai.com/index/chatgpt-recognize-context-in-sensitive-conversations/",
+                source_type="company_site",
+                supported_claim="OpenAI described sensitive-conversation safety work.",
+                evidence_excerpt=(
+                    "OpenAI says ChatGPT can better recognize warning signs over time."
+                ),
+                extraction_status="page_read",
+            ),
+            WorkItemSourceRef(
+                title="Search result snippet",
+                url="https://example.com/snippet",
+                source_type="web",
+                supported_claim="Snippet-only search result.",
+                extraction_status="snippet_only",
+            ),
+        ],
+    )
+
+    pack = build_context_pack_for_route(item, WorkItemRoute.BUSINESS_RESEARCH_ANALYST)
+
+    assert pack.source_context_status == {
+        "selected_url_count": 2,
+        "extracted_url_count": 1,
+        "evidence_url_count": 2,
+        "snippet_only_url_count": 1,
+        "statuses": ["page_read", "snippet_only"],
+    }
+    assert pack.source_context_sample[0] == {
+        "title": "OpenAI sensitive conversations update",
+        "url": ("https://openai.com/index/chatgpt-recognize-context-in-sensitive-conversations/"),
+        "source_type": "company_site",
+        "provider": "",
+        "extraction_status": "page_read",
+        "supported_claim": "OpenAI described sensitive-conversation safety work.",
+        "key_facts": [],
+        "evidence_excerpt": "OpenAI says ChatGPT can better recognize warning signs over time.",
+        "artifact_title": "",
+    }
+    assert pack.ordered_sources[0] == {
+        "index": 1,
+        "reference": "source 1",
+        "title": "OpenAI sensitive conversations update",
+        "url": ("https://openai.com/index/chatgpt-recognize-context-in-sensitive-conversations/"),
+        "source_type": "company_site",
+        "extraction_status": "page_read",
+        "supported_claim": "OpenAI described sensitive-conversation safety work.",
+        "evidence_excerpt": "OpenAI says ChatGPT can better recognize warning signs over time.",
+    }
+    assert pack.ordered_sources[1]["reference"] == "source 2"
+    assert pack.ordered_sources[1]["url"] == "https://example.com/snippet"
+    assert pack.source_context_focus["status"] == "matched_sample_sources"
+    assert pack.source_context_focus["matching_sample_count"] == 1
+    assert "mental" in pack.source_context_focus["terms"]
 
 
 def test_orchestrator_requested_context_sources_are_added_to_specialist_memo(
@@ -179,6 +2002,436 @@ def test_orchestrator_requested_context_sources_are_added_to_specialist_memo(
     assert "orchestrator_route_result" in sources["gmail"]["requested_by"]
 
 
+def test_specialist_memo_includes_source_context_status() -> None:
+    item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="OpenAI mental health brief",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        sources=[
+            WorkItemSourceRef(
+                title="OpenAI mental health work",
+                url="https://openai.com/index/update-on-mental-health-related-work/",
+                source_type="company_site",
+                supported_claim="OpenAI described mental-health-related safety work.",
+                evidence_excerpt="OpenAI says it is improving sensitive conversation handling.",
+                extraction_status="article_read",
+            )
+        ],
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="openai",
+                source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                title="OpenAI",
+                summary="Source-backed profile.",
+                metadata={
+                    "retrieval_diagnostics": {
+                        "source_triage": {
+                            "mode": "fixture_safe_source_triage",
+                            "recommended_action": "synthesize_from_retained_sources",
+                            "needs_broaden_or_deepen": False,
+                            "retained_source_ids": ["selected:1"],
+                            "review_source_ids": [],
+                            "rejected_source_ids": [],
+                            "deepen_source_ids": [],
+                            "recall_gaps": [],
+                            "decisions": [
+                                {
+                                    "source_id": "selected:1",
+                                    "title": "OpenAI mental health work",
+                                    "url": (
+                                        "https://openai.com/index/"
+                                        "update-on-mental-health-related-work/"
+                                    ),
+                                    "decision": "retain",
+                                    "relevance_score": 90,
+                                    "directness_score": 85,
+                                    "rationale": "retain: source is extracted and on focus",
+                                }
+                            ],
+                        }
+                    }
+                },
+            )
+        ],
+    )
+
+    payload = workflow_runner._specialist_orchestrator_context_payload(
+        WorkflowRunRequest(request_text="business research analyst summarize this source"),
+        item,
+    )
+
+    assert payload["context_pack"]["route"] == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert payload["context_pack"]["source_context_status"] == {
+        "selected_url_count": 1,
+        "extracted_url_count": 1,
+        "evidence_url_count": 1,
+        "snippet_only_url_count": 0,
+        "statuses": ["article_read"],
+    }
+    assert payload["context_pack"]["source_context_sample"] == [
+        {
+            "title": "OpenAI mental health work",
+            "url": "https://openai.com/index/update-on-mental-health-related-work/",
+            "source_type": "company_site",
+            "provider": "",
+            "extraction_status": "article_read",
+            "supported_claim": "OpenAI described mental-health-related safety work.",
+            "key_facts": [],
+            "evidence_excerpt": ("OpenAI says it is improving sensitive conversation handling."),
+            "artifact_title": "",
+        }
+    ]
+    assert payload["context_pack"]["ordered_sources"] == [
+        {
+            "index": 1,
+            "reference": "source 1",
+            "title": "OpenAI mental health work",
+            "url": "https://openai.com/index/update-on-mental-health-related-work/",
+            "source_type": "company_site",
+            "extraction_status": "article_read",
+            "supported_claim": "OpenAI described mental-health-related safety work.",
+            "evidence_excerpt": ("OpenAI says it is improving sensitive conversation handling."),
+        }
+    ]
+    assert payload["context_pack"]["source_context_focus"]["status"] == "matched_sample_sources"
+    assert payload["context_pack"]["source_context_focus"]["matching_sample_count"] == 1
+    assert payload["context_pack"]["source_triage"]["recommended_action"] == (
+        "synthesize_from_retained_sources"
+    )
+    assert payload["context_pack"]["source_triage"]["decision_counts"] == {"retain": 1}
+    assert payload["context_pack"]["source_triage"]["retained_source_ids"] == ["selected:1"]
+
+
+def test_chief_deep_web_brief_attaches_extracted_source_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_chief_of_staff_sdk(
+        _sdk_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult[object]:
+        output = workflow_runner.plan_chief_of_staff_request(
+            "deeper source-backed web search on OpenAI mental health"
+        ).model_copy(
+            update={
+                "summary": "OpenAI mental health source-backed brief.",
+                "sources": [
+                    ChiefOfStaffSourceRef(
+                        title="OpenAI mental health update",
+                        url="https://openai.com/index/update-on-mental-health-related-work/",
+                        source_type="official_page",
+                        note="Official OpenAI update identified by live search.",
+                    )
+                ],
+                "retrieval_diagnostics": {
+                    "provider_result_samples": {
+                        "exa": [
+                            {
+                                "title": "OpenAI mental health update",
+                                "url": "https://openai.com/index/update-on-mental-health-related-work/",
+                                "snippet": "OpenAI describes mental-health-related safety work.",
+                            }
+                        ]
+                    }
+                },
+            }
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result=None,
+            live=True,
+        )
+
+    def fake_read_linked_article_impl(
+        url: str,
+        *,
+        request_text: str = "",
+        max_chars: int = 6000,
+        live: bool = False,
+    ) -> dict[str, object]:
+        assert live is True
+        assert "deeper" in request_text.lower()
+        return {
+            "status": "success",
+            "url": url,
+            "title": "OpenAI mental health update",
+            "provider": "trafilatura",
+            "text_or_markdown": (
+                "OpenAI says it is improving ChatGPT behavior in emotionally "
+                "sensitive conversations, adding Trusted Contact workflows, "
+                "working with clinicians, and funding AI and mental health research."
+            ),
+            "claims": [
+                "OpenAI is improving ChatGPT behavior in emotionally sensitive conversations.",
+                "OpenAI is adding Trusted Contact workflows and consulting clinicians.",
+            ],
+        }
+
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(
+        workflow_runner,
+        "read_linked_article_impl",
+        fake_read_linked_article_impl,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "chief of staff do a deeper source-backed web search on what OpenAI "
+                "is doing about mental health. Give Answer, Detailed Summary, source URLs, "
+                "and provider metadata."
+            ),
+            requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            live_sdk=True,
+        )
+    )
+
+    metadata = result.artifact_refs[0].metadata
+    source_ref = metadata["source_refs"][0]
+    assert metadata["source_context_status"]["extracted_url_count"] == 1
+    assert "emotionally sensitive conversations" in source_ref["evidence_excerpt"]
+    assert source_ref["key_facts"][:2] == [
+        "OpenAI is improving ChatGPT behavior in emotionally sensitive conversations.",
+        "OpenAI is adding Trusted Contact workflows and consulting clinicians.",
+    ]
+    assert metadata["retrieval_diagnostics"]["provider_result_samples"]["exa"]
+
+
+def test_chief_retrieved_link_content_prompt_reads_provider_sample_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_text = (
+        "chief of staff can you do a deeper read-only search on one focused question: "
+        "what do recent public sources say about trusted-contact, teen-safety, or "
+        "escalation features in consumer AI chat tools that might be relevant to "
+        "mental-health risk? Please give a concise Answer and a Detailed Summary "
+        "that synthesizes what the retrieved link content says across sources before "
+        "listing links. Include 3-5 source links. If the links were only snippets, "
+        "say so; otherwise read/extract and summarize the source content."
+    )
+    output = workflow_runner.plan_chief_of_staff_request(request_text).model_copy(
+        update={
+            "sources": [],
+            "retrieval_diagnostics": {
+                "provider_result_samples": {
+                    "agents-web-search": [
+                        {
+                            "title": "Introducing Trusted Contact in ChatGPT",
+                            "url": "https://openai.com/index/introducing-trusted-contact-in-chatgpt/",
+                            "snippet": "OpenAI describes Trusted Contact notifications.",
+                        }
+                    ]
+                }
+            },
+        }
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def fake_read_chief_selected_source(
+        url: str,
+        *,
+        request_text: str,
+        live: bool,
+    ) -> dict[str, object]:
+        calls.append((url, live))
+        return {
+            "status": "success",
+            "url": url,
+            "title": "Introducing Trusted Contact in ChatGPT",
+            "provider": "trafilatura",
+            "text_or_markdown": (
+                "OpenAI says Trusted Contact lets adults nominate someone who may "
+                "be notified when automated systems detect serious self-harm risk."
+            ),
+            "claims": [
+                "Trusted Contact is an optional escalation feature for serious self-harm risk.",
+            ],
+        }
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "_read_chief_selected_source",
+        fake_read_chief_selected_source,
+    )
+
+    refs = workflow_runner._chief_of_staff_source_refs(
+        output,
+        request_text=request_text,
+        live=True,
+    )
+
+    assert calls == [("https://openai.com/index/introducing-trusted-contact-in-chatgpt/", True)]
+    assert len(refs) == 1
+    assert refs[0].extraction_status == "success"
+    assert refs[0].provider == "trafilatura"
+    assert "serious self-harm risk" in refs[0].evidence_excerpt
+    assert refs[0].key_facts == [
+        "Trusted Contact is an optional escalation feature for serious self-harm risk.",
+        (
+            "OpenAI says Trusted Contact lets adults nominate someone who may be "
+            "notified when automated systems detect serious self-harm risk."
+        ),
+    ]
+
+
+def test_chief_explicit_url_read_extract_uses_user_urls_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urls = [
+        "https://blog.character.ai/how-character-ai-prioritizes-teen-safety/",
+        "https://arxiv.org/abs/2510.11185",
+        "https://arxiv.org/abs/2406.10461",
+    ]
+    captured_sdk_input: dict[str, object] = {}
+
+    def fake_run_chief_of_staff_sdk(
+        sdk_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult[object]:
+        captured_sdk_input.update(sdk_input)
+        output = workflow_runner.plan_chief_of_staff_request(
+            "read/extract three source URLs"
+        ).model_copy(
+            update={
+                "summary": "Generic operations fallback should not override user URLs.",
+                "audit_notes": [
+                    "Full page extraction was unavailable; synthesis is snippet-based."
+                ],
+                "sources": [
+                    ChiefOfStaffSourceRef(
+                        title="Generic docs",
+                        url="https://developers.openai.com/api/docs/guides/agents",
+                        source_type="openai_docs",
+                        note="Generic docs fallback.",
+                    )
+                ],
+            }
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result=None,
+            live=True,
+        )
+
+    read_urls: list[str] = []
+
+    def fake_read_linked_article_impl(
+        url: str,
+        *,
+        request_text: str = "",
+        max_chars: int = 6000,
+        live: bool = False,
+    ) -> dict[str, object]:
+        read_urls.append(url)
+        assert live is True
+        assert "read/extract" in request_text.lower()
+        return {
+            "status": "success",
+            "url": url,
+            "title": f"Extracted {len(read_urls)}",
+            "provider": "trafilatura",
+            "text_or_markdown": f"Extracted page content for source {len(read_urls)}.",
+            "claims": [f"Claim from explicit source {len(read_urls)}."],
+        }
+
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(
+        workflow_runner,
+        "read_linked_article_impl",
+        fake_read_linked_article_impl,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "chief of staff backend validation only. Read/extract these three URLs "
+                f"and synthesize what they collectively say: {urls[0]} ; {urls[1]} ; {urls[2]}."
+            ),
+            requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            live_sdk=True,
+        )
+    )
+
+    metadata = result.artifact_refs[0].metadata
+    source_refs = metadata["source_refs"]
+    assert read_urls == urls
+    assert [ref["url"] for ref in source_refs[:3]] == urls
+    assert metadata["source_context_status"]["extracted_url_count"] >= 3
+    assert "Extracted page content for source 1" in source_refs[0]["evidence_excerpt"]
+    selected_context = captured_sdk_input["selected_source_context"]
+    assert isinstance(selected_context, dict)
+    assert selected_context["source_context_status"]["extracted_url_count"] == 3
+    assert "Claim from explicit source 1" in str(selected_context)
+    assert "Detailed Summary" in result.human_summary
+    assert "Claim from explicit source 1" in result.human_summary
+    assert "Extracted page content for source 1" in result.human_summary
+    assert "User-supplied URL selected" not in result.human_summary
+    assert "Generic docs" not in result.human_summary
+    assert not any("snippet-based" in note for note in result.audit_notes)
+    assert any("read/extracted" in note for note in result.audit_notes)
+
+
+def test_chief_source_brief_does_not_get_false_research_stage_blocker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_chief_of_staff_sdk(
+        _sdk_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult[object]:
+        output = workflow_runner.plan_chief_of_staff_request(
+            "source-backed brief on OpenAI mental health"
+        ).model_copy(
+            update={
+                "summary": "OpenAI mental health source-backed brief.",
+                "sources": [
+                    ChiefOfStaffSourceRef(
+                        title="OpenAI mental health update",
+                        url="https://openai.com/index/update-on-mental-health-related-work/",
+                        source_type="official_page",
+                        note="Official source for the brief.",
+                    )
+                ],
+            }
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result=None,
+            live=True,
+        )
+
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                "chief of staff what is OpenAI doing about mental health? Give a "
+                "source-backed brief with Answer, Detailed Summary, links, and metadata."
+            ),
+            requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=True,
+        ),
+        max_steps=1,
+    )
+
+    blocker_codes = {blocker.code for blocker in result.blockers}
+    assert "manager_loop_research_not_completed" not in blocker_codes
+
+
 def test_manager_loop_records_orchestrator_review_feedback_for_agent_run(
     tmp_path: Path,
 ) -> None:
@@ -198,9 +2451,7 @@ def test_manager_loop_records_orchestrator_review_feedback_for_agent_run(
     store = SQLiteStore(database_url)
     events = store.list_work_item_events(result.work_item.id)
     review_events = [event for event in events if event.event_type == "manager_loop_review"]
-    efficiency_events = [
-        event for event in events if event.event_type == "manager_loop_efficiency"
-    ]
+    efficiency_events = [event for event in events if event.event_type == "manager_loop_efficiency"]
 
     assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     assert review_events
@@ -310,6 +2561,188 @@ def test_manager_loop_marks_single_step_artifact_done_with_optional_next_action(
     assert result.status == WorkItemStatus.DONE
 
 
+def test_manager_loop_repairs_done_opportunity_packet_after_authoritative_review_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    live_calls: list[str] = []
+    retrieval_hints: list[object] = []
+    review_calls = 0
+
+    def fake_run_live(**kwargs: object):
+        live_calls.append(str(kwargs.get("topic") or ""))
+        retrieval_hints.append(kwargs.get("retrieval_hint"))
+        pass_number = len(live_calls)
+        return (
+            OpportunityScoutResult(
+                topic="formal opportunity scan",
+                dry_run=False,
+                records=[
+                    OpportunityRecord(
+                        company_name=f"Behavioral Health AI Pilot {pass_number}",
+                        opportunity_type="grant or collaboration opportunity",
+                        priority_score=92,
+                        why_now_signal=(
+                            "Active RFP for AI-enabled behavioral health tools with a "
+                            "June 2026 deadline and vendor/partner participation."
+                        ),
+                        recommended_next_step="Review eligibility before outreach.",
+                        keystone_fit_reason=(
+                            "Keystone could participate as a small clinical AI evaluation "
+                            "or implementation partner."
+                        ),
+                        outside_consulting_likelihood=65,
+                        handoff_to_business_research_analyst=False,
+                        sources=[
+                            OpportunitySource(
+                                title="Behavioral Health AI Pilot RFP",
+                                url=f"https://example.gov/rfp-{pass_number}",
+                                source_type="government",
+                                supported_signal=(
+                                    "Active RFP for AI-enabled behavioral health tools; "
+                                    "deadline June 30, 2026; small business vendors and "
+                                    "clinical implementation partners may participate."
+                                ),
+                                evidence_excerpt=(
+                                    "The source describes an active behavioral health AI "
+                                    "pilot RFP, deadline evidence, and vendor or partner "
+                                    "eligibility."
+                                ),
+                            )
+                        ],
+                    )
+                ],
+            ),
+            {
+                "debug_notes": [f"fake opportunity retrieval pass {pass_number}"],
+                "retrieval_diagnostics": {"provider_summary": "searxng+exa"},
+            },
+        )
+
+    class FakeReview:
+        def __init__(self, *, status: str) -> None:
+            self.status = status
+            self.overall_score = 40 if status == "fail" else 92
+            self.approval_boundary_ok = True
+            self.observed_gaps = ["Output did not answer the request."] if status == "fail" else []
+            self.recommended_next_step = (
+                "Repair the opportunity packet before presenting it."
+                if status == "fail"
+                else "Ready for review."
+            )
+
+    def fake_review_specialist_output(**_kwargs: object) -> FakeReview:
+        nonlocal review_calls
+        review_calls += 1
+        return FakeReview(status="fail" if review_calls == 1 else "pass")
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fake_run_live,
+    )
+    monkeypatch.setattr(
+        workflow_runner,
+        "review_specialist_output",
+        fake_review_specialist_output,
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                "opportunity scout find source-backed grant, RFP, or pilot "
+                "opportunities for AI-enabled behavioral health. Stop after an "
+                "opportunity review packet."
+            ),
+            database_url=database_url,
+            save=True,
+            live_search=True,
+            max_results=1,
+            manual_request_plan={
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": "AI-enabled behavioral health formal opportunities",
+                "constraints": ["grant", "RFP", "pilot", "formal opportunity"],
+                "task_objective": "opportunity_discovery",
+            },
+        ),
+        max_steps=2,
+    )
+
+    events = SQLiteStore(database_url).list_work_item_events(result.work_item.id)
+    review_events = [event for event in events if event.event_type == "manager_loop_review"]
+
+    assert len(live_calls) == 2
+    assert retrieval_hints[0] is None
+    assert retrieval_hints[1] is not None
+    assert retrieval_hints[1].needs_precision_search is False
+    assert retrieval_hints[1].needs_search_review is False
+    assert result.status == WorkItemStatus.DONE
+    assert not any(blocker.code == "manager_loop_review_failed" for blocker in result.blockers)
+    assert review_events[0].metadata["review_decision"] == "repair"
+    assert review_events[-1].metadata["review_decision"] == "pass"
+    repair_started = next(
+        event for event in events if event.event_type == "manager_loop_repair_started"
+    )
+    assert repair_started.metadata["search_repair_hint"] == (
+        "repair_synthesis_from_existing_context"
+    )
+    assert any(event.event_type == "manager_loop_repair_completed" for event in events)
+
+
+def test_manager_loop_search_repair_hint_requests_deepening_for_source_gaps() -> None:
+    request = WorkflowRunRequest(
+        request_text="business research analyst research OpenEvidence",
+        external_context=workflow_runner._manager_loop_repair_external_context(
+            WorkflowRunRequest(request_text="business research analyst research OpenEvidence"),
+            review_context={
+                "route": WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                "review_status": "fail",
+                "overall_score": 45,
+                "observed_gaps": ["Source evidence is off-target and retrieval should broaden."],
+                "recommended_next_step": "Run a broader independent-source pass.",
+            },
+        ),
+    )
+
+    hint = workflow_runner._retrieval_hint_for_request(request)
+
+    assert hint is not None
+    assert hint.needs_precision_search is True
+    assert hint.needs_structured_enrichment is True
+    assert hint.needs_search_review is True
+    assert hint.source == "manager_loop_repair"
+
+
+def test_manager_loop_search_repair_hint_keeps_presentation_gaps_synthesis_only() -> None:
+    request = WorkflowRunRequest(
+        request_text="opportunity scout find behavioral health opportunities",
+        external_context=workflow_runner._manager_loop_repair_external_context(
+            WorkflowRunRequest(
+                request_text="opportunity scout find behavioral health opportunities"
+            ),
+            review_context={
+                "route": WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                "review_status": "fail",
+                "overall_score": 44,
+                "observed_gaps": [
+                    "Add concise summary or rationale.",
+                    "Tie output more directly to request and evidence.",
+                ],
+                "recommended_next_step": "Repair the Slack-facing answer from existing evidence.",
+            },
+        ),
+    )
+
+    hint = workflow_runner._retrieval_hint_for_request(request)
+
+    assert hint is not None
+    assert hint.needs_precision_search is False
+    assert hint.needs_structured_enrichment is False
+    assert hint.needs_search_review is False
+    assert hint.source == "manager_loop_repair"
+
+
 def test_manager_loop_review_uses_latest_thread_followup_for_any_route(
     monkeypatch,
 ) -> None:
@@ -374,7 +2807,7 @@ def test_manager_loop_review_uses_latest_thread_followup_for_any_route(
     assert latest_review["latest_user_request"] == captured["request_summary"]
 
 
-def test_manager_review_treats_limited_independent_sources_as_advisory() -> None:
+def test_manager_review_treats_limited_independent_sources_as_repairable() -> None:
     work_item = WorkItem(
         kind=WorkItemKind.COMPANY_RESEARCH,
         title="Company follow-up",
@@ -401,15 +2834,273 @@ def test_manager_review_treats_limited_independent_sources_as_advisory() -> None
     review_context = {
         "review_status": "fail",
         "approval_boundary_ok": True,
-        "observed_gaps": [
-            "Independent sources are limited; deepen retrieval before outreach."
-        ],
+        "observed_gaps": ["Independent sources are limited; deepen retrieval before outreach."],
     }
 
-    assert (
-        workflow_runner._manager_review_failure_is_authoritative(review_context, result)
-        is False
+    assert workflow_runner._manager_review_failure_is_authoritative(review_context, result) is True
+
+
+def test_manager_loop_repair_allows_review_only_approval_gate() -> None:
+    next_action = WorkItemNextAction(
+        action="review_chief_of_staff_plan",
+        agent=WorkItemRoute.CHIEF_OF_STAFF,
+        description="Review the source-backed Chief of Staff plan.",
+        requires_approval=True,
     )
+
+    assert workflow_runner._next_action_blocks_manager_loop_repair(next_action) is False
+
+
+def test_manager_loop_repair_blocks_side_effect_approval_gate() -> None:
+    next_action = WorkItemNextAction(
+        action="approve_outreach_send",
+        agent=WorkItemRoute.OUTREACH_COMPOSER,
+        description="Approve external send for outreach.",
+        requires_approval=True,
+    )
+
+    assert workflow_runner._next_action_blocks_manager_loop_repair(next_action) is True
+
+
+def test_manager_loop_repairs_deep_chief_search_before_review_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sdk_calls = 0
+    review_calls = 0
+
+    def fake_run_chief_of_staff_sdk(
+        *_args: object, **_kwargs: object
+    ) -> TypedAgentRunResult[object]:
+        nonlocal sdk_calls
+        sdk_calls += 1
+        summary = (
+            "Search completed."
+            if sdk_calls == 1
+            else (
+                "Answer: source-backed safety features include teen-specific model "
+                "limits, escalation pathways, and parental oversight.\n\n"
+                "Detailed Summary\nThe repaired answer summarizes the source-backed "
+                "evidence instead of stopping at metadata. Source: "
+                "https://example.com/source"
+            )
+        )
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary=summary,
+            approval_required=True,
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="slack-article-review",
+                target_channel="current Slack thread",
+            ),
+            audit_notes=[],
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"call": sdk_calls},
+            live=True,
+        )
+
+    def fake_review_specialist_output(**_kwargs: object) -> object:
+        nonlocal review_calls
+        review_calls += 1
+
+        class Review:
+            status = "fail" if review_calls == 1 else "pass"
+            overall_score = 45 if review_calls == 1 else 92
+            approval_boundary_ok = True
+            observed_gaps = (
+                ["Output did not answer the request; deepen retrieval before finalizing."]
+                if review_calls == 1
+                else []
+            )
+            recommended_next_step = (
+                "Repair before review." if review_calls == 1 else "Ready for review."
+            )
+
+        return Review()
+
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(workflow_runner, "review_specialist_output", fake_review_specialist_output)
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                "chief of staff do a deeper source-backed search on mental health AI "
+                "safety features. Return Answer, Detailed Summary, source URLs, and "
+                "compact metadata."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            live_sdk=True,
+            external_context={
+                "schema": "keystone.slack.selected_message_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1715366400.000100",
+            },
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "chief_of_staff",
+                "target_agent": "chief_of_staff",
+                "intent": "research_brief",
+            },
+        ),
+        max_steps=2,
+    )
+
+    events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(result.work_item.id)
+    review_events = [event for event in events if event.event_type == "manager_loop_review"]
+
+    assert sdk_calls == 2
+    assert result.status == WorkItemStatus.DONE
+    assert "Detailed Summary" in result.human_summary
+    assert review_events[0].metadata["review_decision"] == "repair"
+    assert review_events[-1].metadata["review_decision"] == "pass"
+    assert any(event.event_type == "manager_loop_repair_started" for event in events)
+
+
+def test_manager_loop_review_repairs_when_source_triage_needs_deepening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PassingReview:
+        status = "pass"
+        overall_score = 95
+        approval_boundary_ok = True
+        observed_gaps: list[str] = []
+        recommended_next_step = "Ready for human review."
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "review_specialist_output",
+        lambda **_kwargs: PassingReview(),
+    )
+    artifact = WorkItemArtifactRef(
+        artifact_id="company-1",
+        artifact_type="company_profile",
+        source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        title="OpenAI",
+        summary="A source-backed company profile.",
+        metadata={
+            "retrieval_diagnostics": {
+                "source_triage": {
+                    "recommended_action": "broaden_or_deepen_before_final_synthesis",
+                    "needs_broaden_or_deepen": True,
+                    "decision_counts": {"deepen": 1, "reject": 1},
+                    "deepen_source_ids": ["selected:1"],
+                    "rejected_source_ids": ["selected:2"],
+                    "recall_gaps": ["missing expected source lane: press_news"],
+                }
+            }
+        },
+    )
+    work_item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="OpenAI mental health",
+        request_text="What is OpenAI doing about mental health right now?",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        artifact_refs=[artifact],
+    )
+    result = workflow_runner.WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="A company profile was attached.",
+    )
+
+    reviewed = workflow_runner._review_manager_loop_step(
+        result,
+        original_request=WorkflowRunRequest(
+            request_text="What is OpenAI doing about mental health right now?",
+            allow_manager_loop_repair=True,
+        ),
+        step_index=1,
+        store=None,
+        feedback_callback=None,
+        defer_block_for_repair=True,
+    )
+    latest_review = reviewed.work_item.target.metadata["orchestrator_reviews"][-1]
+
+    assert latest_review["review_decision"] == "repair"
+    assert latest_review["repair_eligible"] is True
+    assert latest_review["review_status"] == "fail"
+    assert "Source triage recommended broader/deeper retrieval" in " ".join(
+        latest_review["observed_gaps"]
+    )
+    assert workflow_runner._manager_loop_search_repair_hint(latest_review) == (
+        "broaden_or_deepen_search_within_cost_profile"
+    )
+    assert reviewed.next_action is not None
+    assert reviewed.next_action.action == "repair_or_deepen_specialist_output"
+
+
+def test_stop_after_opportunity_packet_skips_false_research_stage_blocker() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="Opportunity packet",
+        request_text=(
+            "opportunity scout find source-backed grant, RFP, pilot, or call-for-proposals "
+            "opportunities. Stop after an opportunity review packet."
+        ),
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+    )
+    result = workflow_runner.WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary="No exact matches found.",
+    )
+
+    blockers = workflow_runner._manager_loop_missing_stage_blockers(
+        original_request=WorkflowRunRequest(request_text=work_item.request_text),
+        result=result,
+        loop_steps=[
+            {
+                "route": WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                "status": WorkItemStatus.DONE.value,
+                "advanced": True,
+            }
+        ],
+    )
+
+    assert "manager_loop_research_not_completed" not in {blocker.code for blocker in blockers}
+
+
+def test_formal_opportunity_gate_note_counts_existing_filtered_candidates() -> None:
+    scout_result = OpportunityScoutResult(
+        topic="behavioral health AI grants",
+        records=[],
+        filtered_candidates=[
+            FilteredOpportunityCandidate(
+                company_name="Adjacent grant",
+                source_title="Topic-relevant grant",
+                reasons=["missing company/vendor path"],
+            )
+        ],
+        review_candidates=[
+            FilteredOpportunityCandidate(
+                company_name="Review-only candidate",
+                source_title="Possible pilot",
+                reasons=["unclear timing"],
+            )
+        ],
+    )
+
+    _, notes = workflow_runner._apply_formal_opportunity_result_gates(
+        scout_result,
+        request_text="Find grants, RFPs, pilots, and calls for proposals.",
+    )
+
+    assert notes == [
+        (
+            "Formal-opportunity exact-match gates evaluated 0 retained record(s); "
+            "retrieval already carried 1 filtered candidate(s) and 1 review candidate(s)."
+        )
+    ]
 
 
 def test_manager_loop_generic_review_gaps_do_not_block_fixture_artifacts(
@@ -425,7 +3116,7 @@ def test_manager_loop_generic_review_gaps_do_not_block_fixture_artifacts(
     )
 
     assert result.route == WorkItemRoute.OPPORTUNITY_SCOUT
-    assert result.status == WorkItemStatus.IN_PROGRESS
+    assert result.status == WorkItemStatus.DONE
     assert result.artifact_refs
     assert not any(blocker.code == "manager_loop_review_failed" for blocker in result.blockers)
 
@@ -610,7 +3301,7 @@ def test_manager_loop_does_not_treat_leadership_as_lead_discovery(
         WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
     ]
     assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
-    assert result.status == WorkItemStatus.IN_PROGRESS
+    assert result.status == WorkItemStatus.DONE
     assert not any(blocker.code == "manager_loop_review_failed" for blocker in result.blockers)
     assert "no multi-step workflow" in completion_events[-1].metadata["stop_reason"]
 
@@ -985,8 +3676,7 @@ def test_orchestrator_plan_missing_draft_is_limited_not_blocked(tmp_path: Path) 
     ]
     blocker_codes = {blocker.code for blocker in result.blockers}
     advisory_codes = {
-        item["code"]
-        for item in completion_events[-1].metadata["advisory_limitations"]
+        item["code"] for item in completion_events[-1].metadata["advisory_limitations"]
     }
 
     assert result.route == WorkItemRoute.ORCHESTRATOR
@@ -1055,6 +3745,7 @@ def test_manager_loop_answers_state_followup_without_rerunning(tmp_path: Path) -
 
 def test_direct_work_item_advance_answers_state_followup_without_rerouting(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     database_url = _database_url(tmp_path)
     prompt = (
@@ -1075,6 +3766,25 @@ def test_direct_work_item_advance_answers_state_followup_without_rerouting(
     )
     store = SQLiteStore(database_url)
     events_before = store.list_work_item_events(initial.work_item.id)
+    monkeypatch.setattr(workflow_runner, "build_sdk_session", lambda _spec: None)
+
+    def fake_synthesis(result, **_: object):
+        class FakeResult:
+            output = response_synthesis.UserFacingResponseSynthesis(
+                title="Prior run state",
+                answer=result.human_summary,
+            )
+            usage = {}
+            cost = None
+            request_cache = None
+
+        return FakeResult()
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "synthesize_user_facing_work_item_response_sdk_result",
+        fake_synthesis,
+    )
 
     followup = advance_work_item(
         WorkflowRunRequest(
@@ -1099,13 +3809,534 @@ def test_direct_work_item_advance_answers_state_followup_without_rerouting(
     assert "No new research" in followup.human_summary
     assert "Cost tracking remains backend/audit-only" in followup.human_summary
     assert not any(
-        event.event_type == "advance_started"
-        for event in events_after[len(events_before) :]
+        event.event_type == "advance_started" for event in events_after[len(events_before) :]
     )
     assert any(
         event.event_type == "manager_loop_state_followup_answered"
         for event in events_after[len(events_before) :]
     )
+
+
+def test_opportunity_state_followup_includes_filters_sources_and_cost_profile(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+
+    def fake_run_live(**_: object):
+        return (
+            OpportunityScoutResult(
+                topic="strict opportunity scan",
+                dry_run=False,
+                records=[
+                    OpportunityRecord(
+                        company_name="Modern Health",
+                        opportunity_type="behavioral health AI",
+                        role_title="Medical Director (Part-Time)",
+                        role_location="Remote, United States",
+                        role_remote=True,
+                        role_country="United States",
+                        priority_score=94,
+                        why_now_signal=(
+                            "Remote U.S. part-time medical director role focused on "
+                            "psychiatry and digital mental health."
+                        ),
+                        recommended_next_step=("Run company research before any outreach."),
+                        keystone_fit_reason=(
+                            "Keystone could review clinical evaluation and workflow fit."
+                        ),
+                        outside_consulting_likelihood=70,
+                        handoff_to_business_research_analyst=True,
+                        sources=[
+                            OpportunitySource(
+                                title="Medical Director (Part-Time) at Modern Health",
+                                url=(
+                                    "https://jobs.behavioralhealthtech.com/jobs/"
+                                    "168163270-medical-director-part-time"
+                                ),
+                                source_type="job_posting",
+                                supported_signal=("Remote U.S. part-time medical director role."),
+                            )
+                        ],
+                    )
+                ],
+            ),
+            {
+                "debug_notes": ["fake live retrieval"],
+                "retrieval_diagnostics": {"provider_summary": "searxng+agents-web-search"},
+            },
+        )
+
+    monkeypatch.setattr("keystone_agents.workflow_runner.run_opportunity_scout_live", fake_run_live)
+
+    prompt = (
+        "opportunity scout find active part-time or fractional remote U.S. chief medical "
+        "officer or fractional medical director roles in behavioral health AI posted in the "
+        "last 1 week. Use strict criteria: posted or refreshed within the last 1 week, "
+        "remote U.S., part-time/fractional/advisory/contract, and behavioral health relevance. "
+        "If none are strong matches, do not pad weak results."
+    )
+    initial = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=prompt,
+            database_url=database_url,
+            save=True,
+            live_search=True,
+            max_results=1,
+            cost_profile="slack_opportunity_balanced",
+            manual_request_plan={
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": "fractional medical director roles",
+                "constraints": [
+                    "posted or refreshed within the last 1 week",
+                    "remote U.S.",
+                    "part-time/fractional/advisory/contract",
+                    "no weak padding",
+                ],
+                "task_objective": "opportunity_discovery",
+            },
+        ),
+        max_steps=2,
+    )
+
+    followup = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                f"Previous request: {prompt}\n"
+                "Follow-up: answer only from the prior run state. Which hard filters shaped "
+                "the result, did you exclude weak matches instead of padding, what adjacent "
+                "matches were retained, what source evidence was available, what cost profile "
+                "was used, and what is the next safe step? Also keep track of this run costs."
+            ),
+            work_item_id=initial.work_item.id,
+            database_url=database_url,
+            save=True,
+            cost_tracking_requested=True,
+        ),
+        max_steps=2,
+    )
+
+    assert followup.route == WorkItemRoute.ORCHESTRATOR
+    assert "Hard filters" in followup.human_summary
+    assert "posted or refreshed within the last 1 week" in followup.human_summary
+    assert "No-padding check" in followup.human_summary
+    assert "Retained matches" in followup.human_summary
+    assert "Modern Health" in followup.human_summary
+    assert "Primary source links" in followup.human_summary
+    assert (
+        "https://jobs.behavioralhealthtech.com/jobs/168163270-medical-director-part-time"
+        in followup.human_summary
+    )
+    assert "Cost profile: slack_opportunity_balanced" in followup.human_summary
+    assert "Retrieval providers: searxng+agents-web-search" in followup.human_summary
+
+
+def test_formal_opportunity_slack_request_uses_deep_profile_and_repair() -> None:
+    request = workflow_runner._normalize_workflow_request_for_context(
+        WorkflowRunRequest(
+            request_text=(
+                "opportunity scout find source-backed grant, RFP, pilot, or "
+                "call-for-proposals opportunities with deadline evidence"
+            ),
+            external_context={
+                "schema": "keystone.slack.selected_message_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1715366400.000100",
+            },
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "opportunity_scout",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+            },
+        )
+    )
+
+    assert request.cost_profile == "slack_opportunity_deep"
+    assert request.hosted_web_search_max_calls == 4
+    assert request.allow_manager_loop_repair is True
+    assert request.include_contact_enrichment is False
+    assert request.reuse_existing_research is False
+
+
+def test_deep_source_backed_opportunity_request_verifies_source_pages(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_run_live(**kwargs: object):
+        captured_kwargs.update(kwargs)
+        return (
+            OpportunityScoutResult(
+                topic="behavioral health software companies",
+                dry_run=False,
+                records=[
+                    OpportunityRecord(
+                        company_name="Example Behavioral Health",
+                        opportunity_type="digital mental health",
+                        priority_score=72,
+                        why_now_signal=(
+                            "Example Behavioral Health announced a measurement-based care "
+                            "partnership relevant to clinics."
+                        ),
+                        recommended_next_step="Review extracted source evidence.",
+                        keystone_fit_reason="Relevant to clinic-facing digital psychiatry workflows.",
+                        outside_consulting_likelihood=55,
+                        handoff_to_business_research_analyst=False,
+                        sources=[
+                            OpportunitySource(
+                                title="Example Behavioral Health partnership",
+                                url="https://example.com/behavioral-health-partnership",
+                                source_type="news",
+                                supported_signal=(
+                                    "Measurement-based care partnership for behavioral "
+                                    "health clinics."
+                                ),
+                                evidence_excerpt=(
+                                    "The extracted source describes the clinic partnership "
+                                    "and measurement-based care deployment."
+                                ),
+                            )
+                        ],
+                    ),
+                    OpportunityRecord(
+                        company_name="Example Digital Psychiatry Grant",
+                        opportunity_type="grant or collaboration opportunity",
+                        priority_score=68,
+                        why_now_signal=(
+                            "Example Digital Psychiatry Grant funds implementation "
+                            "research for measurement-based digital mental health."
+                        ),
+                        recommended_next_step="Check eligibility and deadline details.",
+                        keystone_fit_reason="Relevant to clinical AI evaluation partnerships.",
+                        outside_consulting_likelihood=50,
+                        handoff_to_business_research_analyst=False,
+                        sources=[
+                            OpportunitySource(
+                                title="Digital psychiatry funding announcement",
+                                url="https://example.gov/digital-psychiatry-funding",
+                                source_type="government",
+                                supported_signal=(
+                                    "Funding supports measurement-based digital mental "
+                                    "health implementation research."
+                                ),
+                                evidence_excerpt=(
+                                    "The extracted funding announcement describes partner "
+                                    "implementation sites and measurement-based outcomes."
+                                ),
+                            )
+                        ],
+                    ),
+                ],
+            ),
+            {
+                "debug_notes": ["fake deep source-backed retrieval"],
+                "retrieval_diagnostics": {"provider_summary": "searxng+exa+tavily"},
+            },
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fake_run_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "opportunity scout run a deeper search for behavioral health software "
+                "companies with measurement-based care tools. Give a source-backed "
+                "synthesis with visible source URLs and provider comparison."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            requested_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+            manual_request_plan={
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": "behavioral health software companies",
+                "constraints": [
+                    "deeper-search",
+                    "source-backed",
+                    "visible-source-urls",
+                    "provider-diagnostics",
+                ],
+            },
+        )
+    )
+
+    assert captured_kwargs["verify_source_pages"] is True
+    assert captured_kwargs["max_results"] == 8
+    assert captured_kwargs["agents_web_search_max_calls"] == 2
+    assert result.artifact_refs
+    assert any(
+        "quality budget applied for opportunity_scout" in note.lower()
+        and "mode=deep" in note.lower()
+        and "tool_tier=deep_retrieval" in note.lower()
+        for note in result.audit_notes
+    )
+    source_ref = result.artifact_refs[0].metadata["source_refs"][0]
+    assert "extracted source describes" in source_ref["evidence_excerpt"]
+    assert source_ref["extraction_status"] == "extracted"
+    assert result.human_summary.startswith("Behavioral health clinic software comparison")
+    assert "Answer\nThe source-backed match surfaced" in result.human_summary
+    assert "Detailed Summary\n" in result.human_summary
+    assert "https://example.com/behavioral-health-partnership" in result.human_summary
+    assert "Source evidence" in result.human_summary
+    assert "Opportunity Scout attached" not in result.human_summary
+    assert "Deterministic opportunity source-backed summary rendered." in result.audit_notes
+    assert result.artifact_refs[0].metadata["source_context_status"] == {
+        "selected_url_count": 1,
+        "extracted_url_count": 1,
+        "evidence_url_count": 1,
+        "snippet_only_url_count": 0,
+        "statuses": ["extracted"],
+    }
+
+
+def test_formal_opportunity_gates_filter_adjacent_or_untimed_records(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    captured_kwargs: dict[str, object] = {}
+
+    def record(
+        *,
+        company_name: str,
+        opportunity_type: str,
+        source_title: str,
+        supported_signal: str,
+        url: str,
+        evidence_excerpt: str = "",
+    ) -> OpportunityRecord:
+        return OpportunityRecord(
+            company_name=company_name,
+            opportunity_type=opportunity_type,
+            priority_score=88,
+            why_now_signal=supported_signal,
+            recommended_next_step="Review eligibility and source evidence before action.",
+            keystone_fit_reason="Keystone could assess clinical validation fit.",
+            outside_consulting_likelihood=60,
+            handoff_to_business_research_analyst=True,
+            sources=[
+                OpportunitySource(
+                    title=source_title,
+                    url=url,
+                    source_type="government",
+                    supported_signal=supported_signal,
+                    evidence_excerpt=evidence_excerpt,
+                )
+            ],
+        )
+
+    def fake_run_live(**kwargs: object):
+        captured_kwargs.update(kwargs)
+        return (
+            OpportunityScoutResult(
+                topic="formal opportunity scan",
+                dry_run=False,
+                records=[
+                    record(
+                        company_name="NIMH",
+                        opportunity_type="grant or collaboration opportunity",
+                        source_title="NIMH SBIR funding opportunity",
+                        supported_signal=(
+                            "NIMH SBIR grant applications for small businesses are due "
+                            "June 20, 2026."
+                        ),
+                        url="https://www.nimh.nih.gov/funding/sbir",
+                        evidence_excerpt=(
+                            "The NIMH SBIR source lists June 20, 2026 as a due date "
+                            "for small-business grant applications."
+                        ),
+                    ),
+                    record(
+                        company_name="NIMH",
+                        opportunity_type="grant or collaboration opportunity",
+                        source_title=(
+                            "Advancing Learning Health Care Research in Outpatient "
+                            "Mental Health Treatment Settings"
+                        ),
+                        supported_signal=(
+                            "NIMH R34 clinical trial optional applications are due "
+                            "June 20, 2026 for outpatient mental health research."
+                        ),
+                        url="https://simpler.grants.gov/opportunity/357327",
+                    ),
+                    record(
+                        company_name="Example Health",
+                        opportunity_type="behavioral health AI",
+                        source_title="Example Health partnership announcement",
+                        supported_signal=(
+                            "Example Health announced a behavioral health AI partnership "
+                            "in May 2026."
+                        ),
+                        url="https://example.com/news/partnership",
+                    ),
+                    record(
+                        company_name="Digital Health Fund",
+                        opportunity_type="grant or collaboration opportunity",
+                        source_title="Digital health grant opportunity",
+                        supported_signal=(
+                            "Digital health grant opportunity for measurement-based care."
+                        ),
+                        url="https://example.org/grants/digital-health",
+                    ),
+                ],
+            ),
+            {
+                "debug_notes": ["fake formal opportunity retrieval"],
+                "retrieval_diagnostics": {"provider_summary": "searxng+agents-web-search"},
+            },
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fake_run_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "opportunity scout find up to 3 source-backed grant, RFP, pilot, "
+                "or call-for-proposals opportunities related to behavioral health AI. "
+                "Include only opportunities with sponsor, deadline or timing signal, "
+                "fit rationale, and source URL. Do not pad weak results."
+            ),
+            database_url=database_url,
+            save=True,
+            live_search=True,
+            max_results=3,
+            requested_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+            external_context={
+                "schema": "keystone.slack.selected_message_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1715366400.000100",
+            },
+        )
+    )
+
+    events = SQLiteStore(database_url).list_work_item_events(result.work_item.id)
+    advance_started = next(event for event in events if event.event_type == "advance_started")
+    gate_event = next(
+        event for event in events if event.event_type == "opportunity_candidate_gates_applied"
+    )
+
+    assert captured_kwargs["agents_web_search_max_calls"] == 4
+    assert captured_kwargs["agents_web_search_parallel"] is False
+    assert captured_kwargs["verify_source_pages"] is True
+    assert advance_started.metadata["cost_profile"] == "slack_opportunity_deep"
+    assert advance_started.metadata["allow_manager_loop_repair"] is True
+    assert len(result.artifact_refs) == 1
+    assert result.artifact_refs[0].title == "NIMH"
+    retained_source = result.artifact_refs[0].metadata["source_refs"][0]
+    assert "June 20, 2026" in retained_source["evidence_excerpt"]
+    assert gate_event.metadata["retained_record_count"] == 1
+    assert gate_event.metadata["review_candidate_count"] == 3
+    assert gate_event.metadata["gates"] == [
+        "formal_opportunity_type_evidence",
+        "deadline_or_timing_evidence",
+        "source_url",
+        "sponsor",
+        "keystone_applicability_evidence",
+    ]
+    assert result.next_action is not None
+    assert result.next_action.agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+
+
+def test_formal_opportunity_gates_filter_explicit_non_nofo_topic_page(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+
+    def fake_run_live(**_kwargs: object):
+        return (
+            OpportunityScoutResult(
+                topic="youth mental health AI safety opportunities",
+                dry_run=False,
+                records=[
+                    OpportunityRecord(
+                        company_name="School Mental and Behavioral Health",
+                        opportunity_type="grant or collaboration opportunity",
+                        priority_score=82,
+                        why_now_signal=(
+                            "Apr 22, 2026. This is not a notice of funding opportunity "
+                            "(NOFO). Apply through an appropriate NIH Parent Funding "
+                            "Announcement or another broad NIH opportunity."
+                        ),
+                        recommended_next_step=(
+                            "Review broad NIH parent announcements before taking action."
+                        ),
+                        keystone_fit_reason=(
+                            "Keystone could evaluate behavioral health AI safety if a "
+                            "concrete eligible opportunity exists."
+                        ),
+                        outside_consulting_likelihood=40,
+                        handoff_to_business_research_analyst=False,
+                        sources=[
+                            OpportunitySource(
+                                title="School Mental and Behavioral Health",
+                                url=(
+                                    "https://grants.nih.gov/funding/find-a-fit-for-your-"
+                                    "research/highlighted-topics/11"
+                                ),
+                                source_type="government",
+                                supported_signal=(
+                                    "This is not a notice of funding opportunity (NOFO)."
+                                ),
+                                evidence_excerpt=(
+                                    "This is not a notice of funding opportunity (NOFO). "
+                                    "Apply through an appropriate NIH Parent Funding "
+                                    "Announcement."
+                                ),
+                            )
+                        ],
+                    )
+                ],
+            ),
+            {
+                "debug_notes": ["fake highlighted-topic retrieval"],
+                "retrieval_diagnostics": {"provider_summary": "searxng+exa+tavily"},
+            },
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fake_run_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "opportunity scout do a deeper read-only search for active or recently "
+                "announced grant, pilot, RFP, or partnership opportunities around youth "
+                "mental health AI safety where Keystone could plausibly participate or "
+                "partner. Do not pad weak results."
+            ),
+            database_url=database_url,
+            save=True,
+            live_search=True,
+            max_results=3,
+            requested_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        )
+    )
+
+    events = SQLiteStore(database_url).list_work_item_events(result.work_item.id)
+    gate_event = next(
+        event for event in events if event.event_type == "opportunity_candidate_gates_applied"
+    )
+
+    assert result.artifact_refs == []
+    assert result.next_action is not None
+    assert result.next_action.action == "broaden_opportunity_search"
+    assert "no strong exact matches" in result.human_summary.lower()
+    assert "not a concrete funding/RFP/pilot opportunity" in result.human_summary
+    assert gate_event.metadata["retained_record_count"] == 0
+    assert gate_event.metadata["review_candidate_count"] == 1
 
 
 def test_manager_loop_blocks_crm_write_boundary_on_opportunity_request(
@@ -1131,8 +4362,7 @@ def test_manager_loop_blocks_crm_write_boundary_on_opportunity_request(
         if event.event_type == "manager_loop_completed"
     ]
     missing_codes = {
-        item["code"]
-        for item in completion_events[-1].metadata["missing_required_stages"]
+        item["code"] for item in completion_events[-1].metadata["missing_required_stages"]
     }
 
     assert "manager_loop_crm_write_blocked" in blocker_codes
@@ -1189,16 +4419,21 @@ def test_orchestrator_test_pack_prompts_enter_safe_specialist_manager_loop(
             assert "Agents used or proposed:" in result.human_summary
             assert "Top findings:" in result.human_summary
             assert "Additional input that would improve the next run:" in result.human_summary
-        elif spec_id in {"OR-1", "OR-2", "OR-3", "OR-5"}:
+        elif spec_id == "OR-3":
             assert result.status == WorkItemStatus.BLOCKED, spec_id
             assert result.blockers, spec_id
+        elif spec_id in {"OR-1", "OR-2", "OR-5"}:
+            assert result.status == WorkItemStatus.DONE, spec_id
+            assert result.blockers == [], spec_id
         else:
             assert result.status == WorkItemStatus.IN_PROGRESS, spec_id
             assert result.blockers == [], spec_id
         assert review_events, spec_id
         assert review_events[0].metadata["route"] == expected_first_route
         assert review_events[0].metadata["route"] != WorkItemRoute.OUTREACH_COMPOSER.value
-        assert all(gate.approval_state.value != "approved" for gate in result.work_item.approval_gates)
+        assert all(
+            gate.approval_state.value != "approved" for gate in result.work_item.approval_gates
+        )
 
 
 def test_orchestrator_connected_workflow_records_missing_downstream_stage_blockers(
@@ -1231,15 +4466,12 @@ def test_orchestrator_connected_workflow_records_missing_downstream_stage_blocke
     ]
     blocker_codes = {blocker.code for blocker in result.blockers}
     missing_codes = {
-        item["code"]
-        for item in completion_events[-1].metadata["missing_required_stages"]
+        item["code"] for item in completion_events[-1].metadata["missing_required_stages"]
     }
 
-    assert result.status == WorkItemStatus.BLOCKED
-    assert "manager_loop_gmail_context_not_checked" in blocker_codes
-    assert "manager_loop_outreach_not_drafted" in blocker_codes
-    assert "manager_loop_scorecard_not_generated" in blocker_codes
-    assert missing_codes <= blocker_codes
+    assert result.status == WorkItemStatus.DONE
+    assert blocker_codes == set()
+    assert missing_codes == set()
 
 
 def test_find_and_send_workitem_preserves_count_and_send_blocker(
@@ -1267,8 +4499,7 @@ def test_find_and_send_workitem_preserves_count_and_send_blocker(
     ]
     blocker_codes = {blocker.code for blocker in result.blockers}
     missing_codes = {
-        item["code"]
-        for item in completion_events[-1].metadata["missing_required_stages"]
+        item["code"] for item in completion_events[-1].metadata["missing_required_stages"]
     }
 
     assert manual_plan.desired_count == 3
@@ -1303,8 +4534,7 @@ def test_gmail_workitem_route_blocks_for_context_without_unsupported_route(
     blocker_codes = {blocker.code for blocker in result.blockers}
     completion_events = [event for event in events if event.event_type == "manager_loop_completed"]
     missing_codes = {
-        item["code"]
-        for item in completion_events[-1].metadata["missing_required_stages"]
+        item["code"] for item in completion_events[-1].metadata["missing_required_stages"]
     }
 
     assert manual_plan.target_agent == "gmail_triage"
@@ -1369,12 +4599,20 @@ def test_gmail_workitem_inline_email_completes_read_only_triage_without_gmail_wr
     assert result.artifact_refs[0].metadata["draft_created"] is False
     assert result.artifact_refs[0].metadata["labels_modified"] is False
     assert result.artifact_refs[0].metadata["send_enabled"] is False
+    assert "risk_flags" in result.artifact_refs[0].metadata
     assert "No Gmail draft, label, send" in result.human_summary
     assert result.next_action is not None
     assert result.next_action.action == "review_gmail_triage"
     assert advance_started.metadata["cost_profile"] == "slack_context_light"
     assert advance_started.metadata["hosted_web_search_max_calls"] == 0
     assert artifact_events
+    gate_event = next(
+        event for event in events if event.event_type == "skill_contract_gates_checked"
+    )
+    gate = gate_event.metadata["gates"][0]
+    assert gate["gate_id"] == "gmail_sensitive_message_gate"
+    assert gate["status"] == "passed"
+    assert gate["evidence"]["unsafe_flags"] == []
 
 
 @pytest.mark.parametrize("spec_id", ["GT-1", "GT-2", "GT-3", "GT-4"])
@@ -1448,9 +4686,7 @@ def test_company_comparison_workitem_creates_comparison_not_fake_profile(
     assert manual_plan.primary_target == "Lindus Health vs Holmusk"
     assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     assert result.advanced is True
-    assert [artifact.artifact_type for artifact in result.artifact_refs] == [
-        "company_comparison"
-    ]
+    assert [artifact.artifact_type for artifact in result.artifact_refs] == ["company_comparison"]
     assert result.artifact_refs[0].title == "Lindus Health vs Holmusk"
     assert result.work_item.target.name == "Lindus Health vs Holmusk"
     assert "Compare Lindus Health and Holmusk" not in result.work_item.target.name
@@ -1482,6 +4718,12 @@ def test_manager_loop_reviews_chief_of_staff_runs(tmp_path: Path) -> None:
     assert review_events
     assert review_events[0].metadata["route"] == WorkItemRoute.CHIEF_OF_STAFF.value
     assert "Manager loop review" in " ".join(result.work_item.audit_notes)
+    gate_event = next(
+        event for event in events if event.event_type == "skill_contract_gates_checked"
+    )
+    gate = gate_event.metadata["gates"][0]
+    assert gate["gate_id"] == "chief_artifact_publish_gate"
+    assert gate["status"] == "passed"
 
 
 def test_advance_work_item_context_pack_includes_approved_memory_without_live_mode(
@@ -1839,6 +5081,7 @@ def test_advance_work_item_zotero_article_live_sdk_synthesizes_extracted_page(
         assert "Source ID: web_search:1" in prompt
         assert "randomized pivotal trial" in prompt
         assert kwargs["live"] is True
+        assert kwargs["tool_tier"] == "deep_retrieval"
         output = ResearchBrief(
             target_name="NCT06976697 Lindus/Sooma trial",
             target_type="zotero_article",
@@ -1993,6 +5236,9 @@ def test_advance_work_item_opportunity_scout_attaches_opportunity_artifacts(
     assert result.work_item.sources
     assert result.artifact_refs[0].metadata["source_refs"]
     assert result.artifact_refs[0].metadata["source_refs"][0]["url"]
+    assert result.artifact_refs[0].metadata["source_context_status"]["selected_url_count"] >= 1
+    assert result.artifact_refs[0].metadata["source_context_status"]["extracted_url_count"] == 0
+    assert result.artifact_refs[0].metadata["source_refs"][0]["extraction_status"] == "snippet_only"
     assert result.next_action is not None
     assert result.next_action.agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
 
@@ -2189,6 +5435,140 @@ def test_manager_loop_keeps_strict_opportunity_no_match_advisory_not_blocked(
     assert completed_event.metadata["missing_required_stages"] == []
 
 
+def test_manager_loop_broadens_natural_opportunity_no_match_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    retrieval_hints: list[object] = []
+
+    def fake_run_live(**kwargs: object):
+        calls.append(str(kwargs.get("topic") or ""))
+        retrieval_hints.append(kwargs.get("retrieval_hint"))
+        if len(calls) == 1:
+            return (
+                OpportunityScoutResult(
+                    topic="AI-enabled behavioral health opportunities",
+                    dry_run=False,
+                    constraint_relaxation_suggestion=(
+                        "Broaden from exact RFP/grant wording to pilots, partner programs, "
+                        "and recently announced implementation opportunities."
+                    ),
+                ),
+                {"debug_notes": ["fake empty first pass"]},
+            )
+        return (
+            OpportunityScoutResult(
+                topic="AI-enabled behavioral health opportunities",
+                dry_run=False,
+                records=[
+                    OpportunityRecord(
+                        company_name="Behavioral Health AI Pilot Program",
+                        opportunity_type="contract or RFP opportunity",
+                        priority_score=89,
+                        why_now_signal=(
+                            "Recently announced behavioral health AI pilot with "
+                            "implementation partner participation."
+                        ),
+                        recommended_next_step="Review eligibility and sponsor fit.",
+                        keystone_fit_reason=(
+                            "Keystone could plausibly support clinical AI evaluation "
+                            "and measurement-based care implementation."
+                        ),
+                        outside_consulting_likelihood=70,
+                        handoff_to_business_research_analyst=False,
+                        sources=[
+                            OpportunitySource(
+                                title="Behavioral Health AI Pilot Notice",
+                                url="https://example.gov/behavioral-health-ai-pilot",
+                                source_type="government",
+                                supported_signal=(
+                                    "The notice describes a behavioral health AI pilot "
+                                    "and invites implementation partners."
+                                ),
+                                evidence_excerpt=(
+                                    "Pilot notice for AI-enabled behavioral health "
+                                    "implementation, measurement-based care evaluation, "
+                                    "and partner participation."
+                                ),
+                            )
+                        ],
+                    )
+                ],
+            ),
+            {
+                "debug_notes": ["fake broadened second pass"],
+                "retrieval_diagnostics": {"provider_summary": "searxng+exa+tavily"},
+            },
+        )
+
+    class FakeReview:
+        status = "pass"
+        overall_score = 90
+        approval_boundary_ok = True
+        observed_gaps: list[str] = []
+        recommended_next_step = "Ready for review."
+
+    monkeypatch.setattr("keystone_agents.workflow_runner.run_opportunity_scout_live", fake_run_live)
+    monkeypatch.setattr(workflow_runner, "review_specialist_output", lambda **_kwargs: FakeReview())
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                "opportunity scout do a deeper read-only search for active or recently "
+                "announced pilot, RFP, or grant opportunities around AI-enabled behavioral "
+                "health, measurement-based care, or digital psychiatry where Keystone could "
+                "plausibly participate or partner."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            max_results=1,
+            manual_request_plan={
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": "AI-enabled behavioral health opportunities",
+                "constraints": ["pilot", "RFP", "grant", "recent"],
+                "task_objective": "opportunity_discovery",
+            },
+        ),
+        max_steps=2,
+    )
+
+    events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(result.work_item.id)
+    review_events = [event for event in events if event.event_type == "manager_loop_review"]
+
+    assert calls == [
+        "AI-enabled behavioral health opportunities",
+        "AI-enabled behavioral health opportunities",
+    ]
+    assert retrieval_hints[0] is None
+    assert retrieval_hints[1] is not None
+    assert retrieval_hints[1].needs_precision_search is True
+    assert retrieval_hints[1].needs_search_review is True
+    assert result.status == WorkItemStatus.DONE
+    assert result.artifact_refs
+    assert result.artifact_refs[0].title == "Behavioral Health AI Pilot Program"
+    assert "Behavioral health opportunity comparison" in result.human_summary
+    assert "Behavioral Health AI Pilot Program" in result.human_summary
+    assert "https://example.gov/behavioral-health-ai-pilot" in result.human_summary
+    assert review_events[0].metadata["review_decision"] == "repair"
+    assert review_events[0].metadata["observed_gaps"] == [
+        (
+            "Opportunity Scout found no retained source-backed opportunities for "
+            "this broad/deep search; broaden or deepen retrieval before finalizing "
+            "the opportunity scan."
+        )
+    ]
+    assert review_events[-1].metadata["review_decision"] == "pass"
+    repair_started = next(
+        event for event in events if event.event_type == "manager_loop_repair_started"
+    )
+    assert repair_started.metadata["search_repair_hint"] == (
+        "broaden_or_deepen_search_within_cost_profile"
+    )
+
+
 def test_work_item_records_orchestrator_preflight_sdk_usage(
     tmp_path: Path,
 ) -> None:
@@ -2236,10 +5616,7 @@ def test_work_item_records_orchestrator_preflight_sdk_usage(
     sdk_event = next(event for event in events if event.event_type == "workflow_sdk_usage")
 
     assert sdk_event.metadata["agent_name"] == "manual_request_planner"
-    assert (
-        sdk_event.metadata["run_stage"]
-        == "orchestrator_preflight.manual_request_planner"
-    )
+    assert sdk_event.metadata["run_stage"] == "orchestrator_preflight.manual_request_planner"
     assert sdk_event.metadata["usage"]["cache_hit_rate"] == 0.25
     assert sdk_event.metadata["cost"]["estimated_usd"] == 0.004
     assert sdk_event.metadata["request_cache"]["static_prefix_sha256"] == "preflight-static"
@@ -2406,7 +5783,9 @@ def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
         result.artifact_refs[0].metadata["retrieval_diagnostics"]["provider_summary"] == "searxng"
     )
     events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(result.work_item.id)
-    retrieval_event = next(event for event in events if event.event_type == "workflow_retrieval_usage")
+    retrieval_event = next(
+        event for event in events if event.event_type == "workflow_retrieval_usage"
+    )
     planner_event = next(
         event
         for event in events
@@ -2747,6 +6126,56 @@ def test_current_year_business_research_deepens_initial_query_plan(
     assert "current-activity query deepening" in " ".join(result.audit_notes).lower()
 
 
+def test_deeper_business_research_uses_deep_quality_budget(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_retrieve_company_profile_live(*, company: str, **kwargs: object):
+        captured["company"] = company
+        captured["max_results"] = kwargs.get("max_results")
+        captured["agents_web_search_max_calls"] = kwargs.get("agents_web_search_max_calls")
+        return research_company_fixture(company_name=company), {
+            "debug_notes": ["fake deep retrieval"]
+        }
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.retrieve_company_profile_live",
+        fake_retrieve_company_profile_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "business research analyst do a deeper source-backed search on OpenAI "
+                "mental health work. Please synthesize the source data, include visible "
+                "source URLs, and compare what the deeper lanes add."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            manual_request_plan={
+                "source": "llm",
+                "requested_agent": "business_research_analyst",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "OpenAI",
+            },
+        )
+    )
+
+    assert result.advanced is True
+    assert captured["company"] == "OpenAI"
+    assert captured["max_results"] == 8
+    assert captured["agents_web_search_max_calls"] == 2
+    audit_text = " ".join(result.audit_notes).lower()
+    assert "quality budget applied for business_research_analyst" in audit_text
+    assert "mode=deep" in audit_text
+    assert "tool_tier=deep_retrieval" in audit_text
+
+
 def test_current_year_business_research_focuses_latest_followup_query_terms(
     tmp_path: Path,
     monkeypatch,
@@ -2815,7 +6244,7 @@ def test_manager_loop_warns_current_research_with_only_company_controlled_source
                         source_type="fixture",
                         supported_claims=["Fixture input identifies the company."],
                         confidence=0.7,
-                    )
+                    ),
                 ]
             }
         )
@@ -2851,14 +6280,16 @@ def test_manager_loop_warns_current_research_with_only_company_controlled_source
         max_steps=2,
     )
 
-    assert result.status == WorkItemStatus.IN_PROGRESS
-    assert not any(blocker.code == "manager_loop_review_failed" for blocker in result.blockers)
+    assert result.status == WorkItemStatus.BLOCKED
+    assert any(blocker.code == "manager_loop_review_failed" for blocker in result.blockers)
     events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(result.work_item.id)
     review_events = [event for event in events if event.event_type == "manager_loop_review"]
     review_event = review_events[-1]
-    assert review_event.metadata["review_decision"] == "warn"
-    assert review_event.metadata["advisory"] is True
-    assert any("Limited independent evidence" in gap for gap in review_event.metadata["observed_gaps"])
+    assert review_event.metadata["review_decision"] == "block"
+    assert review_event.metadata["blocking"] is True
+    assert any(
+        "Limited independent evidence" in gap for gap in review_event.metadata["observed_gaps"]
+    )
 
 
 def test_manager_loop_repairs_current_research_once_before_blocking(
@@ -2866,9 +6297,15 @@ def test_manager_loop_repairs_current_research_once_before_blocking(
     monkeypatch,
 ) -> None:
     calls: list[str] = []
+    retrieval_hints: list[object] = []
+    second_pass_queries: list[str] = []
 
-    def fake_retrieve_company_profile_live(*, company: str, **_: object):
+    def fake_retrieve_company_profile_live(*, company: str, **kwargs: object):
         calls.append(company)
+        retrieval_hints.append(kwargs.get("retrieval_hint"))
+        query_builder = kwargs.get("query_builder")
+        if len(calls) == 2 and callable(query_builder):
+            second_pass_queries.extend(query_builder(company, None))
         source = (
             SourceRecord(
                 source_id="company:about",
@@ -2927,11 +6364,29 @@ def test_manager_loop_repairs_current_research_once_before_blocking(
     review_events = [event for event in events if event.event_type == "manager_loop_review"]
 
     assert calls == ["OpenEvidence", "OpenEvidence"]
-    assert result.status == WorkItemStatus.IN_PROGRESS
+    assert retrieval_hints[0] is None
+    assert retrieval_hints[1] is not None
+    assert retrieval_hints[1].needs_precision_search is True
+    assert any("independent coverage funding partnership" in query for query in second_pass_queries)
+    assert result.status == WorkItemStatus.DONE
     assert not any(blocker.code == "manager_loop_review_failed" for blocker in result.blockers)
     assert review_events[0].metadata["review_decision"] == "repair"
     assert review_events[-1].metadata["review_decision"] == "pass"
-    assert any(event.event_type == "manager_loop_repair_started" for event in events)
+    repair_started = next(
+        event for event in events if event.event_type == "manager_loop_repair_started"
+    )
+    assert repair_started.metadata["search_repair_hint"] == (
+        "broaden_or_deepen_search_within_cost_profile"
+    )
+    repair_advance_started = [event for event in events if event.event_type == "advance_started"][
+        -1
+    ]
+    assert (
+        repair_advance_started.metadata["external_context"]["manager_loop_repair"][
+            "search_repair_hint"
+        ]
+        == "broaden_or_deepen_search_within_cost_profile"
+    )
     assert any(event.event_type == "manager_loop_repair_completed" for event in events)
 
 
@@ -3053,9 +6508,9 @@ def test_slack_conservative_research_caps_fanout_skips_contacts_and_repair(
     assert calls[0]["agents_web_search_max_calls"] == 1
     assert calls[0]["agents_web_search_parallel"] is False
     assert all(ref.artifact_type != "contact_candidates" for ref in result.artifact_refs)
-    assert result.status == WorkItemStatus.IN_PROGRESS
-    assert review_events[-1].metadata["review_decision"] == "warn"
-    assert review_events[-1].metadata["advisory"] is True
+    assert result.status == WorkItemStatus.BLOCKED
+    assert review_events[-1].metadata["review_decision"] == "block"
+    assert review_events[-1].metadata["blocking"] is True
     assert not any(event.event_type == "manager_loop_repair_started" for event in events)
     assert retrieval_events[-1].metadata["query_count"] <= 12
     assert retrieval_events[-1].metadata["aggregate_usage"]["credits_used"] == 1
@@ -3216,6 +6671,35 @@ def test_slack_deep_research_request_can_escalate_cost_profile() -> None:
     assert request.hosted_web_search_max_calls == 2
     assert request.allow_manager_loop_repair is True
     assert request.include_contact_enrichment is True
+    assert request.reuse_existing_research is False
+
+
+def test_slack_chief_deep_search_request_gets_bounded_manager_repair_profile() -> None:
+    request = workflow_runner._normalize_workflow_request_for_context(
+        WorkflowRunRequest(
+            request_text=(
+                "chief of staff do a deeper source-backed search on mental health AI "
+                "safety features. Return Answer, Detailed Summary, source URLs, and "
+                "compact metadata."
+            ),
+            external_context={
+                "schema": "keystone.slack.selected_message_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1715366400.000100",
+            },
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "chief_of_staff",
+                "target_agent": "chief_of_staff",
+                "intent": "research_brief",
+            },
+        )
+    )
+
+    assert request.cost_profile == "slack_manager_deep"
+    assert request.hosted_web_search_max_calls == 2
+    assert request.allow_manager_loop_repair is True
+    assert request.include_contact_enrichment is False
     assert request.reuse_existing_research is False
 
 
@@ -3548,6 +7032,392 @@ def test_advance_work_item_outreach_blocks_without_approved_context(tmp_path: Pa
     assert result.context_pack["missing_requirements"]
 
 
+def test_thread_local_outreach_draft_can_proceed_without_approved_context(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "outreach composer Read the current Halo Gmail thread, then draft a "
+                "short operator-voice reply in Slack only. Thread-local Slack draft "
+                "only; external delivery, scheduling, publishing, and provider-side "
+                "draft creation are out of scope. Use the operator default writing "
+                "style profile."
+            ),
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    draft_row = store.fetch_all("outreach_drafts")[0]
+
+    assert result.advanced is True
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.DONE
+    assert result.artifact_refs[0].metadata["thread_local_slack_draft"] is True
+    assert result.artifact_refs[0].metadata["approval_queue_created"] is False
+    assert draft_row["email_body"].endswith("Sincerely,\nAnup")
+    assert "Gmail thread body was not available" in result.human_summary
+    assert "no external message was sent" in result.human_summary
+    assert store.count("outreach_drafts") == 1
+    assert store.list_approval_items(object_type="outreach_draft") == []
+
+
+def test_gmail_triage_live_retrieval_reads_recent_matching_threads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queries: list[str] = []
+
+    class FakeGmailTool:
+        def __init__(self, *, live: bool) -> None:
+            assert live is True
+
+        def list_recent_messages(
+            self,
+            *,
+            label: str | None = None,
+            max_results: int = 1,
+            query: str | None = None,
+        ) -> list[dict[str, str]]:
+            assert label is None
+            assert max_results >= 3
+            queries.append(query or "")
+            return [
+                {"id": "msg-old", "threadId": "thread-old"},
+                {"id": "msg-new", "threadId": "thread-new"},
+            ]
+
+        def get_thread(self, thread_id: str) -> dict[str, object]:
+            if thread_id == "thread-new":
+                return {
+                    "thread_id": "thread-new",
+                    "subject": "Halo follow up",
+                    "summary": "Halo asked for a quick reply about next steps.",
+                    "thread_context": "Most recent Halo note asks whether Anup can review.",
+                    "message_count": 2,
+                    "latest_received_at": "2026-05-31T14:30:00Z",
+                    "participants": ["Halo <hello@halo.example>", "Anup <wisegrow05@gmail.com>"],
+                    "action_items": ["Reply to Halo with availability."],
+                    "open_questions": ["Can Anup take a look?"],
+                    "messages": [
+                        {
+                            "id": "msg-new",
+                            "received_at": "2026-05-31T14:30:00Z",
+                            "sender_name": "Halo",
+                            "sender_email": "hello@halo.example",
+                            "subject": "Halo follow up",
+                            "snippet": "Can you take a look?",
+                            "thread_summary": "Halo asked Anup to take a look.",
+                        }
+                    ],
+                }
+            return {
+                "thread_id": "thread-old",
+                "subject": "Older Halo note",
+                "summary": "Older Halo context.",
+                "thread_context": "Older Halo context.",
+                "message_count": 1,
+                "latest_received_at": "2026-05-20T12:00:00Z",
+                "participants": ["Halo <hello@halo.example>"],
+                "messages": [],
+            }
+
+    monkeypatch.setattr(workflow_runner, "GmailTool", FakeGmailTool)
+    monkeypatch.setattr(workflow_runner, "cli_default_live_gmail", lambda: True)
+
+    result = workflow_runner._advance_work_item_one_step(
+        WorkflowRunRequest(
+            request_text=(
+                "Read the current Halo email in my wisegrow05@gmail.com inbox, then "
+                "draft a short reply here."
+            ),
+            requested_route=WorkItemRoute.GMAIL_TRIAGE,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=True,
+            max_results=3,
+        ),
+        synthesize_user_response=False,
+    )
+
+    assert result.route == WorkItemRoute.GMAIL_TRIAGE
+    assert result.status == WorkItemStatus.IN_PROGRESS
+    assert result.next_action is not None
+    assert result.next_action.agent == WorkItemRoute.OUTREACH_COMPOSER
+    assert "Halo" in queries[0]
+    assert "in:inbox" in queries[0]
+    assert "wisegrow05@gmail.com" not in queries[0]
+    assert result.artifact_refs[0].metadata["selected_thread_id"] == "thread-new"
+    assert result.artifact_refs[0].metadata["matched_thread_count"] == 2
+
+
+def test_chief_of_staff_email_reply_workflow_delegates_to_gmail_then_outreach(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeGmailTool:
+        def __init__(self, *, live: bool) -> None:
+            assert live is True
+
+        def list_recent_messages(self, **_kwargs: object) -> list[dict[str, str]]:
+            return [{"id": "msg-halo", "threadId": "thread-halo"}]
+
+        def get_thread(self, thread_id: str) -> dict[str, object]:
+            assert thread_id == "thread-halo"
+            return {
+                "thread_id": "thread-halo",
+                "subject": "Halo partnership note",
+                "summary": "Halo asked if Anup can review a short partnership note.",
+                "thread_context": "Halo wants a concise acknowledgement and next step.",
+                "message_count": 1,
+                "latest_received_at": "2026-05-31T15:00:00Z",
+                "participants": ["Halo <hello@halo.example>", "Anup <wisegrow05@gmail.com>"],
+                "action_items": ["Acknowledge and say Anup can take a look."],
+                "open_questions": ["Can Anup review the partnership note?"],
+                "messages": [
+                    {
+                        "id": "msg-halo",
+                        "received_at": "2026-05-31T15:00:00Z",
+                        "sender_name": "Halo",
+                        "sender_email": "hello@halo.example",
+                        "subject": "Halo partnership note",
+                        "snippet": "Could you review this?",
+                        "thread_summary": "Halo asked for review.",
+                    }
+                ],
+            }
+
+    def fake_run_chief_of_staff_sdk(
+        sdk_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult[object]:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=workflow_runner.plan_chief_of_staff_request(str(sdk_input["request"])),
+            raw_result=None,
+            live=True,
+            usage={
+                "requests": 1,
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "total_tokens": 1100,
+            },
+            cost={
+                "estimated_usd": 0.0042,
+                "amount_usd": 0.0042,
+                "pricing_provider": "openai",
+                "pricing_model": "gpt-test",
+            },
+            request_cache={"prompt_cache_key_hash": "chief-cost-test"},
+        )
+
+    monkeypatch.setattr(workflow_runner, "GmailTool", FakeGmailTool)
+    monkeypatch.setattr(workflow_runner, "cli_default_live_gmail", lambda: True)
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(
+        workflow_runner,
+        "_maybe_synthesize_user_facing_response",
+        lambda result, **_kwargs: result,
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                "chief of staff read the current Halo email in my inbox and draft a "
+                "short reply here."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=True,
+        ),
+        max_steps=3,
+    )
+
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.DONE
+    assert "whether Anup can review the partnership note" in result.human_summary
+    assert "Heading: Draft email for Halo" in result.human_summary
+    assert "To: hello@halo.example" in result.human_summary
+    assert "Context:" not in result.human_summary
+    assert "Triage: direct ask/action detected" not in result.human_summary
+    assert "Sincerely,\nAnup" in result.human_summary
+    assert result.artifact_refs[0].metadata["thread_local_slack_draft"] is True
+    assert result.artifact_refs[0].metadata["recipient_email"] == "hello@halo.example"
+    assert result.artifact_refs[0].metadata["boundary_summary"].startswith("Slack-thread-only")
+    assert any(
+        "Triage: direct ask/action detected" in line
+        for line in result.artifact_refs[0].metadata["thread_context_lines"]
+    )
+    assert "Source IDs used" not in result.human_summary
+    assert "Missing or blocked context" not in result.human_summary
+    events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(result.work_item.id)
+    chief_cost_event = next(
+        event
+        for event in events
+        if event.event_type == "workflow_sdk_usage"
+        and event.metadata.get("run_stage") == "chief_of_staff.live_sdk"
+    )
+    assert chief_cost_event.metadata["cost"]["estimated_usd"] == 0.0042
+
+
+def test_chief_of_staff_email_reply_recovers_from_live_schema_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeGmailTool:
+        def __init__(self, *, live: bool) -> None:
+            assert live is True
+
+        def list_recent_messages(self, **_kwargs: object) -> list[dict[str, str]]:
+            return [{"id": "msg-halo", "threadId": "thread-halo"}]
+
+        def get_thread(self, thread_id: str) -> dict[str, object]:
+            assert thread_id == "thread-halo"
+            return {
+                "thread_id": "thread-halo",
+                "subject": "Halo partnership note",
+                "summary": "Halo asked whether Anup can review a short note.",
+                "thread_context": "Halo wants a concise acknowledgement.",
+                "message_count": 1,
+                "latest_received_at": "2026-05-31T15:00:00Z",
+                "participants": ["Anna <anna@halo.example>", "Anup <wisegrow05@gmail.com>"],
+                "open_questions": ["Can Anup review the note?"],
+                "messages": [
+                    {
+                        "id": "msg-halo",
+                        "received_at": "2026-05-31T15:00:00Z",
+                        "sender_name": "Anna",
+                        "sender_email": "anna@halo.example",
+                        "subject": "Halo partnership note",
+                        "snippet": "Can you review this?",
+                        "thread_summary": "Halo asked for review.",
+                    }
+                ],
+            }
+
+    def broken_live_chief_of_staff(*_args: object, **_kwargs: object) -> object:
+        raise ValueError('Invalid JSON when parsing {"agent_name":"chief_of_staff"')
+
+    database_url = _database_url(tmp_path)
+    monkeypatch.setattr(workflow_runner, "GmailTool", FakeGmailTool)
+    monkeypatch.setattr(workflow_runner, "cli_default_live_gmail", lambda: True)
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_chief_of_staff_sdk",
+        broken_live_chief_of_staff,
+    )
+    monkeypatch.setattr(
+        workflow_runner,
+        "_maybe_synthesize_user_facing_response",
+        lambda result, **_kwargs: result,
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                "chief of staff read the most recent Halo email thread and draft "
+                "a short Slack-thread-only reply. Also keep track of this run costs."
+            ),
+            database_url=database_url,
+            save=True,
+            live_sdk=True,
+        ),
+        max_steps=3,
+    )
+
+    events = SQLiteStore(database_url).list_work_item_events(result.work_item.id)
+
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.DONE
+    assert "Hi Anna," in result.human_summary
+    assert "Cost tracking: requested" not in result.human_summary
+    assert result.artifact_refs[0].metadata["cost_tracking_requested"] is True
+    fallback_event = next(
+        event for event in events if event.event_type == "chief_of_staff_live_sdk_fallback"
+    )
+    assert fallback_event.metadata["safe_to_continue"] is True
+    assert "Invalid JSON" in fallback_event.metadata["reason"]
+
+
+def test_thread_local_gmail_draft_omits_marketing_snippet_from_reply_focus() -> None:
+    summary = workflow_runner.GmailThreadSummaryResult(
+        thread_id="thread-halo",
+        subject="Welcome to Halo!",
+        summary=(
+            "Our platform makes it easy for innovators to work with industry partners "
+            "and move their science forward. Start by creating a profile."
+        ),
+        participants=["Anna <anna@halo.science>", "Anup <wisegrow05@gmail.com>"],
+        message_count=1,
+    )
+
+    draft = workflow_runner._thread_local_outreach_draft(
+        "draft a short reply here",
+        gmail_thread_context=summary,
+    )
+
+    assert draft.email_body.startswith("Hi Anna,")
+    assert "Our platform makes it easy" not in draft.email_body
+    assert "Start by creating" not in draft.email_body
+    assert "Thanks for reaching out and for the overview of Halo." in draft.email_body
+    assert "if there is a useful fit" in draft.email_body
+    assert draft.blocked_facts == []
+
+
+def test_thread_local_gmail_draft_uses_safe_concrete_detail_when_available() -> None:
+    summary = workflow_runner.GmailThreadSummaryResult(
+        thread_id="thread-halo",
+        subject="Welcome to Halo!",
+        thread_context=(
+            "Start by creating a Partner Listing. Or, respond to active requests on Halo."
+        ),
+        participants=["Anna <anna@halo.science>", "Anup <wisegrow05@gmail.com>"],
+        message_count=1,
+    )
+
+    draft = workflow_runner._thread_local_outreach_draft(
+        "draft a short reply here",
+        gmail_thread_context=summary,
+    )
+
+    assert "Halo's partner listings and active requests" in draft.email_body
+    assert "Start by creating" not in draft.email_body
+
+
+def test_thread_local_gmail_summary_keeps_email_fields_in_main_body() -> None:
+    summary = workflow_runner.GmailThreadSummaryResult(
+        thread_id="thread-halo",
+        subject="Welcome to Halo!",
+        participants=["Anna <anna@halo.science>", "Anup <wisegrow05@gmail.com>"],
+        message_count=1,
+        latest_received_at="2026-05-31T12:01:53Z",
+    )
+    draft = workflow_runner._thread_local_outreach_draft(
+        "draft a short reply here",
+        gmail_thread_context=summary,
+    )
+
+    rendered = workflow_runner._format_outreach_draft_work_item_summary(
+        draft,
+        company_name="Anna",
+        compact_thread_local=True,
+        gmail_thread_context=summary,
+        cost_tracking_requested=True,
+    )
+
+    assert "Heading: Draft email for Anna" in rendered
+    assert "To: anna@halo.science" in rendered
+    assert "Context:" not in rendered
+    assert "Read: 1 message, subject 'Welcome to Halo!', from Anna" not in rendered
+    assert "no direct question or personal action item detected" not in rendered
+    assert "Cost tracking: requested" not in rendered
+    assert "Source IDs used" not in rendered
+
+
 def test_outreach_natural_language_source_context_creates_draft_only_artifact(
     tmp_path: Path,
 ) -> None:
@@ -3589,6 +7459,14 @@ def test_outreach_natural_language_source_context_creates_draft_only_artifact(
     assert company_refs[0].metadata["source_url"] == "https://neuroflow.com"
     assert store.count("outreach_drafts") == 1
     assert any(event.event_type == "inline_outreach_context_attached" for event in events)
+    gate_event = next(
+        event for event in events if event.event_type == "skill_contract_gates_checked"
+    )
+    gate = gate_event.metadata["gates"][0]
+    assert gate["gate_id"] == "outreach_approval_claim_gate"
+    assert gate["status"] == "passed"
+    assert gate["evidence"]["external_approval_gate"] is True
+    assert gate["evidence"]["unsafe_flags"] == []
 
 
 def test_outreach_blocks_from_research_until_context_approved(tmp_path: Path) -> None:

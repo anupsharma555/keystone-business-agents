@@ -24,6 +24,7 @@
   },
   "capabilities": [
     "feedback_jsonl",
+    "operator_failure_payload",
     "selected_context_prior_agent_runs",
     "selected_context_embedded_fallback",
     "write_gate_no_send"
@@ -142,6 +143,50 @@
         "intent"
       ],
       "title": "BusinessAgentActionPayload",
+      "type": "object"
+    },
+    "operator_failure": {
+      "description": "Shared operator-readable failure shape embedded in Slack feedback and results.",
+      "properties": {
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "next_step": {
+          "title": "Next Step",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "retryable": {
+          "default": false,
+          "title": "Retryable",
+          "type": "boolean"
+        },
+        "safe_to_continue": {
+          "default": false,
+          "title": "Safe To Continue",
+          "type": "boolean"
+        },
+        "schema": {
+          "default": "keystone.operator_failure.v1",
+          "title": "Schema",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "summary",
+        "next_step"
+      ],
+      "title": "OperatorFailurePayload",
       "type": "object"
     },
     "selected_message_context": {
@@ -330,6 +375,7 @@
   "schemas": {
     "agent_feedback_event": "keystone.slack.agent_feedback_event.v1",
     "business_agent_action": "keystone.business_agent_action.v1",
+    "operator_failure": "keystone.operator_failure.v1",
     "selected_message_context": "keystone.slack.selected_message_context.v1",
     "write_gate": "keystone.business_agent_write_request.v1"
   },

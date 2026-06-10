@@ -4,20 +4,22 @@ import json
 from pathlib import Path
 
 import pytest
+
 import scripts.handle_slack_agent_action as slack_agent_action_cli
 from keystone_agents.cli import main
 from keystone_agents.models import TypedAgentRunResult
+from keystone_agents.schemas.approval import ApprovalQueueItem
 from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
 )
 from keystone_agents.schemas.work_item import (
+    WorkflowRunResult,
     WorkItem,
     WorkItemKind,
     WorkItemRoute,
     WorkItemStatus,
     WorkItemTarget,
-    WorkflowRunResult,
 )
 from keystone_agents.slack_actions import (
     RUN_AGENT_MESSAGE_CALLBACK_ID,
@@ -414,7 +416,9 @@ def test_modal_submission_passes_prior_thread_runs_to_orchestrator_preflight(
     )
 
     run_result = handle_run_agent_interaction(
-        _modal_submission(private_metadata, task="chief of staff continue this architecture review"),
+        _modal_submission(
+            private_metadata, task="chief of staff continue this architecture review"
+        ),
         database_url=_database_url(tmp_path),
     )
 
@@ -730,8 +734,14 @@ def test_slack_agent_action_cli_emits_structured_error_feedback(
     events = [json.loads(line) for line in captured.err.splitlines() if line.strip()]
     assert output["status"] == "error"
     assert output["send_enabled"] is False
+    assert output["failure"]["schema"] == "keystone.operator_failure.v1"
+    assert output["failure"]["kind"] == "schema_or_parse_error"
+    assert output["next_step"]
     assert events[-1]["event_type"] == "agent_error"
     assert events[-1]["payload"]["send_enabled"] is False
+    assert events[-1]["payload"]["failure"]["schema"] == "keystone.operator_failure.v1"
+    assert events[-1]["payload"]["failure"]["kind"] == "schema_or_parse_error"
+    assert events[-1]["payload"]["next_step"]
 
 
 def test_thread_fetch_failure_warns_but_run_proceeds(tmp_path: Path) -> None:
@@ -1001,3 +1011,75 @@ def test_slack_thread_follow_up_can_reach_chief_of_staff_live_sdk(
     )
     assert orchestrator_context["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
     assert orchestrator_context["slack_context"]["channel_id"] == "C123"
+
+
+def test_slack_natural_followup_with_pending_approval_reaches_workflow(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    SQLiteStore(database_url).save_approval_item(
+        ApprovalQueueItem(
+            id="approval-pending",
+            object_type="outreach_draft",
+            object_id="draft-1",
+            title="Draft approval",
+            summary="Review draft before external use.",
+            source_agent="outreach_composer",
+        )
+    )
+    captured: dict[str, object] = {}
+
+    def fake_manager_loop(request, *, feedback_callback=None):
+        captured["request"] = request
+        slack_context = {
+            "channel_id": "C123",
+            "selected_message_ts": "1715366400.000100",
+            "thread_ts": "1715366400.000100",
+        }
+        work_item = WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="Source follow-up",
+            request_text=request.request_text,
+            current_route=WorkItemRoute.CHIEF_OF_STAFF,
+            target=WorkItemTarget(metadata={"slack_context": slack_context}),
+            status=WorkItemStatus.DONE,
+            last_agent=WorkItemRoute.CHIEF_OF_STAFF.value,
+        )
+        return WorkflowRunResult(
+            work_item=work_item,
+            route=WorkItemRoute.CHIEF_OF_STAFF,
+            status=WorkItemStatus.DONE,
+            advanced=True,
+            human_summary="Allowed natural source follow-up to workflow.",
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_actions.advance_work_item_manager_loop",
+        fake_manager_loop,
+    )
+    modal_result = handle_run_agent_interaction(
+        _message_action_payload(),
+        context_dir=tmp_path / "contexts",
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task="chief of staff continue this prior Slack thread. can u summarize link 1",
+        ),
+        database_url=database_url,
+        context_dir=tmp_path / "contexts",
+    )
+
+    assert run_result.status == WorkItemStatus.DONE.value
+    assert run_result.route == WorkItemRoute.CHIEF_OF_STAFF.value
+    assert "request" in captured
+    forwarded_request = captured["request"]
+    assert forwarded_request.request_text == (
+        "chief of staff continue this prior Slack thread. can u summarize link 1"
+    )
+    preflight = forwarded_request.orchestrator_preflight
+    assert preflight["selected_agent"] == "chief_of_staff"
+    assert preflight["blocked_by_orchestrator"] is False
+    assert preflight["route_result"]["route"] == "chief_of_staff"

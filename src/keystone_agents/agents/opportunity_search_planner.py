@@ -28,8 +28,7 @@ class OpportunitySearchPlannerInput:
             desired_count=self.desired_count,
         )
         planner_context = (
-            "Orchestrator and WorkItem context for this planning pass:\n"
-            f"{self.planner_context}\n\n"
+            f"Orchestrator and WorkItem context for this planning pass:\n{self.planner_context}\n\n"
             if self.planner_context
             else ""
         )

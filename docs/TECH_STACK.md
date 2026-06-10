@@ -22,7 +22,11 @@ Direct provider implementations remain first-class:
 - SearXNG: optional self-hosted or private metasearch through `SearchProvider`; not required for tests.
 - Agents SDK hosted web search: capped parallel discovery lane beside SearXNG
   for default live research when enabled.
-- Serper: optional live web search only when explicitly selected.
+- Exa: AI-oriented semantic search lane for capped deepening when configured,
+  and explicit Exa-first comparison runs.
+- Tavily: optional deeper-research search lane with local credit tracking.
+- Serper: disabled while API credits are unavailable; requires
+  `KEYSTONE_SERPER_ENABLED=true` after credits are restored.
 - Firecrawl: optional live search provider and optional website extraction provider when explicitly configured.
 - Trafilatura: default live-gated website extraction provider for selected company pages.
 - Apify and Browserless: placeholder wrappers only; live operations are not implemented.
@@ -59,11 +63,12 @@ Optional integrations must not be required for tests. They should be introduced 
 
 ## Search Provider Configuration
 
-Dry-run, SearXNG, Agents SDK hosted web search, Serper, Firecrawl, and Tavily
+Dry-run, SearXNG, Agents SDK hosted web search, Exa, Firecrawl, and Tavily
 implement the shared `SearchProvider` interface. Live search is gated by
-`--live-search --no-dry-run`; SearXNG requires `SEARXNG_BASE_URL`, Serper
-requires `SERPER_API_KEY` only when explicitly selected, Firecrawl requires
-`FIRECRAWL_API_KEY`, and Tavily requires `TAVILY_API_KEY`.
+`--live-search --no-dry-run`; SearXNG requires `SEARXNG_BASE_URL`, Exa requires
+`EXA_API_KEY` when selected or enabled as capped deepening, Firecrawl requires
+`FIRECRAWL_API_KEY`, and Tavily requires `TAVILY_API_KEY`. Serper is disabled
+until credits are restored.
 
 Search coverage is measured separately from page extraction. `scripts/run_search_coverage_eval.py`
 compares query-level provider results against expected source lanes and domains in
@@ -74,6 +79,11 @@ Search provider environment names:
 
 ```bash
 SEARCH_PROVIDER=searxng
+EXA_API_KEY=
+EXA_BASE_URL=https://api.exa.ai
+EXA_SERVICE_API_KEY=
+EXA_API_KEY_ID=
+EXA_API_KEY_NAME=default
 SERPER_API_KEY=
 SEARXNG_BASE_URL=http://127.0.0.1:18080
 SEARXNG_API_KEY=
@@ -89,6 +99,10 @@ KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT=850
 KEYSTONE_TAVILY_CREDIT_ENFORCEMENT=warn
 KEYSTONE_TAVILY_USAGE_PATH=
 KEYSTONE_TAVILY_SEARCH_FALLBACK=false
+KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2
+KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT=1000
+KEYSTONE_EXA_SEARCH_FALLBACK=true
+KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2
 KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK=true
 KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL=true
 KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN=2
@@ -102,15 +116,38 @@ Rules for live search providers are the same:
 - no network calls during pytest
 - explicit live flag/config path required before search
 - source links preserved on every factual claim
+- primary discovery lanes are SearXNG, Agents SDK hosted web search, Exa, and
+  Tavily. Search-capable agents call the shared `search_web` tool; Python
+  retrieval policy decides which provider lanes to attempt and records
+  provider diagnostics.
 - when no provider is explicitly selected, the retrieval ladder defaults to
-  SearXNG broad recall plus a capped Agents SDK hosted web-search parallel lane;
-  Serper is reserved for explicit provider selection, and Tavily remains an
-  optional configured deepening provider
+  SearXNG broad recall plus a capped Agents SDK hosted web-search parallel lane.
+  Exa is the capped semantic deepening lane when configured; Tavily is the
+  capped deeper-research lane when explicitly enabled or selected by a formal
+  research/opportunity policy.
+- Trafilatura, Firecrawl, and Crawl4AI are secondary extraction providers for
+  selected URLs after discovery. Playwright/browser diagnostics are rendered-page
+  inspection, not primary search.
+- Serper is disabled while API credits are unavailable. Keep
+  `KEYSTONE_SERPER_ENABLED=false`; set it true only after credits are restored
+  and an explicit Serper comparison is intended.
+- Exa is treated as a metered/free-tier lane. The working assumption is 1,000
+  credits/month, so Exa is capped by
+  `KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN` when enabled. Use explicit
+  `SEARCH_PROVIDER=exa` for provider comparison or targeted Exa-first runs.
+  For Friday API usage reports, `scripts/check_exa_usage.py` can call Exa's
+  admin usage endpoint when `EXA_SERVICE_API_KEY` plus either `EXA_API_KEY_ID`
+  or `EXA_API_KEY_NAME=default` are set;
+  it estimates remaining free-tier credits against
+  `KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT` and links the dashboard for
+  authoritative credit balance review.
 - Tavily credit tracking is warn-by-default: `basic`, `fast`, and `ultra-fast`
   search cost 1 credit/request, `advanced` costs 2, and local monthly usage is
   tracked under the runtime state directory unless `KEYSTONE_TAVILY_USAGE_PATH`
-  overrides it. Set `KEYSTONE_TAVILY_CREDIT_ENFORCEMENT=block` only when a hard
-  local cap is desired.
+  overrides it. SDK search can reach Tavily for explicit deeper-search/provider
+  comparison asks when `TAVILY_API_KEY` is configured, even if broad Tavily
+  fallback is off. Set `KEYSTONE_TAVILY_CREDIT_ENFORCEMENT=block` only when a
+  hard local cap is desired.
 
 Opportunity Scout adds a deterministic search layer on top of `SearchProvider`.
 It builds lane-specific queries for company growth, collaboration, researcher,
@@ -125,13 +162,13 @@ Website extraction is separate from search:
 ```bash
 KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true
 KEYSTONE_WEBSITE_EXTRACTOR=trafilatura
-KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=firecrawl
+KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=crawl4ai
 KEYSTONE_AGENT_HTML_REVIEW=true
 KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2
 KEYSTONE_ENABLE_SOURCE_API_ENRICHMENT=false
 ```
 
-The extractor supports `trafilatura` and `firecrawl`. It should only process
+The extractor supports `trafilatura`, `crawl4ai`, and `firecrawl`. It should only process
 selected URLs, convert extracted text into source-backed claim candidates, and
 remain disabled by default.
 Agent HTML review is an optional second pass over already retrieved page text.

@@ -39,11 +39,6 @@ from keystone_agents.config import (
     require_cli_live_confirmation,
     with_cli_environment,
 )
-from keystone_agents.orchestrator.preflight_context import (
-    apply_orchestrator_preflight_to_args,
-    attach_orchestrator_preflight_payload,
-    orchestrator_preflight_context_text,
-)
 from keystone_agents.feedback import build_operator_feedback_request
 from keystone_agents.founder_profile import (
     founder_drafting_context,
@@ -55,6 +50,11 @@ from keystone_agents.models import (
     DEFAULT_GMAIL_PRIORITY_GROUPING_REQUEST,
     GmailPriorityGroupingSDKInput,
     GmailTriageSDKInput,
+)
+from keystone_agents.orchestrator.preflight_context import (
+    apply_orchestrator_preflight_to_args,
+    attach_orchestrator_preflight_payload,
+    orchestrator_preflight_context_text,
 )
 from keystone_agents.reporting import (
     build_gmail_priority_grouping_test_pack_payload,

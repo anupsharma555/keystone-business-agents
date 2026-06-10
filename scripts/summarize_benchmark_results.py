@@ -18,8 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--benchmark-db",
         default=None,
         help=(
-            "Optional benchmark SQLite path. Defaults to KEYSTONE_BENCHMARK_DB "
-            "or .keystone/state."
+            "Optional benchmark SQLite path. Defaults to KEYSTONE_BENCHMARK_DB or .keystone/state."
         ),
     )
     parser.add_argument("--limit-runs", type=int, default=10, help="Recent runs to show.")

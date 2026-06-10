@@ -334,8 +334,10 @@ Do not paste search API keys into prompts, fixtures, logs, or committed docs.
 
 Website extraction is separate from search. It is live-gated by
 `KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true`, defaults to Trafilatura, and can use
-Firecrawl with `KEYSTONE_WEBSITE_EXTRACTOR=firecrawl`. Optional fallback between
-`trafilatura` and `firecrawl` is controlled by `KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK`.
+Crawl4AI with `KEYSTONE_WEBSITE_EXTRACTOR=crawl4ai` or Firecrawl with
+`KEYSTONE_WEBSITE_EXTRACTOR=firecrawl`. Optional fallback among `trafilatura`,
+`crawl4ai`, and `firecrawl` is controlled by `KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK`;
+prefer Crawl4AI before Firecrawl when local browser extraction is available.
 
 Apify and Browserless are not live production paths in the current implementation. They return
 dry-run placeholders or raise clear `NotImplementedError` for live execution.

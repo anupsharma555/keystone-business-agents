@@ -773,7 +773,9 @@ def _aggregate_request_cache(items: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "request_layout": "aggregated_static_agent_prefix_then_dynamic_typed_input",
         "static_prefix_sha256": next(iter(static_prefixes)) if len(static_prefixes) == 1 else "",
-        "instructions_sha256": next(iter(instruction_hashes)) if len(instruction_hashes) == 1 else "",
+        "instructions_sha256": next(iter(instruction_hashes))
+        if len(instruction_hashes) == 1
+        else "",
         "tool_names_sha256": next(iter(tool_hashes)) if len(tool_hashes) == 1 else "",
         "output_schema_sha256": next(iter(schema_hashes)) if len(schema_hashes) == 1 else "",
         "tool_count": caches[0].get("tool_count"),

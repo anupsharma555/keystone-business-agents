@@ -142,8 +142,8 @@ def test_opportunity_scout_live_search_planner_receives_orchestrator_memo(
     capsys,
 ) -> None:
     import scripts.run_opportunity_scout as cli
-    from keystone_agents.schemas.opportunity import OpportunityScoutResult
     from keystone_agents.opportunity_scout.search_plan import infer_opportunity_search_plan
+    from keystone_agents.schemas.opportunity import OpportunityScoutResult
 
     captured: dict[str, object] = {}
     request_text = "find 5 behavioral health AI partners and explain the search plan"
@@ -158,7 +158,9 @@ def test_opportunity_scout_live_search_planner_receives_orchestrator_memo(
     def fake_resolve_opportunity_search_plan(request_text_arg, **kwargs):
         captured["request_text"] = request_text_arg
         captured["planner_context"] = kwargs.get("planner_context")
-        return infer_opportunity_search_plan(request_text_arg, desired_count=kwargs["desired_count"])
+        return infer_opportunity_search_plan(
+            request_text_arg, desired_count=kwargs["desired_count"]
+        )
 
     def fake_run_opportunity_scout_live(**kwargs):
         captured["search_plan"] = kwargs.get("search_plan")
@@ -173,7 +175,9 @@ def test_opportunity_scout_live_search_planner_receives_orchestrator_memo(
             {"debug_notes": ["fake live retrieval"]},
         )
 
-    monkeypatch.setattr(cli, "resolve_opportunity_search_plan", fake_resolve_opportunity_search_plan)
+    monkeypatch.setattr(
+        cli, "resolve_opportunity_search_plan", fake_resolve_opportunity_search_plan
+    )
     monkeypatch.setattr(cli, "run_opportunity_scout_live", fake_run_opportunity_scout_live)
     monkeypatch.setattr(
         sys,

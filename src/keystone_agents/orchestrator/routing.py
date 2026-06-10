@@ -114,6 +114,22 @@ def looks_like_send_side_effect(text: str) -> bool:
     return not NO_SEND_RE.search(cleaned)
 
 
+def looks_like_thread_local_draft_request(text: str) -> bool:
+    """Return true for internal Slack-thread draft text with no provider side effect."""
+
+    cleaned = " ".join(str(text or "").lower().split())
+    if not re.search(r"\b(draft|compose|reply|respond|email|outreach)\b", cleaned):
+        return False
+    if not re.search(r"\b(thread-local|slack thread|in this thread|in slack only)\b", cleaned):
+        return False
+    return bool(
+        re.search(
+            r"\b(out of scope|no external|without external|draft only|draft-only)\b",
+            cleaned,
+        )
+    )
+
+
 def looks_like_resume_request(text: str) -> bool:
     """Return true for continuation asks, not requested-output next-step sections."""
 
@@ -163,7 +179,9 @@ def looks_like_email(payload: str | Mapping[str, Any] | None, text: str) -> bool
     if EMAIL_WORKFLOW_RE.search(cleaned):
         return not bool(
             re.search(r"\b(?:outreach|linkedin|cold\s+email|sales)\b", cleaned, flags=re.I)
-            and not re.search(r"\b(?:gmail|inbox|email\s+threads?|current\s+email)\b", cleaned, flags=re.I)
+            and not re.search(
+                r"\b(?:gmail|inbox|email\s+threads?|current\s+email)\b", cleaned, flags=re.I
+            )
         )
     return False
 

@@ -396,6 +396,127 @@ def test_manual_plan_extracts_business_research_target_from_direct_call() -> Non
     assert "NeuroFlow" in plan.objective
 
 
+def test_manual_plan_routes_unnamed_multi_company_business_research_to_scout() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "business research analyst compare three software-first companies with "
+            "measurement-based care tools for behavioral health clinics"
+        ),
+        requested_agent="business research analyst",
+    )
+
+    assert plan.requested_agent == "business_research_analyst"
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.intent == "opportunity_search"
+    assert plan.target_type == "topic"
+    assert (
+        plan.primary_target
+        == "software-first companies with measurement-based care tools for behavioral health clinics"
+    )
+    assert plan.desired_count == 3
+    assert plan.requires_live_search is True
+
+
+def test_manual_plan_cleans_quoted_direct_agent_discovery_prompt() -> None:
+    plan = infer_manual_request_plan(
+        (
+            'business research analyst "Compare three software-first companies with '
+            "measurement-based care or digital psychiatry tools for behavioral health clinics. "
+            'Please give me a compact comparison table and visible source URLs."'
+        ),
+        requested_agent="business research analyst",
+    )
+
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.desired_count == 3
+    assert (
+        plan.primary_target
+        == "software-first companies with measurement-based care or digital psychiatry tools "
+        "for behavioral health clinics"
+    )
+    assert plan.required_entities == []
+
+
+def test_manual_plan_routes_slack_normalized_research_analyst_discovery() -> None:
+    plan = infer_manual_request_plan(
+        (
+            'research analyst "Compare three software-first companies with '
+            "measurement-based care or digital psychiatry tools for behavioral health clinics. "
+            'Please give me a compact comparison table and visible source URLs."'
+        ),
+        requested_agent=None,
+    )
+
+    assert plan.requested_agent == "business_research_analyst"
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.intent == "opportunity_search"
+    assert (
+        plan.primary_target
+        == "software-first companies with measurement-based care or digital psychiatry tools "
+        "for behavioral health clinics"
+    )
+
+
+def test_manual_plan_preserves_deep_search_output_constraints() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "business research analyst compare three software-first companies with "
+            "measurement-based care tools for behavioral health clinics. Please do a "
+            "deeper search, include visible source URLs, return Answer, Synthesis, "
+            "a compact comparison table, and metadata with providers used."
+        ),
+        requested_agent="business research analyst",
+    )
+
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.requires_live_search is True
+    assert {
+        "deeper-search",
+        "visible-source-urls",
+        "metadata-section",
+        "comparison-format",
+        "answer-and-synthesis",
+    } <= set(plan.constraints)
+    assert plan.required_entities == []
+
+
+def test_manual_plan_merge_preserves_unnamed_company_discovery_over_live_company_plan() -> None:
+    fallback = infer_manual_request_plan(
+        (
+            'research analyst "Compare three software-first companies with '
+            "measurement-based care or digital psychiatry tools for behavioral health clinics. "
+            'Please give me a compact comparison table and visible source URLs."'
+        ),
+        requested_agent=None,
+    )
+    bad_candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="business_research_analyst",
+        target_agent="business_research_analyst",
+        intent="company_research",
+        primary_target=(
+            "software-first companies with measurement-based care or digital psychiatry tools "
+            "for behavioral health clinics"
+        ),
+        target_type="company",
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+        desired_count=3,
+        required_entities=[
+            "Compare three software-first companies with measurement-based care or digital "
+            "psychiatry tools for behavioral health clinics."
+        ],
+    )
+
+    merged = merge_manual_request_plan(fallback, bad_candidate)
+
+    assert merged.target_agent == "opportunity_scout"
+    assert merged.intent == "opportunity_search"
+    assert merged.target_type == "topic"
+    assert merged.required_entities == []
+    assert any("explicit named-agent request" in warning for warning in merged.planner_warnings)
+
+
 def test_manual_plan_merge_preserves_explicit_named_agent_when_llm_misroutes() -> None:
     fallback = infer_manual_request_plan(
         "research NeuroFlow recent partnerships and clinical AI relevance",

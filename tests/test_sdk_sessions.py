@@ -16,8 +16,8 @@ from keystone_agents.sdk_sessions import (
     context_file_session_components,
     derive_sdk_session_id,
     resolve_sdk_session_spec,
-    session_audit_metadata,
     sdk_session_env,
+    session_audit_metadata,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.workflow_runner import advance_work_item

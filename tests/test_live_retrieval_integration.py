@@ -13,6 +13,127 @@ from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.tools.search_provider import SearchResult
 
 
+def test_company_website_extraction_prioritizes_query_focused_company_pages() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    urls = live_retrieval._company_website_extraction_urls(
+        company="OpenAI",
+        company_url=None,
+        queries=[
+            "OpenAI 2026 mental health",
+            "OpenAI mental health independent coverage 2026",
+        ],
+        search_results=[
+            SearchResult(
+                title="OpenAI | Research & Deployment",
+                link="https://openai.com/",
+                snippet="OpenAI homepage.",
+                source="searxng",
+            ),
+            SearchResult(
+                title="About | OpenAI",
+                link="https://openai.com/about/",
+                snippet="Company mission and structure.",
+                source="searxng",
+            ),
+            SearchResult(
+                title="Update on mental-health-related work",
+                link="https://openai.com/index/update-on-mental-health-related-work/",
+                snippet="OpenAI mental health related work and safety.",
+                source="exa",
+            ),
+            SearchResult(
+                title="Introducing Trusted Contact in ChatGPT",
+                link="https://openai.com/index/introducing-trusted-contact-in-chatgpt/",
+                snippet="Trusted Contact support for sensitive conversations.",
+                source="agents-web-search",
+            ),
+        ],
+    )
+
+    assert urls[:2] == [
+        "https://openai.com/index/update-on-mental-health-related-work/",
+        "https://openai.com/index/introducing-trusted-contact-in-chatgpt/",
+    ]
+    assert "https://openai.com/" in urls
+
+
+def test_company_live_retrieval_prioritizes_request_focused_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    class FakeProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="OpenAI and Amazon announce strategic partnership",
+                    link="https://www.businesswire.com/news/home/openai-amazon-partnership",
+                    snippet="OpenAI expands enterprise AI infrastructure with AWS.",
+                    source="searxng",
+                ),
+                SearchResult(
+                    title="OpenAI About",
+                    link="https://openai.com/about/",
+                    snippet="OpenAI is an AI research and deployment company.",
+                    source="searxng",
+                ),
+                SearchResult(
+                    title="Update on mental-health-related work",
+                    link="https://openai.com/index/update-on-mental-health-related-work/",
+                    snippet="OpenAI describes mental health related safety work and sensitive conversations.",
+                    source="exa",
+                ),
+            ]
+
+    monkeypatch.setenv("KEYSTONE_ENABLE_WEBSITE_EXTRACTION", "false")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng", website_extractor="trafilatura"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_company_research_queries",
+        lambda *_args: ["OpenAI 2026 mental health", "OpenAI mental health trusted contact"],
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: FakeProvider(),
+    )
+
+    profile, metadata = live_retrieval.retrieve_company_profile_live(
+        company="OpenAI",
+        company_url=None,
+        request_text=(
+            "Can you do a deeper read-only search on what OpenAI is doing "
+            "about mental health right now?"
+        ),
+        max_results=3,
+    )
+
+    assert profile.sources[0].url == (
+        "https://openai.com/index/update-on-mental-health-related-work/"
+    )
+    assert metadata["request_focus_terms"][:2] == ["mental", "health"]
+    assert metadata["source_focus"]["status"] == "matched_selected_sources"
+    assert metadata["source_focus"]["matching_source_count"] >= 1
+    assert metadata["retrieval_diagnostics"]["source_focus"]["matching_urls"] == [
+        "https://openai.com/index/update-on-mental-health-related-work/"
+    ]
+    assert metadata["source_triage"]["request_text"].startswith(
+        "Can you do a deeper read-only search"
+    )
+    assert metadata["source_triage"]["deepen_source_ids"] == ["selected:1"]
+    assert metadata["source_triage"]["needs_broaden_or_deepen"] is True
+    assert metadata["retrieval_diagnostics"]["source_triage"]["deepen_count"] >= 1
+    assert metadata["retrieval_diagnostics"]["source_triage"]["decision_counts"]["deepen"] >= 1
+    assert metadata["retrieval_diagnostics"]["source_triage"]["deepen_urls"] == [
+        "https://openai.com/index/update-on-mental-health-related-work/"
+    ]
+
+
 def test_company_live_retrieval_defaults_to_searxng_with_hosted_parallel_lane(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -93,6 +214,7 @@ def test_company_live_retrieval_defaults_to_searxng_with_hosted_parallel_lane(
     assert metadata["search_quality"]["official_source_present"] is True
     diagnostics = metadata["retrieval_diagnostics"]
     assert diagnostics["provider_summary"] == "searxng+agents-web-search"
+    assert diagnostics["search_queries"][0] == "curebase research"
     assert diagnostics["hosted_web_search_lane_used"] is True
     assert diagnostics["retrieval_ladder"][0]["raw_result_count"] == 2
     assert diagnostics["search_quality_summary"]["official_source_present"] is True
@@ -123,6 +245,58 @@ def test_retrieval_diagnostics_keeps_partial_provider_errors_backend_only() -> N
     )
 
     assert diagnostics["errors"] == []
+
+
+def test_retrieval_diagnostics_keeps_bounded_provider_result_samples() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    diagnostics = live_retrieval.retrieval_diagnostics_from_metadata(
+        {
+            "mode": "live_search",
+            "live_search": True,
+            "search_providers_attempted": ["searxng", "exa"],
+            "search_providers_used": ["searxng", "exa"],
+            "provider_result_samples": {
+                "searxng": [
+                    {
+                        "title": "OpenAI mental health work",
+                        "url": "https://openai.com/index/update-on-mental-health-related-work/",
+                        "snippet": "OpenAI describes mental health related safety updates.",
+                    },
+                    {
+                        "title": "Extra result",
+                        "url": "https://example.com/extra",
+                        "snippet": "Extra.",
+                    },
+                    {
+                        "title": "Third result",
+                        "url": "https://example.com/third",
+                        "snippet": "Third.",
+                    },
+                    {
+                        "title": "Fourth result",
+                        "url": "https://example.com/fourth",
+                        "snippet": "Should be omitted.",
+                    },
+                ],
+                "exa": [
+                    {
+                        "title": "Semantic result",
+                        "url": "https://example.com/exa",
+                        "snippet": "Semantic context.",
+                    }
+                ],
+            },
+        }
+    )
+
+    samples = diagnostics["provider_result_samples"]
+    assert set(samples) == {"searxng", "exa"}
+    assert len(samples["searxng"]) == 3
+    assert samples["searxng"][0]["url"] == (
+        "https://openai.com/index/update-on-mental-health-related-work/"
+    )
+    assert samples["exa"][0]["snippet"] == "Semantic context."
 
 
 def test_retrieval_diagnostics_compacts_source_coverage_assessment_shape() -> None:
@@ -184,7 +358,8 @@ def test_retrieval_diagnostics_surfaces_only_universal_search_failure() -> None:
     )
 
     assert diagnostics["errors"] == [
-        "Live search failed across all attempted providers; backend retrieval telemetry has provider details."
+        "Live search failed across all attempted providers; "
+        "backend retrieval telemetry has provider details."
     ]
 
 
@@ -462,9 +637,10 @@ def test_company_live_retrieval_skips_failed_website_extraction_page(
 
     assert profile.description == "website_inputs=0"
     assert metadata["website_extraction"]["page_count"] == 0
-    assert "fallback firecrawl: fallback provider unavailable" in metadata[
-        "website_extraction"
-    ]["errors"][0]
+    assert (
+        "fallback firecrawl: fallback provider unavailable"
+        in metadata["website_extraction"]["errors"][0]
+    )
 
 
 def test_opportunity_live_retrieval_fans_out_provider_ladder_for_multi_lane_results(
@@ -741,6 +917,73 @@ def test_opportunity_search_provider_can_enable_tavily_deepening(
 
     provider = live_retrieval.build_opportunity_search_provider(
         topic="precision psychiatry collaborations",
+        desired_results=5,
+    )
+
+    assert provider.provider_sequence == ("searxng", "agents-web-search")
+    assert provider.deepening_provider_sequence == ("tavily",)
+
+
+def test_opportunity_search_provider_can_enable_exa_deepening_with_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN", "1")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: SimpleNamespace(
+            provider_name=provider,
+            dry_run=False,
+            validate_configuration=lambda: None,
+            search_web=lambda query, num_results=5: [],
+        ),
+    )
+
+    provider = live_retrieval.build_opportunity_search_provider(
+        topic="precision psychiatry collaborations",
+        desired_results=5,
+    )
+
+    assert provider.provider_sequence == ("searxng", "agents-web-search")
+    assert provider.deepening_provider_sequence == ("exa",)
+    assert provider._provider_request_budget.limit_for("exa") == 1
+
+
+def test_formal_opportunity_search_provider_uses_configured_tavily_deepening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    monkeypatch.delenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", raising=False)
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng", tavily_api_key="test-key"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: SimpleNamespace(
+            provider_name=provider,
+            dry_run=False,
+            validate_configuration=lambda: None,
+            search_web=lambda query, num_results=5: [],
+        ),
+    )
+
+    provider = live_retrieval.build_opportunity_search_provider(
+        topic=(
+            "Find source-backed behavioral-health AI grants, RFPs, pilots, or CFPs "
+            "Keystone could act on."
+        ),
         desired_results=5,
     )
 

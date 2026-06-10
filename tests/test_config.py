@@ -58,6 +58,15 @@ DOTENV_BACKED_ENV_VARS = (
     "KNI_BUSINESS_AGENTS_LIVE_GMAIL_DRAFTS",
     "KNI_BUSINESS_AGENTS_APPROVAL_CHANNEL",
     "SEARCH_PROVIDER",
+    "EXA_API_KEY",
+    "EXA_BASE_URL",
+    "EXA_SERVICE_API_KEY",
+    "EXA_API_KEY_ID",
+    "EXA_API_KEY_NAME",
+    "KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT",
+    "KEYSTONE_EXA_SEARCH_FALLBACK",
+    "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN",
+    "KEYSTONE_SERPER_ENABLED",
     "SERPER_API_KEY",
     "SEARXNG_BASE_URL",
     "SEARXNG_API_KEY",
@@ -70,6 +79,7 @@ DOTENV_BACKED_ENV_VARS = (
     "KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT",
     "KEYSTONE_TAVILY_CREDIT_ENFORCEMENT",
     "KEYSTONE_TAVILY_USAGE_PATH",
+    "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN",
     "APIFY_API_TOKEN",
     "BROWSERLESS_API_KEY",
     "FIRECRAWL_API_KEY",
@@ -108,6 +118,10 @@ def test_pytest_delenv_is_not_repopulated_from_local_dotenv(
     assert settings.gemini_api_key is None
     assert settings.gmail_client_secret is None
     assert settings.slack_bot_token is None
+    assert settings.exa_api_key is None
+    assert settings.exa_service_api_key is None
+    assert settings.exa_api_key_id is None
+    assert settings.exa_api_key_name is None
     assert settings.serper_api_key is None
     assert settings.apify_api_token is None
     assert settings.browserless_api_key is None
@@ -139,6 +153,12 @@ def test_load_settings_loads_explicit_dotenv_when_test_guard_is_removed(
                 "SLACK_BOT_TOKEN=dotenv-test-slack-token",
                 "SLACK_CHANNEL_APPROVALS=CUNITTEST",
                 "SEARCH_PROVIDER=serper",
+                "EXA_API_KEY=dotenv-test-exa-key",
+                "EXA_BASE_URL=https://exa.example",
+                "EXA_SERVICE_API_KEY=dotenv-test-exa-service-key",
+                "EXA_API_KEY_ID=dotenv-test-exa-key-id",
+                "EXA_API_KEY_NAME=default",
+                "KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT=1000",
                 "SERPER_API_KEY=dotenv-test-serper-key",
                 "TAVILY_API_KEY=dotenv-test-tavily-key",
                 "TAVILY_BASE_URL=https://tavily.example",
@@ -169,6 +189,12 @@ def test_load_settings_loads_explicit_dotenv_when_test_guard_is_removed(
     assert settings.slack_bot_token == "dotenv-test-slack-token"
     assert settings.slack_channel_approvals == "CUNITTEST"
     assert settings.search_provider == "serper"
+    assert settings.exa_api_key == "dotenv-test-exa-key"
+    assert settings.exa_base_url == "https://exa.example"
+    assert settings.exa_service_api_key == "dotenv-test-exa-service-key"
+    assert settings.exa_api_key_id == "dotenv-test-exa-key-id"
+    assert settings.exa_api_key_name == "default"
+    assert settings.exa_monthly_free_request_limit == 1000
     assert settings.serper_api_key == "dotenv-test-serper-key"
     assert settings.tavily_api_key == "dotenv-test-tavily-key"
     assert settings.tavily_base_url == "https://tavily.example"

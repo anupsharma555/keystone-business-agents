@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -29,8 +31,15 @@ from keystone_agents.model_provider import (
     get_runtime_agent_model_config,
 )
 from keystone_agents.models import AgentRunRequest, AgentRunResult, RunMode, TypedAgentRunResult
-from keystone_agents.sdk import AgentLike, run_typed_sdk_sync
+from keystone_agents.operator_failures import known_exception_to_operator_failure
+from keystone_agents.sdk import AgentLike, repo_instruction_profile_id, run_typed_sdk_sync
 from keystone_agents.sdk_sessions import build_sdk_session_from_env, session_audit_metadata
+from keystone_agents.tools.serper_tool import (
+    consume_sdk_search_telemetry,
+    reset_sdk_search_telemetry,
+    sdk_search_diagnostics_from_telemetry,
+    set_sdk_search_request_context,
+)
 
 TOutput = TypeVar("TOutput")
 TRaw = TypeVar("TRaw")
@@ -138,22 +147,37 @@ def run_typed_sdk_agent(
         prompt=prompt,
         session=resolved_session,
     )
-    raw_result, output = run_typed_sdk_sync(
-        agent,
-        prompt,
-        output_type,
-        run_config=run_config,
-        live=live,
-        config=config,
-        session=resolved_session,
-        workflow_name=workflow_name,
-        group_id=group_id,
-        trace_metadata=trace_metadata,
-        tracing_disabled=tracing_disabled,
-        trace_include_sensitive_data=trace_include_sensitive_data,
-        trace_config=trace_config,
-        max_turns=max_turns,
-    )
+    retry_count = 0
+    max_rate_limit_retries = _sdk_rate_limit_max_retries(live=live, run_config=run_config)
+    while True:
+        reset_sdk_search_telemetry()
+        set_sdk_search_request_context(prompt)
+        try:
+            raw_result, output = run_typed_sdk_sync(
+                agent,
+                prompt,
+                output_type,
+                run_config=run_config,
+                live=live,
+                config=config,
+                session=resolved_session,
+                workflow_name=workflow_name,
+                group_id=group_id,
+                trace_metadata=trace_metadata,
+                tracing_disabled=tracing_disabled,
+                trace_include_sensitive_data=trace_include_sensitive_data,
+                trace_config=trace_config,
+                max_turns=max_turns,
+            )
+            search_telemetry = consume_sdk_search_telemetry()
+            break
+        except Exception as exc:
+            consume_sdk_search_telemetry()
+            if retry_count >= max_rate_limit_retries or not _is_sdk_rate_limit_error(exc):
+                raise
+            retry_count += 1
+            time.sleep(_sdk_rate_limit_retry_delay_seconds(exc, retry_count))
+    output = _attach_retrieval_diagnostics(output, search_telemetry)
     usage = _extract_sdk_usage(raw_result)
     cost = estimate_usage_cost(provider=model_provider, model=model_name, usage=usage)
     budget_guard = enforce_agent_run_budget(
@@ -171,8 +195,64 @@ def run_typed_sdk_agent(
         usage=usage,
         cost=cost,
         budget_guard=budget_guard,
-        request_cache=request_cache,
+        request_cache={
+            **request_cache,
+            **({"rate_limit_retries": retry_count} if retry_count else {}),
+        },
     )
+
+
+def _sdk_rate_limit_max_retries(*, live: bool, run_config: Any | None) -> int:
+    if not live or run_config is not None:
+        return 0
+    raw = os.getenv("KEYSTONE_SDK_RATE_LIMIT_MAX_RETRIES", "").strip()
+    try:
+        return max(0, min(3, int(raw) if raw else 1))
+    except ValueError:
+        return 1
+
+
+def _is_sdk_rate_limit_error(exc: BaseException) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return "rate limit" in text or "429" in text or "rate_limit_exceeded" in text
+
+
+def _sdk_rate_limit_retry_delay_seconds(exc: BaseException, retry_count: int) -> float:
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is None:
+        headers = getattr(exc, "headers", None)
+        if isinstance(headers, Mapping):
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+    try:
+        delay = float(retry_after) if retry_after is not None else 0.0
+    except (TypeError, ValueError):
+        delay = 0.0
+    if delay <= 0:
+        match = re.search(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", str(exc), flags=re.I)
+        if match:
+            delay = float(match.group(1))
+    if delay <= 0:
+        delay = min(30.0, 4.0 * retry_count)
+    return min(30.0, max(1.0, delay + 0.5))
+
+
+def _attach_retrieval_diagnostics(
+    output: TOutput, telemetry_packets: list[dict[str, Any]]
+) -> TOutput:
+    diagnostics = sdk_search_diagnostics_from_telemetry(telemetry_packets)
+    if not diagnostics:
+        return output
+    model_fields = getattr(output, "model_fields", {})
+    if isinstance(model_fields, dict) and "retrieval_diagnostics" in model_fields:
+        model_copy = getattr(output, "model_copy", None)
+        if callable(model_copy):
+            return model_copy(update={"retrieval_diagnostics": diagnostics})
+    if isinstance(output, dict):
+        return {**output, "retrieval_diagnostics": diagnostics}  # type: ignore[return-value]
+    return output
 
 
 def sdk_synthesis_trace_metadata(
@@ -362,6 +442,7 @@ def _sdk_request_cache_metadata(
     session_metadata = _session_audit_metadata(session)
     return {
         "request_layout": "static_agent_prefix_then_dynamic_typed_input",
+        "repo_instruction_profile": repo_instruction_profile_id(),
         "static_prefix_sha256": _sha256_dumps(static_payload),
         "instructions_sha256": static_payload["instructions_sha256"],
         "tool_names_sha256": _sha256_dumps(tool_names),
@@ -731,12 +812,21 @@ def run_retrieved_sdk_synthesis(
                     daily_usage_source="local_sqlite_agent_runs_current_et_day",
                 )
     except Exception as exc:
+        operator_failure = known_exception_to_operator_failure(
+            exc,
+            context=f"{agent.name} SDK run",
+        )
         if save and storage is not None:
             storage_results["agent_run"] = storage.save_agent_run(
                 agent_name=agent.name,
                 input_payload=audit_payload,
                 input_summary=input_summary,
-                output={},
+                output={
+                    "failure": operator_failure.to_dict(),
+                    "summary": operator_failure.summary,
+                    "next_step": operator_failure.next_step,
+                    "send_enabled": False,
+                },
                 model=model_label or ("sdk-live" if live and run_config is None else "sdk-local"),
                 dry_run=not (live and run_config is None),
                 status="error",

@@ -9,8 +9,9 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from keystone_agents.agent_tool_policy import tool_policy_for_agent
+from keystone_agents.agent_tool_policy import ToolTier, tool_policy_for_agent, tool_tier_for_name
 from keystone_agents.schemas.orchestrator import HandoffSpec
+from keystone_agents.skill_sets import AGENT_SKILL_NAMES
 from keystone_agents.tools.internal_data_tools import GOOGLE_WORKSPACE_TOOL_NAMES
 
 AIRTABLE_READ_TOOL_NAMES = ("airtable_get_base_schema", "airtable_read_records")
@@ -38,6 +39,7 @@ class AgentSpec:
     prompt_files: tuple[str, ...]
     # Prompt files are instruction fragments only. `skills.md` is not a runtime
     # capability registry and must not imply hidden routing or dynamic tools.
+    skills: tuple[str, ...] = ()
     tools: tuple[str, ...] = ()
     optional_tools: tuple[str, ...] = ()
     live_flags_required: tuple[str, ...] = ()
@@ -86,12 +88,23 @@ class AgentSpec:
         """Return a JSON-safe agent card."""
 
         policy = tool_policy_for_agent(self.route_name)
+        tool_tiers = (
+            {
+                tier.name.lower(): sorted(
+                    name for name in policy.allowed_tool_names if tool_tier_for_name(name) == tier
+                )
+                for tier in ToolTier
+            }
+            if policy is not None
+            else {}
+        )
         return {
             "route_name": self.route_name,
             "agent_name": self.agent_name,
             "builder": self.builder,
             "output_schema": self.output_schema,
             "prompt_files": list(self.prompt_files),
+            "skills": list(self.skills),
             "tools": list(self.tools),
             "optional_tools": list(self.optional_tools),
             "live_flags_required": list(self.live_flags_required),
@@ -103,6 +116,7 @@ class AgentSpec:
                 {
                     "agent_name": policy.agent_name,
                     "allowed_tool_names": sorted(policy.allowed_tool_names),
+                    "tool_tiers": tool_tiers,
                     "rationale": policy.rationale,
                 }
                 if policy is not None
@@ -120,10 +134,10 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         prompt_files=(
             "keystone_profile.md",
             "safety_policy.md",
-            "skills.md",
             "tools.md",
             "gmail_triage.md",
         ),
+        skills=AGENT_SKILL_NAMES["gmail_triage"],
         tools=(
             "get_gmail_message",
             "apply_gmail_labels",
@@ -162,11 +176,11 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         prompt_files=(
             "keystone_profile.md",
             "safety_policy.md",
-            "skills.md",
             "tools.md",
             "local_context.md",
             "business_research_analyst.md",
         ),
+        skills=AGENT_SKILL_NAMES["business_research_analyst"],
         tools=(
             "list_local_context_sources",
             "search_local_context",
@@ -212,10 +226,10 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         prompt_files=(
             "keystone_profile.md",
             "safety_policy.md",
-            "skills.md",
             "tools.md",
             "opportunity_scout.md",
         ),
+        skills=AGENT_SKILL_NAMES["opportunity_scout"],
         tools=(
             "retrieve_memory",
             "search_web",
@@ -266,10 +280,10 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         prompt_files=(
             "keystone_profile.md",
             "safety_policy.md",
-            "skills.md",
             "tools.md",
             "outreach_composer.md",
         ),
+        skills=AGENT_SKILL_NAMES["outreach_composer"],
         tools=(
             "load_company_profile",
             "load_opportunity_record",
@@ -312,10 +326,10 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
     prompt_files=(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "orchestrator.md",
     ),
+    skills=AGENT_SKILL_NAMES["orchestrator"],
     tools=(
         "route_request_placeholder",
         "load_orchestrator_workflow_state",
@@ -370,10 +384,10 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
     prompt_files=(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "chief_of_staff.md",
     ),
+    skills=AGENT_SKILL_NAMES["chief_of_staff"],
     tools=(
         "list_chief_of_staff_context_sources",
         "summarize_slack_runtime_config",

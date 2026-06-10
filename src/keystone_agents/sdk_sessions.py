@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 from keystone_agents.sdk import build_sqlite_session
-from keystone_agents.slack_action_contract import SLACK_SELECTED_CONTEXT_SCHEMA
 
 SDK_SESSIONS_ENABLED_ENV = "KEYSTONE_SDK_SESSIONS"
 SDK_SESSION_ID_ENV = "KEYSTONE_SDK_SESSION_ID"
@@ -197,10 +196,7 @@ def context_file_session_components(
     team_id = str(data.get("team_id") or "").strip()
     channel_id = str(data.get("channel_id") or "").strip()
     thread_ts = str(
-        data.get("thread_ts")
-        or data.get("selected_message_ts")
-        or data.get("request_ts")
-        or ""
+        data.get("thread_ts") or data.get("selected_message_ts") or data.get("request_ts") or ""
     ).strip()
     if not (team_id or channel_id or thread_ts):
         return None

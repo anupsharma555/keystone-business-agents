@@ -12,7 +12,8 @@ import inspect
 import json
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace as dataclass_replace
+from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from functools import wraps
 from importlib import resources
 from pathlib import Path
@@ -334,8 +335,11 @@ def function_tool(func: Any = None, **kwargs: Any) -> Any:
 
 
 PROMPT_PACKAGE = "keystone_agents.prompts"
+SKILL_PACKAGE = "keystone_agents.skills"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REPO_AGENT_GUIDE = "AGENTS.md"
+REPO_RUNTIME_POLICY_PROMPT = "repo_runtime_policy.md"
+REPO_GUIDE_PROFILE_ENV = "KEYSTONE_AGENTS_GUIDE_PROFILE"
 SHARED_PRE_RUN_PROMPTS = (
     "memory_policy.md",
     "agent-operating-architecture.md",
@@ -352,6 +356,17 @@ PROMPT_METADATA_FIELDS = frozenset(
         "prompt_purpose",
         "prompt_safety_notes",
         "prompt_eval_datasets",
+    }
+)
+SKILL_METADATA_FIELDS = frozenset(
+    {
+        "skill_id",
+        "skill_version",
+        "skill_purpose",
+        "applies_to",
+        "eval_datasets",
+        "validation_paths",
+        "safety_notes",
     }
 )
 
@@ -380,6 +395,40 @@ class PromptMetadata:
             "purpose": self.purpose,
             "safety_notes": self.safety_notes,
             "eval_datasets": list(self.eval_datasets),
+        }
+
+
+@dataclass(frozen=True)
+class SkillMetadata:
+    """Version metadata parsed from a repo-local Keystone skill bundle."""
+
+    skill_id: str
+    version: str
+    purpose: str
+    applies_to: tuple[str, ...] = ()
+    eval_datasets: tuple[str, ...] = ()
+    validation_paths: tuple[str, ...] = ()
+    safety_notes: tuple[str, ...] = ()
+
+    @property
+    def filename(self) -> str:
+        return f"{self.skill_id}/SKILL.md"
+
+    @property
+    def reference(self) -> str:
+        return f"{self.skill_id}@{self.version}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "skill_id": self.skill_id,
+            "version": self.version,
+            "reference": self.reference,
+            "purpose": self.purpose,
+            "applies_to": list(self.applies_to),
+            "eval_datasets": list(self.eval_datasets),
+            "validation_paths": list(self.validation_paths),
+            "safety_notes": list(self.safety_notes),
+            "filename": self.filename,
         }
 
 
@@ -487,6 +536,14 @@ def _prompt_filename(name: str) -> str:
     return filename
 
 
+def _skill_id(name: str) -> str:
+    if not name or "/" in name or "\\" in name or name in {".", ".."}:
+        raise ValueError("Skill name must be a single skill directory name.")
+    if name != name.strip():
+        raise ValueError("Skill name must not contain leading or trailing whitespace.")
+    return name
+
+
 def load_prompt(name: str) -> str:
     """Load a markdown prompt from the `keystone_agents.prompts` package."""
 
@@ -494,14 +551,38 @@ def load_prompt(name: str) -> str:
     return resources.files(PROMPT_PACKAGE).joinpath(filename).read_text(encoding="utf-8")
 
 
+def load_skill(name: str) -> str:
+    """Load a repo-local Keystone skill from `keystone_agents.skills/<skill>/SKILL.md`."""
+
+    skill_id = _skill_id(name)
+    return resources.files(SKILL_PACKAGE).joinpath(skill_id, "SKILL.md").read_text(encoding="utf-8")
+
+
 def load_repo_agent_guide() -> str:
-    """Load the repository AGENTS.md guide for agent pre-run context."""
+    """Load the full repository AGENTS.md guide."""
 
     configured_path = os.getenv("KEYSTONE_AGENTS_GUIDE_PATH")
     guide_path = Path(configured_path) if configured_path else PROJECT_ROOT / REPO_AGENT_GUIDE
     if not guide_path.is_file():
         return ""
     return guide_path.read_text(encoding="utf-8").strip()
+
+
+def repo_instruction_profile_id() -> str:
+    """Return the configured repo instruction profile id."""
+
+    configured = os.getenv(REPO_GUIDE_PROFILE_ENV, "").strip().lower()
+    if configured in {"full", "agents", "agents.md"}:
+        return "full-agents-md"
+    return "compact-runtime-policy"
+
+
+def load_repo_runtime_policy() -> tuple[str, str]:
+    """Load the repo-level instruction profile used in composed agent prompts."""
+
+    if repo_instruction_profile_id() == "full-agents-md":
+        return REPO_AGENT_GUIDE, load_repo_agent_guide()
+    return REPO_RUNTIME_POLICY_PROMPT, load_prompt(REPO_RUNTIME_POLICY_PROMPT).strip()
 
 
 def _parse_metadata_comment(text: str) -> dict[str, str]:
@@ -521,6 +602,55 @@ def _parse_metadata_comment(text: str) -> dict[str, str]:
         key = key.strip()
         if key in PROMPT_METADATA_FIELDS:
             metadata[key] = value.strip()
+    return metadata
+
+
+def _parse_front_matter(text: str) -> dict[str, str | tuple[str, ...]]:
+    stripped = text.lstrip()
+    if not stripped.startswith("---"):
+        return {}
+    lines = stripped.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    end_index: int | None = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end_index = index
+            break
+    if end_index is None:
+        return {}
+
+    metadata: dict[str, str | tuple[str, ...]] = {}
+    current_key = ""
+    current_items: list[str] = []
+    for raw_line in lines[1:end_index]:
+        line = raw_line.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.startswith((" ", "\t")):
+            item = line.strip()
+            if current_key and item.startswith("- "):
+                current_items.append(item[2:].strip())
+            continue
+        if current_key and current_items:
+            metadata[current_key] = tuple(current_items)
+            current_items = []
+        if ":" not in line:
+            current_key = ""
+            continue
+        key, value = line.split(":", 1)
+        current_key = key.strip()
+        if current_key not in SKILL_METADATA_FIELDS:
+            current_key = ""
+            continue
+        value = value.strip()
+        if value:
+            metadata[current_key] = value
+            current_key = ""
+        else:
+            metadata[current_key] = ()
+    if current_key and current_items:
+        metadata[current_key] = tuple(current_items)
     return metadata
 
 
@@ -552,6 +682,41 @@ def load_prompt_metadata(name: str) -> PromptMetadata:
     )
 
 
+def _metadata_tuple(metadata: Mapping[str, str | tuple[str, ...]], key: str) -> tuple[str, ...]:
+    value = metadata.get(key, ())
+    if isinstance(value, tuple):
+        return tuple(item for item in value if item)
+    if isinstance(value, str):
+        return tuple(item.strip() for item in value.split(",") if item.strip())
+    return ()
+
+
+def load_skill_metadata(name: str) -> SkillMetadata:
+    """Load skill version metadata from a skill bundle's front matter."""
+
+    skill_id = _skill_id(name)
+    text = load_skill(skill_id)
+    metadata = _parse_front_matter(text)
+    required_fields = {"skill_id", "skill_version", "skill_purpose", "safety_notes"}
+    missing = sorted(required_fields - set(metadata))
+    if missing:
+        raise ValueError(f"{skill_id}/SKILL.md missing skill metadata fields: {', '.join(missing)}")
+    declared_id = str(metadata["skill_id"])
+    if declared_id != skill_id:
+        raise ValueError(
+            f"{skill_id}/SKILL.md declares skill_id {declared_id!r}; expected {skill_id!r}"
+        )
+    return SkillMetadata(
+        skill_id=skill_id,
+        version=str(metadata["skill_version"]),
+        purpose=str(metadata["skill_purpose"]),
+        applies_to=_metadata_tuple(metadata, "applies_to"),
+        eval_datasets=_metadata_tuple(metadata, "eval_datasets"),
+        validation_paths=_metadata_tuple(metadata, "validation_paths"),
+        safety_notes=_metadata_tuple(metadata, "safety_notes"),
+    )
+
+
 def list_prompt_metadata(prompt_files: Sequence[str] | None = None) -> list[PromptMetadata]:
     """Return metadata for all prompt files or the selected prompt filenames."""
 
@@ -566,10 +731,30 @@ def list_prompt_metadata(prompt_files: Sequence[str] | None = None) -> list[Prom
     return [load_prompt_metadata(filename) for filename in files]
 
 
+def list_skill_metadata(skill_names: Sequence[str] | None = None) -> list[SkillMetadata]:
+    """Return metadata for all skill bundles or the selected skill names."""
+
+    if skill_names is None:
+        files = sorted(
+            path.name
+            for path in resources.files(SKILL_PACKAGE).iterdir()
+            if path.is_dir() and path.joinpath("SKILL.md").is_file()
+        )
+    else:
+        files = [_skill_id(skill_name) for skill_name in skill_names]
+    return [load_skill_metadata(skill_id) for skill_id in files]
+
+
 def prompt_metadata_for_files(prompt_files: Sequence[str]) -> list[dict[str, Any]]:
     """Return JSON-safe metadata for prompt files."""
 
     return [metadata.to_dict() for metadata in list_prompt_metadata(prompt_files)]
+
+
+def skill_metadata_for_files(skill_names: Sequence[str]) -> list[dict[str, Any]]:
+    """Return JSON-safe metadata for skill bundles."""
+
+    return [metadata.to_dict() for metadata in list_skill_metadata(skill_names)]
 
 
 def prompt_version_references(prompt_files: Sequence[str]) -> list[str]:
@@ -578,19 +763,33 @@ def prompt_version_references(prompt_files: Sequence[str]) -> list[str]:
     return [metadata.reference for metadata in list_prompt_metadata(prompt_files)]
 
 
-def compose_instructions(*prompt_files: str) -> str:
+def skill_version_references(skill_names: Sequence[str]) -> list[str]:
+    """Return compact skill version references such as `source_attribution@2026-05-30.1`."""
+
+    return [metadata.reference for metadata in list_skill_metadata(skill_names)]
+
+
+def compose_instructions(*prompt_files: str, skill_files: Sequence[str] = ()) -> str:
     """Concatenate project, memory, and prompt context with clear boundaries."""
 
     sections = []
-    repo_guide = load_repo_agent_guide()
-    if repo_guide:
-        sections.append(f"<!-- {REPO_AGENT_GUIDE} -->\n{repo_guide}")
+    repo_profile_name, repo_profile = load_repo_runtime_policy()
+    if repo_profile:
+        sections.append(f"<!-- {repo_profile_name} -->\n{repo_profile}")
     requested_files = {_prompt_filename(prompt_file) for prompt_file in prompt_files}
     for shared_prompt in SHARED_PRE_RUN_PROMPTS:
         filename = _prompt_filename(shared_prompt)
         if filename not in requested_files:
             sections.append(f"<!-- {filename} -->\n{load_prompt(filename).strip()}")
-    for prompt_file in prompt_files:
+    leading_prompt_files = prompt_files[:-1] if skill_files and prompt_files else prompt_files
+    trailing_prompt_files = prompt_files[-1:] if skill_files and prompt_files else ()
+    for prompt_file in leading_prompt_files:
+        filename = prompt_file if prompt_file.endswith(".md") else f"{prompt_file}.md"
+        sections.append(f"<!-- {filename} -->\n{load_prompt(filename).strip()}")
+    for skill_file in skill_files:
+        skill_id = _skill_id(skill_file)
+        sections.append(f"<!-- {skill_id}/SKILL.md -->\n{load_skill(skill_id).strip()}")
+    for prompt_file in trailing_prompt_files:
         filename = prompt_file if prompt_file.endswith(".md") else f"{prompt_file}.md"
         sections.append(f"<!-- {filename} -->\n{load_prompt(filename).strip()}")
     return "\n\n".join(sections)
@@ -923,13 +1122,40 @@ def run_sdk_sync(
         trace_include_sensitive_data=trace_include_sensitive_data,
         trace_config=trace_config,
     )
-    return _run_sync_with_optional_session(
-        agent,
-        prompt,
-        run_config=run_config,
-        session=session,
-        max_turns=max_turns,
-    )
+    try:
+        return _run_sync_with_optional_session(
+            agent,
+            prompt,
+            run_config=run_config,
+            session=session,
+            max_turns=max_turns,
+        )
+    finally:
+        _close_run_config_openai_client(run_config)
+
+
+def _close_run_config_openai_client(run_config: Any) -> None:
+    """Best-effort close for AsyncOpenAI clients embedded in live SDK configs."""
+
+    provider = getattr(run_config, "model_provider", None)
+    client = getattr(provider, "_client", None)
+    close = getattr(client, "close", None)
+    if client is None or not callable(close):
+        return
+    is_closed = getattr(client, "is_closed", None)
+    if callable(is_closed) and is_closed():
+        return
+    result = close()
+    if not inspect.isawaitable(result):
+        return
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is not None and running_loop.is_running():
+        running_loop.create_task(result)
+        return
+    asyncio.run(result)
 
 
 def run_sdk_sync_with_config(

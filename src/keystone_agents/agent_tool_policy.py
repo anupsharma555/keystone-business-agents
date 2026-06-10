@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any
 
 from keystone_agents.tools.internal_data_tools import GOOGLE_WORKSPACE_TOOL_NAMES
 
 GOOGLE_WORKSPACE_ALLOWED_TOOLS = frozenset(GOOGLE_WORKSPACE_TOOL_NAMES)
+GOOGLE_WORKSPACE_READ_TOOLS = frozenset(
+    {"google_doc_read", "google_drive_list_folder", "google_sheet_list", "google_sheet_read_table"}
+)
+GOOGLE_WORKSPACE_WRITE_TOOLS = GOOGLE_WORKSPACE_ALLOWED_TOOLS - GOOGLE_WORKSPACE_READ_TOOLS
 AIRTABLE_READ_ALLOWED_TOOLS = frozenset({"airtable_get_base_schema", "airtable_read_records"})
 AIRTABLE_WRITE_ALLOWED_TOOLS = frozenset({"airtable_write_record"})
 WEB_STRUCTURING_ALLOWED_TOOLS = frozenset({"structure_web_data_for_schema"})
@@ -21,6 +26,17 @@ class AgentToolPolicyError(RuntimeError):
     """Raised when an SDK agent is built with tools outside its declared policy."""
 
 
+class ToolTier(IntEnum):
+    """Ordered tool tiers for runtime attachment and review."""
+
+    CORE_READ = 10
+    WEB_SEARCH = 20
+    DEEP_RETRIEVAL = 30
+    DIAGNOSTIC = 40
+    INTERNAL_WRITE = 50
+    PUBLISH = 60
+
+
 @dataclass(frozen=True)
 class AgentToolPolicy:
     """Allowed retrieval/tool classes for one agent."""
@@ -28,6 +44,137 @@ class AgentToolPolicy:
     agent_name: str
     allowed_tool_names: frozenset[str]
     rationale: str
+
+
+CORE_READ_TOOL_NAMES = frozenset(
+    {
+        "list_local_context_sources",
+        "search_local_context",
+        "read_local_context_file",
+        "retrieve_memory",
+        "retrieve_chief_of_staff_memory",
+        "retrieve_outreach_examples",
+        "retrieve_outreach_example_guidance",
+        "check_workflow_duplicate",
+        "load_existing_opportunity_state",
+        "load_company_profile",
+        "load_research_brief_profile",
+        "load_opportunity_record",
+        "load_style_profile",
+        "load_email_style_profile",
+        "list_outreach_templates",
+        "load_outreach_template",
+        "load_outreach_tracking_records",
+        "list_outreach_tracking_records",
+        "load_orchestrator_workflow_state",
+        "load_pending_approval_items",
+        "route_request_placeholder",
+        "list_chief_of_staff_context_sources",
+        "summarize_slack_runtime_config",
+        "search_slack_repo_context",
+        "read_slack_repo_context_file",
+        "lookup_slack_workflow_capability",
+        "list_automation_specs",
+        "list_recent_automation_runs",
+        "list_channel_automation_bindings",
+        "summarize_automation_health",
+        "list_pending_automation_approvals",
+        "inspect_active_work_items",
+        "read_linked_article",
+        "get_gmail_message",
+        "file_search",
+        *GOOGLE_WORKSPACE_READ_TOOLS,
+        *AIRTABLE_READ_ALLOWED_TOOLS,
+    }
+)
+WEB_SEARCH_TOOL_NAMES = frozenset(
+    {
+        "search_web",
+        "search_official_operations_docs",
+        "search_opportunity_sources_placeholder",
+        "search_funding_news_sources",
+        "search_job_posting_sources",
+        "search_clinical_trials_sources",
+        "search_grant_sources",
+        "search_conference_publication_sources",
+        "search_journal_call_sources",
+        "search_contract_rfp_sources",
+        "search_company_page_sources",
+    }
+)
+DEEP_RETRIEVAL_TOOL_NAMES = (
+    frozenset(
+        {
+            "fetch_company_page",
+            "extract_research_claims_from_html",
+            "fetch_linkedin_or_profile_placeholder",
+            "extract_company_signals",
+            "dedupe_and_rank_sources",
+            "build_source_bundle_for_synthesis",
+            "synthesize_company_profile_from_source_bundle",
+            "compare_company_profiles_for_decision",
+            "score_opportunity",
+            "structure_web_data_for_schema",
+            "handoff_to_business_research_analyst_placeholder",
+            "business_research_analyst_research_brief",
+            "opportunity_scout_read_only",
+        }
+    )
+    | WEB_STRUCTURING_ALLOWED_TOOLS
+)
+DIAGNOSTIC_TOOL_NAMES = PLAYWRIGHT_RESEARCH_ALLOWED_TOOLS | BROWSER_DIAGNOSTIC_ALLOWED_TOOLS
+CONTACT_CONTEXT_TOOL_NAMES = frozenset(
+    {
+        "load_contact_context",
+        "load_crm_account_context",
+        "load_approved_contact_context",
+        "load_approved_crm_context",
+        "load_approved_outreach_examples",
+        "build_approved_outreach_drafting_context",
+    }
+)
+INTERNAL_WRITE_TOOL_NAMES = (
+    AIRTABLE_WRITE_ALLOWED_TOOLS
+    | GOOGLE_WORKSPACE_WRITE_TOOLS
+    | CONTACT_CONTEXT_TOOL_NAMES
+    | frozenset(
+        {
+            "apply_gmail_labels",
+            "create_gmail_draft_reply",
+            "create_approval_queue_item",
+            "create_approval_request_placeholder",
+            "check_unsupported_claims",
+            "compose_outreach_draft_llm_constrained",
+            "build_call_prep_artifact",
+            "build_follow_up_schedule_record",
+            "save_company_profile_memory",
+            "save_retrieval_tool_performance_memory",
+            "save_entity_memory",
+            "save_opportunity_memory",
+            "save_opportunity_placeholder",
+            "save_outreach_dedup_memory",
+            "learn_email_style_profile",
+            "save_initial_outreach_tracking_record",
+        }
+    )
+)
+PUBLISH_TOOL_NAMES = frozenset(
+    {
+        "publish_document_report",
+        "publish_internal_artifact",
+        "publish_table_mirror",
+        "publish_slack_summary",
+    }
+)
+
+TOOL_TIER_BY_NAME: dict[str, ToolTier] = {
+    **{name: ToolTier.CORE_READ for name in CORE_READ_TOOL_NAMES},
+    **{name: ToolTier.WEB_SEARCH for name in WEB_SEARCH_TOOL_NAMES},
+    **{name: ToolTier.DEEP_RETRIEVAL for name in DEEP_RETRIEVAL_TOOL_NAMES},
+    **{name: ToolTier.DIAGNOSTIC for name in DIAGNOSTIC_TOOL_NAMES},
+    **{name: ToolTier.INTERNAL_WRITE for name in INTERNAL_WRITE_TOOL_NAMES},
+    **{name: ToolTier.PUBLISH for name in PUBLISH_TOOL_NAMES},
+}
 
 
 AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
@@ -286,6 +433,67 @@ def disallowed_tool_names(agent_name: str, tool_names: list[str]) -> list[str]:
     if policy is None:
         return []
     return sorted(name for name in tool_names if name not in policy.allowed_tool_names)
+
+
+def normalize_tool_tier(value: ToolTier | str | int | None) -> ToolTier:
+    """Normalize a runtime tool tier value."""
+
+    if value is None:
+        return ToolTier.PUBLISH
+    if isinstance(value, ToolTier):
+        return value
+    if isinstance(value, int):
+        return ToolTier(value)
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"full", "all", "full_access"}:
+        return ToolTier.PUBLISH
+    try:
+        return ToolTier[normalized.upper()]
+    except KeyError as exc:
+        allowed = ", ".join(tier.name.lower() for tier in ToolTier)
+        raise ValueError(
+            f"Unsupported tool tier {value!r}; expected one of: {allowed}, full."
+        ) from exc
+
+
+def tool_tier_for_name(tool_name: str) -> ToolTier | None:
+    """Return the declared tier for a stable tool name, if known."""
+
+    return TOOL_TIER_BY_NAME.get(str(tool_name or "").strip())
+
+
+def unclassified_tool_names(tool_names: list[str] | tuple[str, ...] | frozenset[str]) -> list[str]:
+    """Return stable tool names that lack an explicit tier assignment."""
+
+    return sorted(name for name in tool_names if name not in TOOL_TIER_BY_NAME)
+
+
+def allowed_tool_names_for_tier(
+    agent_name: str,
+    tier: ToolTier | str | int | None,
+) -> frozenset[str]:
+    """Return the agent's allowed tool names at or below the requested tier."""
+
+    policy = tool_policy_for_agent(agent_name)
+    if policy is None:
+        return frozenset()
+    max_tier = normalize_tool_tier(tier)
+    return frozenset(
+        name
+        for name in policy.allowed_tool_names
+        if (tool_tier_for_name(name) or ToolTier.PUBLISH) <= max_tier
+    )
+
+
+def filter_tools_for_tier(
+    agent_name: str,
+    tools: list[Any],
+    tier: ToolTier | str | int | None,
+) -> list[Any]:
+    """Filter a concrete SDK tool list to the agent's allowed tier."""
+
+    allowed_names = allowed_tool_names_for_tier(agent_name, tier)
+    return [tool for tool in tools if tool_name_for_policy(tool) in allowed_names]
 
 
 def validate_agent_tool_policy(

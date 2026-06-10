@@ -707,6 +707,8 @@ class HybridSearchProvider:
             for provider_name in (*self._provider_sequence, *self._deepening_provider_sequence)
         }
         self._provider_errors: list[dict[str, str]] = []
+        self._provider_result_samples: dict[str, list[dict[str, str]]] = {}
+        self._search_queries: list[str] = []
         self._all_results: list[Any] = []
         self._precision_search_escalated = False
         self._deepening_search_used = False
@@ -742,11 +744,11 @@ class HybridSearchProvider:
     def search_structured(self, request: SearchRequest) -> list[Any]:
         """Run the retrieval ladder for one provider-aware query request."""
 
+        self._record_search_query(request.query)
         if self._parallel_provider_fanout and len(self._provider_sequence) > 1:
             return self._search_structured_parallel_provider_fanout(request)
 
         merged: list[Any] = []
-        last_error: Exception | None = None
         recovered_from_error = False
         last_assessment: RetrievalQualityAssessment | None = None
 
@@ -760,7 +762,6 @@ class HybridSearchProvider:
                 results = self._provider_search(provider, request)
             except _RECOVERABLE_PROVIDER_EXCEPTIONS as exc:
                 self._record_provider_elapsed(provider_name, perf_counter() - started_at)
-                last_error = exc
                 self._provider_errors.append(
                     {
                         "provider": provider_name,
@@ -776,6 +777,7 @@ class HybridSearchProvider:
             self._record_provider_elapsed(provider_name, perf_counter() - started_at)
             self._increment_usage(provider_name, "requests_succeeded")
             self._increment_usage(provider_name, "raw_result_count", amount=len(results))
+            self._record_provider_result_samples(provider_name, results)
             self._record_provider_credit_usage(provider_name, provider)
             merged = list(results) if not merged else merge_search_results(merged, results)
             assessment = self._quality_assessor(merged, request.query)
@@ -864,6 +866,7 @@ class HybridSearchProvider:
                     continue
                 self._increment_usage(provider_name, "requests_succeeded")
                 self._increment_usage(provider_name, "raw_result_count", amount=len(results))
+                self._record_provider_result_samples(provider_name, results)
                 self._record_provider_credit_usage(provider_name, credit_usage=credit_usage)
                 result_groups[provider_name] = list(results)
 
@@ -936,6 +939,7 @@ class HybridSearchProvider:
             self._record_provider_elapsed(provider_name, perf_counter() - started_at)
             self._increment_usage(provider_name, "requests_succeeded")
             self._increment_usage(provider_name, "raw_result_count", amount=len(results))
+            self._record_provider_result_samples(provider_name, results)
             self._record_provider_credit_usage(provider_name, provider)
             if results:
                 self._deepening_search_used = True
@@ -984,6 +988,7 @@ class HybridSearchProvider:
         return {
             "search_provider_sequence": list(self._provider_sequence),
             "search_deepening_provider_sequence": list(self._deepening_provider_sequence),
+            "search_queries": list(self._search_queries),
             "primary_search_provider": self.provider_name,
             "search_providers_attempted": providers_attempted,
             "search_providers_used": providers_used,
@@ -994,6 +999,7 @@ class HybridSearchProvider:
             "provider_error_fallback_used": self._provider_error_fallback_used,
             "search_provider_errors": list(self._provider_errors),
             "provider_usage": provider_usage,
+            "provider_result_samples": dict(self._provider_result_samples),
             "provider_value_summary": provider_value_summary(provider_usage),
             "tavily_estimated_credits_used": self._provider_usage[
                 SearchProviderName.TAVILY.value
@@ -1083,6 +1089,44 @@ class HybridSearchProvider:
                 total_seconds=usage.total_seconds,
             )
 
+    def _record_search_query(self, query: str) -> None:
+        cleaned = " ".join(str(query or "").strip().split())
+        if not cleaned:
+            return
+        with self._lock:
+            if cleaned not in self._search_queries:
+                self._search_queries.append(cleaned)
+
+    def _record_provider_result_samples(self, provider_name: str, results: Sequence[Any]) -> None:
+        samples: list[dict[str, str]] = []
+        for result in results[:3]:
+            mapping = _result_mapping(result)
+            title = str(mapping.get("title") or "").strip()
+            url = _url(mapping)
+            snippet = str(mapping.get("snippet") or mapping.get("content") or "").strip()
+            if not title and not url:
+                continue
+            samples.append(
+                {
+                    "title": title[:160],
+                    "url": url[:500],
+                    "snippet": snippet[:220],
+                }
+            )
+        if not samples:
+            return
+        with self._lock:
+            existing = self._provider_result_samples.setdefault(provider_name, [])
+            seen = {sample.get("url") or sample.get("title") for sample in existing}
+            for sample in samples:
+                key = sample.get("url") or sample.get("title")
+                if not key or key in seen:
+                    continue
+                existing.append(sample)
+                seen.add(key)
+                if len(existing) >= 3:
+                    break
+
     def _record_provider_elapsed(self, provider_name: str, elapsed_seconds: float) -> None:
         with self._lock:
             usage = self._provider_usage.get(provider_name, RetrievalProviderUsage())
@@ -1128,15 +1172,18 @@ class HybridSearchProvider:
                     requests_succeeded=usage.requests_succeeded,
                     raw_result_count=usage.raw_result_count,
                     credits_used=usage.credits_used + credits,
-                    input_tokens=usage.input_tokens + _usage_context_int(
+                    input_tokens=usage.input_tokens
+                    + _usage_context_int(
                         usage_context,
                         "input_tokens",
                     ),
-                    cached_input_tokens=usage.cached_input_tokens + _usage_context_int(
+                    cached_input_tokens=usage.cached_input_tokens
+                    + _usage_context_int(
                         usage_context,
                         "cached_input_tokens",
                     ),
-                    output_tokens=usage.output_tokens + _usage_context_int(
+                    output_tokens=usage.output_tokens
+                    + _usage_context_int(
                         usage_context,
                         "output_tokens",
                     ),
@@ -1145,8 +1192,7 @@ class HybridSearchProvider:
                         + _usage_context_int(usage_context, "reasoning_output_tokens")
                     ),
                     estimated_usd=round(
-                        usage.estimated_usd
-                        + _usage_context_float(usage_context, "estimated_usd"),
+                        usage.estimated_usd + _usage_context_float(usage_context, "estimated_usd"),
                         8,
                     ),
                     total_seconds=usage.total_seconds,

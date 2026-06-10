@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 EmailCategory = Literal[
     "consulting_opportunity",
@@ -228,6 +229,7 @@ class EmailTriageResult(BaseModel):
     prior_labels: list[str] = Field(default_factory=list)
     snippet: str = ""
     normalized_body: str = ""
+    retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
     extracted_links: list[GmailLinkRecord] = Field(default_factory=list)
     attachment_metadata: list[GmailAttachmentMetadata] = Field(default_factory=list)
     recommended_action: str

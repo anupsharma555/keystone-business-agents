@@ -70,8 +70,7 @@ DEFAULT_AUTOMATION_SPECS: tuple[AutomationSpec, ...] = (
         target_agent="chief_of_staff",
         workflow="chief-of-staff-weekly-meeting-prep",
         input_template=(
-            "Review the next seven days of calendar context and prepare only salient "
-            "meetings."
+            "Review the next seven days of calendar context and prepare only salient meetings."
         ),
         default_channel="#meetings",
         live_flags=["--live-sdk", "--live-search"],

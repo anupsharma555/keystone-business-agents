@@ -138,6 +138,15 @@ def test_typed_sdk_sync_forwards_session_to_local_runner(monkeypatch: pytest.Mon
 def test_typed_sdk_sync_forwards_session_to_live_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, Any]] = []
     session = object()
+    close_calls = 0
+
+    class FakeAsyncClient:
+        def is_closed(self) -> bool:
+            return close_calls > 0
+
+        async def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
 
     class DummyRunner:
         @staticmethod
@@ -154,7 +163,10 @@ def test_typed_sdk_sync_forwards_session_to_live_runner(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         sdk,
         "build_live_run_config",
-        lambda *args, **kwargs: SimpleNamespace(model="fake-live"),
+        lambda *args, **kwargs: SimpleNamespace(
+            model="fake-live",
+            model_provider=SimpleNamespace(_client=FakeAsyncClient()),
+        ),
     )
 
     sdk.run_typed_sdk_sync(
@@ -166,6 +178,7 @@ def test_typed_sdk_sync_forwards_session_to_live_runner(monkeypatch: pytest.Monk
     )
 
     assert calls[0]["session"] is session
+    assert close_calls == 1
 
 
 def test_typed_sdk_sync_forwards_max_turns_to_runner(monkeypatch: pytest.MonkeyPatch) -> None:

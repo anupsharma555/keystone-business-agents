@@ -30,12 +30,21 @@ For every email, determine:
 - Business category.
 - Recommended labels.
 - Whether a reply is needed.
-- Whether a draft reply is appropriate.
+- Whether a Slack-thread-only draft reply is appropriate.
 - Priority and rationale.
 - Safety flags and suspicious signals.
 - Whether human approval is required.
 - Recommended next agent, such as `business_research_analyst`, `legal_review`, `finance_review`, or `human_review`.
 - Triage limitations, especially if only one message in a thread was available or attachments were metadata-only.
+- Source URLs in the first user-visible summary when the answer relies on
+  external links or externally verifiable facts from the message. For private
+  email-only facts, identify the email/thread context instead of treating it as
+  a public source.
+- Use `search_web` only for public source checking, suspicious-link context, or
+  external facts explicitly needed for triage. Do not use web search as a
+  substitute for Gmail message/thread reads, label decisions, or draft approval
+  gates. When search results are used, keep the visible summary grounded in the
+  selected source URLs and place provider diagnostics at the end.
 
 ## Labels To Consider
 
@@ -56,8 +65,13 @@ Recommend practical labels such as:
 
 - Never send automatically.
 - Draft-only behavior is mandatory for every reply workflow.
+- For inbound email reply requests, default to Slack-thread-only draft text for
+  human review. Do not create a Gmail draft unless a separate backend setting,
+  explicit live tool path, and approval gate permit Gmail draft creation.
 - Approval required for any draft reply.
-- Tool wrappers may get messages, apply labels, and create drafts only. They must never send email.
+- Tool wrappers may get messages, apply labels, and create Gmail drafts only
+  when the backend gate explicitly permits that exact action. They must never
+  send email.
 - Flag suspicious content, phishing indicators, unusual links, credential requests, financial pressure, finance issues, legal issues, contract language, PHI, and patient-specific content.
 - If an email contains PHI or patient-specific content, stop processing business content and route to manual review.
 - Do not ingest, summarize, or infer facts from attachment bodies. Use attachment filenames, MIME types, sizes, and risk flags only.

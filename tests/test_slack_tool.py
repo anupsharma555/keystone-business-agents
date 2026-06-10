@@ -974,9 +974,7 @@ def test_kba_revise_draft_modal_submission_records_feedback_and_queues_agent(
     request = calls[0]
     assert request.manual_request_plan["source"] == "slack_business_agent_action"
     assert request.manual_request_plan["intent"] == "revise_draft"
-    assert request.orchestrator_preflight["request_text"].startswith(
-        "Revise the outreach draft"
-    )
+    assert request.orchestrator_preflight["request_text"].startswith("Revise the outreach draft")
     assert request.orchestrator_preflight["manual_request_plan"]["requested_agent"] == (
         WorkItemRoute.OUTREACH_COMPOSER.value
     )
@@ -1351,7 +1349,11 @@ def test_kba_more_research_uses_langgraph_when_enabled(
     assert graph_event.metadata["checkpoint_key"] == f"work-item:{item.id}"
     assert graph_event.metadata["runtime"] in {"langgraph", "dependency_free_fallback"}
     assert graph_event.metadata["node_path"][0] == "advance_work_item"
-    assert "approval_checkpoint" in graph_event.metadata["node_path"]
+    if graph_event.metadata.get("checkpoint_required"):
+        assert "approval_checkpoint" in graph_event.metadata["node_path"]
+        assert graph_event.metadata.get("checkpoint_reason")
+    else:
+        assert graph_event.metadata["node_path"] == ["advance_work_item"]
 
 
 def test_kba_continue_work_item_uses_langgraph_thread_when_enabled(
@@ -1396,9 +1398,7 @@ def test_kba_continue_work_item_uses_langgraph_thread_when_enabled(
     assert advance_event.metadata["orchestrator_preflight"]["request_text"] == "continue"
     assert advance_event.metadata["orchestrator_preflight"]["advisory_only"] is True
     assert (
-        advance_event.metadata["orchestrator_preflight"]["manual_request_plan"][
-            "requested_agent"
-        ]
+        advance_event.metadata["orchestrator_preflight"]["manual_request_plan"]["requested_agent"]
         == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
     )
     assert graph_event.metadata["checkpoint_key"] == f"work-item:{item.id}"

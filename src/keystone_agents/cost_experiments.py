@@ -18,6 +18,7 @@ SLACK_COST_CONTROLLED_PROFILES = frozenset(
         "slack_manager_balanced",
         "slack_research_balanced",
         "slack_opportunity_balanced",
+        "slack_opportunity_deep",
         "slack_research_deep",
     }
 )
@@ -159,7 +160,15 @@ def render_sdk_cost_comparison_markdown(summary: dict[str, Any]) -> str:
             ]
         )
     if runs:
-        lines.extend(["", "## Runs", "", "| Run | Cache Hit | Input | Cached Input | Output | Estimated | Actual | Session |", "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"])
+        lines.extend(
+            [
+                "",
+                "## Runs",
+                "",
+                "| Run | Cache Hit | Input | Cached Input | Output | Estimated | Actual | Session |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            ]
+        )
         for run in runs:
             if not isinstance(run, dict):
                 continue
@@ -230,10 +239,14 @@ def _cache_readiness_diagnosis(
     recommendations: list[str] = []
     if len(records) < 2:
         issues.append("Need at least two comparable runs to evaluate repeated-run caching.")
-        recommendations.append("Run the same thread once, append a follow-up, then compare both runs.")
+        recommendations.append(
+            "Run the same thread once, append a follow-up, then compare both runs."
+        )
     if not cache_summary.get("available"):
         issues.append("SDK token usage was unavailable, so cached input cannot be measured.")
-        recommendations.append("Use a live SDK/model path that returns input and cached-input usage.")
+        recommendations.append(
+            "Use a live SDK/model path that returns input and cached-input usage."
+        )
     if not request_cache_summary.get("available"):
         issues.append("Request-cache fingerprints were unavailable for one or more runs.")
         recommendations.append("Ensure runs use the centralized run_typed_sdk_agent wrapper.")
@@ -248,10 +261,14 @@ def _cache_readiness_diagnosis(
             recommendations.append("Sort or otherwise stabilize dynamic tool assembly.")
         if not request_cache_summary.get("output_schema_stable"):
             issues.append("Structured output schema changed between runs.")
-            recommendations.append("Avoid run-specific schema generation or unordered schema fields.")
+            recommendations.append(
+                "Avoid run-specific schema generation or unordered schema fields."
+            )
         if not request_cache_summary.get("session_attached_all"):
             issues.append("At least one run did not attach an SDK session.")
-            recommendations.append("Use the same thread-derived SDK session for repeated Slack runs.")
+            recommendations.append(
+                "Use the same thread-derived SDK session for repeated Slack runs."
+            )
         if not request_cache_summary.get("session_hash_stable"):
             issues.append("Runs used different SDK session hashes.")
             recommendations.append(
@@ -575,8 +592,7 @@ def load_work_item_cost_summary(
     sdk = _summarize_workflow_sdk_usage_events(sdk_events)
     run_controls = _summarize_workflow_run_controls(run_control_events)
     estimated = round(
-        float(retrieval.get("estimated_usd") or 0.0)
-        + float(sdk.get("estimated_usd") or 0.0),
+        float(retrieval.get("estimated_usd") or 0.0) + float(sdk.get("estimated_usd") or 0.0),
         8,
     )
     comparison = {}
@@ -797,9 +813,7 @@ def _summarize_retrieval_usage_events(events: list[dict[str, Any]]) -> dict[str,
         "query_count": query_count,
         "raw_search_result_count": raw_result_count,
         "provider_usage": provider_usage,
-        "searxng_requests": _int_value(
-            provider_usage.get("searxng", {}).get("requests_attempted")
-        ),
+        "searxng_requests": _int_value(provider_usage.get("searxng", {}).get("requests_attempted")),
         "agents_web_search_calls": _int_value(
             provider_usage.get("agents-web-search", {}).get("requests_succeeded")
         ),
@@ -845,10 +859,7 @@ def _summarize_workflow_sdk_usage_events(events: list[dict[str, Any]]) -> dict[s
             cache_rates.append(rate)
         usage["estimated_usd"] = round(
             float(usage["estimated_usd"])
-            + (
-                _float_value(event_cost.get("estimated_usd", event_cost.get("amount_usd")))
-                or 0.0
-            ),
+            + (_float_value(event_cost.get("estimated_usd", event_cost.get("amount_usd"))) or 0.0),
             8,
         )
     input_tokens = int(usage["input_tokens"])
@@ -956,7 +967,12 @@ def _workflow_cost_diagnosis(
         notes.append("Search query fanout is still high for a normal Slack run.")
     if (
         str(run_controls.get("latest_cost_profile") or "")
-        in {"slack_research_balanced", "slack_opportunity_balanced", "slack_research_deep"}
+        in {
+            "slack_research_balanced",
+            "slack_opportunity_balanced",
+            "slack_opportunity_deep",
+            "slack_research_deep",
+        }
         and _int_value(retrieval.get("query_count")) == 0
         and not _float_value(retrieval.get("estimated_usd"))
     ):
@@ -979,9 +995,7 @@ def _workflow_cost_diagnosis(
             "billing-window mismatch."
         )
     elif comparison.get("available") and actual_gap is not None and actual_gap > 0.02:
-        notes.append(
-            "OpenAI Platform actual exceeded the local estimate by more than two cents."
-        )
+        notes.append("OpenAI Platform actual exceeded the local estimate by more than two cents.")
     if not notes:
         notes.append("Workflow usage is within the conservative Slack cost expectations.")
     return {
@@ -995,11 +1009,7 @@ def _non_mini_openai_models(sdk: dict[str, Any]) -> list[str]:
     if "openai" not in providers:
         return []
     models = sorted(
-        {
-            str(model).strip()
-            for model in (sdk.get("models") or [])
-            if str(model).strip()
-        }
+        {str(model).strip() for model in (sdk.get("models") or []) if str(model).strip()}
     )
     return [
         model

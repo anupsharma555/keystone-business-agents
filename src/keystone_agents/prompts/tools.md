@@ -1,6 +1,6 @@
 <!--
 prompt_name: tools
-prompt_version: 2026-05-20.1
+prompt_version: 2026-06-09.1
 prompt_purpose: Shared Keystone SDK tool policy, registry, and future tool backlog.
 prompt_safety_notes: Tools must be explicit wrappers with guardrails, dry-run defaults, source attribution, redaction, and no send path.
 prompt_eval_datasets: evals/static/gmail_triage_cases.json, evals/static/business_research_analyst_cases.json, evals/static/opportunity_scout_cases.json, evals/static/outreach_composer_cases.json
@@ -106,6 +106,56 @@ Use these tools only for diagnostics and evidence collection. They must not
 click, submit forms, authenticate, download files, use local files, mutate
 systems, or open a user-screen browser.
 
+## Shared Web Search Contract
+
+Agents with `search_web` all use the same shared retrieval contract. The agent
+should decide whether the task needs broad search, deeper search, or source
+verification from the user's natural-language request and the quality of first
+results. It should not choose providers directly or hard-code provider-specific
+branches in the prompt.
+
+`search_web` stays inert by default. When live research is explicitly enabled
+for SDK runs and no `SEARCH_PROVIDER` override is set, the Python retrieval
+policy uses SearXNG as the broad-recall lane plus a capped Agents SDK hosted
+web-search lane. Exa is a capped semantic deepening lane when configured.
+Tavily is a capped deeper-research lane for explicit deeper-search,
+provider-comparison, formal opportunity, RFP, grant, pilot, procurement, or
+otherwise precision-sensitive requests. Serper remains disabled while credits
+are unavailable and must not run unless `KEYSTONE_SERPER_ENABLED=true` is
+deliberately set after credits are restored.
+
+Use search providers for discovery and search-result recall. Use extraction
+providers such as Trafilatura, Firecrawl, Crawl4AI-style page extraction, or
+read-only rendered-browser diagnostics for detailed source reading after
+promising primary URLs have been selected. Slack-facing answers must synthesize
+the findings first, include visible URLs for source-backed claims, and put
+provider diagnostics only in the final metadata section.
+
+When a WorkItem context pack includes `source_context_status`,
+`source_context_sample`, `source_context_focus`, `source_triage`, or
+`ordered_sources`, treat those fields as the retrieval evidence contract for
+specialist reasoning. Use extracted/read source context for substantive claims.
+Use `source_triage` before synthesis: retained sources may support claims,
+rejected sources must not support claims, and deepen sources need page
+reading/extraction before detailed factual synthesis. For natural Slack
+follow-ups such as "summarize link 1" or "explain the first source", resolve
+the ordinal reference from `ordered_sources` and answer from that source context
+before considering new search. If the pack says sources are snippet-only,
+missing evidence, rejected, need deepening, or do not match the request focus,
+say that limitation in the answer and do not convert off-focus provider results
+into a substantive synthesis. Provider top results can still appear in metadata
+for diagnostics, but they are not source-read evidence by themselves.
+
+The quality bar is higher than generic LLM search. A good search-capable agent
+answer should use provider lanes to find distinctive candidate sources, use
+extraction or source bundles to read the relevant selected pages, and then
+produce an enriched but succinct synthesis from that source context. Exa,
+Tavily, Firecrawl, Crawl4AI-style extraction, hosted file search, or future MCP
+tools should be integrated only when they add real retrieval, extraction,
+permission, or cross-client value, and only through the shared tool/provider
+boundary with dry-run tests, explicit live flags, source attribution, budget
+controls, and compact diagnostics.
+
 ## Gmail Triage Tools
 
 Current tools:
@@ -116,6 +166,10 @@ Current tools:
   context folders without exposing full file bodies.
 - `read_local_context_file`: read one capped prompt-safe text file from an
   allowlisted local context folder.
+- `search_web`: shared read-only web search for source checking or public
+  context when the Gmail task asks for external facts. It follows the shared web
+  search contract above and must not replace Gmail structured tools for message
+  reads, labels, drafts, or thread context.
 - `get_gmail_message`: read one message in fixture mode or through CLI-gated
   live Gmail access.
 - `apply_gmail_labels`: apply intended Keystone labels in fixture mode or through
@@ -150,12 +204,14 @@ Current tools:
 - `load_crm_account_context`: load approved local CRM/account context from fixtures.
 - `load_approved_contact_context`: read approved local contact records from SQLite.
 - `load_approved_crm_context`: read approved local CRM/account context from SQLite.
-- `search_web`: broad search through dry-run, SearXNG, Agents SDK hosted web
-  search, Serper, Firecrawl, or Tavily provider paths. It stays inert by
-  default; when live research is explicitly enabled for SDK runs and no
-  `SEARCH_PROVIDER` override is set, it uses SearXNG plus a capped Agents
-  hosted web-search lane. Serper is reserved for explicit provider selection.
-  Tavily can run as an optional deepening provider when configured.
+- `search_web`: broad primary discovery through dry-run, SearXNG, Agents SDK
+  hosted web search, Exa, or Tavily provider paths. It stays inert by default;
+  when live research is explicitly enabled for SDK runs and no `SEARCH_PROVIDER`
+  override is set, it uses SearXNG plus a capped Agents hosted web-search lane,
+  with Exa as a capped semantic deepening lane when configured and Tavily as an
+  optional deeper-research lane for explicit deeper-search/provider comparison
+  asks. Serper is disabled while credits are unavailable and must not be
+  selected unless `KEYSTONE_SERPER_ENABLED=true`.
 - `fetch_company_page`: fetch or fixture-load company website content.
 - `extract_website_content`: live-gated selected-page extraction through
   Trafilatura by default or Firecrawl when explicitly configured.
@@ -190,11 +246,12 @@ Current tools:
   signals, dedup markers, and prompt-safe operator feedback that can sharpen
   ranking or avoid repeated weak recommendations.
 - `search_web`: broad opportunity discovery through dry-run, SearXNG, Agents
-  SDK hosted web search, Serper, Firecrawl, or Tavily provider paths. It stays
-  inert by default; when live research is explicitly enabled for SDK runs and
-  no `SEARCH_PROVIDER` override is set, it uses SearXNG plus a capped Agents
-  hosted web-search lane. Serper is reserved for explicit provider selection.
-  Tavily can run as an optional deepening provider when configured.
+  SDK hosted web search, Exa, or Tavily provider paths. It stays inert by
+  default; when live research is explicitly enabled for SDK runs and no
+  `SEARCH_PROVIDER` override is set, it uses SearXNG plus a capped Agents
+  hosted web-search lane, with Exa as capped semantic deepening and Tavily as
+  optional deeper-research deepening when configured. Serper is disabled while
+  credits are unavailable.
 - `search_opportunity_sources_placeholder`: dry-run opportunity source discovery.
 - `score_opportunity`: deterministic opportunity scoring from type and signals.
 - `handoff_to_business_research_analyst_placeholder`: compatibility-named tool that
@@ -242,6 +299,11 @@ Current tools:
 - `load_crm_account_context`: load approved local CRM/account context fixtures.
 - `load_approved_contact_context`: read approved local contact records from SQLite.
 - `load_approved_crm_context`: read approved local CRM/account context from SQLite.
+- `search_web`: shared read-only web search for lightweight public-source
+  checking when approved context is incomplete or the operator asks for public
+  context. It follows the shared web search contract above. Do not use web
+  search to invent outreach claims; only approved source-backed context may be
+  used in outbound draft copy.
 - `retrieve_outreach_examples`: retrieve 1-3 approved sanitized private outreach
   examples from local SQLite for pattern guidance only. It returns no raw thread
   bodies, headers, secrets, PHI, patient-specific content, or private contact details.
@@ -279,6 +341,9 @@ Current tools:
   context folders without exposing full file bodies.
 - `read_local_context_file`: read one capped prompt-safe text file from an
   allowlisted local context folder.
+- `search_web`: shared read-only web search for route preflight, public-source
+  checking, or lightweight research context when the operator asks for current
+  external facts. Provider selection stays in Python retrieval policy.
 - `route_request_placeholder`: deterministic fixture-mode route selection.
 - `load_pending_approval_items`: read local approval queue state for routing
   context without sending anything.
@@ -292,6 +357,34 @@ Useful future tools:
 
 - `summarize_workflow_state`: produce compact state for long-running workflows.
 - `record_orchestrator_decision`: persist route decisions when a caller passes `--save`.
+
+## Chief Of Staff Tools
+
+Current tools:
+
+- `list_chief_of_staff_context_sources`: list available local operations and
+  automation context sources without reading broad private content.
+- `search_local_context`: search capped snippets from allowlisted Keystone
+  operating context.
+- `read_local_context_file`: read one capped prompt-safe local context file.
+- `search_web`: shared read-only web search for source-backed briefs, current
+  policy/research/company facts, and provider diagnostics. It follows the
+  shared web search contract above. Use deeper search from the request shape or
+  first-pass result quality; do not choose Exa, Tavily, SearXNG, or hosted web
+  search directly in the prompt.
+- `extract_research_claims_from_html`: deterministic extraction from selected
+  retrieved pages when detailed source reading is needed.
+- `summarize_slack_runtime_config`, `list_automation_specs`,
+  `list_recent_automation_runs`, and related automation tools: read-only
+  operations diagnostics unless an explicit live write path is separately
+  approved.
+- Google Workspace and Airtable tools: bounded internal reads/writes only with
+  the required live flags and approval references.
+
+Useful future tools:
+
+- Provider-usage comparison helper that summarizes search lane contribution from
+  retrieval telemetry without asking the model to infer provider diagnostics.
 
 ## Adding A New Tool
 

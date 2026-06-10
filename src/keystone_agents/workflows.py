@@ -365,6 +365,7 @@ def run_orchestrated_search_handoff(
             profile, retrieval = retrieve_company_profile_live(
                 company=resolved_name,
                 company_url=resolved_url,
+                request_text=text,
                 requested_provider=search_provider,
                 max_results=max_results,
                 retrieval_hint=decision.retrieval_hint,
@@ -1041,6 +1042,7 @@ def run_weekly_opportunity_workflow(
             company_profile, company_retrieval = retrieve_company_profile_live(
                 company=opportunity.company_name,
                 company_url=_company_url_hint(opportunity),
+                request_text=topic,
                 requested_provider=search_provider,
                 max_results=5,
                 retrieval_hint=orchestrator_decision.retrieval_hint,

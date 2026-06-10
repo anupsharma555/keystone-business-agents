@@ -75,6 +75,7 @@ class WorkItemSourceRef(BaseModel):
     source_quality: str = ""
     retrieved_at: str = ""
     key_facts: list[str] = Field(default_factory=list)
+    evidence_excerpt: str = ""
     zotero_key: str = ""
 
 

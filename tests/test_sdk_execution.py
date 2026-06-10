@@ -67,8 +67,12 @@ from keystone_agents.models import (
     OutreachComposerSDKInput,
     TypedAgentRunResult,
 )
+from keystone_agents.run import (
+    prompt_from_typed_input,
+    run_retrieved_sdk_synthesis,
+    run_typed_sdk_agent,
+)
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
-from keystone_agents.run import prompt_from_typed_input, run_retrieved_sdk_synthesis
 from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
 from keystone_agents.schemas.email_triage import EmailTriageResult, GmailPriorityGroupingResult
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
@@ -653,6 +657,56 @@ def _run_with_fake_model(
     )
 
 
+def test_run_typed_sdk_agent_retries_live_rate_limit_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    class FakeRateLimitError(Exception):
+        status_code = 429
+
+    class FakeAgent:
+        name = "chief_of_staff"
+        model = "gpt-test"
+
+    def fake_run_typed_sdk_sync(
+        *_args: Any, **_kwargs: Any
+    ) -> tuple[dict[str, Any], ChiefOfStaffResult]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise FakeRateLimitError("Rate limit reached. Please try again in 1.5s.")
+        return (
+            {"fake": True},
+            ChiefOfStaffResult(
+                mode="llm",
+                summary="Recovered after retry.",
+                audit_notes=[],
+            ),
+        )
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr("keystone_agents.run.time.sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(
+        "keystone_agents.run.enforce_agent_run_budget",
+        lambda **_kwargs: {"enforced": False},
+    )
+
+    result = run_typed_sdk_agent(
+        agent=FakeAgent(),
+        typed_input={"request": "deepened search brief"},
+        output_type=ChiefOfStaffResult,
+        live=True,
+        config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+    )
+
+    assert calls == 2
+    assert sleeps == [2.0]
+    assert result.output.summary == "Recovered after retry."
+    assert result.request_cache["rate_limit_retries"] == 1
+
+
 @pytest.mark.parametrize(
     (
         "builder",
@@ -820,6 +874,7 @@ def test_typed_specialist_runtime_harness_uses_fake_model_without_openai_key(
     assert "source" in result.cost
     assert result.budget_guard["status"]
     assert result.request_cache["request_layout"] == "static_agent_prefix_then_dynamic_typed_input"
+    assert result.request_cache["repo_instruction_profile"] == "compact-runtime-policy"
     assert len(result.request_cache["static_prefix_sha256"]) == 64
     assert len(result.request_cache["dynamic_prompt_sha256"]) == 64
     assert model.calls
@@ -852,6 +907,145 @@ def test_business_research_analyst_focused_brief_runtime_uses_llm_output_contrac
     assert "Do not invent facts" in prompt
     assert "fixture:curebase_company" in prompt
     assert result.live is False
+
+
+def test_research_sdk_wrappers_default_to_read_only_core_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    research_model = FakeModel(outputs=[[_structured_message(_company_profile_payload())]])
+    scout_model = FakeModel(outputs=[[_structured_message(_opportunity_scout_payload())]])
+
+    run_business_research_analyst_sdk(
+        BusinessResearchSDKInput(company_name="Curebase"),
+        run_config=build_local_run_config(FakeProvider(research_model)),
+    )
+    run_opportunity_scout_sdk(
+        OpportunityScoutSDKInput(topic="behavioral health AI"),
+        run_config=build_local_run_config(FakeProvider(scout_model)),
+    )
+
+    research_tools = set(research_model.calls[0]["tool_names"])
+    scout_tools = set(scout_model.calls[0]["tool_names"])
+
+    assert "retrieve_memory" in research_tools
+    assert "retrieve_memory" in scout_tools
+    assert "search_web" not in research_tools
+    assert "search_web" not in scout_tools
+    assert "airtable_write_record" not in research_tools
+    assert "save_opportunity_memory" not in scout_tools
+
+
+def test_research_sdk_wrappers_infer_deep_retrieval_without_write_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    research_model = FakeModel(outputs=[[_structured_message(_company_profile_payload())]])
+    scout_model = FakeModel(outputs=[[_structured_message(_opportunity_scout_payload())]])
+
+    run_business_research_analyst_sdk(
+        BusinessResearchSDKInput(
+            company_name="OpenAI",
+            context="Please do a deeper source-backed search and summarize the source data.",
+        ),
+        live=True,
+        run_config=build_local_run_config(FakeProvider(research_model)),
+    )
+    run_opportunity_scout_sdk(
+        OpportunityScoutSDKInput(
+            topic=(
+                "deeper source-backed search for active AI-enabled behavioral health "
+                "pilot, RFP, or grant opportunities"
+            )
+        ),
+        live=True,
+        run_config=build_local_run_config(FakeProvider(scout_model)),
+    )
+
+    research_tools = set(research_model.calls[0]["tool_names"])
+    scout_tools = set(scout_model.calls[0]["tool_names"])
+
+    assert "search_web" in research_tools
+    assert "extract_research_claims_from_html" in research_tools
+    assert "airtable_write_record" not in research_tools
+    assert "google_sheet_append_rows" not in research_tools
+    assert "search_web" in scout_tools
+    assert "extract_research_claims_from_html" in scout_tools
+    assert "score_opportunity" in scout_tools
+    assert "save_opportunity_memory" not in scout_tools
+    assert "airtable_write_record" not in scout_tools
+
+
+def test_gmail_triage_sdk_defaults_to_read_only_unless_draft_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    read_model = FakeModel(outputs=[[_structured_message(_email_triage_payload())]])
+    draft_model = FakeModel(outputs=[[_structured_message(_email_triage_payload())]])
+
+    run_gmail_triage_sdk(
+        GmailTriageSDKInput(
+            subject="Potential project",
+            body="Could Keystone help us evaluate a behavioral health AI workflow?",
+        ),
+        run_config=build_local_run_config(FakeProvider(read_model)),
+    )
+    run_gmail_triage_sdk(
+        GmailTriageSDKInput(
+            subject="Potential project",
+            body="Could Keystone help us evaluate a behavioral health AI workflow?",
+            request="Please draft a short reply but do not send it.",
+        ),
+        run_config=build_local_run_config(FakeProvider(draft_model)),
+    )
+
+    read_tools = set(read_model.calls[0]["tool_names"])
+    draft_tools = set(draft_model.calls[0]["tool_names"])
+
+    assert "get_gmail_message" in read_tools
+    assert "create_gmail_draft_reply" not in read_tools
+    assert "apply_gmail_labels" not in read_tools
+    assert "airtable_write_record" not in read_tools
+    assert "create_gmail_draft_reply" in draft_tools
+    assert "create_approval_queue_item" in draft_tools
+    assert "search_web" in draft_tools
+
+
+def test_orchestrator_sdk_infers_tiered_tools_for_default_and_deep_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    default_model = FakeModel(outputs=[[_structured_message(_orchestrator_payload())]])
+    deep_model = FakeModel(outputs=[[_structured_message(_orchestrator_payload())]])
+
+    run_orchestrator_sdk(
+        "Route Curebase for business research.",
+        run_config=build_local_run_config(FakeProvider(default_model)),
+    )
+    run_orchestrator_sdk(
+        "Run a deeper source-backed web search and summarize the source data.",
+        live=True,
+        run_config=build_local_run_config(FakeProvider(deep_model)),
+    )
+
+    default_tools = set(default_model.calls[0]["tool_names"])
+    deep_tools = set(deep_model.calls[0]["tool_names"])
+
+    assert "retrieve_memory" in default_tools
+    assert "search_web" not in default_tools
+    assert "airtable_write_record" not in default_tools
+    assert "search_web" in deep_tools
+    assert "extract_research_claims_from_html" in deep_tools
+    assert "airtable_write_record" not in deep_tools
+    assert "google_sheet_append_rows" not in deep_tools
 
 
 def test_typed_specialist_runtime_missing_key_only_fails_for_live_execution(
@@ -1131,6 +1325,7 @@ def test_retrieved_sdk_synthesis_harness_validates_and_audits(
     assert outcome.cost["amount_usd"] is None
     assert outcome.cost["source"] == "pricing_table_no_match"
     assert outcome.request_cache["request_layout"] == "static_agent_prefix_then_dynamic_typed_input"
+    assert outcome.request_cache["repo_instruction_profile"] == "compact-runtime-policy"
     assert outcome.request_cache["session_attached"] is False
     assert outcome.request_cache["tool_count"] > 0
     assert len(outcome.request_cache["static_prefix_sha256"]) == 64
@@ -1352,6 +1547,8 @@ def test_retrieved_sdk_synthesis_records_error_for_invalid_model_output(
     assert len(storage.agent_runs) == 1
     assert storage.agent_runs[0]["status"] == "error"
     assert storage.agent_runs[0]["error"] == "ModelBehaviorError"
+    assert storage.agent_runs[0]["output"]["failure"]["kind"] == "schema_or_parse_error"
+    assert storage.agent_runs[0]["output"]["send_enabled"] is False
 
 
 def test_live_sdk_synthesis_retries_gemini_with_openai_fallback(

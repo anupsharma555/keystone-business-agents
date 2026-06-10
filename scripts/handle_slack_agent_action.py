@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from keystone_agents.operator_failures import known_exception_to_operator_failure
 from keystone_agents.slack_action_contract import slack_agent_feedback_event
 from keystone_agents.slack_actions import handle_run_agent_interaction
 from keystone_agents.storage.sqlite_store import database_url_from_env
@@ -54,23 +55,30 @@ def main() -> int:
     try:
         return _main(args)
     except Exception as exc:
+        failure = known_exception_to_operator_failure(exc, context="Slack bridge run")
         error_payload = {
             "stage": "work_item",
             "callback_id": "",
             "status": "error",
             "route": "",
             "send_enabled": False,
+            "failure": failure.to_dict(),
             "error": {
                 "type": type(exc).__name__,
-                "message": str(exc),
+                "message": failure.reason,
             },
+            "summary": failure.summary,
+            "next_step": failure.next_step,
         }
         if args.feedback_jsonl:
             _stream_feedback_jsonl(
                 "agent_error",
                 {
                     "error_type": type(exc).__name__,
-                    "message": str(exc),
+                    "message": failure.reason,
+                    "failure": failure.to_dict(),
+                    "summary": failure.summary,
+                    "next_step": failure.next_step,
                     "send_enabled": False,
                 },
             )

@@ -20,99 +20,127 @@ Agents should handle both broad open-ended asks and exact deterministic requests
 
 Build a Keystone-specific benchmark suite that evaluates the complete agent system: model, prompts, tools, context packs, retrieval, guardrails, handoffs, renderers, and persistence. Generic benchmarks are useful inspiration, but Keystone needs domain-specific tests for its actual business workflows and tools.
 
-## 5. Trace-Graded Workflow Evaluation
+## 5. Distinctive Source-Grounded Answers
+
+Keystone agents should produce answers that are more useful than standard
+generic LLM search. They should combine Keystone-specific context, WorkItem
+state, source bundles, extracted page text, provider diagnostics, approved
+memory, and specialist reasoning to produce enriched, detailed, succinct, and
+query-relevant answers. For search and retrieval tasks, `Detailed Summary` is
+the detailed answer: it should summarize the source data first, then explain
+Keystone relevance, uncertainty, and next steps.
+
+The medium-term product goal is to keep integrating novel useful capabilities
+when they materially improve answer quality, especially open-source or
+free-tier-friendly tools such as SearXNG, Exa, Tavily, Trafilatura, Firecrawl,
+and Crawl4AI-style extraction. New providers, MCP servers, or dynamic tool
+surfaces should be adopted only when they add real retrieval, extraction,
+permission, or cross-client value beyond local function tools, and they must
+remain budget-aware, dry-run-testable, source-attributed, and centrally governed.
+
+## 6. Trace-Graded Workflow Evaluation
 
 Use trace-style grading to evaluate whether the agent selected the right tool, routed or handed off correctly, respected guardrails, preserved context, recovered from errors, and produced the right final state. This should complement output-only tests because many agent failures happen inside the workflow before the final response.
 
-## 6. Repeatability And pass-k Reliability
+## 7. Repeatability And pass-k Reliability
 
 Measure whether agents succeed consistently across repeated runs, not only whether one run passed. For important Slack, Gmail, research, opportunity, and outreach flows, track repeated-run stability, route variance, source variance, approval-boundary consistency, and whether a second or third attempt changes the answer without new evidence.
 
-## 7. State-Correctness Benchmarks
+## 8. State-Correctness Benchmarks
 
 For workflows that read or write local state, evaluate the final SQLite, WorkItem, approval, artifact, source, and memory state against an expected goal state. This mirrors tool-agent-user benchmark practice: the final database or workflow state matters more than whether the final prose sounds plausible.
 
-## 8. Seamless Cross-Agent Handoffs
+## 9. Seamless Cross-Agent Handoffs
 
 Research, Opportunity Scout, Outreach, Gmail, Chief of Staff, and Orchestrator should pass structured context through WorkItems, context packs, artifact refs, source refs, blockers, approval gates, and prior run summaries without losing the original user request or downstream intent.
 
-## 9. Reliable Context Selection
+## 10. Reliable Context Selection
 
 Improve handling of references like "this thread," "the prior post," "that company," "run it again," and "continue" so agents bind to the correct Slack, Gmail, WorkItem, artifact, or prior-run context. If the target cannot be resolved, the system should block with a precise missing-context explanation.
 
-## 10. Richer, Safer Context Layer
+## 11. Richer, Safer Context Layer
 
 Expand context quality across Slack threads, WorkItems, prior runs, selected artifacts, approved facts, source bundles, Gmail threads, local docs, and memory. The goal is more relevant context with less stale, unrelated, or unsafe context.
 
-## 11. Deeper User And Aim Understanding
+## 12. Deeper User And Aim Understanding
 
 Improve the agents' model of Keystone's priorities, business goals, operator preferences, writing style, risk tolerance, current projects, and recurring workflows. Responses should reflect what the user is trying to accomplish, not just the literal command.
 
-## 12. Slack As The Human Work Cockpit
+## 13. Slack As The Human Work Cockpit
 
 Make Slack responses concise, actionable, and downstream-useful. A Slack result should foreground the answer, blockers, next safe action, approval state, and useful buttons while hiding low-value workflow metadata.
 
-## 13. Human Approval As A First-Class Workflow
+## 14. Human Approval As A First-Class Workflow
 
 Treat approvals as durable work objects. Every draft, Slack post, CRM write, Gmail draft, external-use action, or live write plan should carry scope, reviewer state, source basis, allowed action, and next step.
 
-## 14. Agent Output Designed For Downstream Work
+## 15. Agent Output Designed For Downstream Work
 
 Every agent result should be usable by the next step. Research should produce decision-ready evidence and concerns, Scout should produce ranked handoff-ready opportunities, Outreach should produce approval-ready drafts, Gmail should produce triage and reply decisions, and Chief of Staff should produce operational plans.
 
-## 15. Evidence-First Reasoning
+## 16. Evidence-First Reasoning
 
 Agents should separate facts, inferences, missing evidence, and recommendations. Company, opportunity, current-year, and "latest" claims should use source attribution and independent evidence when available, and should say when evidence is too thin.
 
-## 16. Bounded Repair Loop
+## 17. Bounded Repair Loop
 
 Strengthen Orchestrator review and repair so off-target, shallow, stale, unsafe, or weakly sourced outputs get one targeted correction before the system blocks or asks the human for input. Repair should improve quality without creating uncontrolled loops.
 
-## 17. Error Recovery And Escalation Metrics
+## 18. Error Recovery And Escalation Metrics
 
 Track where agents fail, whether they recover, and when they ask for human intervention. Useful metrics include escalation rate, time-to-first-error, recovery success rate, blocker precision, and whether the agent stops safely when context, approval, source evidence, or tool access is insufficient.
 
-## 18. Low-Latency Response Modes
+## 19. Low-Latency Response Modes
 
 Support clear fast and deep execution modes. Quick responses should use available context and deterministic checks; deeper runs should use broader retrieval and synthesis. When tool or time budgets run out, the system should say what was checked and what remains unresolved.
 
-## 19. Cost And Tool-Budget Discipline
+## 20. Cost And Tool-Budget Discipline
 
 Measure token use, tool calls, retrieval breadth, elapsed time, repair count, and cost by request category. A result that is technically correct but too slow or expensive for routine Slack use should fail the practical benchmark for that workflow.
 
-## 20. Personal Operating Memory With Boundaries
+## 21. Personal Operating Memory With Boundaries
 
 Use approved memory to capture recurring aims, preferred answer style, business focus areas, prior decisions, useful corrections, and approved examples. Memory must not override the current request, source attribution, privacy constraints, no-PHI rules, or approval gates.
 
-## 21. Cross-Channel Continuity
+## 22. Cross-Channel Continuity
 
 Let the user start in Slack, continue in CLI, approve through a WorkItem, and later ask a follow-up without losing the thread, confusing stale context, or repeating completed work. WorkItems and audit state should remain the canonical continuity layer.
 
-## 22. OpenAI Agents SDK Alignment
+## 23. OpenAI Agents SDK Alignment
 
 Keep the repo standardized around top-level OpenAI Agents SDK patterns: SDK `Agent` builders, tools, structured outputs, guardrails, handoffs, sessions, tracing, approval patterns, and agents-as-tools where useful. Avoid custom orchestration that duplicates SDK primitives without a clear project-specific reason.
 
-## 23. Tool Surfaces That Match Agent Jobs
+## 24. Tool Surfaces That Match Agent Jobs
 
 Keep tools explicit, typed, and schema-first. Add new helpers only when they improve bounded reads, writes, retrieval, source extraction, diagnostics, or review. Registry, policy, prompt, safety, and test updates should move together.
 
-## 24. Operational Observability Without Noise
+## 25. Agentic Source Triage Before Synthesis
+
+Search-heavy agents should reason over retrieved candidates before final
+retention and synthesis. Retrieval lanes gather candidates and page context, a
+specialist or bounded reranker labels each candidate as retained, review-only,
+or rejected against the raw user request, and Python then enforces hard source,
+eligibility, timing, safety, and approval gates. Deterministic gates should
+catch general contradictions and missing evidence; agentic triage should decide
+relevance, precision, recall gaps, and what deserves deeper reading.
+
+## 25. Operational Observability Without Noise
 
 Track route, latency, repair count, retrieval diagnostics, source sufficiency, cost, final status, guardrail outcomes, and state diffs in audit logs. Human-facing Slack and CLI output should remain focused on the answer, blockers, and next action.
 
-## 25. Feedback-To-Eval Learning Loop
+## 26. Feedback-To-Eval Learning Loop
 
 Convert human corrections into structured feedback, prompt-safe memory, fixtures, evals, and documented acceptance criteria. Repeated operator complaints should become durable regression coverage before being considered solved.
 
-## 26. SDK-Native Evaluation And Tracing
+## 27. SDK-Native Evaluation And Tracing
 
 Move closer to standard OpenAI agent implementation practice by capturing trace IDs, handoff summaries, tool-call summaries, guardrail outcomes, and structured eval results in a way that supports debugging and quality review without exposing sensitive data.
 
-## 27. Live Integration Confidence Ladder
+## 28. Live Integration Confidence Ladder
 
 Preserve dry-run-first development, then promote capabilities through fixture tests, local evals, live smoke tests, and approval-gated live operation. Slack, Gmail, search, Google Workspace, Airtable, and CRM should each stay independently gated.
 
-## 28. Chief Of Staff As Workflow Integrator
+## 29. Chief Of Staff As Workflow Integrator
 
 Use the Chief of Staff agent to synthesize operational state across Slack, WorkItems, automations, approvals, recent agent runs, and repo context. It should own broad questions such as "what should we do next?" and "why did the system respond this way?"
 

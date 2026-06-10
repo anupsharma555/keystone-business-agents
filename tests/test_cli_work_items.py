@@ -36,7 +36,7 @@ def test_cli_work_items_advance_and_show(tmp_path: Path, capsys) -> None:
     show_exit = main(["work-items", "show", work_item_id, "--database-url", database_url])
 
     assert show_exit == 0
-    assert "Status: in_progress" in capsys.readouterr().out
+    assert "Status: done" in capsys.readouterr().out
 
 
 def test_cli_work_items_list_json(tmp_path: Path, capsys) -> None:
@@ -123,14 +123,14 @@ def test_cli_work_items_continue_resolves_single_active_item(tmp_path: Path, cap
         if line.startswith("WorkItem:")
     )
 
-    exit_code = main(
-        ["work-items", "advance", "--input", "continue", "--database-url", database_url]
-    )
+    try:
+        main(["work-items", "advance", "--input", "continue", "--database-url", database_url])
+    except SystemExit as exc:
+        assert "No active WorkItem found" in str(exc)
+    else:
+        raise AssertionError("completed WorkItems should not be auto-continued as active")
 
-    assert exit_code == 0
-    output = capsys.readouterr().out
-    assert f"WorkItem: {work_item_id}" in output
-    assert "Route: opportunity_scout" in output
+    assert work_item_id
 
 
 def test_cli_work_items_langgraph_json_exposes_graph_metadata(tmp_path: Path, capsys) -> None:

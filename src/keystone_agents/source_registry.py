@@ -129,6 +129,9 @@ def classify_source_lanes(
     lowered_url = str(url or "").lower()
     haystack = " ".join([lowered_url, title, snippet, source_type]).lower()
     lanes: list[str] = []
+    normalized_source_type = str(source_type or "").strip().lower()
+    if normalized_source_type in SOURCE_LANES:
+        lanes.append(normalized_source_type)
 
     if domain == "clinicaltrials.gov" or "clinical trial" in haystack or "nct0" in haystack:
         lanes.append("clinical_trials")
@@ -144,14 +147,23 @@ def classify_source_lanes(
         lanes.append("literature")
     if domain in PROCUREMENT_DOMAINS or any(
         term in haystack
-        for term in ("rfp", "request for proposal", "solicitation", "sources sought")
+        for term in ("rfp", "rfi", "request for proposal", "solicitation", "sources sought")
     ):
         lanes.append("procurement_rfp")
     if any(domain == item or domain.endswith(f".{item}") for item in REGULATORY_DOMAINS):
         lanes.append("regulatory")
     if any(
         term in haystack
-        for term in ("conference", "symposium", "summit", "workshop", "call for speakers")
+        for term in (
+            "conference",
+            "symposium",
+            "summit",
+            "workshop",
+            "call for speakers",
+            "call for abstracts",
+            "call for proposals",
+            "cfp",
+        )
     ):
         lanes.append("conference_events")
     if domain in PRESS_DOMAINS or any(
@@ -276,7 +288,20 @@ def required_source_lanes_for_company(
         lanes.insert(0, "company_site")
     if any(term in text for term in ("career", "hiring", "job", "role")):
         lanes.append("careers_jobs")
-    if any(term in text for term in ("clinical", "trial", "study", "validation")):
+    if any(
+        term in text
+        for term in (
+            "clinical",
+            "trial",
+            "study",
+            "validation",
+            "evaluation",
+            "evaluated",
+            "research",
+            "publication",
+            "journal",
+        )
+    ):
         lanes.extend(["clinical_trials", "literature"])
     if any(term in text for term in ("leadership", "founder", "executive", "team")):
         lanes.append("people_institutions")
@@ -293,19 +318,33 @@ def required_source_lanes_for_opportunity(
 
     text = " ".join([request_text, " ".join(target_entity_types), " ".join(objectives)]).lower()
     lanes: list[str] = []
-    if any(term in text for term in ("broad", "company", "growth", "advisory", "partnership")):
+    if any(
+        term in text
+        for term in ("broad company", "company discovery", "growth", "advisory", "partnership")
+    ):
         lanes.extend(["company_site", "press_news"])
     if any(term in text for term in ("role", "job", "hiring", "career")):
         lanes.append("careers_jobs")
     if any(term in text for term in ("trial", "clinical trial", "study")):
         lanes.append("clinical_trials")
-    if any(term in text for term in ("grant", "funding", "sbir", "sttr")):
+    if any(term in text for term in ("grant", "funding", "nofo", "foa", "rfa", "sbir", "sttr")):
         lanes.append("grants_funding")
     if any(term in text for term in ("pubmed", "literature", "publication", "journal")):
         lanes.append("literature")
-    if any(term in text for term in ("rfp", "contract", "procurement", "solicitation")):
+    if any(term in text for term in ("rfp", "rfi", "contract", "procurement", "solicitation")):
         lanes.append("procurement_rfp")
-    if any(term in text for term in ("conference", "presentation", "speaker", "workshop")):
+    if any(
+        term in text
+        for term in (
+            "conference",
+            "presentation",
+            "speaker",
+            "workshop",
+            "call for proposals",
+            "call for abstracts",
+            "cfp",
+        )
+    ):
         lanes.append("conference_events")
     if any(term in text for term in ("researcher", "institute", "university", "faculty")):
         lanes.append("people_institutions")

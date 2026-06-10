@@ -42,8 +42,13 @@ def test_static_eval_scoring_runs() -> None:
     assert summary.failed == 0
     assert summary.average_score == 1.0
     assert payload["datasets"]
+    assert "skill_labels" in payload
+    assert "action_boundary_enforcement" in payload["skill_labels"]
+    assert "evidence_attribution_and_claim_mapping" in payload["skill_labels"]
     assert payload["prompt_metadata"]
     assert all(result["prompt_versions"] for result in payload["results"])
+    assert all(result["skill_labels"] for result in payload["results"])
+    assert all(check["skill_labels"] for result in payload["results"] for check in result["checks"])
     assert all(result["dataset"] for result in payload["results"])
 
 
@@ -84,6 +89,7 @@ def test_eval_report_renders() -> None:
 
     assert "# Keystone Static Eval Report" in report
     assert "outreach/curebase_approved_context_email" in report
+    assert "Skill labels" in report
     assert "Average score" in report
     assert "Prompt versions" in report
     assert "outreach_composer@2026-05-20.1" in report

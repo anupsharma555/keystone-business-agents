@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from inspect import Parameter, signature
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -43,6 +45,7 @@ from keystone_agents.schemas.company_profile import CompanyProfile
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.opportunity_search_plan import OpportunitySearchPlan
 from keystone_agents.schemas.retrieval import RetrievalHint
+from keystone_agents.source_triage import triage_source_candidates
 from keystone_agents.tools.html_review_tool import (
     HtmlReviewError,
     agent_html_review_enabled,
@@ -62,6 +65,7 @@ DEFAULT_SANDBOX_SEARCH_REVIEW_CONTEXT_SIZE = "low"
 DEFAULT_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 8
 MAX_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 12
 DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN = 2
+DEFAULT_EXA_SEARCH_MAX_CALLS_PER_RUN = 2
 DEFAULT_SEARXNG_TRANSIENT_TIMEOUT_SECONDS = 2.0
 
 
@@ -122,7 +126,13 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
         "live_search": bool(metadata.get("live_search")),
         "provider_summary": provider_summary,
         "providers_used": list(dict.fromkeys(providers_used)),
+        "search_queries": _compact_search_queries(metadata.get("search_queries")),
         "provider_usage": _compact_provider_usage(provider_usage),
+        "provider_result_samples": _compact_provider_result_samples(
+            metadata.get("provider_result_samples")
+        ),
+        "source_triage": _compact_source_triage(metadata.get("source_triage")),
+        "source_focus": _compact_source_focus(metadata.get("source_focus")),
         "retrieval_ladder": _compact_retrieval_ladder(metadata.get("retrieval_ladder")),
         "search_quality_summary": _compact_quality_summary(quality),
         "source_coverage_summary": _compact_source_coverage(source_coverage),
@@ -155,6 +165,46 @@ def _split_provider_summary(value: str) -> list[str]:
     return [item.strip() for item in value.replace("+", ",").split(",") if item.strip()]
 
 
+def _compact_source_triage(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    decisions = value.get("decisions")
+    decision_counts: dict[str, int] = {}
+    decision_urls: dict[str, list[str]] = {
+        "retain": [],
+        "review": [],
+        "deepen": [],
+        "reject": [],
+    }
+    if isinstance(decisions, list):
+        for item in decisions:
+            if not isinstance(item, Mapping):
+                continue
+            decision = str(item.get("decision") or "").strip()
+            if decision:
+                decision_counts[decision] = decision_counts.get(decision, 0) + 1
+                url = str(item.get("url") or "").strip()
+                if url and decision in decision_urls and url not in decision_urls[decision]:
+                    decision_urls[decision].append(url)
+    return {
+        "mode": str(value.get("mode") or ""),
+        "decision_counts": decision_counts,
+        "retained_count": len(value.get("retained_source_ids") or []),
+        "review_count": len(value.get("review_source_ids") or []),
+        "rejected_count": len(value.get("rejected_source_ids") or []),
+        "deepen_count": len(value.get("deepen_source_ids") or []),
+        "retained_urls": decision_urls["retain"][:8],
+        "review_urls": decision_urls["review"][:8],
+        "rejected_urls": decision_urls["reject"][:8],
+        "deepen_urls": decision_urls["deepen"][:8],
+        "needs_broaden_or_deepen": bool(value.get("needs_broaden_or_deepen")),
+        "recommended_action": str(value.get("recommended_action") or ""),
+        "recall_gaps": [
+            str(item) for item in (value.get("recall_gaps") or []) if str(item).strip()
+        ][:5],
+    }
+
+
 def _compact_provider_usage(provider_usage: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     compact: dict[str, dict[str, Any]] = {}
     for name, usage in provider_usage.items():
@@ -173,6 +223,64 @@ def _compact_provider_usage(provider_usage: Mapping[str, Any]) -> dict[str, dict
             "total_seconds": round(_safe_float(usage.get("total_seconds")), 3),
         }
     return compact
+
+
+def _compact_search_queries(value: Any) -> list[str]:
+    if isinstance(value, str):
+        queries = [value]
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        queries = [str(item or "") for item in value]
+    else:
+        return []
+    return [query.strip()[:240] for query in queries[:6] if query.strip()]
+
+
+def _compact_provider_result_samples(value: Any) -> dict[str, list[dict[str, str]]]:
+    if not isinstance(value, Mapping):
+        return {}
+    compact: dict[str, list[dict[str, str]]] = {}
+    for provider, samples in value.items():
+        provider_name = str(provider or "").strip()
+        if not provider_name or not isinstance(samples, list):
+            continue
+        provider_samples: list[dict[str, str]] = []
+        for sample in samples[:3]:
+            if not isinstance(sample, Mapping):
+                continue
+            title = str(sample.get("title") or "").strip()
+            url = str(sample.get("url") or "").strip()
+            snippet = str(sample.get("snippet") or "").strip()
+            if not title and not url:
+                continue
+            provider_samples.append(
+                {
+                    "title": title[:160],
+                    "url": url[:500],
+                    "snippet": snippet[:220],
+                }
+            )
+        if provider_samples:
+            compact[provider_name] = provider_samples
+    return compact
+
+
+def _compact_source_focus(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        "status": str(value.get("status") or ""),
+        "terms": [str(item) for item in (value.get("terms") or [])[:8] if str(item).strip()],
+        "selected_source_count": int(_safe_float(value.get("selected_source_count"))),
+        "matching_source_count": int(_safe_float(value.get("matching_source_count"))),
+        "matching_urls": [
+            str(item)[:500] for item in (value.get("matching_urls") or [])[:5] if str(item).strip()
+        ],
+        "top_selected_urls": [
+            str(item)[:500]
+            for item in (value.get("top_selected_urls") or [])[:5]
+            if str(item).strip()
+        ],
+    }
 
 
 def _compact_retrieval_ladder(value: Any) -> list[dict[str, Any]]:
@@ -237,8 +345,7 @@ def _compact_source_coverage(source_coverage: Mapping[str, Any]) -> dict[str, An
         ),
         "official_source_count": int(
             _safe_float(
-                source_coverage.get("official_source_count")
-                or lane_counts.get("company_site")
+                source_coverage.get("official_source_count") or lane_counts.get("company_site")
             )
         ),
         "sufficiency_status": str(source_coverage.get("sufficiency_status") or ""),
@@ -309,7 +416,9 @@ def _universal_search_failure_summary(metadata: Mapping[str, Any]) -> str | None
     if not attempted:
         return None
     provider_usage = (
-        metadata.get("provider_usage") if isinstance(metadata.get("provider_usage"), Mapping) else {}
+        metadata.get("provider_usage")
+        if isinstance(metadata.get("provider_usage"), Mapping)
+        else {}
     )
     succeeded = 0
     for provider_name in attempted:
@@ -323,7 +432,10 @@ def _universal_search_failure_summary(metadata: Mapping[str, Any]) -> str | None
     }
     if succeeded > 0 or not set(attempted).issubset(failed_providers):
         return None
-    return "Live search failed across all attempted providers; backend retrieval telemetry has provider details."
+    return (
+        "Live search failed across all attempted providers; "
+        "backend retrieval telemetry has provider details."
+    )
 
 
 def _compact_timing(timing: Mapping[str, Any]) -> dict[str, Any]:
@@ -400,11 +512,87 @@ def _compact_search_candidates(results: list[Any], *, limit: int = 12) -> list[d
                 "source": item.get("source", ""),
                 "source_type": item.get("source_type", ""),
                 "published_at": item.get("published_at"),
+                "extraction_status": item.get("extraction_status") or "snippet_only",
+                "evidence_excerpt": item.get("evidence_excerpt", ""),
+                "key_facts": item.get("key_facts") or [],
+                "supported_claims": item.get("supported_claims") or [],
             }
         )
         if len(candidates) >= limit:
             break
     return candidates
+
+
+def _company_source_triage_candidates(
+    *,
+    profile: CompanyProfile,
+    search_results: list[Any],
+    limit: int = 16,
+) -> list[dict[str, Any]]:
+    """Return selected/extracted company sources plus search candidates for triage."""
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, source in enumerate(list(getattr(profile, "sources", []) or [])[:8], start=1):
+        url = str(getattr(source, "url", "") or "").strip()
+        title = str(getattr(source, "title", "") or "").strip()
+        key = url.rstrip("/") or title
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        claims = [
+            str(item or "").strip()
+            for item in (getattr(source, "supported_claims", []) or [])
+            if str(item or "").strip()
+        ]
+        excerpt = str(getattr(source, "evidence_excerpt", "") or "").strip()
+        snippet = " ".join(part for part in [excerpt, *claims[:3]] if part).strip()
+        extraction_status = _profile_source_extraction_status(
+            source_type=str(getattr(source, "source_type", "") or ""),
+            excerpt=excerpt,
+            claims=claims,
+        )
+        candidates.append(
+            {
+                "source_id": f"selected:{index}",
+                "title": title,
+                "url": url,
+                "snippet": snippet[:900],
+                "source": str(getattr(source, "provider", "") or ""),
+                "source_type": str(getattr(source, "source_type", "") or ""),
+                "published_at": getattr(source, "published_at", None),
+                "extraction_status": extraction_status,
+                "evidence_excerpt": excerpt,
+                "key_facts": [],
+                "supported_claims": claims,
+            }
+        )
+        if len(candidates) >= limit:
+            return candidates
+
+    for candidate in _compact_search_candidates(search_results, limit=limit):
+        key = str(candidate.get("url") or "").rstrip("/") or str(candidate.get("title") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def _profile_source_extraction_status(
+    *,
+    source_type: str,
+    excerpt: str,
+    claims: Sequence[str],
+) -> str:
+    normalized = str(source_type or "").strip().lower()
+    if normalized in {"google_search", "news", "unknown"}:
+        return "snippet_only"
+    if excerpt or claims:
+        return "extracted"
+    return "snippet_only"
 
 
 def _sandbox_run_dir(
@@ -589,6 +777,8 @@ def retrieve_company_profile_live(
     *,
     company: str,
     company_url: str | None = None,
+    request_text: str | None = None,
+    source_triage_agent_name: str = "business_research_analyst",
     requested_provider: str | None = None,
     max_results: int = 5,
     agents_web_search_max_calls: int | None = None,
@@ -606,7 +796,8 @@ def retrieve_company_profile_live(
     query_builder = query_builder or build_company_research_queries
     search_provider_builder = search_provider_builder or build_search_provider
     profile_builder = profile_builder or research_account_from_search_results
-    request_text = company_research_request_text(company, company_url)
+    canonical_request_text = company_research_request_text(company, company_url)
+    request_text = str(request_text or "").strip() or canonical_request_text
     autonomy_hint = derive_request_autonomy_hint(
         agent_name="business_research_analyst",
         request_text=request_text,
@@ -645,6 +836,7 @@ def retrieve_company_profile_live(
         client.validate_configuration()
 
     queries = query_builder(company, company_url)
+    request_focus_terms = _company_extraction_query_terms(company=company, queries=queries)
     search_results: list[Any] = []
     query_timings: list[dict[str, Any]] = []
     telemetry_packets: list[dict[str, Any]] = []
@@ -724,23 +916,46 @@ def retrieve_company_profile_live(
         company=company,
         company_url=company_url,
         search_results=search_results,
+        queries=queries,
         provider=str(getattr(settings, "website_extractor", "trafilatura") or "trafilatura"),
     )
     website_seconds = perf_counter() - website_started_at
     profile_started_at = perf_counter()
-    profile = profile_builder(
-        company_name=company,
-        company_url=company_url,
-        search_results=search_results,
-        website_inputs=website_inputs,
-    )
+    profile_kwargs: dict[str, Any] = {
+        "company_name": company,
+        "company_url": company_url,
+        "search_results": search_results,
+        "website_inputs": website_inputs,
+    }
+    if _profile_builder_accepts_request_focus(profile_builder):
+        profile_kwargs["request_focus_terms"] = request_focus_terms
+    profile = profile_builder(**profile_kwargs)
     profile_seconds = perf_counter() - profile_started_at
+    source_focus = _profile_source_focus_diagnostics(
+        profile,
+        request_focus_terms=request_focus_terms,
+    )
+    retrieved_source_candidates = _company_source_triage_candidates(
+        profile=profile,
+        search_results=search_results,
+        limit=max(12, max_results * 4),
+    )
+    source_triage = triage_source_candidates(
+        request_text=request_text,
+        candidates=retrieved_source_candidates,
+        agent_name=source_triage_agent_name,
+        max_retain=max_results,
+    )
     metadata.update(
         {
             "mode": "live_search",
             "live_search": True,
             "search_provider": search_provider_label(metadata),
             "search_queries": queries,
+            "request_focus_terms": request_focus_terms,
+            "source_focus": source_focus,
+            "retrieved_source_candidates": retrieved_source_candidates,
+            "source_triage": source_triage.model_dump(mode="json"),
             "raw_search_result_count": len(search_results),
             "max_results": max_results,
             "searxng_transient_runtime": dict(searxng_runtime),
@@ -786,6 +1001,15 @@ def retrieve_company_profile_live(
             ],
         }
     )
+    if source_triage.needs_broaden_or_deepen:
+        metadata["search_review_recommended"] = True
+        quality = metadata.get("search_quality")
+        if isinstance(quality, dict):
+            reasons = [str(item) for item in (quality.get("reasons") or []) if str(item).strip()]
+            reasons.extend(source_triage.recall_gaps)
+            reasons.append("source triage recommended broader/deeper retrieval")
+            quality["needs_search_review"] = True
+            quality["reasons"] = list(dict.fromkeys(reasons))
     metadata["retrieval_diagnostics"] = retrieval_diagnostics_from_metadata(metadata)
     return profile, metadata
 
@@ -795,6 +1019,7 @@ def _extract_company_website_inputs(
     company: str,
     company_url: str | None,
     search_results: list[Any],
+    queries: list[str] | None = None,
     provider: str,
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     fallback_provider = _website_extraction_fallback_provider(primary_provider=provider)
@@ -818,6 +1043,7 @@ def _extract_company_website_inputs(
         company=company,
         company_url=company_url,
         search_results=search_results,
+        queries=queries or [],
     )
     if company_url:
         discovered_urls = discover_company_page_urls(
@@ -939,7 +1165,9 @@ def _website_extraction_fallback_provider(*, primary_provider: str) -> str:
     fallback = os.getenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", "").strip().lower()
     if not fallback or fallback == primary_provider.strip().lower():
         return ""
-    if fallback not in {"firecrawl", "trafilatura"}:
+    if fallback in {"crawl-4-ai", "crawl_4_ai"}:
+        fallback = "crawl4ai"
+    if fallback not in {"crawl4ai", "firecrawl", "trafilatura"}:
         return ""
     return fallback
 
@@ -949,17 +1177,146 @@ def _company_website_extraction_urls(
     company: str,
     company_url: str | None,
     search_results: list[Any],
+    queries: list[str] | None = None,
 ) -> list[str]:
     max_pages = _website_extraction_max_pages()
-    candidates: list[str] = []
+    candidates: list[tuple[str, int, int]] = []
     if company_url:
-        candidates.extend(default_company_page_urls(company_url))
-    for result in search_results:
-        url = str(getattr(result, "link", "") or getattr(result, "url", "") or "").strip()
+        for position, url in enumerate(default_company_page_urls(company_url)):
+            candidates.append((url, 0, position))
+    query_terms = _company_extraction_query_terms(company=company, queries=queries or [])
+    for position, result in enumerate(search_results, start=len(candidates)):
+        item = _jsonable_search_result(result)
+        url = str(item.get("url") or "").strip()
         if not url or not _looks_like_company_page(url, company=company):
             continue
-        candidates.append(url)
-    return list(dict.fromkeys(candidates))[:max_pages]
+        score = _company_page_focus_score(item, query_terms=query_terms)
+        candidates.append((url, score, position))
+    deduped: dict[str, tuple[str, int, int]] = {}
+    for url, score, position in candidates:
+        key = url.rstrip("/")
+        existing = deduped.get(key)
+        if existing is None or (score, -position) > (existing[1], -existing[2]):
+            deduped[key] = (url, score, position)
+    ordered = sorted(deduped.values(), key=lambda item: (-item[1], item[2]))
+    return [url for url, _score, _position in ordered[:max_pages]]
+
+
+def _company_extraction_query_terms(*, company: str, queries: list[str]) -> list[str]:
+    company_terms = {
+        part.lower() for part in re.findall(r"\b[A-Za-z][A-Za-z0-9-]{2,}\b", str(company or ""))
+    }
+    generic = {
+        "2026",
+        "about",
+        "announcement",
+        "company",
+        "coverage",
+        "current",
+        "independent",
+        "latest",
+        "news",
+        "official",
+        "recent",
+        "site",
+        "update",
+    }
+    terms: list[str] = []
+    for query in queries[:6]:
+        for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9-]{3,}\b", str(query or "")):
+            term = match.group(0).lower()
+            if term in company_terms or term in generic or re.fullmatch(r"20\d{2}", term):
+                continue
+            terms.append(term)
+    return list(dict.fromkeys(terms))[:8]
+
+
+def _profile_builder_accepts_request_focus(builder: Callable[..., Any]) -> bool:
+    try:
+        parameters = signature(builder).parameters
+    except (TypeError, ValueError):
+        return True
+    return "request_focus_terms" in parameters or any(
+        parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
+def _profile_source_focus_diagnostics(
+    profile: CompanyProfile,
+    *,
+    request_focus_terms: list[str],
+) -> dict[str, Any]:
+    terms = [str(term or "").strip().lower() for term in request_focus_terms if str(term).strip()]
+    selected_sources = list(getattr(profile, "sources", []) or [])[:12]
+    if not terms:
+        status = "no_focus_terms"
+    elif not selected_sources:
+        status = "no_selected_sources"
+    else:
+        status = "matched_selected_sources"
+    matching: list[Any] = []
+    for source in selected_sources:
+        if _source_record_focus_score(source, query_terms=terms) > 0:
+            matching.append(source)
+    if terms and selected_sources and not matching:
+        status = "no_selected_source_matches_focus"
+    return {
+        "status": status,
+        "terms": terms[:8],
+        "selected_source_count": len(selected_sources),
+        "matching_source_count": len(matching),
+        "matching_urls": [str(getattr(source, "url", "") or "") for source in matching[:5]],
+        "top_selected_urls": [
+            str(getattr(source, "url", "") or "") for source in selected_sources[:5]
+        ],
+    }
+
+
+def _source_record_focus_score(source: Any, *, query_terms: list[str]) -> int:
+    if not query_terms:
+        return 0
+    url = str(getattr(source, "url", "") or "").lower()
+    title = str(getattr(source, "title", "") or "").lower()
+    claims = " ".join(str(item or "") for item in (getattr(source, "supported_claims", []) or []))
+    excerpt = str(getattr(source, "evidence_excerpt", "") or "")
+    haystack = f"{url} {title} {claims.lower()} {excerpt.lower()}"
+    score = 0
+    for term in query_terms:
+        if term in url:
+            score += 4
+        if term in title:
+            score += 3
+        if term in claims.lower():
+            score += 2
+        if term in excerpt.lower():
+            score += 2
+        if term in haystack:
+            score += 1
+    return score
+
+
+def _company_page_focus_score(item: Mapping[str, Any], *, query_terms: list[str]) -> int:
+    if not query_terms:
+        return 0
+    url = str(item.get("url") or "").lower()
+    title = str(item.get("title") or "").lower()
+    snippet = str(item.get("snippet") or "").lower()
+    haystack = f"{url} {title} {snippet}"
+    score = 0
+    for term in query_terms:
+        if term in url:
+            score += 4
+        if term in title:
+            score += 3
+        if term in snippet:
+            score += 2
+        if term in haystack:
+            score += 1
+    if "/index/" in url or "/news" in url or "/blog" in url:
+        score += 1
+    if url.rstrip("/").endswith(("openai.com", "openai.com/about")):
+        score -= 1
+    return score
 
 
 def _website_extraction_max_pages() -> int:
@@ -1014,6 +1371,9 @@ def build_shared_search_provider_config(
     fallback_provider: str | None = None,
     agents_web_search_max_calls: int | None = None,
     agents_web_search_parallel: bool | None = None,
+    tavily_search_fallback: bool | None = None,
+    exa_search_fallback: bool | None = None,
+    exa_search_max_calls: int | None = None,
 ) -> SharedSearchProviderConfig:
     """Resolve the shared live-search policy for search-heavy Keystone agents."""
 
@@ -1037,13 +1397,17 @@ def build_shared_search_provider_config(
         requested_provider=requested_provider,
         provider_sequence=provider_sequence,
         agents_enabled=agents_enabled,
+        tavily_enabled=tavily_search_fallback,
+        exa_enabled=exa_search_fallback,
     )
     return SharedSearchProviderConfig(
         provider_sequence=provider_sequence,
         deepening_provider_sequence=deepening_provider_sequence,
-        provider_request_budget=_agents_web_search_request_budget(
-            enabled=agents_enabled,
-            max_calls=agents_web_search_max_calls,
+        provider_request_budget=_optional_search_request_budget(
+            agents_enabled=agents_enabled,
+            agents_max_calls=agents_web_search_max_calls,
+            exa_enabled=exa_search_fallback,
+            exa_max_calls=exa_search_max_calls,
         ),
         parallel_provider_fanout=_parallel_provider_fanout_enabled(
             requested_provider=requested_provider,
@@ -1091,11 +1455,25 @@ def _deepening_search_providers(
     requested_provider: str | None,
     provider_sequence: tuple[str, ...],
     agents_enabled: bool,
+    tavily_enabled: bool | None = None,
+    exa_enabled: bool | None = None,
 ) -> tuple[str, ...]:
     requested = (requested_provider or "").strip().lower()
     providers: list[str] = []
-    if _env_bool("KEYSTONE_TAVILY_SEARCH_FALLBACK", default=False) and requested != "tavily":
+    use_tavily = (
+        _env_bool("KEYSTONE_TAVILY_SEARCH_FALLBACK", default=False)
+        if tavily_enabled is None
+        else tavily_enabled
+    )
+    if use_tavily and requested != "tavily":
         providers.append("tavily")
+    use_exa = (
+        _env_bool("KEYSTONE_EXA_SEARCH_FALLBACK", default=False)
+        if exa_enabled is None
+        else exa_enabled
+    )
+    if use_exa and requested != "exa":
+        providers.append("exa")
     if agents_enabled and requested in {"", "searxng"}:
         providers.append("agents-web-search")
     return tuple(
@@ -1105,6 +1483,26 @@ def _deepening_search_providers(
     )
 
 
+def _optional_search_request_budget(
+    *,
+    agents_enabled: bool,
+    agents_max_calls: int | None = None,
+    exa_enabled: bool | None = None,
+    exa_max_calls: int | None = None,
+) -> ProviderRequestBudget | None:
+    limits: dict[str, int] = {}
+    if agents_enabled:
+        limits["agents-web-search"] = _agents_web_search_max_calls(agents_max_calls)
+    use_exa = (
+        _env_bool("KEYSTONE_EXA_SEARCH_FALLBACK", default=False)
+        if exa_enabled is None
+        else exa_enabled
+    )
+    if use_exa:
+        limits["exa"] = _exa_search_max_calls(exa_max_calls)
+    return ProviderRequestBudget(limits) if limits else None
+
+
 def _agents_web_search_request_budget(
     *,
     enabled: bool,
@@ -1112,6 +1510,10 @@ def _agents_web_search_request_budget(
 ) -> ProviderRequestBudget | None:
     if not enabled:
         return None
+    return ProviderRequestBudget({"agents-web-search": _agents_web_search_max_calls(max_calls)})
+
+
+def _agents_web_search_max_calls(max_calls: int | None = None) -> int:
     if max_calls is None:
         raw = os.getenv("KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN", "").strip()
         try:
@@ -1120,7 +1522,19 @@ def _agents_web_search_request_budget(
             cap = DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN
     else:
         cap = int(max_calls)
-    return ProviderRequestBudget({"agents-web-search": max(0, cap)})
+    return max(0, cap)
+
+
+def _exa_search_max_calls(max_calls: int | None = None) -> int:
+    if max_calls is None:
+        raw = os.getenv("KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN", "").strip()
+        try:
+            cap = int(raw) if raw else DEFAULT_EXA_SEARCH_MAX_CALLS_PER_RUN
+        except ValueError:
+            cap = DEFAULT_EXA_SEARCH_MAX_CALLS_PER_RUN
+    else:
+        cap = int(max_calls)
+    return max(0, cap)
 
 
 @contextmanager
@@ -1403,6 +1817,8 @@ def build_opportunity_search_provider(
     requested_provider: str | None = None,
     fallback_provider: str | None = None,
     desired_results: int,
+    agents_web_search_max_calls: int | None = None,
+    agents_web_search_parallel: bool | None = None,
     retrieval_hint: RetrievalHint | None = None,
     settings_loader: Callable[[], Any] | None = None,
     search_provider_builder: Callable[..., Any] | None = None,
@@ -1412,15 +1828,23 @@ def build_opportunity_search_provider(
     settings_loader = settings_loader or load_settings
     search_provider_builder = search_provider_builder or build_search_provider
     request_text = opportunity_scout_request_text(topic)
+    settings = settings_loader()
     autonomy_hint = derive_request_autonomy_hint(
         agent_name="opportunity_scout",
         request_text=request_text,
         agent_hint=retrieval_hint,
     )
+    tavily_search_fallback = _opportunity_tavily_deepening_enabled(
+        topic=topic,
+        settings=settings,
+    )
     search_config = build_shared_search_provider_config(
         requested_provider=requested_provider,
-        configured_provider=settings_loader().search_provider,
+        configured_provider=settings.search_provider,
         fallback_provider=fallback_provider,
+        agents_web_search_max_calls=agents_web_search_max_calls,
+        agents_web_search_parallel=agents_web_search_parallel,
+        tavily_search_fallback=tavily_search_fallback,
     )
     provider = HybridSearchProvider(
         provider_sequence=search_config.provider_sequence,
@@ -1442,6 +1866,39 @@ def build_opportunity_search_provider(
     if len(search_config.provider_sequence) == 1:
         provider.validate_configuration()
     return provider
+
+
+def _opportunity_tavily_deepening_enabled(*, topic: str | None, settings: Any) -> bool | None:
+    if _env_bool("KEYSTONE_TAVILY_SEARCH_FALLBACK", default=False):
+        return True
+    if not _formal_opportunity_topic(topic):
+        return None
+    return bool(str(getattr(settings, "tavily_api_key", "") or "").strip())
+
+
+def _formal_opportunity_topic(topic: str | None) -> bool:
+    text = f" {str(topic or '').lower()} "
+    formal_markers = (
+        " grant",
+        " grants",
+        " nofo",
+        " foa",
+        " rfa",
+        " sbir",
+        " sttr",
+        " rfp",
+        " rfps",
+        " request for proposal",
+        " solicitation",
+        " procurement",
+        " pilot",
+        " pilots",
+        " call for proposals",
+        " call-for-proposals",
+        " cfp",
+        " cfps",
+    )
+    return sum(1 for marker in formal_markers if marker in text) >= 2
 
 
 def _topic_is_role_focused(topic: str | None) -> bool:
@@ -1536,6 +1993,8 @@ def run_opportunity_scout_live(
     max_results: int = 5,
     requested_provider: str | None = None,
     fallback_provider: str | None = None,
+    agents_web_search_max_calls: int | None = None,
+    agents_web_search_parallel: bool | None = None,
     retrieval_hint: RetrievalHint | None = None,
     search_plan: OpportunitySearchPlan | None = None,
     save: bool = False,
@@ -1552,6 +2011,7 @@ def run_opportunity_scout_live(
     sandbox_search_review_hosted_web_search: bool | None = None,
     sandbox_search_review_hosted_web_search_external_web_access: bool = True,
     sandbox_search_review_hosted_web_search_context_size: str | None = None,
+    verify_source_pages: bool | None = None,
 ) -> tuple[OpportunityScoutResult, dict[str, Any]]:
     """Run Opportunity Scout live search with orchestrator-aware retrieval hints."""
 
@@ -1562,6 +2022,8 @@ def run_opportunity_scout_live(
         requested_provider=requested_provider,
         fallback_provider=fallback_provider,
         desired_results=max_results,
+        agents_web_search_max_calls=agents_web_search_max_calls,
+        agents_web_search_parallel=agents_web_search_parallel,
         retrieval_hint=retrieval_hint,
         settings_loader=lambda: settings,
         search_provider_builder=search_provider_builder,
@@ -1580,9 +2042,20 @@ def run_opportunity_scout_live(
             search_provider=provider,
             save=save,
             existing_state=existing_state,
+            verify_source_pages=verify_source_pages,
         )
         collected_results = provider.collected_results()
         metadata = provider.telemetry()
+    retrieved_source_candidates = _compact_search_candidates(
+        collected_results,
+        limit=_sandbox_search_review_source_limit(max_results),
+    )
+    source_triage = triage_source_candidates(
+        request_text=topic or "",
+        candidates=retrieved_source_candidates,
+        agent_name="opportunity_scout",
+        max_retain=max_results,
+    )
     metadata.update(
         {
             "search_provider": search_provider_label(metadata),
@@ -1599,10 +2072,8 @@ def run_opportunity_scout_live(
                 retrieval_hint=retrieval_hint,
             ),
             "search_plan": search_plan.model_dump(mode="json") if search_plan is not None else None,
-            "retrieved_source_candidates": _compact_search_candidates(
-                collected_results,
-                limit=_sandbox_search_review_source_limit(max_results),
-            ),
+            "retrieved_source_candidates": retrieved_source_candidates,
+            "source_triage": source_triage.model_dump(mode="json"),
             "retrieval_ladder": [
                 {
                     "rung": "search_discovery",
@@ -1619,10 +2090,13 @@ def run_opportunity_scout_live(
         if isinstance(metadata.get("search_quality"), dict)
         else None
     )
-    if _should_auto_recommend_sandbox_search_review(
-        result=result,
-        metadata=metadata,
-        max_results=max_results,
+    if (
+        _should_auto_recommend_sandbox_search_review(
+            result=result,
+            metadata=metadata,
+            max_results=max_results,
+        )
+        or source_triage.needs_broaden_or_deepen
     ):
         metadata["search_review_recommended"] = True
         quality = metadata.get("search_quality")
@@ -1630,6 +2104,9 @@ def run_opportunity_scout_live(
             reasons = [str(item) for item in (quality.get("reasons") or []) if str(item).strip()]
             if len(result.records) < max(1, min(max_results, 2)):
                 reasons.append("opportunity objective was not met after deterministic retrieval")
+            if source_triage.needs_broaden_or_deepen:
+                reasons.extend(source_triage.recall_gaps)
+                reasons.append("source triage recommended broader/deeper retrieval")
             quality["needs_search_review"] = True
             quality["reasons"] = list(dict.fromkeys(reasons))
     sandbox_source_limit = _sandbox_search_review_source_limit(max_results)

@@ -6,6 +6,7 @@ import json
 from typing import Any
 from urllib.parse import urlparse
 
+from keystone_agents.agent_tool_policy import filter_tools_for_tier
 from keystone_agents.business_research_analyst.context import (
     coerce_contact_context as _coerce_contact_context,
 )
@@ -33,6 +34,7 @@ from keystone_agents.models import (
     ResearchSDKInput,
     TypedAgentRunResult,
 )
+from keystone_agents.quality_budget import business_research_quality_budget
 from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.company_profile import (
     DEFAULT_RESEARCH_DATA_POINT_KEYS,
@@ -47,6 +49,7 @@ from keystone_agents.schemas.company_profile import (
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
 from keystone_agents.schemas.research import ResearchBrief
 from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
+from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.source_enrichment import (
     dedupe_and_rank_source_records,
     normalize_source_record,
@@ -261,6 +264,7 @@ def research_account_from_search_results(
     search_results: list[SearchResult] | None = None,
     website_inputs: list[dict[str, object]] | None = None,
     profile_inputs: list[dict[str, object]] | None = None,
+    request_focus_terms: list[str] | None = None,
     contact_context: ContactRecord | dict[str, Any] | None = None,
     crm_context: CRMAccountContext | dict[str, Any] | None = None,
 ) -> CompanyProfile:
@@ -272,6 +276,7 @@ def research_account_from_search_results(
         search_results=search_results,
         website_inputs=website_inputs,
         profile_inputs=profile_inputs,
+        request_focus_terms=request_focus_terms,
     )
     return apply_local_account_context(
         profile,
@@ -376,22 +381,32 @@ def synthesize_company_profile_from_source_bundle(
     )
 
 
-def build_business_research_analyst_agent(model: str | None = None) -> Agent:
+def build_business_research_analyst_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+    include_all_skills: bool = False,
+    tool_tier: str | int | None = None,
+) -> Agent:
     """Build the business research analyst agent."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "local_context.md",
         "business_research_analyst.md",
+        skill_files=select_agent_skill_names(
+            "business_research_analyst",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     return build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=CompanyProfile,
-        tools=_business_research_analyst_company_profile_tools(),
+        tools=_business_research_analyst_company_profile_tools(tool_tier=tool_tier),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -402,8 +417,8 @@ def build_business_research_analyst_agent(model: str | None = None) -> Agent:
     )
 
 
-def _business_research_analyst_tools() -> list[Any]:
-    return append_configured_file_search_tools(
+def _business_research_analyst_tools(*, tool_tier: str | int | None = None) -> list[Any]:
+    tools = append_configured_file_search_tools(
         "business_research_analyst",
         [
             load_contact_context,
@@ -436,10 +451,16 @@ def _business_research_analyst_tools() -> list[Any]:
             *google_workspace_tools(),
         ],
     )
+    if tool_tier is None:
+        return tools
+    return filter_tools_for_tier("business_research_analyst", tools, tool_tier)
 
 
-def _business_research_analyst_company_profile_tools() -> list[Any]:
-    return append_configured_file_search_tools(
+def _business_research_analyst_company_profile_tools(
+    *,
+    tool_tier: str | int | None = None,
+) -> list[Any]:
+    tools = append_configured_file_search_tools(
         "business_research_analyst",
         [
             load_contact_context,
@@ -471,24 +492,37 @@ def _business_research_analyst_company_profile_tools() -> list[Any]:
             *google_workspace_tools(),
         ],
     )
+    if tool_tier is None:
+        return tools
+    return filter_tools_for_tier("business_research_analyst", tools, tool_tier)
 
 
-def build_business_research_analyst_focused_brief_agent(model: str | None = None) -> Agent:
+def build_business_research_analyst_focused_brief_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+    include_all_skills: bool = False,
+    tool_tier: str | int | None = None,
+) -> Agent:
     """Build Business Research Analyst for BR-1 focused brief synthesis."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "local_context.md",
         "business_research_analyst.md",
+        skill_files=select_agent_skill_names(
+            "business_research_analyst",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     return build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=CompanyResearchFocusedBrief,
-        tools=_business_research_analyst_tools(),
+        tools=_business_research_analyst_tools(tool_tier=tool_tier),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -499,22 +533,32 @@ def build_business_research_analyst_focused_brief_agent(model: str | None = None
     )
 
 
-def build_business_research_analyst_comparison_agent(model: str | None = None) -> Agent:
+def build_business_research_analyst_comparison_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+    include_all_skills: bool = False,
+    tool_tier: str | int | None = None,
+) -> Agent:
     """Build Business Research Analyst for source-backed company comparison synthesis."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "local_context.md",
         "business_research_analyst.md",
+        skill_files=select_agent_skill_names(
+            "business_research_analyst",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     return build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=CompanyResearchComparison,
-        tools=_business_research_analyst_tools(),
+        tools=_business_research_analyst_tools(tool_tier=tool_tier),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -525,22 +569,32 @@ def build_business_research_analyst_comparison_agent(model: str | None = None) -
     )
 
 
-def build_business_research_analyst_research_brief_agent(model: str | None = None) -> Agent:
+def build_business_research_analyst_research_brief_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+    include_all_skills: bool = False,
+    tool_tier: str | int | None = None,
+) -> Agent:
     """Build the broader Business Research Analyst for non-company research briefs."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "local_context.md",
         "business_research_analyst.md",
+        skill_files=select_agent_skill_names(
+            "business_research_analyst",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     return build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=ResearchBrief,
-        tools=_business_research_analyst_tools(),
+        tools=_business_research_analyst_tools(tool_tier=tool_tier),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -749,11 +803,20 @@ def run_business_research_analyst_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    tool_tier: str | int | None = None,
 ) -> TypedAgentRunResult[CompanyProfile]:
     """Run Business Research Analyst through the typed SDK harness."""
 
+    resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
+        typed_input,
+        live=live,
+    )
     return run_typed_sdk_agent(
-        agent=build_business_research_analyst_agent(model=model),
+        agent=build_business_research_analyst_agent(
+            model=model,
+            request_text=skill_request_text(typed_input),
+            tool_tier=resolved_tool_tier,
+        ),
         typed_input=typed_input,
         output_type=CompanyProfile,
         run_config=run_config,
@@ -769,11 +832,20 @@ def run_business_research_analyst_focused_brief_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    tool_tier: str | int | None = None,
 ) -> TypedAgentRunResult[CompanyResearchFocusedBrief]:
     """Run Business Research Analyst through the SDK for a BR-1 focused brief."""
 
+    resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
+        typed_input,
+        live=live,
+    )
     return run_typed_sdk_agent(
-        agent=build_business_research_analyst_focused_brief_agent(model=model),
+        agent=build_business_research_analyst_focused_brief_agent(
+            model=model,
+            request_text=skill_request_text(typed_input),
+            tool_tier=resolved_tool_tier,
+        ),
         typed_input=typed_input,
         output_type=CompanyResearchFocusedBrief,
         run_config=run_config,
@@ -789,14 +861,41 @@ def run_business_research_analyst_research_brief_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    tool_tier: str | int | None = None,
 ) -> TypedAgentRunResult[ResearchBrief]:
     """Run the broader Business Research Analyst through the typed SDK harness."""
 
+    resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
+        typed_input,
+        live=live,
+    )
     return run_typed_sdk_agent(
-        agent=build_business_research_analyst_research_brief_agent(model=model),
+        agent=build_business_research_analyst_research_brief_agent(
+            model=model,
+            request_text=skill_request_text(typed_input),
+            tool_tier=resolved_tool_tier,
+        ),
         typed_input=typed_input,
         output_type=ResearchBrief,
         run_config=run_config,
         live=live,
         session=session,
     )
+
+
+def _default_business_research_sdk_tool_tier(
+    typed_input: BusinessResearchSDKInput
+    | BusinessResearchFocusedBriefSDKInput
+    | BusinessResearchComparisonSDKInput
+    | ResearchSDKInput
+    | str,
+    *,
+    live: bool,
+) -> str:
+    """Infer a read-only tool tier for default Business Research SDK runs."""
+
+    budget = business_research_quality_budget(
+        request_text=skill_request_text(typed_input),
+        live_search=live,
+    )
+    return budget.tool_tier or "core_read"

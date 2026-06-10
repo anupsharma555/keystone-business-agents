@@ -16,7 +16,6 @@ from keystone_agents.sdk import (
     build_sdk_agent,
     function_tool,
 )
-from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.source_enrichment import extract_claim_candidates, extract_clean_text
 
 AGENT_HTML_REVIEW_PROVIDER = "agents-sdk-html-review"
@@ -40,6 +39,14 @@ class HtmlReviewResult(BaseModel):
     claims: list[str] = Field(default_factory=list)
     confidence: float = 0.72
     notes: list[str] = Field(default_factory=list)
+
+
+def run_typed_sdk_agent(**kwargs: Any) -> Any:
+    """Lazy wrapper to avoid importing keystone_agents.run during tool package import."""
+
+    from keystone_agents.run import run_typed_sdk_agent as _run_typed_sdk_agent
+
+    return _run_typed_sdk_agent(**kwargs)
 
 
 def agent_html_review_enabled() -> bool:

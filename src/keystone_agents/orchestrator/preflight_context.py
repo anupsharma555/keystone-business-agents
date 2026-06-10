@@ -86,7 +86,9 @@ def compact_orchestrator_preflight_payload(preflight: Any | None) -> dict[str, A
     manual_plan = payload.get("manual_request_plan")
     if manual_plan:
         compact["manual_request_plan"] = (
-            manual_plan.model_dump(mode="json") if hasattr(manual_plan, "model_dump") else manual_plan
+            manual_plan.model_dump(mode="json")
+            if hasattr(manual_plan, "model_dump")
+            else manual_plan
         )
     route_result = _compact_route_result(payload.get("route_result"))
     if route_result:
@@ -166,6 +168,12 @@ def _preflight_memo_payload(preflight: Mapping[str, Any]) -> dict[str, Any]:
         "orchestrator_rationale": route_result.get("rationale"),
         "orchestrator_refused": route_result.get("refused"),
         "orchestrator_stop_reason": route_result.get("stop_reason"),
+        "source_visibility_requirement": (
+            "If the specialist answer includes source-backed external facts, current "
+            "claims, dates, deadlines, rates, filings, policies, company facts, roles, "
+            "or opportunity signals, include source URLs in the first user-visible "
+            "answer. Structured sources alone are not enough."
+        ),
     }
 
 
@@ -203,9 +211,9 @@ def apply_orchestrator_preflight_to_args(args: Any) -> Any:
 
     preflight = load_orchestrator_preflight_from_env()
     manual_plan = load_manual_request_plan_from_env()
-    setattr(args, "orchestrator_preflight", preflight)
+    args.orchestrator_preflight = preflight
     if manual_plan is not None and not getattr(args, "manual_request_plan", None):
-        setattr(args, "manual_request_plan", manual_plan.model_dump(mode="json"))
+        args.manual_request_plan = manual_plan.model_dump(mode="json")
     return args
 
 
@@ -230,9 +238,8 @@ def orchestrator_preflight_context_text(args: Any) -> str:
         return ""
     if isinstance(preflight, dict) and isinstance(preflight.get("preflight_memo"), dict):
         memo = preflight["preflight_memo"]
-        return (
-            "Orchestrator preflight memo for this specialist run:\n"
-            + json.dumps(memo, ensure_ascii=True, sort_keys=True)
+        return "Orchestrator preflight memo for this specialist run:\n" + json.dumps(
+            memo, ensure_ascii=True, sort_keys=True
         )
     route_result = preflight.get("route_result") if isinstance(preflight, dict) else {}
     if not isinstance(route_result, dict):
@@ -246,7 +253,6 @@ def orchestrator_preflight_context_text(args: Any) -> str:
         "orchestrator_rationale": route_result.get("rationale"),
         "orchestrator_refused": route_result.get("refused"),
     }
-    return (
-        "Orchestrator preflight memo for this specialist run:\n"
-        + json.dumps(memo, ensure_ascii=True, sort_keys=True)
+    return "Orchestrator preflight memo for this specialist run:\n" + json.dumps(
+        memo, ensure_ascii=True, sort_keys=True
     )

@@ -754,9 +754,11 @@ def test_page_text_enrichment_extracts_clean_source_claims() -> None:
     )
 
     evidence = "\n".join(profile.evidence)
+    page_source = next(source for source in profile.sources if source.source_id == "company:page")
     assert "secret()" not in evidence
     assert "clinical trial workflow software" in evidence
-    assert any(source.source_id == "company:page" for source in profile.sources)
+    assert "secret()" not in page_source.evidence_excerpt
+    assert "supports research operations" in page_source.evidence_excerpt
 
 
 def test_business_research_analyst_adds_approved_local_contact_and_crm_context() -> None:

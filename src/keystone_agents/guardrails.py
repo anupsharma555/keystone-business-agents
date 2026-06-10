@@ -470,6 +470,30 @@ def enforce_tool_output_guardrails(tool_name: str, output: Any) -> Any:
     return output
 
 
+def enforce_public_source_output_guardrails(tool_name: str, output: Any) -> Any:
+    """Allow public source evidence while still blocking secrets and PHI."""
+
+    text = f"tool_name: {tool_name}\n{stringify_payload(output)}"
+    risk_flags: list[str] = []
+    reasons: list[str] = []
+    if any(pattern.search(text) for pattern in _PHI_PATTERNS):
+        risk_flags.append("possible_phi")
+        reasons.append("possible PHI or patient-specific content")
+    if any(pattern.search(text) for pattern in _SECRET_PATTERNS):
+        risk_flags.append("secret")
+        reasons.append("secret-like content")
+    if risk_flags:
+        assessment = GuardrailAssessment(
+            allowed=False,
+            manual_review_required=True,
+            risk_flags=tuple(dict.fromkeys(risk_flags)),
+            reasons=tuple(dict.fromkeys(reasons)),
+            draft_policy="no_substantive_reply",
+        )
+        raise ToolGuardrailViolation(_tool_rejection_message(tool_name, assessment))
+    return output
+
+
 def acknowledgement_only_reply(sender_name: str = "") -> str:
     """Return a non-substantive acknowledgement for legal or contract content."""
 

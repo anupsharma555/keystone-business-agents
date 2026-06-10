@@ -438,9 +438,10 @@ def test_github_repo_opportunities_live_sdk_runs_orchestrator_scout_then_researc
             )
         )
 
-    def fake_scout(typed_input, *, live: bool):
+    def fake_scout(typed_input, *, live: bool, tool_tier: str | None = None):
         calls.append("opportunity_scout")
         assert live is True
+        assert tool_tier == "deep_retrieval"
         assert "GitHub repository opportunities" in typed_input.topic
         return SimpleNamespace(
             output=OpportunityScoutResult(
@@ -450,9 +451,10 @@ def test_github_repo_opportunities_live_sdk_runs_orchestrator_scout_then_researc
             )
         )
 
-    def fake_research(typed_input, *, live: bool):
+    def fake_research(typed_input, *, live: bool, tool_tier: str | None = None):
         calls.append("business_research_analyst")
         assert live is True
+        assert tool_tier == "deep_retrieval"
         assert typed_input.target_type == "github_repository_collection"
         assert "Source ID: github_repo_1" in typed_input.source_context
         return SimpleNamespace(
@@ -920,9 +922,10 @@ def test_announcements_research_reads_selected_article_pages(monkeypatch) -> Non
 def test_announcements_research_live_sdk_uses_business_research_analyst(monkeypatch) -> None:
     captured = {}
 
-    def fake_sdk(typed_input, *, live: bool):
+    def fake_sdk(typed_input, *, live: bool, tool_tier: str | None = None):
         captured["typed_input"] = typed_input
         captured["live"] = live
+        captured["tool_tier"] = tool_tier
         return SimpleNamespace(
             output=ResearchBrief(
                 target_name="Weekly #announcements selected links",
@@ -993,6 +996,7 @@ def test_announcements_research_live_sdk_uses_business_research_analyst(monkeypa
     )
 
     assert captured["live"] is True
+    assert captured["tool_tier"] == "deep_retrieval"
     assert captured["typed_input"].target_type == "article_collection"
     assert "Source ID: announcement_1" in captured["typed_input"].source_context
     assert any(

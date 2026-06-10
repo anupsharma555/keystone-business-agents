@@ -86,6 +86,15 @@ inspectable state:
   scoped create/update operations with exact table/field mapping and approval
   references; no deletes, schema changes, attachment uploads, or silent bulk
   overwrites.
+- Use the KNI Finance Operations local app only as a read-only finance
+  operations context source unless a separate write integration is approved.
+  The canonical local app is
+  `/Users/anup/Desktop/AllFiles/Professional/KeystoneNeuroinformatics/kni-finance-ops-local/`
+  at `http://127.0.0.1:8765`; bridge through its documented JSON API or
+  exports for data reads. If Anup explicitly asks from CLI or Slack for a
+  business agent to visualize or read the finance operations webpage, read-only
+  page inspection is allowed, but form submission and mutation controls remain
+  off-limits without a separately approved integration.
 - Use Gmail and Slack structured tools for messages, drafts, labels, thread
   context, and posting decisions. Browser tools should not replace provider
   APIs for business-system reads or writes.
@@ -121,17 +130,36 @@ implementations are:
 - `searxng`: broad-recall live search when explicitly live-enabled.
 - `agents-web-search`: OpenAI Agents SDK hosted web search, enabled as a capped
   parallel lane beside SearXNG for default live research.
-- `serper`: precision-oriented live search when explicitly selected.
+- `exa`: capped semantic deepening lane for configured live search runs, and an
+  explicit provider for Exa-first comparison runs.
+- `tavily`: optional capped deeper-research provider with local credit tracking;
+  used for explicit deeper-search asks or when runtime flags enable it.
 - `firecrawl`: explicit live search provider when configured with
-  `FIRECRAWL_API_KEY`.
-- `tavily`: optional configured deepening provider with local credit tracking.
+  `FIRECRAWL_API_KEY`; Firecrawl is also a secondary page extraction provider.
+- `serper`: disabled while API credits are unavailable. It must not run unless
+  `KEYSTONE_SERPER_ENABLED=true` is deliberately set after credits are restored.
 
 The SDK `search_web` tool is inert unless live mode, non-dry-run mode, and live
 research are enabled. With no `SEARCH_PROVIDER` override, it resolves to
-SearXNG plus a capped Agents hosted web-search parallel lane. Serper remains
-available through explicit provider selection, not as an automatic fallback.
+SearXNG plus a capped Agents hosted web-search parallel lane, with Exa/Tavily
+available as capped deepening lanes according to shared retrieval policy and
+runtime flags.
 Planner agents may set live-search intent and constraints, but provider
 selection stays in the shared Python retrieval policy.
+
+Medium-term search architecture goal: Keystone agents should produce enriched,
+detailed, succinct, and query-relevant answers that are more useful than
+standard generic LLM search. Search-capable agents should combine the original
+request, provider recall, selected source URLs, extracted page text, WorkItem
+context, approved memory, and specialist reasoning before synthesis. Novel
+open-source, free-tier, or low-cost capabilities such as Exa, Tavily,
+Trafilatura, Firecrawl, Crawl4AI-style extraction, hosted file search, or future
+MCP tools may be added when they materially improve retrieval, extraction,
+permission scoping, or cross-client reuse. Add them through the shared provider
+or tool boundary with dry-run tests, explicit live flags, credential checks,
+source attribution, budget controls, and compact diagnostics. Do not add
+provider-specific prompt branches or broad live tools merely because an
+integration exists.
 
 This repo's local SearXNG runtime is separate from the `keystone-slack` repo's
 runtime. Keystone Business Agents uses the `kba-searxng` Colima profile and
@@ -274,6 +302,14 @@ model names inside prompts, tools, or CLI branches.
 Agent final outputs are structured data first. Use Pydantic schemas as the
 contract between agents, tools, storage, tests, and renderers. Do not rely on
 free-form model markdown as the canonical output shape.
+
+External factual confirmations must be source-visible in the first user-facing
+answer. If an answer includes source-backed external facts, current claims,
+dates, deadlines, rates, filing obligations, policies, company facts, roles, or
+opportunity signals, include the relevant source URLs in the visible Slack/CLI
+summary or explicitly state that source verification is still needed. Do not
+hide citations only in structured `sources`, trace metadata, artifacts, or
+follow-up actions.
 
 Human-facing narrative should be LLM-synthesized from bounded structured inputs
 whenever live or local SDK synthesis is explicitly requested, including company

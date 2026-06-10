@@ -17,15 +17,16 @@ from keystone_agents.agents.chief_of_staff import (
 )
 from keystone_agents.memory import chief_of_staff_memory_item
 from keystone_agents.models import TypedAgentRunResult
-from keystone_agents.quality_budget import QualityMode, chief_of_staff_quality_budget
 from keystone_agents.orchestrator.preflight_context import (
     MANUAL_REQUEST_PLAN_ENV,
     ORCHESTRATOR_PREFLIGHT_ENV,
 )
+from keystone_agents.quality_budget import QualityMode, chief_of_staff_quality_budget
 from keystone_agents.schemas.airtable import airtable_base_schema_summary_from_metadata
 from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
+    ChiefOfStaffSourceRef,
 )
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.storage.sqlite_store import SQLiteStore
@@ -60,6 +61,8 @@ from keystone_agents.tools.internal_data_tools import (
     google_sheet_update_tab_impl,
     read_linked_article_impl,
 )
+from keystone_agents.tools.website_extraction_tool import WebsiteExtractionError
+from keystone_agents.visible_sources import append_visible_source_urls_to_output
 
 
 def _payload(raw: str) -> dict[str, object]:
@@ -155,6 +158,72 @@ def test_wrong_response_diagnostics_do_not_trigger_tax_payment_shortcut(request_
 
     assert chief_of_staff_module._looks_like_tax_payment_or_estimate_request(normalized) is False
     assert chief_of_staff_module._looks_like_finance_tracker_request(request_text) is False
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "chief of staff confirm q2 tax estimated payments due on June 15, 2026",
+        "Look online when is q2 payment due date per irs",
+    ],
+)
+def test_tax_deadline_lookup_does_not_trigger_finance_tracker_shortcut(
+    request_text: str,
+) -> None:
+    assert chief_of_staff_module._looks_like_finance_tracker_request(request_text) is False
+
+
+def test_tax_deadline_slack_followup_uses_sdk_interpretation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_typed_sdk_agent(**kwargs: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured.update(kwargs)
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary="Q2 estimated tax deadline lookup should be answered from official sources.",
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="budget-resource-review",
+                target_channel="current Slack thread",
+            ),
+            audit_notes=[],
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    raw_request = (
+        "chief of staff continue this prior Slack thread.\n"
+        "Previous request: chief of staff confirm q2 tax estimated payments due on June 15, 2026\n"
+        "Previous result title: Business Agents Chief of Staff Plan Ready\n"
+        "Previous result: *Answer:* Q2 2026 tax payments Total paid: $0.00 "
+        "Federal: $0.00 Pennsylvania: $0.00 Philadelphia: $0.00\n"
+        "User follow-up: Look online when is q2 payment due date per irs\n"
+        "Continue the same agent task."
+    )
+
+    monkeypatch.setattr(
+        "keystone_agents.agents.chief_of_staff.run_typed_sdk_agent",
+        fake_run_typed_sdk_agent,
+    )
+
+    result = run_chief_of_staff_sdk(
+        {"request": raw_request},
+        live=True,
+        force_sdk_interpretation=True,
+    )
+
+    typed_input = captured["typed_input"]
+    assert result.raw_result == {"sdk": "called"}
+    assert isinstance(typed_input, dict)
+    assert typed_input["latest_operator_request"] == (
+        "Look online when is q2 payment due date per irs"
+    )
+    assert typed_input["request"] == typed_input["latest_operator_request"]
 
 
 def test_chief_of_staff_planner_blocks_unaligned_finance_shortcut(
@@ -321,6 +390,269 @@ def test_run_script_consumes_parent_orchestrator_preflight_env(
     assert payload["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
 
 
+def test_run_script_live_sdk_runs_orchestrator_preflight_when_parent_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from keystone_agents.agents.orchestrator import OrchestratorPreflight
+    from keystone_agents.schemas.orchestrator import OrchestratorResult
+
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="slack_operations",
+        primary_target="q2 estimated tax deadline",
+        target_type="unknown",
+        objective="Confirm the Q2 estimated tax deadline from official sources.",
+        task_objective="slack_operations",
+        expected_artifact_type="slack_ops_summary",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_preflight(*args: object, **kwargs: object) -> OrchestratorPreflight:
+        captured["preflight_args"] = args
+        captured["preflight_kwargs"] = kwargs
+        return OrchestratorPreflight(
+            request_text=str(args[0]),
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            manual_request_plan=plan,
+            route_result=OrchestratorResult(
+                route="chief_of_staff",
+                target_agent="chief_of_staff",
+                rationale="Use Chief of Staff with source-backed interpretation.",
+                audit_notes=["orchestrator preflight ran"],
+            ),
+        )
+
+    def fake_run_chief_of_staff_sdk(*args: object, **kwargs: object) -> TypedAgentRunResult:
+        captured["sdk_args"] = args
+        captured["sdk_kwargs"] = kwargs
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary="Official-source deadline answer.",
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="budget-resource-review",
+                target_channel="current Slack thread",
+            ),
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.delenv(MANUAL_REQUEST_PLAN_ENV, raising=False)
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--json",
+                "--input",
+                "chief of staff confirm q2 tax estimated payments due on June 15, 2026",
+            ]
+        )
+        == 0
+    )
+
+    payload = _payload(capsys.readouterr().out)
+    assert captured["preflight_kwargs"]["live_manual_plan"] is True
+    assert captured["sdk_kwargs"]["manual_request_plan"] is plan
+    assert payload["manual_request_plan"]["source"] == "llm"
+    assert payload["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
+
+
+def test_run_script_falls_back_when_live_sdk_misroutes_search_to_reference_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from keystone_agents.agents.orchestrator import OrchestratorPreflight
+    from keystone_agents.schemas.orchestrator import OrchestratorResult
+
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="research_brief",
+        primary_target="OpenAI mental health work",
+        target_type="topic",
+        objective="Brief what OpenAI is doing about mental health.",
+        task_objective="source_research",
+        expected_artifact_type="research_brief",
+    )
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_preflight(*args: object, **kwargs: object) -> OrchestratorPreflight:
+        return OrchestratorPreflight(
+            request_text=str(args[0]),
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            manual_request_plan=plan,
+            route_result=OrchestratorResult(
+                route="chief_of_staff",
+                target_agent="chief_of_staff",
+                rationale="Use Chief of Staff for a source-backed brief.",
+            ),
+        )
+
+    def fake_run_chief_of_staff_sdk(*args: object, **kwargs: object) -> TypedAgentRunResult:
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary="Captured as a reference note for later research, not executed as a live brief.",
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="reference-capture",
+                target_channel="current Slack thread",
+            ),
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.delenv(MANUAL_REQUEST_PLAN_ENV, raising=False)
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(script, "_chief_of_staff_output_review", lambda **_: {"status": "ok"})
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--json",
+                "--input",
+                (
+                    "chief of staff What is OpenAI doing about mental health? "
+                    "Please do a deeper search brief."
+                ),
+            ]
+        )
+        == 0
+    )
+
+    payload = _payload(capsys.readouterr().out)
+    output = payload["output"]
+    assert output["recommended_route"]["workflow_type"] != "reference-capture"
+    assert "Captured as a reference note" not in output["summary"]
+    assert any(
+        "deterministic Chief of Staff fallback was rendered instead" in note
+        for note in output["audit_notes"]
+    )
+    assert payload["original_orchestrator_review"] == {"status": "ok"}
+
+
+def test_run_script_falls_back_when_live_sdk_output_is_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from keystone_agents.agents.orchestrator import OrchestratorPreflight
+    from keystone_agents.schemas.orchestrator import OrchestratorResult
+
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="research_brief",
+        primary_target="AI therapy chatbots and youth mental health",
+        target_type="topic",
+        objective="Create a sectioned source-backed brief.",
+        task_objective="source_research",
+        expected_artifact_type="research_brief",
+    )
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_preflight(*args: object, **kwargs: object) -> OrchestratorPreflight:
+        return OrchestratorPreflight(
+            request_text=str(args[0]),
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            manual_request_plan=plan,
+            route_result=OrchestratorResult(
+                route="chief_of_staff",
+                target_agent="chief_of_staff",
+                rationale="Use Chief of Staff for a source-backed sectioned brief.",
+            ),
+        )
+
+    def fake_run_chief_of_staff_sdk(*args: object, **kwargs: object) -> TypedAgentRunResult:
+        raise ValueError('Invalid JSON when parsing {"agent_name":"chief_of_staff"')
+
+    monkeypatch.delenv(MANUAL_REQUEST_PLAN_ENV, raising=False)
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(script, "_chief_of_staff_output_review", lambda **_: {"status": "ok"})
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--json",
+                "--input",
+                (
+                    "chief of staff prepare a sectioned brief on AI therapy chatbots "
+                    "and youth mental health."
+                ),
+            ]
+        )
+        == 0
+    )
+
+    payload = _payload(capsys.readouterr().out)
+    output = payload["output"]
+    assert payload["output_type"] == "ChiefOfStaffResult"
+    assert "usage" not in payload
+    assert "cost" not in payload
+    assert "request_cache" not in payload
+    assert any(
+        "Live SDK structured output could not be parsed or validated" in note
+        for note in output["audit_notes"]
+    )
+    assert payload["orchestrator_review"] == {"status": "ok"}
+
+
 def test_run_script_payload_includes_sdk_usage_cost_and_request_cache() -> None:
     script = _load_run_chief_of_staff_script()
     output = plan_chief_of_staff_request("review agent architecture")
@@ -341,6 +673,48 @@ def test_run_script_payload_includes_sdk_usage_cost_and_request_cache() -> None:
     assert payload["request_cache"]["request_layout"] == (
         "static_agent_prefix_then_dynamic_typed_input"
     )
+
+
+def test_run_script_json_exception_emits_operator_failure_payload(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_run_chief_of_staff_script()
+
+    exit_code = script._handle_uncaught_exception(
+        RuntimeError("Error code: 429 - rate limit reached"),
+        ["--json"],
+    )
+
+    assert exit_code == 1
+    payload = _payload(capsys.readouterr().out)
+    failure = payload["output"]["failure"]
+    assert failure["schema"] == "keystone.operator_failure.v1"
+    assert failure["kind"] == "provider_rate_limit"
+    assert failure["retryable"] is True
+    assert "rate limit" in failure["summary"].lower()
+
+
+def test_run_script_makes_structured_source_urls_visible_in_summary() -> None:
+    output = ChiefOfStaffResult(
+        mode="llm",
+        summary="Confirmed: the 2026 Q2 estimated tax payment date is June 15, 2026.",
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="budget-resource-review",
+            target_channel="current Slack thread",
+        ),
+        sources=[
+            ChiefOfStaffSourceRef(
+                title="IRS Publication 505",
+                url="https://www.irs.gov/publications/p505",
+                source_type="irs",
+            )
+        ],
+    )
+
+    visible = append_visible_source_urls_to_output(output)
+
+    assert "https://www.irs.gov/publications/p505" in visible.summary
+    assert "Sources: IRS Publication 505" in visible.summary
 
 
 def test_run_script_allows_bounded_workspace_writes_for_explicit_doc_request() -> None:
@@ -367,11 +741,29 @@ def test_chief_of_staff_article_reader_is_default_off_until_explicit() -> None:
         request_text="read the full article linked in #docs and summarize it"
     )
     explicit_tool_names = {getattr(tool, "name", "") for tool in explicit.tools}
+    deep_source = build_chief_of_staff_agent(
+        request_text=(
+            "What is OpenAI doing about mental health? Please do a deeper "
+            "source-backed web search and give me a readable brief."
+        )
+    )
+    deep_source_tool_names = {getattr(tool, "name", "") for tool in deep_source.tools}
 
     assert explicit_full_article_read_requested("read the full article at https://example.com")
+    assert explicit_full_article_read_requested(
+        "do a deeper source-backed web search with a readable brief"
+    )
+    assert explicit_full_article_read_requested(
+        "Can you do a deeper read-only search on AI scribes? Please give a "
+        "Detailed Summary that summarizes the source data first and 3-5 source links."
+    )
+    assert explicit_full_article_read_requested(
+        "Read/extract these three URLs and return Answer, Detailed Summary, and Source evidence."
+    )
     assert not explicit_full_article_read_requested("summarize links in #docs")
     assert "read_linked_article" not in generic_tool_names
     assert "read_linked_article" in explicit_tool_names
+    assert "read_linked_article" in deep_source_tool_names
 
     result = plan_chief_of_staff_request("read the full article linked in #docs today")
     assert "article_link_review" in result.operating_capabilities
@@ -1189,35 +1581,32 @@ def test_chief_of_staff_finance_tracker_update_requests_use_sdk_interpretation(
     assert "update the personal expenses" in str(captured["typed_input"])
 
 
-def test_chief_of_staff_force_sdk_interpretation_keeps_read_only_finance_aggregate_deterministic(
+def test_chief_of_staff_force_sdk_interpretation_uses_llm_for_finance_language(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_run_typed_sdk_agent(**_: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
-        raise AssertionError("read-only finance aggregate should use deterministic arithmetic")
+    captured: dict[str, object] = {}
 
-    def fake_schema(**_: object) -> dict[str, object]:
-        return {
-            "status": "success",
-            "schema": {
-                "tables": [
-                    {"name": "Personal Expenses", "fields": [{"name": "Total Expenses"}]},
-                ],
-            },
-        }
-
-    def fake_read_records(table: str = "", **_: object) -> dict[str, object]:
-        assert table == "Personal Expenses"
-        return {
-            "status": "success",
-            "records": [{"fields": {"Total Expenses": 123, "Quarter": "Q1"}}],
-        }
+    def fake_run_typed_sdk_agent(**kwargs: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured.update(kwargs)
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary="The LLM should interpret the finance request and choose tools if needed.",
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="budget-resource-review",
+                target_channel="docs",
+            ),
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"sdk": "called"},
+            live=True,
+        )
 
     monkeypatch.setattr(
         "keystone_agents.agents.chief_of_staff.run_typed_sdk_agent",
         fake_run_typed_sdk_agent,
     )
-    monkeypatch.setattr(chief_of_staff_module, "airtable_get_base_schema_impl", fake_schema)
-    monkeypatch.setattr(chief_of_staff_module, "airtable_read_records_impl", fake_read_records)
 
     result = run_chief_of_staff_sdk(
         "sum the Q1 personal expenses",
@@ -1225,8 +1614,8 @@ def test_chief_of_staff_force_sdk_interpretation_keeps_read_only_finance_aggrega
         force_sdk_interpretation=True,
     )
 
-    assert result.raw_result == {"deterministic": "finance_tax_tracker"}
-    assert "$123.00" in result.output.summary
+    assert result.raw_result == {"sdk": "called"}
+    assert captured["typed_input"] == "sum the Q1 personal expenses"
 
 
 def test_chief_of_staff_finance_doc_request_uses_live_sdk_not_tax_payment_shortcut(
@@ -1342,6 +1731,73 @@ def test_internal_data_tools_dry_run_are_gated(monkeypatch: pytest.MonkeyPatch) 
         request_text="read the full article",
     )
     assert full_article["status"] == "dry-run"
+    explicit_url_extract = read_linked_article_impl(
+        "https://example.com/article",
+        request_text=(
+            "Read/extract these three URLs and return Answer, Detailed Summary, "
+            "and Source evidence."
+        ),
+    )
+    assert explicit_url_extract["status"] == "dry-run"
+
+    class FakeExtractionResult:
+        status = "success"
+        url = "https://example.com/article"
+        title = "Example Article"
+        provider = "trafilatura"
+        text_or_markdown = "Extracted page text for source-aware synthesis."
+        claims = ["Source-backed claim"]
+        metadata = {"duration_ms": 12, "secret": "redacted_by_safe_metadata"}
+
+    def fake_extract_website_content(*_args: object, **kwargs: object) -> FakeExtractionResult:
+        assert kwargs["live"] is True
+        return FakeExtractionResult()
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.setattr(
+        internal_data_tools,
+        "extract_website_content",
+        fake_extract_website_content,
+    )
+    deep_article = read_linked_article_impl(
+        "https://example.com/article",
+        request_text="deeper source-backed web search with source URLs",
+    )
+    assert deep_article["status"] == "success"
+    assert deep_article["text_or_markdown"] == "Extracted page text for source-aware synthesis."
+    extracted_url_article = read_linked_article_impl(
+        "https://example.com/article",
+        request_text=(
+            "Read/extract these three URLs and return Answer, Detailed Summary, "
+            "and Source evidence."
+        ),
+    )
+    assert extracted_url_article["status"] == "success"
+    assert (
+        extracted_url_article["text_or_markdown"]
+        == "Extracted page text for source-aware synthesis."
+    )
+
+    def fake_extract_website_content_error(*_args: object, **_kwargs: object) -> object:
+        raise WebsiteExtractionError(
+            "Website extraction failed for https://example.com/blocked with HTTP 403."
+        )
+
+    monkeypatch.setattr(
+        internal_data_tools,
+        "extract_website_content",
+        fake_extract_website_content_error,
+    )
+    blocked_article = read_linked_article_impl(
+        "https://example.com/blocked",
+        request_text="deeper source-backed web search with source URLs",
+    )
+    assert blocked_article["status"] == "extraction_failed"
+    assert blocked_article["provider"] == "trafilatura"
+    assert blocked_article["text_or_markdown"] == ""
+    assert "HTTP 403" in blocked_article["error"]
 
     airtable_read = airtable_read_records_impl("Companies")
     assert airtable_read["status"] == "dry-run"
@@ -1913,6 +2369,44 @@ def test_scope_question_returns_scope_plan_not_clarification() -> None:
     assert "keystone_slack_runtime_repo" in result.context_sources_considered
 
 
+def test_web_search_brief_fallback_does_not_return_scope_blurb() -> None:
+    request = (
+        '"What is OpenAI doing about mental health? Please do a deeper search and '
+        "give me a readable brief, not a diagnostics report. Include a short answer, "
+        'a synthesis with source URLs, key concerns, and metadata with providers used."'
+    )
+
+    result = plan_chief_of_staff_request(request)
+
+    assert result.recommended_route.workflow_type == "research-direction-review"
+    assert result.recommended_route.requires_live_connector is True
+    assert result.summary != "Explain Chief of Staff scope for KNI Slack operations."
+    assert "source-backed web brief request" in result.summary
+    assert "web_search_brief" in result.operating_capabilities
+    assert any("Answer and Detailed Summary" in action for action in result.recommended_actions)
+    assert not any("Answer and Synthesis" in action for action in result.recommended_actions)
+    assert any(
+        "Do not render this as a diagnostics report" in action
+        for action in result.recommended_actions
+    )
+
+
+def test_chief_request_plan_marks_web_brief_as_live_source_research() -> None:
+    plan = chief_of_staff_module._chief_request_plan(
+        (
+            '"What is OpenAI doing about mental health? Please do a deeper search and '
+            'give me a readable brief with source URLs and metadata." *Sent using*'
+        ),
+        None,
+    )
+
+    assert plan.intent == "research_brief"
+    assert plan.task_objective == "source_research"
+    assert plan.expected_artifact_type == "research_brief"
+    assert plan.requires_live_search is True
+    assert "visible source URLs" in plan.constraints
+
+
 def test_supplied_slack_history_digest_renders_timestamped_answer() -> None:
     result = plan_chief_of_staff_request(
         "\n".join(
@@ -2065,36 +2559,32 @@ def test_run_chief_of_staff_sdk_prioritizes_latest_slack_followup(
     assert result.output.recommended_actions
 
 
-def test_run_chief_of_staff_sdk_uses_deterministic_finance_aggregate_even_when_forced(
+def test_run_chief_of_staff_sdk_uses_llm_for_finance_aggregate_when_forced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_run_typed_sdk_agent(**_: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
-        raise AssertionError("read-only finance aggregates should not use live SDK synthesis")
+    captured: dict[str, object] = {}
 
-    def fake_schema(**_: object) -> dict[str, object]:
-        return {
-            "status": "success",
-            "schema": {
-                "tables": [
-                    {"name": "Personal Expenses", "fields": [{"name": "Total Expenses"}]},
-                ],
-            },
-        }
-
-    def fake_read_records(table: str = "", **kwargs: object) -> dict[str, object]:
-        assert table == "Personal Expenses"
-        assert kwargs.get("fetch_all") is True
-        return {
-            "status": "success",
-            "records": [{"fields": {"Total Expenses": 123, "Quarter": "Q1"}}],
-        }
+    def fake_run_typed_sdk_agent(**kwargs: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured.update(kwargs)
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary="Interpreted by the Chief of Staff LLM path.",
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="budget-resource-review",
+                target_channel="docs",
+            ),
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"sdk": "called"},
+            live=True,
+        )
 
     monkeypatch.setattr(
         "keystone_agents.agents.chief_of_staff.run_typed_sdk_agent",
         fake_run_typed_sdk_agent,
     )
-    monkeypatch.setattr(chief_of_staff_module, "airtable_get_base_schema_impl", fake_schema)
-    monkeypatch.setattr(chief_of_staff_module, "airtable_read_records_impl", fake_read_records)
 
     result = run_chief_of_staff_sdk(
         "sum the Q1 personal expenses",
@@ -2102,8 +2592,8 @@ def test_run_chief_of_staff_sdk_uses_deterministic_finance_aggregate_even_when_f
         force_sdk_interpretation=True,
     )
 
-    assert result.raw_result == {"deterministic": "finance_tax_tracker"}
-    assert "$123.00" in result.output.summary
+    assert result.raw_result == {"sdk": "called"}
+    assert captured["typed_input"] == "sum the Q1 personal expenses"
 
 
 def test_reference_capture_request_saves_operator_memory(tmp_path: Path) -> None:

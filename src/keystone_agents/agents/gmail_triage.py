@@ -7,6 +7,7 @@ from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.agent_tool_policy import filter_tools_for_tier
 from keystone_agents.gmail_triage.text import (
     clean_text as _clean_text,
 )
@@ -44,6 +45,7 @@ from keystone_agents.schemas.email_triage import (
     managed_gmail_labels,
 )
 from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
+from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.tools.approval_tool import create_approval_queue_item
 from keystone_agents.tools.email_style_tool import load_email_style_profile
 from keystone_agents.tools.gmail_tool import (
@@ -420,12 +422,18 @@ def run_gmail_triage_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    tool_tier: str | int | None = None,
 ) -> TypedAgentRunResult[EmailTriageResult]:
     """Run Gmail triage through the typed SDK harness."""
 
     if isinstance(typed_input, GmailMessageEnvelope):
         typed_input = GmailTriageSDKInput.from_envelope(typed_input)
-    agent = build_gmail_triage_agent(model=model)
+    resolved_tool_tier = tool_tier or _default_gmail_triage_sdk_tool_tier(typed_input)
+    agent = build_gmail_triage_agent(
+        model=model,
+        request_text=skill_request_text(typed_input),
+        tool_tier=resolved_tool_tier,
+    )
     return run_typed_sdk_agent(
         agent=agent,
         typed_input=typed_input,
@@ -448,7 +456,10 @@ def run_gmail_priority_grouping_sdk(
 
     if isinstance(typed_input, list):
         typed_input = GmailPriorityGroupingSDKInput.from_envelopes(typed_input)
-    agent = build_gmail_priority_grouping_agent(model=model)
+    agent = build_gmail_priority_grouping_agent(
+        model=model,
+        request_text=skill_request_text(typed_input),
+    )
     return run_typed_sdk_agent(
         agent=agent,
         typed_input=typed_input,
@@ -463,42 +474,52 @@ def build_gmail_triage_agent(
     model: str | None = None,
     *,
     include_tools: bool = True,
+    request_text: str = "",
+    include_all_skills: bool = False,
+    tool_tier: str | int | None = None,
 ) -> Agent:
     """Build the Gmail triage agent."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "gmail_triage.md",
+        skill_files=select_agent_skill_names(
+            "gmail_triage",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
+    tools = (
+        [
+            get_gmail_message,
+            apply_gmail_labels,
+            create_gmail_draft_reply,
+            load_email_style_profile,
+            list_local_context_sources,
+            search_local_context,
+            read_local_context_file,
+            retrieve_memory,
+            airtable_get_base_schema,
+            airtable_read_records,
+            airtable_write_record,
+            search_web,
+            structure_web_data_for_schema,
+            list_outreach_tracking_records,
+            create_approval_queue_item,
+            *google_workspace_tools(),
+        ]
+        if include_tools
+        else []
+    )
+    if tool_tier is not None:
+        tools = filter_tools_for_tier("gmail_triage", tools, tool_tier)
     return build_sdk_agent(
         name="gmail_triage",
         instructions=instructions,
         output_type=EmailTriageResult,
-        tools=(
-            [
-                get_gmail_message,
-                apply_gmail_labels,
-                create_gmail_draft_reply,
-                load_email_style_profile,
-                list_local_context_sources,
-                search_local_context,
-                read_local_context_file,
-                retrieve_memory,
-                airtable_get_base_schema,
-                airtable_read_records,
-                airtable_write_record,
-                search_web,
-                structure_web_data_for_schema,
-                list_outreach_tracking_records,
-                create_approval_queue_item,
-                *google_workspace_tools(),
-            ]
-            if include_tools
-            else []
-        ),
+        tools=tools,
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="gmail_triage",
@@ -509,16 +530,41 @@ def build_gmail_triage_agent(
     )
 
 
-def build_gmail_priority_grouping_agent(model: str | None = None) -> Agent:
+def _default_gmail_triage_sdk_tool_tier(
+    typed_input: GmailTriageSDKInput | str,
+) -> str:
+    """Infer the default Gmail SDK tool tier from the operator request."""
+
+    request_text = (
+        typed_input if isinstance(typed_input, str) else getattr(typed_input, "request", "")
+    )
+    request_text = str(request_text or "").lower()
+    if any(marker in request_text for marker in ("draft", "reply", "label", "archive")):
+        return "internal_write"
+    if any(marker in request_text for marker in ("search web", "source", "research", "look up")):
+        return "web_search"
+    return "core_read"
+
+
+def build_gmail_priority_grouping_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+    include_all_skills: bool = False,
+) -> Agent:
     """Build the LLM-only Gmail priority grouping agent."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "gmail_triage.md",
         "gmail_priority_grouping.md",
+        skill_files=select_agent_skill_names(
+            "gmail_triage",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     return build_sdk_agent(
         name="gmail_triage",

@@ -79,6 +79,21 @@ THREAD_DEADLINE_RE = re.compile(
     r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b",
     re.IGNORECASE,
 )
+PROMOTIONAL_CTA_MARKERS = (
+    "communication preferences",
+    "discover partnering requests",
+    "learn more",
+    "log in",
+    "make sure your profile",
+    "our platform",
+    "partner listing",
+    "quick-start guide",
+    "receive direct feedback",
+    "start by creating",
+    "submit a short",
+    "unsubscribe",
+    "we built",
+)
 SUSPICIOUS_LINK_TERMS = (
     "login",
     "verify",
@@ -448,9 +463,23 @@ def _thread_action_items(envelopes: list[GmailMessageEnvelope]) -> list[str]:
     items: list[str] = []
     for envelope in envelopes:
         for sentence in _thread_sentences(envelope.normalized_body, envelope.snippet):
-            if THREAD_ACTION_RE.search(sentence):
+            if THREAD_ACTION_RE.search(sentence) and not _looks_like_promotional_cta(
+                sentence,
+                envelope,
+            ):
                 items.append(sentence)
     return _unique_nonempty(items, limit=5)
+
+
+def _looks_like_promotional_cta(sentence: str, envelope: GmailMessageEnvelope) -> bool:
+    lowered = sentence.lower()
+    if any(marker in lowered for marker in PROMOTIONAL_CTA_MARKERS):
+        return True
+    return bool(
+        "CATEGORY_PROMOTIONS" in envelope.prior_labels
+        and not lowered.endswith("?")
+        and re.search(r"\b(?:discover|submit|profile|listing|platform)\b", lowered)
+    )
 
 
 def _thread_deadlines(envelopes: list[GmailMessageEnvelope]) -> list[str]:
@@ -475,6 +504,17 @@ def _thread_level_limitations(envelopes: list[GmailMessageEnvelope]) -> list[str
     limitations = [
         "Read-only thread summary used sanitized Gmail message bodies from the selected thread."
     ]
+    if any(
+        "CATEGORY_PROMOTIONS" in envelope.prior_labels
+        and any(
+            marker in " ".join([envelope.normalized_body, envelope.snippet]).lower()
+            for marker in PROMOTIONAL_CTA_MARKERS
+        )
+        for envelope in envelopes
+    ):
+        limitations.append(
+            "Promotional or onboarding CTAs were not treated as operator action items."
+        )
     if any(envelope.attachment_metadata for envelope in envelopes):
         limitations.append("Attachments were not ingested; metadata only was screened.")
     if any(

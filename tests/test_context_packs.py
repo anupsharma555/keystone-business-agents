@@ -7,6 +7,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemArtifactRef,
     WorkItemKind,
     WorkItemRoute,
+    WorkItemSourceRef,
     WorkItemTarget,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore
@@ -17,6 +18,7 @@ from keystone_agents.work_items import (
     build_opportunity_context_pack,
     build_outreach_context,
     build_outreach_context_pack,
+    build_research_context,
     build_research_context_pack,
     drafting_ready,
 )
@@ -214,6 +216,105 @@ def test_build_context_pack_for_route_selects_specialist_pack() -> None:
 
     assert pack.pack_type == "opportunity"
     assert pack.route == WorkItemRoute.OPPORTUNITY_SCOUT
+
+
+def test_context_pack_payload_preserves_ordered_sources_for_followups() -> None:
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="OpenAI mental health",
+        request_text="summarize link 1 from the prior thread",
+        target=WorkItemTarget(name="OpenAI"),
+        sources=[
+            WorkItemSourceRef(
+                title="OpenAI mental health update",
+                url="https://openai.com/index/update-on-mental-health-related-work/",
+                source_type="company_site",
+                supported_claim="OpenAI describes mental-health-related safety work.",
+                evidence_excerpt="OpenAI is improving responses in sensitive conversations.",
+                extraction_status="article_read",
+            )
+        ],
+    )
+
+    payload = build_research_context(item)
+
+    assert payload["ordered_sources"] == [
+        {
+            "index": 1,
+            "reference": "source 1",
+            "title": "OpenAI mental health update",
+            "url": "https://openai.com/index/update-on-mental-health-related-work/",
+            "source_type": "company_site",
+            "extraction_status": "article_read",
+            "supported_claim": "OpenAI describes mental-health-related safety work.",
+            "evidence_excerpt": "OpenAI is improving responses in sensitive conversations.",
+        }
+    ]
+
+
+def test_context_pack_carries_source_triage_for_specialist_reasoning() -> None:
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="OpenAI mental health",
+        request_text="What is OpenAI doing about mental health?",
+        target=WorkItemTarget(name="OpenAI"),
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="1",
+                source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                title="OpenAI",
+                summary="Source-backed profile.",
+                metadata={
+                    "retrieval_diagnostics": {
+                        "source_triage": {
+                            "mode": "fixture_safe_source_triage",
+                            "recommended_action": "broaden_or_deepen_before_final_synthesis",
+                            "needs_broaden_or_deepen": True,
+                            "retained_source_ids": [],
+                            "review_source_ids": [],
+                            "rejected_source_ids": ["source:2"],
+                            "deepen_source_ids": ["source:1"],
+                            "recall_gaps": ["missing expected source lane: press_news"],
+                            "decisions": [
+                                {
+                                    "source_id": "source:1",
+                                    "title": "OpenAI mental health update",
+                                    "url": (
+                                        "https://openai.com/index/"
+                                        "update-on-mental-health-related-work/"
+                                    ),
+                                    "decision": "deepen",
+                                    "relevance_score": 82,
+                                    "directness_score": 60,
+                                    "rationale": "deepen: promising match needs page extraction",
+                                },
+                                {
+                                    "source_id": "source:2",
+                                    "title": "OpenAI unrelated partnership",
+                                    "url": "https://example.com/openai-partnership",
+                                    "decision": "reject",
+                                    "relevance_score": 8,
+                                    "directness_score": 40,
+                                    "rationale": "reject: low request-term overlap",
+                                },
+                            ],
+                        }
+                    }
+                },
+            )
+        ],
+    )
+
+    pack = build_context_pack_for_route(item, WorkItemRoute.BUSINESS_RESEARCH_ANALYST)
+
+    assert pack.source_triage["recommended_action"] == ("broaden_or_deepen_before_final_synthesis")
+    assert pack.source_triage["needs_broaden_or_deepen"] is True
+    assert pack.source_triage["decision_counts"] == {"deepen": 1, "reject": 1}
+    assert pack.source_triage["deepen_source_ids"] == ["source:1"]
+    assert pack.source_triage["rejected_source_ids"] == ["source:2"]
+    assert pack.source_triage["decisions"][0]["decision"] == "deepen"
+    assert pack.source_triage["recall_gaps"] == ["missing expected source lane: press_news"]
 
 
 def test_research_context_pack_hydrates_approved_prompt_safe_company_memory(tmp_path) -> None:

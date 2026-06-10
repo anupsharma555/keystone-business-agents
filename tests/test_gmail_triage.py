@@ -624,6 +624,56 @@ def test_gmail_get_thread_returns_summary_fields() -> None:
     )
 
 
+def test_gmail_get_thread_does_not_promote_onboarding_ctas_to_action_items() -> None:
+    class ThreadSession:
+        def request(self, method: str, url: str, **_kwargs: object) -> FakeGmailResponse:
+            if method == "GET" and url.endswith("/threads/thread-halo"):
+                body = base64.urlsafe_b64encode(
+                    b"Hi Anup,\n\n"
+                    b"We built Halo to help innovators find partners. "
+                    b"Start by creating a Partner Listing. "
+                    b"Discover partnering requests from top companies. "
+                    b"Submit a short, non-confidential proposal in less than an hour.\n\n"
+                    b"Best,\nAnna"
+                ).decode()
+                return FakeGmailResponse(
+                    {
+                        "id": "thread-halo",
+                        "messages": [
+                            {
+                                "id": "msg-halo",
+                                "threadId": "thread-halo",
+                                "internalDate": "1772280113000",
+                                "snippet": "Start by creating a Partner Listing",
+                                "labelIds": ["INBOX", "CATEGORY_PROMOTIONS"],
+                                "payload": {
+                                    "headers": [
+                                        {"name": "From", "value": "Anna <anna@halo.science>"},
+                                        {"name": "To", "value": "Anup <wisegrow05@gmail.com>"},
+                                        {"name": "Subject", "value": "Welcome to Halo!"},
+                                    ],
+                                    "mimeType": "text/plain",
+                                    "body": {"data": body},
+                                },
+                            },
+                        ],
+                    }
+                )
+            raise AssertionError(f"Unexpected Gmail API call: {method} {url}")
+
+    gmail = GmailTool(live=True, access_token="test-token", session=ThreadSession())
+
+    thread = gmail.get_thread("thread-halo")
+
+    assert thread["status"] == "read"
+    assert thread["subject"] == "Welcome to Halo!"
+    assert thread["action_items"] == []
+    assert any(
+        "Promotional or onboarding CTAs were not treated as operator action items." == item
+        for item in thread["triage_limitations"]
+    )
+
+
 def test_label_cleanup_preview_is_dry_run_by_default() -> None:
     gmail = GmailTool(live=False)
 

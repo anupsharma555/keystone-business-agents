@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from email.utils import parseaddr
 from pathlib import Path
 from time import perf_counter
@@ -34,6 +35,7 @@ from keystone_agents.agents.outreach_composer import (
 )
 from keystone_agents.cli_sdk import jsonable
 from keystone_agents.company_research import research_company_fixture
+from keystone_agents.config import cli_default_live_gmail
 from keystone_agents.contact_enrichment import build_contact_enrichment_artifact
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
@@ -48,27 +50,46 @@ from keystone_agents.memory import (
     retrieval_tool_performance_memory_item,
 )
 from keystone_agents.models import OutreachComposerSDKInput, ResearchSDKInput
-from keystone_agents.orchestrator.routing import looks_like_send_side_effect
-from keystone_agents.run import run_retrieved_sdk_synthesis
+from keystone_agents.operator_failures import redact_operator_text
+from keystone_agents.orchestrator.routing import (
+    looks_like_send_side_effect,
+    looks_like_thread_local_draft_request,
+)
+from keystone_agents.quality_budget import (
+    AgentQualityBudget,
+    business_research_quality_budget,
+    opportunity_scout_quality_budget,
+)
 from keystone_agents.response_synthesis import (
     format_user_response_synthesis,
     latest_user_request,
+    response_synthesis_metadata_lines,
+    response_synthesis_sources,
     synthesize_user_facing_work_item_response_sdk_result,
 )
+from keystone_agents.run import run_retrieved_sdk_synthesis
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.company_profile import CompanyProfile, SourceRecord
+from keystone_agents.schemas.email_triage import (
+    GmailThreadSummaryMessage,
+    GmailThreadSummaryResult,
+)
+from keystone_agents.schemas.opportunity import (
+    FilteredOpportunityCandidate,
+    OpportunityScoutResult,
+)
 from keystone_agents.schemas.opportunity import (
     OpportunityRecord as ScoutOpportunityRecord,
-    OpportunityScoutResult,
 )
 from keystone_agents.schemas.outreach import (
     OpportunityRecord as OutreachOpportunityRecord,
 )
 from keystone_agents.schemas.outreach import (
+    OutreachDraft,
     OutreachLLMDraftPayload,
 )
-from keystone_agents.schemas.outreach import OutreachDraft
 from keystone_agents.schemas.research import ResearchBrief
+from keystone_agents.schemas.retrieval import RetrievalHint
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
@@ -88,8 +109,17 @@ from keystone_agents.sdk_sessions import (
     context_file_session_components,
     resolve_sdk_session_spec,
 )
+from keystone_agents.skill_contract_gates import evaluate_work_item_skill_gates
+from keystone_agents.skill_sets import (
+    AGENT_SKILL_NAMES,
+    explain_agent_skill_selection,
+    select_agent_skill_names,
+)
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.approval_tool import build_approval_queue_item
+from keystone_agents.tools.gmail_tool import GmailAPIError, GmailConfigurationError, GmailTool
+from keystone_agents.tools.internal_data_tools import read_linked_article_impl
+from keystone_agents.visible_sources import append_visible_source_urls_to_output
 from keystone_agents.work_items import (
     add_blocker,
     attach_artifact,
@@ -124,9 +154,53 @@ _MANAGER_LOOP_STOP_STATUSES = {
     WorkItemStatus.DONE,
     WorkItemStatus.ARCHIVED,
 }
+_MANAGER_LOOP_REPAIR_BOUNDARY_STATUSES = {
+    WorkItemStatus.NEEDS_CONTEXT,
+    WorkItemStatus.NEEDS_APPROVAL,
+    WorkItemStatus.BLOCKED,
+    WorkItemStatus.ARCHIVED,
+}
 _SLACK_CONSERVATIVE_DEEP_RESEARCH_RE = re.compile(
-    r"\b(?:deep research|deeper research|more research|research deeper|run again|"
+    r"\b(?:deep research|deeper research|deep search|deeper search|deepened search|"
+    r"detailed search|source[- ]backed search|source[- ]backed brief|"
+    r"detailed summary|more research|research deeper|run again|"
     r"find contact|contact|email|linkedin)\b",
+    flags=re.I,
+)
+_FORMAL_OPPORTUNITY_REQUEST_RE = re.compile(
+    r"\b(?:grants?|rfps?|request\s+for\s+proposals?|requests\s+for\s+proposals?|"
+    r"solicitations?|pilot(?:s| programs?)?|call[- ]for[- ]proposals?|"
+    r"calls?\s+for\s+(?:proposals|applications)|cfps?|nofo|foa|rfa)\b",
+    flags=re.I,
+)
+_FORMAL_OPPORTUNITY_TIMING_RE = re.compile(
+    r"\b(?:deadline|due|closes?|closing|apply\s+by|applications?\s+(?:due|close|open)|"
+    r"submissions?\s+due|letters?\s+of\s+intent|loi\s+due|expires?|posted|"
+    r"refreshed|published|announced|opening\s+date|closing\s+date|fy\s?20\d{2})\b"
+    r"|\b(?:20\d{2}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/20\d{2})\b"
+    r"|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)\s+\d{1,2}(?:,\s*20\d{2})?\b",
+    flags=re.I,
+)
+_KEYSTONE_APPLICABILITY_RE = re.compile(
+    r"\b(?:small\s+business|for[- ]profit|commercial|company|companies|startup|vendor|"
+    r"contractor|subcontract(?:or|ing)?|partner(?:ship|s)?|collaborat(?:or|ion|e)|"
+    r"consultant|implementation\s+partner|technology\s+provider|service\s+provider|"
+    r"evaluator|evaluation\s+partner|clinical\s+validation\s+partner|sbir|sttr|"
+    r"phase\s+i\b|phase\s+ii\b|procurement|pilot\s+(?:vendor|partner|program)|"
+    r"private\s+sector|industry\s+partner)\b",
+    flags=re.I,
+)
+_FORMAL_OPPORTUNITY_NEGATIVE_EVIDENCE_RE = re.compile(
+    r"\b(?:"
+    r"not\s+(?:a\s+)?notice\s+of\s+funding\s+opportunity|"
+    r"not\s+(?:an?\s+)?(?:nofo|foa|rfa|rfp|grant|solicitation|procurement)|"
+    r"not\s+(?:an?\s+)?(?:active\s+)?funding\s+opportunit(?:y|ies)|"
+    r"not\s+(?:an?\s+)?(?:active\s+)?(?:grant|award|pilot|partnership)\s+opportunit(?:y|ies)|"
+    r"does\s+not\s+(?:accept|invite|request)\s+(?:applications?|proposals?|submissions?)|"
+    r"apply\s+through\s+an?\s+appropriate\s+nih\s+parent\s+funding\s+announcement"
+    r")\b",
     flags=re.I,
 )
 _SLACK_COST_CONTROLLED_PROFILES = frozenset(
@@ -137,7 +211,9 @@ _SLACK_COST_CONTROLLED_PROFILES = frozenset(
         "slack_manager_balanced",
         "slack_research_balanced",
         "slack_opportunity_balanced",
+        "slack_opportunity_deep",
         "slack_research_deep",
+        "slack_manager_deep",
     }
 )
 _SLACK_RUNTIME_ENV_HINTS = frozenset(
@@ -168,11 +244,24 @@ def _normalize_workflow_request_for_context(
     if not _request_has_slack_context(request, store=store, work_item=context_work_item):
         return request
     route = _request_route_for_slack_cost_profile(request, work_item=context_work_item)
-    deep_research = route in {
-        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
-        WorkItemRoute.OPPORTUNITY_SCOUT.value,
-    } and bool(_SLACK_CONSERVATIVE_DEEP_RESEARCH_RE.search(request.request_text or ""))
-    defaults = _slack_cost_defaults_for_route(route, deep_research=deep_research)
+    formal_opportunity = (
+        route == WorkItemRoute.OPPORTUNITY_SCOUT.value
+        and _is_formal_opportunity_request(
+            request.request_text,
+            manual_request_plan=request.manual_request_plan,
+        )
+    )
+    deep_research = _slack_request_needs_deep_research_profile(
+        route,
+        request_text=request.request_text or "",
+        formal_opportunity=formal_opportunity,
+        manual_request_plan=request.manual_request_plan,
+    )
+    defaults = _slack_cost_defaults_for_route(
+        route,
+        deep_research=deep_research,
+        formal_opportunity=formal_opportunity,
+    )
     return request.model_copy(
         update={
             "cost_profile": defaults["cost_profile"],
@@ -251,7 +340,124 @@ def _request_route_for_slack_cost_profile(
     return WorkItemRoute.ORCHESTRATOR.value
 
 
-def _slack_cost_defaults_for_route(route: str, *, deep_research: bool) -> dict[str, object]:
+def _is_formal_opportunity_request(
+    text: str,
+    *,
+    manual_request_plan: dict[str, Any] | None = None,
+) -> bool:
+    values = [str(text or "")]
+    if isinstance(manual_request_plan, dict):
+        for key in ("primary_target", "task_objective", "intent"):
+            values.append(str(manual_request_plan.get(key) or ""))
+        constraints = manual_request_plan.get("constraints")
+        if isinstance(constraints, list):
+            values.extend(str(item or "") for item in constraints)
+    return bool(_FORMAL_OPPORTUNITY_REQUEST_RE.search(" ".join(values)))
+
+
+def _request_requires_selected_web_source_context(
+    text: str,
+    *,
+    manual_request_plan: dict[str, Any] | None = None,
+) -> bool:
+    """Return true when synthesis should be based on read/extracted web links."""
+
+    values = [str(text or "")]
+    constraints: list[str] = []
+    if isinstance(manual_request_plan, dict):
+        for key in ("primary_target", "task_objective", "intent"):
+            values.append(str(manual_request_plan.get(key) or ""))
+        raw_constraints = manual_request_plan.get("constraints")
+        if isinstance(raw_constraints, list):
+            constraints = [str(item or "").strip().lower() for item in raw_constraints]
+            values.extend(constraints)
+    normalized = " ".join(" ".join(values).lower().split())
+    constraint_set = {item for item in constraints if item}
+    if re.search(r"https?://", normalized) and re.search(
+        r"\b(?:read|extract|full\s+(?:page|article|source)|page\s+content|"
+        r"linked\s+(?:article|page|source|content)|source\s+content)\b",
+        normalized,
+    ):
+        return True
+    if "deeper-search" in constraint_set and (
+        "source-backed" in constraint_set
+        or "visible-source-urls" in constraint_set
+        or "answer-and-synthesis" in constraint_set
+        or "provider-diagnostics" in constraint_set
+        or "comparison-format" in constraint_set
+    ):
+        return True
+    if re.search(
+        r"\b(?:source[- ]backed|source\s+(?:data|evidence|context|urls?)|"
+        r"source\s+links?|retrieved\s+link\s+content|link\s+content|"
+        r"key\s+source\s+(?:urls?|links?)|visible\s+source(?:\s+(?:urls?|links?))?)\b",
+        normalized,
+    ) and re.search(
+        r"\b(?:synthesis|summari[sz]e(?:s|d)?|summary|readable brief|"
+        r"detailed answer|detailed summary|compare|comparison|table|"
+        r"what (?:the )?sources say)\b",
+        normalized,
+    ):
+        return True
+    if re.search(r"\b(?:deep|deeper|deepened|detailed)\s+(?:web\s+)?search\b", normalized):
+        return bool(
+            re.search(
+                r"\b(?:source[- ]backed|source\s+urls?|visible\s+source|"
+                r"provider\s+(?:comparison|diagnostics|usage|metadata)|"
+                r"answer\b[\s\S]{0,80}\bsynthesis|synthesis\b[\s\S]{0,80}\banswer|"
+                r"compare|comparison|table)\b",
+                normalized,
+            )
+        )
+    if re.search(
+        r"\b(?:deep|deeper|deepened|detailed)\b[\s\S]{0,80}"
+        r"\b(?:source[- ]backed|source\s+urls?|visible\s+source)\b[\s\S]{0,80}"
+        r"\b(?:web\s+)?search\b",
+        normalized,
+    ):
+        return True
+    return False
+
+
+def _request_stops_after_opportunity_packet(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized:
+        return False
+    return bool(
+        re.search(
+            r"\bstop\s+after\b[\s\S]{0,80}\b(?:opportunit(?:y|ies)|review packet|packet)\b"
+            r"|\b(?:opportunity\s+)?review\s+packet\s+only\b"
+            r"|\bdo\s+not\b[\s\S]{0,80}\b(?:draft|research\s+the\s+companies|handoff|continue)",
+            normalized,
+        )
+    )
+
+
+def _slack_cost_defaults_for_route(
+    route: str,
+    *,
+    deep_research: bool,
+    formal_opportunity: bool = False,
+) -> dict[str, object]:
+    if route == WorkItemRoute.OPPORTUNITY_SCOUT.value and formal_opportunity:
+        return {
+            "cost_profile": "slack_opportunity_deep",
+            "allow_manager_loop_repair": True,
+            "include_contact_enrichment": False,
+            "hosted_web_search_max_calls": 4,
+            "reuse_existing_research": False,
+        }
+    if deep_research and route in {
+        WorkItemRoute.CHIEF_OF_STAFF.value,
+        WorkItemRoute.ORCHESTRATOR.value,
+    }:
+        return {
+            "cost_profile": "slack_manager_deep",
+            "allow_manager_loop_repair": True,
+            "include_contact_enrichment": False,
+            "hosted_web_search_max_calls": 2,
+            "reuse_existing_research": False,
+        }
     if deep_research:
         return {
             "cost_profile": "slack_research_deep",
@@ -291,6 +497,34 @@ def _slack_cost_defaults_for_route(route: str, *, deep_research: bool) -> dict[s
         "hosted_web_search_max_calls": 0,
         "reuse_existing_research": True,
     }
+
+
+def _slack_request_needs_deep_research_profile(
+    route: str,
+    *,
+    request_text: str,
+    formal_opportunity: bool,
+    manual_request_plan: dict[str, Any] | None,
+) -> bool:
+    source_context_required = _request_requires_selected_web_source_context(
+        request_text,
+        manual_request_plan=manual_request_plan,
+    )
+    if route in {
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        WorkItemRoute.OPPORTUNITY_SCOUT.value,
+    }:
+        return bool(
+            formal_opportunity
+            or source_context_required
+            or _SLACK_CONSERVATIVE_DEEP_RESEARCH_RE.search(request_text or "")
+        )
+    if route in {WorkItemRoute.CHIEF_OF_STAFF.value, WorkItemRoute.ORCHESTRATOR.value}:
+        return bool(
+            source_context_required
+            or _SLACK_CONSERVATIVE_DEEP_RESEARCH_RE.search(request_text or "")
+        )
+    return False
 
 
 def _context_file_is_slack_context(context_file_path: str) -> bool:
@@ -412,11 +646,29 @@ def _advance_work_item_one_step(
         },
         store=store,
     )
+    _record_skills_selected_event(
+        work_item,
+        route=route,
+        request_text=work_item.request_text or input_text,
+        store=store,
+    )
     _record_preflight_sdk_cost_events(work_item, request=request, store=store)
 
     sdk_session = build_sdk_session(sdk_session_spec) if request.live_sdk else None
 
-    if route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
+    source_link_followup = (
+        _chief_source_link_followup_result(
+            work_item,
+            request=request,
+            store=store,
+            route=route,
+        )
+        if _use_deterministic_source_link_followup(request)
+        else None
+    )
+    if source_link_followup is not None:
+        result = source_link_followup
+    elif route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
         result = _advance_research(
             work_item,
             request=request,
@@ -439,6 +691,11 @@ def _advance_work_item_one_step(
     else:
         result = _block_unsupported_route(work_item, route=route, store=store)
 
+    _record_skill_contract_gates_event(
+        result,
+        request_text=work_item.request_text or input_text,
+        store=store,
+    )
     final_context_pack = build_context_pack_for_route(result.work_item, result.route, store=store)
     result = result.model_copy(
         update={
@@ -459,6 +716,89 @@ def _advance_work_item_one_step(
     return result
 
 
+def _record_skills_selected_event(
+    work_item: WorkItem,
+    *,
+    route: WorkItemRoute,
+    request_text: str,
+    store: SQLiteStore | None,
+) -> None:
+    """Persist the runtime skill subset selected for the next specialist step."""
+
+    agent_name = route.value
+    if agent_name not in AGENT_SKILL_NAMES:
+        return
+    selected_skills = select_agent_skill_names(agent_name, request_text=request_text)
+    selection_reasons = explain_agent_skill_selection(agent_name, request_text=request_text)
+    record_event(
+        work_item,
+        event_type="skills_selected",
+        actor="orchestrator",
+        summary=f"Selected {len(selected_skills)} skill contract(s) for {agent_name}.",
+        metadata={
+            "schema": "keystone.skills_selected.v1",
+            "agent_name": agent_name,
+            "route": route.value,
+            "selected_skills": list(selected_skills),
+            "selection_reasons": {
+                skill_name: list(reasons) for skill_name, reasons in selection_reasons.items()
+            },
+            "selector_input_sha256": hashlib.sha256(
+                str(request_text or "").encode("utf-8")
+            ).hexdigest(),
+        },
+        store=store,
+    )
+
+
+def _record_skill_contract_gates_event(
+    result: WorkflowRunResult,
+    *,
+    request_text: str,
+    store: SQLiteStore | None,
+) -> None:
+    """Persist deterministic skill contract checks after specialist execution."""
+
+    if store is None:
+        return
+    agent_name = result.route.value
+    if agent_name not in AGENT_SKILL_NAMES:
+        return
+    checks = evaluate_work_item_skill_gates(result, request_text=request_text)
+    if not checks:
+        return
+    counts = {
+        "passed": sum(1 for check in checks if check.status == "passed"),
+        "limited": sum(1 for check in checks if check.status == "limited"),
+        "blocked": sum(1 for check in checks if check.status == "blocked"),
+    }
+    selected_skills = select_agent_skill_names(agent_name, request_text=request_text)
+    record_event(
+        result.work_item,
+        event_type="skill_contract_gates_checked",
+        actor="orchestrator",
+        summary=(
+            f"Checked {len(checks)} skill-backed contract gate(s) for {agent_name}: "
+            f"{counts['passed']} passed, {counts['limited']} limited, {counts['blocked']} blocked."
+        ),
+        metadata={
+            "schema": "keystone.skill_contract_gates.v1",
+            "agent_name": agent_name,
+            "route": result.route.value,
+            "selected_skills": list(selected_skills),
+            "counts": counts,
+            "gates": [check.to_dict() for check in checks],
+            "eval_labels": sorted(
+                {label for check in checks for label in check.eval_labels if str(label).strip()}
+            ),
+            "selector_input_sha256": hashlib.sha256(
+                str(request_text or "").encode("utf-8")
+            ).hexdigest(),
+        },
+        store=store,
+    )
+
+
 def advance_work_item_manager_loop(
     request: WorkflowRunRequest,
     *,
@@ -475,6 +815,14 @@ def advance_work_item_manager_loop(
     step_limit = max(1, min(5, int(max_steps or DEFAULT_MANAGER_LOOP_MAX_STEPS)))
     started_at = perf_counter()
     store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    cost_directive = parse_cost_tracking_directive(request.request_text)
+    if cost_directive.requested and not request.cost_tracking_requested:
+        request = request.model_copy(
+            update={
+                "request_text": (cost_directive.cleaned_text or request.request_text).strip(),
+                "cost_tracking_requested": True,
+            }
+        )
     request = _normalize_workflow_request_for_context(request, store=store)
     state_followup = _maybe_answer_manager_loop_state_followup(request, store=store)
     if state_followup is not None:
@@ -604,7 +952,7 @@ def _maybe_answer_manager_loop_state_followup(
         store=store,
     )
     _record_preflight_sdk_cost_events(work_item, request=request, store=store)
-    return WorkflowRunResult(
+    result = WorkflowRunResult(
         work_item=work_item,
         route=WorkItemRoute.ORCHESTRATOR,
         status=work_item.status,
@@ -618,6 +966,17 @@ def _maybe_answer_manager_loop_state_followup(
         ],
         manual_request_plan=request.manual_request_plan,
         orchestrator_preflight=request.orchestrator_preflight,
+    )
+    sdk_session = (
+        build_sdk_session(_sdk_session_spec_for_work_item(request, work_item))
+        if request.live_sdk
+        else None
+    )
+    return _maybe_synthesize_user_facing_response(
+        result,
+        request=request,
+        sdk_session=sdk_session,
+        store=store,
     )
 
 
@@ -637,7 +996,10 @@ def _looks_like_existing_state_followup(text: str) -> bool:
             r"\b(?:why|explain|did|was|were|what ran|what happened|next safe step)\b",
             normalized,
         )
-        and re.search(r"\b(?:blocked|label|status|prior run|previous run|orchestrator|execute|executed|ran)\b", normalized)
+        and re.search(
+            r"\b(?:blocked|label|status|prior run|previous run|orchestrator|execute|executed|ran)\b",
+            normalized,
+        )
     )
 
 
@@ -650,9 +1012,7 @@ def _render_existing_state_followup_answer(
 ) -> str:
     route_sequence = _manager_loop_event_route_sequence(events)
     artifacts = [
-        ref
-        for ref in work_item.artifact_refs
-        if ref.artifact_type != "orchestrator_plan_summary"
+        ref for ref in work_item.artifact_refs if ref.artifact_type != "orchestrator_plan_summary"
     ]
     unresolved = [blocker for blocker in work_item.blockers if not blocker.resolved]
     advisory = _manager_loop_event_advisory_limitations(events)
@@ -660,9 +1020,7 @@ def _render_existing_state_followup_answer(
     if route_sequence:
         execution_line = (
             "Orchestrator selected or managed the route; the prior WorkItem then ran "
-            "specialist step(s): "
-            + " -> ".join(route_sequence)
-            + "."
+            "specialist step(s): " + " -> ".join(route_sequence) + "."
         )
     elif artifacts:
         execution_line = "It produced specialist artifacts from prior WorkItem state."
@@ -688,6 +1046,13 @@ def _render_existing_state_followup_answer(
     else:
         lines.append("No open hard blocker is recorded on the WorkItem.")
 
+    opportunity_details = _render_opportunity_state_followup_details(
+        work_item,
+        events=events,
+    )
+    if opportunity_details:
+        lines.extend(["", *opportunity_details])
+
     next_step = (
         work_item.next_action.description
         if work_item.next_action is not None and work_item.next_action.description
@@ -705,6 +1070,248 @@ def _render_existing_state_followup_answer(
     if latest_request and cost_tracking_requested:
         lines.append("Cost tracking remains backend/audit-only for this path.")
     return "\n".join(lines).strip()
+
+
+def _render_opportunity_state_followup_details(
+    work_item: WorkItem,
+    *,
+    events: list[Any],
+) -> list[str]:
+    artifacts = [ref for ref in work_item.artifact_refs if ref.artifact_type == "opportunity"]
+    if work_item.current_route != WorkItemRoute.OPPORTUNITY_SCOUT and not artifacts:
+        return []
+
+    metadata = work_item.target.metadata if isinstance(work_item.target.metadata, dict) else {}
+    constraints = [
+        str(item).strip() for item in metadata.get("manual_constraints", []) if str(item).strip()
+    ]
+    cost_profile = _manager_loop_event_cost_profile(events)
+    provider_summary = _manager_loop_event_provider_summary(events) or (
+        _opportunity_artifact_provider_summary(artifacts)
+    )
+
+    lines: list[str] = []
+    if constraints:
+        lines.extend(["Hard filters", *[f"- {item}" for item in constraints[:8]]])
+
+    if artifacts:
+        lines.extend(["", "Retained matches"])
+        for artifact in artifacts[:5]:
+            source_refs = _artifact_source_refs(artifact)
+            primary_url = _first_source_url(source_refs)
+            evidence = _first_supported_claim(source_refs) or artifact.summary
+            line = f"- {artifact.title}"
+            if primary_url:
+                line += f": {primary_url}"
+            if evidence:
+                line += f" - {_truncate_text(evidence, 180)}"
+            lines.append(line)
+    else:
+        lines.extend(["", "Retained matches", "- No exact opportunity artifacts were retained."])
+
+    source_lines = _artifact_primary_source_lines(artifacts)
+    if source_lines:
+        lines.extend(["", "Primary source links", *source_lines[:8]])
+
+    if constraints and any("no weak padding" in item.lower() for item in constraints):
+        recency_unverified = _opportunity_recency_unverified(work_item)
+        padding_note = (
+            "Weak/off-target records should not be treated as exact matches. "
+            "The retained records are review candidates; last-1-week recency remains unverified."
+            if recency_unverified
+            else "Weak/off-target records were excluded before ranking where the source evidence did not satisfy the hard filters."
+        )
+        lines.extend(["", "No-padding check", f"- {padding_note}"])
+
+    if cost_profile or provider_summary:
+        lines.extend(["", "Cost / retrieval profile"])
+        if cost_profile:
+            lines.append(f"- Cost profile: {cost_profile}")
+        if provider_summary:
+            lines.append(f"- Retrieval providers: {provider_summary}")
+    return lines
+
+
+def _manager_loop_event_cost_profile(events: list[Any]) -> str:
+    for event in events:
+        if getattr(event, "event_type", "") != "advance_started":
+            continue
+        metadata = getattr(event, "metadata", {}) or {}
+        value = metadata.get("cost_profile")
+        if value:
+            return str(value)
+    return ""
+
+
+def _manager_loop_event_provider_summary(events: list[Any]) -> str:
+    for event in events:
+        if getattr(event, "event_type", "") != "workflow_retrieval_usage":
+            continue
+        metadata = getattr(event, "metadata", {}) or {}
+        provider = metadata.get("provider_summary")
+        if provider:
+            return str(provider)
+        diagnostics = metadata.get("retrieval_diagnostics")
+        if isinstance(diagnostics, dict) and diagnostics.get("provider_summary"):
+            return str(diagnostics["provider_summary"])
+    return ""
+
+
+def _opportunity_artifact_provider_summary(artifacts: list[WorkItemArtifactRef]) -> str:
+    for artifact in artifacts:
+        diagnostics = artifact.metadata.get("retrieval_diagnostics")
+        if isinstance(diagnostics, dict) and diagnostics.get("provider_summary"):
+            return str(diagnostics["provider_summary"])
+    return ""
+
+
+def _artifact_source_refs(artifact: WorkItemArtifactRef) -> list[dict[str, Any]]:
+    refs = artifact.metadata.get("source_refs") if isinstance(artifact.metadata, dict) else None
+    if not isinstance(refs, list):
+        return []
+    triage_filter = _artifact_source_triage_filter(artifact)
+    filtered: list[dict[str, Any]] = []
+    for item in refs:
+        if not isinstance(item, dict):
+            continue
+        source_id = str(item.get("source_id") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if (source_id and source_id in triage_filter["rejected_ids"]) or (
+            url and url in triage_filter["rejected_urls"]
+        ):
+            continue
+        if (
+            triage_filter["retained_ids"]
+            and source_id
+            and source_id not in triage_filter["retained_ids"]
+        ):
+            continue
+        if (
+            triage_filter["retained_urls"]
+            and not source_id
+            and url
+            and url not in triage_filter["retained_urls"]
+        ):
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def _artifact_source_triage_filter(artifact: WorkItemArtifactRef) -> dict[str, set[str]]:
+    metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {}
+    diagnostics = metadata.get("retrieval_diagnostics")
+    triage = metadata.get("source_triage")
+    if not isinstance(triage, dict) and isinstance(diagnostics, dict):
+        triage = diagnostics.get("source_triage")
+    if not isinstance(triage, dict):
+        return {
+            "retained_ids": set(),
+            "rejected_ids": set(),
+            "retained_urls": set(),
+            "rejected_urls": set(),
+        }
+    retained_ids = {
+        str(item or "").strip()
+        for item in (triage.get("retained_source_ids") or [])
+        if str(item or "").strip()
+    }
+    rejected_ids = {
+        str(item or "").strip()
+        for item in (triage.get("rejected_source_ids") or [])
+        if str(item or "").strip()
+    }
+    retained_urls = {
+        str(item or "").strip()
+        for item in (triage.get("retained_urls") or [])
+        if str(item or "").strip()
+    }
+    rejected_urls = {
+        str(item or "").strip()
+        for item in (triage.get("rejected_urls") or [])
+        if str(item or "").strip()
+    }
+    decisions = triage.get("decisions")
+    if isinstance(decisions, list):
+        for item in decisions:
+            if not isinstance(item, dict):
+                continue
+            decision = str(item.get("decision") or "").strip().lower()
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            if decision == "retain":
+                retained_urls.add(url)
+            elif decision == "reject":
+                rejected_urls.add(url)
+    return {
+        "retained_ids": retained_ids,
+        "rejected_ids": rejected_ids,
+        "retained_urls": retained_urls,
+        "rejected_urls": rejected_urls,
+    }
+
+
+def _artifact_primary_source_lines(artifacts: list[WorkItemArtifactRef]) -> list[str]:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for artifact in artifacts:
+        for ref in _artifact_source_refs(artifact):
+            url = str(ref.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            title = str(ref.get("title") or artifact.title or "Source").strip()
+            lines.append(f"- {title}: {url}")
+            break
+    return lines
+
+
+def _first_source_url(source_refs: list[dict[str, Any]]) -> str:
+    for ref in source_refs:
+        url = str(ref.get("url") or "").strip()
+        if url:
+            return url
+    return ""
+
+
+def _first_supported_claim(source_refs: list[dict[str, Any]]) -> str:
+    for ref in source_refs:
+        for key in ("supported_claim", "supported_signal"):
+            value = str(ref.get(key) or "").strip()
+            if value:
+                return value
+        facts = ref.get("key_facts")
+        if isinstance(facts, list):
+            for fact in facts:
+                value = str(fact or "").strip()
+                if value:
+                    return value
+    return ""
+
+
+def _opportunity_recency_unverified(work_item: WorkItem) -> bool:
+    constraints = [
+        str(item).lower()
+        for item in work_item.target.metadata.get("manual_constraints", [])
+        if str(item).strip()
+    ]
+    if not any("last 1 week" in item or "last one week" in item for item in constraints):
+        return False
+    for artifact in work_item.artifact_refs:
+        if artifact.artifact_type != "opportunity":
+            continue
+        metadata_text = json.dumps(artifact.metadata, ensure_ascii=True).lower()
+        if re.search(r"\b(?:posted|refreshed|published|retrieved_at)\b", metadata_text):
+            if re.search(r"\b(?:posted|refreshed|published)\b", metadata_text):
+                return False
+    return True
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    stripped = " ".join(str(text or "").split())
+    if len(stripped) <= max_chars:
+        return stripped
+    return stripped[: max(0, max_chars - 3)].rstrip() + "..."
 
 
 def _manager_loop_event_route_sequence(events: list[Any]) -> list[str]:
@@ -786,7 +1393,11 @@ def _record_manager_loop_efficiency_metrics(
         "live_search": bool(original_request.live_search),
         "live_sdk": bool(original_request.live_sdk),
         "final_synthesis_executed": any(
-            "Live user-facing response synthesis executed." == note
+            note
+            in {
+                "Live user-facing response synthesis executed.",
+                "Deterministic user-facing response fallback executed.",
+            }
             for note in result.audit_notes
         ),
         "seconds_per_specialist_step": round(elapsed / max(1, specialist_step_count), 3),
@@ -895,10 +1506,7 @@ def _review_manager_loop_step(
         request_summary=focused_request or original_request.request_text,
         run_type="work_item_manager_loop",
     )
-    note = (
-        f"Manager loop review step {step_index}: "
-        f"{review.status} ({review.overall_score}/100)."
-    )
+    note = f"Manager loop review step {step_index}: {review.status} ({review.overall_score}/100)."
     review_context = {
         "step": step_index,
         "route": result.route.value,
@@ -921,6 +1529,38 @@ def _review_manager_loop_step(
         review_context["recommended_next_step"] = (
             "Deepen Business Research with current-year independent sources before "
             "treating the profile as decision-ready."
+        )
+        note = (
+            f"Manager loop review step {step_index}: "
+            f"{review_context['review_status']} ({review_context['overall_score']}/100)."
+        )
+    opportunity_gap = _manager_loop_opportunity_retrieval_gap(original_request, result)
+    if opportunity_gap:
+        review_context["review_status"] = "fail"
+        review_context["overall_score"] = min(int(review_context["overall_score"]), 55)
+        review_context["observed_gaps"] = [
+            *list(review_context.get("observed_gaps") or []),
+            opportunity_gap,
+        ][:6]
+        review_context["recommended_next_step"] = (
+            "Broaden or deepen Opportunity Scout retrieval once within the current "
+            "cost profile before finalizing the opportunity scan."
+        )
+        note = (
+            f"Manager loop review step {step_index}: "
+            f"{review_context['review_status']} ({review_context['overall_score']}/100)."
+        )
+    source_triage_gap = _manager_loop_source_triage_gap(result)
+    if source_triage_gap:
+        review_context["review_status"] = "fail"
+        review_context["overall_score"] = min(int(review_context["overall_score"]), 55)
+        review_context["observed_gaps"] = [
+            *list(review_context.get("observed_gaps") or []),
+            source_triage_gap,
+        ][:6]
+        review_context["recommended_next_step"] = (
+            "Broaden, deepen, or read selected sources according to source triage "
+            "before treating the specialist output as decision-ready."
         )
         note = (
             f"Manager loop review step {step_index}: "
@@ -963,16 +1603,12 @@ def _review_manager_loop_step(
     )
     target_metadata = dict(result.work_item.target.metadata)
     prior_reviews = [
-        item
-        for item in target_metadata.get("orchestrator_reviews", [])
-        if isinstance(item, dict)
+        item for item in target_metadata.get("orchestrator_reviews", []) if isinstance(item, dict)
     ]
     target_metadata["orchestrator_reviews"] = [*prior_reviews, review_context][-5:]
     work_item = result.work_item.model_copy(
         update={
-            "target": result.work_item.target.model_copy(
-                update={"metadata": target_metadata}
-            ),
+            "target": result.work_item.target.model_copy(update={"metadata": target_metadata}),
             "audit_notes": list(dict.fromkeys([*result.work_item.audit_notes, note])),
         }
     ).touch()
@@ -1082,11 +1718,47 @@ def _manager_loop_repair_allowed(
         return False
     if not result.advanced or result.blockers:
         return False
-    if result.status in _MANAGER_LOOP_STOP_STATUSES:
+    if _manager_loop_status_blocks_repair(result):
         return False
-    if result.next_action is not None and result.next_action.requires_approval:
+    if _next_action_blocks_manager_loop_repair(result.next_action):
         return False
-    return _manager_review_failure_is_authoritative(review_context, result)
+    return _manager_review_failure_is_authoritative(
+        review_context,
+        result,
+        original_request=original_request,
+    )
+
+
+def _manager_loop_status_blocks_repair(result: WorkflowRunResult) -> bool:
+    if result.status not in _MANAGER_LOOP_REPAIR_BOUNDARY_STATUSES:
+        return False
+    if (
+        result.status == WorkItemStatus.NEEDS_APPROVAL
+        and not _next_action_blocks_manager_loop_repair(result.next_action)
+    ):
+        return False
+    return True
+
+
+def _next_action_blocks_manager_loop_repair(next_action: WorkItemNextAction | None) -> bool:
+    if next_action is None or not next_action.requires_approval:
+        return False
+    action = str(next_action.action or "").strip().lower()
+    description = str(next_action.description or "").strip().lower()
+    action_side_effect = re.search(
+        r"\b(?:send|post|publish|schedule|write|create|draft|external|outreach)\b",
+        action,
+    )
+    if action.startswith("review_") and not action_side_effect:
+        return False
+    review_only = "review" in action and not action_side_effect
+    description_side_effect = re.search(
+        r"\b(?:send|post|publish|schedule|write|create|draft|external|outreach)\b",
+        description,
+    )
+    if review_only and not description_side_effect:
+        return False
+    return True
 
 
 def _attempt_manager_loop_repair(
@@ -1105,14 +1777,14 @@ def _attempt_manager_loop_repair(
         "review_status": review_context.get("review_status"),
         "observed_gaps": list(review_context.get("observed_gaps") or [])[:6],
         "recommended_next_step": review_context.get("recommended_next_step") or "",
+        "search_repair_hint": _manager_loop_search_repair_hint(review_context),
         "send_enabled": False,
     }
     record_event(
         result.work_item,
         event_type="manager_loop_repair_started",
         summary=(
-            "Orchestrator requested one bounded specialist repair pass for "
-            f"{result.route.value}."
+            f"Orchestrator requested one bounded specialist repair pass for {result.route.value}."
         ),
         metadata=repair_payload,
         store=store,
@@ -1124,6 +1796,10 @@ def _attempt_manager_loop_repair(
             "request_text": original_request.request_text or result.work_item.request_text,
             "work_item_id": result.work_item.id,
             "requested_route": result.route,
+            "external_context": _manager_loop_repair_external_context(
+                original_request,
+                review_context=review_context,
+            ),
         }
     )
     repaired = _advance_work_item_one_step(repair_request, synthesize_user_response=False)
@@ -1140,9 +1816,7 @@ def _attempt_manager_loop_repair(
         "route": repaired.route.value,
         "work_item_id": repaired.work_item.id,
         "status": repaired.status.value,
-        "review_decision": _manager_loop_latest_review(repaired.work_item).get(
-            "review_decision"
-        ),
+        "review_decision": _manager_loop_latest_review(repaired.work_item).get("review_decision"),
         "send_enabled": False,
     }
     record_event(
@@ -1157,6 +1831,99 @@ def _attempt_manager_loop_repair(
     return repaired
 
 
+def _manager_loop_repair_external_context(
+    original_request: WorkflowRunRequest,
+    *,
+    review_context: dict[str, Any],
+) -> dict[str, Any]:
+    context = dict(original_request.external_context or {})
+    context.setdefault("schema", "keystone.manager_loop.repair_context.v1")
+    context.setdefault("source", "manager_loop_review")
+    context["manager_loop_repair"] = {
+        "schema": "keystone.manager_loop.repair_context.v1",
+        "source": "manager_loop_review",
+        "route": str(review_context.get("route") or ""),
+        "review_status": str(review_context.get("review_status") or ""),
+        "overall_score": review_context.get("overall_score"),
+        "observed_gaps": [
+            str(item or "").strip()
+            for item in list(review_context.get("observed_gaps") or [])[:6]
+            if str(item or "").strip()
+        ],
+        "recommended_next_step": str(review_context.get("recommended_next_step") or ""),
+        "search_repair_hint": _manager_loop_search_repair_hint(review_context),
+    }
+    return context
+
+
+def _manager_loop_search_repair_hint(review_context: dict[str, Any]) -> str:
+    gaps = " ".join(str(gap or "").lower() for gap in review_context.get("observed_gaps") or [])
+    if _manager_loop_gaps_need_broader_retrieval(gaps):
+        return "broaden_or_deepen_search_within_cost_profile"
+    return "repair_synthesis_from_existing_context"
+
+
+def _manager_loop_gaps_need_broader_retrieval(gaps: str) -> bool:
+    """Return true only when review gaps point to missing or bad retrieval."""
+
+    text = str(gaps or "").lower()
+    if not text:
+        return False
+    if re.search(
+        r"\b(?:retrieval|search|stale|unrelated|wrong lane|wrong source|"
+        r"term overlap|off[- ]target|independent evidence|deepen retrieval|"
+        r"broaden(?:ed|ing)? search|deeper search|more sources?|missing sources?|"
+        r"insufficient sources?|source focus mismatch|no selected source)\b",
+        text,
+    ):
+        return True
+    if "evidence" in text and re.search(
+        r"\b(?:limited|missing|insufficient|weak|no|not enough|independent|external)\b",
+        text,
+    ):
+        return True
+    return False
+
+
+def _request_manager_loop_repair_context(request: WorkflowRunRequest) -> dict[str, Any]:
+    context = request.external_context if isinstance(request.external_context, dict) else {}
+    repair = context.get("manager_loop_repair")
+    return repair if isinstance(repair, dict) else {}
+
+
+def _request_search_repair_hint(request: WorkflowRunRequest) -> str:
+    repair = _request_manager_loop_repair_context(request)
+    return str(repair.get("search_repair_hint") or "").strip()
+
+
+def _request_needs_broaden_or_deepen_repair(request: WorkflowRunRequest) -> bool:
+    return _request_search_repair_hint(request) == "broaden_or_deepen_search_within_cost_profile"
+
+
+def _retrieval_hint_for_request(request: WorkflowRunRequest) -> RetrievalHint | None:
+    repair = _request_manager_loop_repair_context(request)
+    if not repair:
+        return None
+    reasons = [
+        str(item or "").strip()
+        for item in list(repair.get("observed_gaps") or [])[:6]
+        if str(item or "").strip()
+    ]
+    if _request_needs_broaden_or_deepen_repair(request):
+        return RetrievalHint(
+            source="manager_loop_repair",
+            needs_precision_search=True,
+            needs_structured_enrichment=True,
+            needs_search_review=True,
+            reasons=reasons
+            or ["Manager-loop repair requested broader or deeper source retrieval."],
+        )
+    return RetrievalHint(
+        source="manager_loop_repair",
+        reasons=reasons or ["Manager-loop repair requested synthesis from existing context."],
+    )
+
+
 def _manager_review_should_block(
     review_context: dict[str, Any],
     result: WorkflowRunResult,
@@ -1167,9 +1934,13 @@ def _manager_review_should_block(
         return False
     if not result.advanced or result.blockers:
         return False
-    if result.status in _MANAGER_LOOP_STOP_STATUSES:
+    if _manager_loop_status_blocks_repair(result):
         return False
-    if not _manager_review_failure_is_authoritative(review_context, result):
+    if not _manager_review_failure_is_authoritative(
+        review_context,
+        result,
+        original_request=original_request,
+    ):
         return False
     if (
         result.next_action is not None
@@ -1204,9 +1975,7 @@ def _manager_loop_stop_reason(
     if result.next_action.agent in {None, result.route}:
         return "stopped because the next action did not require a distinct specialist"
     previous_routes = {
-        str(step.get("route") or "")
-        for step in loop_steps[:-1]
-        if str(step.get("route") or "")
+        str(step.get("route") or "") for step in loop_steps[:-1] if str(step.get("route") or "")
     }
     if result.next_action.agent.value in previous_routes:
         return "stopped before repeating a specialist already used in this manager loop"
@@ -1299,10 +2068,24 @@ def _manager_loop_mentions_next_agent(
                 r"\bfollow\s+up\b",
             ),
         )
+    if next_action_agent == WorkItemRoute.GMAIL_TRIAGE:
+        return _manager_continuation_has_marker(
+            padded_normalized_text,
+            (
+                r"\bgmail\b",
+                r"\bemail\b",
+                r"\binbox\b",
+                r"\bthread\b",
+                r"\bread\b",
+                r"\breply\b",
+            ),
+        )
     return False
 
 
-def _manager_continuation_has_marker(padded_normalized_text: str, patterns: tuple[str, ...]) -> bool:
+def _manager_continuation_has_marker(
+    padded_normalized_text: str, patterns: tuple[str, ...]
+) -> bool:
     return any(re.search(pattern, padded_normalized_text) for pattern in patterns)
 
 
@@ -1359,6 +2142,20 @@ def _specialist_orchestrator_context_payload(
     checklist = _specialist_response_quality_checklist(request, work_item)
     if checklist:
         payload["response_quality_checklist"] = checklist
+    context_pack = build_context_pack_for_route(work_item, work_item.current_route)
+    payload["context_pack"] = {
+        "pack_type": context_pack.pack_type,
+        "route": context_pack.route.value,
+        "ready": context_pack.ready,
+        "can_synthesize": context_pack.can_synthesize,
+        "source_context_status": context_pack.source_context_status,
+        "source_context_sample": context_pack.source_context_sample,
+        "source_context_focus": context_pack.source_context_focus,
+        "source_triage": context_pack.source_triage,
+        "ordered_sources": context_pack.ordered_sources,
+        "missing_requirements": context_pack.missing_requirements[:6],
+        "limitation_notes": context_pack.limitation_notes[:6],
+    }
     feedback = _specialist_orchestrator_feedback_payload(work_item)
     if feedback:
         payload["orchestrator_feedback"] = feedback
@@ -1459,6 +2256,9 @@ def _specialist_response_quality_checklist(
         checklist.append(
             "For temporal or current-activity wording, reason about freshness and whether independent or recent sources are needed before treating the answer as complete."
         )
+    checklist.append(
+        "When source-backed claims are present, include source URLs in the first user-visible answer; structured source fields alone are not enough for Slack-facing output."
+    )
     if re.search(
         r"\b(?:before|for|to)\s+(?:opportunity scout|outreach composer|gmail triage|business research analyst|chief of staff)\b",
         normalized,
@@ -1474,9 +2274,8 @@ def _specialist_orchestrator_context_text(
     work_item: WorkItem,
 ) -> str:
     payload = _specialist_orchestrator_context_payload(request, work_item)
-    return (
-        "Orchestrator memo for this specialist WorkItem run:\n"
-        + json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    return "Orchestrator memo for this specialist WorkItem run:\n" + json.dumps(
+        payload, ensure_ascii=True, sort_keys=True
     )
 
 
@@ -1579,8 +2378,7 @@ def _finalize_manager_loop_result(
             "stop_reason": stop_reason,
             "steps": loop_steps,
             "missing_required_stages": [
-                {"code": blocker.code, "message": blocker.message}
-                for blocker in all_blockers
+                {"code": blocker.code, "message": blocker.message} for blocker in all_blockers
             ],
             "advisory_limitations": [
                 {"code": blocker.code, "message": blocker.message}
@@ -1595,9 +2393,7 @@ def _finalize_manager_loop_result(
         _render_orchestrator_plan_summary(plan_summary) if plan_summary else result.human_summary
     )
     result_route = WorkItemRoute.ORCHESTRATOR if plan_summary else result.route
-    artifact_refs = (
-        [plan_artifact] if plan_artifact is not None else []
-    ) or result.artifact_refs
+    artifact_refs = ([plan_artifact] if plan_artifact is not None else []) or result.artifact_refs
     if feedback_callback is not None:
         feedback_callback(
             "manager_loop_completed",
@@ -1605,8 +2401,7 @@ def _finalize_manager_loop_result(
                 "stop_reason": stop_reason,
                 "steps": loop_steps,
                 "missing_required_stages": [
-                    {"code": blocker.code, "message": blocker.message}
-                    for blocker in all_blockers
+                    {"code": blocker.code, "message": blocker.message} for blocker in all_blockers
                 ],
                 "status": work_item.status.value,
                 "route": result_route.value,
@@ -1682,9 +2477,7 @@ def _orchestrator_plan_summary_for_manager_loop(
         return None
     if result.blockers or result.status in _MANAGER_LOOP_STOP_STATUSES:
         non_review_blockers = [
-            blocker
-            for blocker in result.blockers
-            if blocker.code != "manager_loop_review_failed"
+            blocker for blocker in result.blockers if blocker.code != "manager_loop_review_failed"
         ]
         only_review_blockers = bool(result.blockers) and not non_review_blockers
         if non_review_blockers or (
@@ -1718,7 +2511,9 @@ def _orchestrator_plan_summary_for_manager_loop(
     ]
     if any(step.get("route") == WorkItemRoute.OPPORTUNITY_SCOUT.value for step in loop_steps):
         assumptions.append("Started with opportunity scouting to identify plausible directions.")
-    if any(step.get("route") == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value for step in loop_steps):
+    if any(
+        step.get("route") == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value for step in loop_steps
+    ):
         assumptions.append("Used business research to add source-backed company context.")
     top_findings = [
         f"{item['artifact_type']}: {item['title'] or item['summary'] or 'artifact attached'}"
@@ -1810,12 +2605,7 @@ def _render_orchestrator_plan_summary(summary: dict[str, Any]) -> str:
 
 
 def _manager_loop_review_completion_blockers(result: WorkflowRunResult) -> list[WorkItemBlocker]:
-    if result.blockers or result.status in {
-        WorkItemStatus.BLOCKED,
-        WorkItemStatus.NEEDS_APPROVAL,
-        WorkItemStatus.NEEDS_CONTEXT,
-        WorkItemStatus.ARCHIVED,
-    }:
+    if result.blockers or result.status in _MANAGER_LOOP_REPAIR_BOUNDARY_STATUSES:
         return []
     reviews = result.work_item.target.metadata.get("orchestrator_reviews", [])
     if not isinstance(reviews, list) or not reviews:
@@ -1845,9 +2635,16 @@ def _manager_loop_review_completion_blockers(result: WorkflowRunResult) -> list[
 def _manager_review_failure_is_authoritative(
     review_context: dict[str, Any],
     result: WorkflowRunResult,
+    *,
+    original_request: WorkflowRunRequest | None = None,
 ) -> bool:
     if review_context.get("approval_boundary_ok") is False:
         return True
+    if _result_is_no_exact_match_advisory(result) and not (
+        original_request is not None
+        and _manager_loop_opportunity_no_match_should_repair(original_request, result)
+    ):
+        return False
     if not result.work_item.artifact_refs and not result.artifact_refs:
         return True
     gaps = " ".join(str(gap or "").lower() for gap in review_context.get("observed_gaps") or [])
@@ -1864,8 +2661,163 @@ def _manager_review_failure_is_authoritative(
         "approval boundary",
         "unsupported claim",
         "missing approved",
+        "limited independent evidence",
+        "deepen retrieval",
+        "broader/deeper retrieval",
+        "source triage",
+        "page extraction",
     )
     return any(marker in gaps for marker in critical_markers)
+
+
+def _result_is_no_exact_match_advisory(result: WorkflowRunResult) -> bool:
+    text = " ".join(
+        [
+            result.status.value,
+            result.human_summary,
+            result.next_action.action if result.next_action else "",
+            result.next_action.description if result.next_action else "",
+        ]
+    ).lower()
+    return bool(
+        result.advanced
+        and result.route == WorkItemRoute.OPPORTUNITY_SCOUT
+        and result.status == WorkItemStatus.DONE
+        and re.search(r"\bno (?:strong )?exact matches?\b|\badjacent .*not exact matches?\b", text)
+    )
+
+
+def _manager_loop_opportunity_retrieval_gap(
+    original_request: WorkflowRunRequest,
+    result: WorkflowRunResult,
+) -> str:
+    if not _manager_loop_opportunity_no_match_should_repair(original_request, result):
+        return ""
+    return (
+        "Opportunity Scout found no retained source-backed opportunities for "
+        "this broad/deep search; broaden or deepen retrieval before finalizing "
+        "the opportunity scan."
+    )
+
+
+def _manager_loop_source_triage_gap(result: WorkflowRunResult) -> str:
+    """Return a repairable manager-loop gap from source triage diagnostics."""
+
+    triage = _manager_loop_latest_source_triage(result)
+    if not triage or not bool(triage.get("needs_broaden_or_deepen")):
+        return ""
+    action = str(triage.get("recommended_action") or "").strip()
+    if action and action not in {
+        "broaden_or_deepen_before_final_synthesis",
+        "run_retrieval_before_synthesis",
+    }:
+        return ""
+    decisions = triage.get("decision_counts")
+    if not isinstance(decisions, dict):
+        decisions = {}
+    parts: list[str] = []
+    for key in ("retain", "deepen", "reject", "review"):
+        value = decisions.get(key)
+        if value:
+            parts.append(f"{key}: {value}")
+    gaps = [str(item).strip() for item in (triage.get("recall_gaps") or []) if str(item).strip()][
+        :3
+    ]
+    detail = f" Decisions: {', '.join(parts)}." if parts else ""
+    gap_text = f" Recall gaps: {'; '.join(gaps)}." if gaps else ""
+    return (
+        "Source triage recommended broader/deeper retrieval or page extraction "
+        "before final synthesis."
+        f"{detail}{gap_text}"
+    )
+
+
+def _manager_loop_latest_source_triage(result: WorkflowRunResult) -> dict[str, Any]:
+    for artifact in reversed([*result.artifact_refs, *result.work_item.artifact_refs]):
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {}
+        triage = metadata.get("source_triage")
+        if isinstance(triage, dict) and triage:
+            return _manager_loop_normalized_source_triage(triage)
+        diagnostics = metadata.get("retrieval_diagnostics")
+        if isinstance(diagnostics, dict):
+            nested = diagnostics.get("source_triage")
+            if isinstance(nested, dict) and nested:
+                return _manager_loop_normalized_source_triage(nested)
+        retrieval = metadata.get("retrieval")
+        if isinstance(retrieval, dict):
+            nested = retrieval.get("source_triage")
+            if isinstance(nested, dict) and nested:
+                return _manager_loop_normalized_source_triage(nested)
+            diagnostics = retrieval.get("retrieval_diagnostics")
+            if isinstance(diagnostics, dict):
+                nested = diagnostics.get("source_triage")
+                if isinstance(nested, dict) and nested:
+                    return _manager_loop_normalized_source_triage(nested)
+    return {}
+
+
+def _manager_loop_normalized_source_triage(triage: dict[str, Any]) -> dict[str, Any]:
+    if "decision_counts" in triage and "needs_broaden_or_deepen" in triage:
+        return triage
+    decisions = triage.get("decisions")
+    counts: dict[str, int] = {}
+    if isinstance(decisions, list):
+        for item in decisions:
+            if not isinstance(item, dict):
+                continue
+            decision = str(item.get("decision") or "").strip()
+            if decision:
+                counts[decision] = counts.get(decision, 0) + 1
+    return {**triage, "decision_counts": counts}
+
+
+def _manager_loop_opportunity_no_match_should_repair(
+    original_request: WorkflowRunRequest,
+    result: WorkflowRunResult,
+) -> bool:
+    if result.route != WorkItemRoute.OPPORTUNITY_SCOUT:
+        return False
+    if result.artifact_refs or result.work_item.artifact_refs:
+        return False
+    if result.status != WorkItemStatus.DONE:
+        return False
+    if result.next_action is None or result.next_action.action != "broaden_opportunity_search":
+        return False
+    request_text = latest_user_request(original_request.request_text).lower()
+    if _opportunity_no_padding_should_stop_without_repair(request_text):
+        return False
+    if _request_needs_broaden_or_deepen_repair(original_request):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:deep|deeper|broader|broad|active|recent|recently|announced|"
+            r"pilot|rfp|grant|opportunit|partner|participate|source-backed)\b",
+            request_text,
+        )
+    )
+
+
+def _opportunity_request_prefers_no_padding_or_adjacent_report(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:do not pad|don't pad|no padding|strict criteria|strict filters|"
+            r"hard filters?|list adjacent|adjacent matches?|if none are strong|"
+            r"no weak results?|do not include weak|don't include weak)\b",
+            normalized,
+        )
+    )
+
+
+def _opportunity_no_padding_should_stop_without_repair(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not _opportunity_request_prefers_no_padding_or_adjacent_report(normalized):
+        return False
+    if _is_strict_role_recency_search(normalized):
+        return True
+    return not bool(re.search(r"\b(?:deep|deeper|broader|broad|broaden)\b", normalized))
 
 
 def _manager_loop_business_research_depth_gap(
@@ -1875,7 +2827,9 @@ def _manager_loop_business_research_depth_gap(
     if result.route != WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
         return ""
     request_text = latest_user_request(original_request.request_text).lower()
-    if not re.search(r"\b(?:2026|current|recent|latest|doing|activity|update|roadmap)\b", request_text):
+    if not re.search(
+        r"\b(?:2026|current|recent|latest|doing|activity|update|roadmap)\b", request_text
+    ):
         return ""
     source_refs: list[dict[str, Any]] = []
     for artifact in [*result.artifact_refs, *result.work_item.artifact_refs]:
@@ -1892,8 +2846,7 @@ def _manager_loop_business_research_depth_gap(
         if str(
             (ref.get("source_quality") or {}).get("source_type")
             if isinstance(ref.get("source_quality"), dict)
-            else ref.get("source_type")
-            or ""
+            else ref.get("source_type") or ""
         ).lower()
         not in {"company_site", "official_company_site", "fixture"}
     ]
@@ -1918,11 +2871,14 @@ def _manager_loop_missing_stage_blockers(
         return []
     routes = {str(step.get("route") or "") for step in loop_steps}
     artifact_types = {artifact.artifact_type for artifact in result.work_item.artifact_refs}
+    stop_after_opportunity_packet = (
+        WorkItemRoute.OPPORTUNITY_SCOUT.value in routes
+        and _request_stops_after_opportunity_packet(text)
+    )
     blockers: list[WorkItemBlocker] = []
     if (
-        ("gmail context" in text or "check recent gmail" in text or "email context" in text)
-        and WorkItemRoute.GMAIL_TRIAGE.value not in routes
-    ):
+        "gmail context" in text or "check recent gmail" in text or "email context" in text
+    ) and WorkItemRoute.GMAIL_TRIAGE.value not in routes:
         blockers.append(
             WorkItemBlocker(
                 code="manager_loop_gmail_context_not_checked",
@@ -1935,6 +2891,8 @@ def _manager_loop_missing_stage_blockers(
         )
     if (
         _manager_loop_requests_research(text)
+        and not stop_after_opportunity_packet
+        and not _chief_source_brief_satisfies_research_request(result)
         and WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value not in routes
         and "company_profile" not in artifact_types
         and "source_summary" not in artifact_types
@@ -2007,9 +2965,8 @@ def _manager_loop_missing_stage_blockers(
             )
         )
     if (
-        ("score the workflow" in text or "scorecard" in text or "score the" in text)
-        and "chief_of_staff_plan" not in artifact_types
-    ):
+        "score the workflow" in text or "scorecard" in text or "score the" in text
+    ) and "chief_of_staff_plan" not in artifact_types:
         blockers.append(
             WorkItemBlocker(
                 code="manager_loop_scorecard_not_generated",
@@ -2020,6 +2977,24 @@ def _manager_loop_missing_stage_blockers(
             )
         )
     return blockers
+
+
+def _chief_source_brief_satisfies_research_request(result: WorkflowRunResult) -> bool:
+    if result.route != WorkItemRoute.CHIEF_OF_STAFF:
+        return False
+    if _rendered_has_heading(result.human_summary, "detailed summary") and re.search(
+        r"https?://", result.human_summary
+    ):
+        return True
+    for artifact in result.work_item.artifact_refs:
+        if artifact.artifact_type != "chief_of_staff_plan":
+            continue
+        refs = artifact.metadata.get("source_refs") if isinstance(artifact.metadata, dict) else None
+        if not isinstance(refs, list):
+            continue
+        if any(isinstance(ref, dict) and str(ref.get("url") or "").strip() for ref in refs):
+            return True
+    return False
 
 
 def _manager_loop_requests_research(normalized_text: str) -> bool:
@@ -2051,23 +3026,27 @@ def _manager_loop_requests_opportunity_record(normalized_text: str) -> bool:
 
 
 def _manager_loop_requests_outreach_draft(normalized_text: str) -> bool:
-    return bool(re.search(r"\boutreach draft\b(?!ing)", normalized_text, flags=re.I)) or bool(
-        re.search(
-            r"\b(?:draft|write|compose|prepare|send)\b[^.\n]{0,160}"
-            r"\b(?:outreach|email|linkedin|message|note)\b",
-            normalized_text,
-            flags=re.I,
-        )
-    ) or (
-        (
-            _manager_loop_requests_research(normalized_text)
-            or _manager_loop_requests_opportunity_record(normalized_text)
-        )
-        and bool(
+    return (
+        bool(re.search(r"\boutreach draft\b(?!ing)", normalized_text, flags=re.I))
+        or bool(
             re.search(
-                r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,160}\b(?:response|reply)\b",
+                r"\b(?:draft|write|compose|prepare|send)\b[^.\n]{0,160}"
+                r"\b(?:outreach|email|linkedin|message|note|reply|response)\b",
                 normalized_text,
                 flags=re.I,
+            )
+        )
+        or (
+            (
+                _manager_loop_requests_research(normalized_text)
+                or _manager_loop_requests_opportunity_record(normalized_text)
+            )
+            and bool(
+                re.search(
+                    r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,160}\b(?:response|reply)\b",
+                    normalized_text,
+                    flags=re.I,
+                )
             )
         )
     )
@@ -2115,6 +3094,8 @@ def _select_route(
     planned_route = _route_from_manual_plan(request.manual_request_plan)
     if planned_route is not None:
         return planned_route
+    if re.match(r"^\s*@?KNI\s+chief\s+of\s+staff\b|^\s*chief\s+of\s+staff\b", input_text, re.I):
+        return WorkItemRoute.CHIEF_OF_STAFF
     if input_text and _looks_like_outreach_request(input_text):
         return WorkItemRoute.OUTREACH_COMPOSER
     decision = route_request(input_text)
@@ -2265,8 +3246,22 @@ def _maybe_synthesize_user_facing_response(
     sdk_session: Any | None,
     store: SQLiteStore | None = None,
 ) -> WorkflowRunResult:
-    if not request.live_sdk:
-        return result
+    if "Deterministic source-link follow-up summary executed." in result.audit_notes:
+        return result.model_copy(
+            update={
+                "audit_notes": list(
+                    dict.fromkeys(
+                        [
+                            *result.audit_notes,
+                            (
+                                "Skipped generic user-facing response synthesis because "
+                                "the source-link follow-up summary is already final."
+                            ),
+                        ]
+                    )
+                )
+            }
+        )
     if _result_has_canonical_outreach_draft(result):
         return result.model_copy(
             update={
@@ -2283,6 +3278,29 @@ def _maybe_synthesize_user_facing_response(
                 )
             }
         )
+    if not request.live_sdk:
+        fallback_text = _deterministic_user_facing_response_fallback(
+            result,
+            request_text=request.request_text or result.work_item.request_text,
+        )
+        if fallback_text and _needs_deterministic_user_facing_repair(
+            result.human_summary,
+            result=result,
+        ):
+            return result.model_copy(
+                update={
+                    "human_summary": fallback_text,
+                    "audit_notes": list(
+                        dict.fromkeys(
+                            [
+                                *result.audit_notes,
+                                "Deterministic user-facing response fallback executed.",
+                            ]
+                        )
+                    ),
+                }
+            )
+        return result
     try:
         sdk_result = synthesize_user_facing_work_item_response_sdk_result(
             result,
@@ -2293,6 +3311,25 @@ def _maybe_synthesize_user_facing_response(
         synthesis = sdk_result.output
     except Exception as exc:
         note = f"User-facing response synthesis failed: {type(exc).__name__}: {exc}"
+        fallback_text = _deterministic_user_facing_response_fallback(
+            result,
+            request_text=request.request_text or result.work_item.request_text,
+        )
+        if fallback_text:
+            return result.model_copy(
+                update={
+                    "human_summary": fallback_text,
+                    "audit_notes": list(
+                        dict.fromkeys(
+                            [
+                                *result.audit_notes,
+                                note,
+                                "Deterministic user-facing response fallback executed.",
+                            ]
+                        )
+                    ),
+                }
+            )
         return result.model_copy(
             update={"audit_notes": list(dict.fromkeys([*result.audit_notes, note]))}
         )
@@ -2307,8 +3344,49 @@ def _maybe_synthesize_user_facing_response(
             request_cache=sdk_result.request_cache,
             store=store,
         )
-    text = format_user_response_synthesis(synthesis)
+    text = format_user_response_synthesis(
+        synthesis,
+        sources=response_synthesis_sources(result),
+        metadata_lines=response_synthesis_metadata_lines(result),
+    )
+    text = _ensure_requested_opportunity_comparison_table(
+        text,
+        result=result,
+        request_text=request.request_text or result.work_item.request_text,
+    )
+    fallback_text = _deterministic_user_facing_response_fallback(
+        result,
+        request_text=request.request_text or result.work_item.request_text,
+    )
+    if fallback_text and _needs_deterministic_user_facing_repair(text, result=result):
+        return result.model_copy(
+            update={
+                "human_summary": fallback_text,
+                "audit_notes": list(
+                    dict.fromkeys(
+                        [
+                            *result.audit_notes,
+                            "Deterministic user-facing response fallback executed.",
+                        ]
+                    )
+                ),
+            }
+        )
     if not text:
+        if fallback_text:
+            return result.model_copy(
+                update={
+                    "human_summary": fallback_text,
+                    "audit_notes": list(
+                        dict.fromkeys(
+                            [
+                                *result.audit_notes,
+                                "Deterministic user-facing response fallback executed.",
+                            ]
+                        )
+                    ),
+                }
+            )
         return result
     return result.model_copy(
         update={
@@ -2325,6 +3403,557 @@ def _maybe_synthesize_user_facing_response(
     )
 
 
+def _deterministic_user_facing_response_fallback(
+    result: WorkflowRunResult,
+    *,
+    request_text: str,
+) -> str:
+    if result.route == WorkItemRoute.OPPORTUNITY_SCOUT and result.artifact_refs:
+        text = _opportunity_artifact_user_facing_summary(
+            result,
+            request_text=request_text,
+        )
+        if text:
+            return text
+    if result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST and result.artifact_refs:
+        text = _business_research_artifact_user_facing_summary(
+            result,
+            request_text=request_text,
+        )
+        if text:
+            return text
+    if result.route == WorkItemRoute.CHIEF_OF_STAFF and result.artifact_refs:
+        text = _chief_of_staff_artifact_user_facing_summary(
+            result,
+            request_text=request_text,
+        )
+        if text:
+            return text
+    return ""
+
+
+def _needs_deterministic_user_facing_repair(
+    text: str,
+    *,
+    result: WorkflowRunResult,
+) -> bool:
+    if (
+        result.route
+        not in {
+            WorkItemRoute.OPPORTUNITY_SCOUT,
+            WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            WorkItemRoute.CHIEF_OF_STAFF,
+        }
+        or not result.artifact_refs
+    ):
+        return False
+    has_answer = _rendered_has_heading(text, "answer")
+    has_detailed_summary = _rendered_has_heading(
+        text,
+        "detailed summary",
+    ) or _rendered_has_heading(text, "synthesis")
+    if has_answer and has_detailed_summary:
+        return _source_backed_synthesis_needs_repair(text, result=result)
+    compact = " ".join(str(text or "").lower().split())
+    if result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST and any(
+        marker in compact
+        for marker in (
+            "source summaries",
+            "requested details",
+            "source id:",
+            "methods/design",
+            "inclusion/exclusion",
+        )
+    ):
+        return False
+    artifact_only_markers = ["workitem advanced", "artifacts:"]
+    if result.route == WorkItemRoute.OPPORTUNITY_SCOUT:
+        artifact_only_markers.extend(
+            [
+                "opportunity scout attached",
+                "source-backed opportunity record",
+                "next action: review_opportunities",
+                "review the opportunity packet without downstream specialist handoff",
+            ]
+        )
+    if result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
+        artifact_only_markers.extend(
+            [
+                "business research analyst attached",
+                "source-backed company profile",
+                "review_company_profile",
+                "review the source-backed profile",
+            ]
+        )
+    if result.route == WorkItemRoute.CHIEF_OF_STAFF:
+        artifact_only_markers.extend(
+            [
+                "chief of staff plan",
+                "review_chief_of_staff_plan",
+                "review the chief of staff plan",
+                "business agents chief of staff",
+                "search completed",
+                "read-only search completed",
+            ]
+        )
+    if any(marker in compact for marker in artifact_only_markers):
+        return True
+    return "source evidence" not in compact and "source:" not in compact
+
+
+def _rendered_has_heading(text: str, heading: str) -> bool:
+    target = heading.strip().lower()
+    return any(
+        _normalized_rendered_heading(line) == target for line in str(text or "").splitlines()
+    )
+
+
+def _source_backed_synthesis_needs_repair(
+    text: str,
+    *,
+    result: WorkflowRunResult,
+) -> bool:
+    """Return true when a headed synthesis is thin or artifact/payload commentary."""
+
+    sources = response_synthesis_sources(result)
+    if not sources:
+        return False
+    answer = _extract_rendered_section(
+        text,
+        "answer",
+        stop_headings=(
+            "detailed summary",
+            "synthesis",
+            "source evidence",
+            "terms",
+            "recommended actions",
+            "recommended action",
+            "run notes",
+            "metadata",
+        ),
+    )
+    if answer and _source_backed_section_is_metadata_like(answer):
+        return True
+    synthesis = _extract_rendered_section(
+        text,
+        "detailed summary",
+        stop_headings=(
+            "source evidence",
+            "terms",
+            "recommended actions",
+            "recommended action",
+            "run notes",
+            "metadata",
+        ),
+    )
+    if not synthesis:
+        synthesis = _extract_rendered_section(
+            text,
+            "synthesis",
+            stop_headings=(
+                "source evidence",
+                "terms",
+                "recommended actions",
+                "recommended action",
+                "run notes",
+                "metadata",
+            ),
+        )
+    if not synthesis:
+        return True
+    if _source_backed_section_is_metadata_like(synthesis):
+        return True
+    return _source_backed_section_is_too_thin(synthesis, sources=sources)
+
+
+def _source_backed_section_is_metadata_like(
+    section_text: str,
+) -> bool:
+    compact = " ".join(section_text.lower().split())
+    if not compact:
+        return False
+    metadata_markers = (
+        "retained artifact",
+        "displayed opportunity artifacts",
+        "bounded payload",
+        "provider-level metadata",
+        "retrieval diagnostics",
+        "workflow",
+        "workitem",
+        "route",
+        "business research analyst attached",
+        "source-backed company profile",
+        "opportunity scout attached",
+        "source-backed opportunity record",
+        "chief of staff plan",
+        "review_chief_of_staff_plan",
+        "not using generic source-backed artifacts as filler",
+        "keeps the slack answer focused",
+        "source-backed shortlist from the current read-only run",
+    )
+    if any(marker in compact for marker in metadata_markers):
+        return True
+    return False
+
+
+def _source_backed_section_is_too_thin(
+    section_text: str,
+    *,
+    sources: list[dict[str, Any]],
+) -> bool:
+    """Detect shallow source-backed summaries without over-constraining relevance."""
+
+    source_count = sum(1 for source in sources if _first_source_evidence([source]))
+    if source_count < 2:
+        return False
+    compact = " ".join(section_text.split())
+    word_count = len(compact.split())
+    source_shaped_lines = 0
+    bullet_lines = 0
+    narrative_lines: list[str] = []
+    for line in section_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("-", "*")):
+            bullet_lines += 1
+        else:
+            narrative_lines.append(stripped)
+            continue
+        if not stripped.startswith(("-", "*")):
+            continue
+        if "http" in stripped or ":" in stripped:
+            source_shaped_lines += 1
+    narrative_text = " ".join(narrative_lines)
+    narrative_words = len(narrative_text.split())
+    if word_count < 55:
+        return True
+    if source_shaped_lines >= min(3, source_count) and narrative_words < 45:
+        return True
+    if bullet_lines and not narrative_lines and word_count < 140:
+        return True
+    if narrative_words >= 50:
+        return False
+    if word_count < 100:
+        return True
+    return False
+
+
+def _extract_rendered_section(
+    text: str,
+    heading: str,
+    *,
+    stop_headings: tuple[str, ...],
+) -> str:
+    target = heading.strip().lower()
+    stops = {item.strip().lower() for item in stop_headings}
+    lines = str(text or "").splitlines()
+    collecting = False
+    collected: list[str] = []
+    for line in lines:
+        normalized = _normalized_rendered_heading(line)
+        if not collecting:
+            if normalized == target:
+                collecting = True
+            continue
+        if normalized in stops:
+            break
+        collected.append(line)
+    return "\n".join(collected).strip()
+
+
+def _normalized_rendered_heading(line: str) -> str:
+    stripped = str(line or "").strip().strip("*#").strip().rstrip(":").strip()
+    if not stripped or stripped.startswith(("-", "*")):
+        return ""
+    if len(stripped) > 80:
+        return ""
+    return stripped.lower()
+
+
+def _business_research_artifact_user_facing_summary(
+    result: WorkflowRunResult,
+    *,
+    request_text: str = "",
+) -> str:
+    artifacts = [
+        artifact for artifact in result.artifact_refs if artifact.artifact_type == "company_profile"
+    ]
+    if not artifacts:
+        return ""
+    source_lines = _business_research_artifact_source_synthesis(artifacts)
+    source_evidence = _business_research_artifact_source_evidence_lines(artifacts)
+    if not source_lines and not source_evidence:
+        return ""
+
+    primary = artifacts[0]
+    title = (
+        f"{primary.title} source-backed brief"
+        if primary.title
+        else "Business research source-backed brief"
+    )
+    target = primary.title or result.work_item.target.name or "the target"
+    answer = _business_research_answer_line(target, artifacts)
+    detailed_summary_parts = [
+        _artifact_source_narrative_summary(source_lines, label="selected source refs"),
+        "",
+        "Key source details:",
+        *_artifact_source_detail_lines(source_lines),
+    ]
+    relevance = _business_research_relevance_line(request_text)
+    if relevance:
+        detailed_summary_parts.extend(["", relevance])
+    sections = [
+        title,
+        "Answer\n" + answer,
+        "Detailed Summary\n" + "\n".join(detailed_summary_parts).strip(),
+    ]
+    if source_evidence:
+        sections.append("Source evidence\n" + "\n".join(source_evidence))
+    sections.append(
+        "Run notes\n"
+        "* This is a read-only source-backed research summary.\n"
+        "* No draft, send, publish, schedule, or file-write action was taken."
+    )
+    metadata = _business_research_artifact_metadata(artifacts)
+    if metadata:
+        sections.append("Metadata\n" + "\n".join(metadata))
+    return "\n\n".join(section for section in sections if section.strip())
+
+
+def _business_research_answer_line(
+    target: str,
+    artifacts: list[WorkItemArtifactRef],
+) -> str:
+    artifact_types = {artifact.artifact_type for artifact in artifacts}
+    if "company_profile" in artifact_types:
+        return (
+            f"{target} has source-backed company context in this run; the useful "
+            "summary should be read from the attached source evidence, not from "
+            "artifact metadata alone."
+        )
+    return (
+        f"The run produced a source-backed research brief for {target}; the key "
+        "findings are the source-supported points below."
+    )
+
+
+def _business_research_relevance_line(request_text: str) -> str:
+    lower = str(request_text or "").lower()
+    if "keystone" in lower:
+        return (
+            "Keystone relevance: use the source-backed points to decide whether the "
+            "target is strategically relevant before moving to opportunity scouting or "
+            "draft-only outreach."
+        )
+    return (
+        "Operator relevance: use these points as the evidence base for any follow-up "
+        "comparison, deeper search, or draft-only next step."
+    )
+
+
+def _business_research_artifact_source_synthesis(
+    artifacts: list[WorkItemArtifactRef],
+) -> list[str]:
+    lines: list[str] = []
+    for artifact in artifacts:
+        refs = _artifact_source_refs(artifact)
+        findings = _opportunity_artifact_source_findings(artifact, refs)
+        source_url = _first_source_url(refs)
+        if not findings:
+            continue
+        finding_text = _source_findings_summary(findings)
+        suffix = f" ({source_url})" if source_url else ""
+        lines.append(f"* {artifact.title or artifact.artifact_type}: {finding_text}{suffix}")
+        if len(lines) >= 5:
+            break
+    return lines
+
+
+def _business_research_artifact_source_evidence_lines(
+    artifacts: list[WorkItemArtifactRef],
+) -> list[str]:
+    lines: list[str] = []
+    for artifact in artifacts:
+        for ref in _artifact_source_refs(artifact)[:4]:
+            url = str(ref.get("url") or "").strip()
+            if not url:
+                continue
+            title = str(ref.get("title") or artifact.title or "Source").strip()
+            evidence = _first_source_evidence([ref])
+            note = f" - {_truncate_text(evidence, 160)}" if evidence else ""
+            lines.append(f"* {title}: {url}{note}")
+            if len(lines) >= 6:
+                return lines
+    return lines
+
+
+def _business_research_artifact_metadata(
+    artifacts: list[WorkItemArtifactRef],
+) -> list[str]:
+    for artifact in artifacts:
+        diagnostics = artifact.metadata.get("retrieval_diagnostics")
+        if isinstance(diagnostics, dict) and diagnostics.get("provider_summary"):
+            return [f"* Search providers: {diagnostics['provider_summary']}"]
+    return []
+
+
+def _chief_of_staff_artifact_user_facing_summary(
+    result: WorkflowRunResult,
+    *,
+    request_text: str = "",
+) -> str:
+    artifacts = [
+        artifact
+        for artifact in result.artifact_refs
+        if artifact.artifact_type == "chief_of_staff_plan"
+    ]
+    if not artifacts:
+        return ""
+    source_lines = _chief_of_staff_artifact_source_synthesis(artifacts)
+    source_evidence = _chief_of_staff_artifact_source_evidence_lines(artifacts)
+    if not source_lines and not source_evidence:
+        return ""
+
+    answer = (
+        "The selected user-provided URLs were read/extracted and support the "
+        "Detailed Summary below."
+        if _request_url_source_candidates(request_text)
+        else _chief_of_staff_answer_line(artifacts)
+    )
+    detailed_summary_parts = [
+        _artifact_source_narrative_summary(source_lines, label="selected source refs"),
+        "",
+        "Key source details:",
+        *_artifact_source_detail_lines(source_lines),
+    ]
+    relevance = _chief_of_staff_relevance_line(request_text)
+    if relevance:
+        detailed_summary_parts.extend(["", relevance])
+    sections = [
+        "Chief of Staff source-backed brief",
+        "Answer\n" + answer,
+        "Detailed Summary\n" + "\n".join(detailed_summary_parts).strip(),
+    ]
+    if source_evidence:
+        sections.append("Source evidence\n" + "\n".join(source_evidence))
+    sections.append(
+        "Run notes\n"
+        "* This is a read-only source-backed Chief of Staff summary.\n"
+        "* No draft, send, publish, schedule, or file-write action was taken."
+    )
+    metadata = _chief_of_staff_artifact_metadata(artifacts)
+    if metadata:
+        sections.append("Metadata\n" + "\n".join(metadata))
+    return "\n\n".join(section for section in sections if section.strip())
+
+
+def _chief_of_staff_answer_line(artifacts: list[WorkItemArtifactRef]) -> str:
+    summary = " ".join(str(artifacts[0].summary or "").split()).strip()
+    if summary and not _looks_like_workflow_only_summary(summary):
+        return _truncate_text(summary, 260)
+    return (
+        "The run found source-backed context for the request; the useful answer "
+        "is the source-supported synthesis below rather than plan metadata."
+    )
+
+
+def _looks_like_workflow_only_summary(text: str) -> bool:
+    compact = " ".join(str(text or "").lower().split())
+    return any(
+        marker in compact
+        for marker in (
+            "search completed",
+            "read-only search completed",
+            "chief of staff plan",
+            "review the chief of staff plan",
+            "business agents",
+        )
+    )
+
+
+def _chief_of_staff_relevance_line(request_text: str) -> str:
+    lower = str(request_text or "").lower()
+    if "keystone" in lower:
+        return (
+            "Keystone relevance: treat the source-backed points as briefing evidence "
+            "for prioritization, not as approval to draft, send, post, or write externally."
+        )
+    return (
+        "Operator relevance: use these source-backed points for the requested brief or "
+        "follow-up decision before running any write-capable specialist."
+    )
+
+
+def _chief_of_staff_artifact_source_synthesis(
+    artifacts: list[WorkItemArtifactRef],
+) -> list[str]:
+    lines: list[str] = []
+    for artifact in artifacts:
+        for ref in _artifact_source_refs(artifact)[:5]:
+            source_url = str(ref.get("url") or "").strip()
+            findings = _opportunity_artifact_source_findings(artifact, [ref])
+            if not source_url or not findings:
+                continue
+            title = str(ref.get("title") or artifact.title or "Source").strip()
+            finding_text = _source_findings_summary(findings)
+            lines.append(f"* {title}: {finding_text} ({source_url})")
+            if len(lines) >= 5:
+                return lines
+    return lines
+
+
+def _source_findings_summary(findings: list[str]) -> str:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in findings:
+        value = " ".join(str(item or "").split()).strip()
+        if not value:
+            continue
+        normalized = value.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(_truncate_text(value, 220))
+        if len(cleaned) >= 4:
+            break
+    return "; ".join(cleaned)
+
+
+def _chief_of_staff_artifact_source_evidence_lines(
+    artifacts: list[WorkItemArtifactRef],
+) -> list[str]:
+    lines: list[str] = []
+    for artifact in artifacts:
+        for ref in _artifact_source_refs(artifact)[:6]:
+            url = str(ref.get("url") or "").strip()
+            if not url:
+                continue
+            title = str(ref.get("title") or artifact.title or "Source").strip()
+            evidence = _first_source_evidence([ref])
+            note = f" - {_truncate_text(evidence, 160)}" if evidence else ""
+            lines.append(f"* {title}: {url}{note}")
+            if len(lines) >= 6:
+                return lines
+    return lines
+
+
+def _chief_of_staff_artifact_metadata(
+    artifacts: list[WorkItemArtifactRef],
+) -> list[str]:
+    for artifact in artifacts:
+        diagnostics = artifact.metadata.get("retrieval_diagnostics")
+        if not isinstance(diagnostics, dict):
+            continue
+        provider_summary = diagnostics.get("provider_summary")
+        if provider_summary:
+            return [f"* Search providers: {provider_summary}"]
+        samples = diagnostics.get("provider_result_samples")
+        if isinstance(samples, dict) and samples:
+            return [f"* Search providers: {'+'.join(str(key) for key in samples.keys())}"]
+    return []
+
+
 def _result_has_canonical_outreach_draft(result: WorkflowRunResult) -> bool:
     if result.route != WorkItemRoute.OUTREACH_COMPOSER:
         return False
@@ -2333,6 +3962,373 @@ def _result_has_canonical_outreach_draft(result: WorkflowRunResult) -> bool:
         and bool(artifact.metadata.get("canonical_draft_copy", True))
         for artifact in result.artifact_refs
     )
+
+
+def _ensure_requested_opportunity_comparison_table(
+    text: str,
+    *,
+    result: WorkflowRunResult,
+    request_text: str,
+) -> str:
+    if result.route != WorkItemRoute.OPPORTUNITY_SCOUT:
+        return text
+    lower = str(request_text or "").lower()
+    if "table" not in lower or "compar" not in lower:
+        return text
+    summary = _opportunity_artifact_user_facing_summary(result, request_text=request_text)
+    if not summary:
+        return text
+    return summary
+
+
+def _contains_markdown_table(text: str) -> bool:
+    lines = [line.strip() for line in str(text or "").splitlines()]
+    for first, second in zip(lines, lines[1:], strict=False):
+        if "|" in first and re.search(r"\|\s*:?-{3,}:?\s*(?:\||$)", second):
+            return True
+    return False
+
+
+def _opportunity_artifact_user_facing_summary(
+    result: WorkflowRunResult,
+    *,
+    request_text: str = "",
+) -> str:
+    max_rows = _manual_plan_desired_count(result.manual_request_plan) or 3
+    table = _opportunity_artifact_comparison_table(
+        result.artifact_refs,
+        max_rows=max_rows,
+        request_text=request_text,
+    )
+    source_synthesis = _opportunity_artifact_source_data_synthesis(
+        result.artifact_refs,
+        max_rows=max_rows,
+    )
+    source_evidence = _opportunity_artifact_source_evidence_lines(
+        result.artifact_refs,
+        max_rows=max_rows,
+    )
+    if not table and not source_synthesis and not source_evidence:
+        return ""
+    names = [
+        artifact.title
+        for artifact in result.artifact_refs
+        if artifact.artifact_type == "opportunity" and artifact.title
+    ][:max_rows]
+    if names:
+        if len(names) == 1:
+            answer = f"The source-backed match surfaced in this run is {names[0]}."
+        else:
+            answer = (
+                "The strongest source-backed matches surfaced in this run are "
+                + ", ".join(names[:-1])
+                + f", and {names[-1]}."
+            )
+    else:
+        answer = "The run surfaced source-backed matches for review."
+    relevance_synthesis = (
+        "Keystone relevance: prioritize the entries whose source-backed signal is closest "
+        "to behavioral health clinic workflow, measurement-based care, digital psychiatry, "
+        "or AI-enabled care operations. Treat these as discovery leads, not a full "
+        "commercial or clinical diligence ranking."
+    )
+    synthesis = (
+        f"{source_synthesis}\n\n{relevance_synthesis}" if source_synthesis else relevance_synthesis
+    )
+    title = (
+        "Behavioral health opportunity comparison"
+        if _looks_like_formal_opportunity_request_text(request_text)
+        else "Behavioral health clinic software comparison"
+    )
+    sections = [
+        title,
+        "Answer\n" + answer,
+        "Detailed Summary\n" + synthesis,
+    ]
+    if table:
+        sections.append("Comparison table\n" + table)
+    if source_evidence:
+        sections.append("Source evidence\n" + "\n".join(source_evidence))
+    sections.append(
+        "Run notes\n"
+        "* This is a read-only discovery comparison, not a full diligence memo.\n"
+        "* The table uses only source refs attached to the displayed opportunity artifacts.\n"
+        "* No draft, send, publish, schedule, or file-write action was taken."
+    )
+    metadata = _opportunity_artifact_comparison_metadata(result.artifact_refs)
+    if metadata:
+        sections.append("Metadata\n" + "\n".join(metadata))
+    return "\n\n".join(sections)
+
+
+def _looks_like_formal_opportunity_request_text(text: str) -> bool:
+    normalized = str(text or "").lower()
+    return bool(_FORMAL_OPPORTUNITY_REQUEST_RE.search(normalized))
+
+
+def _opportunity_artifact_source_data_synthesis(
+    artifacts: list[WorkItemArtifactRef],
+    *,
+    max_rows: int,
+) -> str:
+    lines: list[str] = []
+    for artifact in artifacts:
+        if artifact.artifact_type != "opportunity":
+            continue
+        refs = _artifact_source_refs(artifact)
+        source_url = _first_source_url(refs)
+        findings = _opportunity_artifact_source_findings(artifact, refs)
+        if not source_url or not findings:
+            continue
+        finding_text = _source_findings_summary(findings)
+        lines.append(f"* {artifact.title or 'Opportunity'}: {finding_text} ({source_url})")
+        if len(lines) >= max_rows:
+            break
+    if not lines:
+        return ""
+    return "\n".join(
+        [
+            _artifact_source_narrative_summary(lines, label="attached source refs"),
+            "",
+            "Key source details:",
+            *_artifact_source_detail_lines(lines),
+        ]
+    )
+
+
+def _artifact_source_narrative_summary(lines: list[str], *, label: str) -> str:
+    if not lines:
+        return f"The {label} do not yet contain enough detail for a source-backed detailed summary."
+    combined = " ".join(line.lower() for line in lines)
+    themes: list[str] = []
+    checks = (
+        ("source-backed evaluation evidence", ("study", "evaluation", "trial", "clinical")),
+        ("behavioral-health or psychiatry relevance", ("behavioral", "mental health", "psychiatr")),
+        (
+            "workflow, documentation, or implementation signals",
+            ("workflow", "documentation", "scribe", "note", "implementation"),
+        ),
+        (
+            "funding, partnership, or opportunity fit",
+            ("funding", "grant", "rfp", "pilot", "partnership"),
+        ),
+        ("company/product positioning", ("platform", "product", "vendor", "market")),
+    )
+    for label_text, markers in checks:
+        if any(marker in combined for marker in markers):
+            themes.append(label_text)
+    if not themes:
+        themes = ["source-backed evidence"]
+    details = _artifact_source_detail_sentences(lines)
+    detail_sentence = ""
+    if details:
+        if len(details) == 1:
+            detail_sentence = f" The clearest source detail is that {details[0]}."
+        else:
+            joined = "; ".join(details[:3])
+            detail_sentence = f" The selected source details show that {joined}."
+    return (
+        f"The {label} point to {', '.join(themes[:3])}."
+        f"{detail_sentence} Taken together, these sources should be read as evidence "
+        "about the concrete activity, adoption signals, and remaining uncertainty in "
+        "the requested topic."
+    )
+
+
+def _artifact_source_detail_lines(lines: list[str]) -> list[str]:
+    return [line for line in lines if str(line or "").strip()]
+
+
+def _artifact_source_detail_sentences(lines: list[str]) -> list[str]:
+    details: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        value = re.sub(r"^\s*[-*]\s*", "", str(line or "").strip())
+        value = re.sub(r"\s+\(https?://[^)]+\)\s*$", "", value)
+        if ":" in value:
+            value = value.split(":", 1)[1].strip()
+        value = value.rstrip(".")
+        if not value:
+            continue
+        normalized = value.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        details.append(value)
+        if len(details) >= 4:
+            break
+    return details
+
+
+def _opportunity_artifact_source_evidence_lines(
+    artifacts: list[WorkItemArtifactRef],
+    *,
+    max_rows: int,
+) -> list[str]:
+    lines: list[str] = []
+    for artifact in artifacts:
+        if artifact.artifact_type != "opportunity":
+            continue
+        refs = _artifact_source_refs(artifact)
+        source_url = _first_source_url(refs)
+        if not source_url:
+            continue
+        title = ""
+        for ref in refs:
+            if str(ref.get("url") or "").strip() == source_url:
+                title = str(ref.get("title") or "").strip()
+                break
+        title = title or artifact.title or "Source"
+        evidence = _first_source_evidence(refs) or artifact.summary
+        note = f" - {_truncate_text(evidence, 160)}" if evidence else ""
+        lines.append(f"* {artifact.title or 'Opportunity'} / {title}: {source_url}{note}")
+        if len(lines) >= max_rows:
+            break
+    return lines
+
+
+def _opportunity_artifact_source_findings(
+    artifact: WorkItemArtifactRef,
+    source_refs: list[dict[str, Any]],
+) -> list[str]:
+    findings: list[str] = []
+    for ref in source_refs[:3]:
+        extraction_status = str(ref.get("extraction_status") or "").strip().lower()
+        key_order = (
+            ("evidence_excerpt", "supported_signal", "supported_claim")
+            if extraction_status
+            in {
+                "success",
+                "extracted",
+                "read",
+                "extracted/read",
+                "article_read",
+                "page_read",
+            }
+            else ("supported_claim", "supported_signal", "evidence_excerpt")
+        )
+        facts = ref.get("key_facts")
+        if isinstance(facts, list) and extraction_status in {
+            "success",
+            "extracted",
+            "read",
+            "extracted/read",
+            "article_read",
+            "page_read",
+        }:
+            for fact in facts[:4]:
+                value = " ".join(str(fact or "").split())
+                if value and value not in findings:
+                    findings.append(value)
+        for key in key_order:
+            value = " ".join(str(ref.get(key) or "").split())
+            if key == "supported_claim" and _generic_user_url_supported_claim(value):
+                continue
+            if value and value not in findings:
+                findings.append(value)
+        if isinstance(facts, list) and extraction_status not in {
+            "success",
+            "extracted",
+            "read",
+            "extracted/read",
+            "article_read",
+            "page_read",
+        }:
+            for fact in facts[:4]:
+                value = " ".join(str(fact or "").split())
+                if value and value not in findings:
+                    findings.append(value)
+    if not findings and artifact.summary:
+        findings.append(" ".join(str(artifact.summary).split()))
+    return findings[:5]
+
+
+def _generic_user_url_supported_claim(value: str) -> bool:
+    normalized = " ".join(str(value or "").lower().split())
+    return normalized.startswith("user-supplied url selected for requested read/extract synthesis")
+
+
+def _opportunity_artifact_comparison_metadata(
+    artifacts: list[WorkItemArtifactRef],
+) -> list[str]:
+    provider_summary = _opportunity_artifact_provider_summary(artifacts)
+    if not provider_summary:
+        return []
+    return [f"* Search providers: {provider_summary}"]
+
+
+def _manual_plan_desired_count(plan: dict[str, Any] | None) -> int:
+    if not isinstance(plan, dict):
+        return 0
+    try:
+        return max(1, min(10, int(plan.get("desired_count") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _opportunity_artifact_comparison_table(
+    artifacts: list[WorkItemArtifactRef],
+    *,
+    max_rows: int,
+    request_text: str = "",
+) -> str:
+    rows: list[tuple[str, str, str]] = []
+    for artifact in artifacts:
+        if artifact.artifact_type != "opportunity":
+            continue
+        source_url = _first_source_url(_artifact_source_refs(artifact))
+        if not source_url:
+            continue
+        rows.append(
+            (
+                _table_cell(artifact.title or "Opportunity"),
+                _table_cell(
+                    _compact_table_text(
+                        artifact.summary or _first_supported_claim(_artifact_source_refs(artifact))
+                    )
+                ),
+                _table_cell(f"[Source]({source_url})"),
+            )
+        )
+        if len(rows) >= max_rows:
+            break
+    if len(rows) < 2:
+        return ""
+    first_column = (
+        "Opportunity" if _looks_like_formal_opportunity_request_text(request_text) else "Company"
+    )
+    lines = [
+        f"| {first_column} | Relevant signal | Source |",
+        "|---|---|---|",
+        *[f"| {company} | {signal} | {source} |" for company, signal, source in rows],
+    ]
+    return "\n".join(lines)
+
+
+def _compact_table_text(text: str, *, max_chars: int = 140) -> str:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip(" .,;:") + "..."
+
+
+def _table_cell(text: str) -> str:
+    return str(text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _first_source_evidence(source_refs: list[dict[str, Any]]) -> str:
+    for ref in source_refs:
+        for key in ("evidence_excerpt", "supported_claim", "supported_signal"):
+            value = str(ref.get(key) or "").strip()
+            if value:
+                return value
+        facts = ref.get("key_facts")
+        if isinstance(facts, list):
+            for fact in facts:
+                value = str(fact or "").strip()
+                if value:
+                    return value
+    return ""
 
 
 def _record_workflow_sdk_cost_event(
@@ -2462,9 +4458,7 @@ def _existing_workflow_sdk_usage_keys(
         metadata = event.metadata if isinstance(event.metadata, dict) else {}
         usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else {}
         request_cache = (
-            metadata.get("request_cache")
-            if isinstance(metadata.get("request_cache"), dict)
-            else {}
+            metadata.get("request_cache") if isinstance(metadata.get("request_cache"), dict) else {}
         )
         keys.add(
             _workflow_sdk_usage_event_key(
@@ -2653,6 +4647,17 @@ def _orchestrator_preflight_event_payload(preflight: dict | None) -> dict:
                 "clarification_request",
             )
             if key in route_result and route_result[key] not in (None, "")
+        }
+    memo = preflight.get("preflight_memo")
+    if isinstance(memo, dict) and memo:
+        payload["preflight_memo"] = {
+            key: memo[key]
+            for key in (
+                "source_visibility_requirement",
+                "orchestrator_rationale",
+                "orchestrator_stop_reason",
+            )
+            if key in memo and memo[key] not in (None, "")
         }
     return payload
 
@@ -3108,7 +5113,11 @@ def _slack_prompt_transcript(slack_context: dict[str, Any], *, latest_request: s
 
 def _slack_prompt_messages(slack_context: dict[str, Any]) -> list[dict[str, str]]:
     raw_messages = slack_context.get("thread_messages")
-    messages = [item for item in raw_messages if isinstance(item, dict)] if isinstance(raw_messages, list) else []
+    messages = (
+        [item for item in raw_messages if isinstance(item, dict)]
+        if isinstance(raw_messages, list)
+        else []
+    )
     selected = slack_context.get("selected_message")
     if isinstance(selected, dict) and selected.get("text"):
         selected_ts = str(selected.get("ts") or "")
@@ -3187,6 +5196,16 @@ def _apply_slack_history_context(
                 key_facts=[read_context],
             )
         )
+    for link_source in _slack_history_link_source_refs(
+        read_context,
+        channel_id=channel_id,
+        thread_ts=thread_ts or request_ts,
+    ):
+        if all(
+            source.source_id != link_source.source_id and source.url != link_source.url
+            for source in sources
+        ):
+            sources.append(link_source)
     audit_notes = list(work_item.audit_notes)
     for warning in warnings:
         note = f"Slack context warning: {warning}"
@@ -3212,6 +5231,28 @@ def _external_context_event_payload(
         "schema": str(context.get("schema") or ""),
         "source": str(context.get("source") or ""),
     }
+    repair_context = context.get("manager_loop_repair")
+    if isinstance(repair_context, dict):
+        payload["manager_loop_repair"] = {
+            "route": _compact_context_text(repair_context.get("route"), max_chars=80),
+            "review_status": _compact_context_text(
+                repair_context.get("review_status"),
+                max_chars=40,
+            ),
+            "search_repair_hint": _compact_context_text(
+                repair_context.get("search_repair_hint"),
+                max_chars=120,
+            ),
+            "observed_gap_count": len(
+                [
+                    item
+                    for item in repair_context.get("observed_gaps", [])
+                    if str(item or "").strip()
+                ]
+            )
+            if isinstance(repair_context.get("observed_gaps"), list)
+            else 0,
+        }
     if context_file_path:
         payload["context_file_path"] = context_file_path
     if str(context.get("schema") or "") == "keystone.slack.selected_message_context.v1":
@@ -3247,6 +5288,72 @@ def _slack_history_context_window_days(context: dict[str, Any]) -> int:
     return max(1, min(7, raw_days))
 
 
+_SLACK_HISTORY_URL_RE = re.compile(r"<?https?://[^\s<>)\]]+(?:\|[^>\s]+)?>?", flags=re.I)
+
+
+def _slack_history_link_source_refs(
+    read_context: str,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    limit: int = 10,
+) -> list[WorkItemSourceRef]:
+    """Promote visible Slack thread URLs into ordered source refs for follow-ups."""
+
+    refs: list[WorkItemSourceRef] = []
+    seen_urls: set[str] = set()
+    for line in str(read_context or "").splitlines():
+        if len(refs) >= limit:
+            break
+        for match in _SLACK_HISTORY_URL_RE.finditer(line):
+            url = _clean_slack_history_url(match.group(0))
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            index = len(refs) + 1
+            evidence_line = _compact_context_text(line, max_chars=500)
+            title = _slack_history_link_title(line, match.group(0)) or f"Slack history link {index}"
+            source_id_parts = [part for part in (channel_id, thread_ts, str(index)) if part]
+            refs.append(
+                WorkItemSourceRef(
+                    title=title,
+                    url=url,
+                    source_type="slack_thread_link",
+                    source_id="slack-history-link:" + ":".join(source_id_parts),
+                    supported_claim=(
+                        f"Link {index} appeared in prior Slack thread context as: {title}."
+                    ),
+                    provider="slack",
+                    extraction_status="from_slack_history_context",
+                    retrieved_at=utc_now_iso(),
+                    key_facts=[evidence_line] if evidence_line else [],
+                    evidence_excerpt=evidence_line,
+                )
+            )
+            if len(refs) >= limit:
+                break
+    return refs
+
+
+def _clean_slack_history_url(raw: str) -> str:
+    text = str(raw or "").strip().strip("<>")
+    if "|" in text:
+        text = text.split("|", 1)[0]
+    return text.rstrip(".,;:)>]}\"'")
+
+
+def _slack_history_link_title(line: str, raw_url: str) -> str:
+    before = str(line or "").split(raw_url, 1)[0]
+    before = re.sub(r"^\s*(?:[-*]\s*)?", "", before)
+    before = before.strip(" \t:-*`")
+    if ":" in before:
+        before = before.rsplit(":", 1)[0].strip()
+    before = re.sub(r"\s+", " ", before)
+    if before.lower() in {"source evidence", "sources", "source", "link"}:
+        return ""
+    return before[:120]
+
+
 def _context_int(value: Any) -> int:
     try:
         return int(value or 0)
@@ -3259,6 +5366,31 @@ def _bounded_context_metadata(context: dict[str, Any]) -> dict[str, Any]:
     for key in ("schema", "source", "permalink", "warnings"):
         if key in context:
             allowed[key] = context[key]
+    repair_context = context.get("manager_loop_repair")
+    if isinstance(repair_context, dict):
+        allowed["manager_loop_repair"] = {
+            "schema": _compact_context_text(repair_context.get("schema"), max_chars=120),
+            "source": _compact_context_text(repair_context.get("source"), max_chars=120),
+            "route": _compact_context_text(repair_context.get("route"), max_chars=80),
+            "review_status": _compact_context_text(
+                repair_context.get("review_status"),
+                max_chars=40,
+            ),
+            "overall_score": repair_context.get("overall_score"),
+            "search_repair_hint": _compact_context_text(
+                repair_context.get("search_repair_hint"),
+                max_chars=120,
+            ),
+            "observed_gaps": _context_string_list(
+                repair_context.get("observed_gaps"),
+                max_items=6,
+                max_chars=240,
+            ),
+            "recommended_next_step": _compact_context_text(
+                repair_context.get("recommended_next_step"),
+                max_chars=400,
+            ),
+        }
     return allowed
 
 
@@ -3310,6 +5442,44 @@ def _effective_max_results(request: WorkflowRunRequest) -> int:
     return max(1, min(20, count))
 
 
+def _quality_budgeted_max_results(
+    request: WorkflowRunRequest,
+    budget: AgentQualityBudget,
+    *,
+    preserve_requested_count: bool = False,
+) -> int:
+    count = _effective_max_results(request)
+    if preserve_requested_count:
+        plan = request.manual_request_plan if isinstance(request.manual_request_plan, dict) else {}
+        desired_count = plan.get("desired_count")
+        if isinstance(desired_count, int) or request.max_results < 3:
+            return count
+    if budget.retrieval_max_results is not None:
+        count = max(count, budget.retrieval_max_results)
+    return max(1, min(20, count))
+
+
+def _quality_budgeted_hosted_web_search_max_calls(
+    request: WorkflowRunRequest,
+    budget: AgentQualityBudget,
+) -> int | None:
+    if request.hosted_web_search_max_calls is not None:
+        return request.hosted_web_search_max_calls
+    return budget.hosted_web_search_max_calls
+
+
+def _quality_budget_audit_note(budget: AgentQualityBudget) -> str:
+    controls = [
+        f"mode={budget.mode.value}",
+        f"retrieval_max_results={budget.retrieval_max_results}",
+        f"hosted_web_search_max_calls={budget.hosted_web_search_max_calls}",
+        f"tool_tier={budget.tool_tier}",
+        f"page_verification={budget.enable_page_verification}",
+        f"synthesis_review={budget.enable_synthesis_review}",
+    ]
+    return f"Quality budget applied for {budget.agent_name}: " + ", ".join(controls) + "."
+
+
 _WORK_ITEM_COMPARISON_RE = re.compile(
     r"\b(?:compare|comparison\s+of)\s+"
     r"(?P<company_a>(?:[A-Z][\w&.-]*|[A-Z]{2,})(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})"
@@ -3347,8 +5517,9 @@ def _advance_gmail_triage(
     request: WorkflowRunRequest,
     store: SQLiteStore | None,
 ) -> WorkflowRunResult:
-    gmail_plan = infer_gmail_execution_plan(request.request_text, source="work_item")
-    inline_fixture = _inline_gmail_fixture_from_request(request.request_text)
+    effective_request_text = _effective_work_item_request_text(request, work_item)
+    gmail_plan = infer_gmail_execution_plan(effective_request_text, source="work_item")
+    inline_fixture = _inline_gmail_fixture_from_request(effective_request_text)
     metadata = {
         **work_item.target.metadata,
         "gmail_execution_plan": gmail_plan.model_dump(mode="json"),
@@ -3388,11 +5559,11 @@ def _advance_gmail_triage(
                 store.save_agent_run(
                     agent_name=WorkItemRoute.GMAIL_TRIAGE.value,
                     input_payload={
-                        "request": request.request_text,
+                        "request": effective_request_text,
                         "mode": "inline_read_only_triage",
                         "gmail_execution_plan": gmail_plan.model_dump(mode="json"),
                     },
-                    input_summary=request.request_text[:240],
+                    input_summary=effective_request_text[:240],
                     output=output_payload,
                     model="fixture",
                     dry_run=True,
@@ -3416,6 +5587,8 @@ def _advance_gmail_triage(
                 "inline_context": True,
                 "message_id": triage.message_id,
                 "thread_id": triage.thread_id,
+                "risk_flags": list(triage.risk_flags),
+                "triage_limitations": list(triage.triage_limitations),
             },
         )
         updated = attach_artifact(
@@ -3464,6 +5637,14 @@ def _advance_gmail_triage(
                 )
             ],
         )
+    live_result = _try_live_gmail_thread_retrieval(
+        work_item,
+        request=request.model_copy(update={"request_text": effective_request_text}),
+        store=store,
+        gmail_plan=gmail_plan,
+    )
+    if live_result is not None:
+        return live_result
     blocker = WorkItemBlocker(
         code="gmail_context_required",
         message=(
@@ -3487,10 +5668,405 @@ def _advance_gmail_triage(
         next_action,
         store=store,
         route=WorkItemRoute.GMAIL_TRIAGE,
-        audit_notes=[
-            "Gmail Triage WorkItem route recognized; stopped at Gmail context gate."
-        ],
+        audit_notes=["Gmail Triage WorkItem route recognized; stopped at Gmail context gate."],
     )
+
+
+def _try_live_gmail_thread_retrieval(
+    work_item: WorkItem,
+    *,
+    request: WorkflowRunRequest,
+    store: SQLiteStore | None,
+    gmail_plan: Any,
+) -> WorkflowRunResult | None:
+    if store is None or not _live_gmail_retrieval_enabled(request):
+        return None
+    query = _gmail_retrieval_query_from_request(request.request_text, request.manual_request_plan)
+    if not query:
+        return None
+    try:
+        gmail = GmailTool(live=True)
+        message_refs = gmail.list_recent_messages(
+            label=None,
+            max_results=min(max(3, request.max_results), 8),
+            query=query,
+        )
+        thread_ids = _dedupe_gmail_thread_ids(message_refs)
+        if not thread_ids:
+            return _blocked_live_gmail_result(
+                work_item,
+                query=query,
+                code="gmail_thread_not_found",
+                message=(
+                    "Gmail Triage searched Gmail read-only but found no matching recent "
+                    f"thread for query `{query}`."
+                ),
+                store=store,
+            )
+        thread_payloads = [gmail.get_thread(thread_id) for thread_id in thread_ids[:3]]
+    except (GmailAPIError, GmailConfigurationError, ValueError, RuntimeError) as exc:
+        return _blocked_live_gmail_result(
+            work_item,
+            query=query,
+            code="gmail_live_retrieval_failed",
+            message=(
+                "Gmail Triage could not complete read-only Gmail retrieval. "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            store=store,
+        )
+
+    summaries = [
+        _gmail_thread_summary_result_from_payload(thread=thread, query=query)
+        for thread in thread_payloads
+    ]
+    summaries = sorted(
+        summaries,
+        key=lambda summary: (
+            _gmail_thread_relevance_score(summary, query),
+            summary.latest_received_at,
+        ),
+        reverse=True,
+    )
+    selected = summaries[0]
+    draft_requested = _manager_loop_requests_outreach_draft(request.request_text)
+    output_payload = {
+        "mode": "live-gmail-thread-summary",
+        "query": query,
+        "count": len(summaries),
+        "selected_thread_id": selected.thread_id,
+        "threads": [summary.model_dump(mode="json") for summary in summaries],
+        "thread_summary_result": selected.model_dump(mode="json"),
+        "send_enabled": False,
+        "draft_created": False,
+        "labels_modified": False,
+    }
+    artifact_id = str(
+        store.save_agent_run(
+            agent_name=WorkItemRoute.GMAIL_TRIAGE.value,
+            input_payload={
+                "request": request.request_text,
+                "mode": "live_gmail_thread_retrieval",
+                "gmail_query": query,
+                "gmail_execution_plan": gmail_plan.model_dump(mode="json"),
+            },
+            input_summary=request.request_text[:240],
+            output=output_payload,
+            model="live-gmail-read",
+            dry_run=True,
+            status="success",
+        )
+    )
+    artifact = WorkItemArtifactRef(
+        artifact_type="gmail_triage_report",
+        artifact_id=artifact_id,
+        source_agent=WorkItemRoute.GMAIL_TRIAGE.value,
+        approval_state=ApprovalState.PENDING.value,
+        title=selected.subject or "Read-only Gmail thread summary",
+        summary=(selected.summary or selected.thread_context or selected.subject)[:240],
+        selected=True,
+        metadata={
+            "mode": "live-gmail-thread-summary",
+            "query": query,
+            "selected": True,
+            "selected_thread_id": selected.thread_id,
+            "matched_thread_ids": [summary.thread_id for summary in summaries],
+            "matched_thread_count": len(summaries),
+            "message_count": selected.message_count,
+            "latest_received_at": selected.latest_received_at,
+            "thread_summary": selected.summary,
+            "send_enabled": False,
+            "draft_created": False,
+            "labels_modified": False,
+            "gmail_live_read_only": True,
+        },
+    )
+    next_action = (
+        WorkItemNextAction(
+            action="draft_thread_local_reply",
+            agent=WorkItemRoute.OUTREACH_COMPOSER,
+            description=(
+                "Use the selected read-only Gmail thread summary to draft a Slack-thread "
+                "reply. Do not create a Gmail draft or send."
+            ),
+            requires_approval=False,
+        )
+        if draft_requested
+        else WorkItemNextAction(
+            action="review_gmail_thread_summary",
+            agent=WorkItemRoute.GMAIL_TRIAGE,
+            description="Review the read-only Gmail thread summary.",
+            requires_approval=False,
+        )
+    )
+    updated = attach_artifact(
+        work_item.model_copy(
+            update={
+                "last_agent": WorkItemRoute.GMAIL_TRIAGE.value,
+                "status": WorkItemStatus.IN_PROGRESS if draft_requested else WorkItemStatus.DONE,
+                "confidence": max(work_item.confidence, 0.74),
+                "audit_notes": [
+                    *work_item.audit_notes,
+                    (
+                        "Gmail Triage performed read-only live Gmail retrieval, selected "
+                        "the most relevant recent matching thread, and performed no Gmail "
+                        "writes."
+                    ),
+                ],
+                "next_action": next_action,
+            }
+        ).touch(),
+        artifact,
+    )
+    _persist_artifact_and_event(
+        updated,
+        artifact,
+        summary="Attached read-only live Gmail thread summary.",
+        store=store,
+    )
+    return WorkflowRunResult(
+        work_item=updated,
+        route=WorkItemRoute.GMAIL_TRIAGE,
+        status=updated.status,
+        advanced=True,
+        artifact_refs=[artifact],
+        next_action=updated.next_action,
+        human_summary=_format_gmail_thread_summary_work_item_summary(selected, query=query),
+        audit_notes=updated.audit_notes[-1:],
+    )
+
+
+def _effective_work_item_request_text(request: WorkflowRunRequest, work_item: WorkItem) -> str:
+    request_text = str(request.request_text or "").strip()
+    if request_text.lower() in {"", "continue", "resume"}:
+        return str(work_item.request_text or "").strip() or request_text
+    return request_text
+
+
+def _live_gmail_retrieval_enabled(request: WorkflowRunRequest) -> bool:
+    return bool(request.live_sdk and cli_default_live_gmail())
+
+
+def _blocked_live_gmail_result(
+    work_item: WorkItem,
+    *,
+    query: str,
+    code: str,
+    message: str,
+    store: SQLiteStore | None,
+) -> WorkflowRunResult:
+    blocker = WorkItemBlocker(code=code, message=message)
+    next_action = WorkItemNextAction(
+        action="refine_gmail_search",
+        agent=WorkItemRoute.GMAIL_TRIAGE,
+        description=(
+            "Provide a sender, subject phrase, body keyword, or known Gmail thread id, "
+            "then retry Gmail Triage."
+        ),
+        requires_approval=False,
+    )
+    return _blocked_result(
+        work_item,
+        (blocker,),
+        next_action,
+        store=store,
+        route=WorkItemRoute.GMAIL_TRIAGE,
+        audit_notes=[f"Gmail read-only retrieval query `{query}` did not produce usable context."],
+    )
+
+
+def _gmail_retrieval_query_from_request(
+    request_text: str,
+    manual_request_plan: dict[str, Any] | None,
+) -> str:
+    parts: list[str] = []
+    if isinstance(manual_request_plan, dict):
+        planned_query = str(manual_request_plan.get("gmail_query") or "").strip()
+        if planned_query:
+            parts.extend(planned_query.split())
+    lower = str(request_text or "").lower()
+    if "inbox" in lower and not any(part.startswith("in:") for part in parts):
+        parts.append("in:inbox")
+    if "unread" in lower and "is:unread" not in parts:
+        parts.append("is:unread")
+    if not any(part.startswith("newer_than:") for part in parts):
+        parts.append("newer_than:30d")
+    sender_email = _email_address_from_text(request_text)
+    if sender_email:
+        parts.append(f"from:{sender_email}")
+    terms = _gmail_search_terms_from_request(request_text)
+    parts.extend(_quote_gmail_query_term(term) for term in terms[:4])
+    return " ".join(list(dict.fromkeys(part for part in parts if part))).strip()
+
+
+def _email_address_from_text(text: str) -> str:
+    match = re.search(
+        r"\b(?:from|sender)\s+([\w.+-]+@[\w.-]+\.[A-Za-z]{2,})",
+        str(text or ""),
+        flags=re.I,
+    )
+    return match.group(1).strip().lower() if match else ""
+
+
+def _gmail_search_terms_from_request(text: str) -> list[str]:
+    raw = str(text or "")
+    terms: list[str] = []
+    for pattern in (
+        r"\bsubject(?: line)?\s+(?:is|contains|about|with)?\s*[\"']([^\"']{2,80})[\"']",
+        r"\bbody\s+(?:contains|mentions|about|with)\s+[\"']([^\"']{2,80})[\"']",
+        r"[\"']([^\"']{2,80})[\"']",
+        r"\b(?:from|sender|topic|about|regarding|re:)\s+([A-Z][A-Za-z0-9&._ -]{1,60})",
+        r"\bcurrent\s+([A-Z][A-Za-z0-9&._-]{1,50})\s+(?:gmail|email|thread)\b",
+        r"\b([A-Z][A-Za-z0-9&._-]{1,50})\s+(?:gmail|email|thread)\b",
+    ):
+        for match in re.finditer(pattern, raw):
+            terms.append(match.group(1))
+    if not terms:
+        for token in re.findall(r"\b[A-Z][A-Za-z0-9&._-]{2,50}\b", raw):
+            if token.lower() not in _GMAIL_QUERY_STOPWORDS:
+                terms.append(token)
+    cleaned: list[str] = []
+    for term in terms:
+        value = re.sub(r"\s+", " ", str(term or "")).strip(" .,:;!?")
+        words = [word for word in value.split() if word.lower() not in _GMAIL_QUERY_STOPWORDS]
+        value = " ".join(words).strip()
+        if value and value.lower() not in _GMAIL_QUERY_STOPWORDS:
+            cleaned.append(value[:80])
+    return list(dict.fromkeys(cleaned))
+
+
+_GMAIL_QUERY_STOPWORDS = {
+    "anup",
+    "chief",
+    "current",
+    "draft",
+    "email",
+    "gmail",
+    "inbox",
+    "kni",
+    "read",
+    "reply",
+    "staff",
+    "thread",
+    "wisegrow05",
+}
+
+
+def _quote_gmail_query_term(term: str) -> str:
+    value = re.sub(r'["\\]', " ", str(term or "")).strip()
+    if not value:
+        return ""
+    if re.search(r"\s", value):
+        return f'"{value}"'
+    return value
+
+
+def _dedupe_gmail_thread_ids(refs: list[dict[str, Any]]) -> list[str]:
+    thread_ids: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        thread_id = str(ref.get("threadId") or ref.get("id") or "").strip()
+        if not thread_id or thread_id in seen:
+            continue
+        seen.add(thread_id)
+        thread_ids.append(thread_id)
+    return thread_ids
+
+
+def _gmail_thread_summary_result_from_payload(
+    *,
+    thread: dict[str, Any],
+    query: str,
+) -> GmailThreadSummaryResult:
+    messages = [
+        GmailThreadSummaryMessage(
+            message_id=str(item.get("id") or ""),
+            received_at=str(item.get("received_at") or ""),
+            sender_name=str(item.get("sender_name") or ""),
+            sender_email=str(item.get("sender_email") or ""),
+            subject=str(item.get("subject") or ""),
+            snippet=str(item.get("snippet") or ""),
+            prior_labels=[
+                str(label) for label in item.get("prior_labels", []) if str(label).strip()
+            ],
+            summary=str(item.get("thread_summary") or item.get("snippet") or ""),
+        )
+        for item in thread.get("messages", [])
+        if isinstance(item, dict)
+    ]
+    return GmailThreadSummaryResult(
+        thread_id=str(thread.get("thread_id") or thread.get("id") or ""),
+        source_label="",
+        query=query,
+        subject=str(thread.get("subject") or ""),
+        summary=str(thread.get("summary") or ""),
+        thread_context=str(thread.get("thread_context") or ""),
+        message_count=int(thread.get("message_count") or 0),
+        latest_received_at=str(thread.get("latest_received_at") or ""),
+        participants=[str(item) for item in thread.get("participants", []) if str(item).strip()],
+        action_items=[str(item) for item in thread.get("action_items", []) if str(item).strip()],
+        deadlines=[str(item) for item in thread.get("deadlines", []) if str(item).strip()],
+        open_questions=[
+            str(item) for item in thread.get("open_questions", []) if str(item).strip()
+        ],
+        triage_limitations=[
+            str(item) for item in thread.get("triage_limitations", []) if str(item).strip()
+        ],
+        messages=messages,
+        send_enabled=False,
+        draft_created=False,
+        labels_modified=False,
+    )
+
+
+def _gmail_thread_relevance_score(summary: GmailThreadSummaryResult, query: str) -> int:
+    haystack = " ".join(
+        [
+            summary.subject,
+            summary.summary,
+            summary.thread_context,
+            " ".join(summary.participants),
+            " ".join(message.snippet for message in summary.messages),
+        ]
+    ).lower()
+    score = 0
+    for term in _gmail_search_terms_from_request(query):
+        lowered = term.lower()
+        if lowered and lowered in haystack:
+            score += 3 if lowered in summary.subject.lower() else 1
+    return score
+
+
+def _format_gmail_thread_summary_work_item_summary(
+    summary: GmailThreadSummaryResult,
+    *,
+    query: str,
+) -> str:
+    lines = [
+        "Read-only Gmail thread summary",
+        "",
+        f"Query: {query}",
+        f"Subject: {summary.subject or 'Unknown'}",
+        f"Messages: {summary.message_count}",
+        f"Latest: {summary.latest_received_at or 'Unknown'}",
+    ]
+    if summary.participants:
+        lines.append(f"Participants: {', '.join(summary.participants[:6])}")
+    if summary.summary or summary.thread_context:
+        lines.extend(["", summary.summary or summary.thread_context])
+    if summary.action_items:
+        lines.extend(["", "Action items:"])
+        lines.extend(f"- {item}" for item in summary.action_items[:4])
+    if summary.open_questions:
+        lines.extend(["", "Open questions:"])
+        lines.extend(f"- {item}" for item in summary.open_questions[:4])
+    lines.extend(
+        [
+            "",
+            "Safety: read-only Gmail retrieval; no labels changed, no Gmail draft created, and no message sent.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _gmail_plan_allows_inline_read_only_triage(gmail_plan: Any) -> bool:
@@ -3507,7 +6083,10 @@ def _inline_gmail_fixture_from_request(request_text: str) -> EmailFixture | None
         return None
 
     from_text = _extract_inline_email_field(text, "from", stop_fields=("subject", "body"))
-    subject = _extract_inline_email_field(text, "subject", stop_fields=("body",)) or "Manual Gmail triage request"
+    subject = (
+        _extract_inline_email_field(text, "subject", stop_fields=("body",))
+        or "Manual Gmail triage request"
+    )
     body = _extract_inline_email_field(text, "body", stop_fields=())
     if body:
         body = re.split(
@@ -3575,9 +6154,7 @@ def _gmail_triage_human_summary(triage: Any) -> str:
         lines.append("Risks: " + ", ".join(triage.risk_flags) + ".")
     else:
         lines.append("Risks: no high-risk flags detected from the sanitized inline text.")
-    lines.append(
-        "No Gmail draft, label, send, save, post, or external write was performed."
-    )
+    lines.append("No Gmail draft, label, send, save, post, or external write was performed.")
     if triage.triage_limitations:
         lines.extend(["", "Run notes"])
         lines.extend(f"* {item}" for item in triage.triage_limitations[:4])
@@ -3592,14 +6169,33 @@ def _advance_chief_of_staff(
     sdk_session: Any | None = None,
 ) -> WorkflowRunResult:
     request_text = request.request_text.strip() or work_item.request_text
+    link_followup = (
+        _chief_source_link_followup_result(
+            work_item,
+            request=request,
+            store=store,
+        )
+        if _use_deterministic_source_link_followup(request)
+        else None
+    )
+    if link_followup is not None:
+        return link_followup
+    preselected_source_refs = _chief_preselected_source_refs_for_sdk(
+        request_text,
+        live=request.live_search,
+    )
     sdk_input = {
         "request": request_text,
         "work_item": {
             "id": work_item.id,
             "route": WorkItemRoute.CHIEF_OF_STAFF.value,
             "target": work_item.target.model_dump(mode="json"),
-            "sources": [source.model_dump(mode="json") for source in work_item.sources[:8]],
+            "sources": [
+                source.model_dump(mode="json")
+                for source in [*preselected_source_refs, *work_item.sources][:8]
+            ],
         },
+        "selected_source_context": _source_refs_sdk_context(preselected_source_refs),
         "slack_context": work_item.target.metadata.get("slack_context", {}),
         "orchestrator_context": _specialist_orchestrator_context_payload(request, work_item),
         "side_effect_policy": (
@@ -3608,20 +6204,68 @@ def _advance_chief_of_staff(
         ),
     }
     if request.live_sdk:
-        typed_result = run_chief_of_staff_sdk(
-            sdk_input,
-            live=True,
-            session=sdk_session,
-            force_sdk_interpretation=True,
-        )
-        output = typed_result.output
-        mode_note = "Chief of Staff live SDK interpretation executed for this WorkItem."
+        try:
+            typed_result = run_chief_of_staff_sdk(
+                sdk_input,
+                live=True,
+                session=sdk_session,
+                force_sdk_interpretation=True,
+            )
+            output = typed_result.output
+            mode_note = "Chief of Staff live SDK interpretation executed for this WorkItem."
+            if store is not None:
+                _record_workflow_sdk_cost_event(
+                    work_item,
+                    event_type="workflow_sdk_usage",
+                    summary="Recorded Chief of Staff live SDK usage.",
+                    agent_name=WorkItemRoute.CHIEF_OF_STAFF.value,
+                    usage=typed_result.usage,
+                    cost=typed_result.cost,
+                    request_cache=typed_result.request_cache,
+                    store=store,
+                    run_stage="chief_of_staff.live_sdk",
+                )
+        except Exception as exc:
+            if not _recoverable_live_chief_of_staff_output_error(exc):
+                raise
+            output = plan_chief_of_staff_request(request_text, database_url=request.database_url)
+            mode_note = (
+                "Chief of Staff live SDK output failed validation; deterministic fallback "
+                "planner used for this WorkItem."
+            )
+            record_event(
+                work_item,
+                event_type="chief_of_staff_live_sdk_fallback",
+                actor=WorkItemRoute.CHIEF_OF_STAFF.value,
+                summary=(
+                    "Chief of Staff live SDK output failed validation; deterministic "
+                    "fallback planner used."
+                ),
+                metadata={
+                    "error_type": type(exc).__name__,
+                    "reason": redact_operator_text(str(exc), max_chars=500),
+                    "fallback": "deterministic_chief_of_staff_plan",
+                    "safe_to_continue": True,
+                },
+                store=store,
+            )
     else:
         output = plan_chief_of_staff_request(request_text, database_url=request.database_url)
         mode_note = "Chief of Staff deterministic dry-run planner executed for this WorkItem."
 
+    output = append_visible_source_urls_to_output(output)
     artifact_id = ""
     output_payload = output.model_dump(mode="json")
+    source_refs = preselected_source_refs or _chief_of_staff_source_refs(
+        output,
+        request_text=request_text,
+        live=request.live_search,
+    )
+    output_audit_notes = _chief_output_audit_notes_for_source_context(
+        list(output.audit_notes),
+        source_refs,
+    )
+    output_payload["audit_notes"] = output_audit_notes
     if store is not None:
         artifact_id = str(
             store.save_agent_run(
@@ -3646,23 +6290,39 @@ def _advance_chief_of_staff(
             "target_channel": output.recommended_route.target_channel,
             "slack_post_allowed": output.slack_post_allowed,
             "send_enabled": output.send_enabled,
+            "retrieval_diagnostics": output.retrieval_diagnostics,
+            "source_refs": [ref.model_dump(mode="json") for ref in source_refs],
+            "source_context_status": _source_context_status(source_refs),
         },
     )
+    delegated_agent = _chief_of_staff_delegated_next_agent(output_payload, request_text)
+    next_action = (
+        WorkItemNextAction(
+            action="run_gmail_triage",
+            agent=WorkItemRoute.GMAIL_TRIAGE,
+            description=(
+                "Route the request context to Gmail Triage for read-only thread lookup "
+                "and summary before any draft step."
+            ),
+            requires_approval=False,
+        )
+        if delegated_agent == WorkItemRoute.GMAIL_TRIAGE
+        else WorkItemNextAction(
+            action="review_chief_of_staff_plan",
+            agent=WorkItemRoute.CHIEF_OF_STAFF,
+            description=("Review the Chief of Staff plan before any live internal write or post."),
+            requires_approval=bool(output.approval_required),
+        )
+    )
+    status = WorkItemStatus.IN_PROGRESS if delegated_agent else WorkItemStatus.DONE
     updated = attach_artifact(
         work_item.model_copy(
             update={
                 "last_agent": WorkItemRoute.CHIEF_OF_STAFF.value,
-                "status": WorkItemStatus.DONE,
+                "status": status,
                 "confidence": max(work_item.confidence, 0.7),
-                "audit_notes": [*work_item.audit_notes, mode_note, *output.audit_notes],
-                "next_action": WorkItemNextAction(
-                    action="review_chief_of_staff_plan",
-                    agent=WorkItemRoute.CHIEF_OF_STAFF,
-                    description=(
-                        "Review the Chief of Staff plan before any live internal write or post."
-                    ),
-                    requires_approval=bool(output.approval_required),
-                ),
+                "audit_notes": [*work_item.audit_notes, mode_note, *output_audit_notes],
+                "next_action": next_action,
             }
         ).touch(),
         artifact,
@@ -3673,7 +6333,7 @@ def _advance_chief_of_staff(
         summary="Attached Chief of Staff plan.",
         store=store,
     )
-    return WorkflowRunResult(
+    result = WorkflowRunResult(
         work_item=updated,
         route=WorkItemRoute.CHIEF_OF_STAFF,
         status=updated.status,
@@ -3681,8 +6341,781 @@ def _advance_chief_of_staff(
         artifact_refs=[artifact],
         next_action=updated.next_action,
         human_summary=output.summary,
-        audit_notes=[mode_note, *output.audit_notes],
+        audit_notes=[mode_note, *output_audit_notes],
     )
+    user_facing_summary = _chief_of_staff_artifact_user_facing_summary(
+        result,
+        request_text=request_text,
+    )
+    if user_facing_summary:
+        return result.model_copy(
+            update={
+                "human_summary": user_facing_summary,
+                "audit_notes": list(
+                    dict.fromkeys(
+                        [
+                            *result.audit_notes,
+                            "Deterministic Chief of Staff source-backed summary rendered.",
+                        ]
+                    )
+                ),
+            }
+        )
+    return result
+
+
+def _chief_preselected_source_refs_for_sdk(
+    request_text: str,
+    *,
+    live: bool,
+) -> list[WorkItemSourceRef]:
+    """Read explicit user-supplied URLs before Chief SDK synthesis when requested."""
+
+    if not _request_url_source_candidates(request_text):
+        return []
+    if not _request_requires_selected_web_source_context(request_text):
+        return []
+    return _chief_of_staff_source_refs(None, request_text=request_text, live=live)
+
+
+def _source_refs_sdk_context(source_refs: list[WorkItemSourceRef]) -> dict[str, Any]:
+    if not source_refs:
+        return {}
+    entries: list[dict[str, Any]] = []
+    for ref in source_refs[:4]:
+        facts = [str(item) for item in ref.key_facts[:4] if str(item or "").strip()]
+        entries.append(
+            {
+                "title": ref.title,
+                "url": ref.url,
+                "provider": ref.provider,
+                "extraction_status": ref.extraction_status,
+                "key_facts": facts,
+                "evidence_excerpt": _compact_context_text(ref.evidence_excerpt, max_chars=1200),
+            }
+        )
+    return {
+        "schema": "keystone.selected_source_context.v1",
+        "instruction": (
+            "Use these read/extracted source details as the primary factual substrate "
+            "for Answer and Detailed Summary. Do not say page extraction was unavailable "
+            "for sources whose extraction_status is success."
+        ),
+        "source_context_status": _source_context_status(source_refs),
+        "sources": entries,
+    }
+
+
+def _chief_output_audit_notes_for_source_context(
+    audit_notes: list[str],
+    source_refs: list[WorkItemSourceRef],
+) -> list[str]:
+    status = _source_context_status(source_refs)
+    if int(status.get("extracted_url_count") or 0) <= 0:
+        return audit_notes
+    filtered: list[str] = []
+    stale_markers = (
+        "extraction was unavailable",
+        "extraction unavailable",
+        "rendered-page fetch returned no content",
+        "snippet-based",
+        "snippet/title-based",
+        "search snippets rather than",
+    )
+    for note in audit_notes:
+        normalized = " ".join(str(note or "").lower().split())
+        if any(marker in normalized for marker in stale_markers):
+            continue
+        filtered.append(note)
+    filtered.append("Selected source URLs were read/extracted and included in the source context.")
+    return list(dict.fromkeys(filtered))
+
+
+def _chief_of_staff_source_refs(
+    output: Any,
+    *,
+    request_text: str,
+    live: bool,
+) -> list[WorkItemSourceRef]:
+    request_url_candidates = _request_url_source_candidates(request_text)
+    candidates = request_url_candidates or _chief_of_staff_source_candidates(output)
+    if not candidates:
+        return []
+    should_read = _request_requires_selected_web_source_context(request_text)
+    refs: list[WorkItemSourceRef] = []
+    seen_urls: set[str] = set()
+    for candidate in candidates:
+        url = str(candidate.get("url") or "").strip()
+        title = str(candidate.get("title") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        note = str(candidate.get("note") or candidate.get("snippet") or "").strip()
+        source_id = str(candidate.get("source_id") or "")
+        source_type = str(candidate.get("source_type") or candidate.get("provider") or "web")
+        provider = _provider_from_source_id_or_type(source_id, source_type)
+        extraction_status = "source_linked"
+        evidence_excerpt = ""
+        key_facts = [note[:500]] if note else []
+        if should_read:
+            extracted = _read_chief_selected_source(url, request_text=request_text, live=live)
+            extraction_status = str(extracted.get("status") or "unavailable")
+            title = str(extracted.get("title") or title)
+            provider = str(extracted.get("provider") or provider)
+            text = str(extracted.get("text_or_markdown") or "").strip()
+            extracted_claims = _source_claims_from_extracted_payload(extracted)
+            if text:
+                evidence_excerpt = _compact_source_evidence_excerpt(text)
+            if extracted_claims:
+                if not note:
+                    note = extracted_claims[0]
+                key_facts = _dedupe_source_facts(
+                    [
+                        *(extracted_claims[:4]),
+                        *([evidence_excerpt[:500]] if evidence_excerpt else []),
+                    ]
+                )
+            elif evidence_excerpt:
+                key_facts = [evidence_excerpt[:500]]
+        refs.append(
+            WorkItemSourceRef(
+                title=title,
+                url=url,
+                source_type=source_type,
+                source_id=source_id,
+                supported_claim=note[:500],
+                provider=provider,
+                extraction_status=extraction_status,
+                retrieved_at=utc_now_iso(),
+                key_facts=key_facts[:5],
+                evidence_excerpt=evidence_excerpt[:1000],
+            )
+        )
+        if len(refs) >= 4:
+            break
+    return refs
+
+
+_REQUEST_URL_RE = re.compile(r"https?://[^\s<>)]+", flags=re.I)
+
+
+def _request_url_source_candidates(request_text: str) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_url in _REQUEST_URL_RE.findall(str(request_text or "")):
+        url = raw_url.strip().rstrip(".,;:)]}\"'")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        label = _source_domain_label(url) or "User-supplied URL"
+        candidates.append(
+            {
+                "title": label,
+                "url": url,
+                "note": "User-supplied URL selected for requested read/extract synthesis.",
+                "source_type": "user_supplied_url",
+                "provider": "user_supplied_url",
+                "source_id": f"user_url:{len(candidates) + 1}",
+            }
+        )
+    return candidates[:6]
+
+
+_SOURCE_LINK_FOLLOWUP_RE = re.compile(
+    r"\b(?:summari[sz]e|explain|review|read|what\s+(?:does|is))\b.{0,120}?"
+    r"\b(?:link|source|url)\s*#?\s*(?P<index>\d{1,2})\b",
+    flags=re.I | re.S,
+)
+_SOURCE_LINK_FOLLOWUP_ORDINAL_RE = re.compile(
+    r"\b(?:summari[sz]e|explain|review|read|what\s+(?:does|is))\b.{0,120}?"
+    r"\b(?P<ordinal>first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
+    r"one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2}(?:st|nd|rd|th)?)"
+    r"\s+(?:link|source|url)\b",
+    flags=re.I | re.S,
+)
+_SOURCE_LINK_FOLLOWUP_WORD_INDEX_RE = re.compile(
+    r"\b(?:summari[sz]e|explain|review|read|what\s+(?:does|is))\b.{0,120}?"
+    r"\b(?:link|source|url)\s+(?P<word>one|two|three|four|five|six|seven|eight|nine|ten)\b",
+    flags=re.I | re.S,
+)
+_SOURCE_LINK_INDEX_WORDS = {
+    "first": 1,
+    "one": 1,
+    "second": 2,
+    "two": 2,
+    "third": 3,
+    "three": 3,
+    "fourth": 4,
+    "four": 4,
+    "fifth": 5,
+    "five": 5,
+    "sixth": 6,
+    "six": 6,
+    "seventh": 7,
+    "seven": 7,
+    "eighth": 8,
+    "eight": 8,
+    "ninth": 9,
+    "nine": 9,
+    "tenth": 10,
+    "ten": 10,
+}
+
+
+def _source_link_followup_index(text: str) -> int | None:
+    match = _SOURCE_LINK_FOLLOWUP_RE.search(text)
+    if match:
+        return int(match.group("index"))
+    match = _SOURCE_LINK_FOLLOWUP_ORDINAL_RE.search(text)
+    if match:
+        return _parse_source_link_index(match.group("ordinal"))
+    match = _SOURCE_LINK_FOLLOWUP_WORD_INDEX_RE.search(text)
+    if match:
+        return _parse_source_link_index(match.group("word"))
+    return None
+
+
+def _use_deterministic_source_link_followup(request: WorkflowRunRequest) -> bool:
+    return _source_link_followup_index(request.request_text or "") is not None
+
+
+def _parse_source_link_index(value: str) -> int | None:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized in _SOURCE_LINK_INDEX_WORDS:
+        return _SOURCE_LINK_INDEX_WORDS[normalized]
+    numeric = re.sub(r"(?:st|nd|rd|th)$", "", normalized)
+    if numeric.isdigit():
+        return int(numeric)
+    return None
+
+
+def _chief_source_link_followup_result(
+    work_item: WorkItem,
+    *,
+    request: WorkflowRunRequest,
+    store: SQLiteStore | None,
+    route: WorkItemRoute = WorkItemRoute.CHIEF_OF_STAFF,
+) -> WorkflowRunResult | None:
+    latest_request = latest_user_request(request.request_text or work_item.request_text)
+    index = _source_link_followup_index(latest_request)
+    if index is None:
+        return None
+    selected = _ordered_source_for_link_followup(
+        _source_refs_for_link_followup(work_item),
+        index=index,
+    )
+    if selected is None:
+        return None
+
+    summary_source = _read_source_for_link_followup(
+        selected,
+        request_text=latest_request,
+        live=request.live_search,
+    )
+    source_ref = _source_ref_with_link_followup_context(selected, summary_source)
+    human_summary = _render_chief_source_link_followup_summary(
+        source_ref,
+        index=index,
+        latest_request=latest_request,
+    )
+    artifact = WorkItemArtifactRef(
+        artifact_type="source_link_summary",
+        artifact_id=f"unsaved:{work_item.id}:source_link_followup:{index}",
+        source_agent=route.value,
+        approval_state=ApprovalState.PENDING.value,
+        title=f"Link {index} source summary",
+        summary=_compact_context_text(human_summary, max_chars=240),
+        metadata={
+            "workflow_type": "slack-article-review",
+            "slack_post_allowed": False,
+            "send_enabled": False,
+            "source_refs": [source_ref.model_dump(mode="json")],
+            "source_context_status": _source_context_status([source_ref]),
+            "deterministic_source_link_followup": True,
+            "latest_user_request": latest_request,
+        },
+    )
+    updated = attach_artifact(
+        work_item.model_copy(
+            update={
+                "last_agent": route.value,
+                "status": WorkItemStatus.DONE,
+                "confidence": max(work_item.confidence, 0.75),
+                "audit_notes": [
+                    *work_item.audit_notes,
+                    "Deterministic source-link follow-up summary executed.",
+                ],
+                "next_action": WorkItemNextAction(
+                    action="review_source_link_summary",
+                    agent=route,
+                    description="Review the read-only source-link summary.",
+                    requires_approval=False,
+                ),
+            }
+        ).touch(),
+        artifact,
+    )
+    _persist_artifact_and_event(
+        updated,
+        artifact,
+        summary=f"Attached {route.value} link {index} source summary.",
+        store=store,
+    )
+    return WorkflowRunResult(
+        work_item=updated,
+        route=route,
+        status=updated.status,
+        advanced=True,
+        artifact_refs=[artifact],
+        next_action=updated.next_action,
+        human_summary=human_summary,
+        audit_notes=["Deterministic source-link follow-up summary executed."],
+    )
+
+
+def _source_refs_for_link_followup(work_item: WorkItem) -> list[WorkItemSourceRef]:
+    """Return ordered URL-bearing sources available for narrow source follow-ups."""
+
+    refs: list[WorkItemSourceRef] = []
+    seen_urls: set[str] = set()
+
+    def add_ref(ref: WorkItemSourceRef) -> None:
+        url = str(ref.url or "").strip()
+        if not url or url in seen_urls:
+            return
+        seen_urls.add(url)
+        refs.append(ref)
+
+    for source in work_item.sources:
+        add_ref(source)
+    for artifact in work_item.artifact_refs:
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {}
+        source_refs = metadata.get("source_refs")
+        if not isinstance(source_refs, list):
+            continue
+        for raw_ref in source_refs:
+            ref = _work_item_source_ref_from_mapping(raw_ref)
+            if ref is not None:
+                add_ref(ref)
+    return refs
+
+
+def _work_item_source_ref_from_mapping(value: Any) -> WorkItemSourceRef | None:
+    if isinstance(value, WorkItemSourceRef):
+        return value
+    if not isinstance(value, dict):
+        return None
+    url = str(value.get("url") or "").strip()
+    if not url:
+        return None
+    key_facts = value.get("key_facts")
+    if not isinstance(key_facts, list):
+        key_facts = value.get("supported_claims")
+    if not isinstance(key_facts, list):
+        key_facts = []
+    supported_claim = str(
+        value.get("supported_claim")
+        or value.get("supported_signal")
+        or (key_facts[0] if key_facts else "")
+        or ""
+    ).strip()
+    return WorkItemSourceRef(
+        title=str(value.get("title") or "").strip(),
+        url=url,
+        source_type=str(value.get("source_type") or "").strip(),
+        source_id=str(value.get("source_id") or "").strip(),
+        supported_claim=supported_claim,
+        provider=str(value.get("provider") or "").strip(),
+        extraction_status=str(value.get("extraction_status") or "").strip(),
+        source_quality=str(value.get("source_quality") or "").strip(),
+        retrieved_at=str(value.get("retrieved_at") or "").strip(),
+        key_facts=[str(item) for item in key_facts[:5] if str(item or "").strip()],
+        evidence_excerpt=str(value.get("evidence_excerpt") or "").strip(),
+        zotero_key=str(value.get("zotero_key") or "").strip(),
+    )
+
+
+def _ordered_source_for_link_followup(
+    sources: list[WorkItemSourceRef],
+    *,
+    index: int,
+) -> WorkItemSourceRef | None:
+    if index < 1:
+        return None
+    url_sources = [source for source in sources if str(source.url or "").strip()]
+    slack_links = [source for source in url_sources if source.source_type == "slack_thread_link"]
+    ordered = slack_links or url_sources
+    if index > len(ordered):
+        return None
+    return ordered[index - 1]
+
+
+def _read_source_for_link_followup(
+    source: WorkItemSourceRef,
+    *,
+    request_text: str,
+    live: bool,
+) -> dict[str, Any]:
+    if not live or not source.url:
+        return {"status": "not_requested"}
+    return _read_chief_selected_source(source.url, request_text=request_text, live=live)
+
+
+def _source_ref_with_link_followup_context(
+    source: WorkItemSourceRef,
+    extracted: dict[str, Any],
+) -> WorkItemSourceRef:
+    title = str(extracted.get("title") or source.title or "").strip()
+    text = str(extracted.get("text_or_markdown") or "").strip()
+    evidence_excerpt = _compact_source_evidence_excerpt(text) if text else source.evidence_excerpt
+    extracted_claims = _source_claims_from_extracted_payload(extracted)
+    key_facts = (
+        _dedupe_source_facts(
+            [
+                *(extracted_claims[:4]),
+                *source.key_facts[:5],
+                *([evidence_excerpt[:500]] if evidence_excerpt else []),
+            ]
+        )
+        if extracted_claims or source.key_facts or evidence_excerpt
+        else list(source.key_facts[:5])
+    )
+    extracted_status = str(extracted.get("status") or "").strip()
+    status = (
+        source.extraction_status if extracted_status in {"", "not_requested"} else extracted_status
+    ) or "source_linked"
+    provider = str(extracted.get("provider") or source.provider or "slack")
+    supported_claim = source.supported_claim or _first_nonempty(source.key_facts)
+    return source.model_copy(
+        update={
+            "title": title or source.title,
+            "supported_claim": supported_claim[:500],
+            "provider": provider,
+            "extraction_status": status,
+            "retrieved_at": utc_now_iso(),
+            "key_facts": key_facts[:5],
+            "evidence_excerpt": evidence_excerpt[:1000],
+        }
+    )
+
+
+def _source_claims_from_extracted_payload(extracted: dict[str, Any]) -> list[str]:
+    raw_claims = extracted.get("claims")
+    if not isinstance(raw_claims, list):
+        return []
+    return _dedupe_source_facts(str(item) for item in raw_claims if str(item or "").strip())
+
+
+def _dedupe_source_facts(items: Iterable[str]) -> list[str]:
+    facts: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = " ".join(str(item or "").split()).strip()
+        if not value:
+            continue
+        normalized = value.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        facts.append(value[:500])
+        if len(facts) >= 5:
+            break
+    return facts
+
+
+def _render_chief_source_link_followup_summary(
+    source: WorkItemSourceRef,
+    *,
+    index: int,
+    latest_request: str,
+) -> str:
+    title = source.title or _source_domain_label(source.url) or f"Link {index}"
+    summary_points = _source_link_summary_points(source)
+    summary_paragraph = _source_link_summary_paragraph(source, summary_points)
+    source_note = source.supported_claim or _first_nonempty(summary_points)
+    lines = [
+        f"Link {index} summary: {title}",
+        "",
+        "*Answer:*",
+        f"Link {index} is {title}: {source.url}",
+        "",
+        "*Detailed Summary:*",
+        summary_paragraph,
+        "",
+        "Key source details:",
+        *[f"* {point}" for point in summary_points[:4]],
+        "",
+        "Use in this thread:",
+        (
+            "* Use this source as the cited basis for link-specific follow-up claims. "
+            "Do not broaden into a new topic brief unless the linked source is missing "
+            "or the operator asks for more research."
+        ),
+        (
+            "* Keep claims bounded to the read/extracted source text, source-provided "
+            "facts, and the visible Slack context."
+        ),
+        (
+            "* Extraction note: "
+            + (
+                "the page was read/extracted for this follow-up."
+                if source.evidence_excerpt and _work_item_source_ref_is_extracted(source)
+                else "the summary is limited to retrieved excerpts and Slack source context."
+            )
+        ),
+        "",
+        "Source evidence",
+        f"* {title}: {source.url} - {_first_sentence(source_note)}",
+        "",
+        "Recommended actions",
+        "* Use this source as the first citation for this thread's link-specific follow-up.",
+        "* Open or extract the full page before making detailed claims beyond the excerpt.",
+        "",
+        "*Metadata:*",
+        f"- Follow-up request: {latest_request[:300]}",
+        "- Search providers: not used for this narrow source follow-up",
+        f"- Source extraction status: {source.extraction_status or 'source_linked'}",
+    ]
+    return "\n".join(lines).strip()
+
+
+def _source_link_summary_points(source: WorkItemSourceRef) -> list[str]:
+    candidates = [
+        *source.key_facts,
+        *(_split_summary_sentences(source.evidence_excerpt) if source.evidence_excerpt else []),
+        source.supported_claim,
+    ]
+    points: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        value = " ".join(str(item or "").split()).strip()
+        if not value:
+            continue
+        normalized = value.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        points.append(value[:500])
+        if len(points) >= 5:
+            break
+    if points:
+        return points
+    return [
+        "No extracted source text was available; this summary is limited to the visible thread context."
+    ]
+
+
+def _source_link_summary_paragraph(source: WorkItemSourceRef, points: list[str]) -> str:
+    if not points:
+        return (
+            "The source did not include enough extracted text for a detailed source-data "
+            "summary, so the answer is limited to the URL and visible thread context."
+        )
+    first = _first_sentence(points[0])
+    if len(points) == 1:
+        return first
+    second = _first_sentence(points[1])
+    if len(points) == 2:
+        return f"{first} It also notes that {second[:1].lower() + second[1:] if second else second}"
+    third = _first_sentence(points[2])
+    return (
+        f"{first} It also notes that "
+        f"{second[:1].lower() + second[1:] if second else second} "
+        f"Taken together, the extracted source details add that "
+        f"{third[:1].lower() + third[1:] if third else third}"
+    ).strip()
+
+
+def _split_summary_sentences(text: str, *, limit: int = 4) -> list[str]:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", cleaned)
+    sentences = [part.strip() for part in parts if part.strip()]
+    if not sentences:
+        return [cleaned[:500]]
+    return sentences[:limit]
+
+
+def _source_domain_label(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    return parsed.netloc.replace("www.", "")
+
+
+def _first_nonempty(items: list[str]) -> str:
+    for item in items:
+        value = str(item or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _first_sentence(text: str, *, max_chars: int = 220) -> str:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return ""
+    match = re.search(r"(?<=[.!?])\s+", cleaned)
+    sentence = cleaned[: match.start()].strip() if match else cleaned
+    if len(sentence) <= max_chars:
+        return sentence
+    return sentence[: max_chars - 1].rstrip() + "..."
+
+
+def _chief_of_staff_source_candidates(output: Any) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    def add_candidate(
+        *,
+        title: str = "",
+        url: str = "",
+        note: str = "",
+        source_type: str = "",
+        provider: str = "",
+        source_id: str = "",
+    ) -> None:
+        cleaned_url = str(url or "").strip()
+        if not cleaned_url or cleaned_url in seen_urls:
+            return
+        seen_urls.add(cleaned_url)
+        candidates.append(
+            {
+                "title": str(title or "").strip(),
+                "url": cleaned_url,
+                "note": str(note or "").strip(),
+                "source_type": str(source_type or "").strip(),
+                "provider": str(provider or "").strip(),
+                "source_id": str(source_id or "").strip(),
+            }
+        )
+
+    for source in list(getattr(output, "sources", []) or [])[:8]:
+        add_candidate(
+            title=str(getattr(source, "title", "") or ""),
+            url=str(getattr(source, "url", "") or ""),
+            note=str(getattr(source, "note", "") or ""),
+            source_type=str(getattr(source, "source_type", "") or ""),
+        )
+
+    diagnostics = getattr(output, "retrieval_diagnostics", None)
+    if isinstance(diagnostics, dict):
+        samples = diagnostics.get("provider_result_samples")
+        if isinstance(samples, dict):
+            for provider, items in samples.items():
+                if not isinstance(items, list):
+                    continue
+                added_for_provider = 0
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    add_candidate(
+                        title=str(item.get("title") or ""),
+                        url=str(item.get("url") or ""),
+                        note=str(item.get("snippet") or ""),
+                        source_type=str(provider or ""),
+                        provider=str(provider or ""),
+                    )
+                    added_for_provider += 1
+                    if added_for_provider >= 2 or len(candidates) >= 8:
+                        break
+                if len(candidates) >= 8:
+                    break
+    return candidates[:8]
+
+
+def _read_chief_selected_source(
+    url: str,
+    *,
+    request_text: str,
+    live: bool,
+) -> dict[str, Any]:
+    try:
+        return read_linked_article_impl(
+            url,
+            request_text=request_text,
+            max_chars=4000,
+            live=live,
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "url": url,
+            "reason": redact_operator_text(str(exc), max_chars=240),
+        }
+
+
+def _compact_source_evidence_excerpt(text: str) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= 1000:
+        return cleaned
+    return cleaned[:997].rstrip() + "..."
+
+
+def _source_context_status(source_refs: list[WorkItemSourceRef]) -> dict[str, Any]:
+    extracted = [ref for ref in source_refs if _work_item_source_ref_is_extracted(ref)]
+    evidence = [ref for ref in source_refs if _work_item_source_ref_has_evidence(ref)]
+    return {
+        "selected_url_count": len(source_refs),
+        "extracted_url_count": len(extracted),
+        "evidence_url_count": len(evidence),
+        "snippet_only_url_count": max(len(evidence) - len(extracted), 0),
+        "statuses": [ref.extraction_status for ref in source_refs[:6]],
+    }
+
+
+def _work_item_source_ref_has_evidence(ref: WorkItemSourceRef) -> bool:
+    return bool(
+        ref.evidence_excerpt.strip()
+        or ref.supported_claim.strip()
+        or any(str(item or "").strip() for item in ref.key_facts)
+    )
+
+
+def _work_item_source_ref_is_extracted(ref: WorkItemSourceRef) -> bool:
+    status = ref.extraction_status.strip().lower()
+    return status in {
+        "success",
+        "extracted",
+        "read",
+        "extracted/read",
+        "article_read",
+        "page_read",
+    }
+
+
+def _recoverable_live_chief_of_staff_output_error(exc: BaseException) -> bool:
+    lowered = f"{type(exc).__name__} {exc}".lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "invalid json",
+            "json",
+            "modelbehaviorerror",
+            "parse",
+            "schema",
+            "validationerror",
+        )
+    )
+
+
+def _chief_of_staff_delegated_next_agent(
+    output_payload: dict[str, Any],
+    request_text: str,
+) -> WorkItemRoute | None:
+    route = output_payload.get("recommended_route")
+    workflow_type = ""
+    if isinstance(route, dict):
+        workflow_type = str(route.get("workflow_type") or "").strip().lower()
+    lower = str(request_text or "").lower()
+    if workflow_type in {"gmail-summary", "gmail-triage"}:
+        return WorkItemRoute.GMAIL_TRIAGE
+    if re.search(r"\b(?:gmail|email|inbox|thread)\b", lower) and re.search(
+        r"\b(?:read|find|search|summarize|summary|draft|reply)\b", lower
+    ):
+        return WorkItemRoute.GMAIL_TRIAGE
+    return None
 
 
 def _advance_research(
@@ -3762,7 +7195,9 @@ def _advance_research(
             ),
             store=store,
             route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
-            audit_notes=["Business Research blocked before live search because Slack context did not resolve the target."],
+            audit_notes=[
+                "Business Research blocked before live search because Slack context did not resolve the target."
+            ],
         )
     ready = research_ready(work_item)
     if not ready.ready:
@@ -3798,24 +7233,37 @@ def _advance_research(
 
     metadata: dict[str, object] = {}
     if request.live_search:
-        max_results = _effective_max_results(request)
+        quality_budget = business_research_quality_budget(
+            request_text=f"{request.request_text} {work_item.request_text}",
+            live_search=request.live_search,
+            cost_profile=request.cost_profile,
+        )
+        max_results = _quality_budgeted_max_results(request, quality_budget)
+        hosted_web_search_max_calls = _quality_budgeted_hosted_web_search_max_calls(
+            request,
+            quality_budget,
+        )
         query_builder = _business_research_query_builder_for_request(request)
         profile, metadata = retrieve_company_profile_live(
             company=target,
-            max_results=(
-                max(max_results, 8)
-                if query_builder is not None
-                else max_results
-            ),
+            request_text=request.request_text or work_item.request_text,
+            max_results=(max(max_results, 8) if query_builder is not None else max_results),
             query_builder=query_builder,
-            agents_web_search_max_calls=request.hosted_web_search_max_calls,
+            agents_web_search_max_calls=hosted_web_search_max_calls,
             agents_web_search_parallel=not _is_slack_conservative_cost_profile(request),
+            retrieval_hint=_retrieval_hint_for_request(request),
         )
-        audit_notes = ["Live company retrieval executed.", *metadata.get("debug_notes", [])]
+        audit_notes = [
+            "Live company retrieval executed.",
+            _quality_budget_audit_note(quality_budget),
+            *metadata.get("debug_notes", []),
+        ]
         if query_builder is not None:
             audit_notes.append(
                 "Current-activity query deepening was included in the initial retrieval pass."
             )
+        if _request_needs_broaden_or_deepen_repair(request):
+            audit_notes.append("Manager-loop repair requested bounded broader/deeper retrieval.")
     else:
         profile = research_company_fixture(company_name=target)
         audit_notes = ["Fixture company research executed; no live APIs were called."]
@@ -3831,7 +7279,11 @@ def _advance_research(
             work_item,
             metadata=metadata,
             cost_profile=request.cost_profile,
-            hosted_web_search_max_calls=request.hosted_web_search_max_calls,
+            hosted_web_search_max_calls=(
+                hosted_web_search_max_calls
+                if request.live_search
+                else request.hosted_web_search_max_calls
+            ),
             store=store,
         )
 
@@ -3860,7 +7312,8 @@ def _advance_research(
         metadata={
             "consulting_fit_score": profile.consulting_fit_score,
             "confidence_score": profile.confidence_score,
-            "source_refs": [source.model_dump(mode="json") for source in profile.sources[:8]],
+            "source_refs": [source.model_dump(mode="json") for source in source_refs[:8]],
+            "source_context_status": _source_context_status(source_refs[:8]),
             "retrieval_diagnostics": metadata.get("retrieval_diagnostics"),
         },
     )
@@ -3931,7 +7384,7 @@ def _advance_research(
             store=store,
         )
     result_artifacts = [artifact, *([contact_artifact] if contact_artifact is not None else [])]
-    return WorkflowRunResult(
+    result = WorkflowRunResult(
         work_item=work_item,
         route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
         status=work_item.status,
@@ -3950,6 +7403,25 @@ def _advance_research(
         ),
         audit_notes=audit_notes,
     )
+    user_facing_summary = _business_research_artifact_user_facing_summary(
+        result,
+        request_text=request.request_text or work_item.request_text,
+    )
+    if user_facing_summary:
+        return result.model_copy(
+            update={
+                "human_summary": user_facing_summary,
+                "audit_notes": list(
+                    dict.fromkeys(
+                        [
+                            *result.audit_notes,
+                            "Deterministic business research source-backed summary rendered.",
+                        ]
+                    )
+                ),
+            }
+        )
+    return result
 
 
 def _business_research_query_builder_for_request(
@@ -3959,9 +7431,13 @@ def _business_research_query_builder_for_request(
     request_text = raw_request_text.lower()
     if _is_slack_conservative_cost_profile(request):
         return _slack_conservative_company_research_query_builder(request)
-    if not re.search(
-        r"\b(?:2026|current|recent|latest|this year|what .* doing|activity|update|roadmap)\b",
-        request_text,
+    broaden_or_deepen_repair = _request_needs_broaden_or_deepen_repair(request)
+    if (
+        not re.search(
+            r"\b(?:2026|current|recent|latest|right now|this year|what .* doing|activity|update|roadmap)\b",
+            request_text,
+        )
+        and not broaden_or_deepen_repair
     ):
         return None
     focus_terms = _request_focus_terms_for_search(latest_user_request(raw_request_text))
@@ -4002,7 +7478,25 @@ def _business_research_query_builder_for_request(
             f"site:crunchbase.com/organization {normalized_company}",
             f"site:linkedin.com/company {normalized_company} hiring 2026",
         ]
-        return list(dict.fromkeys([*focus_queries, *current_activity_queries, *base_queries]))
+        repair_queries = (
+            [
+                f"{normalized_company} independent coverage funding partnership product 2026",
+                f"{normalized_company} customer case study validation healthcare 2026",
+                f"{normalized_company} clinical validation partnership behavioral health 2026",
+                f"{normalized_company} investors funding valuation healthcare 2026",
+                f"{normalized_company} press release partnership launch 2026",
+                f"site:news.crunchbase.com {normalized_company} 2026",
+                f"site:healthcareitnews.com {normalized_company} 2026",
+                f"site:beckershospitalreview.com {normalized_company} 2026",
+            ]
+            if broaden_or_deepen_repair
+            else []
+        )
+        return list(
+            dict.fromkeys(
+                [*repair_queries, *focus_queries, *current_activity_queries, *base_queries]
+            )
+        )
 
     return build_queries
 
@@ -4134,25 +7628,52 @@ def _request_focus_terms_for_search(text: str, *, max_terms: int = 5) -> list[st
 
     stopwords = {
         "about",
+        "around",
+        "backed",
         "between",
+        "brief",
+        "business",
+        "clear",
+        "deep",
+        "deeper",
+        "detailed",
         "could",
         "details",
         "doing",
+        "draft",
         "focus",
+        "give",
+        "keystone",
+        "links",
         "look",
         "need",
         "other",
         "please",
+        "publish",
         "recent",
+        "relevance",
+        "relevant",
         "research",
+        "right",
+        "schedule",
+        "search",
+        "send",
+        "seems",
+        "source",
+        "source-backed",
+        "sources",
         "specific",
         "still",
+        "summarize",
         "there",
         "these",
         "this",
         "want",
         "what",
         "with",
+        "write",
+        "analyst",
+        "read-only",
     }
     terms: list[str] = []
     for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9-]{3,}\b", str(text or "")):
@@ -4486,6 +8007,7 @@ def _advance_zotero_article_research(
                 ),
                 live=True,
                 session=sdk_session,
+                tool_tier="deep_retrieval" if source_context else "web_search",
             )
         except Exception as exc:
             blocker = WorkItemBlocker(
@@ -4635,6 +8157,16 @@ def _advance_opportunity(
         else planned_topic or request_text or work_item.request_text or work_item.target.name
     )
     topic = normalize_target_text(topic_input, WorkItemRoute.OPPORTUNITY_SCOUT)
+    combined_request_text = f"{request.request_text} {work_item.request_text} {topic}"
+    formal_opportunity_request = _is_formal_opportunity_request(
+        combined_request_text,
+        manual_request_plan=request.manual_request_plan,
+    )
+    source_context_required = _request_requires_selected_web_source_context(
+        combined_request_text,
+        manual_request_plan=request.manual_request_plan,
+    )
+    stop_after_opportunity_packet = _request_stops_after_opportunity_packet(combined_request_text)
     work_item = work_item.model_copy(
         update={
             "target": work_item.target.model_copy(update={"name": topic, "object_type": "topic"}),
@@ -4647,6 +8179,28 @@ def _advance_opportunity(
 
     metadata: dict[str, object] = {}
     if request.live_search:
+        quality_budget = opportunity_scout_quality_budget(
+            request_text=combined_request_text,
+            live_search=request.live_search,
+            cost_profile=request.cost_profile,
+            formal_opportunity=formal_opportunity_request,
+            source_context_required=source_context_required,
+        )
+        max_results = _quality_budgeted_max_results(
+            request,
+            quality_budget,
+            preserve_requested_count=True,
+        )
+        hosted_web_search_max_calls = _quality_budgeted_hosted_web_search_max_calls(
+            request,
+            quality_budget,
+        )
+        verify_source_pages = (
+            formal_opportunity_request
+            or source_context_required
+            or quality_budget.enable_page_verification
+        )
+
         def record_planner_cost(sdk_result: Any) -> None:
             if store is None:
                 return
@@ -4664,7 +8218,7 @@ def _advance_opportunity(
         search_plan = (
             resolve_opportunity_search_plan(
                 topic,
-                desired_count=_effective_max_results(request),
+                desired_count=max_results,
                 live=bool(request.live_sdk),
                 planner_context=_specialist_orchestrator_context_text(request, work_item),
                 cost_callback=record_planner_cost,
@@ -4674,12 +8228,26 @@ def _advance_opportunity(
         )
         scout_result, metadata = run_opportunity_scout_live(
             topic=topic,
-            max_results=_effective_max_results(request),
+            max_results=max_results,
             search_plan=search_plan,
+            agents_web_search_max_calls=hosted_web_search_max_calls,
+            agents_web_search_parallel=not _is_slack_conservative_cost_profile(request),
+            retrieval_hint=_retrieval_hint_for_request(request),
+            verify_source_pages=verify_source_pages,
         )
-        audit_notes = ["Live opportunity retrieval executed.", *metadata.get("debug_notes", [])]
+        audit_notes = [
+            "Live opportunity retrieval executed.",
+            _quality_budget_audit_note(quality_budget),
+            *metadata.get("debug_notes", []),
+        ]
+        if verify_source_pages:
+            audit_notes.append(
+                "Selected source page verification was enabled for this Opportunity Scout run."
+            )
         if search_plan is not None:
             audit_notes.append("Opportunity Scout used the named-agent live search planning path.")
+        if _request_needs_broaden_or_deepen_repair(request):
+            audit_notes.append("Manager-loop repair requested bounded broader/deeper retrieval.")
         retrieval_memory_id = _persist_retrieval_tool_memory(
             metadata,
             object_id=f"work_item_opportunity_scout:{topic}",
@@ -4692,7 +8260,7 @@ def _advance_opportunity(
                 work_item,
                 metadata=metadata,
                 cost_profile=request.cost_profile,
-                hosted_web_search_max_calls=request.hosted_web_search_max_calls,
+                hosted_web_search_max_calls=hosted_web_search_max_calls,
                 store=store,
                 agent_name=WorkItemRoute.OPPORTUNITY_SCOUT.value,
             )
@@ -4774,6 +8342,37 @@ def _advance_opportunity(
             store=store,
         )
 
+    if formal_opportunity_request:
+        filtered_result, formal_gate_notes = _apply_formal_opportunity_result_gates(
+            scout_result,
+            request_text=combined_request_text,
+        )
+        if formal_gate_notes:
+            scout_result = filtered_result
+            audit_notes.extend(formal_gate_notes)
+        if store is not None:
+            record_event(
+                work_item,
+                event_type="opportunity_candidate_gates_applied",
+                actor=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                summary="Applied formal-opportunity exact-match gates.",
+                metadata={
+                    "schema": "keystone.opportunity_candidate_gates.v1",
+                    "formal_opportunity_request": True,
+                    "retained_record_count": len(scout_result.records),
+                    "filtered_candidate_count": len(scout_result.filtered_candidates),
+                    "review_candidate_count": len(scout_result.review_candidates),
+                    "gates": [
+                        "formal_opportunity_type_evidence",
+                        "deadline_or_timing_evidence",
+                        "source_url",
+                        "sponsor",
+                        "keystone_applicability_evidence",
+                    ],
+                },
+                store=store,
+            )
+
     saved_ids: list[str] = []
     if store is not None:
         saved_ids = [str(item_id) for item_id in store.save_opportunity_scout_result(scout_result)]
@@ -4796,6 +8395,7 @@ def _advance_opportunity(
                 "opportunity_type": record.opportunity_type,
                 "recommended_next_step": record.recommended_next_step,
                 "source_refs": [ref.model_dump(mode="json") for ref in record_source_refs],
+                "source_context_status": _source_context_status(record_source_refs),
                 "retrieval_diagnostics": metadata.get("retrieval_diagnostics"),
             },
         )
@@ -4803,13 +8403,13 @@ def _advance_opportunity(
         work_item = attach_artifact(work_item, artifact)
 
     if not artifacts:
-        if _is_strict_role_recency_search(topic):
+        if _is_strict_role_recency_search(topic) or formal_opportunity_request:
             next_action = WorkItemNextAction(
                 action="broaden_opportunity_search",
                 agent=WorkItemRoute.OPPORTUNITY_SCOUT,
                 description=(
-                    "Relax one hard filter, such as role title, fractional/advisory "
-                    "status, remote/U.S. verification, or the recency window, then rerun."
+                    "Relax one hard filter, such as formal opportunity type, deadline "
+                    "evidence, sponsor/source requirements, or the recency window, then rerun."
                 ),
             )
             work_item = work_item.model_copy(
@@ -4828,6 +8428,7 @@ def _advance_opportunity(
                         "the requested hard filters."
                     ),
                     metadata={
+                        "formal_opportunity_request": formal_opportunity_request,
                         "filtered_candidate_count": len(scout_result.filtered_candidates),
                         "review_candidate_count": len(scout_result.review_candidates),
                         "constraint_relaxation_suggestion": (
@@ -4870,12 +8471,24 @@ def _advance_opportunity(
             "audit_notes": [*work_item.audit_notes, *audit_notes],
             "next_action": WorkItemNextAction(
                 action="review_opportunities",
-                agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
-                description=(
-                    "Review the opportunity records and run company research for any "
-                    "priority target."
+                agent=(
+                    WorkItemRoute.OPPORTUNITY_SCOUT
+                    if stop_after_opportunity_packet
+                    else WorkItemRoute.BUSINESS_RESEARCH_ANALYST
                 ),
-                command_hint=f"keystone work-items advance {work_item.id}",
+                description=(
+                    "Review the opportunity packet without downstream specialist handoff."
+                    if stop_after_opportunity_packet
+                    else (
+                        "Review the opportunity records and run company research for any "
+                        "priority target."
+                    )
+                ),
+                command_hint=(
+                    ""
+                    if stop_after_opportunity_packet
+                    else f"keystone work-items advance {work_item.id}"
+                ),
             ),
         }
     )
@@ -4887,7 +8500,7 @@ def _advance_opportunity(
             summary=f"Attached opportunity for {artifact.title}.",
             store=store,
         )
-    return WorkflowRunResult(
+    result = WorkflowRunResult(
         work_item=work_item,
         route=WorkItemRoute.OPPORTUNITY_SCOUT,
         status=work_item.status,
@@ -4899,6 +8512,25 @@ def _advance_opportunity(
         ),
         audit_notes=audit_notes,
     )
+    user_facing_summary = _opportunity_artifact_user_facing_summary(
+        result,
+        request_text=combined_request_text,
+    )
+    if user_facing_summary:
+        return result.model_copy(
+            update={
+                "human_summary": user_facing_summary,
+                "audit_notes": list(
+                    dict.fromkeys(
+                        [
+                            *result.audit_notes,
+                            "Deterministic opportunity source-backed summary rendered.",
+                        ]
+                    )
+                ),
+            }
+        )
+    return result
 
 
 def _opportunity_no_exact_match_human_summary(scout_result: OpportunityScoutResult) -> str:
@@ -4927,7 +8559,9 @@ def _opportunity_no_exact_match_human_summary(scout_result: OpportunityScoutResu
     if rendered == 0:
         lines.append("- No adjacent source-backed candidates were strong enough to list.")
     if scout_result.constraint_relaxation_suggestion:
-        lines.extend(["", "Constraint to relax next:", f"- {scout_result.constraint_relaxation_suggestion}"])
+        lines.extend(
+            ["", "Constraint to relax next:", f"- {scout_result.constraint_relaxation_suggestion}"]
+        )
     lines.extend(
         [
             "",
@@ -4935,6 +8569,224 @@ def _opportunity_no_exact_match_human_summary(scout_result: OpportunityScoutResu
         ]
     )
     return "\n".join(lines).strip()
+
+
+def _apply_formal_opportunity_result_gates(
+    scout_result: OpportunityScoutResult,
+    *,
+    request_text: str,
+) -> tuple[OpportunityScoutResult, list[str]]:
+    requested_kinds = _requested_formal_opportunity_kinds(request_text)
+    if not requested_kinds:
+        return scout_result, []
+
+    retained_records: list[ScoutOpportunityRecord] = []
+    gate_filtered: list[FilteredOpportunityCandidate] = []
+    for record in scout_result.records:
+        reasons = _formal_opportunity_record_gate_failures(record, requested_kinds)
+        if reasons:
+            gate_filtered.append(_filtered_opportunity_candidate_from_record(record, reasons))
+        else:
+            retained_records.append(record)
+    if not gate_filtered:
+        existing_filtered_count = len(scout_result.filtered_candidates)
+        review_candidate_count = len(scout_result.review_candidates)
+        if existing_filtered_count or review_candidate_count:
+            return scout_result, [
+                (
+                    "Formal-opportunity exact-match gates evaluated "
+                    f"{len(retained_records)} retained record(s); retrieval already carried "
+                    f"{existing_filtered_count} filtered candidate(s) and "
+                    f"{review_candidate_count} review candidate(s)."
+                )
+            ]
+        return scout_result, [
+            (
+                "Formal-opportunity exact-match gates evaluated "
+                f"{len(retained_records)} retained record(s) and filtered no candidates."
+            )
+        ]
+
+    relaxation = scout_result.constraint_relaxation_suggestion
+    if not retained_records and not relaxation:
+        relaxation = (
+            "Relax one exact-match requirement: formal opportunity type, deadline/timing "
+            "evidence, visible sponsor, source URL, or Keystone applicability evidence."
+        )
+    filtered_result = scout_result.model_copy(
+        update={
+            "records": retained_records,
+            "review_candidates": [*scout_result.review_candidates, *gate_filtered],
+            "constraint_relaxation_suggestion": relaxation,
+            "audit_notes": [
+                *scout_result.audit_notes,
+                (
+                    "Formal-opportunity gates filtered adjacent candidates that lacked "
+                    "requested type, timing, sponsor, source, or Keystone applicability evidence."
+                ),
+            ],
+        }
+    )
+    return filtered_result, [
+        (
+            "Formal-opportunity exact-match gates retained "
+            f"{len(retained_records)} record(s), moved {len(gate_filtered)} record candidate(s) "
+            f"to review, and final packet carried {len(filtered_result.filtered_candidates)} "
+            f"filtered candidate(s) and {len(filtered_result.review_candidates)} review "
+            "candidate(s)."
+        )
+    ]
+
+
+def _requested_formal_opportunity_kinds(request_text: str) -> set[str]:
+    lower = str(request_text or "").lower()
+    kinds: set[str] = set()
+    if re.search(r"\b(?:grants?|nofo|foa|rfa|funding opportunity|award)\b", lower):
+        kinds.add("grant")
+    if re.search(r"\b(?:rfps?|request\s+for\s+proposals?|solicitations?|procurement)\b", lower):
+        kinds.add("rfp")
+    if re.search(r"\b(?:pilot(?:s| programs?)?|demonstrations?|challenge)\b", lower):
+        kinds.add("pilot")
+    if re.search(r"\b(?:call[- ]for[- ]proposals?|calls?\s+for\s+proposals|cfps?)\b", lower):
+        kinds.add("call_for_proposals")
+    if re.search(r"\bcalls?\s+for\s+applications\b", lower):
+        kinds.add("call_for_applications")
+    return kinds
+
+
+def _formal_opportunity_record_gate_failures(
+    record: ScoutOpportunityRecord,
+    requested_kinds: set[str],
+) -> list[str]:
+    failures: list[str] = []
+    if not str(record.company_name or "").strip() or record.company_name == "Unknown company":
+        failures.append("missing visible sponsor")
+    if not any(str(source.url or "").strip() for source in record.sources):
+        failures.append("missing source URL")
+    if not _record_has_requested_formal_opportunity_type(record, requested_kinds):
+        failures.append("missing requested grant/RFP/pilot/call-for-proposals evidence")
+    if not _record_has_formal_opportunity_timing(record):
+        failures.append("missing deadline or explicit timing evidence")
+    if _record_has_formal_opportunity_negative_evidence(record):
+        failures.append("source evidence says this is not a concrete funding/RFP/pilot opportunity")
+    if not _record_has_keystone_applicability(record):
+        failures.append(
+            "missing Keystone/company applicant, vendor, partner, or action-path evidence"
+        )
+    return failures
+
+
+def _record_has_requested_formal_opportunity_type(
+    record: ScoutOpportunityRecord,
+    requested_kinds: set[str],
+) -> bool:
+    evidence_text = _formal_opportunity_evidence_text(record)
+    opportunity_type = str(record.opportunity_type or "").lower()
+    checks = {
+        "grant": (
+            r"\b(?:grant|nofo|foa|rfa|funding opportunity|award opportunity|sbir|sttr)\b",
+            evidence_text,
+        ),
+        "rfp": (
+            r"\b(?:rfp|request\s+for\s+proposals?|solicitation|procurement|sam\.gov)\b",
+            f"{evidence_text} {opportunity_type}",
+        ),
+        "pilot": (
+            r"\b(?:pilot|demonstration|innovation challenge|challenge program)\b",
+            evidence_text,
+        ),
+        "call_for_proposals": (
+            r"\b(?:call\s+for\s+proposals|cfp|proposal submissions?)\b",
+            evidence_text,
+        ),
+        "call_for_applications": (
+            r"\b(?:call\s+for\s+applications|applications?\s+open)\b",
+            evidence_text,
+        ),
+    }
+    for kind in requested_kinds:
+        pattern, text = checks.get(kind, ("", ""))
+        if pattern and re.search(pattern, text, flags=re.I):
+            return True
+    return False
+
+
+def _record_has_formal_opportunity_timing(record: ScoutOpportunityRecord) -> bool:
+    if str(record.role_posted_at or "").strip():
+        return True
+    return bool(_FORMAL_OPPORTUNITY_TIMING_RE.search(_formal_opportunity_evidence_text(record)))
+
+
+def _record_has_formal_opportunity_negative_evidence(record: ScoutOpportunityRecord) -> bool:
+    return bool(
+        _FORMAL_OPPORTUNITY_NEGATIVE_EVIDENCE_RE.search(_formal_opportunity_evidence_text(record))
+    )
+
+
+def _record_has_keystone_applicability(record: ScoutOpportunityRecord) -> bool:
+    evidence_text = _formal_opportunity_evidence_text(record)
+    if not _KEYSTONE_APPLICABILITY_RE.search(evidence_text):
+        return False
+    disqualifying_markers = (
+        "academic institutions only",
+        "nonprofits only",
+        "government agencies only",
+        "individual applicants only",
+        "not open to companies",
+        "not open to for-profit",
+        "for-profit entities are not eligible",
+    )
+    lower = evidence_text.lower()
+    return not any(marker in lower for marker in disqualifying_markers)
+
+
+def _formal_opportunity_evidence_text(record: ScoutOpportunityRecord) -> str:
+    parts: list[str] = [
+        record.company_name,
+        record.why_now_signal,
+        record.recommended_next_step,
+        record.keystone_fit_reason,
+        record.score_rationale,
+        *record.source_signals,
+        *record.missing_evidence,
+        *record.weak_evidence_reasons,
+    ]
+    for source in record.sources:
+        parts.extend([source.title, source.url, source.source_type, source.supported_signal])
+    for bundle in record.source_bundles:
+        parts.extend(
+            [
+                bundle.summary,
+                bundle.source_category,
+                *bundle.missing_evidence,
+                *bundle.weak_evidence_reasons,
+                *bundle.recommended_next_actions,
+            ]
+        )
+        parts.extend(signal.signal_text for signal in bundle.signals)
+        for source in bundle.sources:
+            parts.extend([source.title, source.url, source.source_type, source.supported_signal])
+    return " ".join(str(part or "") for part in parts)
+
+
+def _filtered_opportunity_candidate_from_record(
+    record: ScoutOpportunityRecord,
+    reasons: list[str],
+) -> FilteredOpportunityCandidate:
+    source = record.sources[0] if record.sources else None
+    return FilteredOpportunityCandidate(
+        company_name=record.company_name or "Unknown company",
+        entity_kind=record.entity_kind or "",
+        source_category=str(source.source_type if source is not None else ""),
+        source_title=str(source.title if source is not None else record.company_name),
+        source_url=str(source.url if source is not None else ""),
+        role_title=record.role_title,
+        role_location=record.role_location,
+        role_remote=record.role_remote,
+        role_country=record.role_country,
+        reasons=reasons,
+        role_filter_notes=list(record.role_filter_notes),
+    )
 
 
 def _is_strict_role_recency_search(topic: str) -> bool:
@@ -5009,7 +8861,9 @@ def _opportunity_source_summary_result(
                 ),
             ]
     matching = [
-        candidate for candidate in candidates if _source_candidate_matches_terms(candidate, required_terms)
+        candidate
+        for candidate in candidates
+        if _source_candidate_matches_terms(candidate, required_terms)
     ]
     if not matching:
         rejected_titles = [
@@ -5148,8 +9002,7 @@ def _fixture_source_summary_candidates(
 
 def _source_summary_intro(candidates: list[dict[str, object]]) -> str:
     fixture_only = bool(candidates) and all(
-        str(candidate.get("source_id") or "").startswith("fixture:")
-        for candidate in candidates
+        str(candidate.get("source_id") or "").startswith("fixture:") for candidate in candidates
     )
     if fixture_only:
         return (
@@ -5163,7 +9016,9 @@ def _source_summary_intro(candidates: list[dict[str, object]]) -> str:
     )
 
 
-def _source_candidate_matches_terms(candidate: dict[str, object], required_terms: list[str]) -> bool:
+def _source_candidate_matches_terms(
+    candidate: dict[str, object], required_terms: list[str]
+) -> bool:
     if not required_terms:
         return True
     text = _source_candidate_text(candidate)
@@ -5244,6 +9099,10 @@ def _work_item_source_ref_from_company_source(source) -> WorkItemSourceRef:
         )
     claims = list(getattr(source, "supported_claims", []) or [])
     source_id = str(getattr(source, "source_id", "") or "")
+    evidence_excerpt = str(getattr(source, "evidence_excerpt", "") or "")
+    extraction_status = (
+        "extracted" if evidence_excerpt.strip() else "snippet_only" if claims else ""
+    )
     return WorkItemSourceRef(
         title=str(getattr(source, "title", "") or ""),
         url=str(getattr(source, "url", "") or ""),
@@ -5254,10 +9113,11 @@ def _work_item_source_ref_from_company_source(source) -> WorkItemSourceRef:
             source_id,
             str(getattr(source, "source_type", "") or ""),
         ),
-        extraction_status="extracted" if claims else "",
+        extraction_status=extraction_status,
         source_quality=quality_label,
         retrieved_at=utc_now_iso(),
         key_facts=claims[:5],
+        evidence_excerpt=evidence_excerpt[:1200],
         zotero_key=_zotero_item_key(source_id),
     )
 
@@ -5274,6 +9134,10 @@ def _work_item_source_ref_from_opportunity_source(source) -> WorkItemSourceRef:
     source_id = str(getattr(source, "source_id", "") or "")
     source_type = str(getattr(source, "source_type", "") or "")
     supported_signal = str(getattr(source, "supported_signal", "") or "")
+    evidence_excerpt = str(getattr(source, "evidence_excerpt", "") or "")
+    extraction_status = (
+        "extracted" if evidence_excerpt.strip() else "snippet_only" if supported_signal else ""
+    )
     return WorkItemSourceRef(
         title=str(getattr(source, "title", "") or ""),
         url=str(getattr(source, "url", "") or ""),
@@ -5281,10 +9145,11 @@ def _work_item_source_ref_from_opportunity_source(source) -> WorkItemSourceRef:
         source_id=source_id,
         supported_claim=supported_signal,
         provider=_provider_from_source_id_or_type(source_id, source_type),
-        extraction_status="opportunity_source",
+        extraction_status=extraction_status,
         source_quality=quality_label,
         retrieved_at=utc_now_iso(),
         key_facts=[supported_signal] if supported_signal else [],
+        evidence_excerpt=evidence_excerpt[:1000],
         zotero_key=_zotero_item_key(source_id),
     )
 
@@ -5504,6 +9369,8 @@ def _advance_outreach(
     request: WorkflowRunRequest,
     store: SQLiteStore | None,
 ) -> WorkflowRunResult:
+    effective_request_text = _effective_work_item_request_text(request, work_item)
+    request = request.model_copy(update={"request_text": effective_request_text})
     if store is None:
         blocker = WorkItemBlocker(
             code="outreach_requires_saved_artifacts",
@@ -5527,6 +9394,17 @@ def _advance_outreach(
         request=request,
         store=store,
     )
+    gmail_thread_context = _latest_gmail_thread_summary_for_outreach(work_item, store=store)
+    if (
+        looks_like_thread_local_draft_request(request.request_text)
+        or gmail_thread_context is not None
+    ) and not selected_artifacts(work_item, "company_profile"):
+        return _advance_thread_local_outreach_draft(
+            work_item,
+            request=request,
+            store=store,
+            gmail_thread_context=gmail_thread_context,
+        )
     ready = drafting_ready(work_item)
     if not ready.ready:
         return _blocked_result(
@@ -5663,13 +9541,389 @@ def _advance_outreach(
     )
 
 
+def _latest_gmail_thread_summary_for_outreach(
+    work_item: WorkItem,
+    *,
+    store: SQLiteStore,
+) -> GmailThreadSummaryResult | None:
+    gmail_refs = [
+        artifact
+        for artifact in work_item.artifact_refs
+        if artifact.artifact_type == "gmail_triage_report"
+    ]
+    for artifact in reversed(gmail_refs):
+        try:
+            run_id = int(str(artifact.artifact_id))
+        except (TypeError, ValueError):
+            continue
+        with store.connect() as connection:
+            row = connection.execute(
+                "SELECT output_json FROM agent_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            continue
+        try:
+            payload = json.loads(str(row["output_json"] or "{}"))
+        except json.JSONDecodeError:
+            continue
+        summary_payload = payload.get("thread_summary_result")
+        if not isinstance(summary_payload, dict):
+            threads = payload.get("threads")
+            if isinstance(threads, list) and threads and isinstance(threads[0], dict):
+                summary_payload = threads[0]
+        if not isinstance(summary_payload, dict):
+            continue
+        try:
+            return GmailThreadSummaryResult.model_validate(summary_payload)
+        except ValueError:
+            continue
+    return None
+
+
+def _advance_thread_local_outreach_draft(
+    work_item: WorkItem,
+    *,
+    request: WorkflowRunRequest,
+    store: SQLiteStore,
+    gmail_thread_context: GmailThreadSummaryResult | None = None,
+) -> WorkflowRunResult:
+    draft = _thread_local_outreach_draft(
+        request.request_text,
+        gmail_thread_context=gmail_thread_context,
+    )
+    thread_context_lines = _thread_local_email_context_lines(gmail_thread_context)
+    boundary_summary = "Slack-thread-only draft; no Gmail draft created and no send performed."
+    recipient_email = _gmail_thread_recipient_email_address(gmail_thread_context)
+    draft_id = str(store.save_outreach_draft(draft))
+    artifact = WorkItemArtifactRef(
+        artifact_type="outreach_draft",
+        artifact_id=draft_id,
+        source_agent=WorkItemRoute.OUTREACH_COMPOSER.value,
+        approval_state=ApprovalState.PENDING.value,
+        title=draft.email_subject,
+        summary=draft.personalization_rationale[:240],
+        selected=True,
+        metadata={
+            "artifact_subtype": "thread_local_email_draft",
+            "thread_local_slack_draft": True,
+            "canonical_draft_copy": True,
+            "email_subject": draft.email_subject,
+            "recipient_email": recipient_email,
+            "thread_context_lines": thread_context_lines,
+            "boundary_summary": boundary_summary,
+            "cost_tracking_requested": request.cost_tracking_requested,
+            "gmail_draft_created": False,
+            "send_enabled": False,
+            "external_write_performed": False,
+            "approval_queue_created": False,
+            "style_profile_id": draft.style_profile_id,
+        },
+    )
+    work_item = attach_artifact(work_item, artifact)
+    work_item = work_item.model_copy(
+        update={
+            "last_agent": WorkItemRoute.OUTREACH_COMPOSER.value,
+            "next_action": None,
+            "audit_notes": [
+                *work_item.audit_notes,
+                (
+                    "Thread-local Outreach Composer draft created without approved "
+                    "CompanyProfile because no external delivery, Gmail draft, or provider "
+                    "write was requested."
+                ),
+            ],
+        }
+    )
+    work_item = work_item.model_copy(update={"status": derive_case_status(work_item)}).touch()
+    _persist_artifact_and_event(
+        work_item,
+        artifact,
+        summary="Attached thread-local Outreach Composer draft.",
+        store=store,
+    )
+    summary = _format_outreach_draft_work_item_summary(
+        draft,
+        company_name=draft.company_name,
+        compact_thread_local=gmail_thread_context is not None,
+        gmail_thread_context=gmail_thread_context,
+        cost_tracking_requested=request.cost_tracking_requested,
+    )
+    return WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.OUTREACH_COMPOSER,
+        status=work_item.status,
+        advanced=True,
+        artifact_refs=[artifact],
+        next_action=work_item.next_action,
+        human_summary=summary,
+        audit_notes=work_item.audit_notes[-1:],
+    )
+
+
+def _thread_local_outreach_draft(
+    request_text: str,
+    *,
+    gmail_thread_context: GmailThreadSummaryResult | None = None,
+) -> OutreachDraft:
+    target = (
+        _thread_local_draft_target_from_gmail(gmail_thread_context)
+        if gmail_thread_context is not None
+        else _thread_local_draft_target(request_text)
+    )
+    subject = f"Re: {target}" if target else "Re: your note"
+    if gmail_thread_context is not None and gmail_thread_context.subject:
+        subject = _reply_subject(gmail_thread_context.subject)
+    body = _thread_local_draft_body(gmail_thread_context)
+    rationale = (
+        "Thread-local reply drafted from a read-only Gmail Triage thread summary "
+        "using the operator default writing style. No Gmail draft or external send "
+        "was performed."
+        if gmail_thread_context is not None
+        else (
+            "Thread-local placeholder reply in the operator default style. Gmail "
+            "thread content or approved source-backed context was not available to "
+            "the Outreach Composer, so no recipient-specific factual claims were used."
+        )
+    )
+    blocked_facts = (
+        []
+        if gmail_thread_context is not None
+        else [
+            "Gmail thread body was not available to the Outreach Composer.",
+            "Recipient-specific claims require thread context or approved source-backed context.",
+        ]
+    )
+    source_ids = (
+        [f"gmail_thread:{gmail_thread_context.thread_id}"]
+        if gmail_thread_context is not None and gmail_thread_context.thread_id
+        else []
+    )
+    unsupported = (
+        []
+        if gmail_thread_context is not None
+        else ["No recipient-specific facts were used because source context was unavailable."]
+    )
+    return OutreachDraft(
+        company_name=target or "Gmail thread",
+        outreach_goal=_compact_outreach_summary_text(request_text)[:500],
+        email_subject=subject[:140],
+        email_body=body,
+        personalization_rationale=rationale,
+        blocked_facts=blocked_facts,
+        source_ids_used=source_ids,
+        style_profile_used=True,
+        style_profile_id="operator_default_writing_style",
+        revision_request=request_text,
+        approved_context_used=False,
+        unsupported_claims_flagged=unsupported,
+    )
+
+
+def _thread_local_draft_body(gmail_thread_context: GmailThreadSummaryResult | None) -> str:
+    if gmail_thread_context is None:
+        return "\n\n".join(
+            [
+                "Hi [Name],",
+                (
+                    "Thanks for reaching out. This sounds useful. I can take a look "
+                    "and follow up with any relevant context."
+                ),
+                "Sincerely,\nAnup",
+            ]
+        )
+    greeting_name = _gmail_thread_recipient_first_name(gmail_thread_context)
+    ask = _gmail_thread_reply_focus(gmail_thread_context)
+    if ask:
+        middle = (
+            f"Thanks for reaching out. I saw your note about {ask}. "
+            "I can take a look and follow up."
+        )
+    else:
+        detail = _gmail_thread_acknowledgement_detail(gmail_thread_context)
+        middle = (
+            f"Thanks for reaching out{detail}. "
+            "I can take a look and follow up if there is a useful fit."
+        )
+    body = "\n\n".join(
+        [
+            f"Hi {greeting_name}," if greeting_name else "Hi,",
+            middle,
+            "Sincerely,\nAnup",
+        ]
+    )
+    return body
+
+
+def _gmail_thread_acknowledgement_detail(
+    gmail_thread_context: GmailThreadSummaryResult,
+) -> str:
+    context = " ".join(
+        [
+            gmail_thread_context.subject,
+            gmail_thread_context.summary,
+            gmail_thread_context.thread_context,
+            " ".join(message.summary for message in gmail_thread_context.messages),
+            " ".join(message.snippet for message in gmail_thread_context.messages),
+        ]
+    ).lower()
+    if "halo" in context and (
+        "partner listing" in context
+        or "partnering request" in context
+        or "active request" in context
+    ):
+        return " and for the overview of Halo's partner listings and active requests"
+    if "halo" in context:
+        return " and for the overview of Halo"
+    if "profile" in context and ("guide" in context or "quick-start" in context):
+        return " and for the profile guidance"
+    return ""
+
+
+def _gmail_thread_reply_focus(gmail_thread_context: GmailThreadSummaryResult) -> str:
+    candidates = [
+        *gmail_thread_context.open_questions,
+        *gmail_thread_context.action_items,
+        gmail_thread_context.subject,
+        gmail_thread_context.summary,
+        gmail_thread_context.thread_context,
+    ]
+    for candidate in candidates:
+        value = _compact_outreach_summary_text(candidate)
+        if value and _usable_reply_focus(value):
+            value = value[:120].rstrip(" .")
+            if value.endswith("?"):
+                question = value[:-1].strip()
+                can_match = re.match(r"can\s+(.+?)\s+(.+)", question, flags=re.I)
+                if can_match:
+                    value = f"whether {can_match.group(1)} can {can_match.group(2)}"
+                else:
+                    value = "whether " + question[:1].lower() + question[1:]
+            return value
+    return ""
+
+
+def _usable_reply_focus(value: str) -> bool:
+    lowered = str(value or "").lower()
+    if len(lowered) > 110 and not lowered.endswith("?"):
+        return False
+    weak_markers = (
+        "our platform makes it easy",
+        "start by creating",
+        "welcome to",
+        "click here",
+        "unsubscribe",
+        "privacy policy",
+        "terms of service",
+    )
+    return not any(marker in lowered for marker in weak_markers)
+
+
+def _gmail_thread_recipient_first_name(gmail_thread_context: GmailThreadSummaryResult) -> str:
+    for participant in gmail_thread_context.participants:
+        if "wisegrow05" in participant.lower() or "anup" in participant.lower():
+            continue
+        name = re.sub(r"<[^>]+>", "", participant).strip().strip('"')
+        name = name.split()[0] if name else ""
+        name = re.sub(r"[^A-Za-z'-]", "", name)
+        if name:
+            return name[:40]
+    for message in gmail_thread_context.messages:
+        if "wisegrow05" in message.sender_email.lower() or "anup" in message.sender_name.lower():
+            continue
+        name = (
+            re.sub(r"[^A-Za-z'-]", "", message.sender_name.split()[0])
+            if message.sender_name
+            else ""
+        )
+        if name:
+            return name[:40]
+    return ""
+
+
+def _gmail_thread_recipient_email_address(
+    gmail_thread_context: GmailThreadSummaryResult | None,
+) -> str:
+    if gmail_thread_context is None:
+        return ""
+    for message in gmail_thread_context.messages:
+        email = _clean_recipient_email_address(message.sender_email)
+        if email:
+            return email
+    for participant in gmail_thread_context.participants:
+        _name, email = parseaddr(participant)
+        email = _clean_recipient_email_address(email)
+        if email:
+            return email
+    return ""
+
+
+def _clean_recipient_email_address(value: str) -> str:
+    email = parseaddr(str(value or "").strip())[1] or str(value or "").strip()
+    email = email.strip().strip("<>")
+    if not email or "@" not in email:
+        return ""
+    lowered = email.lower()
+    if "wisegrow05" in lowered or lowered.startswith("anup@"):
+        return ""
+    return email[:160]
+
+
+def _thread_local_draft_target_from_gmail(
+    gmail_thread_context: GmailThreadSummaryResult | None,
+) -> str:
+    if gmail_thread_context is None:
+        return "Gmail thread"
+    participants = [item for item in gmail_thread_context.participants if item.strip()]
+    for participant in participants:
+        if "wisegrow05" not in participant.lower() and "anup" not in participant.lower():
+            return _compact_outreach_summary_text(participant)[:80]
+    return _compact_outreach_summary_text(gmail_thread_context.subject)[:80] or "Gmail thread"
+
+
+def _reply_subject(subject: str) -> str:
+    clean = _compact_outreach_summary_text(subject)
+    if not clean:
+        return "Re: your note"
+    return clean if clean.lower().startswith("re:") else f"Re: {clean}"
+
+
+def _thread_local_draft_target(request_text: str) -> str:
+    text = str(request_text or "")
+    for pattern in (
+        r"\b(?:from|to|for)\s+([A-Z][A-Za-z0-9& ._-]{1,60})\b",
+        r"\b([A-Z][A-Za-z0-9&._-]{1,40})\s+(?:gmail|email|thread)\b",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;")
+            if candidate and candidate.lower() not in {"the", "current", "this"}:
+                return candidate[:80]
+    return "Gmail thread"
+
+
 def _format_outreach_draft_work_item_summary(
     draft: OutreachDraft,
     *,
     company_name: str,
+    compact_thread_local: bool = False,
+    gmail_thread_context: GmailThreadSummaryResult | None = None,
+    cost_tracking_requested: bool = False,
 ) -> str:
     subject = _compact_outreach_summary_text(draft.email_subject) or "Untitled draft"
     body = str(draft.email_body or "").strip()
+    if compact_thread_local:
+        recipient_email = _gmail_thread_recipient_email_address(gmail_thread_context)
+        lines = [
+            f"Heading: Draft email for {company_name}",
+            "",
+            f"To: {recipient_email or 'Unknown email address'}",
+            f"Subject: {subject}",
+            "",
+            "Body:",
+            body or "No email body was generated.",
+        ]
+        return "\n".join(lines).strip()
     rationale = _compact_outreach_summary_text(draft.personalization_rationale)
     source_ids = [
         _compact_outreach_summary_text(source_id)
@@ -5688,6 +9942,11 @@ def _format_outreach_draft_work_item_summary(
         lines.extend(["", f"Rationale: {rationale}"])
     if source_ids:
         lines.extend(["", f"Source IDs used: {', '.join(source_ids)}"])
+    if draft.blocked_facts:
+        lines.extend(["", "Missing or blocked context:"])
+        lines.extend(
+            f"- {_compact_outreach_summary_text(item)}" for item in draft.blocked_facts[:3]
+        )
     lines.extend(
         [
             "",
@@ -5696,10 +9955,51 @@ def _format_outreach_draft_work_item_summary(
                 "review; no external message was sent, no Gmail draft was created, and "
                 "no external save/post/write was performed."
             ),
-            "Next safe step: review the draft approval item before any external use.",
+            (
+                "Next safe step: review the thread-local draft in Slack; approve separately "
+                "before any external use."
+            )
+            if draft.style_profile_id == "operator_default_writing_style"
+            and "thread-local" in draft.personalization_rationale.lower()
+            else "Next safe step: review the draft approval item before any external use.",
         ]
     )
     return "\n".join(lines).strip()
+
+
+def _thread_local_email_context_lines(
+    gmail_thread_context: GmailThreadSummaryResult | None,
+) -> list[str]:
+    if gmail_thread_context is None:
+        return []
+    subject = _compact_outreach_summary_text(gmail_thread_context.subject)
+    sender = _gmail_thread_recipient_first_name(gmail_thread_context)
+    latest = _compact_outreach_summary_text(gmail_thread_context.latest_received_at)
+    message_count = gmail_thread_context.message_count
+    read_bits: list[str] = []
+    if message_count:
+        read_bits.append(f"{message_count} message")
+    if subject:
+        read_bits.append(f"subject '{subject}'")
+    if sender:
+        read_bits.append(f"from {sender}")
+    if latest:
+        read_bits.append(f"latest {latest}")
+    lines: list[str] = []
+    if read_bits:
+        lines.append(f"- Read: {', '.join(read_bits)}.")
+    direct_items = [
+        _compact_outreach_summary_text(item)
+        for item in [*gmail_thread_context.open_questions, *gmail_thread_context.action_items]
+        if _compact_outreach_summary_text(item)
+    ]
+    if direct_items:
+        lines.append(f"- Triage: direct ask/action detected: {direct_items[0][:140]}")
+    else:
+        lines.append(
+            "- Triage: no direct question or personal action item detected; drafted a generic acknowledgement."
+        )
+    return lines
 
 
 def _compact_outreach_summary_text(value: Any) -> str:
@@ -6021,8 +10321,7 @@ def _compose_outreach_draft_for_work_item(
                 recent_signal=opportunity_record.rationale if opportunity_record else "",
                 outreach_goal=objective,
                 approved_context=(
-                    _specialist_orchestrator_context_text(request, work_item)
-                    + "\n\n"
+                    _specialist_orchestrator_context_text(request, work_item) + "\n\n"
                     "Approved source-backed WorkItem outreach context:\n"
                     f"{json.dumps(jsonable(context), ensure_ascii=True, sort_keys=True)}"
                 ),

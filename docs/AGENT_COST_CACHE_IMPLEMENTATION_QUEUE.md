@@ -462,7 +462,7 @@ Next Slack test pass condition:
   Slack cost-controlled profiles:
   `slack_context_light`, `slack_manager_balanced`,
   `slack_research_balanced`, `slack_opportunity_balanced`, or
-  `slack_research_deep`.
+  `slack_opportunity_deep`, or `slack_research_deep`.
 - The WorkItem SDK section should show `Models: gpt-5.4-mini`; a non-mini
   OpenAI model should now appear as a diagnosis warning.
 - If it does not, inspect the child process environment and the Slack bridge
@@ -529,6 +529,15 @@ agent:
   12 targeted SearXNG queries for current company/topic evidence.
 - `slack_opportunity_balanced`: Opportunity Scout. Hosted cap 2 to allow broader
   opportunity/source discovery.
+- `slack_opportunity_deep`: Opportunity Scout for formal grant, RFP, pilot, or
+  call-for-proposals searches. Hosted cap 4 and one manager repair pass allowed
+  when review fails. Formal opportunity runs also enable capped source-page
+  verification so Trafilatura can extract selected candidate pages, Crawl4AI can
+  serve as the preferred local/heavier extraction fallback, and Firecrawl is used
+  only after local extraction is insufficient or explicitly configured. Tavily
+  should be reserved for bounded precision retry/deepening, not broad fanout
+  across every SearXNG query. Apify and Browserless remain out of this path until
+  their live adapters, safety gates, and tests are reviewed.
 - `slack_research_deep`: explicit `more research`, `run again`, contact, email,
   LinkedIn, or similar deepening requests. Hosted cap 2 and manager repair
   allowed.

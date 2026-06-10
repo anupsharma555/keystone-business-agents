@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.decision_trace import DecisionTrace
@@ -343,6 +344,7 @@ class OrchestratorResult(BaseModel):
     forbidden_actions: list[str] = Field(default_factory=lambda: ["send_email"])
     intended_handoffs: list[HandoffSpec] = Field(default_factory=list)
     retrieval_hint: RetrievalHint | None = None
+    retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
     artifacts: OrchestratorArtifacts = Field(default_factory=OrchestratorArtifacts)
     state_context_used: bool = False
     workflow_state_summary: OrchestratorWorkflowStateSummary = Field(

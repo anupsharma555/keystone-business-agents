@@ -59,6 +59,7 @@ from keystone_agents.schemas.outreach import (
     default_follow_up_date,
 )
 from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
+from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.tools.approval_tool import create_approval_queue_item
 from keystone_agents.tools.email_style_tool import (
     DEFAULT_EMAIL_STYLE_PROFILE,
@@ -1419,15 +1420,21 @@ def build_outreach_composer_agent(
     model: str | None = None,
     *,
     include_tools: bool = True,
+    request_text: str = "",
+    include_all_skills: bool = False,
 ) -> Agent:
     """Build the outreach composer agent."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "outreach_composer.md",
+        skill_files=select_agent_skill_names(
+            "outreach_composer",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     return build_sdk_agent(
         name="outreach_composer",
@@ -1485,15 +1492,24 @@ def build_outreach_composer_agent(
     )
 
 
-def build_outreach_composer_compact_synthesis_agent(model: str | None = None) -> Agent:
+def build_outreach_composer_compact_synthesis_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+    include_all_skills: bool = False,
+) -> Agent:
     """Build a compact structured-output outreach agent for constrained providers."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "outreach_composer.md",
+        skill_files=select_agent_skill_names(
+            "outreach_composer",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     instructions = "\n\n".join(
         [
@@ -1522,15 +1538,24 @@ def build_outreach_composer_compact_synthesis_agent(model: str | None = None) ->
     )
 
 
-def build_outreach_composer_compact_variant_agent(model: str | None = None) -> Agent:
+def build_outreach_composer_compact_variant_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+    include_all_skills: bool = False,
+) -> Agent:
     """Build a compact one-call outreach variant-set agent."""
 
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "outreach_composer.md",
+        skill_files=select_agent_skill_names(
+            "outreach_composer",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     instructions = "\n\n".join(
         [
@@ -1587,7 +1612,11 @@ def run_outreach_composer_sdk(
         )
 
     return run_typed_sdk_agent(
-        agent=build_outreach_composer_agent(model=model, include_tools=include_tools),
+        agent=build_outreach_composer_agent(
+            model=model,
+            include_tools=include_tools,
+            request_text=skill_request_text(typed_input),
+        ),
         typed_input=typed_input,
         output_type=OutreachDraft,
         run_config=run_config,

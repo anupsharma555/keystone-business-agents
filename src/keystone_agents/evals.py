@@ -45,6 +45,40 @@ AGENT_PROMPT_FILES: dict[str, tuple[str, ...]] = {
     "outreach": ("keystone_profile.md", "outreach_composer.md"),
 }
 
+CHECK_SKILL_LABELS: dict[str, tuple[str, ...]] = {
+    "source_attribution": ("evidence_attribution_and_claim_mapping",),
+    "no_hallucinated_facts": (
+        "evidence_attribution_and_claim_mapping",
+        "unsupported_claim_and_gap_handling",
+    ),
+    "no_unsupported_claims": ("unsupported_claim_and_gap_handling",),
+    "unsupported_claims_min": ("unsupported_claim_and_gap_handling",),
+    "unsupported_claim_explanations": ("unsupported_claim_and_gap_handling",),
+    "no_auto_send": ("action_boundary_enforcement",),
+    "approval_required": ("context_permission_gating", "action_boundary_enforcement"),
+    "approval_status": ("context_permission_gating",),
+    "approved_context_used": ("context_permission_gating",),
+    "source_ids_used": ("evidence_attribution_and_claim_mapping",),
+    "facts_used": ("evidence_attribution_and_claim_mapping",),
+    "risk_flag_correctness": ("gmail_triage_specialist_contracts",),
+    "draft_quality": ("gmail_triage_specialist_contracts", "action_boundary_enforcement"),
+    "category_correctness": ("gmail_triage_specialist_contracts",),
+    "needs_reply_correctness": ("gmail_triage_specialist_contracts",),
+    "priority_score": ("opportunity_scout_specialist_contracts",),
+    "outside_consulting_likelihood": ("opportunity_scout_specialist_contracts",),
+    "score_breakdown": ("opportunity_scout_specialist_contracts",),
+    "duplicate_state_skip": ("prior_work_and_duplicate_checking",),
+    "unique_companies": ("identity_and_record_resolution",),
+    "ranking_quality": ("opportunity_scout_specialist_contracts",),
+    "record_count": ("opportunity_scout_specialist_contracts",),
+    "copy_required_terms": ("outreach_composer_specialist_contracts",),
+    "copy_forbidden_terms": ("outreach_composer_specialist_contracts",),
+    "tone": ("outreach_composer_specialist_contracts",),
+    "email_concision": ("outreach_composer_specialist_contracts",),
+    "linkedin_concision": ("outreach_composer_specialist_contracts",),
+    "no_em_dashes": ("structured_output_quality_review",),
+}
+
 
 @dataclass(frozen=True)
 class EvalCheck:
@@ -52,6 +86,7 @@ class EvalCheck:
     passed: bool
     score: float
     message: str = ""
+    skill_labels: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,6 +94,7 @@ class EvalCheck:
             "passed": self.passed,
             "score": self.score,
             "message": self.message,
+            "skill_labels": list(self.skill_labels),
         }
 
 
@@ -70,10 +106,14 @@ class EvalScore:
     checks: list[EvalCheck] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        skill_labels = sorted(
+            {label for check in self.checks for label in check.skill_labels if str(label).strip()}
+        )
         return {
             "agent": self.agent,
             "score": self.score,
             "passed": self.passed,
+            "skill_labels": skill_labels,
             "checks": [check.to_dict() for check in self.checks],
         }
 
@@ -90,12 +130,16 @@ class EvalCaseResult:
     prompt_metadata: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        skill_labels = sorted(
+            {label for check in self.checks for label in check.skill_labels if str(label).strip()}
+        )
         return {
             "id": self.case_id,
             "dataset": self.dataset,
             "agent": self.agent,
             "score": self.score,
             "passed": self.passed,
+            "skill_labels": skill_labels,
             "checks": [check.to_dict() for check in self.checks],
             "observed": self.observed,
             "prompt_metadata": self.prompt_metadata,
@@ -132,6 +176,15 @@ class EvalSuiteResult:
             "failed": self.failed,
             "average_score": self.average_score,
             "datasets": sorted({result.dataset for result in self.results}),
+            "skill_labels": sorted(
+                {
+                    label
+                    for result in self.results
+                    for check in result.checks
+                    for label in check.skill_labels
+                    if str(label).strip()
+                }
+            ),
             "prompt_metadata": _unique_prompt_metadata(self.results),
             "results": [result.to_dict() for result in self.results],
         }
@@ -213,6 +266,8 @@ def generate_eval_report(summary: EvalSuiteResult | Mapping[str, Any]) -> str:
     ]
     if data.get("datasets"):
         lines.append(f"- Datasets: {', '.join(data['datasets'])}")
+    if data.get("skill_labels"):
+        lines.append(f"- Skill labels: {', '.join(data['skill_labels'])}")
     if data.get("prompt_metadata"):
         prompt_refs = [metadata["reference"] for metadata in data["prompt_metadata"]]
         lines.append(f"- Prompt versions: {', '.join(prompt_refs)}")
@@ -232,7 +287,9 @@ def generate_eval_report(summary: EvalSuiteResult | Mapping[str, Any]) -> str:
         for check in result.get("checks", []):
             check_status = "pass" if check.get("passed") else "fail"
             message = f": {check.get('message')}" if check.get("message") else ""
-            lines.append(f"- {check_status} `{check.get('name')}`{message}")
+            labels = ", ".join(check.get("skill_labels", []))
+            label_text = f" [{labels}]" if labels else ""
+            lines.append(f"- {check_status} `{check.get('name')}`{label_text}{message}")
     return "\n".join(lines)
 
 
@@ -631,7 +688,26 @@ def _score_outreach(observed: Mapping[str, Any], expected: Mapping[str, Any]) ->
 
 
 def _check(name: str, passed: bool, message: str = "") -> EvalCheck:
-    return EvalCheck(name=name, passed=passed, score=1.0 if passed else 0.0, message=message)
+    return EvalCheck(
+        name=name,
+        passed=passed,
+        score=1.0 if passed else 0.0,
+        message=message,
+        skill_labels=_skill_labels_for_check(name),
+    )
+
+
+def _skill_labels_for_check(name: str) -> tuple[str, ...]:
+    labels = CHECK_SKILL_LABELS.get(name)
+    if labels is not None:
+        return labels
+    if name.startswith("all_handoff") or name == "state_action":
+        return ("workflow_lifecycle_tracking", "handoff_contract_packaging")
+    if name.endswith("_range") or name in {"fit_score_plausibility", "confidence_score"}:
+        return ("structured_output_quality_review",)
+    if name in {"source_recency", "research_completeness"}:
+        return ("business_research_specialist_contracts",)
+    return ("structured_output_quality_review",)
 
 
 def _exact(name: str, observed: Any, expected: Any) -> EvalCheck:

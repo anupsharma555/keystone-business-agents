@@ -2237,11 +2237,7 @@ class SQLiteStore:
             output = _json_dict(row["output_json"])
             sdk_cost = output.get("_sdk_cost")
             regular_cost = output.get("cost")
-            cost = (
-                dict(sdk_cost)
-                if isinstance(sdk_cost, Mapping)
-                else _json_dict(sdk_cost)
-            ) or (
+            cost = (dict(sdk_cost) if isinstance(sdk_cost, Mapping) else _json_dict(sdk_cost)) or (
                 dict(regular_cost)
                 if isinstance(regular_cost, Mapping)
                 else _json_dict(regular_cost)

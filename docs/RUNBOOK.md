@@ -4,6 +4,8 @@ This is the short operator runbook. The fuller local-first deployment guide is `
 
 Default posture: dry-run first, draft-only, approval required, no PHI, no auto-send, and no secrets in the repo.
 
+For publishing local changes to GitHub, use `docs/GITHUB_UPDATE_RUNBOOK.md`.
+
 ## Local Setup
 
 ```bash
@@ -41,10 +43,15 @@ The live research ladder is:
 - `SearXNG` for broad recall when no explicit provider override is set.
 - `Agents hosted web search` as a capped parallel lane beside SearXNG for
   default live research.
-- `Serper` only when explicitly selected for a specific run.
+- `Exa` as a capped semantic deepening lane and explicit Exa-first provider.
+- `Tavily` as a capped deeper-research lane for explicit deeper-search,
+  provider-comparison, formal opportunity, or breadth-oriented runs.
+- `Serper` is disabled while API credits are unavailable and must not run unless
+  `KEYSTONE_SERPER_ENABLED=true` is deliberately restored.
 - `Firecrawl` as an explicit search provider when configured, and as an
   optional website extractor for selected company pages.
 - `Trafilatura` as the default live-gated website extractor.
+- `Crawl4AI` as an optional local/heavier selected-page extraction fallback.
 - `Apify` or `Browserless` only as future structured-enrichment candidates;
   current live operations are placeholders and do not execute.
 - `Sandbox` only as a later second-pass reviewer over staged retrieval and
@@ -388,11 +395,18 @@ Gmail send, create a background job, create a CRM task, or authorize outbound co
 
 ## Live Search Providers
 
-Search defaults to `SEARCH_PROVIDER=dry-run`, which never makes network calls. Live company
-research and opportunity scouting should use SearXNG plus a capped Agents hosted
-web-search lane for routine discovery, and Trafilatura for selected-page
-extraction. Serper remains available only when explicitly selected for a
-specific run.
+Search defaults to `SEARCH_PROVIDER=dry-run`, which never makes network calls.
+Live company research, opportunity scouting, and Chief of Staff search
+diagnostics use the shared `search_web` provider policy. Routine discovery uses
+SearXNG plus capped Agents hosted web search. Exa is configured as the capped
+semantic deepening lane, and Tavily is reached for explicit deeper-search or
+provider-comparison prompts when `TAVILY_API_KEY` is present. Trafilatura,
+Firecrawl, and Crawl4AI are secondary extraction providers for selected URLs
+after discovery. Serper remains disabled until credits are restored.
+
+The current architecture diagram lives at
+`docs/assets/web-search-agent-architecture.svg`, with a rendered PNG export at
+`docs/assets/web-search-agent-architecture.png`.
 
 ```bash
 export SEARCH_PROVIDER=searxng
@@ -400,6 +414,9 @@ export SEARXNG_BASE_URL="http://127.0.0.1:18080"
 export KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK=true
 export KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL=true
 export KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN=2
+export KEYSTONE_EXA_SEARCH_FALLBACK=true
+export KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2
+export KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2
 export KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true
 export KEYSTONE_WEBSITE_EXTRACTOR=trafilatura
 export KEYSTONE_AGENT_HTML_REVIEW=true
@@ -453,6 +470,16 @@ but Business Agents child runners load this repo's `.env` and should use
 Business Agents runs; let the child runner report search diagnostics if the
 Business Agents endpoint is unavailable.
 
+For Exa-first comparison, set `SEARCH_PROVIDER=exa` or pass
+`--search-provider exa`. For normal multi-lane searches, leave
+`SEARCH_PROVIDER=searxng`; Exa is selected by the shared deepening policy and is
+capped by `KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN`.
+
+For Tavily-first comparison, set `SEARCH_PROVIDER=tavily` or pass
+`--search-provider tavily`. For normal multi-lane searches, leave
+`SEARCH_PROVIDER=searxng`; explicit deeper-search/provider-comparison prompts
+can trigger capped Tavily deepening when `TAVILY_API_KEY` is configured.
+
 For Firecrawl search, set `SEARCH_PROVIDER=firecrawl`, `FIRECRAWL_API_KEY`, and
 optionally `FIRECRAWL_BASE_URL`, or pass `--search-provider firecrawl`.
 
@@ -475,14 +502,16 @@ The fallback does not bypass input safety guardrails. If a query is blocked as s
 stops before trying the backup provider. Search-provider outputs are checked per result; unsafe
 individual hits are dropped instead of failing the whole search run.
 
-Live search is implemented for Researcher company-research paths and opportunity scouting. It requires
-`--live-search --no-dry-run` and provider configuration. Use small result counts first and
-preserve source attribution. The shared `SearchProvider` supports dry-run, SearXNG,
-Agents hosted web search, Serper, Firecrawl, and Tavily. The deterministic
-retrieval ladder defaults to SearXNG plus a capped Agents hosted web-search lane
-when no explicit provider is selected; an explicit `--search-provider` uses that provider first, and
-`--fallback-search-provider` can recover from provider configuration or provider response errors
-without bypassing input guardrails.
+Live search is implemented through the shared provider contract for
+search-capable agents. It requires live flags and provider configuration. Use
+small result counts first and preserve source attribution. The shared
+`SearchProvider` supports dry-run, SearXNG, Agents hosted web search, Exa,
+Firecrawl, and Tavily. Serper is present but disabled until credits are restored.
+The deterministic retrieval ladder defaults to SearXNG plus capped Agents hosted
+web search; explicit deeper-search/provider-comparison requests force the capped
+Exa/Tavily deepening lanes when configured. An explicit `--search-provider` uses
+that provider first, and `--fallback-search-provider` can recover from provider
+configuration or provider response errors without bypassing input guardrails.
 
 Opportunity Scout live search is provider-gated: dry-run providers are rejected in live mode,
 results are normalized into source bundles, duplicate source URLs and duplicate companies are
@@ -509,6 +538,20 @@ Run `scripts/run_search_coverage_eval.py` against
 useful websites. This eval measures source-lane and expected-domain recall; use
 browser extraction evals only after URLs have already been discovered.
 
+Exa is free-tier aware. The current operating assumption is 1,000 credits per
+month. Set `EXA_SERVICE_API_KEY` plus either `EXA_API_KEY_ID` or
+`EXA_API_KEY_NAME=default` so the Friday API usage automation can resolve usage
+through Exa's admin API. The local estimate is reported against
+`KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT`, and the dashboard remains the
+authoritative balance source.
+
+```bash
+export EXA_API_KEY_NAME=default
+export KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT=1000
+export KEYSTONE_EXA_SEARCH_FALLBACK=true
+export KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2
+```
+
 Tavily is budget-aware when used as a provider or fallback. Keystone requests
 `include_usage=true` and records provider-reported credits when present; if a
 response omits usage, it estimates search credits from `TAVILY_SEARCH_DEPTH`
@@ -520,6 +563,7 @@ export TAVILY_SEARCH_DEPTH=basic
 export KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT=1000
 export KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT=850
 export KEYSTONE_TAVILY_CREDIT_ENFORCEMENT=warn
+export KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2
 ```
 
 The default `warn` mode does not block retrieval. Set
@@ -527,19 +571,123 @@ The default `warn` mode does not block retrieval. Set
 prevent additional Tavily requests. Budget context appears in retrieval metadata
 as `tavily_credit_budget` and provider usage includes `credits_used`.
 
+Slack Chief of Staff runs render backend provider diagnostics in the `*Metadata:*`
+section when search telemetry is available:
+
+- `Search query`: exact query text passed to the search provider layer.
+- `Search providers`: provider summary for the run.
+- `Search attempted`: providers that actually ran.
+- `Search used`: providers that returned successful results.
+- `Search lane status`: primary lane status for SearXNG, Agents web search,
+  Exa, and Tavily.
+- `Provider usage`: request counts, result counts, and reported credits.
+- `Provider top results`: representative top result URLs/snippets by provider.
+- `Search errors`: provider-level errors, if any.
+
+For the validated deeper-search diagnostics prompt on June 9, 2026, the expected
+metadata shape was:
+
+```text
+Search query: measurement-based care digital psychiatry pilot RFP behavioral health AI
+Search providers: searxng+agents-web-search+exa+tavily
+Search attempted: searxng, agents-web-search, exa, tavily
+Search used: searxng, agents-web-search, exa, tavily
+Search lane status: agents-web-search: used; exa: used; searxng: used; tavily: used
+Provider top results: searxng/exa/tavily/agents-web-search representative URLs
+```
+
+Slack-facing research/search answers should follow the shared posting rules:
+`Answer` first, then a richer `Detailed Summary` when useful, then `Terms`,
+`Recommended actions`, `Suggested route`, and `Metadata` last. The detailed
+summary should be detailed enough for Slack, usually a concise paragraph plus
+bullets, and should include visible source links for external facts. The
+canonical rule file is `src/keystone_agents/prompts/slack-posting-rules.md`; it
+is included in the shared pre-run prompt context for all agents through
+`compose_instructions()`.
+
+Manual Slack diagnostics prompts should request both provider metadata and the
+actual search output in a consistent format. Use precise queries and require
+provider-separated results so recall/precision comparisons are inspectable:
+
+```text
+@KNI chief of staff "Run a read-only web search diagnostics test.
+Query: <exact query>.
+Search mode: <simple | deeper provider comparison | extraction follow-up>.
+Return this exact output shape:
+1. Search query used.
+2. Provider result table with columns: provider, attempted, used, top URLs, result count, credit count, error.
+3. Best result per provider with title, URL, and one-sentence relevance note.
+4. Provider comparison: which lane improved recall, which improved precision, and what first-pass search missed.
+5. Metadata section with search providers, lane status, provider usage, and errors.
+Do not draft, send, publish, schedule, write files, or post elsewhere."
+```
+
+For deeper-search comparison tests, include wording such as "deeper search",
+"provider comparison", "improved recall", or "improved precision"; the SDK
+retrieval policy treats this as a signal to attempt capped Exa/Tavily deepening
+when configured.
+
+Queued Slack provider validation set:
+
+1. Simple first-pass search. Expected behavior: SearXNG plus Agents hosted web
+   search should run; Exa/Tavily may remain `configured_not_attempted` unless the
+   quality gate or prompt requests deepening.
+
+   ```text
+   @KNI chief of staff "Run a read-only web search diagnostics test.
+   Query: measurement-based care psychiatry digital pilot behavioral health.
+   Search mode: simple.
+   Return Answer, Detailed Summary, Terms, and Metadata. In Detailed Summary, explain what the query is about and list the top 3 source URLs with one-sentence relevance notes. In Metadata, report search query, providers attempted, providers used, lane status, provider usage, provider top results, and errors. Do not draft, send, publish, schedule, write files, or post elsewhere."
+   ```
+
+2. Deeper provider comparison. Expected behavior: SearXNG, Agents hosted web
+   search, Exa, and Tavily should all be attempted when configured.
+
+   ```text
+   @KNI chief of staff "Run a read-only deeper search diagnostics test.
+   Query: measurement-based care digital psychiatry pilot RFP behavioral health AI.
+   Search mode: deeper provider comparison with improved recall and improved precision.
+   Return Answer, Detailed Summary, Terms, Recommended actions, and Metadata. In Detailed Summary, compare what first-pass search found versus what Exa or Tavily added. Include visible source URLs. In Metadata, report search query, providers attempted, providers used, lane status, provider usage, provider top results, and errors. Do not draft, send, publish, schedule, write files, or post elsewhere."
+   ```
+
+3. Precision-oriented named-entity search. Expected behavior: Exa should help
+   semantic precision if configured; Tavily should run only if the deepening
+   policy triggers.
+
+   ```text
+   @KNI chief of staff "Run a read-only provider diagnostics comparison.
+   Query: CalMHSA SmartCare measurement based care integration behavioral health RFP.
+   Search mode: precision comparison.
+   Return Answer, Detailed Summary, Terms, and Metadata. Explain CalMHSA, SmartCare, RFP, and measurement-based care in Terms. Show provider-separated top URLs and say which lane improved precision. Do not draft, send, publish, schedule, write files, or post elsewhere."
+   ```
+
+4. Extraction follow-up. Expected behavior: search providers discover candidate
+   URLs first; extraction providers should be reported as attempted only if the
+   agent actually selected pages for reading and extraction is enabled.
+
+   ```text
+   @KNI chief of staff "Run a read-only web/document retrieval diagnostics test.
+   Query: official behavioral health AI procurement RFP measurement based care pilot.
+   Search mode: extraction follow-up after primary discovery.
+   Return Answer, Detailed Summary, Source evidence, Terms, and Metadata. In Detailed Summary, identify the best official or primary URLs and say whether selected-page extraction was attempted, skipped, or unavailable. In Metadata, report search providers, provider top results, extraction provider status if available, and errors. Do not draft, send, publish, schedule, write files, or post elsewhere."
+   ```
+
 Website extraction is a separate live-gated enrichment step for selected company pages. Enable it
 only when needed:
 
 ```bash
 export KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true
 export KEYSTONE_WEBSITE_EXTRACTOR=trafilatura
-export KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=firecrawl
+export KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=crawl4ai
 export FIRECRAWL_API_KEY="..."
 ```
 
-Trafilatura is the default extractor. Firecrawl can be selected with
-`KEYSTONE_WEBSITE_EXTRACTOR=firecrawl` or used as a fallback. Extracted page text is converted
-into source-backed claim candidates; it is not a generic crawl or outbound action.
+Trafilatura is the default extractor. Crawl4AI can be selected with
+`KEYSTONE_WEBSITE_EXTRACTOR=crawl4ai` or used as the preferred fallback for
+local/heavier extraction before spending Firecrawl credits. Firecrawl can be
+selected with `KEYSTONE_WEBSITE_EXTRACTOR=firecrawl` or used as a later fallback.
+Extracted page text is converted into source-backed claim candidates; it is not
+a generic crawl or outbound action.
 
 Apify and Browserless remain dry-run or placeholder paths. Their live network operations are not
 implemented.
@@ -1445,5 +1593,8 @@ Review for unexpected live flags, missing approval records, stale drafts, failed
 2. Review unresolved approvals and stale drafts.
 3. Review audit tables for repeated failures.
 4. Validate or rotate live credentials.
-5. Review live-search usage and result counts.
+5. Review live-search usage, provider diagnostics, and result counts.
 6. Update fixtures and tests for any production issue before expanding live scope.
+7. Confirm the Friday API usage automation includes OpenAI, Tavily, Exa, Apify,
+   Firecrawl, Browserless, and Google Cloud snapshots; local/free providers are
+   listed separately.

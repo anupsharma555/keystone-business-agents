@@ -52,6 +52,16 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         "website_extraction",
         default_notes="Defaults to https://api.firecrawl.dev.",
     ),
+    EnvVarContract("EXA_API_KEY", "search", secret=True, display_safety="secret"),
+    EnvVarContract("EXA_API_KEY_ID", "search", display_safety="identifier"),
+    EnvVarContract("EXA_API_KEY_NAME", "search", display_safety="identifier"),
+    EnvVarContract(
+        "EXA_BASE_URL",
+        "search",
+        display_safety="url",
+        default_notes="Defaults to https://api.exa.ai.",
+    ),
+    EnvVarContract("EXA_SERVICE_API_KEY", "search", secret=True, display_safety="secret"),
     EnvVarContract("GEMINI_API_KEY", "model", secret=True, display_safety="secret"),
     EnvVarContract("GMAIL_CLIENT_ID", "gmail", display_safety="identifier"),
     EnvVarContract("GMAIL_CLIENT_SECRET", "gmail", secret=True, display_safety="secret"),
@@ -102,6 +112,24 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         "website_extraction",
         default_notes="Defaults to disabled unless explicitly enabled.",
     ),
+    EnvVarContract(
+        "KEYSTONE_EXA_SEARCH_FALLBACK",
+        "search",
+        default_notes=(
+            "Defaults to true when Exa is configured. Intended for capped semantic "
+            "deepening under the free-tier credit budget."
+        ),
+    ),
+    EnvVarContract(
+        "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN",
+        "search",
+        default_notes="Defaults to 2 for opt-in Exa fallback/deepening runs.",
+    ),
+    EnvVarContract(
+        "KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT",
+        "search",
+        default_notes="Defaults to 1000 credits/month for the Exa free tier.",
+    ),
     EnvVarContract("KEYSTONE_HOME", "storage", display_safety="path"),
     EnvVarContract("KEYSTONE_LIVE_MODE", "safety", default_notes="Defaults to false."),
     EnvVarContract("KEYSTONE_LIVE_MODEL_MAX_RETRIES", "model"),
@@ -122,6 +150,14 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         default_notes="Slack child runs default to true.",
     ),
     EnvVarContract(
+        "KEYSTONE_SERPER_ENABLED",
+        "search",
+        default_notes=(
+            "Disabled while Serper API credits are unavailable; set true only after "
+            "credits are restored."
+        ),
+    ),
+    EnvVarContract(
         "KEYSTONE_TAVILY_CREDIT_ENFORCEMENT",
         "search",
         default_notes="Defaults to warn.",
@@ -140,6 +176,11 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         "KEYSTONE_TAVILY_SEARCH_FALLBACK",
         "search",
         default_notes="Slack child runs default to false.",
+    ),
+    EnvVarContract(
+        "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN",
+        "search",
+        default_notes="Defaults to 2 for opt-in Tavily deepening runs.",
     ),
     EnvVarContract("KEYSTONE_TAVILY_USAGE_PATH", "search", display_safety="path"),
     EnvVarContract("KEYSTONE_TRACE_GROUP_ID", "tracing", display_safety="identifier"),
@@ -250,6 +291,9 @@ def keystone_env_contract() -> dict[str, Any]:
                 "SEARXNG_BASE_URL": "http://127.0.0.1:18080",
                 "KEYSTONE_SEARXNG_TRANSIENT": "true",
                 "KEYSTONE_TAVILY_SEARCH_FALLBACK": "false",
+                "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN": "2",
+                "KEYSTONE_EXA_SEARCH_FALLBACK": "true",
+                "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "2",
             },
         },
         "notes": [

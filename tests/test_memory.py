@@ -11,11 +11,11 @@ from keystone_agents.memory import (
     company_profile_memory_items,
     email_style_memory_item,
     feedback_memory_item,
+    manager_loop_efficiency_memory_item,
     opportunity_entity_memory_items,
     opportunity_memory_items,
     outreach_dedup_memory_items,
     outreach_example_memory_item,
-    manager_loop_efficiency_memory_item,
     retrieval_tool_performance_memory_item,
 )
 from keystone_agents.outreach_examples import retrieve_outreach_examples_local

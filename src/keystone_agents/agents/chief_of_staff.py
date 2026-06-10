@@ -14,12 +14,12 @@ from zoneinfo import ZoneInfo
 from keystone_agents.automation_inventory import build_automation_inventory_report
 from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.guardrails import keystone_guardrails
+from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.memory import (
     build_chief_of_staff_memory_context,
     chief_of_staff_memory_item,
     operator_reference_memory_item,
 )
-from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.quality_budget import (
     AgentQualityBudget,
@@ -38,7 +38,13 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffSourceRef,
 )
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
-from keystone_agents.sdk import Agent, build_model_settings, build_sdk_agent, compose_instructions
+from keystone_agents.sdk import (
+    Agent,
+    build_model_settings,
+    build_sdk_agent,
+    compose_instructions,
+)
+from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.automation_inventory_tool import (
     inspect_active_work_items,
@@ -223,14 +229,81 @@ def _coerce_manual_request_plan(
         return None
 
 
+def _looks_like_web_search_brief_request(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if not lowered.strip():
+        return False
+    has_research_shape = any(
+        marker in lowered
+        for marker in (
+            "deeper search",
+            "deepened search",
+            "live search",
+            "web search",
+            "source url",
+            "source urls",
+            "source-backed",
+            "readable brief",
+            "research brief",
+            "synthesis with source",
+            "what is ",
+            "what are ",
+            "what's ",
+        )
+    )
+    has_brief_or_synthesis = any(
+        marker in lowered
+        for marker in (
+            "brief",
+            "synthesis",
+            "synthesize",
+            "source urls",
+            "source url",
+            "search providers",
+            "metadata section",
+        )
+    )
+    return has_research_shape and has_brief_or_synthesis
+
+
 def _chief_request_plan(
     request_text: str,
     manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None,
 ) -> ManualRequestPlan:
-    return _coerce_manual_request_plan(manual_request_plan) or infer_manual_request_plan(
+    plan = _coerce_manual_request_plan(manual_request_plan) or infer_manual_request_plan(
         request_text,
         requested_agent="chief_of_staff",
     )
+    if _looks_like_web_search_brief_request(request_text):
+        constraints = list(plan.constraints)
+        for constraint in (
+            "source-backed web research",
+            "visible source URLs",
+            "provider metadata at end",
+        ):
+            if constraint not in constraints:
+                constraints.append(constraint)
+        warnings = list(plan.planner_warnings)
+        warning = (
+            "Chief of Staff request contains web-search brief wording; preserve live "
+            "source retrieval and do not collapse to a Slack scope explanation."
+        )
+        if warning not in warnings:
+            warnings.append(warning)
+        return plan.model_copy(
+            update={
+                "intent": "research_brief",
+                "target_type": "topic"
+                if plan.target_type in {"unknown", "slack_channel"}
+                else plan.target_type,
+                "task_objective": "source_research",
+                "expected_artifact_type": "research_brief",
+                "requires_live_search": True,
+                "constraints": constraints,
+                "planner_warnings": warnings,
+            }
+        )
+    return plan
 
 
 def _latest_slack_followup_request(request_text: str) -> str:
@@ -352,9 +425,6 @@ def _looks_like_finance_tracker_request(text: str) -> bool:
         "finance tax tracker",
         "2026 finance",
         "tax tracker",
-        "tax payments",
-        "tax expenses",
-        "tax expense",
         "airtable tracker",
         "total expenses",
         "business income",
@@ -372,6 +442,8 @@ def _looks_like_finance_tracker_request(text: str) -> bool:
     has_period = bool(re.search(r"\b(?:q[1-4]|quarter\s+[1-4]|20\d{2})\b", normalized))
     has_tax_metric = _looks_like_tax_payment_or_estimate_request(normalized)
     has_rank_metric = _looks_like_top_finance_record_request(normalized)
+    if has_tax_metric and not _has_clear_finance_tracker_data_anchor(normalized):
+        return False
     return (
         (has_finance_metric or has_tax_metric)
         and has_period
@@ -813,6 +885,50 @@ def _looks_like_tax_payment_or_estimate_request(normalized: str) -> bool:
         )
     )
     return has_tax_subject and has_task
+
+
+def _has_clear_finance_tracker_data_anchor(normalized: str) -> bool:
+    text = " ".join(str(normalized or "").lower().split())
+    if not text:
+        return False
+    if any(
+        marker in text
+        for marker in (
+            "finance_tax_tracker",
+            "finance tax tracker",
+            "airtable tracker",
+            "tax tracker",
+            "from the tracker",
+            "from tracker",
+            "from airtable",
+            "airtable table",
+            "airtable tables",
+            "airtable record",
+            "airtable records",
+            "airtable schema",
+            "business income",
+            "business expenses",
+            "personal income",
+            "personal expenses",
+            "tax payments table",
+            "tax expenses table",
+        )
+    ):
+        return True
+    has_local_amount_task = bool(
+        re.search(
+            r"\b(?:paid|total|sum|summarize|summary|calculate|calc|count|"
+            r"how\s+much|amount|owed|owe|remaining|record|records|rows?)\b",
+            text,
+        )
+    )
+    has_finance_table_subject = bool(
+        re.search(
+            r"\b(?:income|expense|expenses|deduction|spend|tax\s+payments?|tax\s+expenses?)\b",
+            text,
+        )
+    )
+    return has_local_amount_task and has_finance_table_subject
 
 
 def _looks_like_wrong_response_diagnostic_request(normalized: str) -> bool:
@@ -3372,6 +3488,63 @@ def _looks_like_research_direction_request(lowered: str) -> bool:
     )
 
 
+def _plan_web_search_brief_request(text: str) -> ChiefOfStaffResult:
+    lowered = text.lower()
+    topic = text.strip().strip('"') or "requested web research topic"
+    summary = (
+        "This is a read-only source-backed web brief request. Live retrieval should "
+        "produce the answer with visible source URLs; deterministic fallback cannot "
+        "verify current external facts."
+    )
+    actions = [
+        "Run the live Chief of Staff or Business Research Analyst path with web search enabled.",
+        "Keep the main answer as Answer and Detailed Summary, with provider details only in Metadata.",
+        "Do not post, send, publish, schedule, or write externally from this fallback.",
+    ]
+    if "not a diagnostics" in lowered or "not a diagnostic" in lowered:
+        actions.append("Do not render this as a diagnostics report unless explicitly re-requested.")
+    return ChiefOfStaffResult(
+        mode="deterministic",
+        intent=text,
+        summary=summary,
+        time_window=_extract_time_window(text),
+        target_channels=[],
+        operating_capabilities=[
+            "source_research",
+            "web_search_brief",
+            "provider_metadata_reporting",
+        ],
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="research-direction-review",
+            command_text=f"Read-only source-backed web brief: {topic[:180]}",
+            target_channel="current-thread",
+            rationale=(
+                "The request asks for current source-backed web research. "
+                "Use live retrieval and keep all provider diagnostics in trailing metadata."
+            ),
+            requires_live_connector=True,
+            requires_human_approval_before_post=True,
+        ),
+        recommended_actions=actions,
+        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        sources=_docs_for_topic(text),
+        context_sources_considered=[
+            "operator_request",
+            "manual_request_plan",
+            "shared_search_provider_policy",
+        ],
+        repo_context_used=_repo_context_for_capability("research-direction-review"),
+        audit_notes=[
+            "Deterministic Chief of Staff web-search brief fallback used.",
+            "No live source facts were verified by this fallback.",
+        ],
+    )
+
+
 def plan_chief_of_staff_request(
     request_text: str,
     *,
@@ -3383,6 +3556,7 @@ def plan_chief_of_staff_request(
 
     del slack_repo_path  # Reserved for parity with SDK tools and future deterministic repo checks.
     text = str(request_text or "").strip()
+    active_text = _latest_slack_followup_request(text) or text
     request_plan = _chief_request_plan(text, manual_request_plan)
 
     def planned(result: ChiefOfStaffResult, *, action: str) -> ChiefOfStaffResult:
@@ -3393,20 +3567,18 @@ def plan_chief_of_staff_request(
             _plan_slack_history_digest_request(text),
             action="allowed_slack_history_digest_shortcut",
         )
-    if (
-        _looks_like_finance_tracker_artifact_workflow_request(text)
-        and _manual_plan_allows_finance_tracker_shortcut(request_plan, text)
-    ):
+    if _looks_like_finance_tracker_artifact_workflow_request(
+        active_text
+    ) and _manual_plan_allows_finance_tracker_shortcut(request_plan, active_text):
         return planned(
-            _plan_finance_tracker_artifact_workflow_request(text),
+            _plan_finance_tracker_artifact_workflow_request(active_text),
             action="allowed_finance_artifact_workflow_shortcut",
         )
-    if (
-        _looks_like_finance_tracker_request(text)
-        and _manual_plan_allows_finance_tracker_shortcut(request_plan, text)
-    ):
+    if _looks_like_finance_tracker_request(
+        active_text
+    ) and _manual_plan_allows_finance_tracker_shortcut(request_plan, active_text):
         return planned(
-            _plan_finance_tracker_request(text, live=False),
+            _plan_finance_tracker_request(active_text, live=False),
             action="allowed_finance_tracker_shortcut",
         )
     if _looks_like_chief_memory_capture_request(text):
@@ -3439,6 +3611,11 @@ def plan_chief_of_staff_request(
             _plan_business_artifact_write_request(text),
             action="allowed_business_artifact_write_plan",
         )
+    if _looks_like_web_search_brief_request(active_text):
+        return planned(
+            _plan_web_search_brief_request(active_text),
+            action="allowed_web_search_brief_plan",
+        )
     natural_intent = _plan_natural_language_operating_intent(text, database_url=database_url)
     if natural_intent is not None:
         return planned(natural_intent, action="allowed_natural_language_operating_intent")
@@ -3447,55 +3624,57 @@ def plan_chief_of_staff_request(
         write_requests = _write_requests_from_text(text)
         return planned(
             ChiefOfStaffResult(
-            mode="deterministic",
-            intent=text,
-            summary=report.summary,
-            time_window=_extract_time_window(text),
-            target_channels=_extract_target_channels(
-                text, _extract_target_channel(text, "ai-agents-workflow")
-            ),
-            operating_capabilities=_capabilities_for_request(text),
-            recommended_route=ChiefOfStaffRouteRecommendation(
-                workflow_type="slack-runtime-review",
-                command_text="@KNI chief of staff audit automations",
-                target_channel=_extract_target_channel(text, "ai-agents-workflow"),
-                rationale=(
-                    "Chief of Staff can audit automation state and coordinate internal "
-                    "review writes through typed tools."
+                mode="deterministic",
+                intent=text,
+                summary=report.summary,
+                time_window=_extract_time_window(text),
+                target_channels=_extract_target_channels(
+                    text, _extract_target_channel(text, "ai-agents-workflow")
                 ),
-                requires_live_connector=any(request.live_required for request in write_requests),
-                requires_human_approval_before_post=True,
-            ),
-            recommended_actions=[
-                *report.recommended_actions,
-                *[
-                    f"Prepare {request.destination.value} internal write request."
-                    for request in write_requests
+                operating_capabilities=_capabilities_for_request(text),
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="slack-runtime-review",
+                    command_text="@KNI chief of staff audit automations",
+                    target_channel=_extract_target_channel(text, "ai-agents-workflow"),
+                    rationale=(
+                        "Chief of Staff can audit automation state and coordinate internal "
+                        "review writes through typed tools."
+                    ),
+                    requires_live_connector=any(
+                        request.live_required for request in write_requests
+                    ),
+                    requires_human_approval_before_post=True,
+                ),
+                recommended_actions=[
+                    *report.recommended_actions,
+                    *[
+                        f"Prepare {request.destination.value} internal write request."
+                        for request in write_requests
+                    ],
                 ],
-            ],
-            blocked_side_effects=BLOCKED_SIDE_EFFECTS,
-            approval_required=True,
-            human_review_required=True,
-            send_enabled=False,
-            slack_post_allowed=False,
-            sources=_docs_for_topic(text),
-            context_sources_considered=[
-                "business_workflow_state",
-                "operator_and_agent_policy",
-                "keystone_slack_runtime_repo",
-                "keystone_local_context",
-            ],
-            repo_context_used=_repo_context_for_capability("slack-runtime-review"),
-            automation_report=report,
-            write_requests=write_requests,
-            audit_notes=[
-                "Deterministic Chief of Staff automation audit used.",
-                (
-                    "Internal write requests are represented as typed plans; "
-                    "live providers remain gated."
-                ),
-                "SQLite and WorkItems remain canonical.",
-            ],
+                blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+                approval_required=True,
+                human_review_required=True,
+                send_enabled=False,
+                slack_post_allowed=False,
+                sources=_docs_for_topic(text),
+                context_sources_considered=[
+                    "business_workflow_state",
+                    "operator_and_agent_policy",
+                    "keystone_slack_runtime_repo",
+                    "keystone_local_context",
+                ],
+                repo_context_used=_repo_context_for_capability("slack-runtime-review"),
+                automation_report=report,
+                write_requests=write_requests,
+                audit_notes=[
+                    "Deterministic Chief of Staff automation audit used.",
+                    (
+                        "Internal write requests are represented as typed plans; "
+                        "live providers remain gated."
+                    ),
+                    "SQLite and WorkItems remain canonical.",
+                ],
             ),
             action="allowed_automation_inventory_plan",
         )
@@ -3546,37 +3725,41 @@ def plan_chief_of_staff_request(
     )
     return planned(
         ChiefOfStaffResult(
-        mode="deterministic",
-        intent=text,
-        summary=summary,
-        time_window=_extract_time_window(text),
-        target_channels=target_channels,
-        operating_capabilities=_capabilities_for_request(text),
-        recommended_route=route,
-        recommended_actions=_action_lines(capability, target_channel or "selected channel"),
-        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
-        approval_required=True,
-        human_review_required=True,
-        send_enabled=False,
-        slack_post_allowed=False,
-        sources=_docs_for_topic(text),
-        context_sources_considered=[
-            "operator_and_agent_policy",
-            "keystone_slack_runtime_repo",
-            "official_developer_docs",
-            "keystone_local_context",
-            "selected_gmail_context" if "mail" in text.lower() or "email" in text.lower() else "",
-            "selected_calendar_context"
-            if "calendar" in text.lower() or "meeting" in text.lower()
-            else "",
-            "github_and_local_repos" if "github" in text.lower() or "repo" in text.lower() else "",
-        ],
-        repo_context_used=_repo_context_for_capability(workflow_type),
-        audit_notes=[
-            "Deterministic Chief of Staff fallback used.",
-            "KNI Slack repo is treated as read-only operational context.",
-            "No Slack, Gmail, Calendar, CRM, or repo write was attempted.",
-        ],
+            mode="deterministic",
+            intent=text,
+            summary=summary,
+            time_window=_extract_time_window(text),
+            target_channels=target_channels,
+            operating_capabilities=_capabilities_for_request(text),
+            recommended_route=route,
+            recommended_actions=_action_lines(capability, target_channel or "selected channel"),
+            blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+            approval_required=True,
+            human_review_required=True,
+            send_enabled=False,
+            slack_post_allowed=False,
+            sources=_docs_for_topic(text),
+            context_sources_considered=[
+                "operator_and_agent_policy",
+                "keystone_slack_runtime_repo",
+                "official_developer_docs",
+                "keystone_local_context",
+                "selected_gmail_context"
+                if "mail" in text.lower() or "email" in text.lower()
+                else "",
+                "selected_calendar_context"
+                if "calendar" in text.lower() or "meeting" in text.lower()
+                else "",
+                "github_and_local_repos"
+                if "github" in text.lower() or "repo" in text.lower()
+                else "",
+            ],
+            repo_context_used=_repo_context_for_capability(workflow_type),
+            audit_notes=[
+                "Deterministic Chief of Staff fallback used.",
+                "KNI Slack repo is treated as read-only operational context.",
+                "No Slack, Gmail, Calendar, CRM, or repo write was attempted.",
+            ],
         ),
         action="allowed_general_route_plan",
     )
@@ -4104,6 +4287,7 @@ def build_chief_of_staff_agent(
     quality_budget: AgentQualityBudget | None = None,
     quality_mode: QualityMode | str | None = None,
     request_text: str = "",
+    include_all_skills: bool = False,
 ) -> Agent:
     """Build the KNI Chief of Staff SDK agent."""
 
@@ -4115,9 +4299,13 @@ def build_chief_of_staff_agent(
     instructions = compose_instructions(
         "keystone_profile.md",
         "safety_policy.md",
-        "skills.md",
         "tools.md",
         "chief_of_staff.md",
+        skill_files=select_agent_skill_names(
+            "chief_of_staff",
+            request_text=request_text,
+            include_all=include_all_skills,
+        ),
     )
     return build_sdk_agent(
         name="chief_of_staff",
@@ -4165,6 +4353,7 @@ def run_chief_of_staff_sdk(
         typed_input,
         raw_request_text=request_text,
     )
+    active_request_text = _latest_slack_followup_request(request_text) or request_text
     request_plan = _chief_request_plan(request_text, manual_request_plan)
     if (
         not force_sdk_interpretation
@@ -4181,12 +4370,14 @@ def run_chief_of_staff_sdk(
             raw_result={"deterministic": "slack_history_digest"},
             live=live,
         )
-    finance_artifact_workflow = _looks_like_finance_tracker_artifact_workflow_request(request_text)
+    finance_artifact_workflow = _looks_like_finance_tracker_artifact_workflow_request(
+        active_request_text
+    )
     if finance_artifact_workflow and not live:
         return TypedAgentRunResult(
             agent_name="chief_of_staff",
             output=_with_manual_plan_audit(
-                _plan_finance_tracker_artifact_workflow_request(request_text),
+                _plan_finance_tracker_artifact_workflow_request(active_request_text),
                 request_plan,
                 action="allowed_finance_artifact_workflow_shortcut",
             ),
@@ -4194,15 +4385,16 @@ def run_chief_of_staff_sdk(
             live=live,
         )
     if (
-        _looks_like_finance_tracker_request(request_text)
+        _looks_like_finance_tracker_request(active_request_text)
         and not finance_artifact_workflow
-        and not (live and _looks_like_finance_tracker_mutation_request(request_text))
-        and _manual_plan_allows_finance_tracker_shortcut(request_plan, request_text)
+        and not force_sdk_interpretation
+        and not (live and _looks_like_finance_tracker_mutation_request(active_request_text))
+        and _manual_plan_allows_finance_tracker_shortcut(request_plan, active_request_text)
     ):
         return TypedAgentRunResult(
             agent_name="chief_of_staff",
             output=_with_manual_plan_audit(
-                _plan_finance_tracker_request(request_text, live=live),
+                _plan_finance_tracker_request(active_request_text, live=live),
                 request_plan,
                 action="allowed_finance_tracker_shortcut",
             ),

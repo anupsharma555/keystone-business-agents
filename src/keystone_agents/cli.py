@@ -39,6 +39,10 @@ from keystone_agents.evals import generate_eval_report, run_static_evals
 from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
 from keystone_agents.models import RunMode
+from keystone_agents.operator_failures import (
+    known_exception_to_operator_failure,
+    operator_failure_from_mapping,
+)
 from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
     orchestrator_preflight_env,
@@ -73,8 +77,7 @@ from keystone_agents.sdk_sessions import (
     resolve_sdk_session_spec,
     sdk_session_env,
 )
-from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
-from keystone_agents.storage.sqlite_store import redact_secrets
+from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
 from keystone_agents.tools.slack_tool import SlackTool, slack_review_message_from_approval_item
 from keystone_agents.tools.storage_tool import StorageTool
 from keystone_agents.work_items import (
@@ -87,7 +90,7 @@ from keystone_agents.work_items import (
     select_artifact,
     set_next_action,
 )
-from keystone_agents.workflow_runner import advance_work_item, advance_work_item_manager_loop
+from keystone_agents.workflow_runner import advance_work_item_manager_loop
 from keystone_agents.workflows import (
     pipeline_markdown_report,
     run_keystone_pipeline,
@@ -455,6 +458,15 @@ def _agent_display_name(route: str) -> str:
     return spec.agent_name if spec is not None else route
 
 
+def _route_with_manual_plan_advice(route: str, manual_plan: ManualRequestPlan) -> str:
+    planned = str(manual_plan.target_agent or "").strip()
+    if planned in {"", "orchestrator", "clarification"}:
+        return route
+    if planned not in AGENT_REGISTRY:
+        return route
+    return planned
+
+
 def _run_ask(args: argparse.Namespace) -> int:
     raw_input = _ask_input(args)
     mention = parse_agent_mention(raw_input)
@@ -505,7 +517,7 @@ def _run_ask(args: argparse.Namespace) -> int:
                 cost_tracking_requested=cost_directive.requested,
             )
         if live_sdk and mention.explicit and mention.route is not None:
-            route = str(mention.route)
+            route = _route_with_manual_plan_advice(str(mention.route), manual_plan)
             if manual_plan.intent == "browser_diagnostics" and manual_plan.target_agent in {
                 "chief_of_staff",
                 "orchestrator",
@@ -569,6 +581,7 @@ def _run_ask(args: argparse.Namespace) -> int:
             cost_tracking_requested=cost_directive.requested,
         )
     if live_sdk:
+        route = _route_with_manual_plan_advice(route, manual_plan)
         if manual_plan.intent == "browser_diagnostics" and manual_plan.target_agent in {
             "chief_of_staff",
             "orchestrator",
@@ -856,40 +869,106 @@ def _run_ask_work_item(
     sdk_session_db_path: str = "",
     cost_tracking_requested: bool = False,
 ) -> int:
-    store = SQLiteStore(database_url or database_url_from_env())
-    work_item_id = _resolve_continue_work_item_id(
-        store,
-        input_text=input_text,
-        explicit_work_item_id=None,
-        json_output=json_output,
-    )
-    existing_work_item = store.get_work_item(work_item_id) if work_item_id else None
-    result = advance_work_item_manager_loop(
-        WorkflowRunRequest(
-            request_text=input_text,
-            work_item_id=work_item_id,
-            save=True,
-            database_url=database_url,
-            live_search=live_search,
-            live_sdk=live_sdk,
-            max_results=max_results,
-            manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
-            orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
-            context_file_path=context_file_path,
-            sdk_session_enabled=sdk_session_enabled,
-            sdk_session_id=sdk_session_id,
-            sdk_session_db_path=sdk_session_db_path,
-            cost_tracking_requested=cost_tracking_requested,
-            **_workflow_cost_options_for_request_context(
+    try:
+        store = SQLiteStore(database_url or database_url_from_env())
+        work_item_id = _resolve_continue_work_item_id(
+            store,
+            input_text=input_text,
+            explicit_work_item_id=None,
+            json_output=json_output,
+        )
+        existing_work_item = store.get_work_item(work_item_id) if work_item_id else None
+        result = advance_work_item_manager_loop(
+            WorkflowRunRequest(
                 request_text=input_text,
+                work_item_id=work_item_id,
+                save=True,
+                database_url=database_url,
+                live_search=live_search,
+                live_sdk=live_sdk,
+                max_results=max_results,
+                manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
+                orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
                 context_file_path=context_file_path,
-                work_item=existing_work_item,
+                sdk_session_enabled=sdk_session_enabled,
+                sdk_session_id=sdk_session_id,
+                sdk_session_db_path=sdk_session_db_path,
+                cost_tracking_requested=cost_tracking_requested,
+                **_workflow_cost_options_for_request_context(
+                    request_text=input_text,
+                    context_file_path=context_file_path,
+                    work_item=existing_work_item,
+                ),
             ),
-        ),
-        max_steps=max_manager_steps,
-        feedback_callback=None if json_output else _print_manager_loop_feedback,
-    )
+            max_steps=max_manager_steps,
+            feedback_callback=None if json_output else _print_manager_loop_feedback,
+        )
+    except Exception as exc:
+        if not json_output:
+            raise
+        return _print_ask_work_item_failure(
+            input_text=input_text,
+            exc=exc,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+        )
     return _print_work_item_result(result, json_output=json_output)
+
+
+def _print_ask_work_item_failure(
+    *,
+    input_text: str,
+    exc: Exception,
+    manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None,
+) -> int:
+    error_type = type(exc).__name__
+    failure = known_exception_to_operator_failure(exc, context="WorkItem run")
+    payload = {
+        "mode": "work_item",
+        "status": "failed",
+        "input": input_text,
+        "send_enabled": False,
+        "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+        "output": {
+            "summary": failure.summary,
+            "send_enabled": False,
+            "failure": failure.to_dict(),
+            "error_type": error_type,
+            "error_message": failure.reason,
+            "next_step": failure.next_step,
+        },
+    }
+    print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    print(f"Business Agents run failed: {failure.summary}", file=sys.stderr)
+    if failure.reason and failure.reason != failure.summary:
+        print(f"Reason: {failure.reason}", file=sys.stderr)
+    return 1
+
+
+def _operator_failure_from_child_output(
+    stdout: str,
+    *,
+    fallback: Exception,
+    context: str,
+):
+    try:
+        payload = json.loads(stdout or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    if isinstance(payload, dict):
+        candidates = [
+            payload.get("failure"),
+            payload.get("output", {}).get("failure")
+            if isinstance(payload.get("output"), dict)
+            else None,
+        ]
+        for candidate in candidates:
+            failure = operator_failure_from_mapping(candidate)
+            if failure is not None:
+                return failure
+    return known_exception_to_operator_failure(fallback, context=context)
 
 
 def _print_manager_loop_feedback(event_type: str, payload: dict[str, Any]) -> None:
@@ -1442,6 +1521,10 @@ def _run_ask_script_live(
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
+        failure = known_exception_to_operator_failure(
+            subprocess.TimeoutExpired(command, timeout_seconds),
+            context=f"{_agent_display_name(route)} child process",
+        )
         payload = {
             "mode": "live_sdk",
             "selected_agent": route,
@@ -1456,17 +1539,25 @@ def _run_ask_script_live(
             "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
             "cost_tracking_requested": cost_tracking_requested,
             "output": {
-                "summary": (
-                    f"{_agent_display_name(route)} timed out after "
-                    f"{timeout_seconds:.0f} seconds."
-                ),
+                "summary": failure.summary,
                 "send_enabled": False,
+                "failure": failure.to_dict(),
                 "error_type": "timeout",
+                "next_step": failure.next_step,
             },
         }
         _print_ask_live_payload(payload, json_output=json_output)
         return 1
     if completed.returncode != 0:
+        failure = _operator_failure_from_child_output(
+            completed.stdout,
+            fallback=RuntimeError(
+                _redacted_child_output(completed.stderr)
+                or _redacted_child_output(completed.stdout)
+                or f"child process exited {completed.returncode}"
+            ),
+            context=f"{_agent_display_name(route)} child process",
+        )
         payload = {
             "mode": "live_sdk",
             "selected_agent": route,
@@ -1481,12 +1572,14 @@ def _run_ask_script_live(
             "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
             "cost_tracking_requested": cost_tracking_requested,
             "output": {
-                "summary": f"{_agent_display_name(route)} child process failed.",
+                "summary": failure.summary,
                 "send_enabled": False,
+                "failure": failure.to_dict(),
                 "error_type": "child_process_failed",
                 "returncode": int(completed.returncode),
                 "stderr_excerpt": _redacted_child_output(completed.stderr),
                 "stdout_excerpt": _redacted_child_output(completed.stdout),
+                "next_step": failure.next_step,
             },
         }
         _print_ask_live_payload(payload, json_output=json_output)
@@ -1494,6 +1587,10 @@ def _run_ask_script_live(
     try:
         script_payload = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError as exc:
+        failure = known_exception_to_operator_failure(
+            exc,
+            context=f"{_agent_display_name(route)} child process",
+        )
         payload = {
             "mode": "live_sdk",
             "selected_agent": route,
@@ -1508,12 +1605,14 @@ def _run_ask_script_live(
             "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
             "cost_tracking_requested": cost_tracking_requested,
             "output": {
-                "summary": f"{_agent_display_name(route)} returned malformed JSON.",
+                "summary": failure.summary,
                 "send_enabled": False,
+                "failure": failure.to_dict(),
                 "error_type": "child_process_malformed_json",
                 "parse_error": str(exc),
                 "stderr_excerpt": _redacted_child_output(completed.stderr),
                 "stdout_excerpt": _redacted_child_output(completed.stdout),
+                "next_step": failure.next_step,
             },
         }
         _print_ask_live_payload(payload, json_output=json_output)
@@ -1662,8 +1761,7 @@ def _print_ask_live_payload(payload: dict[str, object], *, json_output: bool) ->
         review = payload.get("orchestrator_review")
         if isinstance(review, dict):
             print(
-                "Orchestrator review: "
-                f"{review.get('status')} ({review.get('overall_score')}/100)"
+                f"Orchestrator review: {review.get('status')} ({review.get('overall_score')}/100)"
             )
             next_step = str(review.get("recommended_next_step") or "").strip()
             if next_step:

@@ -147,8 +147,13 @@ The intended retrieval ladder for live research is:
 - `Agents hosted web search` as a capped parallel lane beside SearXNG for
   default live research. The default cap is 2 hosted web-search requests per
   run through `KEYSTONE_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN`.
-- `Serper` only when `SEARCH_PROVIDER=serper` or `--search-provider serper` is
-  explicitly selected.
+- `Exa` as a capped semantic deepening lane when configured, and as an explicit
+  provider for Exa-first comparison runs. Treat it as a 1,000-credit/month
+  free-tier lane unless the dashboard shows otherwise.
+- `Tavily` as an optional capped deeper-research lane for formal research,
+  explicit deeper-search asks, provider comparison, or opportunity searches.
+- `Serper` is disabled while API credits are unavailable. It must not run unless
+  `KEYSTONE_SERPER_ENABLED=true` is deliberately set after credits are restored.
 - `Firecrawl` as an explicit `SearchProvider` option when configured, and as an
   optional website extraction provider when `KEYSTONE_WEBSITE_EXTRACTOR=firecrawl`.
 - `Trafilatura` as the default live-gated website extraction provider for
@@ -300,8 +305,8 @@ detected. CI also enforces this via `tests/test_architecture.py::test_no_obvious
 ```
 
 Tests use fixtures and mocks only. They do not require OpenAI, Gmail, Slack,
-SearXNG, hosted web search, Serper, Firecrawl, Apify, Browserless, or other
-live API keys.
+SearXNG, hosted web search, Exa, Tavily, Firecrawl, Apify, Browserless, or
+other live API keys.
 
 Use `.venv/bin/python scripts/check_quality.py` for the full local gate with
 coverage, ruff, and dependency audit.
@@ -365,7 +370,8 @@ Implemented:
 - Explicit live Gmail read, label, and draft-only operations.
 - Explicit live search for Researcher/company research and opportunity scouting
   through `SearchProvider`. Default live research uses SearXNG plus capped
-  hosted web search; Serper and Firecrawl remain explicit configured options.
+  hosted web search, with Exa/Tavily available as capped deepening lanes through
+  shared retrieval policy. Serper is disabled while API credits are unavailable.
 - Live-gated website extraction for selected company pages through Trafilatura
   by default or Firecrawl when explicitly configured, with optional fallback
   between those two extractors.

@@ -9,8 +9,8 @@ import scripts.run_orchestrator as run_orchestrator
 from keystone_agents.agents.orchestrator import (
     BUSINESS_RESEARCH_TOOL_NAME,
     INTENDED_HANDOFFS,
-    ORCHESTRATOR_SPECIALIST_TOOLS_ENV,
     OPPORTUNITY_SCOUT_TOOL_NAME,
+    ORCHESTRATOR_SPECIALIST_TOOLS_ENV,
     _resume_from_state_result,
     build_orchestrator_agent,
     load_orchestrator_workflow_state,
@@ -97,9 +97,64 @@ def test_resume_gate_does_not_block_concrete_thread_followup() -> None:
     assert result is None
 
 
+def test_resume_gate_does_not_block_source_link_followup_without_marker() -> None:
+    result = _resume_from_state_result(
+        (
+            "chief of staff continue this prior Slack thread. "
+            "Linked WorkItem: wi_123. Previous request: chief of staff deeper search. "
+            "can u summarize link 1"
+        ),
+        workflow_state={"pending_approvals": [{"id": "stale_approval"}]},
+    )
+
+    assert result is None
+
+
+def test_route_request_source_link_followup_bypasses_pending_approval_gate() -> None:
+    result = route_request(
+        "can u summarize link 1",
+        workflow_state={"pending_approvals": [{"id": "approval_1"}]},
+    )
+
+    assert result.route == "chief_of_staff"
+    assert result.refused is False
+    assert result.stop_reason is None
+    assert result.state_context_used is True
+
+
+def test_route_request_generic_link_research_does_not_use_source_followup_shortcut() -> None:
+    result = route_request("find links about OpenAI mental health")
+
+    assert result.route != "chief_of_staff"
+
+
+def test_resume_gate_does_not_block_natural_source_followup_with_pending_approval() -> None:
+    result = _resume_from_state_result(
+        (
+            "chief of staff continue this prior Slack thread.\n"
+            "Previous request: chief of staff source-backed research.\n"
+            "Latest request: please explain the first source"
+        ),
+        workflow_state={"pending_approvals": [{"id": "stale_approval"}]},
+    )
+
+    assert result is None
+
+
 def test_resume_gate_still_blocks_pure_continue_with_pending_approval() -> None:
     result = _resume_from_state_result(
         "continue this prior Slack thread",
+        workflow_state={"pending_approvals": [{"id": "approval_1"}]},
+    )
+
+    assert result is not None
+    assert result.route == "clarification"
+    assert result.stop_reason == "Pending approval gate must be resolved before continuing."
+
+
+def test_resume_gate_still_blocks_agent_prefixed_pure_continue() -> None:
+    result = _resume_from_state_result(
+        "chief of staff continue this prior Slack thread",
         workflow_state={"pending_approvals": [{"id": "approval_1"}]},
     )
 
@@ -266,7 +321,9 @@ def test_orchestrator_review_flags_wrong_response_diagnostic_wrong_lane(
     )
 
     assert review.relevance.status == "fail"
-    assert any("diagnose a wrong or unrelated prior response" in gap for gap in review.observed_gaps)
+    assert any(
+        "diagnose a wrong or unrelated prior response" in gap for gap in review.observed_gaps
+    )
 
 
 def test_orchestrator_review_allows_wrong_response_diagnostic_answer() -> None:
@@ -574,11 +631,9 @@ def test_find_behavioral_health_ai_companies_routes_to_opportunity_scout() -> No
 
 def test_recent_remote_role_search_routes_to_opportunity_scout() -> None:
     result = route_request(
-        (
-            "Find up to 5 active U.S.-based remote roles posted in the last 7 days "
-            "for a physician-scientist with behavioral health, clinical research, "
-            "and AI experience. Exclude AI tutor roles."
-        )
+        "Find up to 5 active U.S.-based remote roles posted in the last 7 days "
+        "for a physician-scientist with behavioral health, clinical research, "
+        "and AI experience. Exclude AI tutor roles."
     )
 
     assert result.route == "opportunity_scout"
@@ -742,11 +797,9 @@ def test_generic_outreach_to_this_company_blocks_for_missing_context() -> None:
 
 def test_attached_research_brief_outreach_blocks_without_context_object() -> None:
     result = route_request(
-        (
-            "Write a short outreach email to Curebase based only on the attached "
-            "research brief. Focus on Keystone fit. Do not invent shared contacts, "
-            "traction, or product details."
-        )
+        "Write a short outreach email to Curebase based only on the attached "
+        "research brief. Focus on Keystone fit. Do not invent shared contacts, "
+        "traction, or product details."
     )
 
     assert result.route == "clarification"

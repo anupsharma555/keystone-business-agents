@@ -1590,6 +1590,7 @@ def _run_opportunity_scout_github_repo_synthesis(
                 ),
             ),
             live=True,
+            tool_tier="deep_retrieval",
         )
     except Exception as exc:
         return None, diagnostics + [
@@ -1657,6 +1658,7 @@ def _run_business_research_analyst_github_repo_synthesis(
                 source_context=source_context,
             ),
             live=True,
+            tool_tier="deep_retrieval",
         )
     except Exception as exc:
         return None, diagnostics + [
@@ -1897,6 +1899,7 @@ def _run_business_research_analyst_announcement_synthesis(
                 source_context=source_context,
             ),
             live=True,
+            tool_tier="deep_retrieval",
         )
     except Exception as exc:
         return None, diagnostics + [

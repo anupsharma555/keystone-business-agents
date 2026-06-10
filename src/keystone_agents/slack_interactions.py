@@ -1294,9 +1294,7 @@ def _advance_work_item_for_intent(
             live_sdk=live_sdk,
             requested_route=resolved_route,
             manual_request_plan=manual_plan,
-            orchestrator_preflight=compact_orchestrator_preflight_payload(
-                orchestrator_preflight
-            ),
+            orchestrator_preflight=compact_orchestrator_preflight_payload(orchestrator_preflight),
             **_slack_action_cost_conservation_request_options(intent),
         )
     )
@@ -1323,9 +1321,7 @@ def _record_slack_action_orchestrator_review(
         return result
     target_metadata = dict(work_item.target.metadata)
     prior_reviews = [
-        item
-        for item in target_metadata.get("orchestrator_reviews", [])
-        if isinstance(item, dict)
+        item for item in target_metadata.get("orchestrator_reviews", []) if isinstance(item, dict)
     ]
     latest_manager_review = next(
         (
@@ -1420,10 +1416,7 @@ def _record_slack_action_orchestrator_review(
         "review_decision": "pass" if review.status == "pass" else "warn",
     }
     target_metadata["orchestrator_reviews"] = [*prior_reviews, review_context][-5:]
-    note = (
-        "Slack action Orchestrator review: "
-        f"{review.status} ({review.overall_score}/100)."
-    )
+    note = f"Slack action Orchestrator review: {review.status} ({review.overall_score}/100)."
     reviewed_item = work_item.model_copy(
         update={
             "target": work_item.target.model_copy(update={"metadata": target_metadata}),

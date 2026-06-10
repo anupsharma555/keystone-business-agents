@@ -27,7 +27,7 @@ from keystone_agents.agents.opportunity_scout import (
 )
 from keystone_agents.live_retrieval import run_opportunity_scout_live
 from keystone_agents.schemas.opportunity import Opportunity, OpportunityScoutResult
-from keystone_agents.sdk import load_prompt
+from keystone_agents.sdk import ToolGuardrailViolation, load_prompt
 from keystone_agents.tools.html_review_tool import HtmlReviewResult
 from keystone_agents.tools.search_provider import (
     DryRunSearchProvider,
@@ -35,7 +35,10 @@ from keystone_agents.tools.search_provider import (
     SerperSearchError,
 )
 from keystone_agents.tools.serper_tool import SearchResult, SerperTool
-from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResult
+from keystone_agents.tools.website_extraction_tool import (
+    WebsiteExtractionError,
+    WebsiteExtractionResult,
+)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -183,6 +186,33 @@ def test_strict_company_plan_uses_company_only_live_query_lanes() -> None:
     )
 
 
+def test_formal_opportunity_plan_expands_short_request_across_actionable_lanes() -> None:
+    topic = (
+        "Find source-backed behavioral-health AI grants, RFPs, pilots, or CFPs "
+        "Keystone could act on."
+    )
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=5)
+    specs = scout_module._build_live_query_specs(topic, search_plan=plan)  # noqa: SLF001
+
+    assert set(plan.target_entity_types) == {
+        "grant_program",
+        "contract_rfp",
+        "conference",
+        "institute",
+    }
+    assert {"grant_funding", "procurement_rfp", "pilot_partnership", "proposal_call"} <= {
+        lane.lane_type for lane in plan.lanes
+    }
+    assert {"grant", "contract_rfp", "collaboration", "conference"}.issubset(
+        {spec.lane for spec in specs}
+    )
+    assert any("site:grants.gov" in spec.query for spec in specs)
+    assert any("site:sam.gov" in spec.query for spec in specs)
+    assert any(
+        "call for proposals" in spec.query.lower() or "cfp" in spec.query.lower() for spec in specs
+    )
+
+
 def test_strict_role_live_search_does_not_pad_with_weak_adjacent_result() -> None:
     class WeakRoleProvider:
         provider_name = "searxng"
@@ -214,11 +244,7 @@ def test_strict_role_live_search_does_not_pad_with_weak_adjacent_result() -> Non
     )
 
     assert result.records == []
-    reasons = {
-        reason
-        for candidate in result.filtered_candidates
-        for reason in candidate.reasons
-    }
+    reasons = {reason for candidate in result.filtered_candidates for reason in candidate.reasons}
     assert "requested remote status was not verified" in reasons
     assert "requested U.S. location or eligibility was not verified" in reasons
     assert any("requested role-title evidence" in reason for reason in reasons)
@@ -719,6 +745,117 @@ def test_source_verification_can_use_agent_html_review(
     ]
     assert "clinical trial software" in verified[0]["signal"]
     assert any("Agent HTML review added 1 claim" in note for note in notes)
+
+
+def test_source_verification_prefers_crawl4ai_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", raising=False)
+    monkeypatch.setenv("KEYSTONE_ENABLE_OPPORTUNITY_SOURCE_VERIFICATION", "true")
+    monkeypatch.setenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "1")
+    calls: list[str] = []
+
+    def fake_extract(*_args, **kwargs):
+        provider = kwargs.get("provider") or "trafilatura"
+        calls.append(provider)
+        if provider == "trafilatura":
+            raise WebsiteExtractionError("empty trafilatura")
+        return WebsiteExtractionResult(
+            url="https://www.curebase.com",
+            title="Curebase",
+            provider=str(provider),
+            status="success",
+            text_or_markdown="Curebase supports decentralized clinical trial operations.",
+            claims=["Curebase supports decentralized clinical trial operations."],
+        )
+
+    monkeypatch.setattr(scout_module, "extract_website_content", fake_extract)
+
+    verified, notes = scout_module._verify_source_hits(
+        [
+            {
+                "company_name": "Curebase",
+                "source_title": "Curebase",
+                "source_url": "https://www.curebase.com",
+                "signal": "Official site.",
+            }
+        ],
+        verify_source_pages=True,
+    )
+
+    assert calls[:2] == ["trafilatura", "crawl4ai"]
+    assert "decentralized clinical trial operations" in verified[0]["signal"]
+    source = scout_module._source_from_hit(verified[0], str(verified[0]["signal"]))
+    assert "decentralized clinical trial operations" in source.evidence_excerpt
+    assert any("Verification used crawl4ai" in note for note in notes)
+
+
+def test_source_verification_uses_public_opportunity_guardrail_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_ENABLE_OPPORTUNITY_SOURCE_VERIFICATION", "true")
+    monkeypatch.setenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "1")
+    contexts: list[str] = []
+
+    def fake_extract(*_args, **kwargs):
+        contexts.append(str(kwargs.get("guardrail_context") or ""))
+        return WebsiteExtractionResult(
+            url="https://sam.gov/opp/example",
+            title="Example Solicitation",
+            provider=str(kwargs.get("provider") or "trafilatura"),
+            status="success",
+            text_or_markdown=(
+                "Behavioral health AI solicitation with proposal deadline June 30, 2026. "
+                "For-profit vendors may respond."
+            ),
+            claims=["Behavioral health AI solicitation with proposal deadline June 30, 2026."],
+        )
+
+    monkeypatch.setattr(scout_module, "extract_website_content", fake_extract)
+
+    verified, notes = scout_module._verify_source_hits(
+        [
+            {
+                "company_name": "SAM.gov",
+                "source_title": "Example Solicitation",
+                "source_url": "https://sam.gov/opp/example",
+                "signal": "Solicitation.",
+            }
+        ],
+        verify_source_pages=True,
+    )
+
+    assert contexts == ["public_opportunity_source"]
+    assert "For-profit vendors may respond" in verified[0]["signal"]
+    assert any("Verified source page" in note for note in notes)
+
+
+def test_source_verification_guardrail_failure_is_nonfatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_ENABLE_OPPORTUNITY_SOURCE_VERIFICATION", "true")
+    monkeypatch.setenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "1")
+
+    def fake_extract(*_args, **_kwargs):
+        raise ToolGuardrailViolation("blocked by safety guardrail")
+
+    monkeypatch.setattr(scout_module, "extract_website_content", fake_extract)
+
+    verified, notes = scout_module._verify_source_hits(
+        [
+            {
+                "company_name": "SAM.gov",
+                "source_title": "Example Solicitation",
+                "source_url": "https://sam.gov/opp/example",
+                "signal": "Solicitation.",
+            }
+        ],
+        verify_source_pages=True,
+    )
+
+    assert verified[0]["signal"] == "Solicitation."
+    assert any("Verification failed" in note for note in notes)
+    assert any("guardrail blocked extraction" in note for note in notes)
 
 
 def test_opportunity_fixture_can_validate() -> None:
@@ -1567,6 +1704,56 @@ def test_dated_newsletter_archive_title_is_not_scored_as_company() -> None:
     assert any("newsletter or archive" in reason for reason in reasons)
 
 
+def test_negative_search_results_page_is_not_scored_as_opportunity() -> None:
+    hit = scout_module._search_result_to_hit(
+        scout_module._OpportunityQuerySpec(
+            lane="grant_funding",
+            time_window="current",
+            query="site:grants.gov behavioral health AI grant",
+            entity_hint="grant_program",
+        ),
+        {
+            "title": "No results found",
+            "url": "https://www.grants.gov/search-results.html?keywords=mental+health+ai",
+            "snippet": (
+                "A site-restricted search for grants.gov with the requested mental health / "
+                "AI / funding opportunity terms returned no indexed results."
+            ),
+        },
+    )
+
+    reasons = scout_module._candidate_acceptance_rejection_reasons(hit)
+
+    assert any("negative search-results page" in reason for reason in reasons)
+    review_reasons = scout_module._candidate_acceptance_review_reasons(
+        hit,
+        rejection_reasons=reasons,
+    )
+    assert review_reasons == []
+
+
+def test_generic_grants_search_page_is_not_scored_as_specific_opportunity() -> None:
+    hit = scout_module._search_result_to_hit(
+        scout_module._OpportunityQuerySpec(
+            lane="grant_funding",
+            time_window="current",
+            query="site:simpler.grants.gov mental health grants",
+            entity_hint="grant_program",
+        ),
+        {
+            "title": "Search | Simpler.Grants.gov",
+            "url": "https://simpler.grants.gov/search?query=programs+mental+health",
+            "snippet": (
+                "Forecasted opportunity for psychiatry residents appears in a search results table."
+            ),
+        },
+    )
+
+    reasons = scout_module._candidate_acceptance_rejection_reasons(hit)
+
+    assert any("search-results page" in reason for reason in reasons)
+
+
 def test_article_headline_is_not_scored_as_company_name() -> None:
     reason = scout_module._candidate_name_rejection_reason(
         "There are more AI health tools than ever—but how well do they work?"
@@ -2211,8 +2398,7 @@ def test_company_growth_plan_broadens_partnership_advisory_underfill() -> None:
 
     result = scout_opportunities_live_search(
         topic=(
-            "active behavioral health AI partnership or advisory opportunities relevant "
-            "to Keystone"
+            "active behavioral health AI partnership or advisory opportunities relevant to Keystone"
         ),
         max_results=3,
         search_plan=search_plan,
@@ -2414,7 +2600,7 @@ def test_live_search_tests_do_not_require_network(monkeypatch: pytest.MonkeyPatc
     assert len(result.records) <= 2
 
 
-def test_cli_live_search_requires_api_key_before_network(
+def test_cli_live_search_blocks_disabled_serper_before_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import scripts.run_opportunity_scout as cli
@@ -2434,11 +2620,11 @@ def test_cli_live_search_requires_api_key_before_network(
     )
 
     def fail_network(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("network must not be reached without SERPER_API_KEY")
+        raise AssertionError("network must not be reached while Serper is disabled")
 
     monkeypatch.setattr("keystone_agents.tools.serper_tool.requests.post", fail_network)
 
-    with pytest.raises(SystemExit, match="SERPER_API_KEY is required"):
+    with pytest.raises(SystemExit, match="Serper search is disabled"):
         cli.main()
 
 

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from keystone_agents.schemas.automation import (
     AutomationArtifactRef,
@@ -95,6 +96,7 @@ class ChiefOfStaffResult(BaseModel):
     mode: ChiefOfStaffMode = "deterministic"
     intent: str = ""
     summary: str = ""
+    synthesis: str = ""
     time_window: str = ""
     target_channels: list[str] = Field(default_factory=list)
     operating_capabilities: list[str] = Field(default_factory=list)
@@ -126,9 +128,10 @@ class ChiefOfStaffResult(BaseModel):
     memory_context: ChiefOfStaffMemoryContext | None = None
     write_requests: list[ChiefOfStaffWriteRequest] = Field(default_factory=list)
     artifact_refs: list[AutomationArtifactRef] = Field(default_factory=list)
+    retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
     audit_notes: list[str] = Field(default_factory=list)
 
-    @field_validator("agent_name", "intent", "summary", mode="before")
+    @field_validator("agent_name", "intent", "summary", "synthesis", mode="before")
     @classmethod
     def _clean_fields(cls, value: object) -> str:
         return _clean_text(value)

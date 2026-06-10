@@ -6,6 +6,7 @@ import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_serializer, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from keystone_agents.schemas.company_profile import ClaimEvidenceRecord
 from keystone_agents.schemas.decision_trace import DecisionTrace
@@ -119,6 +120,7 @@ class OpportunitySource(BaseModel):
     url: str
     source_type: OpportunitySourceType
     supported_signal: str
+    evidence_excerpt: str = ""
     source_quality: SourceQualityScore | None = None
 
     @model_validator(mode="after")
@@ -366,6 +368,7 @@ class OpportunityScoutResult(BaseModel):
     duplicate_companies_skipped: list[str] = Field(default_factory=list)
     source_quality_summary: SourceQualitySummary | None = None
     decision_trace: DecisionTrace | None = None
+    retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
     audit_notes: list[str] = Field(default_factory=list)
     constraint_relaxation_suggestion: str = ""
     outreach_generated: bool = False

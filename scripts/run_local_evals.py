@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.agent_registry import AGENT_REGISTRY
+from keystone_agents.agents.chief_of_staff import plan_chief_of_staff_request
 from keystone_agents.agents.gmail_triage import EmailFixture, triage_email_fixture
 from keystone_agents.agents.opportunity_scout import (
     score_opportunity_impl,
@@ -39,15 +41,39 @@ from keystone_agents.schemas.approval import (
     approval_queue_status_allows_sending,
 )
 from keystone_agents.schemas.company_profile import CompanyProfile
+from keystone_agents.schemas.work_item import (
+    WorkflowRunResult,
+    WorkItem,
+    WorkItemApprovalGate,
+    WorkItemArtifactRef,
+    WorkItemBlocker,
+    WorkItemKind,
+    WorkItemRoute,
+    WorkItemStatus,
+)
 from keystone_agents.sdk import prompt_metadata_for_files, prompt_version_references
+from keystone_agents.skill_contract_gates import (
+    check_business_research_claim_gate,
+    check_chief_artifact_publish_gate,
+    check_gmail_sensitive_message_gate,
+    check_outreach_approval_claim_gate,
+)
+from keystone_agents.skill_evals import (
+    DEFAULT_SKILL_TASK_MATRIX,
+    SkillTaskEvalResult,
+    run_skill_task_eval_suite,
+)
 from keystone_agents.storage.sqlite_store import SQLiteStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EVAL_DIR = PROJECT_ROOT / "evals" / "local"
+SKILL_TASK_MATRIX_DATASET = "skill_task_matrix"
 SPECIALIZED_EVAL_DATASETS = frozenset(
     {
         "browser_extraction_cases.jsonl",
         "search_coverage_cases.jsonl",
+        "skill_contracts.jsonl",
+        f"{SKILL_TASK_MATRIX_DATASET}.jsonl",
     }
 )
 
@@ -76,6 +102,14 @@ LOCAL_EVAL_PROMPT_FILES: dict[str, tuple[str, ...]] = {
         "safety_policy.md",
         "outreach_composer.md",
     ),
+    "skill_gate_failures": (
+        "keystone_profile.md",
+        "safety_policy.md",
+        "business_research_analyst.md",
+        "gmail_triage.md",
+        "outreach_composer.md",
+        "chief_of_staff.md",
+    ),
 }
 
 
@@ -88,6 +122,8 @@ class LocalEvalCase:
     input_payload: Mapping[str, Any]
     expected: Mapping[str, Any]
     validates_prompts: tuple[str, ...] = ()
+    validates_skills: tuple[str, ...] = ()
+    surface: str = "cli"
 
 
 @dataclass(frozen=True)
@@ -100,6 +136,8 @@ class LocalEvalResult:
     observed: Mapping[str, Any]
     prompt_metadata: list[dict[str, Any]]
     validates_prompts: tuple[str, ...] = ()
+    validates_skills: tuple[str, ...] = ()
+    surface: str = "cli"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +150,8 @@ class LocalEvalResult:
             "prompt_metadata": self.prompt_metadata,
             "prompt_versions": [str(metadata["reference"]) for metadata in self.prompt_metadata],
             "validates_prompts": list(self.validates_prompts),
+            "validates_skills": list(self.validates_skills),
+            "surface": self.surface,
         }
 
 
@@ -229,9 +269,19 @@ def _load_jsonl_cases(path: Path) -> list[LocalEvalCase]:
                 input_payload=row["input"],
                 expected=row["expected"],
                 validates_prompts=_validates_prompts(row, task),
+                validates_skills=_string_tuple(row.get("validates_skills")),
+                surface=str(row.get("surface") or "cli"),
             )
         )
     return cases
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    if not all(isinstance(item, str) and item for item in value):
+        raise ValueError("Expected a list of non-empty strings")
+    return tuple(value)
 
 
 def _validates_prompts(row: Mapping[str, Any], task: str) -> tuple[str, ...]:
@@ -278,6 +328,8 @@ def _result(
         observed=observed,
         prompt_metadata=prompt_metadata,
         validates_prompts=case.validates_prompts,
+        validates_skills=case.validates_skills,
+        surface=case.surface,
     )
 
 
@@ -819,7 +871,188 @@ def grade_approval_queue_revision(case: LocalEvalCase) -> LocalEvalResult:
     return _result(case, failures, observed)
 
 
+def grade_chief_of_staff(case: LocalEvalCase) -> LocalEvalResult:
+    expected = case.expected
+    request = str(case.input_payload.get("request") or "")
+    result = plan_chief_of_staff_request(request)
+    observed = result.model_dump(mode="json")
+    failures: list[str] = []
+
+    for field in (
+        "mode",
+        "summary",
+        "approval_required",
+        "human_review_required",
+        "send_enabled",
+        "slack_post_allowed",
+        "slack_post_policy",
+    ):
+        _expect_equal(failures, observed, expected, field)
+    route = observed.get("recommended_route")
+    if isinstance(route, Mapping):
+        for field in ("workflow_type", "target_channel", "requires_live_connector"):
+            expected_key = f"recommended_route_{field}"
+            if expected_key in expected and route.get(field) != expected[expected_key]:
+                _fail(failures, expected_key, route.get(field), expected[expected_key])
+    else:
+        failures.append("recommended_route: missing route recommendation")
+    _expect_contains_all(
+        failures,
+        observed.get("operating_capabilities", []),
+        expected.get("operating_capabilities_contains", []),
+        "operating_capabilities",
+    )
+    _expect_contains_all(
+        failures,
+        observed.get("blocked_side_effects", []),
+        expected.get("blocked_side_effects_contains", []),
+        "blocked_side_effects",
+    )
+    _expect_contains_all(
+        failures,
+        observed.get("context_sources_considered", []),
+        expected.get("context_sources_contains", []),
+        "context_sources_considered",
+    )
+    _expect_range(
+        failures,
+        len(observed.get("sources", [])),
+        field="sources",
+        minimum=expected.get("min_sources"),
+    )
+    if expected.get("require_source_urls") and not all(
+        source.get("url") for source in observed.get("sources", []) if isinstance(source, Mapping)
+    ):
+        failures.append("sources: each source must include a URL")
+    if expected.get("write_requests_empty") and observed.get("write_requests"):
+        failures.append("write_requests: expected no write requests")
+    return _result(case, failures, observed)
+
+
+def grade_skill_gate_failures(case: LocalEvalCase) -> LocalEvalResult:
+    expected = case.expected
+    gate = _skill_gate_failure_case(case)
+    observed = gate.to_dict()
+    failures: list[str] = []
+    for field in ("gate_id", "status", "domain"):
+        _expect_equal(failures, observed, expected, field)
+    _expect_contains_all(
+        failures,
+        observed.get("eval_labels", []),
+        expected.get("eval_labels_contains", []),
+        "eval_labels",
+    )
+    _expect_contains_all(
+        failures,
+        observed.get("skill_ids", []),
+        expected.get("skill_ids_contains", []),
+        "skill_ids",
+    )
+    if "hard_gate" in expected:
+        _expect_equal(failures, observed, expected, "hard_gate")
+    return _result(case, failures, observed)
+
+
+def _skill_gate_failure_case(case: LocalEvalCase):
+    mode = str(case.input_payload.get("mode", ""))
+    if mode == "business_research_missing_sources":
+        item = WorkItem(
+            kind=WorkItemKind.COMPANY_RESEARCH,
+            title="Research missing sources",
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            artifact_refs=[
+                WorkItemArtifactRef(
+                    artifact_type="company_profile",
+                    artifact_id="company-1",
+                    source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                    metadata={},
+                )
+            ],
+        )
+        return check_business_research_claim_gate(item)
+    if mode == "business_research_source_blocker":
+        item = WorkItem(
+            kind=WorkItemKind.COMPANY_RESEARCH,
+            title="Research blocked",
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            blockers=[
+                WorkItemBlocker(
+                    code="source_bundle_required",
+                    message="Source bundle required before claim synthesis.",
+                )
+            ],
+        )
+        return check_business_research_claim_gate(item)
+    if mode == "outreach_send_flag":
+        item = WorkItem(
+            kind=WorkItemKind.OUTREACH,
+            title="Outreach unsafe send flag",
+            current_route=WorkItemRoute.OUTREACH_COMPOSER,
+            artifact_refs=[
+                WorkItemArtifactRef(
+                    artifact_type="outreach_draft",
+                    artifact_id="draft-1",
+                    source_agent=WorkItemRoute.OUTREACH_COMPOSER.value,
+                    metadata={"send_enabled": True},
+                )
+            ],
+            approval_gates=[WorkItemApprovalGate(scope="external_use", state="pending")],
+        )
+        return check_outreach_approval_claim_gate(item)
+    if mode == "gmail_sensitive_missing_flags":
+        item = WorkItem(
+            kind=WorkItemKind.GMAIL_THREAD,
+            title="Gmail sensitive missing flags",
+            request_text="Payment attachment and credential reset link.",
+            current_route=WorkItemRoute.GMAIL_TRIAGE,
+            artifact_refs=[
+                WorkItemArtifactRef(
+                    artifact_type="gmail_triage_report",
+                    artifact_id="triage-1",
+                    source_agent=WorkItemRoute.GMAIL_TRIAGE.value,
+                    metadata={"send_enabled": False},
+                )
+            ],
+        )
+        result = WorkflowRunResult(
+            work_item=item,
+            route=WorkItemRoute.GMAIL_TRIAGE,
+            status=WorkItemStatus.DONE,
+            advanced=True,
+            artifact_refs=list(item.artifact_refs),
+        )
+        return check_gmail_sensitive_message_gate(
+            item,
+            result=result,
+            request_text=item.request_text,
+        )
+    if mode == "chief_publish_without_approval":
+        item = WorkItem(
+            kind=WorkItemKind.WEEKLY_SCAN,
+            title="Chief publish unsafe",
+            current_route=WorkItemRoute.CHIEF_OF_STAFF,
+            artifact_refs=[
+                WorkItemArtifactRef(
+                    artifact_type="chief_of_staff_plan",
+                    artifact_id="chief-1",
+                    source_agent=WorkItemRoute.CHIEF_OF_STAFF.value,
+                    metadata={"slack_post_allowed": True},
+                )
+            ],
+        )
+        result = WorkflowRunResult(
+            work_item=item,
+            route=WorkItemRoute.CHIEF_OF_STAFF,
+            status=WorkItemStatus.IN_PROGRESS,
+            advanced=True,
+            artifact_refs=list(item.artifact_refs),
+        )
+        return check_chief_artifact_publish_gate(item, result=result)
+    raise ValueError(f"{case.case_id}: unsupported skill_gate_failures mode {mode!r}")
+
+
 GRADERS: dict[str, Callable[[LocalEvalCase], LocalEvalResult]] = {
+    "chief_of_staff": grade_chief_of_staff,
     "gmail_triage": grade_gmail_triage,
     "orchestrator_routing": grade_orchestrator_routing,
     "safety_refusal": grade_safety_refusal,
@@ -827,6 +1060,7 @@ GRADERS: dict[str, Callable[[LocalEvalCase], LocalEvalResult]] = {
     "opportunity_scoring": grade_opportunity_scoring,
     "outreach_copy_constraints": grade_outreach_copy_constraints,
     "approval_queue_revision": grade_approval_queue_revision,
+    "skill_gate_failures": grade_skill_gate_failures,
 }
 
 
@@ -870,15 +1104,57 @@ def run_cases(cases: Iterable[LocalEvalCase]) -> list[LocalEvalResult]:
     return results
 
 
+def _dataset_stem(value: str) -> str:
+    return Path(value).stem
+
+
+def _skill_task_matrix_requested(dataset_names: Sequence[str]) -> bool:
+    return not dataset_names or any(
+        _dataset_stem(dataset_name) == SKILL_TASK_MATRIX_DATASET for dataset_name in dataset_names
+    )
+
+
+def _standard_dataset_names(dataset_names: Sequence[str]) -> tuple[str, ...]:
+    return tuple(
+        dataset_name
+        for dataset_name in dataset_names
+        if _dataset_stem(dataset_name) != SKILL_TASK_MATRIX_DATASET
+    )
+
+
+def _skill_task_result_to_local(result: SkillTaskEvalResult) -> LocalEvalResult:
+    spec = AGENT_REGISTRY[result.agent]
+    prompt_metadata = prompt_metadata_for_files(spec.prompt_files)
+    return LocalEvalResult(
+        dataset=SKILL_TASK_MATRIX_DATASET,
+        case_id=result.case_id,
+        task=SKILL_TASK_MATRIX_DATASET,
+        passed=result.passed,
+        failures=list(result.failures),
+        observed=result.to_dict(),
+        prompt_metadata=prompt_metadata,
+        validates_prompts=tuple(prompt_version_references(spec.prompt_files)),
+        validates_skills=result.selected_skills,
+        surface=result.surface,
+    )
+
+
 def run_local_evals(
     *,
     eval_dir: Path = DEFAULT_EVAL_DIR,
     dataset_names: Sequence[str] = (),
 ) -> LocalEvalSummary:
     cases: list[LocalEvalCase] = []
-    for path in resolve_eval_paths(eval_dir, dataset_names):
-        cases.extend(_load_jsonl_cases(path))
-    return LocalEvalSummary(results=run_cases(cases))
+    standard_dataset_names = _standard_dataset_names(dataset_names)
+    if standard_dataset_names or not dataset_names:
+        for path in resolve_eval_paths(eval_dir, standard_dataset_names):
+            cases.extend(_load_jsonl_cases(path))
+    results = run_cases(cases)
+    if _skill_task_matrix_requested(dataset_names):
+        skill_matrix_path = eval_dir / DEFAULT_SKILL_TASK_MATRIX.name
+        skill_summary = run_skill_task_eval_suite(skill_matrix_path)
+        results.extend(_skill_task_result_to_local(result) for result in skill_summary.results)
+    return LocalEvalSummary(results=results)
 
 
 def format_summary(summary: LocalEvalSummary) -> str:
@@ -923,8 +1199,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--benchmark-db",
         default=None,
         help=(
-            "Optional benchmark SQLite path. Defaults to KEYSTONE_BENCHMARK_DB "
-            "or .keystone/state."
+            "Optional benchmark SQLite path. Defaults to KEYSTONE_BENCHMARK_DB or .keystone/state."
         ),
     )
     parser.add_argument(

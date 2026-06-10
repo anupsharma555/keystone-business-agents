@@ -9,8 +9,8 @@ fixture-safe.
 2. Add a markdown prompt under `src/keystone_agents/prompts/` with metadata for name, version,
    purpose, safety notes, and eval datasets.
 3. Add a `build_*_agent()` function that returns an SDK `Agent` through `build_sdk_agent()`.
-4. Load instructions through `compose_instructions()` and include shared safety, tools, skills,
-   and Keystone profile context.
+4. Load instructions through `compose_instructions()` and include shared safety, tools,
+   declared repo-local skills, and Keystone profile context.
 5. Add deterministic fixture mode before live execution.
 6. Use explicit tool wrappers. Do not place live integration logic directly in the agent module.
 7. Require explicit live flags for every live integration path.
@@ -29,6 +29,7 @@ Each `AgentSpec` should include:
 - builder import path
 - output schema import path
 - prompt files
+- declared skills
 - supported tool names
 - required live flags
 - eval datasets and validation paths
@@ -50,3 +51,11 @@ Run the narrow tests first, then the suite:
 
 Do not mark a new agent complete until dry-run behavior, prompt metadata, safety gates, and eval
 or validation coverage are all present.
+
+## Skill Bundles
+
+Use `src/keystone_agents/skills/<skill_id>/SKILL.md` for reusable reasoning and
+output contracts shared across agents. Skills may describe required behavior,
+flexible behavior, boundaries, output contracts, failure modes, and evals. They
+must not attach tools, grant permissions, select hidden routes, or replace
+Python approval/source/action gates.

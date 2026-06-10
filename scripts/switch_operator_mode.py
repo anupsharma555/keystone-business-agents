@@ -18,7 +18,11 @@ MANAGED_KEYS: Final[tuple[str, ...]] = (
     "KEYSTONE_WEBSITE_EXTRACTOR",
     "SEARXNG_BASE_URL",
     "KEYSTONE_SEARXNG_TRANSIENT",
+    "KEYSTONE_EXA_SEARCH_FALLBACK",
+    "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN",
+    "KEYSTONE_SERPER_ENABLED",
     "KEYSTONE_TAVILY_SEARCH_FALLBACK",
+    "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN",
     "KEYSTONE_AGENT_HTML_REVIEW",
     "KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES",
     "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS",
@@ -26,7 +30,7 @@ MANAGED_KEYS: Final[tuple[str, ...]] = (
     "SEARCH_PROVIDER",
     "AUTO_SEND_EMAIL",
 )
-LIVE_SEARCH_PROVIDERS: Final[tuple[str, ...]] = ("serper", "searxng")
+LIVE_SEARCH_PROVIDERS: Final[tuple[str, ...]] = ("searxng", "exa", "tavily", "firecrawl")
 ENV_LINE_RE: Final[re.Pattern[str]] = re.compile(
     r"^(?P<indent>\s*)(?P<export>export\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)"
     r"(?P<pre_equals>\s*)=(?P<post_equals>\s*)(?P<body>.*)$"
@@ -55,7 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Live search provider for live-test/full-live. Defaults to the current live "
-            "provider if present, otherwise serper."
+            "provider if present, otherwise searxng. Serper is intentionally excluded "
+            "while credits are unavailable."
         ),
     )
     return parser
@@ -118,7 +123,11 @@ def mode_values(
             "KEYSTONE_WEBSITE_EXTRACTOR": "trafilatura",
             "SEARXNG_BASE_URL": "http://127.0.0.1:18080",
             "KEYSTONE_SEARXNG_TRANSIENT": "true",
+            "KEYSTONE_EXA_SEARCH_FALLBACK": "true",
+            "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "2",
+            "KEYSTONE_SERPER_ENABLED": "false",
             "KEYSTONE_TAVILY_SEARCH_FALLBACK": "false",
+            "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN": "2",
             "KEYSTONE_AGENT_HTML_REVIEW": "false",
             "KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES": "2",
             "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS": "120",
@@ -138,7 +147,11 @@ def mode_values(
             "KEYSTONE_WEBSITE_EXTRACTOR": "trafilatura",
             "SEARXNG_BASE_URL": "http://127.0.0.1:18080",
             "KEYSTONE_SEARXNG_TRANSIENT": "true",
+            "KEYSTONE_EXA_SEARCH_FALLBACK": "true",
+            "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "2",
+            "KEYSTONE_SERPER_ENABLED": "false",
             "KEYSTONE_TAVILY_SEARCH_FALLBACK": "false",
+            "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN": "2",
             "KEYSTONE_AGENT_HTML_REVIEW": "true",
             "KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES": "2",
             "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS": "120",
@@ -158,7 +171,11 @@ def mode_values(
             "KEYSTONE_WEBSITE_EXTRACTOR": "trafilatura",
             "SEARXNG_BASE_URL": "http://127.0.0.1:18080",
             "KEYSTONE_SEARXNG_TRANSIENT": "true",
+            "KEYSTONE_EXA_SEARCH_FALLBACK": "true",
+            "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "2",
+            "KEYSTONE_SERPER_ENABLED": "false",
             "KEYSTONE_TAVILY_SEARCH_FALLBACK": "false",
+            "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN": "2",
             "KEYSTONE_AGENT_HTML_REVIEW": "true",
             "KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES": "2",
             "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS": "120",

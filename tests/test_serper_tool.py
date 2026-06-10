@@ -8,7 +8,11 @@ from keystone_agents.tools.serper_tool import (
     SerperConfigurationError,
     SerperSearchError,
     SerperTool,
+    consume_sdk_search_telemetry,
+    reset_sdk_search_telemetry,
+    sdk_search_diagnostics_from_telemetry,
     search_web,
+    set_sdk_search_request_context,
 )
 
 
@@ -131,6 +135,8 @@ def test_search_web_defaults_to_live_searxng_when_live_research_enabled(
     monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
     monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
     monkeypatch.setenv("SEARXNG_BASE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "false")
 
     def fail_post(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("default live SDK search should prefer SearXNG before Serper")
@@ -190,6 +196,7 @@ def test_search_web_default_live_policy_includes_hosted_agents_lane(
     monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
     monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
     monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "false")
     monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "true")
     monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", "true")
     monkeypatch.setattr(
@@ -206,7 +213,367 @@ def test_search_web_default_live_policy_includes_hosted_agents_lane(
     assert [result.source for result in results] == ["searxng", "agents-web-search"]
 
 
-def test_search_web_uses_live_serper_when_explicitly_configured(
+def test_search_web_default_live_policy_can_include_exa_deepening_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            calls.append(f"{self.provider_name}:{request.query}:{request.num_results}")
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://example.com/{self.provider_name}",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN", "1")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    results = search_web("Curebase", num_results=2)
+
+    assert {
+        "searxng:Curebase:2",
+        "agents-web-search:Curebase:2",
+        "exa:Curebase:2",
+    } <= set(calls)
+    assert [result.source for result in results] == [
+        "searxng",
+        "agents-web-search",
+        "exa",
+    ]
+
+
+def test_search_web_default_live_policy_can_include_tavily_deepening_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            calls.append(f"{self.provider_name}:{request.query}:{request.num_results}")
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://example.com/{self.provider_name}",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN", "1")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    results = search_web("Curebase", num_results=2)
+
+    assert {
+        "searxng:Curebase:2",
+        "agents-web-search:Curebase:2",
+        "tavily:Curebase:2",
+    } <= set(calls)
+    assert [result.source for result in results] == [
+        "searxng",
+        "agents-web-search",
+        "tavily",
+    ]
+
+
+def test_search_web_can_query_trigger_tavily_deepening_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            calls.append(f"{self.provider_name}:{request.query}:{request.num_results}")
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://example.com/{self.provider_name}",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN", "1")
+    monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    results = search_web("Run deeper search and compare providers for Curebase", num_results=2)
+
+    assert any(call.startswith("tavily:") for call in calls)
+    assert [result.source for result in results] == [
+        "searxng",
+        "agents-web-search",
+        "tavily",
+    ]
+
+
+def test_search_web_can_context_trigger_tavily_deepening_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            calls.append(f"{self.provider_name}:{request.query}:{request.num_results}")
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://example.com/{self.provider_name}",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    reset_sdk_search_telemetry()
+    set_sdk_search_request_context("Search mode: deeper provider comparison.")
+    results = search_web("CalMHSA behavioral health clinical AI tools RFP", num_results=2)
+
+    assert any(call.startswith("tavily:") for call in calls)
+    assert [result.source for result in results] == [
+        "searxng",
+        "agents-web-search",
+        "tavily",
+    ]
+
+
+def test_search_web_can_context_trigger_tavily_from_deepened_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            calls.append(f"{self.provider_name}:{request.query}:{request.num_results}")
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://example.com/{self.provider_name}",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    reset_sdk_search_telemetry()
+    set_sdk_search_request_context("Please search beyond a first pass with a deepened brief.")
+    results = search_web("OpenAI mental health official", num_results=2)
+
+    assert any(call.startswith("tavily:") for call in calls)
+    assert [result.source for result in results] == [
+        "searxng",
+        "agents-web-search",
+        "tavily",
+    ]
+
+
+def test_search_web_enforces_optional_provider_caps_across_sdk_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            calls.append(f"{self.provider_name}:{request.query}:{request.num_results}")
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://example.com/{self.provider_name}",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN", "2")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    reset_sdk_search_telemetry()
+    set_sdk_search_request_context("Run a deepened search beyond a first pass.")
+    for index in range(3):
+        search_web(f"OpenAI mental health official {index}", num_results=2)
+
+    diagnostics = sdk_search_diagnostics_from_telemetry(consume_sdk_search_telemetry())
+
+    exa_calls = [call for call in calls if call.startswith("exa:")]
+    assert len(exa_calls) == 2
+    assert diagnostics["provider_usage"]["exa"]["requests_attempted"] == 2
+    assert diagnostics["provider_usage"]["exa"]["requests_succeeded"] == 2
+    assert any(
+        error.get("provider") == "exa" and error.get("error_type") == "ProviderRequestCapExceeded"
+        for error in diagnostics["search_provider_errors"]
+    )
+
+
+def test_search_web_records_sdk_provider_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://example.com/{self.provider_name}",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_PARALLEL", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "true")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    reset_sdk_search_telemetry()
+    search_web("Curebase", num_results=2)
+    diagnostics = sdk_search_diagnostics_from_telemetry(consume_sdk_search_telemetry())
+
+    assert diagnostics["search_provider_sequence"] == ["searxng", "agents-web-search"]
+    assert diagnostics["search_deepening_provider_sequence"] == ["exa", "tavily"]
+    assert diagnostics["primary_lane_statuses"]["searxng"] == "used"
+    assert diagnostics["primary_lane_statuses"]["agents-web-search"] == "used"
+    assert diagnostics["primary_lane_statuses"]["exa"] == "used"
+    assert diagnostics["primary_lane_statuses"]["tavily"] == "used"
+    assert diagnostics["provider_usage"]["exa"]["raw_result_count"] == 1
+    assert diagnostics["provider_result_samples"]["exa"] == [
+        {
+            "title": "exa result",
+            "url": "https://example.com/exa",
+            "snippet": "Source-backed search result.",
+        }
+    ]
+
+
+def test_search_web_blocks_serper_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
@@ -214,6 +581,21 @@ def test_search_web_uses_live_serper_when_explicitly_configured(
     monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
     monkeypatch.setenv("SEARCH_PROVIDER", "serper")
     monkeypatch.setenv("SERPER_API_KEY", "test-key")
+    monkeypatch.delenv("KEYSTONE_SERPER_ENABLED", raising=False)
+
+    with pytest.raises(SerperConfigurationError, match="Serper search is disabled"):
+        search_web("Curebase", num_results=1)
+
+
+def test_search_web_uses_live_serper_when_explicitly_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.setenv("SEARCH_PROVIDER", "serper")
+    monkeypatch.setenv("SERPER_API_KEY", "test-key")
+    monkeypatch.setenv("KEYSTONE_SERPER_ENABLED", "true")
 
     def fail_get(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("explicit Serper configuration should not call SearXNG first")

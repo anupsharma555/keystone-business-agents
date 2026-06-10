@@ -269,6 +269,18 @@ def _payload_claims(payload: dict[str, Any], *, company_name: str = "") -> list[
     return []
 
 
+def _payload_evidence_excerpt(payload: dict[str, Any], *, max_chars: int = 900) -> str:
+    for key in ("evidence_excerpt", "text_or_markdown", "content", "text", "html", "summary"):
+        raw_text = str(payload.get(key) or "").strip()
+        if not raw_text:
+            continue
+        clean_text = extract_clean_text(raw_text)
+        if not clean_text:
+            continue
+        return clean_text[:max_chars].rstrip()
+    return ""
+
+
 def _unsupported_claim_flags(claim: str) -> list[str]:
     return [
         f"unsupported company research claim: {flag}"
@@ -350,6 +362,7 @@ def _source_records(
                 url=str(raw_source.get("url") or fixture_ref),
                 source_type=_safe_source_type(raw_source.get("source_type"), default="fixture"),
                 supported_claims=claims,
+                evidence_excerpt=_payload_evidence_excerpt(raw_source),
                 confidence=float(raw_source.get("confidence", 0.75)),
                 published_at=raw_source.get("published_at") or raw_source.get("date"),
             )
@@ -515,6 +528,7 @@ def _website_source_records(
                 url=url,
                 source_type=_safe_source_type(payload.get("source_type"), default="website"),
                 supported_claims=claims,
+                evidence_excerpt=_payload_evidence_excerpt(payload),
                 confidence=float(payload.get("confidence", 0.7)),
                 published_at=payload.get("published_at") or payload.get("date"),
             )
@@ -551,6 +565,7 @@ def _profile_source_records(
                 url=url,
                 source_type=_safe_source_type(payload.get("source_type"), default=source_type),
                 supported_claims=claims,
+                evidence_excerpt=_payload_evidence_excerpt(payload),
                 confidence=float(payload.get("confidence", 0.6)),
                 published_at=payload.get("published_at") or payload.get("date"),
             )
@@ -1216,6 +1231,51 @@ def _score_sources(
     return scored
 
 
+def _rank_sources_for_request_focus(
+    sources: list[SourceRecord],
+    *,
+    request_focus_terms: list[str] | None,
+) -> list[SourceRecord]:
+    """Prefer sources whose title, URL, claims, or extracted text match the request focus."""
+
+    focus_terms = [
+        str(term or "").strip().lower()
+        for term in request_focus_terms or []
+        if str(term or "").strip()
+    ]
+    if not focus_terms:
+        return sources
+
+    scored: list[tuple[int, int, SourceRecord]] = []
+    for position, source in enumerate(sources):
+        url = source.url.lower()
+        title = source.title.lower()
+        claims = " ".join(source.supported_claims).lower()
+        excerpt = source.evidence_excerpt.lower()
+        haystack = f"{url} {title} {claims} {excerpt}"
+        score = 0
+        for term in focus_terms:
+            if term in url:
+                score += 4
+            if term in title:
+                score += 3
+            if term in claims:
+                score += 2
+            if term in excerpt:
+                score += 2
+            if term in haystack:
+                score += 1
+        if score and source.evidence_excerpt.strip():
+            score += 2
+        scored.append((score, position, source))
+
+    if not any(score for score, _position, _source in scored):
+        return sources
+    return [
+        source for score, position, source in sorted(scored, key=lambda item: (-item[0], item[1]))
+    ]
+
+
 def _evidence_from_sources(sources: list[SourceRecord]) -> list[str]:
     return list(
         dict.fromkeys(
@@ -1543,6 +1603,7 @@ def research_company_fixture(
     search_results: list[Any] | None = None,
     website_inputs: Any = None,
     profile_inputs: Any = None,
+    request_focus_terms: list[str] | None = None,
 ) -> CompanyProfile:
     """Build a source-attributed company profile without live API calls."""
 
@@ -1565,6 +1626,10 @@ def research_company_fixture(
     ranked_sources = dedupe_and_rank_source_records(
         scored_sources,
         company_url=resolved_url,
+    )
+    ranked_sources = _rank_sources_for_request_focus(
+        ranked_sources,
+        request_focus_terms=request_focus_terms,
     )
     sources, research_completeness = _select_sources_until_complete(
         ranked_sources,

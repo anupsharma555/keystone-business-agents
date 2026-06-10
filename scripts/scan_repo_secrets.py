@@ -120,10 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Scanned {report.scanned_files} tracked text files under {root}.")
         print(f"Found {len(report.findings)} potential secret(s):")
         for finding in report.findings:
-            print(
-                f"- {finding.path}:{finding.line} "
-                f"[{finding.pattern}] sample={finding.sample}"
-            )
+            print(f"- {finding.path}:{finding.line} [{finding.pattern}] sample={finding.sample}")
     else:
         print(
             "Scanned "

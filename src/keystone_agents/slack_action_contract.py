@@ -12,12 +12,14 @@ BUSINESS_AGENT_SLACK_CONTRACT_SCHEMA = "keystone.business_agent_slack_contract.v
 BUSINESS_AGENT_SLACK_CONTRACT_VERSION = "1"
 BUSINESS_AGENT_SLACK_CONTRACT_CAPABILITIES = (
     "feedback_jsonl",
+    "operator_failure_payload",
     "selected_context_prior_agent_runs",
     "selected_context_embedded_fallback",
     "write_gate_no_send",
 )
 SLACK_SELECTED_CONTEXT_SCHEMA = "keystone.slack.selected_message_context.v1"
 SLACK_AGENT_FEEDBACK_EVENT_SCHEMA = "keystone.slack.agent_feedback_event.v1"
+OPERATOR_FAILURE_SCHEMA = "keystone.operator_failure.v1"
 
 KBA_CREATE_GMAIL_DRAFT = "kba_create_gmail_draft"
 KBA_APPROVE_EXTERNAL_USE = "kba_approve_external_use"
@@ -256,6 +258,32 @@ def slack_agent_feedback_event(event_type: str, payload: dict[str, Any]) -> dict
     ).model_dump(mode="json", by_alias=True)
 
 
+class OperatorFailurePayload(BaseModel):
+    """Shared operator-readable failure shape embedded in Slack feedback and results."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_name: str = Field(default=OPERATOR_FAILURE_SCHEMA, alias="schema")
+    kind: str
+    summary: str
+    reason: str = ""
+    next_step: str
+    retryable: bool = False
+    safe_to_continue: bool = False
+
+    @field_validator("schema_name", "kind", "summary", "reason", "next_step", mode="before")
+    @classmethod
+    def _clean_scalar(cls, value: Any) -> str:
+        return " ".join(str(value or "").strip().split())
+
+    @field_validator("schema_name")
+    @classmethod
+    def _validate_schema_name(cls, value: str) -> str:
+        if value != OPERATOR_FAILURE_SCHEMA:
+            raise ValueError(f"Unsupported operator failure schema: {value or 'missing'}")
+        return value
+
+
 class BusinessAgentWriteGatePayload(BaseModel):
     """JSON value carried by Slack's business-agent write request gate."""
 
@@ -360,6 +388,7 @@ def business_agent_slack_contract() -> dict[str, Any]:
         "schemas": {
             "business_agent_action": BUSINESS_AGENT_ACTION_SCHEMA,
             "agent_feedback_event": SLACK_AGENT_FEEDBACK_EVENT_SCHEMA,
+            "operator_failure": OPERATOR_FAILURE_SCHEMA,
             "selected_message_context": SLACK_SELECTED_CONTEXT_SCHEMA,
             "write_gate": BUSINESS_AGENT_WRITE_GATE_SCHEMA,
         },
@@ -388,6 +417,7 @@ def business_agent_slack_contract() -> dict[str, Any]:
         "payload_json_schemas": {
             "business_agent_action": BusinessAgentActionPayload.model_json_schema(),
             "agent_feedback_event": SlackAgentFeedbackEvent.model_json_schema(),
+            "operator_failure": OperatorFailurePayload.model_json_schema(),
             "selected_message_context": selected_message_context_json_schema(),
             "write_gate": BusinessAgentWriteGatePayload.model_json_schema(),
         },

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from keystone_agents import run as run_module
 from keystone_agents import sdk as sdk_module
+from keystone_agents.agent_registry import AGENT_REGISTRY
 from keystone_agents.agents import (
     business_research_analyst,
     gmail_triage,
@@ -18,6 +19,7 @@ from keystone_agents.agents import (
     outreach_composer,
 )
 from keystone_agents.company_research import research_company_fixture
+from keystone_agents.context_sources import context_source_by_id, context_source_catalog
 from keystone_agents.schemas.company_profile import CompanyProfile
 from keystone_agents.schemas.email_triage import EmailTriageResult
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
@@ -44,6 +46,7 @@ from scripts.scan_repo_secrets import scan_tracked_files
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 KEYSTONE_AGENTS_ROOT = PROJECT_ROOT / "src" / "keystone_agents"
 KEYSTONE_PROMPTS_ROOT = KEYSTONE_AGENTS_ROOT / "prompts"
+KEYSTONE_SKILLS_ROOT = KEYSTONE_AGENTS_ROOT / "skills"
 FIXTURES_ROOT = PROJECT_ROOT / "tests" / "fixtures"
 
 CANONICAL_SPECIALISTS = (
@@ -54,7 +57,6 @@ CANONICAL_SPECIALISTS = (
         (
             "keystone_profile.md",
             "safety_policy.md",
-            "skills.md",
             "tools.md",
             "gmail_triage.md",
         ),
@@ -66,7 +68,6 @@ CANONICAL_SPECIALISTS = (
         (
             "keystone_profile.md",
             "safety_policy.md",
-            "skills.md",
             "tools.md",
             "business_research_analyst.md",
         ),
@@ -78,7 +79,6 @@ CANONICAL_SPECIALISTS = (
         (
             "keystone_profile.md",
             "safety_policy.md",
-            "skills.md",
             "tools.md",
             "opportunity_scout.md",
         ),
@@ -90,7 +90,6 @@ CANONICAL_SPECIALISTS = (
         (
             "keystone_profile.md",
             "safety_policy.md",
-            "skills.md",
             "tools.md",
             "outreach_composer.md",
         ),
@@ -105,7 +104,6 @@ CANONICAL_AGENTS = CANONICAL_SPECIALISTS + (
         (
             "keystone_profile.md",
             "safety_policy.md",
-            "skills.md",
             "tools.md",
             "orchestrator.md",
         ),
@@ -177,6 +175,95 @@ def test_agents_sdk_conformance_doc_maps_structural_boundaries() -> None:
         assert required in text
 
 
+def test_context_source_catalog_declares_required_contracts() -> None:
+    catalog = context_source_catalog()
+    by_id = {source.source_id: source for source in catalog}
+
+    assert {
+        "operator_project_policy",
+        "work_item_state",
+        "slack_thread_context",
+        "agent_memory",
+        "local_docs_zotero_cache",
+        "web_search_and_page_extraction",
+        "airtable_finance_tax",
+        "gmail",
+        "google_workspace",
+        "slack_posting",
+        "openai_file_search",
+        "sandbox_workspace_review",
+    } <= set(by_id)
+
+    known_agents = set(AGENT_REGISTRY)
+    for source in catalog:
+        assert source.owner_modules, source.source_id
+        assert source.allowed_agents, source.source_id
+        assert set(source.allowed_agents) <= known_agents, source.source_id
+        assert source.contract, source.source_id
+        assert source.approval_notes, source.source_id
+        assert source.source_attribution, source.source_id
+        assert source.validation_paths, source.source_id
+        for path in source.validation_paths:
+            assert (PROJECT_ROOT / path).exists(), f"{source.source_id}: {path}"
+        for owner in source.owner_modules:
+            owner_path = PROJECT_ROOT / owner
+            if owner_path.suffix or owner_path.exists():
+                assert owner_path.exists(), f"{source.source_id}: {owner}"
+            else:
+                module_path = PROJECT_ROOT / (owner.replace(".", "/") + ".py")
+                assert module_path.exists(), f"{source.source_id}: {owner}"
+
+
+def test_live_context_sources_declare_live_flags_and_approval_boundaries() -> None:
+    live_context_ids = {
+        "web_search_and_page_extraction",
+        "airtable_finance_tax",
+        "gmail",
+        "google_workspace",
+        "slack_posting",
+        "openai_file_search",
+        "sandbox_workspace_review",
+    }
+
+    for source_id in live_context_ids:
+        source = context_source_by_id(source_id)
+        assert source.live_flags, source_id
+        approval_text = " ".join(source.approval_notes).lower()
+        assert any(
+            marker in approval_text
+            for marker in ("approval", "read-only", "read only", "never automatic")
+        ), source_id
+
+
+def test_web_search_context_catalog_matches_current_provider_lanes() -> None:
+    source = context_source_by_id("web_search_and_page_extraction")
+    expected_live_flags = {
+        "SEARXNG_BASE_URL",
+        "EXA_API_KEY",
+        "TAVILY_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "KEYSTONE_SERPER_ENABLED",
+    }
+
+    assert expected_live_flags <= set(source.live_flags)
+    assert source.allowed_agents == (
+        "chief_of_staff",
+        "business_research_analyst",
+        "opportunity_scout",
+    )
+    assert "retrieval_diagnostics" in source.contract
+    assert "source_refs" in source.contract
+    assert "extracted/read URLs" in source.source_attribution
+    assert {
+        "searxng",
+        "agents-web-search",
+        "exa",
+        "tavily",
+        "firecrawl",
+        "serper",
+    }
+
+
 def test_prompt_files_exist() -> None:
     expected_prompts = {
         "business_research_analyst.md",
@@ -192,6 +279,35 @@ def test_prompt_files_exist() -> None:
     }
 
     assert expected_prompts <= {path.name for path in KEYSTONE_PROMPTS_ROOT.glob("*.md")}
+
+
+def test_skill_files_exist() -> None:
+    expected_skills = {
+        "identity_and_record_resolution",
+        "prior_work_and_duplicate_checking",
+        "evidence_attribution_and_claim_mapping",
+        "context_permission_gating",
+        "action_boundary_enforcement",
+        "unsupported_claim_and_gap_handling",
+        "tool_result_resilience",
+        "structured_output_quality_review",
+        "workspace_artifact_governance",
+        "workflow_lifecycle_tracking",
+        "handoff_contract_packaging",
+        "request_to_specialist_brief",
+        "gmail_triage_specialist_contracts",
+        "business_research_specialist_contracts",
+        "opportunity_scout_specialist_contracts",
+        "outreach_composer_specialist_contracts",
+        "orchestrator_specialist_contracts",
+        "chief_of_staff_specialist_contracts",
+    }
+
+    assert expected_skills <= {
+        path.name for path in KEYSTONE_SKILLS_ROOT.iterdir() if path.is_dir()
+    }
+    for skill_name in expected_skills:
+        assert (KEYSTONE_SKILLS_ROOT / skill_name / "SKILL.md").exists()
 
 
 def test_each_agent_module_has_builder_function() -> None:
@@ -458,7 +574,8 @@ def test_canonical_builders_return_structured_sdk_agents_with_guardrails() -> No
         assert agent.tools
         assert agent.input_guardrails
         assert agent.output_guardrails
-        assert "<!-- AGENTS.md -->" in agent.instructions
+        assert "<!-- repo_runtime_policy.md -->" in agent.instructions
+        assert "<!-- AGENTS.md -->" not in agent.instructions
         assert "<!-- memory_policy.md -->" in agent.instructions
         assert "Agent Improvement Test Pack" in agent.instructions
         assert "Memory And Pre-Run Context Policy" in agent.instructions
