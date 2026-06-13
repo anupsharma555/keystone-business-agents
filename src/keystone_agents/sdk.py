@@ -38,6 +38,9 @@ try:
         FileSearchTool as SDKFileSearchTool,
     )
     from agents import (
+        HostedMCPTool as SDKHostedMCPTool,
+    )
+    from agents import (
         GuardrailFunctionOutput,
         ModelSettings,
         OpenAIProvider,
@@ -55,6 +58,9 @@ try:
     )
     from agents import (
         WebSearchTool as SDKWebSearchTool,
+    )
+    from agents import (
+        ToolSearchTool as SDKToolSearchTool,
     )
     from agents import (
         function_tool as _sdk_function_tool,
@@ -75,6 +81,8 @@ except ImportError as exc:  # pragma: no cover - depends on optional local insta
     AsyncOpenAI = Any  # type: ignore
     SDKWebSearchTool = None  # type: ignore[assignment]
     SDKFileSearchTool = None  # type: ignore[assignment]
+    SDKHostedMCPTool = None  # type: ignore[assignment]
+    SDKToolSearchTool = None  # type: ignore[assignment]
 
     def input_guardrail(*_: Any, **__: Any) -> Any:  # type: ignore
         return lambda wrapped: wrapped
@@ -470,6 +478,8 @@ LocalFile = SDKLocalFile
 UnixLocalSandboxClient = SDKUnixLocalSandboxClient
 WebSearchTool = SDKWebSearchTool
 FileSearchTool = SDKFileSearchTool
+HostedMCPTool = SDKHostedMCPTool
+ToolSearchTool = SDKToolSearchTool
 
 GuardrailSpec = (
     Mapping[str, Sequence[Any]] | tuple[Sequence[Any], Sequence[Any]] | Sequence[Any] | None

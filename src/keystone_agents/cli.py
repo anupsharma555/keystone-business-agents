@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from keystone_agents.agent_mentions import parse_agent_mention
 from keystone_agents.agent_registry import AGENT_REGISTRY, agent_cards
@@ -36,6 +37,7 @@ from keystone_agents.cli_sdk import add_sdk_session_arguments
 from keystone_agents.config import cli_default_live_research, cli_default_live_sdk, load_settings
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.evals import generate_eval_report, run_static_evals
+from keystone_agents.file_search import local_file_search_config_summary
 from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
 from keystone_agents.models import RunMode
@@ -383,6 +385,24 @@ def build_parser() -> argparse.ArgumentParser:
     agents_list = agent_subparsers.add_parser("list", help="List registered agent cards.")
     agents_list.add_argument("--json", action="store_true", help="Print JSON.")
     agents_list.set_defaults(func=_run_agents_list)
+    agents_tools = agent_subparsers.add_parser(
+        "tools",
+        help="Show sanitized runtime tool availability for registered agents.",
+    )
+    agents_tools.add_argument(
+        "--agent",
+        choices=["all", *sorted(AGENT_REGISTRY)],
+        default="all",
+        help="Agent route to inspect. Defaults to all agents.",
+    )
+    agents_tools.add_argument("--json", action="store_true", help="Print JSON.")
+    agents_tools.set_defaults(func=_run_agents_tools)
+    agents_file_search_config = agent_subparsers.add_parser(
+        "file-search-config",
+        help="Validate the ignored local FileSearch vector-store config.",
+    )
+    agents_file_search_config.add_argument("--json", action="store_true", help="Print JSON.")
+    agents_file_search_config.set_defaults(func=_run_agents_file_search_config)
 
     return parser
 
@@ -473,6 +493,18 @@ def _run_ask(args: argparse.Namespace) -> int:
     input_text = raw_input if args.agent else mention.input_text
     cost_directive = parse_cost_tracking_directive(input_text)
     input_text = (cost_directive.cleaned_text or input_text).strip()
+    eval_score_save = _eval_score_save_payload(input_text, context_file_path=args.context_file)
+    if eval_score_save is not None:
+        return _print_eval_score_saved(eval_score_save, json_output=args.json)
+    eval_score_template = _eval_score_template_payload(
+        input_text,
+        context_file_path=args.context_file,
+    )
+    if eval_score_template is not None:
+        return _print_eval_score_template(eval_score_template, json_output=args.json)
+    eval_status = _eval_status_payload(input_text, context_file_path=args.context_file)
+    if eval_status is not None:
+        return _print_eval_status(eval_status, json_output=args.json)
     live_sdk = _ask_live_sdk_enabled(args)
     live_manual_plan = args.live_manual_plan or live_sdk
     live_search = args.live_search or (live_sdk and cli_default_live_research())
@@ -622,6 +654,416 @@ def _run_ask(args: argparse.Namespace) -> int:
         orchestrator_preflight=orchestrator_preflight,
         database_url=args.database_url,
     )
+
+
+def _eval_score_save_payload(
+    input_text: str,
+    *,
+    context_file_path: str = "",
+) -> dict[str, object] | None:
+    compact = " ".join(str(input_text or "").split())
+    lowered = compact.lower()
+    has_score_word = any(term in lowered for term in ("score", "scoring", "scorecard"))
+    inferred = _eval_context_fields(context_file_path)
+    if "eval" not in lowered and not has_score_word and not inferred.get("case_id"):
+        return None
+    if not _looks_like_eval_human_score_reply(input_text):
+        return None
+
+    try:
+        from promptfoo.human_review import (
+            DEFAULT_REVIEW_DB,
+            parse_human_review,
+            save_human_review,
+        )
+    except ImportError:
+        return {
+            "mode": "eval_score_saved",
+            "status": "blocked",
+            "route": "orchestrator",
+            "human_summary": (
+                "Promptfoo human-review helpers are not available in this environment."
+            ),
+            "send_enabled": False,
+        }
+
+    slack_context = _slack_context_metadata(context_file_path)
+    try:
+        review = parse_human_review(
+            input_text,
+            case_id=inferred.get("case_id", ""),
+            run_id=inferred.get("run_id", ""),
+            agent=inferred.get("agent", ""),
+            slack_channel_id=slack_context.get("channel_id", "C0BA17Y9C01"),
+            slack_channel_name=slack_context.get("channel_name", "evals"),
+            slack_thread_ts=slack_context.get("thread_ts", ""),
+        )
+    except ValueError as exc:
+        return {
+            "mode": "eval_score_saved",
+            "status": "blocked",
+            "route": "orchestrator",
+            "human_summary": f"Eval score was not saved: {exc}",
+            "error": str(exc),
+            "send_enabled": False,
+        }
+
+    database_path = Path(os.environ.get("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB") or DEFAULT_REVIEW_DB)
+    row_id = save_human_review(review, database_path=database_path)
+    dashboard = _render_promptfoo_dashboard(database_path)
+    case_dashboard = _dashboard_case_link(dashboard, review.case_id)
+    payload = review.to_dict()
+    summary = (
+        f"Eval score saved for `{review.case_id}`"
+        + (f" / `{review.run_id}`" if review.run_id else "")
+        + f" with average {review.average_score}/5."
+    )
+    if case_dashboard.get("dashboard_case_url"):
+        summary += f" Dashboard: {_slack_link(case_dashboard['dashboard_case_url'], 'case dashboard')}."
+    elif dashboard.get("dashboard_path"):
+        summary += f" Dashboard: {dashboard['dashboard_path']}."
+    payload.update(
+        {
+            "id": row_id,
+            "mode": "eval_score_saved",
+            "status": "done",
+            "route": "orchestrator",
+            "human_summary": summary,
+            "database_path": str(database_path),
+            "eval_thread_reply": _eval_thread_reply_guidance(
+                case_id=review.case_id,
+                run_id=review.run_id,
+                dashboard_case_url=case_dashboard.get("dashboard_case_url", ""),
+            ),
+            "send_enabled": False,
+            **dashboard,
+            **case_dashboard,
+        }
+    )
+    return payload
+
+
+def _eval_score_template_payload(
+    input_text: str,
+    *,
+    context_file_path: str = "",
+) -> dict[str, object] | None:
+    compact = " ".join(str(input_text or "").split())
+    lowered = compact.lower()
+    inferred = _eval_context_fields(context_file_path)
+    natural_scorecard_request = bool(
+        re.search(
+            r"\b(?:scorecard|rubric|score\s+this|score\s+the|grade\s+this|"
+            r"review\s+this|human\s+score|scoring\s+template)\b",
+            lowered,
+        )
+    )
+    if "eval" not in lowered and not inferred.get("case_id") and not natural_scorecard_request:
+        return None
+    if (
+        not any(term in lowered for term in ("template", "rubric", "scorecard", "scoring"))
+        and not natural_scorecard_request
+    ):
+        return None
+    if re.search(r"\bstore|save|record|submit\b", lowered):
+        return None
+
+    try:
+        from promptfoo.human_review import build_slack_review_template
+    except ImportError:
+        return {
+            "mode": "eval_score_template",
+            "status": "blocked",
+            "route": "orchestrator",
+            "human_summary": (
+                "Promptfoo human-review helpers are not available in this environment."
+            ),
+            "send_enabled": False,
+        }
+
+    case_id = (
+        _extract_eval_template_field(compact, "case")
+        or inferred.get("case_id")
+        or "<case_id>"
+    )
+    run_id = _extract_eval_template_field(compact, "run") or inferred.get("run_id", "")
+    agent = _extract_eval_template_field(compact, "agent") or inferred.get("agent", "")
+    template = build_slack_review_template(case_id=case_id, run_id=run_id, agent=agent)
+    review_db_path = os.environ.get(
+        "KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB",
+        ".keystone/promptfoo/human-reviews.sqlite",
+    )
+    dashboard = _render_promptfoo_dashboard(Path(review_db_path))
+    case_dashboard = _dashboard_case_link(dashboard, case_id) if case_id != "<case_id>" else {}
+    return {
+        "mode": "eval_score_template",
+        "status": "done",
+        "route": "orchestrator",
+        "case_id": case_id,
+        "run_id": run_id,
+        "agent": agent,
+        "human_summary": template,
+        "output": template,
+        "eval_thread_reply": _eval_thread_reply_guidance(
+            case_id=case_id,
+            run_id=run_id,
+            dashboard_case_url=case_dashboard.get("dashboard_case_url", ""),
+        ),
+        "slack_channel_id": "C0BA17Y9C01",
+        "slack_channel_name": "evals",
+        "send_enabled": False,
+        **dashboard,
+        **case_dashboard,
+    }
+
+
+def _looks_like_eval_human_score_reply(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:accuracy|relevance|explainability|readability|source_quality|"
+            r"search_quality|synthesis|output|format|instruction_following|usefulness)"
+            r"\s*(?:[:=\-]\s*)?[0-5](?:\.\d+)?\b",
+            str(text or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _eval_status_payload(
+    input_text: str,
+    *,
+    context_file_path: str = "",
+) -> dict[str, object] | None:
+    compact = " ".join(str(input_text or "").split())
+    lowered = compact.lower()
+    inferred = _eval_context_fields(context_file_path)
+    if "eval" not in lowered and "promptfoo" not in lowered and not inferred.get("case_id"):
+        return None
+    if not any(
+        term in lowered
+        for term in ("status", "summary", "show", "list", "doing", "progress")
+    ):
+        return None
+    case_id = _extract_eval_template_field(compact, "case") or inferred.get("case_id", "")
+    if not case_id:
+        return None
+
+    try:
+        from promptfoo.eval_database import DEFAULT_EVAL_DB, eval_case_status
+    except ImportError:
+        return {
+            "mode": "eval_status",
+            "status": "blocked",
+            "route": "orchestrator",
+            "human_summary": "Promptfoo eval database helpers are not available.",
+            "send_enabled": False,
+        }
+
+    database_path = Path(os.environ.get("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB") or DEFAULT_EVAL_DB)
+    status = eval_case_status(case_id, database_path=database_path)
+    dashboard = _render_promptfoo_dashboard(database_path)
+    case_dashboard = _dashboard_case_link(dashboard, case_id)
+    promptfoo = (
+        status.get("latest_promptfoo")
+        if isinstance(status.get("latest_promptfoo"), dict)
+        else None
+    )
+    human = (
+        status.get("latest_human_review")
+        if isinstance(status.get("latest_human_review"), dict)
+        else None
+    )
+    promptfoo_text = "no imported Promptfoo result"
+    if promptfoo:
+        promptfoo_state = "pass" if promptfoo.get("success") else "fail"
+        promptfoo_text = (
+            f"{promptfoo_state}, score {promptfoo.get('score')}, "
+            f"eval {promptfoo.get('eval_id')}"
+        )
+    human_text = "no saved human review"
+    if human:
+        human_text = (
+            f"average {human.get('average_score')}/5, "
+            f"safety {human.get('safety')}"
+        )
+    summary = (
+        f"Eval `{case_id}` status: Promptfoo {promptfoo_text}; "
+        f"human review {human_text}; Slack runs {status.get('slack_run_count')}."
+    )
+    if case_dashboard.get("dashboard_case_url"):
+        summary += f" Dashboard: {_slack_link(case_dashboard['dashboard_case_url'], 'case dashboard')}."
+    elif dashboard.get("dashboard_path"):
+        summary += f" Dashboard: {dashboard['dashboard_path']}."
+    review_case = _review_case_link(case_id)
+    if review_case.get("review_case_url"):
+        summary += f" Review form: {_slack_link(review_case['review_case_url'], 'score this case')}."
+    latest_run = _latest_slack_eval_run(status)
+    scorecard_request = (
+        f"@KNI can you give me a scorecard for this eval?"
+        if case_id
+        else ""
+    )
+    return {
+        "mode": "eval_status",
+        "status": "done",
+        "route": "orchestrator",
+        "case_id": case_id,
+        "run_id": str(latest_run.get("run_id") or ""),
+        "agent": str(latest_run.get("agent") or ""),
+        "human_summary": summary,
+        "scorecard_request": scorecard_request,
+        "eval_thread_reply": _eval_thread_reply_guidance(
+            case_id=case_id,
+            run_id=str(latest_run.get("run_id") or ""),
+            dashboard_case_url=case_dashboard.get("dashboard_case_url", ""),
+            review_case_url=review_case.get("review_case_url", ""),
+        ),
+        "database_path": str(database_path),
+        "eval_status": status,
+        "send_enabled": False,
+        **dashboard,
+        **case_dashboard,
+        **review_case,
+    }
+
+
+def _extract_eval_template_field(text: str, field: str) -> str:
+    pattern = rf"\b{re.escape(field)}(?:_id)?\s*(?:[:=]\s*|\s+)([A-Za-z0-9_.:-]+)"
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return str(match.group(1)).strip() if match else ""
+
+
+def _print_eval_score_template(payload: dict[str, object], *, json_output: bool) -> int:
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(str(payload.get("human_summary") or ""))
+        if payload.get("dashboard_case_url"):
+            print(f"Dashboard: {payload.get('dashboard_case_url')}")
+    return 0
+
+
+def _print_eval_score_saved(payload: dict[str, object], *, json_output: bool) -> int:
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(str(payload.get("human_summary") or "Eval score saved."))
+        print(f"Database: {payload.get('database_path')}")
+        if payload.get("dashboard_path"):
+            print(f"Dashboard: {payload.get('dashboard_path')}")
+        if payload.get("dashboard_case_url"):
+            print(f"Case dashboard: {payload.get('dashboard_case_url')}")
+        if payload.get("slack_thread_ts"):
+            print(
+                f"Slack thread: {payload.get('slack_channel_name')} "
+                f"{payload.get('slack_thread_ts')}"
+            )
+    return 0
+
+
+def _print_eval_status(payload: dict[str, object], *, json_output: bool) -> int:
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(str(payload.get("human_summary") or ""))
+        print(f"Database: {payload.get('database_path')}")
+        if payload.get("dashboard_path"):
+            print(f"Dashboard: {payload.get('dashboard_path')}")
+        if payload.get("dashboard_case_url"):
+            print(f"Case dashboard: {payload.get('dashboard_case_url')}")
+        if payload.get("review_case_url"):
+            print(f"Human review form: {payload.get('review_case_url')}")
+    return 0
+
+
+def _render_promptfoo_dashboard(database_path: Path) -> dict[str, str]:
+    try:
+        from promptfoo.eval_dashboard import render_dashboard
+    except ImportError:
+        return {}
+    try:
+        dashboard_output = os.environ.get("KEYSTONE_PROMPTFOO_DASHBOARD_PATH", "")
+        output_path = dashboard_output or str(database_path.parent / "dashboard.html")
+        dashboard_path = render_dashboard(
+            database_path=database_path,
+            output_path=output_path,
+        )
+    except (OSError, ValueError) as exc:
+        return {"dashboard_error": str(exc)}
+    return {
+        "dashboard_path": str(dashboard_path.resolve()),
+        "dashboard_relative_path": str(dashboard_path),
+        "dashboard_url": _promptfoo_dashboard_url(),
+    }
+
+
+def _promptfoo_dashboard_url() -> str:
+    try:
+        from promptfoo.eval_urls import eval_dashboard_url
+    except ImportError:
+        return os.environ.get(
+            "KEYSTONE_PROMPTFOO_DASHBOARD_URL",
+            "http://127.0.0.1:8769/dashboard",
+        )
+    return eval_dashboard_url()
+
+
+def _dashboard_case_link(dashboard: dict[str, str], case_id: str) -> dict[str, str]:
+    base_url = str(dashboard.get("dashboard_url") or "").strip()
+    if not base_url or not case_id:
+        return {}
+    try:
+        from promptfoo.eval_urls import eval_dashboard_case_url
+    except ImportError:
+        separator = "&" if "?" in base_url else "?"
+        return {"dashboard_case_url": f"{base_url}{separator}case={quote(case_id)}"}
+    return {"dashboard_case_url": eval_dashboard_case_url(case_id)}
+
+
+def _review_case_link(case_id: str) -> dict[str, str]:
+    if not case_id:
+        return {}
+    try:
+        from promptfoo.eval_urls import eval_review_case_url
+    except ImportError:
+        base_url = _promptfoo_dashboard_url().replace("/dashboard", "/review")
+        separator = "&" if "?" in base_url else "?"
+        return {"review_case_url": f"{base_url}{separator}case={quote(case_id)}"}
+    return {"review_case_url": eval_review_case_url(case_id)}
+
+
+def _slack_link(url: object, label: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    return f"<{value}|{label}>"
+
+
+def _latest_slack_eval_run(status: dict[str, object]) -> dict[str, object]:
+    runs = status.get("slack_runs")
+    if isinstance(runs, list) and runs and isinstance(runs[0], dict):
+        return runs[0]
+    return {}
+
+
+def _eval_thread_reply_guidance(
+    *,
+    case_id: str,
+    run_id: str = "",
+    dashboard_case_url: str = "",
+    review_case_url: str = "",
+) -> dict[str, str]:
+    guidance = {
+        "scorecard_request": "@KNI can you give me a scorecard for this eval?",
+        "status_request": "@KNI how is this eval doing?",
+        "case_id": case_id,
+        "run_id": run_id,
+    }
+    if dashboard_case_url:
+        guidance["dashboard_case_url"] = dashboard_case_url
+    if review_case_url:
+        guidance["review_case_url"] = review_case_url
+    return {key: value for key, value in guidance.items() if value}
 
 
 def _ask_live_sdk_enabled(args: argparse.Namespace) -> bool:
@@ -852,6 +1294,158 @@ def _context_file_is_slack_context(context_file_path: str) -> bool:
     return schema.startswith("keystone.slack.")
 
 
+def _slack_context_metadata(context_file_path: str) -> dict[str, str]:
+    metadata = {
+        "channel_id": "C0BA17Y9C01",
+        "channel_name": "evals",
+        "thread_ts": "",
+    }
+    if not context_file_path:
+        return metadata
+    try:
+        data = json.loads(Path(context_file_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return metadata
+    if not isinstance(data, dict):
+        return metadata
+    metadata["channel_id"] = str(data.get("channel_id") or metadata["channel_id"]).strip()
+    metadata["channel_name"] = str(data.get("channel_name") or metadata["channel_name"]).strip()
+    thread_ts = data.get("thread_ts") or data.get("selected_message_ts") or ""
+    metadata["thread_ts"] = str(thread_ts or "").strip()
+    return metadata
+
+
+def _eval_context_fields(context_file_path: str) -> dict[str, str]:
+    """Infer eval identifiers from a Slack context file for natural follow-ups."""
+
+    metadata = _eval_context_metadata(context_file_path)
+    thread_metadata = _eval_context_fields_from_thread(context_file_path)
+    text = _eval_context_text(context_file_path)
+    compact = " ".join(text.split())
+    case_id = (
+        metadata.get("case_id", "")
+        or thread_metadata.get("case_id", "")
+        or _extract_eval_template_field(compact, "case")
+        or _last_regex_group(r"\beval\s+case\s+([A-Za-z0-9_.:-]+)", compact)
+        or _last_regex_group(r"\bcase[_\s-]*id\s*[:=]\s*([A-Za-z0-9_.:-]+)", compact)
+    )
+    run_id = (
+        metadata.get("run_id", "")
+        or thread_metadata.get("run_id", "")
+        or _last_regex_group(r"\bWorkItem:\s*(wi_[A-Za-z0-9_.:-]+)", text)
+        or _extract_eval_template_field(compact, "run")
+        or _last_regex_group(r"\bRun:\s*([A-Za-z0-9_.:-]+)", text)
+    )
+    agent = (
+        metadata.get("agent", "")
+        or thread_metadata.get("agent", "")
+        or _extract_eval_template_field(compact, "agent")
+        or _last_regex_group(r"\bRoute:\s*([A-Za-z0-9_.:-]+)", text)
+        or _agent_from_eval_context_text(compact)
+    )
+    return {
+        key: value
+        for key, value in {
+            "case_id": case_id,
+            "run_id": run_id,
+            "agent": agent,
+        }.items()
+        if value
+    }
+
+
+def _eval_context_fields_from_thread(context_file_path: str) -> dict[str, str]:
+    slack_context = _slack_context_metadata(context_file_path)
+    if not slack_context.get("thread_ts"):
+        return {}
+    try:
+        from promptfoo.eval_database import DEFAULT_EVAL_DB, eval_context_from_slack_thread
+    except ImportError:
+        return {}
+    database_path = Path(os.environ.get("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB") or DEFAULT_EVAL_DB)
+    try:
+        return eval_context_from_slack_thread(
+            slack_thread_ts=slack_context.get("thread_ts", ""),
+            slack_channel_id=slack_context.get("channel_id", "C0BA17Y9C01"),
+            slack_channel_name=slack_context.get("channel_name", "evals"),
+            database_path=database_path,
+        )
+    except (OSError, ValueError):
+        return {}
+
+
+def _eval_context_metadata(context_file_path: str) -> dict[str, str]:
+    if not context_file_path:
+        return {}
+    try:
+        data = json.loads(Path(context_file_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    eval_data = data.get("eval") if isinstance(data.get("eval"), dict) else {}
+    case_id = str(eval_data.get("case_id") or data.get("eval_case_id") or "").strip()
+    run_id = str(eval_data.get("run_id") or data.get("eval_run_id") or "").strip()
+    agent = str(eval_data.get("agent") or data.get("eval_agent") or "").strip()
+    return {
+        key: value
+        for key, value in {
+            "case_id": case_id,
+            "run_id": run_id,
+            "agent": agent,
+        }.items()
+        if value
+    }
+
+
+def _eval_context_text(context_file_path: str) -> str:
+    if not context_file_path:
+        return ""
+    try:
+        data = json.loads(Path(context_file_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    parts: list[str] = []
+    for key in (
+        "read_context",
+        "selected_message_text",
+        "message_text",
+        "request_text",
+        "text",
+    ):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _last_regex_group(pattern: str, text: str) -> str:
+    matches = re.findall(pattern, text, flags=re.IGNORECASE)
+    if not matches:
+        return ""
+    value = matches[-1]
+    if isinstance(value, tuple):
+        value = next((item for item in value if item), "")
+    return str(value or "").strip().rstrip(".,;)")
+
+
+def _agent_from_eval_context_text(text: str) -> str:
+    lowered = text.lower()
+    phrase_to_route = {
+        "business research analyst": "business_research_analyst",
+        "opportunity scout": "opportunity_scout",
+        "chief of staff": "chief_of_staff",
+        "gmail triage": "gmail_triage",
+        "outreach composer": "outreach_composer",
+    }
+    for phrase, route in phrase_to_route.items():
+        if phrase in lowered or route in lowered:
+            return route
+    return ""
+
+
 def _run_ask_work_item(
     input_text: str,
     *,
@@ -912,7 +1506,108 @@ def _run_ask_work_item(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
         )
-    return _print_work_item_result(result, json_output=json_output)
+    eval_record = _record_eval_slack_run_if_requested(
+        input_text,
+        context_file_path=context_file_path,
+        result=result,
+    )
+    return _print_work_item_result(result, json_output=json_output, eval_record=eval_record)
+
+
+def _record_eval_slack_run_if_requested(
+    input_text: str,
+    *,
+    context_file_path: str,
+    result: WorkflowRunResult,
+) -> dict[str, object] | None:
+    if not _context_file_is_slack_context(context_file_path):
+        return None
+    try:
+        from promptfoo.eval_database import (
+            DEFAULT_EVAL_DB,
+            record_slack_eval_run,
+            resolve_slack_eval_case_id,
+        )
+    except ImportError:
+        return None
+
+    slack_context = _slack_context_metadata(context_file_path)
+    work_item = result.work_item
+    run_id = getattr(work_item, "id", "") if work_item is not None else ""
+    agent = str(getattr(work_item, "current_route", "") or getattr(result, "route", "") or "")
+    case_id = _extract_eval_run_case_id(input_text, context_file_path=context_file_path)
+    database_path = Path(os.environ.get("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB") or DEFAULT_EVAL_DB)
+    if not case_id:
+        try:
+            case_id = resolve_slack_eval_case_id(
+                request_text=input_text,
+                agent=agent,
+                slack_channel_id=slack_context.get("channel_id", "C0BA17Y9C01"),
+                slack_channel_name=slack_context.get("channel_name", "evals"),
+                database_path=database_path,
+            )
+        except (OSError, ValueError):
+            case_id = ""
+    if not case_id:
+        return None
+    summary = _eval_run_result_summary(result)
+    try:
+        row_id = record_slack_eval_run(
+            case_id=case_id,
+            run_id=run_id,
+            agent=agent,
+            slack_channel_id=slack_context.get("channel_id", "C0BA17Y9C01"),
+            slack_channel_name=slack_context.get("channel_name", "evals"),
+            slack_thread_ts=slack_context.get("thread_ts", ""),
+            request_text=input_text,
+            result_summary=summary,
+            database_path=database_path,
+        )
+    except (OSError, ValueError):
+        return None
+    dashboard = _render_promptfoo_dashboard(database_path)
+    case_dashboard = _dashboard_case_link(dashboard, case_id)
+    review_case = _review_case_link(case_id)
+    return {
+        "id": row_id,
+        "case_id": case_id,
+        "run_id": run_id,
+        "agent": agent,
+        "database_path": str(database_path),
+        "slack_thread_ts": slack_context.get("thread_ts", ""),
+        "scorecard_request": "@KNI can you give me a scorecard for this eval?",
+        "status_request": "@KNI how is this eval doing?",
+        "eval_thread_reply": _eval_thread_reply_guidance(
+            case_id=case_id,
+            run_id=run_id,
+            dashboard_case_url=case_dashboard.get("dashboard_case_url", ""),
+            review_case_url=review_case.get("review_case_url", ""),
+        ),
+        **dashboard,
+        **case_dashboard,
+        **review_case,
+    }
+
+
+def _extract_eval_run_case_id(input_text: str, *, context_file_path: str = "") -> str:
+    context_case_id = _eval_context_fields(context_file_path).get("case_id", "")
+    if context_case_id:
+        return context_case_id
+    compact = " ".join(str(input_text or "").split())
+    lowered = compact.lower()
+    if "eval" not in lowered and "promptfoo" not in lowered:
+        return ""
+    return _extract_eval_template_field(compact, "case")
+
+
+def _eval_run_result_summary(result: WorkflowRunResult) -> str:
+    work_item = result.work_item
+    title = str(getattr(work_item, "title", "") or "").strip() if work_item is not None else ""
+    status = str(getattr(result, "status", "") or "").strip()
+    route = str(getattr(result, "route", "") or "").strip()
+    if title:
+        return f"{status} {route}: {title}".strip()
+    return f"{status} {route}".strip()
 
 
 def _print_ask_work_item_failure(
@@ -2360,20 +3055,62 @@ def _print_work_item_result(
     *,
     json_output: bool,
     graph_metadata: dict | None = None,
+    eval_record: dict[str, object] | None = None,
 ) -> int:
     if json_output:
         payload = result.model_dump(mode="json")
         if graph_metadata is not None:
             payload["_langgraph"] = graph_metadata
+        if eval_record is not None:
+            payload["_eval_record"] = eval_record
+            payload["human_summary"] = _append_eval_thread_guidance_to_summary(
+                str(payload.get("human_summary") or ""),
+                eval_record=eval_record,
+            )
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
         print(render_work_item_result_text(result))
+        if eval_record is not None:
+            print(
+                "Eval record: "
+                f"{eval_record.get('case_id')} / {eval_record.get('run_id')}"
+            )
+            if eval_record.get("dashboard_case_url"):
+                print(f"Eval dashboard: {eval_record.get('dashboard_case_url')}")
+            if eval_record.get("review_case_url"):
+                print(f"Human review form: {eval_record.get('review_case_url')}")
         if graph_metadata is not None:
             print(f"Graph runtime: {graph_metadata['runtime']}")
             print(f"Graph nodes: {' -> '.join(graph_metadata['node_path'])}")
             if graph_metadata["checkpoint_required"]:
                 print(f"Graph checkpoint: {graph_metadata['checkpoint_reason']}")
     return 0
+
+
+def _append_eval_thread_guidance_to_summary(
+    summary: str,
+    *,
+    eval_record: dict[str, object],
+) -> str:
+    if "Review form:" in summary and "case dashboard" in summary:
+        return summary
+    case_id = str(eval_record.get("case_id") or "").strip()
+    if not case_id:
+        return summary
+    run_id = str(eval_record.get("run_id") or "").strip()
+    dashboard_case_url = str(eval_record.get("dashboard_case_url") or "").strip()
+    review_case_url = str(eval_record.get("review_case_url") or "").strip()
+    parts = [summary.strip()] if summary.strip() else []
+    detail = f"Eval: case `{case_id}`"
+    if run_id:
+        detail += f", run `{run_id}`"
+    detail += "."
+    if dashboard_case_url:
+        detail += f" Dashboard: {_slack_link(dashboard_case_url, 'case dashboard')}."
+    if review_case_url:
+        detail += f" Review form: {_slack_link(review_case_url, 'score this case')}."
+    parts.append(detail)
+    return "\n\n".join(parts).strip()
 
 
 def _work_item_missing_information(result: WorkflowRunResult) -> list[str]:
@@ -2397,6 +3134,7 @@ def _work_item_limitation_notes(result: WorkflowRunResult) -> list[str]:
 
 
 def _run_agents_list(args: argparse.Namespace) -> int:
+    load_settings(force_dotenv=True)
     cards = agent_cards()
     if args.json:
         print(json.dumps(cards, ensure_ascii=True, indent=2, sort_keys=True))
@@ -2418,6 +3156,159 @@ def _run_agents_list(args: argparse.Namespace) -> int:
             )
         )
     return 0
+
+
+def _run_agents_tools(args: argparse.Namespace) -> int:
+    load_settings(force_dotenv=True)
+    cards = [
+        card
+        for card in agent_cards()
+        if args.agent == "all" or card["route_name"] == args.agent
+    ]
+    payload = [
+        {
+            "route_name": card["route_name"],
+            "agent_name": card["agent_name"],
+            "runtime_tool_availability": card["runtime_tool_availability"],
+        }
+        for card in cards
+    ]
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(_render_agent_tool_availability_table(payload))
+    return 0
+
+
+def _run_agents_file_search_config(args: argparse.Namespace) -> int:
+    load_settings(force_dotenv=True)
+    summary = local_file_search_config_summary()
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(_render_file_search_config_summary(summary))
+    return 1 if summary["status"] == "invalid_config" else 0
+
+
+def _render_file_search_config_summary(summary: dict[str, Any]) -> str:
+    status = str(summary.get("status") or "unknown")
+    path = str(summary.get("path") or "")
+    if status == "missing":
+        return f"Local FileSearch config: missing ({path})"
+    if status == "invalid_config":
+        return f"Local FileSearch config: invalid ({path})\n{summary.get('error')}"
+    rows: list[list[str]] = []
+    global_summary = summary.get("global")
+    if isinstance(global_summary, dict):
+        rows.append(
+            [
+                "global",
+                "-",
+                str(global_summary.get("vector_store_id_count", 0)),
+                str(global_summary.get("max_num_results") or "-"),
+                str(bool(global_summary.get("include_search_results"))),
+            ]
+        )
+    for agent in summary.get("agents") or []:
+        if not isinstance(agent, dict):
+            continue
+        rows.append(
+            [
+                "agent",
+                str(agent.get("agent_name") or ""),
+                str(agent.get("vector_store_id_count", 0)),
+                str(agent.get("max_num_results") or "-"),
+                str(bool(agent.get("include_search_results"))),
+            ]
+        )
+    header = f"Local FileSearch config: {status} ({path})"
+    if not rows:
+        return header
+    table = render_markdown_table(
+        ["Scope", "Agent", "Stores", "Max results", "Include results"],
+        rows,
+    )
+    unknown_agents = summary.get("unknown_agents") or []
+    if unknown_agents:
+        return (
+            f"{header}\n\n{table}\n\nUnknown agents: "
+            + ", ".join(str(agent) for agent in unknown_agents)
+        )
+    return f"{header}\n\n{table}"
+
+
+def _render_agent_tool_availability_table(cards: list[dict[str, Any]]) -> str:
+    rows: list[list[str]] = []
+    for card in cards:
+        route_name = str(card.get("route_name") or "")
+        availability = card.get("runtime_tool_availability") or {}
+        if not isinstance(availability, dict):
+            continue
+        for tool_name in sorted(availability):
+            status = availability.get(tool_name)
+            if not isinstance(status, dict):
+                continue
+            rows.append(
+                [
+                    route_name,
+                    tool_name,
+                    str(status.get("status") or "-"),
+                    "yes" if bool(status.get("available")) else "no",
+                    _tool_availability_details(tool_name, status),
+                ]
+            )
+    if not rows:
+        return "No runtime tool availability records found."
+    return render_markdown_table(
+        ["Agent", "Tool", "Status", "Available", "Details"],
+        rows,
+    )
+
+
+def _tool_availability_details(tool_name: str, status: dict[str, Any]) -> str:
+    if tool_name == "file_search":
+        details = [
+            f"stores={status.get('vector_store_id_count', 0)}",
+            f"scope={status.get('vector_store_source') or 'none'}",
+        ]
+        env_name = status.get("vector_store_env_name")
+        if env_name:
+            details.append(f"env={env_name}")
+        config_path = status.get("vector_store_config_path")
+        if config_path:
+            details.append(f"config={config_path}")
+        return "; ".join(details)
+    if tool_name == "search_web":
+        providers = status.get("provider_sequence") or []
+        provider_text = ",".join(str(provider) for provider in providers) or "none"
+        return (
+            f"live_enabled={bool(status.get('live_enabled'))}; "
+            f"live_available={bool(status.get('live_available'))}; "
+            f"providers={provider_text}"
+        )
+    if tool_name == "local_kni_documents":
+        return (
+            f"indexed={status.get('indexed_count', 0)}; "
+            f"local_only={bool(status.get('local_only'))}; "
+            f"model_context_allowed={bool(status.get('model_context_allowed'))}; "
+            f"send_enabled={bool(status.get('send_enabled'))}"
+        )
+    if tool_name == "source_layer_policy":
+        layers = status.get("layers") or []
+        if not isinstance(layers, list):
+            return "-"
+        names = []
+        for layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            layer_name = str(layer.get("layer") or "").strip()
+            if not layer_name:
+                continue
+            status_text = str(layer.get("runtime_status") or "unknown").strip()
+            names.append(f"{layer_name}:{status_text}")
+        return "layers=" + ",".join(names) if names else "-"
+    reason = str(status.get("reason") or status.get("error") or "").strip()
+    return reason or "-"
 
 
 def _approval_item_export_dict(item: ApprovalQueueItem) -> dict[str, object]:

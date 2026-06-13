@@ -3,10 +3,12 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import keystone_agents.agents.chief_of_staff as chief_of_staff_module
+import keystone_agents.local_kni_evidence as local_kni_evidence
 import keystone_agents.tools.internal_data_tools as internal_data_tools
 from keystone_agents.agent_registry import AGENT_REGISTRY
 from keystone_agents.agent_tool_policy import disallowed_tool_names, tool_policy_for_agent
@@ -113,6 +115,255 @@ def test_chief_of_staff_builder_matches_schema_and_policy() -> None:
     policy = tool_policy_for_agent("chief_of_staff")
     assert policy is not None
     assert "search_official_operations_docs" in policy.allowed_tool_names
+
+
+def test_chief_of_staff_local_kni_document_request_skips_hosted_file_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_append_configured_file_search_tools(agent_name: str, tools: list[object]) -> list[object]:
+        return [*tools, SimpleNamespace(name="file_search")]
+
+    monkeypatch.setattr(
+        chief_of_staff_module,
+        "append_configured_file_search_tools",
+        fake_append_configured_file_search_tools,
+    )
+
+    generic = build_chief_of_staff_agent(request_text="summarize Slack workflow docs")
+    local_kni = build_chief_of_staff_agent(
+        request_text=(
+            "Using local KNI documents, what date was Keystone Neuroinformatics LLC formed? "
+            "Return the date and evidence path."
+        )
+    )
+    local_kni_formation_role = build_chief_of_staff_agent(
+        request_text=(
+            "Who formally organized Keystone Neuroinformatics LLC in Pennsylvania?"
+        )
+    )
+
+    generic_tool_names = {getattr(tool, "name", "") for tool in generic.tools}
+    local_kni_tool_names = {getattr(tool, "name", "") for tool in local_kni.tools}
+    formation_role_tool_names = {
+        getattr(tool, "name", "") for tool in local_kni_formation_role.tools
+    }
+
+    assert "file_search" in generic_tool_names
+    assert "file_search" not in local_kni_tool_names
+    assert "file_search" not in formation_role_tool_names
+    assert "search_kni_documents" in local_kni_tool_names
+    assert "read_kni_document_file" in local_kni_tool_names
+    assert "search_kni_documents" in formation_role_tool_names
+    assert "read_kni_document_file" in formation_role_tool_names
+
+
+def test_chief_of_staff_local_kni_document_fallback_returns_evidence_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_search(query: str, *, max_results: int = 5) -> dict[str, object]:
+        return {
+            "status": "ready",
+            "model_context_allowed": True,
+            "blocked_result_count": 0,
+            "matches": [
+                {
+                    "relative_path": (
+                        "00_Admin/Formation/2-12-26-PA-FormationDocument-"
+                        "Keystone Neuroinformatics LLC.pdf"
+                    ),
+                    "title": "PA FormationDocument Keystone Neuroinformatics LLC",
+                    "snippet": "Certificate of Organization Date Filed: 2/6/2026",
+                    "sensitivity_status": "allowed",
+                    "review_required": False,
+                    "review_reasons": [],
+                }
+            ],
+            "refresh": {"attempted": False},
+            "diagnostic": None,
+        }
+
+    def fake_read(relative_path: str, *, max_chars: int = 8_000) -> dict[str, object]:
+        return {
+            "relative_path": relative_path,
+            "content": "Certificate of Organization\nDate Filed: 2/6/2026",
+            "sensitivity_status": "allowed",
+            "review_required": False,
+            "review_reasons": [],
+            "truncated": False,
+            "local_only": True,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(local_kni_evidence, "search_kni_documents_impl", fake_search)
+    monkeypatch.setattr(local_kni_evidence, "read_kni_document_file_impl", fake_read)
+
+    result = plan_chief_of_staff_request(
+        (
+            "Using local KNI documents, what date was Keystone Neuroinformatics LLC "
+            "formed? Return the date, evidence path, and uncertainty if any."
+        )
+    )
+
+    assert result.recommended_route.workflow_type == "project-context-review"
+    assert "evidence is available for Chief of Staff synthesis" in result.summary
+    assert "does not decide the substantive answer" in result.summary
+    assert "00_Admin/Formation" in result.summary
+    assert result.retrieval_diagnostics["local_only"] is True
+    assert result.retrieval_diagnostics["effective_lookup_kind"] == "formation"
+    assert any(
+        "allowed_local_kni_document_lookup" in note for note in result.audit_notes
+    )
+
+
+def test_chief_of_staff_peo_insurance_question_uses_local_kni_documents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_search(query: str, *, max_results: int = 8) -> dict[str, object]:
+        assert "insurance" in query.lower() or "peo" in query.lower()
+        return {
+            "status": "ready",
+            "model_context_allowed": True,
+            "blocked_result_count": 0,
+            "matches": [
+                {
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                    "title": "COI AnupSharma 2026",
+                    "snippet": (
+                        "CERTIFICATE OF LIABILITY INSURANCE PRODUCER IAO Inc dba "
+                        "ProAssurance Agency INSURER A: CFC Underwriters"
+                    ),
+                    "sensitivity_status": "allowed",
+                    "review_required": True,
+                    "review_reasons": ["insurance_policy"],
+                }
+            ],
+            "refresh": {"attempted": False},
+            "diagnostic": None,
+        }
+
+    def fake_read(relative_path: str, *, max_chars: int = 12_000) -> dict[str, object]:
+        return {
+            "relative_path": relative_path,
+            "content": (
+                "CERTIFICATE OF LIABILITY INSURANCE CONTACT PRODUCER NAME: "
+                "IAO Inc dba ProAssurance Agency INSURER(S) AFFORDING COVERAGE "
+                "INSURER A : CFC Underwriters INSURED Keystone Neuroinformatics, LLC"
+            ),
+            "sensitivity_status": "allowed",
+            "review_required": True,
+            "review_reasons": ["insurance_policy"],
+            "truncated": False,
+            "local_only": True,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(local_kni_evidence, "search_kni_documents_impl", fake_search)
+    monkeypatch.setattr(local_kni_evidence, "read_kni_document_file_impl", fake_read)
+
+    result = plan_chief_of_staff_request(
+        "chief of staff who provides the PEO insurance for the company keystone neuroinformatics?"
+    )
+
+    assert result.recommended_route.workflow_type == "project-context-review"
+    assert "evidence is available for Chief of Staff synthesis" in result.summary
+    assert "does not decide the substantive answer" in result.summary
+    assert "00_Admin/Insurance" in result.summary
+    assert any("Review candidate evidence path: " in action for action in result.recommended_actions)
+    assert result.retrieval_diagnostics["lookup_kind"] == "insurance"
+    assert result.retrieval_diagnostics["effective_lookup_kind"] == "insurance"
+    assert result.retrieval_diagnostics["local_only"] is True
+    assert result.human_review_required is True
+    assert any(
+        "allowed_local_kni_document_lookup" in note for note in result.audit_notes
+    )
+
+
+def test_chief_of_staff_cfc_broker_question_prefers_proassurance_producer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_search(query: str, *, max_results: int = 8) -> dict[str, object]:
+        assert "insurance" in query.lower() or "broker" in query.lower()
+        return {
+            "status": "ready",
+            "model_context_allowed": True,
+            "blocked_result_count": 0,
+            "matches": [
+                {
+                    "relative_path": (
+                        "00_Admin/Insurance/InsurancePolicy/"
+                        "CFC POLICY stamped 042126.pdf"
+                    ),
+                    "title": "CFC policy stamped",
+                    "snippet": "Insurance effected through the Coverholder: CFC Underwriting Limited",
+                    "sensitivity_status": "allowed",
+                    "review_required": True,
+                    "review_reasons": ["insurance_policy"],
+                },
+                {
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                    "title": "COI AnupSharma 2026",
+                    "snippet": (
+                        "CERTIFICATE OF LIABILITY INSURANCE PRODUCER IAO, Inc. "
+                        "DBA ProAssurance Agency INSURER A: CFC Underwriters"
+                    ),
+                    "sensitivity_status": "allowed",
+                    "review_required": True,
+                    "review_reasons": ["insurance_policy"],
+                },
+            ],
+            "refresh": {"attempted": False},
+            "diagnostic": None,
+        }
+
+    def fake_read(relative_path: str, *, max_chars: int = 12_000) -> dict[str, object]:
+        if "COI_" in relative_path:
+            content = (
+                "CERTIFICATE OF LIABILITY INSURANCE PRODUCER IAO, Inc. DBA "
+                "ProAssurance Agency INSURER A : CFC Underwriters INSURED "
+                "Keystone Neuroinformatics, LLC"
+            )
+        else:
+            content = (
+                "Insurance effected through the Coverholder: CFC Underwriting Limited "
+                "This policy is issued to Keystone Neuroinformatics, LLC"
+            )
+        return {
+            "relative_path": relative_path,
+            "content": content,
+            "sensitivity_status": "allowed",
+            "review_required": True,
+            "review_reasons": ["insurance_policy"],
+            "truncated": False,
+            "local_only": True,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(local_kni_evidence, "search_kni_documents_impl", fake_search)
+    monkeypatch.setattr(local_kni_evidence, "read_kni_document_file_impl", fake_read)
+
+    result = plan_chief_of_staff_request(
+        "And who was the broker for the CFC insurance for Keystone Neuroinformatics?"
+    )
+
+    assert result.recommended_route.workflow_type == "project-context-review"
+    assert "does not decide the substantive answer" in result.summary
+    assert "COI_AnupSharma_2026.pdf" in result.summary
+    assert result.retrieval_diagnostics["answer_focus"] == "broker"
+    assert result.retrieval_diagnostics["effective_answer_focus"] == "broker"
+    assert result.retrieval_diagnostics["evidence_paths"][0].endswith("COI_AnupSharma_2026.pdf")
+    assert any("Review candidate evidence path: " in action for action in result.recommended_actions)
+
+
+def test_chief_of_staff_cfc_insurance_followup_is_local_kni_context() -> None:
+    local_kni = build_chief_of_staff_agent(
+        request_text="And who was the broker for the CFC insurance?"
+    )
+
+    tool_names = {getattr(tool, "name", "") for tool in local_kni.tools}
+
+    assert "search_kni_documents" in tool_names
+    assert "read_kni_document_file" in tool_names
+    assert "file_search" not in tool_names
 
 
 def test_architecture_slack_history_does_not_trigger_tax_payment_shortcut() -> None:
@@ -570,6 +821,468 @@ def test_run_script_falls_back_when_live_sdk_misroutes_search_to_reference_captu
         for note in output["audit_notes"]
     )
     assert payload["original_orchestrator_review"] == {"status": "ok"}
+
+
+def test_run_script_allows_local_kni_evidence_lookup_as_reference_capture() -> None:
+    script = _load_run_chief_of_staff_script()
+    output = ChiefOfStaffResult(
+        mode="llm",
+        summary=(
+            "Keystone Neuroinformatics LLC appears to have been formed on "
+            "February 6, 2026. Evidence path: "
+            "00_Admin/Formation/2-12-26-PA-FormationDocument-Keystone "
+            "Neuroinformatics LLC.pdf."
+        ),
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="reference-capture",
+            target_channel="current Slack thread",
+        ),
+    )
+
+    assert (
+        script._reference_capture_mismatch(
+            (
+                "Find the date Keystone Neuroinformatics LLC was formed using "
+                "local KNI documents. Return the date and evidence path."
+            ),
+            output,
+        )
+        is False
+    )
+
+
+def test_run_script_rejects_local_kni_reference_capture_without_evidence_path() -> None:
+    script = _load_run_chief_of_staff_script()
+    output = ChiefOfStaffResult(
+        mode="llm",
+        summary="Keystone Neuroinformatics LLC was formed on 2026-02-06.",
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="reference-capture",
+            target_channel="current Slack thread",
+        ),
+    )
+
+    assert (
+        script._reference_capture_mismatch(
+            (
+                "Find the date Keystone Neuroinformatics LLC was formed using "
+                "local KNI documents. Return the date and evidence path."
+            ),
+            output,
+        )
+        is True
+    )
+
+
+def test_run_script_live_sdk_passes_local_kni_evidence_packet_to_model(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="slack_operations",
+        primary_target="CFC insurance broker",
+        target_type="slack_channel",
+        objective="Identify the CFC insurance broker from local KNI evidence.",
+        task_objective="slack_operations",
+        expected_artifact_type="slack_ops_summary",
+    )
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    captured: dict[str, object] = {}
+
+    def fake_run_chief_of_staff_sdk(*args: object, **kwargs: object) -> TypedAgentRunResult:
+        captured["sdk_args"] = args
+        captured["sdk_kwargs"] = kwargs
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary=(
+                "Based on the local KNI evidence packet, the broker/producer/agency "
+                "is IAO, Inc. DBA ProAssurance Agency. Evidence path: "
+                "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf."
+            ),
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="project-context-review",
+                target_channel="current-thread",
+            ),
+            retrieval_diagnostics={
+                "local_only": True,
+                "send_enabled": False,
+                "lookup_kind": "insurance",
+                "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+            },
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    def fake_plan(*_args: object, **_kwargs: object) -> ChiefOfStaffResult:
+        raise AssertionError("local KNI live evidence must be built from the raw query")
+
+    def fake_read(relative_path: str, *, max_chars: int = 4_000) -> dict[str, object]:
+        if "COI_" in relative_path:
+            content = (
+                "CERTIFICATE OF LIABILITY INSURANCE PRODUCER IAO, Inc. DBA "
+                "ProAssurance Agency INSURER A : CFC Underwriters."
+            )
+        else:
+            content = (
+                "Insurance effected through the Coverholder: CFC Underwriting Limited. "
+                "Insured: Keystone Neuroinformatics, LLC."
+            )
+        return {
+            "relative_path": relative_path,
+            "title": Path(relative_path).stem,
+            "extension": "pdf",
+            "sensitivity_status": "allowed",
+            "review_required": True,
+            "review_reasons": ["insurance_policy"],
+            "truncated": False,
+            "content": content,
+            "local_only": True,
+            "model_context_allowed": True,
+            "send_enabled": False,
+        }
+
+    def fake_search(query: str, *, max_results: int = 8) -> dict[str, object]:
+        return {
+            "status": "ready",
+            "matches": [
+                {
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                    "title": "COI AnupSharma 2026",
+                    "snippet": "PRODUCER IAO, Inc. DBA ProAssurance Agency",
+                    "sensitivity_status": "allowed",
+                    "review_required": True,
+                    "review_reasons": ["insurance_policy"],
+                },
+                {
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/CFC POLICY stamped 042126.pdf",
+                    "title": "CFC policy stamped",
+                    "snippet": "Coverholder: CFC Underwriting Limited",
+                    "sensitivity_status": "allowed",
+                    "review_required": True,
+                    "review_reasons": ["insurance_policy"],
+                },
+            ],
+            "blocked_result_count": 0,
+            "local_only": True,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setenv(MANUAL_REQUEST_PLAN_ENV, plan.model_dump_json())
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(script, "plan_chief_of_staff_request", fake_plan)
+    monkeypatch.setattr(
+        script,
+        "runtime_source_layer_policy_context",
+        lambda agent_name: {
+            "agent_name": agent_name,
+            "status": "declared",
+            "available": True,
+            "layers": [
+                {
+                    "layer": "local_kni_documents",
+                    "runtime_status": "ready",
+                    "runtime_available": True,
+                },
+                {
+                    "layer": "hosted_file_search",
+                    "runtime_status": "available",
+                    "runtime_available": True,
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(local_kni_evidence, "read_kni_document_file_impl", fake_read)
+    monkeypatch.setattr(local_kni_evidence, "search_kni_documents_impl", fake_search)
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--json",
+                "--input",
+                "who was the broker for the CFC insurance?",
+            ]
+        )
+        == 0
+    )
+
+    payload = _payload(capsys.readouterr().out)
+    assert payload["mode"] == "live_sdk"
+    assert payload["live_sdk"] is True
+    assert payload["output"]["retrieval_diagnostics"]["lookup_kind"] == "insurance"
+    assert "ProAssurance Agency" in payload["output"]["summary"]
+    typed_input = captured["sdk_args"][0]
+    packet = typed_input["local_kni_evidence_packet"]
+    assert packet["local_only"] is True
+    assert packet["send_enabled"] is False
+    assert packet["packet_type"] == "bounded_local_kni_document_evidence"
+    assert "summary" not in packet
+    assert "synthesis" not in packet
+    assert packet["answer_policy"]["deterministic_prefetch_is_not_final_answer"] is True
+    assert packet["retrieval_diagnostics"]["effective_lookup_kind"] == "insurance"
+    assert packet["retrieval_diagnostics"]["effective_answer_focus"] == "broker"
+    assert packet["candidate_documents"][0]["relative_path"].endswith("COI_AnupSharma_2026.pdf")
+    assert "ProAssurance" in packet["candidate_documents"][0]["content_excerpt"]
+    assert any(
+        doc["relative_path"].endswith("CFC POLICY stamped 042126.pdf")
+        for doc in packet["candidate_documents"]
+    )
+    assert any(
+        match["relative_path"].endswith("COI_AnupSharma_2026.pdf")
+        for match in packet["search_matches"]
+    )
+    assert "not as a prewritten final answer" in typed_input["local_kni_instruction"]
+    source_layer_policy = typed_input["runtime_source_layer_policy"]
+    assert source_layer_policy["agent_name"] == "chief_of_staff"
+    layer_status = {
+        layer["layer"]: layer["runtime_status"]
+        for layer in source_layer_policy["layers"]
+    }
+    assert layer_status["local_kni_documents"] == "ready"
+    assert layer_status["hosted_file_search"] == "available"
+
+
+def test_run_script_preserves_local_kni_live_answer_when_path_is_repaired(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="slack_operations",
+        primary_target="formation confirmation department",
+        target_type="slack_channel",
+        objective="Identify the department from local KNI formation evidence.",
+        task_objective="slack_operations",
+        expected_artifact_type="slack_ops_summary",
+    )
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_run_chief_of_staff_sdk(*_args: object, **_kwargs: object) -> TypedAgentRunResult:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary=(
+                    "The confirmation appears to come from the Pennsylvania "
+                    "Department of State."
+                ),
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="project-context-review",
+                    target_channel="current-thread",
+                ),
+                retrieval_diagnostics={
+                    "local_only": True,
+                    "send_enabled": False,
+                    "lookup_kind": "formation",
+                },
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    def fake_plan(*_args: object, **_kwargs: object) -> ChiefOfStaffResult:
+        raise AssertionError("local KNI live answer should be repaired, not replaced")
+
+    def fake_read(relative_path: str, *, max_chars: int = 4_000) -> dict[str, object]:
+        return {
+            "relative_path": relative_path,
+            "title": Path(relative_path).stem,
+            "extension": "pdf",
+            "sensitivity_status": "allowed",
+            "review_required": True,
+            "review_reasons": ["legal_contract"],
+            "truncated": False,
+            "content": (
+                "Pennsylvania Department of State\n"
+                "Confirmation of organized documentation for Keystone Neuroinformatics LLC."
+            ),
+            "local_only": True,
+            "model_context_allowed": True,
+            "send_enabled": False,
+        }
+
+    def fake_search(query: str, *, max_results: int = 8) -> dict[str, object]:
+        return {
+            "status": "ready",
+            "matches": [
+                {
+                    "relative_path": (
+                        "00_Admin/Formation/2-12-26-PA-FormationDocument-"
+                        "Keystone Neuroinformatics LLC.pdf"
+                    ),
+                    "title": "PA FormationDocument Keystone Neuroinformatics LLC",
+                    "snippet": "Pennsylvania Department of State confirmation",
+                    "sensitivity_status": "allowed",
+                    "review_required": True,
+                    "review_reasons": ["legal_contract"],
+                }
+            ],
+            "blocked_result_count": 0,
+            "local_only": True,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setenv(MANUAL_REQUEST_PLAN_ENV, plan.model_dump_json())
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(script, "plan_chief_of_staff_request", fake_plan)
+    monkeypatch.setattr(
+        script,
+        "runtime_source_layer_policy_context",
+        lambda agent_name: {"agent_name": agent_name, "layers": []},
+    )
+    monkeypatch.setattr(local_kni_evidence, "read_kni_document_file_impl", fake_read)
+    monkeypatch.setattr(local_kni_evidence, "search_kni_documents_impl", fake_search)
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--json",
+                "--input",
+                (
+                    "chief of staff what department provided the confirmation of "
+                    "organized documentation for Keystone Neuroinformatics llc in "
+                    "pennsylvania?"
+                ),
+            ]
+        )
+        == 0
+    )
+
+    payload = _payload(capsys.readouterr().out)
+    output = payload["output"]
+    assert "Pennsylvania Department of State" in output["summary"]
+    assert "evidence is available for Chief of Staff synthesis" not in output["summary"]
+    assert output["retrieval_diagnostics"]["evidence_path"].startswith("00_Admin/Formation/")
+    assert any(source["source_type"] == "local_kni_document" for source in output["sources"])
+    assert any("live model answer was preserved" in note for note in output["audit_notes"])
+
+
+def test_run_script_local_kni_formation_packet_filters_broad_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    output = ChiefOfStaffResult(
+        mode="deterministic",
+        summary=(
+            "Keystone Neuroinformatics LLC appears to have been formed on February 6, 2026. "
+            "Evidence path: 00_Admin/Formation/2-12-26-PA-FormationDocument-Keystone "
+            "Neuroinformatics LLC.pdf."
+        ),
+        sources=[
+            ChiefOfStaffSourceRef(
+                title=(
+                    "00_Admin/Formation/2-12-26-PA-FormationDocument-"
+                    "Keystone Neuroinformatics LLC.pdf"
+                ),
+                url="",
+                source_type="local_kni_document",
+            )
+        ],
+        retrieval_diagnostics={
+            "local_only": True,
+            "send_enabled": False,
+            "lookup_kind": "formation",
+            "evidence_path": (
+                "00_Admin/Formation/2-12-26-PA-FormationDocument-"
+                "Keystone Neuroinformatics LLC.pdf"
+            ),
+        },
+    )
+
+    def fake_search(query: str, *, max_results: int = 8) -> dict[str, object]:
+        return {
+            "status": "ready",
+            "matches": [
+                {
+                    "relative_path": (
+                        "00_Admin/Internal_Policies/BoardRoom-Memos/"
+                        "2026-03-29-keystone-neuroinformatics-12-month-positioning.md"
+                    ),
+                    "title": "12-month positioning",
+                    "snippet": "Broad company memo",
+                    "sensitivity_status": "allowed",
+                    "review_required": False,
+                    "review_reasons": [],
+                },
+                {
+                    "relative_path": (
+                        "00_Admin/Formation/InitialResolutions-LLC Single Member--"
+                        "Keystone Neuroinformatics LLC.pdf"
+                    ),
+                    "title": "Initial resolutions",
+                    "snippet": "Keystone Neuroinformatics LLC formation",
+                    "sensitivity_status": "allowed",
+                    "review_required": True,
+                    "review_reasons": ["legal_contract"],
+                },
+            ],
+            "blocked_result_count": 0,
+            "local_only": True,
+            "send_enabled": False,
+        }
+
+    def fake_read(relative_path: str, *, max_chars: int = 4_000) -> dict[str, object]:
+        return {
+            "relative_path": relative_path,
+            "title": Path(relative_path).stem,
+            "extension": "pdf",
+            "sensitivity_status": "allowed",
+            "review_required": "InitialResolutions" in relative_path,
+            "review_reasons": ["legal_contract"] if "InitialResolutions" in relative_path else [],
+            "truncated": False,
+            "content": "Date Filed: 2/6/2026",
+            "local_only": True,
+            "model_context_allowed": True,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(local_kni_evidence, "search_kni_documents_impl", fake_search)
+    monkeypatch.setattr(local_kni_evidence, "read_kni_document_file_impl", fake_read)
+
+    packet = script._local_kni_evidence_packet(
+        output,
+        query_text="what date was Keystone Neuroinformatics LLC formed?",
+    )
+    paths = [doc["relative_path"] for doc in packet["candidate_documents"]]
+
+    assert paths == [
+        "00_Admin/Formation/2-12-26-PA-FormationDocument-Keystone Neuroinformatics LLC.pdf",
+        "00_Admin/Formation/InitialResolutions-LLC Single Member--Keystone Neuroinformatics LLC.pdf",
+    ]
+    assert all("BoardRoom-Memos" not in path for path in paths)
 
 
 def test_run_script_falls_back_when_live_sdk_output_is_malformed(

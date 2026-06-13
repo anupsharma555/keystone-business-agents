@@ -6,6 +6,7 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -6759,6 +6760,7 @@ def build_opportunity_scout_agent(
     model: str | None = None,
     *,
     request_text: str = "",
+    context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
 ) -> Agent:
@@ -6772,6 +6774,7 @@ def build_opportunity_scout_agent(
         skill_files=select_agent_skill_names(
             "opportunity_scout",
             request_text=request_text,
+            context_flags=context_flags,
             include_all=include_all_skills,
         ),
     )
@@ -6831,6 +6834,7 @@ def run_opportunity_scout_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
 ) -> TypedAgentRunResult[OpportunityScoutResult]:
     """Run Opportunity Scout through the typed SDK harness."""
@@ -6843,6 +6847,7 @@ def run_opportunity_scout_sdk(
         agent=build_opportunity_scout_agent(
             model=model,
             request_text=skill_request_text(typed_input),
+            context_flags=context_flags,
             tool_tier=resolved_tool_tier,
         ),
         typed_input=typed_input,

@@ -36,11 +36,16 @@ from keystone_agents.agents.outreach_composer import (
 from keystone_agents.benchmark_tracking import record_eval_summary
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.guardrails import assess_text_guardrails
+from keystone_agents.multi_target_research import (
+    MultiTargetResearchPlan,
+    run_multi_target_research,
+)
 from keystone_agents.schemas.approval import (
     ApprovalQueueItem,
     approval_queue_status_allows_sending,
 )
-from keystone_agents.schemas.company_profile import CompanyProfile
+from keystone_agents.schemas.company_profile import CompanyProfile, SourceRecord
+from keystone_agents.schemas.retrieval import RetrievalHint
 from keystone_agents.schemas.work_item import (
     WorkflowRunResult,
     WorkItem,
@@ -63,7 +68,12 @@ from keystone_agents.skill_evals import (
     SkillTaskEvalResult,
     run_skill_task_eval_suite,
 )
+from keystone_agents.slack_query_prompts import (
+    build_slack_query_prompt_input,
+    resolve_slack_query_prompt,
+)
 from keystone_agents.storage.sqlite_store import SQLiteStore
+from keystone_agents.tools.search_provider import SearchResult
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EVAL_DIR = PROJECT_ROOT / "evals" / "local"
@@ -90,6 +100,11 @@ LOCAL_EVAL_PROMPT_FILES: dict[str, tuple[str, ...]] = {
         "safety_policy.md",
         "business_research_analyst.md",
         "opportunity_scout.md",
+    ),
+    "slack_research_workflow": (
+        "keystone_profile.md",
+        "safety_policy.md",
+        "business_research_analyst.md",
     ),
     "opportunity_scoring": (
         "keystone_profile.md",
@@ -572,6 +587,212 @@ def grade_source_attribution(case: LocalEvalCase) -> LocalEvalResult:
         return _result(case, failures, observed)
 
     raise ValueError(f"{case.case_id}: unsupported source_attribution kind {kind!r}")
+
+
+class _SlackResearchEvalSearchProvider:
+    provider_name = "local_eval"
+
+    def __init__(self, results_by_marker: Mapping[str, Sequence[SearchResult]]) -> None:
+        self._results_by_marker = results_by_marker
+
+    def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+        for marker, results in self._results_by_marker.items():
+            if marker in query:
+                return list(results[:num_results])
+        return []
+
+
+def _slack_research_eval_provider_builder(
+    results_by_marker: Mapping[str, Sequence[SearchResult]],
+) -> Callable[..., _SlackResearchEvalSearchProvider]:
+    def build_provider(**_kwargs: Any) -> _SlackResearchEvalSearchProvider:
+        return _SlackResearchEvalSearchProvider(results_by_marker)
+
+    return build_provider
+
+
+def _eval_source(source_id: str, title: str, url: str, claim: str) -> SourceRecord:
+    return SourceRecord(
+        source_id=source_id,
+        title=title,
+        url=url,
+        source_type="company_site",
+        supported_claims=[claim],
+        evidence_excerpt=claim,
+        confidence=0.85,
+    )
+
+
+def grade_slack_research_workflow(case: LocalEvalCase) -> LocalEvalResult:
+    """Grade reusable Slack prompt selection plus offline multi-target research."""
+
+    payload = case.input_payload
+    expected = case.expected
+    request_text = str(payload.get("request") or "")
+    selection = resolve_slack_query_prompt(
+        build_slack_query_prompt_input(
+            raw_request=request_text,
+            selected_message_text=str(payload.get("selected_message_text") or ""),
+            thread_summary=str(payload.get("thread_summary") or ""),
+            manual_plan=(
+                payload.get("manual_plan")
+                if isinstance(payload.get("manual_plan"), dict)
+                else None
+            ),
+            target_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        )
+    )
+    if selection is None:
+        observed = {"prompt_selected": False}
+        return _result(case, ["slack query prompt was not selected"], observed)
+
+    plan = MultiTargetResearchPlan(
+        topic=str(payload.get("topic") or "three public AI companion or chatbot products"),
+        desired_count=int(payload.get("desired_count") or 3),
+        requested_dimensions=[
+            str(item) for item in payload.get("requested_dimensions", []) if str(item).strip()
+        ],
+        request_text=request_text,
+    )
+    discovery_results = [
+        SearchResult(
+            title="Character.AI teen safety",
+            link="https://character.ai/safety",
+            snippet="Character.AI describes teen safety for its AI companion.",
+            source="local_eval",
+        ),
+        SearchResult(
+            title="ChatGPT safety protections",
+            link="https://chatgpt.com/parent-resources/safety-protections/",
+            snippet="ChatGPT describes teen safety and escalation protections.",
+            source="local_eval",
+        ),
+        SearchResult(
+            title="Replika crisis guidance",
+            link="https://replika.com/safety",
+            snippet="Replika describes escalation guidance for its AI companion.",
+            source="local_eval",
+        ),
+        SearchResult(
+            title="AP News reports on AI chatbot safety",
+            link="https://apnews.com/article/openai-chatgpt-chatbot-ai-online-safety",
+            snippet="AP News is a source about ChatGPT safety, not a product target.",
+            source="local_eval",
+        ),
+    ]
+    results_by_marker = {
+        "official products": discovery_results,
+        "product safety pages": discovery_results,
+        "teen safety escalation": discovery_results,
+    }
+
+    def retrieve_profile(**kwargs: Any) -> tuple[CompanyProfile, dict[str, Any]]:
+        company = str(kwargs["company"])
+        source_map = {
+            "Character.AI": _eval_source(
+                "characterai:teen-safety",
+                "Character.AI teen safety",
+                "https://character.ai/safety/teen-safety",
+                "Character.AI describes teen safety controls and escalation boundaries.",
+            ),
+            "ChatGPT": _eval_source(
+                "chatgpt:safety",
+                "ChatGPT safety protections",
+                "https://chatgpt.com/parent-resources/safety-protections/",
+                "ChatGPT describes teen safety protections and escalation safeguards.",
+            ),
+            "Replika": _eval_source(
+                "replika:crisis",
+                "Replika crisis guidance",
+                "https://replika.com/safety",
+                "Replika describes safety guidance and escalation to crisis resources.",
+            ),
+        }
+        source = source_map[company]
+        profile = research_company_fixture(company_name=company).model_copy(
+            update={"sources": [source]}
+        )
+        return profile, {"retrieval_diagnostics": {"provider_summary": "local_eval"}}
+
+    result = run_multi_target_research(
+        plan,
+        live_search=True,
+        retrieval_hint=RetrievalHint(allow_deepening=False),
+        search_provider_builder=_slack_research_eval_provider_builder(results_by_marker),
+        retrieve_profile=retrieve_profile,
+    )
+    source_urls = [
+        str(source.get("url") or "")
+        for packet in result.packets
+        for source in packet.source_refs
+        if isinstance(source, dict) and source.get("url")
+    ]
+    target_selection = result.diagnostics.get("target_selection", {})
+    observed = {
+        "prompt_selected": True,
+        "prompt_schema": selection.schema_,
+        "prompt_version": selection.version,
+        "prompt_kind": selection.kind.value,
+        "target_route": selection.target_route.value,
+        "context_flags": selection.context_flags,
+        "task_brief": selection.task_brief,
+        "dynamic_content_sha256_length": len(selection.dynamic_content_sha256),
+        "comparison_ready": result.comparison_ready,
+        "pass_types": result.pass_types,
+        "selected_targets": result.selected_targets,
+        "source_urls": source_urls,
+        "ready_packet_count": result.diagnostics.get("ready_packet_count", 0),
+        "weak_targets": target_selection.get("weak_targets", []),
+        "top_candidates": [
+            item.get("name")
+            for item in target_selection.get("top_candidates", [])
+            if isinstance(item, dict)
+        ],
+    }
+    failures: list[str] = []
+    for field in (
+        "prompt_selected",
+        "prompt_schema",
+        "prompt_version",
+        "prompt_kind",
+        "target_route",
+        "comparison_ready",
+        "ready_packet_count",
+    ):
+        _expect_equal(failures, observed, expected, field)
+    _expect_contains_all(
+        failures,
+        observed["pass_types"],
+        expected.get("pass_types_contains", []),
+        "pass_types",
+    )
+    _expect_contains_all(
+        failures,
+        observed["selected_targets"],
+        expected.get("selected_targets_contains", []),
+        "selected_targets",
+    )
+    forbidden_targets = {str(item) for item in expected.get("forbidden_targets", [])}
+    bad_targets = sorted(forbidden_targets.intersection(set(observed["selected_targets"])))
+    if bad_targets:
+        failures.append(f"selected_targets: included forbidden targets {bad_targets!r}")
+    if expected.get("require_context_flag_source_triage") and not observed["context_flags"].get(
+        "needs_source_triage"
+    ):
+        failures.append("context_flags: missing needs_source_triage")
+    if expected.get("require_dynamic_hash") and observed["dynamic_content_sha256_length"] != 64:
+        failures.append("dynamic_content_sha256: expected 64 hex characters")
+    if expected.get("require_visible_source_urls"):
+        _expect_range(
+            failures,
+            len(observed["source_urls"]),
+            field="source_urls",
+            minimum=int(expected.get("min_source_urls", 1)),
+        )
+    for text in expected.get("task_brief_contains", []):
+        if str(text) not in selection.task_brief:
+            failures.append(f"task_brief: missing expected text {text!r}")
+    return _result(case, failures, observed)
 
 
 def grade_opportunity_scoring(case: LocalEvalCase) -> LocalEvalResult:
@@ -1057,6 +1278,7 @@ GRADERS: dict[str, Callable[[LocalEvalCase], LocalEvalResult]] = {
     "orchestrator_routing": grade_orchestrator_routing,
     "safety_refusal": grade_safety_refusal,
     "source_attribution": grade_source_attribution,
+    "slack_research_workflow": grade_slack_research_workflow,
     "opportunity_scoring": grade_opportunity_scoring,
     "outreach_copy_constraints": grade_outreach_copy_constraints,
     "approval_queue_revision": grade_approval_queue_revision,

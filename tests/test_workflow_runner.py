@@ -12,6 +12,11 @@ from keystone_agents.agents.opportunity_scout import scout_opportunities_fixture
 from keystone_agents.agents.orchestrator import run_orchestrator_preflight
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import TypedAgentRunResult
+from keystone_agents.multi_target_research import (
+    MultiTargetResearchPlan,
+    MultiTargetResearchResult,
+    PerTargetResearchPacket,
+)
 from keystone_agents.orchestrator.preflight_context import compact_orchestrator_preflight_payload
 from keystone_agents.reporting import render_work_item_result_text
 from keystone_agents.schemas.approval import ApprovalState
@@ -100,6 +105,183 @@ def test_lightweight_source_list_does_not_force_selected_page_context() -> None:
     assert not workflow_runner._request_requires_selected_web_source_context(
         "chief of staff find a few source URLs about OpenAI mental health."
     )
+
+
+def test_slack_runtime_request_auto_attaches_reusable_query_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNI_BUSINESS_AGENTS_REPO", "/tmp/kba")
+    request = WorkflowRunRequest(
+        request_text=(
+            "business research analyst: reusable source-read test. Compare how three "
+            "public AI companion or chatbot products describe teen safety. Do not draft, "
+            "send, publish, schedule, write files, or post elsewhere."
+        ),
+        requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        cost_profile="slack_research_deep",
+    )
+    work_item = WorkItem(
+        id="wi_test",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Reusable Slack test",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+    )
+
+    updated = workflow_runner._attach_reusable_slack_query_prompt(
+        request,
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        work_item=work_item,
+    )
+
+    assert isinstance(updated.slack_query_prompt, dict)
+    assert updated.slack_query_prompt["kind"] == "research_summary"
+    assert updated.slack_query_prompt["target_route"] == "business_research_analyst"
+    assert updated.external_context["slack_query_prompt"]["context_flags"]["needs_source_triage"]
+
+
+def test_reusable_slack_query_prompt_task_brief_reaches_specialist_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNI_BUSINESS_AGENTS_REPO", "/tmp/kba")
+    request = WorkflowRunRequest(
+        request_text=(
+            "business research analyst: reusable source-read test. Compare how three "
+            "public AI companion or chatbot products describe teen safety. Do not draft, "
+            "send, publish, schedule, write files, or post elsewhere."
+        ),
+        requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        cost_profile="slack_research_deep",
+    )
+    work_item = WorkItem(
+        id="wi_test",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Reusable Slack test",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+    )
+    updated = workflow_runner._attach_reusable_slack_query_prompt(
+        request,
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        work_item=work_item,
+    )
+
+    payload = workflow_runner._specialist_orchestrator_context_payload(updated, work_item)
+    prompt = payload["reusable_slack_query_prompt"]
+
+    assert prompt["kind"] == "research_summary"
+    assert "task_brief" in prompt
+    assert "Resolve three named products" in prompt["task_brief"]
+    assert "does not grant tool access" in prompt["specialist_use"]
+    assert prompt["context_flags"]["needs_source_triage"] is True
+
+
+def test_business_research_category_comparison_dispatches_multi_target_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_retrieve_company_profile_live(**_kwargs: object):
+        raise AssertionError("single-company retrieval should not run")
+
+    def fake_multi_target_research(plan: MultiTargetResearchPlan, **_kwargs: object):
+        calls.append(plan.topic)
+        return MultiTargetResearchResult(
+            plan=plan,
+            selected_targets=["Replika", "Character.AI", "Nomi"],
+            packets=[
+                PerTargetResearchPacket(
+                    target_name="Replika",
+                    source_refs=[
+                        {
+                            "source_id": "replika:safety",
+                            "title": "Replika safety",
+                            "url": "https://replika.com/safety",
+                            "source_type": "company_site",
+                            "supported_claims": ["Replika describes teen safety."],
+                        }
+                    ],
+                    extraction_status="extracted",
+                    source_sufficient=True,
+                ),
+                PerTargetResearchPacket(
+                    target_name="Character.AI",
+                    source_refs=[
+                        {
+                            "source_id": "character:safety",
+                            "title": "Character.AI safety",
+                            "url": "https://character.ai/safety",
+                            "source_type": "company_site",
+                            "supported_claims": ["Character.AI describes teen safety."],
+                        }
+                    ],
+                    extraction_status="extracted",
+                    source_sufficient=True,
+                ),
+                PerTargetResearchPacket(
+                    target_name="Nomi",
+                    source_refs=[
+                        {
+                            "source_id": "nomi:safety",
+                            "title": "Nomi safety",
+                            "url": "https://nomi.ai/safety",
+                            "source_type": "company_site",
+                            "supported_claims": ["Nomi describes teen safety."],
+                        }
+                    ],
+                    extraction_status="extracted",
+                    source_sufficient=True,
+                ),
+            ],
+            comparison_ready=True,
+            diagnostics={"ready_packet_count": 3},
+            pass_types=["candidate_discovery", "target_selection", "per_target_depth"],
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "retrieve_company_profile_live",
+        fake_retrieve_company_profile_live,
+    )
+    monkeypatch.setattr(workflow_runner, "run_multi_target_research", fake_multi_target_research)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "business research analyst: Compare how three public AI companion products "
+                "describe teen safety."
+            ),
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            manual_request_plan={
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "public AI companion products",
+                "target_type": "company",
+                "desired_count": 3,
+                "required_terms": ["teen safety"],
+                "planner_warnings": [
+                    "Target is a product category rather than a single named company."
+                ],
+            },
+        )
+    )
+
+    assert calls == ["public AI companion products"]
+    assert result.status == WorkItemStatus.DONE
+    assert result.artifact_refs[0].artifact_type == "multi_target_research"
+    assert "Detailed Summary" in result.human_summary
+    assert result.human_summary.index("Detailed Summary") < result.human_summary.index(
+        "Source-backed comparison table"
+    )
+    assert "The comparison is supported for Replika, Character.AI, Nomi" in result.human_summary
+    assert "Synthesis:" not in result.human_summary
+    assert "no clean source list" not in result.human_summary
+    assert result.human_summary.index("Source-backed comparison table") < result.human_summary.index(
+        "Metadata"
+    )
+    assert "Multi-target pass types" in result.human_summary
 
 
 def test_requested_opportunity_comparison_gets_artifact_aligned_table() -> None:
@@ -2000,6 +2182,254 @@ def test_orchestrator_requested_context_sources_are_added_to_specialist_memo(
     sources = {entry["source"]: entry for entry in manifest["sources"]}
     assert "orchestrator_route_result" in sources["airtable"]["requested_by"]
     assert "orchestrator_route_result" in sources["gmail"]["requested_by"]
+
+
+def test_chief_of_staff_local_kni_packet_uses_latest_wrapped_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    latest_ask = "who was the broker for the CFC insurance?"
+    wrapped_request = (
+        "chief of staff continue this prior Slack thread.\n"
+        f"Latest request: {latest_ask}\n"
+        "Previous request: chief of staff who provides insurance for Keystone Neuroinformatics?\n"
+        "Previous result: CFC Underwriting Limited.\n"
+        "Slack thread context: previous local KNI insurance discussion."
+    )
+
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="CFC insurance follow-up",
+        request_text=wrapped_request,
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        target=WorkItemTarget(metadata={"slack_context": {"channel_id": "C123"}}),
+        status=WorkItemStatus.IN_PROGRESS,
+    )
+
+    def fake_plan_chief_of_staff_request(*_args: object, **_kwargs: object) -> ChiefOfStaffResult:
+        raise AssertionError("local KNI live evidence must be built from the focused query")
+
+    def fake_build_local_kni_evidence_packet_for_query(
+        query_text: str,
+        *,
+        max_candidate_documents: int = 5,
+    ) -> dict[str, object]:
+        del max_candidate_documents
+        captured["packet_query_text"] = query_text
+        return {
+            "packet_type": "bounded_local_kni_document_evidence",
+            "local_only": True,
+            "send_enabled": False,
+            "candidate_documents": [
+                {
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                    "content_excerpt": "PRODUCER IAO, Inc. DBA ProAssurance Agency",
+                    "local_only": True,
+                    "send_enabled": False,
+                }
+            ],
+            "retrieval_diagnostics": {
+                "local_only": True,
+                "send_enabled": False,
+                "effective_lookup_kind": "insurance",
+                "effective_answer_focus": "broker",
+            },
+        }
+
+    def fake_run_chief_of_staff_sdk(
+        sdk_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured["sdk_input"] = sdk_input
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary=(
+                    "The broker/producer is ProAssurance. Evidence path: "
+                    "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf."
+                ),
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="project-context-review",
+                    target_channel="current-thread",
+                ),
+                retrieval_diagnostics={
+                    "local_only": True,
+                    "send_enabled": False,
+                    "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                },
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.setattr(workflow_runner, "plan_chief_of_staff_request", fake_plan_chief_of_staff_request)
+    monkeypatch.setattr(
+        workflow_runner,
+        "build_local_kni_evidence_packet_for_query",
+        fake_build_local_kni_evidence_packet_for_query,
+    )
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(
+        workflow_runner,
+        "runtime_source_layer_policy_context",
+        lambda agent_name: {
+            "agent_name": agent_name,
+            "status": "declared",
+            "available": True,
+            "layers": [
+                {
+                    "layer": "local_kni_documents",
+                    "runtime_status": "ready",
+                    "runtime_available": True,
+                },
+                {
+                    "layer": "public_web_search",
+                    "runtime_status": "attached_live_gated",
+                    "runtime_available": True,
+                },
+            ],
+        },
+    )
+
+    result = workflow_runner._advance_chief_of_staff(
+        work_item,
+        request=WorkflowRunRequest(
+            request_text=wrapped_request,
+            database_url=_database_url(tmp_path),
+            live_sdk=True,
+        ),
+        store=None,
+    )
+
+    assert result.status == WorkItemStatus.DONE
+    assert captured["packet_query_text"] == latest_ask
+    sdk_input = captured["sdk_input"]
+    assert sdk_input["request"] == wrapped_request
+    assert sdk_input["orchestrator_context"]["local_kni_evidence_query"] == latest_ask
+    assert sdk_input["local_kni_evidence_packet"]["candidate_documents"][0][
+        "relative_path"
+    ].endswith("COI_AnupSharma_2026.pdf")
+    assert sdk_input["runtime_source_layer_policy"]["agent_name"] == "chief_of_staff"
+    layer_status = {
+        layer["layer"]: layer["runtime_status"]
+        for layer in sdk_input["runtime_source_layer_policy"]["layers"]
+    }
+    assert layer_status["local_kni_documents"] == "ready"
+    assert layer_status["public_web_search"] == "attached_live_gated"
+
+
+def test_chief_of_staff_workitem_repairs_local_kni_path_without_replacing_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_text = (
+        "chief of staff what department provided the confirmation of organized "
+        "documentation for Keystone Neuroinformatics llc in pennsylvania?"
+    )
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Formation department",
+        request_text=request_text,
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        target=WorkItemTarget(metadata={"slack_context": {"channel_id": "C123"}}),
+        status=WorkItemStatus.IN_PROGRESS,
+    )
+
+    def fake_plan_chief_of_staff_request(*_args: object, **_kwargs: object) -> ChiefOfStaffResult:
+        raise AssertionError("live local KNI answer should be repaired, not replaced")
+
+    def fake_build_local_kni_evidence_packet_for_query(
+        query_text: str,
+        *,
+        max_candidate_documents: int = 5,
+    ) -> dict[str, object]:
+        del query_text, max_candidate_documents
+        return {
+            "packet_type": "bounded_local_kni_document_evidence",
+            "local_only": True,
+            "send_enabled": False,
+            "candidate_documents": [
+                {
+                    "relative_path": (
+                        "00_Admin/Formation/2-12-26-PA-FormationDocument-"
+                        "Keystone Neuroinformatics LLC.pdf"
+                    ),
+                    "content_excerpt": "Pennsylvania Department of State confirmation",
+                    "local_only": True,
+                    "send_enabled": False,
+                }
+            ],
+            "retrieval_diagnostics": {
+                "local_only": True,
+                "send_enabled": False,
+                "effective_lookup_kind": "formation",
+                "effective_answer_focus": "filing_role",
+            },
+        }
+
+    def fake_run_chief_of_staff_sdk(
+        sdk_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        assert sdk_input["local_kni_evidence_packet"]["local_only"] is True
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary=(
+                    "The confirmation appears to come from the Pennsylvania "
+                    "Department of State."
+                ),
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="project-context-review",
+                    target_channel="current-thread",
+                ),
+                retrieval_diagnostics={
+                    "local_only": True,
+                    "send_enabled": False,
+                    "lookup_kind": "formation",
+                },
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.setattr(workflow_runner, "plan_chief_of_staff_request", fake_plan_chief_of_staff_request)
+    monkeypatch.setattr(
+        workflow_runner,
+        "build_local_kni_evidence_packet_for_query",
+        fake_build_local_kni_evidence_packet_for_query,
+    )
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(
+        workflow_runner,
+        "runtime_source_layer_policy_context",
+        lambda agent_name: {"agent_name": agent_name, "layers": []},
+    )
+
+    result = workflow_runner._advance_chief_of_staff(
+        work_item,
+        request=WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            live_sdk=True,
+        ),
+        store=None,
+    )
+
+    assert result.status == WorkItemStatus.DONE
+    assert "Pennsylvania Department of State" in result.human_summary
+    artifact = result.artifact_refs[0]
+    diagnostics = artifact.metadata["retrieval_diagnostics"]
+    assert diagnostics["evidence_path"].startswith("00_Admin/Formation/")
+    assert any(
+        source["source_type"] == "local_kni_document"
+        for source in artifact.metadata["source_refs"]
+    )
+    assert any("live model answer was preserved" in note for note in result.audit_notes)
 
 
 def test_specialist_memo_includes_source_context_status() -> None:
@@ -6388,6 +6818,9 @@ def test_manager_loop_repairs_current_research_once_before_blocking(
         == "broaden_or_deepen_search_within_cost_profile"
     )
     assert any(event.event_type == "manager_loop_repair_completed" for event in events)
+    assert "Metadata" in result.human_summary
+    assert "Manager loop steps:" in result.human_summary
+    assert "1 repair/deepen pass(es) attempted" in result.human_summary
 
 
 def test_slack_conservative_research_caps_fanout_skips_contacts_and_repair(

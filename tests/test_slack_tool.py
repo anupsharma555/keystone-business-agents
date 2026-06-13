@@ -1067,6 +1067,11 @@ def test_kba_more_research_records_event_and_duplicate_is_idempotent(
     assert "funding, partnerships, product updates, hiring, roadmap signals" in (
         calls[0].request_text
     )
+    assert calls[0].cost_profile == "slack_research_deep"
+    assert calls[0].allow_manager_loop_repair is True
+    assert calls[0].hosted_web_search_max_calls == 2
+    assert calls[0].slack_query_prompt["kind"] == "deeper_research"
+    assert calls[0].external_context["slack_query_prompt"]["task_brief"]
     assert duplicate.idempotent is True
     assert len(calls) == 1
     events = store.list_work_item_events(item.id)

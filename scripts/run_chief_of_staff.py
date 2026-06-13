@@ -28,6 +28,15 @@ from keystone_agents.orchestrator.preflight_context import (
     load_orchestrator_preflight_from_env,
 )
 from keystone_agents.quality_budget import AgentQualityBudget, chief_of_staff_quality_budget
+from keystone_agents.schemas.chief_of_staff import ChiefOfStaffSourceRef
+from keystone_agents.source_layer_context import runtime_source_layer_policy_context
+from keystone_agents.local_kni_evidence import (
+    build_local_kni_evidence_packet,
+    build_local_kni_evidence_packet_for_query,
+    local_kni_evidence_paths,
+    local_kni_live_instruction,
+    looks_like_local_kni_evidence_lookup,
+)
 from keystone_agents.visible_sources import append_visible_source_urls_to_output
 
 
@@ -270,6 +279,8 @@ def _reference_capture_mismatch(input_text: str, output: object) -> bool:
     if workflow_type != "reference-capture":
         return False
     lowered = str(input_text or "").lower()
+    if _looks_like_local_kni_evidence_lookup(lowered):
+        return not _output_mentions_local_kni_evidence_path(output)
     explicit_capture_markers = (
         "keep this for future reference",
         "for future reference",
@@ -295,6 +306,89 @@ def _reference_capture_mismatch(input_text: str, output: object) -> bool:
         "source",
     )
     return any(marker in lowered for marker in question_or_search_markers)
+
+
+def _output_mentions_local_kni_evidence_path(output: object) -> bool:
+    values: list[str] = [
+        str(getattr(output, "summary", "") or ""),
+        str(getattr(output, "synthesis", "") or ""),
+    ]
+    sources = getattr(output, "sources", []) or []
+    if isinstance(sources, list):
+        for source in sources:
+            values.extend(
+                [
+                    str(getattr(source, "title", "") or ""),
+                    str(getattr(source, "url", "") or ""),
+                    str(getattr(source, "note", "") or ""),
+                ]
+            )
+            if isinstance(source, dict):
+                values.extend(
+                    [
+                        str(source.get("title") or ""),
+                        str(source.get("url") or ""),
+                        str(source.get("note") or ""),
+                    ]
+                )
+    diagnostics = getattr(output, "retrieval_diagnostics", {}) or {}
+    if isinstance(diagnostics, dict):
+        values.append(str(diagnostics.get("evidence_path") or ""))
+    combined = " ".join(values).lower()
+    return (
+        "evidence path" in combined
+        or "00_admin/formation/" in combined
+        or "formationdocument" in combined
+        or ".pdf" in combined
+    )
+
+
+def _local_kni_evidence_paths(packet: object | None) -> list[str]:
+    return local_kni_evidence_paths(packet)
+
+
+def _with_local_kni_evidence_path_note(output: object, packet: object | None) -> object:
+    paths = _local_kni_evidence_paths(packet)
+    if not paths or not hasattr(output, "model_copy"):
+        return output
+    primary_path = paths[0]
+    actions = list(getattr(output, "recommended_actions", []) or [])
+    evidence_action = f"Review candidate evidence path: {primary_path}."
+    if evidence_action not in actions:
+        actions.append(evidence_action)
+    diagnostics = dict(getattr(output, "retrieval_diagnostics", {}) or {})
+    diagnostics.setdefault("local_only", True)
+    diagnostics.setdefault("send_enabled", False)
+    diagnostics.setdefault("evidence_path", primary_path)
+    diagnostics.setdefault("evidence_paths", paths[:5])
+    sources = list(getattr(output, "sources", []) or [])
+    if not any(primary_path in str(getattr(source, "title", "") or "") for source in sources):
+        sources.append(
+            ChiefOfStaffSourceRef(
+                title=primary_path,
+                source_type="local_kni_document",
+                note="Candidate evidence path used for local KNI document synthesis.",
+            )
+        )
+    audit_notes = list(getattr(output, "audit_notes", []) or [])
+    audit_note = (
+        "Local KNI evidence path was appended after live synthesis omitted an explicit "
+        "path; the live model answer was preserved."
+    )
+    if audit_note not in audit_notes:
+        audit_notes.append(audit_note)
+    return output.model_copy(
+        update={
+            "recommended_actions": actions,
+            "retrieval_diagnostics": diagnostics,
+            "sources": sources,
+            "audit_notes": audit_notes,
+        }
+    )
+
+
+def _looks_like_local_kni_evidence_lookup(lowered: str) -> bool:
+    return looks_like_local_kni_evidence_lookup(lowered)
 
 
 def _fallback_after_unrelated_live_output(
@@ -362,6 +456,30 @@ def _fallback_after_live_sdk_exception(
     return result
 
 
+def _local_kni_evidence_packet(
+    output: object,
+    *,
+    query_text: str = "",
+    max_candidate_documents: int = 5,
+) -> dict[str, object]:
+    return build_local_kni_evidence_packet(
+        output,
+        query_text=query_text,
+        max_candidate_documents=max_candidate_documents,
+    )
+
+
+def _local_kni_evidence_packet_for_query(
+    query_text: str,
+    *,
+    max_candidate_documents: int = 5,
+) -> dict[str, object]:
+    return build_local_kni_evidence_packet_for_query(
+        query_text,
+        max_candidate_documents=max_candidate_documents,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.mode == RunMode.LIVE.value and not args.live_sdk:
@@ -375,12 +493,19 @@ def main(argv: list[str] | None = None) -> int:
     input_text = (cost_directive.cleaned_text or raw_input_text).strip()
     orchestrator_preflight = load_orchestrator_preflight_from_env()
     parent_manual_plan = load_manual_request_plan_from_env()
+    local_kni_lookup = _looks_like_local_kni_evidence_lookup(input_text.lower())
     if args.live_sdk:
         load_settings(force_dotenv=True)
         model_config = get_runtime_agent_model_config("chief_of_staff", model_override=args.model)
         sdk_session = _chief_of_staff_session_from_args(args)
         if parent_manual_plan is not None:
             manual_plan = parent_manual_plan
+        elif local_kni_lookup:
+            manual_plan = resolve_manual_request_plan(
+                input_text,
+                requested_agent="chief_of_staff",
+                live=False,
+            )
         else:
             preflight = run_orchestrator_preflight(
                 input_text,
@@ -399,16 +524,33 @@ def main(argv: list[str] | None = None) -> int:
         )
         typed_result = None
         original_review = None
+        local_kni_evidence = None
+        if local_kni_lookup:
+            local_kni_evidence = _local_kni_evidence_packet_for_query(input_text)
+            orchestrator_preflight = orchestrator_preflight or {
+                "local_kni_evidence_prefetch": True,
+                "note": (
+                    "Local KNI retrieval packaged bounded evidence directly from "
+                    "the raw user query before live Chief of Staff synthesis."
+                ),
+            }
         try:
+            typed_input: dict[str, object] = {
+                "request": input_text,
+                "slack_repo_path": args.slack_repo_path,
+                "approval_reference": _approval_reference_for_request(input_text),
+                "side_effect_policy": _live_side_effect_policy(input_text),
+                "manual_request_plan": manual_plan.model_dump(mode="json"),
+                "orchestrator_preflight": orchestrator_preflight,
+                "runtime_source_layer_policy": runtime_source_layer_policy_context(
+                    "chief_of_staff"
+                ),
+            }
+            if local_kni_evidence is not None:
+                typed_input["local_kni_evidence_packet"] = local_kni_evidence
+                typed_input["local_kni_instruction"] = local_kni_live_instruction()
             typed_result = run_chief_of_staff_sdk(
-                {
-                    "request": input_text,
-                    "slack_repo_path": args.slack_repo_path,
-                    "approval_reference": _approval_reference_for_request(input_text),
-                    "side_effect_policy": _live_side_effect_policy(input_text),
-                    "manual_request_plan": manual_plan.model_dump(mode="json"),
-                    "orchestrator_preflight": orchestrator_preflight,
-                },
+                typed_input,
                 live=True,
                 model=args.model,
                 quality_budget=budget,
@@ -429,8 +571,9 @@ def main(argv: list[str] | None = None) -> int:
                 output=result,
                 run_type="live_sdk",
             )
-            if _review_detected_unrelated_output(review) or _reference_capture_mismatch(
-                input_text, result
+            local_kni_missing_path = local_kni_lookup and not _output_mentions_local_kni_evidence_path(result)
+            if _review_detected_unrelated_output(review) or (
+                _reference_capture_mismatch(input_text, result) and not local_kni_missing_path
             ):
                 original_review = review
                 result = _fallback_after_unrelated_live_output(
@@ -443,6 +586,13 @@ def main(argv: list[str] | None = None) -> int:
                     input_text=input_text,
                     output=result,
                     run_type="deterministic_fallback_after_live_review",
+                )
+            elif local_kni_missing_path:
+                result = _with_local_kni_evidence_path_note(result, local_kni_evidence)
+                review = _chief_of_staff_output_review(
+                    input_text=input_text,
+                    output=result,
+                    run_type="live_sdk_with_local_kni_evidence_path_repair",
                 )
         except Exception as exc:
             if not _should_fallback_after_live_sdk_exception(exc):

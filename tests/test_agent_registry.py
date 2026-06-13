@@ -19,6 +19,7 @@ from keystone_agents.agent_tool_policy import (
     ToolTier,
     allowed_tool_names_for_tier,
     disallowed_tool_names,
+    source_layer_policy_for_tools,
     tool_policy_for_agent,
     unclassified_tool_names,
 )
@@ -43,33 +44,33 @@ SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "2d51d6da5d6927bbb6a033f9b4524706aae9cd8bdad9899b814c1f16ca4311d9",
+        "instructions_sha256": "136f0d985a644d4e83a17841182a7a6cc682330d38bccc896ae13d7c7aeabca9",
         "tool_names_sha256": "7f8aa859104bbb74f20effcc9ea3df828444a7a5e6ee333faaa4308f214a7b1a",
         "output_schema_sha256": "563358d4e138654b23fb9567b06c639a66127dcfd6a3182a497b20a32dc166de",
     },
     "business_research_analyst": {
-        "instructions_sha256": "d188c6135295be2acbb85ce872aea619ee188660dffb8b3df5e49c43f1c384f7",
+        "instructions_sha256": "f81ed08dabb3e1fc350de2884a6bb546ed2755e0058783bac065f6ff8b87a72a",
         "tool_names_sha256": "dc99c3bef9ef99b28c0fefeb017783195c895dc2c819670275e860e8b2fc16fa",
         "output_schema_sha256": "b8218a333d85d2f3850203f5ee48b7ec535a6f924a8851c513f1f2b2afeef6e0",
     },
     "opportunity_scout": {
-        "instructions_sha256": "856054f0f8ea6e3d592e7861cd84f8db42c413109a4b298bd9c550e8edaf6a95",
+        "instructions_sha256": "1388420f2192e3688472b57d482ff09c9d66cf0df36f7c8e332b173b1e926061",
         "tool_names_sha256": "cfd3e659bff1d1d5a9d2c9d3ed823f9261df6f5e5197fd50d51d96c069b34e66",
         "output_schema_sha256": "2e91674be427e59361cfb5a9c275a048bf4166fbcd9f88f6e06405a235ab59e8",
     },
     "outreach_composer": {
-        "instructions_sha256": "c3c802afb1bd3eacf069e36299b767467bc4aefc9cbf8f49ca90ccf04331f497",
+        "instructions_sha256": "201376da278381c2be3e4d5d841aa10513bdb1d32d2c26364dbca4cd0675d7f1",
         "tool_names_sha256": "ef26ea7d5fdaaa5e435c8e4d6dee0521dd07a8ddf663dc12bcec3116a9592585",
         "output_schema_sha256": "167da45f0bb07c0a255c4115b52e9510272a22cc1c479abe9e97c88693d44b34",
     },
     "orchestrator": {
-        "instructions_sha256": "3a425283ff544b95eca56539ee6d4192f26f5c03d7e00f835dd89e9df98cc042",
+        "instructions_sha256": "252ae339fc80c3bedfd79ee9626891972c92514b48b782c78b8eb9b808d69574",
         "tool_names_sha256": "1c2bf4210e21e89f1381c3fc9e33b1480130220b362593845c47475e93b2f925",
         "output_schema_sha256": "89d3c6cd618bcd2546fd63fdbd9de221cf4db20af407030347d7f64c0a646e8b",
     },
     "chief_of_staff": {
-        "instructions_sha256": "5f6004b0df94b3e342367e3de636dc6a2af0a5881dc7647b94410be9927de6ed",
-        "tool_names_sha256": "7eb39fa7ca936b8307f679537f03f155e6a41e71280a9d22b0c9ea46ad881d63",
+        "instructions_sha256": "4a02f59f82e94e283114b17eb7b6d0a161b6b71fbb5b2eb2a92c66b33216043d",
+        "tool_names_sha256": "79a314c867ddd181048dccef8b3f943fa71b034a0a68c5d6fe54e3d1802e72b5",
         "output_schema_sha256": "132332f59ebca8c234b91d6f51380f7e18effd7dc623c77d104774f1003cbe3f",
     },
 }
@@ -154,6 +155,39 @@ def test_registered_agents_have_builders_schemas_prompts_and_validation() -> Non
 
         for eval_path in (*spec.eval_datasets, *spec.validation_paths):
             assert (PROJECT_ROOT / eval_path).exists(), eval_path
+
+
+def test_source_layer_policy_separates_local_hosted_and_public_search() -> None:
+    policy = source_layer_policy_for_tools(
+        (
+            "search_web",
+            "file_search",
+            "list_kni_document_folder",
+            "list_kni_document_sources",
+            "search_kni_documents",
+            "read_kni_document_file",
+        )
+    )
+    by_layer = {str(item["layer"]): item for item in policy}
+
+    assert set(by_layer) == {
+        "local_kni_documents",
+        "hosted_file_search",
+        "public_web_search",
+    }
+    assert "local KNI folder evidence" in " ".join(
+        str(item) for item in by_layer["hosted_file_search"]["not_for"]
+    )
+    assert "current public facts" in " ".join(
+        str(item) for item in by_layer["public_web_search"]["use_for"]
+    )
+    assert "latest user question" in str(
+        by_layer["local_kni_documents"]["reasoning_contract"]
+    )
+    assert "organizer" in str(by_layer["local_kni_documents"]["reasoning_contract"])
+    assert "registered agent" in str(
+        by_layer["local_kni_documents"]["reasoning_contract"]
+    )
 
 
 def test_registered_builders_match_declared_schema_and_tools() -> None:
@@ -417,3 +451,54 @@ def test_agent_cards_are_json_safe_extension_metadata() -> None:
         assert isinstance(card["tool_policy"]["tool_tiers"], dict)
         assert "core_read" in card["tool_policy"]["tool_tiers"]
         assert "internal_write" in card["tool_policy"]["tool_tiers"]
+        assert isinstance(card["runtime_tool_availability"], dict)
+
+
+def test_agent_cards_expose_sanitized_file_search_runtime_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from keystone_agents import file_search
+
+    for key in (
+        file_search.GLOBAL_VECTOR_STORE_IDS_ENV,
+        file_search.GLOBAL_MAX_RESULTS_ENV,
+        file_search.GLOBAL_INCLUDE_RESULTS_ENV,
+        *file_search.AGENT_VECTOR_STORE_IDS_ENVS.values(),
+        *file_search.AGENT_MAX_RESULTS_ENVS.values(),
+        *file_search.AGENT_INCLUDE_RESULTS_ENVS.values(),
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(
+        "KEYSTONE_CHIEF_OF_STAFF_FILE_SEARCH_VECTOR_STORE_IDS",
+        "vs_private_ops",
+    )
+
+    cards_by_route = {card["route_name"]: card for card in agent_cards()}
+    chief_status = cards_by_route["chief_of_staff"]["runtime_tool_availability"][
+        "file_search"
+    ]
+    gmail_status = cards_by_route["gmail_triage"]["runtime_tool_availability"]
+
+    assert chief_status["configured"] is True
+    assert chief_status["vector_store_id_count"] == 1
+    assert chief_status["vector_store_source"] == "agent"
+    assert "vs_private_ops" not in repr(chief_status)
+    assert "file_search" not in gmail_status
+    assert gmail_status["search_web"]["status"] == "attached_live_gated"
+    assert gmail_status["mcp"]["status"] in {
+        "sdk_available_not_configured",
+        "sdk_unavailable",
+    }
+    assert gmail_status["tool_search"]["status"] in {
+        "sdk_available_not_configured",
+        "sdk_unavailable",
+    }
+
+
+def test_chief_of_staff_agent_card_exposes_local_kni_document_status() -> None:
+    cards_by_route = {card["route_name"]: card for card in agent_cards()}
+    status = cards_by_route["chief_of_staff"]["runtime_tool_availability"]
+
+    assert "local_kni_documents" in status
+    assert status["local_kni_documents"]["local_only"] is True
+    assert status["local_kni_documents"]["send_enabled"] is False

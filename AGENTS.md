@@ -123,6 +123,37 @@ inspectable state:
   scope is missing, ask a targeted clarification or return an exact blocker
   instead of guessing.
 
+## Local KNI Document QA
+
+Local Keystone Neuroinformatics document questions must use one general
+retrieval-and-reasoning path. Do not add deterministic branches for individual
+natural-language questions such as one formation-record wording, one insurance
+broker wording, or one follow-up phrasing. A missed answer is usually a
+retrieval contract, evidence ranking, context-pack, or synthesis issue, not a
+reason to hardcode the expected answer in Python.
+
+The deterministic layer may detect that the request needs local KNI document
+access, expose or call bounded local KNI search/read tools, refresh or report
+the local index status, rank candidate documents by source quality and
+sensitivity, enforce `local_only=true` and `send_enabled=false`, block sensitive
+content, mark review-required material, and validate that a local-document
+answer includes evidence paths and uncertainty.
+
+The deterministic layer must not compose the substantive answer for arbitrary
+who/what/which questions; encode expected names, vendors, dates, organizers,
+brokers, agencies, or counterparties for a single query; replace model
+interpretation with phrase-specific routing; or treat the first retrieved source
+or a prefetch summary as the final answer.
+
+The Chief of Staff should interpret bounded document evidence itself. It should
+distinguish roles found in documents, such as organizer, signer, registered
+agent, broker, producer, agency, insurer, coverholder, underwriter, owner, or
+accountable lead, and state uncertainty when the document evidence does not
+support the requested role. If a local KNI Slack test fails, improve the shared
+local-document retrieval/evidence contract or add a general eval that exercises
+the contract across multiple wording variants; do not add a one-off shortcut
+for the observed prompt.
+
 Search-heavy agents use the shared `SearchProvider` contract. Current provider
 implementations are:
 
@@ -285,6 +316,15 @@ model names inside prompts, tools, or CLI branches.
   `OPENAI_MODEL` settings.
 - Live model execution must fail before a model call when the selected provider
   lacks required credentials or gateway configuration.
+- All live model runs and ad hoc Agents SDK smoke tests for this repo should
+  use the repo-specific `KEYSTONE_OPENAI_API_KEY` from the local `.env` or shell
+  environment. Do not rely on a generic `OPENAI_API_KEY` from another project;
+  if a raw SDK snippet requires `OPENAI_API_KEY`, map `KEYSTONE_OPENAI_API_KEY`
+  into that process explicitly without printing the secret.
+- Current SDK conversation continuity uses option 2, local Agents SDK sessions.
+  Do not use `result.to_input_list()`, server-managed continuation IDs, or
+  `result.to_state()` with SDK interruptions as the default state mechanism
+  unless a future assessment deliberately changes the state model.
 - Live SDK runs can hit organization/project model rate limits, especially TPM
   limits on large structured prompts. Treat HTTP 429 as a recoverable provider
   throttle: wait for the reported reset or retry-after window, then retry with

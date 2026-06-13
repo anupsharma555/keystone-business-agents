@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from keystone_agents.agent_tool_policy import ToolTier, tool_policy_for_agent, tool_tier_for_name
 from keystone_agents.schemas.orchestrator import HandoffSpec
 from keystone_agents.skill_sets import AGENT_SKILL_NAMES
+from keystone_agents.tool_availability import runtime_tool_availability_for_agent
 from keystone_agents.tools.internal_data_tools import GOOGLE_WORKSPACE_TOOL_NAMES
 
 AIRTABLE_READ_TOOL_NAMES = ("airtable_get_base_schema", "airtable_read_records")
@@ -122,6 +123,11 @@ class AgentSpec:
                 if policy is not None
                 else None
             ),
+            "runtime_tool_availability": runtime_tool_availability_for_agent(
+                self.route_name,
+                tools=self.tools,
+                optional_tools=self.optional_tools,
+            ),
         }
 
 
@@ -200,6 +206,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             *GOOGLE_WORKSPACE_TOOL_NAMES,
         ),
         live_flags_required=("--live-search", "--no-dry-run", "--live-sdk"),
+        optional_tools=("file_search",),
         eval_datasets=(
             "evals/static/business_research_analyst_cases.json",
             "evals/local/source_attribution.jsonl",
@@ -348,6 +355,7 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
         *GOOGLE_WORKSPACE_TOOL_NAMES,
     ),
     optional_tools=(
+        "file_search",
         "business_research_analyst_research_brief",
         "opportunity_scout_read_only",
     ),
@@ -399,6 +407,10 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         "list_local_context_sources",
         "search_local_context",
         "read_local_context_file",
+        "list_kni_document_folder",
+        "list_kni_document_sources",
+        "search_kni_documents",
+        "read_kni_document_file",
         "extract_research_claims_from_html",
         "list_automation_specs",
         "list_recent_automation_runs",
@@ -419,6 +431,7 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         *BROWSER_DIAGNOSTIC_TOOL_NAMES,
         *GOOGLE_WORKSPACE_TOOL_NAMES,
     ),
+    optional_tools=("file_search",),
     live_flags_required=("--live-sdk",),
     eval_datasets=(),
     validation_paths=("tests/test_chief_of_staff.py",),

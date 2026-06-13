@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -27,6 +30,11 @@ from keystone_agents.slack_action_contract import (
     slack_agent_feedback_event,
 )
 from keystone_agents.slack_interactions import parse_slack_interaction_payload
+from keystone_agents.slack_query_prompts import (
+    build_slack_query_prompt_input,
+    resolve_slack_query_prompt,
+    slack_query_prompt_external_context,
+)
 from keystone_agents.workflow_runner import advance_work_item_manager_loop
 
 DEFAULT_SLACK_CONTEXT_DIR = Path("artifacts/slack_contexts")
@@ -73,6 +81,7 @@ class SlackSelectedMessageContext(BaseModel):
     thread_fetch_status: Literal["ok", "failed", "not_requested"] = "not_requested"
     warnings: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    eval_metadata: dict[str, Any] = Field(default_factory=dict, alias="eval")
 
 
 class SlackAgentRunSubmission(BaseModel):
@@ -98,6 +107,7 @@ class SlackAgentActionResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     feedback_events: list[dict[str, Any]] = Field(default_factory=list)
     run_provenance: dict[str, Any] = Field(default_factory=dict)
+    eval_record: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
 
 
@@ -209,6 +219,7 @@ def build_selected_message_context(
             "max_thread_messages": _MAX_THREAD_MESSAGES,
             "channel_history_included": False,
         },
+        eval=_eval_metadata_from_payload(payload, message),
     )
 
 
@@ -315,6 +326,7 @@ def _run_agent_modal_private_metadata(
         "thread_ts": context.thread_ts,
         "permalink": context.permalink,
         "warnings": context.warnings,
+        "eval": context.eval_metadata,
     }
     private_metadata = json.dumps(metadata, ensure_ascii=True, sort_keys=True)
     if len(private_metadata) <= _MAX_PRIVATE_METADATA_CHARS:
@@ -329,6 +341,7 @@ def _run_agent_modal_private_metadata(
         "thread_ts": context.thread_ts,
         "permalink": "",
         "warnings": [],
+        "eval": context.eval_metadata,
     }
     private_metadata = json.dumps(metadata, ensure_ascii=True, sort_keys=True)
     if len(private_metadata) <= _MAX_PRIVATE_METADATA_CHARS:
@@ -365,6 +378,7 @@ def _modal_pointer_metadata(
         "thread_fetch_status": context.thread_fetch_status,
         "warnings": [],
         "metadata": {"fallback_scope": "selected_message_pointer"},
+        "eval": context.eval_metadata,
     }
     return {
         "schema": context.schema_,
@@ -374,6 +388,7 @@ def _modal_pointer_metadata(
         "selected_message_ts": _metadata_scalar(context.selected_message_ts),
         "thread_ts": _metadata_scalar(context.thread_ts),
         "warnings": ["Slack modal metadata reduced to context pointer."],
+        "eval": context.eval_metadata,
     }
 
 
@@ -407,6 +422,7 @@ def _modal_embedded_context(
         "thread_fetch_status": context.thread_fetch_status,
         "warnings": [_clean_text(item, max_chars=180) for item in context.warnings[:2]],
         "metadata": {"fallback_scope": "selected_message_minimal"},
+        "eval": context.eval_metadata,
     }
 
 
@@ -544,6 +560,24 @@ def handle_run_agent_interaction(
                 feedback_events=feedback_events,
                 orchestrator_preflight=orchestrator_preflight,
             )
+        manual_request_plan = orchestrator_preflight.manual_request_plan.model_dump(mode="json")
+        slack_query_prompt = _slack_query_prompt_for_submission(
+            submission,
+            selected_context,
+            manual_request_plan=manual_request_plan,
+        )
+        if slack_query_prompt is not None:
+            slack_feedback_callback(
+                "slack_query_prompt_selected",
+                slack_query_prompt.metadata(),
+            )
+        request_options = _slack_cost_conservation_request_options(submission.requested_task)
+        if (
+            slack_query_prompt is not None
+            and slack_query_prompt.cost_profile != "standard"
+            and "cost_profile" not in request_options
+        ):
+            request_options["cost_profile"] = slack_query_prompt.cost_profile
         result = advance_work_item_manager_loop(
             WorkflowRunRequest(
                 request_text=submission.requested_task,
@@ -553,13 +587,17 @@ def handle_run_agent_interaction(
                 live_sdk=live_sdk,
                 max_results=max_results,
                 context_file_path=context_file_path,
-                manual_request_plan=orchestrator_preflight.manual_request_plan.model_dump(
-                    mode="json"
-                ),
+                manual_request_plan=manual_request_plan,
                 orchestrator_preflight=compact_orchestrator_preflight_payload(
                     orchestrator_preflight
                 ),
-                **_slack_cost_conservation_request_options(submission.requested_task),
+                external_context=slack_query_prompt_external_context(slack_query_prompt),
+                slack_query_prompt=(
+                    slack_query_prompt.model_dump(mode="json", by_alias=True)
+                    if slack_query_prompt is not None
+                    else None
+                ),
+                **request_options,
             ),
             feedback_callback=slack_feedback_callback,
         )
@@ -575,6 +613,18 @@ def handle_run_agent_interaction(
             )
         result_payload = result.model_dump(mode="json")
         result_payload["slack_run_provenance"] = run_provenance
+        eval_record = _record_eval_run_for_slack_bridge(
+            submission.requested_task,
+            context=selected_context,
+            result=result,
+            run_provenance=run_provenance,
+        )
+        if eval_record is not None:
+            result_payload["eval_record"] = eval_record
+            result_payload["human_summary"] = _append_eval_thread_guidance(
+                str(result_payload.get("human_summary") or ""),
+                eval_record=eval_record,
+            )
         return SlackAgentActionResult(
             stage="work_item",
             callback_id=RUN_AGENT_VIEW_CALLBACK_ID,
@@ -585,6 +635,7 @@ def handle_run_agent_interaction(
             warnings=context_warnings,
             feedback_events=feedback_events,
             run_provenance=run_provenance,
+            eval_record=eval_record,
             result=result_payload,
         )
     raise ValueError(f"Unsupported Slack run-agent payload type: {payload_type or 'unknown'}")
@@ -594,6 +645,153 @@ def _slack_cost_conservation_request_options(request_text: str) -> dict[str, Any
     """Let the WorkItem runner choose route-aware Slack cost controls."""
 
     return {}
+
+
+def _record_eval_run_for_slack_bridge(
+    request_text: str,
+    *,
+    context: SlackSelectedMessageContext | None,
+    result: Any,
+    run_provenance: dict[str, Any],
+) -> dict[str, Any] | None:
+    if context is None:
+        return None
+    try:
+        from promptfoo.eval_database import (
+            DEFAULT_EVAL_DB,
+            record_slack_eval_run,
+            resolve_slack_eval_case_id,
+        )
+    except ImportError:
+        return None
+
+    database_path = Path(os.environ.get("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB") or DEFAULT_EVAL_DB)
+    agent = str(getattr(getattr(result, "route", ""), "value", getattr(result, "route", "")))
+    case_id = _clean_scalar(context.eval_metadata.get("case_id"))
+    if not case_id:
+        try:
+            case_id = resolve_slack_eval_case_id(
+                request_text=request_text,
+                agent=agent,
+                slack_channel_id=context.channel_id,
+                slack_channel_name=context.channel_name,
+                database_path=database_path,
+            )
+        except (OSError, ValueError):
+            case_id = ""
+    if not case_id:
+        return None
+
+    run_id = str(run_provenance.get("work_item_id") or "").strip()
+    try:
+        row_id = record_slack_eval_run(
+            case_id=case_id,
+            run_id=run_id,
+            agent=agent,
+            slack_channel_id=context.channel_id,
+            slack_channel_name=context.channel_name,
+            slack_thread_ts=context.thread_ts or context.selected_message_ts,
+            request_text=request_text,
+            result_summary=str(getattr(result, "human_summary", "") or ""),
+            database_path=database_path,
+        )
+    except (OSError, ValueError):
+        return None
+
+    dashboard = _render_eval_dashboard(database_path)
+    dashboard_case_url = _eval_dashboard_case_url(case_id)
+    review_case_url = _eval_review_case_url(case_id)
+    return {
+        "id": row_id,
+        "case_id": case_id,
+        "run_id": run_id,
+        "agent": agent,
+        "database_path": str(database_path),
+        "slack_thread_ts": context.thread_ts or context.selected_message_ts,
+        "dashboard_url": _eval_dashboard_url(),
+        "dashboard_case_url": dashboard_case_url,
+        "review_case_url": review_case_url,
+        "dashboard_path": dashboard.get("dashboard_path", ""),
+        "dashboard_relative_path": dashboard.get("dashboard_relative_path", ""),
+        "scorecard_request": "@KNI can you give me a scorecard for this eval?",
+        "status_request": "@KNI how is this eval doing?",
+        "eval_thread_reply": {
+            "case_id": case_id,
+            "run_id": run_id,
+            "dashboard_case_url": dashboard_case_url,
+            "review_case_url": review_case_url,
+            "scorecard_request": "@KNI can you give me a scorecard for this eval?",
+            "status_request": "@KNI how is this eval doing?",
+        },
+    }
+
+
+def _render_eval_dashboard(database_path: Path) -> dict[str, str]:
+    try:
+        from promptfoo.eval_dashboard import DEFAULT_DASHBOARD_PATH, render_dashboard
+    except ImportError:
+        return {}
+    try:
+        output_path = render_dashboard(database_path=database_path)
+    except (OSError, ValueError, sqlite3.Error):
+        return {}
+    try:
+        relative = str(output_path.relative_to(Path.cwd()))
+    except ValueError:
+        relative = str(output_path)
+    return {
+        "dashboard_path": str(output_path.resolve()),
+        "dashboard_relative_path": relative or str(DEFAULT_DASHBOARD_PATH),
+    }
+
+
+def _eval_dashboard_url() -> str:
+    try:
+        from promptfoo.eval_urls import eval_dashboard_url
+    except ImportError:
+        return os.environ.get(
+            "KEYSTONE_PROMPTFOO_DASHBOARD_URL",
+            "http://127.0.0.1:8769/dashboard",
+        ).rstrip("/")
+    return eval_dashboard_url()
+
+
+def _eval_dashboard_case_url(case_id: str) -> str:
+    try:
+        from promptfoo.eval_urls import eval_dashboard_case_url
+    except ImportError:
+        base_url = _eval_dashboard_url()
+        separator = "&" if "?" in base_url else "?"
+        return f"{base_url}{separator}case={quote(case_id)}"
+    return eval_dashboard_case_url(case_id)
+
+
+def _eval_review_case_url(case_id: str) -> str:
+    try:
+        from promptfoo.eval_urls import eval_review_case_url
+    except ImportError:
+        base_url = _eval_dashboard_url().replace("/dashboard", "/review")
+        separator = "&" if "?" in base_url else "?"
+        return f"{base_url}{separator}case={quote(case_id)}"
+    return eval_review_case_url(case_id)
+
+
+def _append_eval_thread_guidance(summary: str, *, eval_record: dict[str, Any]) -> str:
+    case_id = _clean_scalar(eval_record.get("case_id"))
+    run_id = _clean_scalar(eval_record.get("run_id"))
+    dashboard_case_url = _clean_scalar(eval_record.get("dashboard_case_url"))
+    review_case_url = _clean_scalar(eval_record.get("review_case_url"))
+    parts = [summary.strip()] if summary.strip() else []
+    detail = f"Eval: case `{case_id}`"
+    if run_id:
+        detail += f", run `{run_id}`"
+    detail += "."
+    if dashboard_case_url:
+        detail += f" Dashboard: <{dashboard_case_url}|case dashboard>."
+    if review_case_url:
+        detail += f" Review form: <{review_case_url}|score this case>."
+    parts.append(detail)
+    return "\n\n".join(parts).strip()
 
 
 def _blocked_slack_agent_result(
@@ -753,6 +951,42 @@ def _orchestrator_workflow_state_from_slack_context(
         if automations:
             state["channel_automations"] = automations
     return state
+
+
+def _slack_query_prompt_for_submission(
+    submission: SlackAgentRunSubmission,
+    context: SlackSelectedMessageContext | None,
+    *,
+    manual_request_plan: dict[str, Any] | None,
+):
+    selected_text = ""
+    selected_permalink = ""
+    channel_name = ""
+    thread_summary = ""
+    prior_summaries: list[str] = []
+    if context is not None:
+        selected_text = context.selected_message.text
+        selected_permalink = context.selected_message.permalink or context.permalink
+        channel_name = context.channel_name or context.channel_id
+        thread_summary = _slack_thread_transcript(
+            context,
+            latest_request=submission.requested_task,
+        )
+        prior_summaries = [
+            str(item.get("summary") or item.get("title") or "").strip()
+            for item in (_compact_prior_agent_run(run) for run in context.prior_agent_runs[:3])
+            if str(item.get("summary") or item.get("title") or "").strip()
+        ]
+    prompt_input = build_slack_query_prompt_input(
+        raw_request=submission.requested_task,
+        selected_message_text=selected_text,
+        selected_message_permalink=selected_permalink,
+        channel_name=channel_name,
+        thread_summary=thread_summary,
+        prior_agent_summaries=prior_summaries,
+        manual_plan=manual_request_plan,
+    )
+    return resolve_slack_query_prompt(prompt_input)
 
 
 def _should_include_channel_automation_context(request_text: str) -> bool:
@@ -983,6 +1217,32 @@ def _message_from_payload(
             "subtype": _clean_scalar(message.get("subtype")),
         },
     )
+
+
+def _eval_metadata_from_payload(
+    payload: dict[str, Any],
+    message: dict[str, Any],
+) -> dict[str, Any]:
+    candidates = [
+        payload.get("eval"),
+        message.get("eval"),
+        _nested(payload, "metadata", "eval"),
+        _nested(payload, "metadata", "event_payload", "eval"),
+        _nested(message, "metadata", "eval"),
+        _nested(message, "metadata", "event_payload", "eval"),
+    ]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        case_id = _clean_scalar(candidate.get("case_id"))
+        if not case_id:
+            continue
+        return {
+            "case_id": case_id,
+            "source": _clean_scalar(candidate.get("source")),
+            "visible_in_prompt": bool(candidate.get("visible_in_prompt", False)),
+        }
+    return {}
 
 
 def _ordered_thread_messages(raw_messages: list[dict[str, Any]]) -> list[SlackContextMessage]:

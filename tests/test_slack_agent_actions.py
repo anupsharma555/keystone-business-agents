@@ -26,6 +26,7 @@ from keystone_agents.slack_actions import (
     RUN_AGENT_TASK_ACTION_ID,
     RUN_AGENT_TASK_BLOCK_ID,
     RUN_AGENT_VIEW_CALLBACK_ID,
+    SlackAgentActionResult,
     build_run_agent_modal,
     build_selected_message_context,
     handle_run_agent_interaction,
@@ -190,6 +191,14 @@ def test_modal_submission_can_create_context_file_from_private_metadata(tmp_path
     assert Path(run_result.context_file_path).is_file()
     work_item = run_result.work_item or {}
     assert work_item["target"]["metadata"]["slack_context"]["channel_id"] == "C123"
+    query_prompt = work_item["target"]["metadata"]["slack_context"]["query_prompt"]
+    assert query_prompt["kind"] == "research_summary"
+    assert query_prompt["target_route"] == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert "task_brief" not in query_prompt
+    assert any(
+        event["event_type"] == "slack_query_prompt_selected"
+        for event in run_result.feedback_events
+    )
 
 
 def test_modal_submission_uses_embedded_context_when_context_file_is_missing(
@@ -351,6 +360,103 @@ def test_modal_submission_starts_work_item_with_slack_metadata(tmp_path: Path) -
     assert result_payload["slack_run_provenance"] == provenance
     assert any(source["source_type"] == "slack_message" for source in work_item["sources"])
     assert work_item["approval_gates"] == []
+
+
+def test_slack_eval_message_action_records_run_and_reply_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from promptfoo.eval_database import eval_case_status
+
+    review_db = tmp_path / "human-reviews.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    payload = _message_action_payload()
+    payload["channel"] = {"id": "C0BA17Y9C01", "name": "evals"}
+    payload["eval"] = {
+        "case_id": "slack_bridge_hidden_eval_001",
+        "source": "slack_eval_channel_backend",
+        "visible_in_prompt": False,
+    }
+
+    modal_result = handle_run_agent_interaction(
+        payload,
+        context_dir=tmp_path / "contexts",
+    )
+    metadata = json.loads(modal_result.modal_view["private_metadata"])
+    assert metadata["selected_context"]["eval"]["case_id"] == "slack_bridge_hidden_eval_001"
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(modal_result.modal_view["private_metadata"]),
+        database_url=_database_url(tmp_path),
+        context_dir=tmp_path / "contexts",
+    )
+
+    eval_record = run_result.eval_record or {}
+    result_payload = run_result.result or {}
+    assert eval_record["case_id"] == "slack_bridge_hidden_eval_001"
+    assert eval_record["run_id"] == run_result.work_item["id"]
+    assert eval_record["slack_thread_ts"] == "1715366400.000100"
+    assert eval_record["dashboard_case_url"].endswith(
+        "?case=slack_bridge_hidden_eval_001"
+    )
+    assert eval_record["scorecard_request"] == (
+        "@KNI can you give me a scorecard for this eval?"
+    )
+    assert result_payload["eval_record"] == eval_record
+    assert "Eval: case `slack_bridge_hidden_eval_001`" in result_payload["human_summary"]
+    assert (
+        "<http://127.0.0.1:8769/dashboard?case=slack_bridge_hidden_eval_001|case dashboard>"
+        in result_payload["human_summary"]
+    )
+    assert (
+        "<http://127.0.0.1:8769/review?case=slack_bridge_hidden_eval_001|score this case>"
+        in result_payload["human_summary"]
+    )
+
+    status = eval_case_status("slack_bridge_hidden_eval_001", database_path=review_db)
+    assert status["slack_run_count"] == 1
+    assert status["slack_runs"][0]["run_id"] == run_result.work_item["id"]
+
+
+def test_modal_submission_selects_reusable_prompt_for_multi_target_source_read(
+    tmp_path: Path,
+) -> None:
+    modal_result = handle_run_agent_interaction(
+        _message_action_payload(),
+        context_dir=tmp_path / "contexts",
+    )
+    task = (
+        "business research analyst: reusable source-read test. Compare how three public "
+        "AI companion or chatbot products describe teen safety, escalation, or "
+        "trusted-contact features. Do not draft, send, publish, schedule, write files, "
+        "or post elsewhere."
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(modal_result.modal_view["private_metadata"], task=task),
+        database_url=_database_url(tmp_path),
+        context_dir=tmp_path / "contexts",
+    )
+
+    work_item = run_result.work_item or {}
+    slack_context = work_item["target"]["metadata"]["slack_context"]
+    query_prompt = slack_context["query_prompt"]
+    prompt_events = [
+        event
+        for event in run_result.feedback_events
+        if event["event_type"] == "slack_query_prompt_selected"
+    ]
+
+    assert prompt_events
+    assert query_prompt["kind"] == "research_summary"
+    assert query_prompt["target_route"] == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert query_prompt["context_flags"]["needs_source_triage"] is True
+    assert "task_brief" not in query_prompt
+    assert any(
+        artifact["artifact_type"] == "multi_target_research"
+        for artifact in work_item["artifact_refs"]
+    )
+    assert work_item["status"] == WorkItemStatus.BLOCKED.value
 
 
 def test_modal_submission_gmail_request_uses_gmail_context_gate_not_unsupported_route(
@@ -709,6 +815,56 @@ def test_slack_agent_action_cli_streams_feedback_jsonl(
     assert any(event["event_type"] == "manager_loop_review" for event in events)
 
 
+def test_slack_agent_action_cli_prints_thread_reply_for_local_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload_path = tmp_path / "view-submission.json"
+    payload_path.write_text(json.dumps({"type": "view_submission"}), encoding="utf-8")
+
+    def fake_handle_run_agent_interaction(*_args, **_kwargs):
+        return SlackAgentActionResult(
+            stage="work_item",
+            callback_id=RUN_AGENT_VIEW_CALLBACK_ID,
+            work_item={"id": "wi_eval_123"},
+            route="opportunity_scout",
+            status="done",
+            run_provenance={"source_thread_ts": "1781202023.470699"},
+            result={
+                "human_summary": (
+                    "Eval `slack_agents_sdk_course_001` status: Promptfoo pass. "
+                    "Dashboard: <http://127.0.0.1:8769/dashboard?case=slack_agents_sdk_course_001|case dashboard>."
+                )
+            },
+        )
+
+    monkeypatch.setattr(
+        slack_agent_action_cli,
+        "handle_run_agent_interaction",
+        fake_handle_run_agent_interaction,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "handle_slack_agent_action.py",
+            "--payload-file",
+            str(payload_path),
+            "--database-url",
+            _database_url(tmp_path),
+        ],
+    )
+
+    assert slack_agent_action_cli.main() == 0
+
+    output = capsys.readouterr().out
+    assert "Keystone WorkItem started." in output
+    assert "WorkItem: wi_eval_123" in output
+    assert "Thread reply:" in output
+    assert "case dashboard" in output
+    assert "Reply thread: 1781202023.470699" in output
+
+
 def test_slack_agent_action_cli_emits_structured_error_feedback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1011,6 +1167,110 @@ def test_slack_thread_follow_up_can_reach_chief_of_staff_live_sdk(
     )
     assert orchestrator_context["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
     assert orchestrator_context["slack_context"]["channel_id"] == "C123"
+
+
+def test_slack_chief_of_staff_local_kni_followup_gets_evidence_packet(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_chief_of_staff_sdk(typed_input, **kwargs):
+        captured["typed_input"] = typed_input
+        captured["kwargs"] = kwargs
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary=(
+                    "The local KNI evidence identifies ProAssurance as broker/producer. "
+                    "Evidence path: 00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf."
+                ),
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="project-context-review",
+                    target_channel="current-thread",
+                ),
+                send_enabled=False,
+                slack_post_allowed=False,
+                retrieval_diagnostics={
+                    "local_only": True,
+                    "send_enabled": False,
+                    "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                },
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    def fake_plan_chief_of_staff_request(*_args, **_kwargs):
+        raise AssertionError("local KNI live evidence must be built from the query")
+
+    def fake_build_local_kni_evidence_packet_for_query(query_text, *, max_candidate_documents=5):
+        captured["packet_query_text"] = query_text
+        return {
+            "packet_type": "bounded_local_kni_document_evidence",
+            "local_only": True,
+            "send_enabled": False,
+            "candidate_documents": [
+                {
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                    "content_excerpt": "PRODUCER IAO, Inc. DBA ProAssurance Agency",
+                    "sensitivity_status": "allowed",
+                    "review_required": True,
+                    "review_reasons": ["insurance_policy"],
+                    "local_only": True,
+                    "send_enabled": False,
+                }
+            ],
+            "retrieval_diagnostics": {
+                "local_only": True,
+                "send_enabled": False,
+                "effective_lookup_kind": "insurance",
+                "effective_answer_focus": "broker",
+            },
+        }
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_chief_of_staff_sdk",
+        fake_run_chief_of_staff_sdk,
+    )
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.plan_chief_of_staff_request",
+        fake_plan_chief_of_staff_request,
+    )
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.build_local_kni_evidence_packet_for_query",
+        fake_build_local_kni_evidence_packet_for_query,
+    )
+
+    modal_result = handle_run_agent_interaction(
+        _message_action_payload(),
+        context_dir=tmp_path / "contexts",
+        thread_messages=[
+            {"ts": "1715366400.000100", "user": "U456", "text": "CFC insurance provider was discussed"},
+            {"ts": "1715366460.000200", "user": "U789", "text": "Actually it was ProAssurance"},
+        ],
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task="chief of staff who was the broker for the CFC insurance?",
+        ),
+        database_url=_database_url(tmp_path),
+        live_sdk=True,
+    )
+
+    typed_input = captured["typed_input"]
+
+    assert run_result.route == "chief_of_staff"
+    assert typed_input["local_kni_evidence_packet"]["local_only"] is True
+    assert typed_input["local_kni_evidence_packet"]["candidate_documents"][0][
+        "relative_path"
+    ].endswith("COI_AnupSharma_2026.pdf")
+    assert "not as a prewritten final answer" in typed_input["local_kni_instruction"]
+    assert typed_input["orchestrator_context"]["local_kni_evidence_prefetch"] is True
+    assert captured["packet_query_text"] == "chief of staff who was the broker for the CFC insurance?"
 
 
 def test_slack_natural_followup_with_pending_approval_reaches_workflow(

@@ -10,6 +10,16 @@ from typing import Any
 
 DEFAULT_CORPUS_MANIFEST = Path("docs/corpus/seed_manifest.json")
 
+AGENT_FILE_SEARCH_VECTOR_STORE_ENVS = {
+    "business_research_analyst": (
+        "KEYSTONE_BUSINESS_RESEARCH_ANALYST_FILE_SEARCH_VECTOR_STORE_IDS"
+    ),
+    "chief_of_staff": "KEYSTONE_CHIEF_OF_STAFF_FILE_SEARCH_VECTOR_STORE_IDS",
+    "orchestrator": "KEYSTONE_ORCHESTRATOR_FILE_SEARCH_VECTOR_STORE_IDS",
+}
+GLOBAL_FILE_SEARCH_VECTOR_STORE_ENV = "KEYSTONE_FILE_SEARCH_VECTOR_STORE_IDS"
+LOCAL_FILE_SEARCH_CONFIG_PATH = Path(".local/file-search-vector-stores.json")
+
 
 @dataclass(frozen=True)
 class CorpusFile:
@@ -126,6 +136,125 @@ def corpus_upload_plan_summary(plan: CorpusUploadPlan) -> dict[str, Any]:
             }
             for item in plan.files
         ],
+        "runtime_configuration": corpus_runtime_configuration_recommendation(plan),
+    }
+
+
+def corpus_runtime_configuration_recommendation(
+    plan: CorpusUploadPlan,
+    *,
+    vector_store_id: str | None = None,
+) -> dict[str, Any]:
+    """Return env-var guidance for enabling a FileSearch corpus after upload.
+
+    Prefer agent-specific settings so a corpus approved for three agents does
+    not accidentally become global context for future agents.
+    """
+
+    approved_agents = sorted({agent for item in plan.files for agent in item.approved_for})
+    corpora = sorted({item.corpus for item in plan.files})
+    sensitivities = sorted({item.sensitivity for item in plan.files})
+    vector_store_value = str(vector_store_id or "").strip() or "<vector_store_id>"
+    agent_env = []
+    for agent in approved_agents:
+        env_name = AGENT_FILE_SEARCH_VECTOR_STORE_ENVS.get(agent)
+        if not env_name:
+            continue
+        agent_env.append(
+            {
+                "agent_name": agent,
+                "vector_store_ids_env": env_name,
+                "suggested_value": vector_store_value,
+            }
+        )
+    return {
+        "corpora": corpora,
+        "approved_agents": approved_agents,
+        "sensitivity": sensitivities,
+        "public_reference_only": all(
+            item.sensitivity == "public_reference" for item in plan.files
+        ),
+        "recommended_scope": "agent_specific",
+        "agent_env": agent_env,
+        "global_env": {
+            "vector_store_ids_env": GLOBAL_FILE_SEARCH_VECTOR_STORE_ENV,
+            "suggested_value": vector_store_value,
+            "note": (
+                "Use the global env only when every file in the vector store is "
+                "appropriate for every FileSearch-enabled Keystone agent."
+            ),
+        },
+        "config_file": {
+            "path": str(LOCAL_FILE_SEARCH_CONFIG_PATH),
+            "example": _local_file_search_config_payload(
+                plan,
+                vector_store_id=vector_store_value,
+            ),
+        },
+    }
+
+
+def write_local_file_search_config(
+    *,
+    path: Path,
+    plan: CorpusUploadPlan,
+    vector_store_id: str,
+) -> dict[str, Any]:
+    """Merge FileSearch vector-store IDs into an ignored local config file."""
+
+    existing: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid local FileSearch config JSON: {path}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError(f"Local FileSearch config must be a JSON object: {path}")
+        existing = loaded
+    agents = existing.get("agents")
+    if agents is None:
+        agents = {}
+    if not isinstance(agents, dict):
+        raise ValueError(f"Local FileSearch config `agents` must be a JSON object: {path}")
+
+    update_payload = _local_file_search_config_payload(plan, vector_store_id=vector_store_id)
+    for agent_name, agent_update in update_payload["agents"].items():
+        current = agents.get(agent_name)
+        if current is None:
+            current = {}
+        if not isinstance(current, dict):
+            raise ValueError(
+                f"Local FileSearch config `agents.{agent_name}` must be a JSON object: {path}"
+            )
+        agents[agent_name] = {**current, **agent_update}
+
+    existing["schema"] = "keystone.file_search_vector_stores.v1"
+    existing["agents"] = dict(sorted(agents.items()))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "path": str(path),
+        "updated_agents": sorted(update_payload["agents"]),
+        "vector_store_id_count": 1,
+        "public_reference_only": all(
+            item.sensitivity == "public_reference" for item in plan.files
+        ),
+    }
+
+
+def _local_file_search_config_payload(
+    plan: CorpusUploadPlan,
+    *,
+    vector_store_id: str,
+) -> dict[str, Any]:
+    agents: dict[str, dict[str, Any]] = {}
+    for agent in sorted({agent for item in plan.files for agent in item.approved_for}):
+        if agent not in AGENT_FILE_SEARCH_VECTOR_STORE_ENVS:
+            continue
+        agents[agent] = {"vector_store_ids": [str(vector_store_id).strip()]}
+    return {
+        "schema": "keystone.file_search_vector_stores.v1",
+        "agents": agents,
     }
 
 

@@ -1,6 +1,7 @@
 .DS_Store
 .coverage
 .venv/
+node_modules/
 .env
 .env.*
 !.env.example

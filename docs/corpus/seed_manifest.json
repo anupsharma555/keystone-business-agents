@@ -190,6 +190,39 @@
       "external_sources_summarized": []
     },
     {
+      "name": "keystone-business-agents-openai-agents-python-public",
+      "description": "Public OpenAI Agents Python SDK docs for SDK-native business-agent architecture.",
+      "approved_for": [
+        "business_research_analyst",
+        "chief_of_staff",
+        "orchestrator"
+      ],
+      "sensitivity": "public_reference",
+      "local_files": [
+        "docs/corpus/vendor/openai-agents-python/SOURCE.md",
+        "docs/corpus/vendor/openai-agents-python/LICENSE",
+        "docs/corpus/vendor/openai-agents-python/agents.md",
+        "docs/corpus/vendor/openai-agents-python/tools.md",
+        "docs/corpus/vendor/openai-agents-python/sessions-index.md"
+      ],
+      "external_sources_summarized": [],
+      "external_sources_vendored": [
+        {
+          "title": "OpenAI Agents Python SDK docs",
+          "source_url": "https://github.com/openai/openai-agents-python",
+          "license": "MIT",
+          "retrieved_at": "2026-05-14",
+          "local_files": [
+            "docs/corpus/vendor/openai-agents-python/SOURCE.md",
+            "docs/corpus/vendor/openai-agents-python/LICENSE",
+            "docs/corpus/vendor/openai-agents-python/agents.md",
+            "docs/corpus/vendor/openai-agents-python/tools.md",
+            "docs/corpus/vendor/openai-agents-python/sessions-index.md"
+          ]
+        }
+      ]
+    },
+    {
       "name": "keystone-business-agents-public-vendor-reference",
       "description": "Public official docs/specs only, safe for live vector-store smoke tests.",
       "approved_for": [
