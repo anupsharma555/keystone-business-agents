@@ -1,0 +1,22 @@
+{
+  "scripts": {
+    "eval:promptfoo": "mkdir -p .keystone/promptfoo/config .keystone/promptfoo/cache .keystone/promptfoo/logs && PROMPTFOO_CONFIG_DIR=.keystone/promptfoo/config PROMPTFOO_CACHE_PATH=.keystone/promptfoo/cache PROMPTFOO_LOG_DIR=.keystone/promptfoo/logs promptfoo eval -c promptfooconfig.yaml --no-cache --max-concurrency 1",
+    "eval:promptfoo:json": "mkdir -p .keystone/promptfoo/config .keystone/promptfoo/cache .keystone/promptfoo/logs && PROMPTFOO_CONFIG_DIR=.keystone/promptfoo/config PROMPTFOO_CACHE_PATH=.keystone/promptfoo/cache PROMPTFOO_LOG_DIR=.keystone/promptfoo/logs promptfoo eval -c promptfooconfig.yaml --no-cache --max-concurrency 1 --no-table -o .keystone/promptfoo/latest-eval.json",
+    "eval:promptfoo:db": "npm run eval:promptfoo:json && .venv/bin/python scripts/promptfoo_eval_db.py import-latest",
+    "eval:promptfoo:dashboard": ".venv/bin/python scripts/render_promptfoo_eval_dashboard.py",
+    "eval:promptfoo:dashboard:server": ".venv/bin/python scripts/serve_promptfoo_eval_dashboard.py",
+    "eval:promptfoo:list": ".venv/bin/python scripts/promptfoo_eval_db.py list",
+    "eval:slack:readiness": ".venv/bin/python scripts/check_eval_slack_readiness.py",
+    "eval:slack:live-readiness": ".venv/bin/python scripts/check_eval_slack_readiness.py --live-slack-probe",
+    "eval:slack:strict-readiness": ".venv/bin/python scripts/check_eval_slack_readiness.py --strict",
+    "eval:slack:strict-live-readiness": ".venv/bin/python scripts/check_eval_slack_readiness.py --strict --live-slack-probe",
+    "eval:slack:test-server": ".venv/bin/python scripts/run_eval_slack_test_server.py",
+    "eval:slack:strict-test-server": ".venv/bin/python scripts/run_eval_slack_test_server.py --strict-readiness",
+    "eval:slack:strict-live-test-server": ".venv/bin/python scripts/run_eval_slack_test_server.py --strict-readiness --live-slack-probe",
+    "eval:promptfoo:validate": "mkdir -p .keystone/promptfoo/config .keystone/promptfoo/cache .keystone/promptfoo/logs && PROMPTFOO_CONFIG_DIR=.keystone/promptfoo/config PROMPTFOO_CACHE_PATH=.keystone/promptfoo/cache PROMPTFOO_LOG_DIR=.keystone/promptfoo/logs promptfoo validate config -c promptfooconfig.yaml",
+    "eval:promptfoo:view": "mkdir -p .keystone/promptfoo/config .keystone/promptfoo/cache .keystone/promptfoo/logs && PROMPTFOO_CONFIG_DIR=.keystone/promptfoo/config PROMPTFOO_CACHE_PATH=.keystone/promptfoo/cache PROMPTFOO_LOG_DIR=.keystone/promptfoo/logs promptfoo view"
+  },
+  "devDependencies": {
+    "promptfoo": "^0.121.15"
+  }
+}

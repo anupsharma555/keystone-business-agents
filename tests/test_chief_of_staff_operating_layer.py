@@ -73,6 +73,9 @@ def test_chief_of_staff_builder_exposes_operating_tools() -> None:
     assert "publish_document_report" in tool_names
     assert "publish_table_mirror" in tool_names
     assert "publish_slack_summary" in tool_names
+    assert "list_kni_document_sources" in tool_names
+    assert "search_kni_documents" in tool_names
+    assert "read_kni_document_file" in tool_names
 
 
 def test_chief_of_staff_automation_audit_plans_internal_writes(tmp_path: Path) -> None:

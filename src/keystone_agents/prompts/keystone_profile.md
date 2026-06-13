@@ -10,6 +10,10 @@ prompt_eval_datasets: evals/static/*.json, evals/local/*.jsonl
 
 Company name: Keystone Neuroinformatics LLC.
 
+Aliases: In Keystone business-agent contexts, treat "Keystone", "KNI", and
+"Keystone Neuroinformatics" as references to Keystone Neuroinformatics LLC
+unless the user clearly indicates a different entity.
+
 Keystone Neuroinformatics LLC is a physician-scientist-led consulting company focused on clinical AI, psychiatry, neuroscience, neuroinformatics, behavioral health, CNS, digital health, clinical research operations, and evidence generation.
 
 ## Services

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -50,6 +52,7 @@ from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountCon
 from keystone_agents.schemas.research import ResearchBrief
 from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
+from keystone_agents.source_layer_context import append_runtime_source_layer_policy_text
 from keystone_agents.source_enrichment import (
     dedupe_and_rank_source_records,
     normalize_source_record,
@@ -385,6 +388,7 @@ def build_business_research_analyst_agent(
     model: str | None = None,
     *,
     request_text: str = "",
+    context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
 ) -> Agent:
@@ -399,6 +403,7 @@ def build_business_research_analyst_agent(
         skill_files=select_agent_skill_names(
             "business_research_analyst",
             request_text=request_text,
+            context_flags=context_flags,
             include_all=include_all_skills,
         ),
     )
@@ -803,6 +808,7 @@ def run_business_research_analyst_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
 ) -> TypedAgentRunResult[CompanyProfile]:
     """Run Business Research Analyst through the typed SDK harness."""
@@ -811,13 +817,15 @@ def run_business_research_analyst_sdk(
         typed_input,
         live=live,
     )
+    typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     return run_typed_sdk_agent(
         agent=build_business_research_analyst_agent(
             model=model,
             request_text=skill_request_text(typed_input),
+            context_flags=context_flags,
             tool_tier=resolved_tool_tier,
         ),
-        typed_input=typed_input,
+        typed_input=typed_input_for_run,
         output_type=CompanyProfile,
         run_config=run_config,
         live=live,
@@ -840,13 +848,14 @@ def run_business_research_analyst_focused_brief_sdk(
         typed_input,
         live=live,
     )
+    typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     return run_typed_sdk_agent(
         agent=build_business_research_analyst_focused_brief_agent(
             model=model,
             request_text=skill_request_text(typed_input),
             tool_tier=resolved_tool_tier,
         ),
-        typed_input=typed_input,
+        typed_input=typed_input_for_run,
         output_type=CompanyResearchFocusedBrief,
         run_config=run_config,
         live=live,
@@ -869,18 +878,60 @@ def run_business_research_analyst_research_brief_sdk(
         typed_input,
         live=live,
     )
+    typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     return run_typed_sdk_agent(
         agent=build_business_research_analyst_research_brief_agent(
             model=model,
             request_text=skill_request_text(typed_input),
             tool_tier=resolved_tool_tier,
         ),
-        typed_input=typed_input,
+        typed_input=typed_input_for_run,
         output_type=ResearchBrief,
         run_config=run_config,
         live=live,
         session=session,
     )
+
+
+def _with_runtime_source_layer_policy(
+    typed_input: BusinessResearchSDKInput
+    | BusinessResearchFocusedBriefSDKInput
+    | BusinessResearchComparisonSDKInput
+    | ResearchSDKInput
+    | str,
+) -> (
+    BusinessResearchSDKInput
+    | BusinessResearchFocusedBriefSDKInput
+    | BusinessResearchComparisonSDKInput
+    | ResearchSDKInput
+    | str
+):
+    if isinstance(typed_input, str):
+        return typed_input
+    if isinstance(typed_input, BusinessResearchSDKInput):
+        return replace(
+            typed_input,
+            context=append_runtime_source_layer_policy_text(
+                typed_input.context,
+                "business_research_analyst",
+            ),
+        )
+    if isinstance(
+        typed_input,
+        (
+            BusinessResearchFocusedBriefSDKInput,
+            BusinessResearchComparisonSDKInput,
+            ResearchSDKInput,
+        ),
+    ):
+        return replace(
+            typed_input,
+            source_context=append_runtime_source_layer_policy_text(
+                typed_input.source_context,
+                "business_research_analyst",
+            ),
+        )
+    return typed_input
 
 
 def _default_business_research_sdk_tool_tier(

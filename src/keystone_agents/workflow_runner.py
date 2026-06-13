@@ -43,6 +43,12 @@ from keystone_agents.live_retrieval import (
     retrieve_company_profile_live,
     run_opportunity_scout_live,
 )
+from keystone_agents.local_kni_evidence import (
+    build_local_kni_evidence_packet_for_query,
+    local_kni_evidence_paths,
+    local_kni_live_instruction,
+    looks_like_local_kni_evidence_lookup,
+)
 from keystone_agents.memory import (
     MANAGER_LOOP_EFFICIENCY_METRIC_NAME,
     MANAGER_LOOP_EFFICIENCY_METRIC_VERSION,
@@ -50,6 +56,13 @@ from keystone_agents.memory import (
     retrieval_tool_performance_memory_item,
 )
 from keystone_agents.models import OutreachComposerSDKInput, ResearchSDKInput
+from keystone_agents.multi_target_research import (
+    MultiTargetResearchResult,
+    build_multi_target_research_plan,
+    render_multi_target_research_summary,
+    run_multi_target_research,
+    should_run_multi_target_research,
+)
 from keystone_agents.operator_failures import redact_operator_text
 from keystone_agents.orchestrator.routing import (
     looks_like_send_side_effect,
@@ -69,6 +82,7 @@ from keystone_agents.response_synthesis import (
 )
 from keystone_agents.run import run_retrieved_sdk_synthesis
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
+from keystone_agents.schemas.chief_of_staff import ChiefOfStaffSourceRef
 from keystone_agents.schemas.company_profile import CompanyProfile, SourceRecord
 from keystone_agents.schemas.email_triage import (
     GmailThreadSummaryMessage,
@@ -115,6 +129,12 @@ from keystone_agents.skill_sets import (
     explain_agent_skill_selection,
     select_agent_skill_names,
 )
+from keystone_agents.slack_query_prompts import (
+    build_slack_query_prompt_input,
+    resolve_slack_query_prompt,
+    slack_query_prompt_external_context,
+)
+from keystone_agents.source_layer_context import runtime_source_layer_policy_context
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.approval_tool import build_approval_queue_item
 from keystone_agents.tools.gmail_tool import GmailAPIError, GmailConfigurationError, GmailTool
@@ -302,6 +322,113 @@ def _request_has_slack_runtime_env() -> bool:
     """Return true when invoked by the Slack bridge without a context file."""
 
     return any(str(os.environ.get(key) or "").strip() for key in _SLACK_RUNTIME_ENV_HINTS)
+
+
+def _attach_reusable_slack_query_prompt(
+    request: WorkflowRunRequest,
+    *,
+    route: WorkItemRoute,
+    work_item: WorkItem | None = None,
+    store: SQLiteStore | None = None,
+) -> WorkflowRunRequest:
+    """Attach reusable Slack query prompt metadata for Slack-origin WorkItem runs."""
+
+    if isinstance(request.slack_query_prompt, dict):
+        return request
+    external_context = request.external_context if isinstance(request.external_context, dict) else {}
+    if isinstance(external_context.get("slack_query_prompt"), dict):
+        return request
+    if not _request_has_slack_context(request, store=store, work_item=work_item):
+        return request
+
+    manual_plan = _manual_request_plan_dict(request.manual_request_plan)
+    prompt_input = build_slack_query_prompt_input(
+        raw_request=request.request_text or "",
+        selected_message_text=_slack_context_selected_message_text(work_item),
+        selected_message_permalink=_slack_context_permalink(work_item),
+        channel_name=_slack_context_channel_name(work_item),
+        thread_summary=_slack_context_thread_summary(work_item),
+        prior_agent_summaries=_slack_context_prior_agent_summaries(work_item),
+        manual_plan=manual_plan,
+        work_item_id=work_item.id if work_item is not None else "",
+        target_route=route,
+    )
+    selection = resolve_slack_query_prompt(prompt_input)
+    if selection is None:
+        return request
+
+    prompt_context = slack_query_prompt_external_context(selection)
+    merged_external_context = dict(external_context)
+    merged_external_context.setdefault("source", prompt_context.get("source"))
+    merged_external_context["slack_query_prompt"] = prompt_context["slack_query_prompt"]
+    if "schema" not in merged_external_context:
+        merged_external_context["schema"] = prompt_context.get("schema")
+    return request.model_copy(
+        update={
+            "slack_query_prompt": prompt_context["slack_query_prompt"],
+            "external_context": merged_external_context,
+        }
+    )
+
+
+def _manual_request_plan_dict(value: Any) -> dict[str, Any] | None:
+    if hasattr(value, "model_dump"):
+        payload = value.model_dump(mode="json")
+        return payload if isinstance(payload, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def _slack_context_from_work_item(work_item: WorkItem | None) -> dict[str, Any]:
+    if work_item is None:
+        return {}
+    context = work_item.target.metadata.get("slack_context")
+    return context if isinstance(context, dict) else {}
+
+
+def _slack_context_selected_message_text(work_item: WorkItem | None) -> str:
+    context = _slack_context_from_work_item(work_item)
+    selected = context.get("selected_message")
+    if isinstance(selected, dict):
+        return str(selected.get("text") or "")
+    return ""
+
+
+def _slack_context_permalink(work_item: WorkItem | None) -> str:
+    context = _slack_context_from_work_item(work_item)
+    selected = context.get("selected_message")
+    if isinstance(selected, dict):
+        return str(selected.get("permalink") or context.get("permalink") or "")
+    return str(context.get("permalink") or "")
+
+
+def _slack_context_channel_name(work_item: WorkItem | None) -> str:
+    context = _slack_context_from_work_item(work_item)
+    return str(context.get("channel_name") or "")
+
+
+def _slack_context_thread_summary(work_item: WorkItem | None) -> str:
+    context = _slack_context_from_work_item(work_item)
+    transcript = context.get("thread_transcript")
+    if isinstance(transcript, list):
+        values = []
+        for item in transcript[:8]:
+            if isinstance(item, dict):
+                text = str(item.get("text") or "").strip()
+                if text:
+                    values.append(text)
+        return "\n".join(values)
+    return ""
+
+
+def _slack_context_prior_agent_summaries(work_item: WorkItem | None) -> list[str]:
+    if work_item is None:
+        return []
+    summaries: list[str] = []
+    for artifact in work_item.artifact_refs[:3]:
+        summary = str(artifact.summary or "").strip()
+        if summary:
+            summaries.append(summary)
+    return summaries
 
 
 def _request_route_for_slack_cost_profile(
@@ -580,6 +707,12 @@ def _advance_work_item_one_step(
     if input_text and input_text.lower() not in {"continue", "resume"}:
         work_item = work_item.model_copy(update={"request_text": input_text})
     work_item = _apply_manual_request_plan(work_item, request.manual_request_plan)
+    request = _attach_reusable_slack_query_prompt(
+        request,
+        route=route,
+        work_item=work_item,
+        store=store,
+    )
     external_context = _load_external_context(request)
     work_item = _apply_external_context(
         work_item,
@@ -650,6 +783,7 @@ def _advance_work_item_one_step(
         work_item,
         route=route,
         request_text=work_item.request_text or input_text,
+        context_flags=_slack_query_context_flags(request),
         store=store,
     )
     _record_preflight_sdk_cost_events(work_item, request=request, store=store)
@@ -721,6 +855,7 @@ def _record_skills_selected_event(
     *,
     route: WorkItemRoute,
     request_text: str,
+    context_flags: dict[str, bool] | None = None,
     store: SQLiteStore | None,
 ) -> None:
     """Persist the runtime skill subset selected for the next specialist step."""
@@ -728,8 +863,16 @@ def _record_skills_selected_event(
     agent_name = route.value
     if agent_name not in AGENT_SKILL_NAMES:
         return
-    selected_skills = select_agent_skill_names(agent_name, request_text=request_text)
-    selection_reasons = explain_agent_skill_selection(agent_name, request_text=request_text)
+    selected_skills = select_agent_skill_names(
+        agent_name,
+        request_text=request_text,
+        context_flags=context_flags,
+    )
+    selection_reasons = explain_agent_skill_selection(
+        agent_name,
+        request_text=request_text,
+        context_flags=context_flags,
+    )
     record_event(
         work_item,
         event_type="skills_selected",
@@ -743,12 +886,29 @@ def _record_skills_selected_event(
             "selection_reasons": {
                 skill_name: list(reasons) for skill_name, reasons in selection_reasons.items()
             },
+            "context_flags": {
+                str(key): bool(value) for key, value in (context_flags or {}).items() if value
+            },
             "selector_input_sha256": hashlib.sha256(
                 str(request_text or "").encode("utf-8")
             ).hexdigest(),
         },
         store=store,
     )
+
+
+def _slack_query_context_flags(request: WorkflowRunRequest) -> dict[str, bool]:
+    query_prompt = request.slack_query_prompt
+    if not isinstance(query_prompt, dict):
+        query_prompt = {}
+        external_context = request.external_context if isinstance(request.external_context, dict) else {}
+        nested = external_context.get("slack_query_prompt")
+        if isinstance(nested, dict):
+            query_prompt = nested
+    flags = query_prompt.get("context_flags")
+    if not isinstance(flags, dict):
+        return {}
+    return {str(key): bool(value) for key, value in flags.items() if value}
 
 
 def _record_skill_contract_gates_event(
@@ -909,6 +1069,7 @@ def advance_work_item_manager_loop(
         elapsed_seconds=perf_counter() - started_at,
         store=store,
     )
+    final_result = _append_manager_loop_run_metadata(final_result, loop_steps=loop_steps)
     return final_result
 
 
@@ -1452,6 +1613,73 @@ def _manager_loop_latency_bucket(elapsed_seconds: float) -> str:
     if elapsed_seconds < 120:
         return "45_to_120s"
     return "over_120s"
+
+
+def _append_manager_loop_run_metadata(
+    result: WorkflowRunResult,
+    *,
+    loop_steps: list[dict[str, Any]],
+) -> WorkflowRunResult:
+    line = _manager_loop_run_metadata_line(result, loop_steps=loop_steps)
+    if not line:
+        return result
+    updated = _append_metadata_line(result.human_summary, line)
+    if updated == result.human_summary:
+        return result
+    return result.model_copy(update={"human_summary": updated})
+
+
+def _manager_loop_run_metadata_line(
+    result: WorkflowRunResult,
+    *,
+    loop_steps: list[dict[str, Any]],
+) -> str:
+    if not loop_steps:
+        return ""
+    repair_count = sum(1 for step in loop_steps if step.get("repair"))
+    specialist_count = sum(1 for step in loop_steps if not step.get("repair"))
+    if specialist_count <= 1 and repair_count == 0:
+        return ""
+    route_sequence = [
+        str(step.get("route") or "").strip()
+        for step in loop_steps
+        if str(step.get("route") or "").strip()
+    ]
+    route_text = " -> ".join(route_sequence[:4])
+    if len(route_sequence) > 4:
+        route_text += " -> ..."
+    parts = [
+        f"{specialist_count} specialist pass(es)",
+        f"{repair_count} repair/deepen pass(es) attempted",
+        f"final status {result.status.value}",
+    ]
+    if route_text:
+        parts.append(f"routes {route_text}")
+    return "* Manager loop steps: " + "; ".join(parts)
+
+
+def _append_metadata_line(text: str, line: str) -> str:
+    if not line or line in str(text or ""):
+        return text
+    original = str(text or "").rstrip()
+    if not original:
+        return f"Metadata\n{line}"
+    lines = original.splitlines()
+    metadata_index: int | None = None
+    for index, current in enumerate(lines):
+        if _normalized_rendered_heading(current) == "metadata":
+            metadata_index = index
+            break
+    if metadata_index is None:
+        return f"{original}\n\nMetadata\n{line}"
+    insert_at = len(lines)
+    for index in range(metadata_index + 1, len(lines)):
+        normalized = _normalized_rendered_heading(lines[index])
+        if normalized and normalized != "metadata":
+            insert_at = index
+            break
+    updated_lines = [*lines[:insert_at], line, *lines[insert_at:]]
+    return "\n".join(updated_lines).rstrip()
 
 
 def _manager_loop_efficiency_signal(metrics: dict[str, Any]) -> str:
@@ -2139,6 +2367,9 @@ def _specialist_orchestrator_context_payload(
     preflight = _orchestrator_preflight_event_payload(request.orchestrator_preflight)
     if preflight:
         payload["orchestrator_preflight"] = preflight
+    slack_query_prompt = _specialist_slack_query_prompt_payload(request)
+    if slack_query_prompt:
+        payload["reusable_slack_query_prompt"] = slack_query_prompt
     checklist = _specialist_response_quality_checklist(request, work_item)
     if checklist:
         payload["response_quality_checklist"] = checklist
@@ -2183,6 +2414,32 @@ def _specialist_orchestrator_context_payload(
             )
             if slack_context.get(key) not in (None, "", [], {})
         }
+    return payload
+
+
+def _specialist_slack_query_prompt_payload(request: WorkflowRunRequest) -> dict[str, Any]:
+    query_prompt = request.slack_query_prompt
+    if not isinstance(query_prompt, dict):
+        external_context = request.external_context if isinstance(request.external_context, dict) else {}
+        nested = external_context.get("slack_query_prompt")
+        query_prompt = nested if isinstance(nested, dict) else {}
+    if not query_prompt:
+        return {}
+    payload = _slack_query_prompt_metadata(query_prompt)
+    task_brief = _compact_context_text(query_prompt.get("task_brief"), max_chars=2400)
+    if task_brief:
+        payload["task_brief"] = task_brief
+        payload["specialist_use"] = (
+            "Treat this as reusable dynamic task guidance from Slack. It is advisory "
+            "and does not grant tool access, live integrations, approvals, or side effects."
+        )
+    safety_notes = _context_string_list(
+        query_prompt.get("safety_notes"),
+        max_items=6,
+        max_chars=220,
+    )
+    if safety_notes:
+        payload["safety_notes"] = safety_notes
     return payload
 
 
@@ -4839,6 +5096,8 @@ def _requested_context_source_manifest(
 
 def _context_request_evidence_texts(request: WorkflowRunRequest) -> list[tuple[str, str]]:
     evidence: list[tuple[str, str]] = [("user_request", request.request_text or "")]
+    if isinstance(request.slack_query_prompt, dict):
+        evidence.append(("slack_query_prompt", _bounded_json_text(request.slack_query_prompt)))
     if isinstance(request.manual_request_plan, dict):
         evidence.append(("manual_request_plan", _bounded_json_text(request.manual_request_plan)))
     if isinstance(request.orchestrator_preflight, dict):
@@ -4939,6 +5198,8 @@ def _context_source_manifest_event_payload(work_item: WorkItem) -> dict[str, Any
 
 def _load_external_context(request: WorkflowRunRequest) -> dict[str, Any]:
     payload: dict[str, Any] = {}
+    if isinstance(request.slack_query_prompt, dict):
+        payload["slack_query_prompt"] = request.slack_query_prompt
     if isinstance(request.external_context, dict):
         payload.update(request.external_context)
     if request.context_file_path:
@@ -5024,6 +5285,9 @@ def _apply_slack_selected_context(
     }
     if context_file_path:
         slack_metadata["context_file_path"] = context_file_path
+    query_prompt = context.get("slack_query_prompt")
+    if isinstance(query_prompt, dict):
+        slack_metadata["query_prompt"] = _slack_query_prompt_metadata(query_prompt)
     metadata = {**work_item.target.metadata, "slack_context": slack_metadata}
     sources = list(work_item.sources)
     if source_id and all(source.source_id != source_id for source in sources):
@@ -5083,6 +5347,35 @@ def _attach_slack_prompt_context(work_item: WorkItem, *, latest_request: str) ->
             )
         }
     ).touch()
+
+
+def _slack_query_prompt_metadata(query_prompt: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "schema": _compact_context_text(query_prompt.get("schema"), max_chars=80),
+        "version": _compact_context_text(query_prompt.get("version"), max_chars=80),
+        "kind": _compact_context_text(query_prompt.get("kind"), max_chars=80),
+        "target_route": _compact_context_text(query_prompt.get("target_route"), max_chars=80),
+        "cost_profile": _compact_context_text(query_prompt.get("cost_profile"), max_chars=80),
+        "requires_approved_context": bool(query_prompt.get("requires_approved_context")),
+        "dynamic_content_sha256": _compact_context_text(
+            query_prompt.get("dynamic_content_sha256"),
+            max_chars=80,
+        ),
+        "context_flags": {
+            str(key): bool(value)
+            for key, value in (query_prompt.get("context_flags") or {}).items()
+            if value
+        }
+        if isinstance(query_prompt.get("context_flags"), dict)
+        else {},
+    }
+    route_mismatch = query_prompt.get("route_mismatch")
+    if isinstance(route_mismatch, dict) and route_mismatch:
+        payload["route_mismatch"] = {
+            str(key): _compact_context_text(value, max_chars=120)
+            for key, value in route_mismatch.items()
+        }
+    return {key: value for key, value in payload.items() if value not in ("", {}, [])}
 
 
 def _slack_prompt_transcript(slack_context: dict[str, Any], *, latest_request: str) -> str:
@@ -5255,6 +5548,9 @@ def _external_context_event_payload(
         }
     if context_file_path:
         payload["context_file_path"] = context_file_path
+    query_prompt = context.get("slack_query_prompt")
+    if isinstance(query_prompt, dict):
+        payload["slack_query_prompt"] = _slack_query_prompt_metadata(query_prompt)
     if str(context.get("schema") or "") == "keystone.slack.selected_message_context.v1":
         payload.update(
             {
@@ -6161,6 +6457,104 @@ def _gmail_triage_human_summary(triage: Any) -> str:
     return "\n".join(lines).strip()
 
 
+def _chief_local_kni_focus_request(request_text: str) -> str:
+    focused = latest_user_request(request_text).strip() or str(request_text or "").strip()
+    stop_markers = (
+        "\nPrevious request:",
+        "\nPrevious result:",
+        "\nLinked WorkItem:",
+        "\nContinue the same agent task",
+        "\nRead-only Slack",
+        "\nSlack thread context",
+    )
+    lowered = focused.lower()
+    stop = len(focused)
+    for marker in stop_markers:
+        index = lowered.find(marker.lower())
+        if index >= 0:
+            stop = min(stop, index)
+    return focused[:stop].strip().strip('"') or str(request_text or "").strip()
+
+
+def _chief_output_mentions_local_kni_evidence_path(output: object) -> bool:
+    values = [
+        str(getattr(output, "summary", "") or ""),
+        str(getattr(output, "synthesis", "") or ""),
+    ]
+    sources = getattr(output, "sources", []) or []
+    if isinstance(sources, list):
+        for source in sources:
+            values.extend(
+                [
+                    str(getattr(source, "title", "") or ""),
+                    str(getattr(source, "url", "") or ""),
+                    str(getattr(source, "note", "") or ""),
+                ]
+            )
+            if isinstance(source, dict):
+                values.extend(
+                    [
+                        str(source.get("title") or ""),
+                        str(source.get("url") or ""),
+                        str(source.get("note") or ""),
+                    ]
+                )
+    diagnostics = getattr(output, "retrieval_diagnostics", {}) or {}
+    if isinstance(diagnostics, dict):
+        values.append(str(diagnostics.get("evidence_path") or ""))
+    combined = " ".join(values).lower()
+    return (
+        "evidence path" in combined
+        or "00_admin/formation/" in combined
+        or "00_admin/insurance/" in combined
+        or "formationdocument" in combined
+        or ".pdf" in combined
+    )
+
+
+def _with_chief_local_kni_evidence_path_note(
+    output: object,
+    packet: object | None,
+) -> object:
+    paths = local_kni_evidence_paths(packet)
+    if not paths or not hasattr(output, "model_copy"):
+        return output
+    primary_path = paths[0]
+    actions = list(getattr(output, "recommended_actions", []) or [])
+    evidence_action = f"Review candidate evidence path: {primary_path}."
+    if evidence_action not in actions:
+        actions.append(evidence_action)
+    diagnostics = dict(getattr(output, "retrieval_diagnostics", {}) or {})
+    diagnostics.setdefault("local_only", True)
+    diagnostics.setdefault("send_enabled", False)
+    diagnostics.setdefault("evidence_path", primary_path)
+    diagnostics.setdefault("evidence_paths", paths[:5])
+    sources = list(getattr(output, "sources", []) or [])
+    if not any(primary_path in str(getattr(source, "title", "") or "") for source in sources):
+        sources.append(
+            ChiefOfStaffSourceRef(
+                title=primary_path,
+                source_type="local_kni_document",
+                note="Candidate evidence path used for local KNI document synthesis.",
+            )
+        )
+    audit_notes = list(getattr(output, "audit_notes", []) or [])
+    audit_note = (
+        "Local KNI evidence path was appended after live synthesis omitted an explicit "
+        "path; the live model answer was preserved."
+    )
+    if audit_note not in audit_notes:
+        audit_notes.append(audit_note)
+    return output.model_copy(
+        update={
+            "recommended_actions": actions,
+            "retrieval_diagnostics": diagnostics,
+            "sources": sources,
+            "audit_notes": audit_notes,
+        }
+    )
+
+
 def _advance_chief_of_staff(
     work_item: WorkItem,
     *,
@@ -6169,6 +6563,7 @@ def _advance_chief_of_staff(
     sdk_session: Any | None = None,
 ) -> WorkflowRunResult:
     request_text = request.request_text.strip() or work_item.request_text
+    focused_request_text = _chief_local_kni_focus_request(request_text)
     link_followup = (
         _chief_source_link_followup_result(
             work_item,
@@ -6184,6 +6579,14 @@ def _advance_chief_of_staff(
         request_text,
         live=request.live_search,
     )
+    local_kni_lookup = looks_like_local_kni_evidence_lookup(
+        f"{focused_request_text}\n{request_text}"
+    )
+    local_kni_evidence_packet = (
+        build_local_kni_evidence_packet_for_query(focused_request_text)
+        if request.live_sdk and local_kni_lookup
+        else None
+    )
     sdk_input = {
         "request": request_text,
         "work_item": {
@@ -6198,11 +6601,22 @@ def _advance_chief_of_staff(
         "selected_source_context": _source_refs_sdk_context(preselected_source_refs),
         "slack_context": work_item.target.metadata.get("slack_context", {}),
         "orchestrator_context": _specialist_orchestrator_context_payload(request, work_item),
+        "runtime_source_layer_policy": runtime_source_layer_policy_context(
+            WorkItemRoute.CHIEF_OF_STAFF.value
+        ),
         "side_effect_policy": (
             "read-only interpretation; no Slack post, Gmail send, calendar write, "
             "Airtable write, or repo write without explicit approval gates"
         ),
     }
+    if local_kni_evidence_packet is not None:
+        sdk_input["local_kni_evidence_packet"] = local_kni_evidence_packet
+        sdk_input["local_kni_instruction"] = local_kni_live_instruction()
+        sdk_input["orchestrator_context"] = {
+            **sdk_input.get("orchestrator_context", {}),
+            "local_kni_evidence_prefetch": True,
+            "local_kni_evidence_query": focused_request_text,
+        }
     if request.live_sdk:
         try:
             typed_result = run_chief_of_staff_sdk(
@@ -6210,8 +6624,17 @@ def _advance_chief_of_staff(
                 live=True,
                 session=sdk_session,
                 force_sdk_interpretation=True,
+                context_flags=_slack_query_context_flags(request),
             )
             output = typed_result.output
+            if (
+                local_kni_evidence_packet is not None
+                and not _chief_output_mentions_local_kni_evidence_path(output)
+            ):
+                output = _with_chief_local_kni_evidence_path_note(
+                    output,
+                    local_kni_evidence_packet,
+                )
             mode_note = "Chief of Staff live SDK interpretation executed for this WorkItem."
             if store is not None:
                 _record_workflow_sdk_cost_event(
@@ -6447,12 +6870,30 @@ def _chief_of_staff_source_refs(
     for candidate in candidates:
         url = str(candidate.get("url") or "").strip()
         title = str(candidate.get("title") or "").strip()
+        source_type = str(candidate.get("source_type") or candidate.get("provider") or "web")
+        if not url and source_type == "local_kni_document" and title:
+            note = str(candidate.get("note") or candidate.get("snippet") or "").strip()
+            refs.append(
+                WorkItemSourceRef(
+                    title=title,
+                    url="",
+                    source_type=source_type,
+                    source_id=str(candidate.get("source_id") or title),
+                    supported_claim=note[:500],
+                    provider="local",
+                    extraction_status="local_document_path",
+                    retrieved_at=utc_now_iso(),
+                    key_facts=[note[:500]] if note else [],
+                )
+            )
+            if len(refs) >= 4:
+                break
+            continue
         if not url or url in seen_urls:
             continue
         seen_urls.add(url)
         note = str(candidate.get("note") or candidate.get("snippet") or "").strip()
         source_id = str(candidate.get("source_id") or "")
-        source_type = str(candidate.get("source_type") or candidate.get("provider") or "web")
         provider = _provider_from_source_id_or_type(source_id, source_type)
         extraction_status = "source_linked"
         evidence_excerpt = ""
@@ -6977,15 +7418,33 @@ def _chief_of_staff_source_candidates(output: Any) -> list[dict[str, str]]:
         source_id: str = "",
     ) -> None:
         cleaned_url = str(url or "").strip()
+        cleaned_title = str(title or "").strip()
+        cleaned_source_type = str(source_type or "").strip()
+        if not cleaned_url and cleaned_source_type == "local_kni_document" and cleaned_title:
+            local_key = f"local:{cleaned_title}"
+            if local_key in seen_urls:
+                return
+            seen_urls.add(local_key)
+            candidates.append(
+                {
+                    "title": cleaned_title,
+                    "url": "",
+                    "note": str(note or "").strip(),
+                    "source_type": cleaned_source_type,
+                    "provider": str(provider or "").strip(),
+                    "source_id": str(source_id or cleaned_title).strip(),
+                }
+            )
+            return
         if not cleaned_url or cleaned_url in seen_urls:
             return
         seen_urls.add(cleaned_url)
         candidates.append(
             {
-                "title": str(title or "").strip(),
+                "title": cleaned_title,
                 "url": cleaned_url,
                 "note": str(note or "").strip(),
-                "source_type": str(source_type or "").strip(),
+                "source_type": cleaned_source_type,
                 "provider": str(provider or "").strip(),
                 "source_id": str(source_id or "").strip(),
             }
@@ -7213,6 +7672,24 @@ def _advance_research(
             store=store,
         )
 
+    manual_plan = _manual_request_plan_dict(request.manual_request_plan) or (
+        work_item.target.metadata.get("manual_request_plan")
+        if isinstance(work_item.target.metadata.get("manual_request_plan"), dict)
+        else None
+    )
+    if should_run_multi_target_research(
+        request_text=request.request_text or work_item.request_text,
+        manual_plan=manual_plan,
+        target=target,
+    ):
+        return _advance_multi_target_research(
+            work_item,
+            request=request,
+            target=target,
+            manual_plan=manual_plan,
+            store=store,
+        )
+
     if _should_run_zotero_article_brief(work_item, request.request_text):
         return _advance_zotero_article_research(
             work_item,
@@ -7422,6 +7899,187 @@ def _advance_research(
             }
         )
     return result
+
+
+def _advance_multi_target_research(
+    work_item: WorkItem,
+    *,
+    request: WorkflowRunRequest,
+    target: str,
+    manual_plan: dict[str, Any] | None,
+    store: SQLiteStore | None,
+) -> WorkflowRunResult:
+    request_text = request.request_text or work_item.request_text
+    quality_budget = business_research_quality_budget(
+        request_text=f"{request_text} {work_item.request_text}",
+        live_search=request.live_search,
+        cost_profile=request.cost_profile,
+    )
+    plan = build_multi_target_research_plan(
+        request_text=request_text,
+        manual_plan=manual_plan,
+        target=target,
+        cost_profile=request.cost_profile,
+    )
+    result_payload = run_multi_target_research(
+        plan,
+        live_search=request.live_search,
+        quality_budget=quality_budget,
+        agents_web_search_max_calls=_quality_budgeted_hosted_web_search_max_calls(
+            request,
+            quality_budget,
+        ),
+        retrieval_hint=_retrieval_hint_for_request(request),
+        retrieve_profile=retrieve_company_profile_live,
+    )
+    source_refs = _multi_target_work_item_sources(result_payload)
+    artifact_id = ""
+    if store is not None:
+        artifact_id = str(
+            store.save_agent_run(
+                agent_name=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                input_payload=plan.model_dump(mode="json", by_alias=True),
+                input_summary=f"Multi-target research plan: {plan.topic}",
+                output=result_payload.model_dump(mode="json", by_alias=True),
+                dry_run=not request.live_search,
+                status="success" if result_payload.comparison_ready else "blocked",
+            )
+        )
+    artifact = WorkItemArtifactRef(
+        artifact_type="multi_target_research",
+        artifact_id=artifact_id or f"unsaved:{work_item.id}:multi_target_research",
+        source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        approval_state="approved_for_research",
+        title=f"Multi-target research: {plan.topic}",
+        summary=(
+            f"{len(result_payload.packets)}/{plan.desired_count} target packet(s); "
+            + ("comparison ready" if result_payload.comparison_ready else "source gaps remain")
+        )[:240],
+        metadata={
+            "schema": "keystone.multi_target_research.artifact.v1",
+            "multi_target_research": result_payload.model_dump(mode="json", by_alias=True),
+            "pass_types": result_payload.pass_types,
+            "comparison_ready": result_payload.comparison_ready,
+            "blockers": result_payload.blockers,
+            "diagnostics": result_payload.diagnostics,
+        },
+    )
+    updated = attach_artifact(
+        work_item.model_copy(
+            update={
+                "target": work_item.target.model_copy(
+                    update={
+                        "name": plan.topic,
+                        "object_type": "topic",
+                        "metadata": {
+                            **work_item.target.metadata,
+                            "multi_target_research": {
+                                "pass_types": result_payload.pass_types,
+                                "comparison_ready": result_payload.comparison_ready,
+                                "blockers": result_payload.blockers,
+                                "diagnostics": result_payload.diagnostics,
+                            },
+                        },
+                    }
+                ),
+                "sources": [*work_item.sources, *source_refs],
+                "last_agent": WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                "confidence": max(
+                    work_item.confidence,
+                    result_payload.diagnostics.get("ready_packet_count", 0)
+                    / max(1, plan.desired_count),
+                ),
+                "audit_notes": [
+                    *work_item.audit_notes,
+                    "Multi-target Business Research branch executed.",
+                    _quality_budget_audit_note(quality_budget),
+                ],
+                "next_action": WorkItemNextAction(
+                    action=(
+                        "review_multi_target_research"
+                        if result_payload.comparison_ready
+                        else "repair_or_deepen_multi_target_research"
+                    ),
+                    agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+                    description=(
+                        "Review the multi-target comparison evidence."
+                        if result_payload.comparison_ready
+                        else "Broaden candidate discovery or deepen per-target source extraction."
+                    ),
+                    command_hint=f"keystone work-items advance {work_item.id}",
+                ),
+            }
+        ).touch(),
+        artifact,
+    )
+    if not result_payload.comparison_ready:
+        for blocker_text in result_payload.blockers[:5]:
+            updated = add_blocker(
+                updated,
+                WorkItemBlocker(
+                    code="multi_target_research_insufficient",
+                    message=blocker_text,
+                ),
+            )
+    updated = updated.model_copy(
+        update={
+            "status": (
+                WorkItemStatus.DONE if result_payload.comparison_ready else WorkItemStatus.BLOCKED
+            )
+        }
+    ).touch()
+    _persist_artifact_and_event(
+        updated,
+        artifact,
+        summary="Attached multi-target research result.",
+        store=store,
+    )
+    return WorkflowRunResult(
+        work_item=updated,
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=updated.status,
+        advanced=True,
+        artifact_refs=[artifact],
+        blockers=[blocker for blocker in updated.blockers if not blocker.resolved],
+        next_action=updated.next_action,
+        human_summary=render_multi_target_research_summary(result_payload),
+        audit_notes=["Multi-target Business Research branch executed."],
+    )
+
+
+def _multi_target_work_item_sources(
+    result: MultiTargetResearchResult,
+) -> list[WorkItemSourceRef]:
+    refs: list[WorkItemSourceRef] = []
+    seen_urls: set[str] = set()
+    for packet in result.packets:
+        for raw_source in packet.source_refs[:6]:
+            if not isinstance(raw_source, dict):
+                continue
+            url = str(raw_source.get("url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            claims = [
+                str(item).strip()
+                for item in raw_source.get("supported_claims") or []
+                if str(item).strip()
+            ]
+            refs.append(
+                WorkItemSourceRef(
+                    title=str(raw_source.get("title") or packet.target_name or "Source"),
+                    url=url,
+                    source_type=str(raw_source.get("source_type") or "web"),
+                    source_id=str(raw_source.get("source_id") or f"multi_target:{len(refs) + 1}"),
+                    supported_claim=(claims[0] if claims else ""),
+                    provider="multi_target_research",
+                    extraction_status=packet.extraction_status,
+                    retrieved_at=utc_now_iso(),
+                    key_facts=claims[:5],
+                    evidence_excerpt=str(raw_source.get("evidence_excerpt") or "")[:1000],
+                )
+            )
+    return refs
 
 
 def _business_research_query_builder_for_request(

@@ -67,6 +67,11 @@ from keystone_agents.slack_action_contract import (
     BusinessAgentActionPayload,
     parse_business_agent_action_value,
 )
+from keystone_agents.slack_query_prompts import (
+    build_slack_query_prompt_input,
+    resolve_slack_query_prompt,
+    slack_query_prompt_external_context,
+)
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.gmail_tool import GmailTool
 from keystone_agents.tools.operations_publisher_tool import (
@@ -909,6 +914,25 @@ def _handle_chief_of_staff_action(
             ),
             database_url=database_url,
         )
+        slack_query_prompt = _slack_query_prompt_for_work_item_action(
+            request_text="continue",
+            intent=intent,
+            feedback="",
+            work_item=existing_item,
+            route=(
+                _route_for_steering_intent(intent, existing_item)
+                if existing_item is not None
+                else WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+            ),
+            manual_plan=None,
+        )
+        request_options = _slack_action_cost_conservation_request_options(intent)
+        if (
+            slack_query_prompt is not None
+            and slack_query_prompt.cost_profile != "standard"
+            and "cost_profile" not in request_options
+        ):
+            request_options["cost_profile"] = slack_query_prompt.cost_profile
         advance = advance_work_item_manager_loop_with_optional_langgraph(
             WorkflowRunRequest(
                 request_text="continue",
@@ -918,7 +942,13 @@ def _handle_chief_of_staff_action(
                 orchestrator_preflight=compact_orchestrator_preflight_payload(
                     orchestrator_preflight
                 ),
-                **_slack_action_cost_conservation_request_options(intent),
+                external_context=slack_query_prompt_external_context(slack_query_prompt),
+                slack_query_prompt=(
+                    slack_query_prompt.model_dump(mode="json", by_alias=True)
+                    if slack_query_prompt is not None
+                    else None
+                ),
+                **request_options,
             )
         )
         advance = _record_slack_action_orchestrator_review(
@@ -1284,6 +1314,24 @@ def _advance_work_item_for_intent(
         "side_effect_policy": "draft_only_no_send_no_publish_no_schedule",
         "reviewer": reviewer,
     }
+    slack_query_prompt = _slack_query_prompt_for_work_item_action(
+        request_text=request_text,
+        intent=intent,
+        feedback=feedback,
+        work_item=existing_work_item,
+        route=resolved_route,
+        manual_plan=manual_plan,
+    )
+    request_options = _slack_action_cost_conservation_request_options(intent)
+    if (
+        slack_query_prompt is not None
+        and slack_query_prompt.cost_profile != "standard"
+        and "cost_profile" not in request_options
+    ):
+        request_options["cost_profile"] = slack_query_prompt.cost_profile
+    manual_plan["slack_query_prompt"] = (
+        slack_query_prompt.metadata() if slack_query_prompt is not None else {}
+    )
     result = advance_work_item_manager_loop_with_optional_langgraph(
         WorkflowRunRequest(
             request_text=request_text,
@@ -1295,7 +1343,13 @@ def _advance_work_item_for_intent(
             requested_route=resolved_route,
             manual_request_plan=manual_plan,
             orchestrator_preflight=compact_orchestrator_preflight_payload(orchestrator_preflight),
-            **_slack_action_cost_conservation_request_options(intent),
+            external_context=slack_query_prompt_external_context(slack_query_prompt),
+            slack_query_prompt=(
+                slack_query_prompt.model_dump(mode="json", by_alias=True)
+                if slack_query_prompt is not None
+                else None
+            ),
+            **request_options,
         )
     )
     return _record_slack_action_orchestrator_review(
@@ -1471,6 +1525,37 @@ def _slack_action_cost_conservation_request_options(intent: str) -> dict[str, An
         "hosted_web_search_max_calls": 2,
         "reuse_existing_research": False,
     }
+
+
+def _slack_query_prompt_for_work_item_action(
+    *,
+    request_text: str,
+    intent: str,
+    feedback: str,
+    work_item: Any,
+    route: WorkItemRoute | None,
+    manual_plan: dict[str, Any] | None,
+):
+    target_name = ""
+    prior_summary = ""
+    work_item_id = ""
+    if work_item is not None:
+        work_item_id = str(getattr(work_item, "id", "") or "")
+        target = getattr(work_item, "target", None)
+        target_name = str(getattr(target, "name", "") or "")
+        prior_summary = str(getattr(work_item, "request_text", "") or "")
+    prompt_input = build_slack_query_prompt_input(
+        raw_request=request_text,
+        selected_message_text=target_name,
+        thread_summary=prior_summary,
+        prior_agent_summaries=[prior_summary] if prior_summary else [],
+        manual_plan=manual_plan,
+        work_item_id=work_item_id,
+        intent=intent,
+        target_route=route,
+        feedback=feedback,
+    )
+    return resolve_slack_query_prompt(prompt_input)
 
 
 def _env_truthy(name: str, *, default: bool = False) -> bool:

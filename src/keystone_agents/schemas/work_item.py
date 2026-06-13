@@ -192,6 +192,7 @@ class WorkflowRunRequest(BaseModel):
     orchestrator_preflight: dict[str, Any] | None = None
     context_file_path: str = ""
     external_context: dict[str, Any] | None = None
+    slack_query_prompt: dict[str, Any] | None = None
     sdk_session_enabled: bool | None = None
     sdk_session_id: str = ""
     sdk_session_db_path: str = ""

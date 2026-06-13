@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -1421,6 +1422,7 @@ def build_outreach_composer_agent(
     *,
     include_tools: bool = True,
     request_text: str = "",
+    context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
 ) -> Agent:
     """Build the outreach composer agent."""
@@ -1433,6 +1435,7 @@ def build_outreach_composer_agent(
         skill_files=select_agent_skill_names(
             "outreach_composer",
             request_text=request_text,
+            context_flags=context_flags,
             include_all=include_all_skills,
         ),
     )
@@ -1593,6 +1596,7 @@ def run_outreach_composer_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    context_flags: Mapping[str, bool] | None = None,
 ) -> TypedAgentRunResult[OutreachDraft]:
     """Run Outreach Composer through the typed SDK harness."""
 
@@ -1616,6 +1620,7 @@ def run_outreach_composer_sdk(
             model=model,
             include_tools=include_tools,
             request_text=skill_request_text(typed_input),
+            context_flags=context_flags,
         ),
         typed_input=typed_input,
         output_type=OutreachDraft,

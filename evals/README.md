@@ -36,6 +36,13 @@ Skill matrix results include selection reasons and are included in the default
 dataset, or `--surface slack` / `--surface computer` to isolate one operator
 surface.
 
+The reusable Slack source-read and multi-target research path is covered by
+`evals/local/slack_research_workflow.jsonl`. Run only that offline case with:
+
+```bash
+.venv/bin/python scripts/run_local_evals.py --dataset slack_research_workflow --json
+```
+
 Live OpenAI API benchmark runs should use the same case IDs and benchmark store,
 with explicit labels, provider/model metadata, and redacted artifacts.
 

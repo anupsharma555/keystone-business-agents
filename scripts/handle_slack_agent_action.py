@@ -113,6 +113,13 @@ def _main(args: argparse.Namespace) -> int:
             print(f"WorkItem: {(result.work_item or {}).get('id', '')}")
             print(f"Route: {result.route}")
             print(f"Status: {result.status}")
+            summary = (result.result or {}).get("human_summary", "")
+            if summary:
+                print("Thread reply:")
+                print(summary)
+            thread_ts = result.run_provenance.get("source_thread_ts", "")
+            if thread_ts:
+                print(f"Reply thread: {thread_ts}")
         for warning in result.warnings:
             print(f"Warning: {warning}")
     return 0

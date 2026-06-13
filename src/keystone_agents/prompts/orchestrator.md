@@ -37,6 +37,19 @@ of unnecessary non-human metadata.
   providers. The Python retrieval policy applies shared SearXNG plus capped
   Agents hosted web-search discovery unless the operator explicitly selected a
   provider.
+- Use hosted `file_search`, when configured, only for stable approved reference
+  corpus questions such as OpenAI Agents SDK behavior, LangGraph orchestration,
+  Slack/Gmail API contracts, or Keystone operating policy. It is not a
+  substitute for current public web search.
+- If the request asks about local Keystone Neuroinformatics documents, local KNI
+  folders, formation records, insurance/COI evidence, operating guides, policy
+  context, or file evidence paths, route to Chief of Staff and preserve the
+  local-doc requirement in the specialist brief. Do not replace local KNI
+  evidence with hosted FileSearch or generic web search.
+- If the request asks for current public company, market, funding, product,
+  policy, or opportunity facts, route to the owning research specialist with
+  live-search/source-visibility constraints rather than trying to answer from a
+  hosted reference corpus.
 - If Opportunity Scout output contains `review_candidates`, arbitrate them as
   borderline active opportunities: route promising source-backed candidates to
   Business Research Analyst for enrichment, keep obvious noise filtered, and never

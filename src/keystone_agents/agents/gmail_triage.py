@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from email.utils import parseaddr
 from pathlib import Path
@@ -422,6 +423,7 @@ def run_gmail_triage_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
 ) -> TypedAgentRunResult[EmailTriageResult]:
     """Run Gmail triage through the typed SDK harness."""
@@ -432,6 +434,7 @@ def run_gmail_triage_sdk(
     agent = build_gmail_triage_agent(
         model=model,
         request_text=skill_request_text(typed_input),
+        context_flags=context_flags,
         tool_tier=resolved_tool_tier,
     )
     return run_typed_sdk_agent(
@@ -475,6 +478,7 @@ def build_gmail_triage_agent(
     *,
     include_tools: bool = True,
     request_text: str = "",
+    context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
 ) -> Agent:
@@ -488,6 +492,7 @@ def build_gmail_triage_agent(
         skill_files=select_agent_skill_names(
             "gmail_triage",
             request_text=request_text,
+            context_flags=context_flags,
             include_all=include_all_skills,
         ),
     )

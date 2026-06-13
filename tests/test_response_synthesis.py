@@ -338,10 +338,12 @@ def test_format_user_response_synthesis_prepends_summary_to_bullet_only_synthesi
 
     synthesis_section = text.split("*Detailed Summary:*", 1)[1].split("Source evidence", 1)[0]
 
-    assert synthesis_section.strip().startswith("The selected 2 sources point to")
+    assert synthesis_section.strip().startswith("Across the retrieved sources")
     assert "behavioral-health or psychiatry relevance" in synthesis_section
     assert "JMIR: direct behavioral-health-provider evaluation signal" in synthesis_section
-    assert text.index("The selected 2 sources") < text.index("- JMIR:")
+    assert "The detailed summary should treat these links" not in synthesis_section
+    assert "not as a citation list" not in synthesis_section
+    assert text.index("Across the retrieved sources") < text.index("- JMIR:")
     assert "Source evidence" in text
 
 

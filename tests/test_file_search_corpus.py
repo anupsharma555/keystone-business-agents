@@ -10,7 +10,9 @@ import pytest
 
 from keystone_agents.file_search_corpus import (
     build_corpus_upload_plan,
+    corpus_runtime_configuration_recommendation,
     corpus_upload_plan_summary,
+    write_local_file_search_config,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -158,6 +160,165 @@ def test_corpus_upload_plan_builds_file_attributes_for_vector_store_ingestion() 
     assert any(item.source_url for item in plan.files)
     assert any(item.license == "MIT" for item in plan.files)
     assert all(item.attributes["source_path"] == item.relative_path for item in plan.files)
+
+
+def test_public_openai_agents_corpus_recommends_agent_specific_file_search_envs() -> None:
+    plan = build_corpus_upload_plan(
+        project_root=PROJECT_ROOT,
+        manifest_path=MANIFEST_PATH,
+        corpus_name="keystone-business-agents-openai-agents-python-public",
+    )
+
+    recommendation = corpus_runtime_configuration_recommendation(
+        plan,
+        vector_store_id="vs_openai_agents_sdk_docs",
+    )
+
+    assert recommendation["public_reference_only"] is True
+    assert recommendation["recommended_scope"] == "agent_specific"
+    assert recommendation["approved_agents"] == [
+        "business_research_analyst",
+        "chief_of_staff",
+        "orchestrator",
+    ]
+    assert {
+        item["vector_store_ids_env"]: item["suggested_value"]
+        for item in recommendation["agent_env"]
+    } == {
+        "KEYSTONE_BUSINESS_RESEARCH_ANALYST_FILE_SEARCH_VECTOR_STORE_IDS": (
+            "vs_openai_agents_sdk_docs"
+        ),
+        "KEYSTONE_CHIEF_OF_STAFF_FILE_SEARCH_VECTOR_STORE_IDS": (
+            "vs_openai_agents_sdk_docs"
+        ),
+        "KEYSTONE_ORCHESTRATOR_FILE_SEARCH_VECTOR_STORE_IDS": (
+            "vs_openai_agents_sdk_docs"
+        ),
+    }
+    assert recommendation["global_env"]["vector_store_ids_env"] == (
+        "KEYSTONE_FILE_SEARCH_VECTOR_STORE_IDS"
+    )
+    assert recommendation["config_file"]["path"] == ".local/file-search-vector-stores.json"
+    assert recommendation["config_file"]["example"]["agents"] == {
+        "business_research_analyst": {"vector_store_ids": ["vs_openai_agents_sdk_docs"]},
+        "chief_of_staff": {"vector_store_ids": ["vs_openai_agents_sdk_docs"]},
+        "orchestrator": {"vector_store_ids": ["vs_openai_agents_sdk_docs"]},
+    }
+
+
+def test_corpus_summary_includes_runtime_configuration_placeholder() -> None:
+    plan = build_corpus_upload_plan(
+        project_root=PROJECT_ROOT,
+        manifest_path=MANIFEST_PATH,
+        corpus_name="keystone-business-agents-openai-agents-python-public",
+    )
+
+    summary = corpus_upload_plan_summary(plan)
+
+    assert summary["runtime_configuration"]["public_reference_only"] is True
+    assert all(
+        item["suggested_value"] == "<vector_store_id>"
+        for item in summary["runtime_configuration"]["agent_env"]
+    )
+
+
+def test_write_local_file_search_config_merges_approved_agent_entries(tmp_path: Path) -> None:
+    plan = build_corpus_upload_plan(
+        project_root=PROJECT_ROOT,
+        manifest_path=MANIFEST_PATH,
+        corpus_name="keystone-business-agents-openai-agents-python-public",
+    )
+    config_path = tmp_path / "file-search-vector-stores.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.file_search_vector_stores.v1",
+                "agents": {
+                    "chief_of_staff": {
+                        "vector_store_ids": ["vs_old"],
+                        "max_num_results": 3,
+                    },
+                    "gmail_triage": {
+                        "vector_store_ids": ["vs_keep"],
+                    },
+                },
+            }
+        )
+    )
+
+    result = write_local_file_search_config(
+        path=config_path,
+        plan=plan,
+        vector_store_id="vs_openai_agents_sdk_docs",
+    )
+
+    payload = json.loads(config_path.read_text())
+    assert result == {
+        "path": str(config_path),
+        "updated_agents": ["business_research_analyst", "chief_of_staff", "orchestrator"],
+        "vector_store_id_count": 1,
+        "public_reference_only": True,
+    }
+    assert payload["agents"]["chief_of_staff"] == {
+        "max_num_results": 3,
+        "vector_store_ids": ["vs_openai_agents_sdk_docs"],
+    }
+    assert payload["agents"]["business_research_analyst"]["vector_store_ids"] == [
+        "vs_openai_agents_sdk_docs"
+    ]
+    assert payload["agents"]["orchestrator"]["vector_store_ids"] == [
+        "vs_openai_agents_sdk_docs"
+    ]
+    assert payload["agents"]["gmail_triage"]["vector_store_ids"] == ["vs_keep"]
+
+
+def test_ingest_script_can_write_local_config_after_live_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_ingest_script()
+    config_path = tmp_path / "local-vector-stores.json"
+
+    class FakeClient:
+        pass
+
+    monkeypatch.setenv("KEYSTONE_OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(module, "_build_openai_client", lambda *, api_key: FakeClient())
+    monkeypatch.setattr(
+        module,
+        "_upload_plan",
+        lambda *, client, vector_store_id, plan: [
+            {"path": item.relative_path, "vector_store_file_id": "file_test", "status": "completed"}
+            for item in plan.files[:1]
+        ],
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "ingest_file_search_corpus.py",
+            "--corpus",
+            "keystone-business-agents-openai-agents-python-public",
+            "--live",
+            "--vector-store-id",
+            "vs_live_public_docs",
+            "--write-local-config",
+            "--local-config-path",
+            str(config_path),
+            "--json",
+        ],
+    )
+
+    module.main()
+
+    output = json.loads(capsys.readouterr().out)
+    saved = json.loads(config_path.read_text())
+    assert output["local_config_written"]["updated_agents"] == [
+        "business_research_analyst",
+        "chief_of_staff",
+        "orchestrator",
+    ]
+    assert saved["agents"]["orchestrator"]["vector_store_ids"] == ["vs_live_public_docs"]
 
 
 def test_corpus_upload_plan_rejects_blocked_manifest_paths(tmp_path: Path) -> None:

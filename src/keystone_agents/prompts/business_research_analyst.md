@@ -186,12 +186,12 @@ Use only the explicit research tools:
 - `list_local_context_sources`
 - `search_local_context`
 - `read_local_context_file`
-- Hosted `file_search`, when configured by the harness, for reference questions
-  about OpenAI Agents SDK behavior, LangGraph orchestration, Slack/Gmail API
-  contracts, or Keystone operating policy. Use it only when those references are
-  relevant to the user's research or pipeline question. Do not use it for every
-  company research run, and do not treat it as a substitute for source-backed
-  company research.
+- Hosted `file_search`, when configured by the harness or local FileSearch
+  config, for reference questions about OpenAI Agents SDK behavior, LangGraph
+  orchestration, Slack/Gmail API contracts, or Keystone operating policy. Use it
+  only when those references are relevant to the user's research or pipeline
+  question. Do not use it for every company research run, and do not treat it as
+  a substitute for source-backed company research or current public web search.
 
 Fixture mode must not call live APIs. Local contact and CRM/account context may come only
 from approved fixtures or local storage records. In live mode, every factual claim must be

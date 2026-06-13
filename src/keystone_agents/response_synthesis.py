@@ -1270,7 +1270,7 @@ def _source_status_is_extracted(status: str) -> bool:
 def _source_set_summary_paragraph(source_details: list[tuple[str, str, str]]) -> str:
     notes = [note for _title, note, _status in source_details if note]
     if not notes:
-        return "The selected source set supports a source-backed answer, but details are limited."
+        return "The retrieved source set supports a source-backed answer, but details are limited."
     combined = " ".join(notes).lower()
     themes: list[str] = []
     theme_checks = (
@@ -1295,16 +1295,26 @@ def _source_set_summary_paragraph(source_details: list[tuple[str, str, str]]) ->
     title_examples = ", ".join(title for title, _note, _status in source_details[:2])
     if source_count == 1:
         return (
-            f"The selected source, {title_examples}, supports the core answer "
-            f"around {themes[0]} and provides the factual basis for the detailed summary."
+            f"{title_examples} supports the core answer around {themes[0]}. "
+            "Use its concrete claims as the factual basis and keep any broader interpretation "
+            "limited to what the source actually says."
         )
+    detail_sentences = [
+        _first_sentence(note, max_chars=220).rstrip(".")
+        for note in notes[:2]
+        if _first_sentence(note, max_chars=220).strip()
+    ]
+    detail_text = ". ".join(dict.fromkeys(detail_sentences))
+    if detail_text:
+        detail_text = f" {detail_text}."
+    evidence_weight = (
+        " Official, extracted, or otherwise primary pages should carry the main factual "
+        "weight; secondary summaries and vendor positioning are useful context only when "
+        "they name concrete mechanisms rather than broad safety claims."
+    )
     return (
-        f"The selected {source_count} sources point to "
-        f"{', '.join(themes[:3])}. The detailed summary should treat these links as "
-        "the evidence base, not as a citation list. The stronger evidence comes from studies, trial "
-        "registries, official pages, or clinic/provider reports when present; vendor "
-        "pages are useful as adoption or demand signals but should not carry the "
-        "main factual conclusion alone."
+        f"Across the retrieved sources, the strongest evidence concerns "
+        f"{', '.join(themes[:3])}.{detail_text}{evidence_weight}"
     )
 
 

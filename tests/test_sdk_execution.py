@@ -938,6 +938,30 @@ def test_research_sdk_wrappers_default_to_read_only_core_tools(
     assert "save_opportunity_memory" not in scout_tools
 
 
+def test_business_research_sdk_input_includes_runtime_source_layer_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("KEYSTONE_FILE_SEARCH_VECTOR_STORE_IDS", "vs_private_reference")
+    model = FakeModel(outputs=[[_structured_message(_company_profile_payload())]])
+
+    run_business_research_analyst_sdk(
+        BusinessResearchSDKInput(company_name="Curebase", context="Existing source context."),
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    prompt = _model_input_text(model.calls[0]["input"])
+    assert "Existing source context." in prompt
+    assert "Runtime source-layer policy:" in prompt
+    assert "hosted_file_search" in prompt
+    assert "reasoning_contract=" in prompt
+    assert "stable approved reference corpora" in prompt
+    assert "public_web_search" in prompt
+    assert "local_kni_documents" not in prompt
+    assert "vs_private_reference" not in prompt
+
+
 def test_research_sdk_wrappers_infer_deep_retrieval_without_write_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1046,6 +1070,33 @@ def test_orchestrator_sdk_infers_tiered_tools_for_default_and_deep_runs(
     assert "extract_research_claims_from_html" in deep_tools
     assert "airtable_write_record" not in deep_tools
     assert "google_sheet_append_rows" not in deep_tools
+
+
+def test_orchestrator_live_sdk_input_includes_runtime_source_layer_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("KEYSTONE_ORCHESTRATOR_FILE_SEARCH_VECTOR_STORE_IDS", "vs_router")
+    model = FakeModel(outputs=[[_structured_message(_orchestrator_payload())]])
+
+    run_orchestrator_sdk(
+        "Route this public-company research request.",
+        live=True,
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    raw_input = model.calls[0]["input"]
+    assert isinstance(raw_input, list)
+    payload = json.loads(raw_input[0]["content"])
+    prompt = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    assert payload["request"] == "Route this public-company research request."
+    source_layer_policy = payload["runtime_source_layer_policy"]
+    layers = {item["layer"]: item for item in source_layer_policy["layers"]}
+    assert "hosted_file_search" in layers
+    assert "public_web_search" in layers
+    assert layers["hosted_file_search"]["runtime_configured"] is True
+    assert "vs_router" not in prompt
 
 
 def test_typed_specialist_runtime_missing_key_only_fails_for_live_execution(

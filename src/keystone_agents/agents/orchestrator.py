@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from keystone_agents.agent_registry import SPECIALIST_AGENT_SPECS, specialist_handoff_specs
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
+from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.feedback import build_operator_feedback_request
 from keystone_agents.guardrails import (
     assess_text_guardrails,
@@ -78,6 +79,7 @@ from keystone_agents.sdk import (
     function_tool,
 )
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
+from keystone_agents.source_layer_context import runtime_source_layer_policy_context
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
 from keystone_agents.tools.browser_diagnostics_tool import (
     capture_browser_diagnostics,
@@ -118,10 +120,18 @@ def _orchestrator_sdk_input(
 ) -> str | Mapping[str, Any]:
     """Add live-safe operating context for SDK Orchestrator string prompts."""
 
-    if not live or not isinstance(typed_input, str):
+    if not live:
+        return typed_input
+    source_layer_policy = runtime_source_layer_policy_context("orchestrator")
+    if isinstance(typed_input, Mapping):
+        data = dict(typed_input)
+        data.setdefault("runtime_source_layer_policy", source_layer_policy)
+        return data
+    if not isinstance(typed_input, str):
         return typed_input
     return {
         "request": typed_input,
+        "runtime_source_layer_policy": source_layer_policy,
         "live_integration_context": {
             "live_sdk": True,
             "backend_browser_diagnostics_allowed": _env_flag_enabled("KEYSTONE_PLAYWRIGHT_ENABLED"),
@@ -3076,6 +3086,7 @@ def build_orchestrator_agent(
     include_handoffs: bool = True,
     include_specialist_tools: bool | None = None,
     request_text: str = "",
+    context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
 ) -> Agent:
@@ -3089,6 +3100,7 @@ def build_orchestrator_agent(
         skill_files=select_agent_skill_names(
             "orchestrator",
             request_text=request_text,
+            context_flags=context_flags,
             include_all=include_all_skills,
         ),
     )
@@ -3102,26 +3114,29 @@ def build_orchestrator_agent(
         )
         else []
     )
-    tools = [
-        list_local_context_sources,
-        search_local_context,
-        read_local_context_file,
-        retrieve_memory,
-        airtable_get_base_schema,
-        airtable_read_records,
-        airtable_write_record,
-        search_web,
-        structure_web_data_for_schema,
-        render_page,
-        capture_browser_diagnostics,
-        summarize_rendered_page_diagnostics,
-        route_request_placeholder,
-        load_orchestrator_workflow_state,
-        load_pending_approval_items,
-        extract_research_claims_from_html,
-        *specialist_tools,
-        *google_workspace_tools(),
-    ]
+    tools = append_configured_file_search_tools(
+        "orchestrator",
+        [
+            list_local_context_sources,
+            search_local_context,
+            read_local_context_file,
+            retrieve_memory,
+            airtable_get_base_schema,
+            airtable_read_records,
+            airtable_write_record,
+            search_web,
+            structure_web_data_for_schema,
+            render_page,
+            capture_browser_diagnostics,
+            summarize_rendered_page_diagnostics,
+            route_request_placeholder,
+            load_orchestrator_workflow_state,
+            load_pending_approval_items,
+            extract_research_claims_from_html,
+            *specialist_tools,
+            *google_workspace_tools(),
+        ],
+    )
     if tool_tier is not None:
         tools = filter_tools_for_tier("orchestrator", tools, tool_tier)
     agent = build_sdk_agent(

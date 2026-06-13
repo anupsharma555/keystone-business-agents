@@ -21,6 +21,8 @@ from keystone_agents.schemas.work_item import (
 )
 from keystone_agents.sdk import ToolGuardrailViolation
 from keystone_agents.storage.sqlite_store import SQLiteStore
+from promptfoo.eval_database import eval_case_status, import_promptfoo_results
+from promptfoo.human_review import list_human_reviews
 
 
 def _fake_orchestrator_preflight(
@@ -96,6 +98,791 @@ def test_cli_ask_routes_unmentioned_input_through_work_item(tmp_path: Path, caps
     assert "Route: business_research_analyst" in output
     assert "Manual plan: business_research_analyst / company_research" in output
     assert "Artifacts: company_profile:" in output
+
+
+def test_cli_ask_eval_score_template_returns_prompted_rubric_json(capsys) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "@KNI",
+            "eval",
+            "score",
+            "template",
+            "case",
+            "slack_behavioral_health_rfp_001",
+            "run",
+            "sbar_example",
+            "agent",
+            "business_research_analyst",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "eval_score_template"
+    assert payload["status"] == "done"
+    assert payload["case_id"] == "slack_behavioral_health_rfp_001"
+    assert payload["run_id"] == "sbar_example"
+    assert payload["agent"] == "business_research_analyst"
+    assert payload["slack_channel_id"] == "C0BA17Y9C01"
+    assert "Score each dimension 0-5" in payload["human_summary"]
+    assert "readability:" in payload["human_summary"]
+    assert payload["dashboard_case_url"].endswith("?case=slack_behavioral_health_rfp_001")
+    assert payload["dashboard_url"] == "http://127.0.0.1:8769/dashboard"
+    assert payload["eval_thread_reply"]["scorecard_request"] == (
+        "@KNI can you give me a scorecard for this eval?"
+    )
+    assert payload["send_enabled"] is False
+
+
+def test_cli_ask_eval_score_template_plain_text(capsys) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "@KNI",
+            "eval",
+            "scoring",
+            "rubric",
+            "case:slack_case_1",
+        ]
+    )
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert output.startswith("eval score")
+    assert "case: slack_case_1" in output
+    assert "metadata-heavy" in output
+
+
+def test_cli_ask_eval_score_template_handles_wrapped_slack_followup(capsys) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "@KNI",
+            "workitem",
+            "opportunity_scout",
+            "continue",
+            "this",
+            "prior",
+            "Slack",
+            "thread.",
+            "Linked",
+            "WorkItem:",
+            "wi_example",
+            "Follow-up:",
+            "eval",
+            "score",
+            "template",
+            "case",
+            "slack_behavioral_health_rfp_001",
+            "run",
+            "sbar_wrapped",
+            "agent",
+            "business_research_analyst",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "eval_score_template"
+    assert payload["case_id"] == "slack_behavioral_health_rfp_001"
+    assert payload["run_id"] == "sbar_wrapped"
+    assert "accuracy:" in payload["human_summary"]
+
+
+def test_cli_ask_eval_scorecard_infers_case_from_slack_thread_context(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C0BA17Y9C01",
+                "channel_name": "evals",
+                "thread_ts": "1781202023.470699",
+                "read_context": (
+                    "Slack thread history digest:\n"
+                    "Thread messages, oldest first:\n"
+                    "- ts=1781202023.470699 author=UUSER title=Eval request: "
+                    "@KNI business research analyst: eval case "
+                    "slack_behavioral_health_rfp_001 Find 3 current grants/RFPs.\n"
+                    "- ts=1781202025.859599 author=BKNI title=Business Agents Run Completed: "
+                    "Run: sbar_bd1fe1d83aca4f93864a03c0618c5dfc "
+                    "WorkItem: wi_e59cb39aeac24ec49d012b2f27cb244b "
+                    "Route: business_research_analyst\n"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "--context-file",
+            str(context_file),
+            "@KNI",
+            "can",
+            "you",
+            "give",
+            "me",
+            "a",
+            "scorecard",
+            "for",
+            "this",
+            "eval?",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "eval_score_template"
+    assert payload["case_id"] == "slack_behavioral_health_rfp_001"
+    assert payload["run_id"] == "wi_e59cb39aeac24ec49d012b2f27cb244b"
+    assert payload["agent"] == "business_research_analyst"
+    assert "case: slack_behavioral_health_rfp_001" in payload["human_summary"]
+
+
+def test_cli_ask_eval_score_reply_saves_human_review(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    review_db = tmp_path / "human-reviews.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.selected_message_context.v1",
+                "channel_id": "C0BA17Y9C01",
+                "channel_name": "evals",
+                "thread_ts": "1781201599.554659",
+            }
+        ),
+        encoding="utf-8",
+    )
+    score_block = """eval score
+case: slack_behavioral_health_rfp_001
+run: sbar_example
+agent: business_research_analyst
+accuracy: 4
+relevance: 5
+explainability: 4
+readability: 5
+source_quality: 4
+search_quality: 4
+synthesis: 4
+output: 4
+format: 5
+instruction_following: 5
+usefulness: 5
+safety: pass
+notes: Useful and source-backed enough for a first pass."""
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "--context-file",
+            str(context_file),
+            "@KNI",
+            score_block,
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "eval_score_saved"
+    assert payload["status"] == "done"
+    assert payload["case_id"] == "slack_behavioral_health_rfp_001"
+    assert payload["run_id"] == "sbar_example"
+    assert payload["average_score"] == 4.455
+    assert payload["slack_channel_name"] == "evals"
+    assert payload["slack_thread_ts"] == "1781201599.554659"
+    assert payload["database_path"] == str(review_db)
+    assert payload["dashboard_path"] == str((tmp_path / "dashboard.html").resolve())
+    assert payload["dashboard_case_url"].endswith("?case=slack_behavioral_health_rfp_001")
+    assert payload["eval_thread_reply"]["status_request"] == "@KNI how is this eval doing?"
+    assert (tmp_path / "dashboard.html").exists()
+
+    stored = list_human_reviews(database_path=review_db)
+    assert len(stored) == 1
+    assert stored[0]["scores"]["accuracy"] == 4
+    assert stored[0]["scores"]["readability"] == 5
+
+
+def test_cli_ask_natural_eval_score_reply_uses_slack_thread_context(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    review_db = tmp_path / "human-reviews.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C0BA17Y9C01",
+                "channel_name": "evals",
+                "thread_ts": "1781202023.470699",
+                "read_context": (
+                    "Original request: eval case slack_behavioral_health_rfp_001\n"
+                    "Business Agents Run Completed Run: sbar_example "
+                    "WorkItem: wi_e59cb39aeac24ec49d012b2f27cb244b "
+                    "Route: business_research_analyst"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    score_reply = """Here are my scores:
+accuracy 4
+relevance 5
+explainability 4
+readability 5
+source_quality 4
+search_quality 4
+synthesis 4
+output 4
+format 5
+instruction_following 5
+usefulness 5
+safety pass
+notes: Good enough for a first pass."""
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "--context-file",
+            str(context_file),
+            "@KNI",
+            score_reply,
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "eval_score_saved"
+    assert payload["case_id"] == "slack_behavioral_health_rfp_001"
+    assert payload["run_id"] == "wi_e59cb39aeac24ec49d012b2f27cb244b"
+    assert payload["agent"] == "business_research_analyst"
+    assert payload["average_score"] == 4.455
+    assert payload["notes"] == "Good enough for a first pass."
+    assert payload["dashboard_path"] == str((tmp_path / "dashboard.html").resolve())
+    assert payload["dashboard_case_url"].endswith("?case=slack_behavioral_health_rfp_001")
+
+
+def test_cli_ask_eval_status_reports_promptfoo_and_human_scores(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    review_db = tmp_path / "evals.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    results_path = tmp_path / "latest-eval.json"
+    results_path.write_text(
+        json.dumps(
+            {
+                "evalId": "eval-example",
+                "results": {
+                    "timestamp": "2026-06-11T18:00:00Z",
+                    "stats": {"successes": 1, "failures": 0, "errors": 0},
+                    "results": [
+                        {
+                            "id": "result-1",
+                            "testIdx": 0,
+                            "success": True,
+                            "score": 1,
+                            "vars": {
+                                "case_id": "slack_behavioral_health_rfp_001",
+                                "agent_under_test": "opportunity_scout",
+                            },
+                            "gradingResult": {"reason": "All assertions passed"},
+                            "response": {"output": "{}"},
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    import_promptfoo_results(results_path, database_path=review_db)
+    score_block = """eval score
+case: slack_behavioral_health_rfp_001
+run: sbar_example
+agent: opportunity_scout
+accuracy: 4
+relevance: 5
+safety: pass"""
+    main(["ask", "@KNI", score_block])
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "@KNI",
+            "eval",
+            "status",
+            "case",
+            "slack_behavioral_health_rfp_001",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "eval_status"
+    assert payload["case_id"] == "slack_behavioral_health_rfp_001"
+    assert "Promptfoo pass" in payload["human_summary"]
+    assert "average 4.5/5" in payload["human_summary"]
+    assert payload["dashboard_path"] == str((tmp_path / "dashboard.html").resolve())
+    assert "<http://127.0.0.1:8769/dashboard?case=slack_behavioral_health_rfp_001|case dashboard>" in payload["human_summary"]
+    assert payload["dashboard_case_url"].endswith("?case=slack_behavioral_health_rfp_001")
+    assert payload["scorecard_request"] == "@KNI can you give me a scorecard for this eval?"
+    assert payload["eval_thread_reply"]["status_request"] == "@KNI how is this eval doing?"
+
+
+def test_cli_ask_natural_eval_status_infers_case_from_slack_thread_context(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    review_db = tmp_path / "evals.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    results_path = tmp_path / "latest-eval.json"
+    results_path.write_text(
+        json.dumps(
+            {
+                "evalId": "eval-example",
+                "results": {
+                    "timestamp": "2026-06-11T18:00:00Z",
+                    "stats": {"successes": 1, "failures": 0, "errors": 0},
+                    "results": [
+                        {
+                            "id": "result-1",
+                            "testIdx": 0,
+                            "success": True,
+                            "score": 1,
+                            "vars": {
+                                "case_id": "slack_behavioral_health_rfp_001",
+                                "agent_under_test": "opportunity_scout",
+                            },
+                            "gradingResult": {"reason": "All assertions passed"},
+                            "response": {"output": "{}"},
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    import_promptfoo_results(results_path, database_path=review_db)
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C0BA17Y9C01",
+                "channel_name": "evals",
+                "thread_ts": "1781202023.470699",
+                "read_context": "Prior ask: eval case slack_behavioral_health_rfp_001",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "--context-file",
+            str(context_file),
+            "@KNI",
+            "how",
+            "is",
+            "this",
+            "eval",
+            "doing?",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "eval_status"
+    assert payload["case_id"] == "slack_behavioral_health_rfp_001"
+    assert "Promptfoo pass" in payload["human_summary"]
+    assert payload["dashboard_path"] == str((tmp_path / "dashboard.html").resolve())
+    assert payload["dashboard_case_url"].endswith("?case=slack_behavioral_health_rfp_001")
+    assert payload["scorecard_request"] == "@KNI can you give me a scorecard for this eval?"
+
+
+def test_cli_ask_eval_case_with_slack_context_records_slack_eval_run(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    review_db = tmp_path / "evals.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.selected_message_context.v1",
+                "channel_id": "C0BA17Y9C01",
+                "channel_name": "evals",
+                "thread_ts": "1781202023.470699",
+                "selected_message_ts": "1781202023.470699",
+            }
+        ),
+        encoding="utf-8",
+    )
+    database_url = f"sqlite:///{tmp_path / 'work-items.db'}"
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "--database-url",
+            database_url,
+            "--context-file",
+            str(context_file),
+            "@KNI",
+            "business",
+            "research",
+            "analyst:",
+            "eval",
+            "case",
+            "slack_behavioral_health_rfp_001",
+            "research",
+            "Curebase",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["_eval_record"]["case_id"] == "slack_behavioral_health_rfp_001"
+    assert payload["_eval_record"]["slack_thread_ts"] == "1781202023.470699"
+    assert payload["_eval_record"]["run_id"].startswith("wi_")
+    assert payload["_eval_record"]["dashboard_case_url"].endswith(
+        "?case=slack_behavioral_health_rfp_001"
+    )
+    assert payload["_eval_record"]["scorecard_request"] == (
+        "@KNI can you give me a scorecard for this eval?"
+    )
+    assert payload["_eval_record"]["eval_thread_reply"]["dashboard_case_url"].endswith(
+        "?case=slack_behavioral_health_rfp_001"
+    )
+    assert payload["_eval_record"]["review_case_url"].endswith(
+        "?case=slack_behavioral_health_rfp_001"
+    )
+    assert "Eval: case `slack_behavioral_health_rfp_001`" in payload["human_summary"]
+    assert "<http://127.0.0.1:8769/dashboard?case=slack_behavioral_health_rfp_001|case dashboard>" in payload["human_summary"]
+    assert "<http://127.0.0.1:8769/review?case=slack_behavioral_health_rfp_001|score this case>" in payload["human_summary"]
+
+    status = eval_case_status("slack_behavioral_health_rfp_001", database_path=review_db)
+    assert status["slack_run_count"] == 1
+    assert status["slack_runs"][0]["run_id"] == payload["_eval_record"]["run_id"]
+    assert status["slack_runs"][0]["agent"] == "business_research_analyst"
+
+
+def test_cli_ask_records_hidden_eval_case_from_slack_context(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    review_db = tmp_path / "evals.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C0BA17Y9C01",
+                "channel_name": "evals",
+                "thread_ts": "1781206953.875749",
+                "request_ts": "1781206953.875749",
+                "request_text": (
+                    "opportunity scout -- find three Agents SDK courses that are "
+                    "reasonably cost and good for someone with some experience"
+                ),
+                "eval": {
+                    "case_id": "slack_agents_sdk_course_001",
+                    "source": "slack_eval_channel_backend",
+                    "visible_in_prompt": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    database_url = f"sqlite:///{tmp_path / 'work-items.db'}"
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "--database-url",
+            database_url,
+            "--context-file",
+            str(context_file),
+            "@KNI",
+            "opportunity scout -- find three Agents SDK courses that are reasonably cost",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["_eval_record"]["case_id"] == "slack_agents_sdk_course_001"
+    assert payload["_eval_record"]["slack_thread_ts"] == "1781206953.875749"
+    assert payload["_eval_record"]["dashboard_case_url"].endswith(
+        "?case=slack_agents_sdk_course_001"
+    )
+    assert "Eval: case `slack_agents_sdk_course_001`" in payload["human_summary"]
+    assert "<http://127.0.0.1:8769/dashboard?case=slack_agents_sdk_course_001|case dashboard>" in payload["human_summary"]
+    assert "<http://127.0.0.1:8769/review?case=slack_agents_sdk_course_001|score this case>" in payload["human_summary"]
+
+    status = eval_case_status("slack_agents_sdk_course_001", database_path=review_db)
+    assert status["slack_run_count"] == 1
+    assert status["slack_runs"][0]["request_text"].startswith("find three Agents SDK courses")
+    assert "eval case" not in status["slack_runs"][0]["request_text"].lower()
+
+
+def test_cli_hidden_eval_case_records_run_and_natural_human_review(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    review_db = tmp_path / "evals.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C0BA17Y9C01",
+                "channel_name": "evals",
+                "thread_ts": "1781206953.875749",
+                "request_ts": "1781206953.875749",
+                "request_text": (
+                    "opportunity scout -- find three Agents SDK courses that are "
+                    "reasonably cost and good for someone with some experience"
+                ),
+                "eval": {
+                    "case_id": "slack_agents_sdk_course_001",
+                    "source": "slack_eval_channel_backend",
+                    "visible_in_prompt": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    database_url = f"sqlite:///{tmp_path / 'work-items.db'}"
+
+    run_exit = main(
+        [
+            "ask",
+            "--json",
+            "--database-url",
+            database_url,
+            "--context-file",
+            str(context_file),
+            "@KNI",
+            "opportunity scout -- find three Agents SDK courses that are reasonably cost",
+        ]
+    )
+
+    assert run_exit == 0
+    run_payload = json.loads(capsys.readouterr().out)
+    run_id = run_payload["_eval_record"]["run_id"]
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C0BA17Y9C01",
+                "channel_name": "evals",
+                "thread_ts": "1781206953.875749",
+                "read_context": (
+                    "Slack thread history digest\n"
+                    f"Business Agents WorkItem Advanced WorkItem: {run_id} "
+                    "Route: opportunity_scout\n"
+                ),
+                "eval": {
+                    "case_id": "slack_agents_sdk_course_001",
+                    "source": "slack_eval_channel_backend",
+                    "visible_in_prompt": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    score_reply = """Here are my scores:
+accuracy 4
+relevance 4
+explainability 5
+readability 5
+source_quality 4
+search_quality 4
+synthesis 4
+output 5
+format 5
+instruction_following 5
+usefulness 5
+safety pass
+notes: Strong answer, but course price recency should be rechecked."""
+
+    score_exit = main(
+        [
+            "ask",
+            "--json",
+            "--context-file",
+            str(context_file),
+            "@KNI",
+            score_reply,
+        ]
+    )
+
+    assert score_exit == 0
+    score_payload = json.loads(capsys.readouterr().out)
+    assert score_payload["mode"] == "eval_score_saved"
+    assert score_payload["case_id"] == "slack_agents_sdk_course_001"
+    assert score_payload["run_id"] == run_id
+    assert score_payload["agent"] == "opportunity_scout"
+    assert score_payload["dashboard_path"] == str((tmp_path / "dashboard.html").resolve())
+    assert score_payload["dashboard_case_url"].endswith("?case=slack_agents_sdk_course_001")
+
+    status = eval_case_status("slack_agents_sdk_course_001", database_path=review_db)
+    assert status["slack_run_count"] == 1
+    assert status["latest_human_review"]["case_id"] == "slack_agents_sdk_course_001"
+    assert status["latest_human_review"]["run_id"] == run_id
+    assert status["latest_human_review"]["safety"] == "pass"
+
+
+def test_cli_eval_channel_natural_ask_reuses_promptfoo_case_and_scores_by_thread(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    review_db = tmp_path / "evals.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    results_path = tmp_path / "latest-eval.json"
+    results_path.write_text(
+        json.dumps(
+            {
+                "evalId": "eval-course",
+                "results": {
+                    "timestamp": "2026-06-11T18:00:00Z",
+                    "stats": {"successes": 1, "failures": 0, "errors": 0},
+                    "results": [
+                        {
+                            "id": "result-1",
+                            "testIdx": 0,
+                            "success": True,
+                            "score": 1,
+                            "vars": {
+                                "case_id": "slack_agents_sdk_course_001",
+                                "agent_under_test": "opportunity_scout",
+                                "user_input": (
+                                    "@KNI opportunity scout -- find three Agents SDK "
+                                    "courses that are reasonably cost and good for "
+                                    "someone with some experience"
+                                ),
+                            },
+                            "gradingResult": {"reason": "All assertions passed"},
+                            "response": {"output": "{}"},
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    import_promptfoo_results(results_path, database_path=review_db)
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C0BA17Y9C01",
+                "channel_name": "evals",
+                "thread_ts": "1781207777.000100",
+                "request_ts": "1781207777.000100",
+                "request_text": (
+                    "opportunity scout -- find three Agents SDK courses that are "
+                    "reasonably cost and good for someone with some experience"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    database_url = f"sqlite:///{tmp_path / 'work-items.db'}"
+
+    run_exit = main(
+        [
+            "ask",
+            "--json",
+            "--database-url",
+            database_url,
+            "--context-file",
+            str(context_file),
+            "@KNI",
+            "opportunity scout -- find three Agents SDK courses that are reasonably cost "
+            "and good for someone with some experience",
+        ]
+    )
+
+    assert run_exit == 0
+    run_payload = json.loads(capsys.readouterr().out)
+    run_id = run_payload["_eval_record"]["run_id"]
+    assert run_payload["_eval_record"]["case_id"] == "slack_agents_sdk_course_001"
+    assert run_payload["_eval_record"]["dashboard_path"] == str(
+        (tmp_path / "dashboard.html").resolve()
+    )
+    assert run_payload["_eval_record"]["dashboard_case_url"].endswith(
+        "?case=slack_agents_sdk_course_001"
+    )
+    status = eval_case_status("slack_agents_sdk_course_001", database_path=review_db)
+    assert status["slack_run_count"] == 1
+    assert "eval case" not in status["slack_runs"][0]["request_text"].lower()
+
+    score_reply = """Looks good:
+accuracy 4
+relevance 5
+explainability 5
+readability 5
+source_quality 4
+search_quality 4
+synthesis 4
+output 5
+format 5
+instruction_following 5
+usefulness 5
+safety pass
+notes: This is readable and useful."""
+    score_exit = main(
+        [
+            "ask",
+            "--json",
+            "--context-file",
+            str(context_file),
+            "@KNI",
+            score_reply,
+        ]
+    )
+
+    assert score_exit == 0
+    score_payload = json.loads(capsys.readouterr().out)
+    assert score_payload["mode"] == "eval_score_saved"
+    assert score_payload["case_id"] == "slack_agents_sdk_course_001"
+    assert score_payload["run_id"] == run_id
+    assert score_payload["agent"] == "opportunity_scout"
+    assert score_payload["notes"] == "This is readable and useful."
 
 
 def test_cli_work_items_advance_zotero_collection_outputs_research_brief(
@@ -1294,3 +2081,186 @@ def test_cli_agents_list_json(capsys) -> None:
     assert '"route_name": "orchestrator"' in output
     assert '"tool_policy"' in output
     assert '"allowed_tool_names"' in output
+
+
+def test_cli_agents_tools_prints_sanitized_runtime_availability(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "agent_cards",
+        lambda: [
+            {
+                "route_name": "chief_of_staff",
+                "agent_name": "Chief",
+                "runtime_tool_availability": {
+                    "file_search": {
+                        "status": "available",
+                        "available": True,
+                        "vector_store_id_count": 1,
+                        "vector_store_source": "agent",
+                        "vector_store_env_name": (
+                            "KEYSTONE_CHIEF_OF_STAFF_FILE_SEARCH_VECTOR_STORE_IDS"
+                        ),
+                    },
+                    "local_kni_documents": {
+                        "status": "ready",
+                        "available": True,
+                        "indexed_count": 1055,
+                        "local_only": True,
+                        "model_context_allowed": True,
+                        "send_enabled": False,
+                    },
+                    "mcp": {
+                        "status": "sdk_available_not_configured",
+                        "available": False,
+                        "sdk_available": True,
+                        "reason": "Agents SDK HostedMCPTool is installed.",
+                    },
+                    "source_layer_policy": {
+                        "status": "declared",
+                        "available": True,
+                        "layers": [
+                            {
+                                "layer": "local_kni_documents",
+                                "runtime_status": "ready",
+                            },
+                            {
+                                "layer": "hosted_file_search",
+                                "runtime_status": "available",
+                            },
+                            {
+                                "layer": "public_web_search",
+                                "runtime_status": "attached_live_available",
+                            },
+                        ],
+                    },
+                },
+            }
+        ],
+    )
+
+    exit_code = main(["agents", "tools", "--agent", "chief_of_staff"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "chief_of_staff" in output
+    assert "file_search" in output
+    assert "local_kni_documents" in output
+    assert "stores=1" in output
+    assert "indexed=1055" in output
+    assert "source_layer_policy" in output
+    assert "local_kni_documents:ready" in output
+    assert "hosted_file_search:available" in output
+    assert "sdk_available_not_configured" in output
+    assert "vs_" not in output
+
+
+def test_cli_agents_tools_json_reports_runtime_availability(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "agent_cards",
+        lambda: [
+            {
+                "route_name": "business_research_analyst",
+                "agent_name": "Research",
+                "runtime_tool_availability": {
+                    "file_search": {
+                        "status": "not_configured",
+                        "available": False,
+                        "vector_store_id_count": 0,
+                    }
+                },
+            }
+        ],
+    )
+
+    exit_code = main(["agents", "tools", "--agent", "business_research_analyst", "--json"])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["route_name"] == "business_research_analyst"
+    assert payload[0]["runtime_tool_availability"]["file_search"]["status"] == (
+        "not_configured"
+    )
+
+
+def test_cli_agents_file_search_config_prints_sanitized_summary(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "local_file_search_config_summary",
+        lambda: {
+            "path": ".local/file-search-vector-stores.json",
+            "exists": True,
+            "configured": True,
+            "status": "ready",
+            "error": None,
+            "global": {
+                "vector_store_id_count": 1,
+                "max_num_results": 5,
+                "include_search_results": False,
+            },
+            "agents": [
+                {
+                    "agent_name": "chief_of_staff",
+                    "known_agent": True,
+                    "vector_store_id_count": 1,
+                    "max_num_results": None,
+                    "include_search_results": True,
+                },
+                {
+                    "agent_name": "unknown_helper",
+                    "known_agent": False,
+                    "vector_store_id_count": 1,
+                    "max_num_results": None,
+                    "include_search_results": False,
+                },
+            ],
+            "unknown_agents": ["unknown_helper"],
+        },
+    )
+
+    exit_code = main(["agents", "file-search-config"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Local FileSearch config: ready" in output
+    assert "chief_of_staff" in output
+    assert "unknown_helper" in output
+    assert "Unknown agents: unknown_helper" in output
+    assert "Stores" in output
+    assert "vs_" not in output
+
+
+def test_cli_agents_file_search_config_json_reports_invalid(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "local_file_search_config_summary",
+        lambda: {
+            "path": ".local/file-search-vector-stores.json",
+            "exists": True,
+            "configured": True,
+            "status": "invalid_config",
+            "error": "agents.chief_of_staff.vector_store_ids must include at least one id",
+            "global": None,
+            "agents": [],
+            "unknown_agents": [],
+        },
+    )
+
+    exit_code = main(["agents", "file-search-config", "--json"])
+
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "invalid_config"
+    assert payload["error"]

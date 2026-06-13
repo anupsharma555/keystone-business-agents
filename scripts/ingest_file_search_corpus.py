@@ -13,9 +13,12 @@ from openai import OpenAI
 
 from keystone_agents.file_search_corpus import (
     DEFAULT_CORPUS_MANIFEST,
+    LOCAL_FILE_SEARCH_CONFIG_PATH,
     CorpusUploadPlan,
     build_corpus_upload_plan,
+    corpus_runtime_configuration_recommendation,
     corpus_upload_plan_summary,
+    write_local_file_search_config,
 )
 from keystone_agents.model_provider import (
     KEYSTONE_OPENAI_API_KEY_ENV,
@@ -66,6 +69,19 @@ def build_parser() -> argparse.ArgumentParser:
             "operator-controlled environment after reviewing the manifest."
         ),
     )
+    parser.add_argument(
+        "--write-local-config",
+        action="store_true",
+        help=(
+            "After live upload, merge the vector store id into the ignored local "
+            "FileSearch config for the corpus-approved agents."
+        ),
+    )
+    parser.add_argument(
+        "--local-config-path",
+        default=str(LOCAL_FILE_SEARCH_CONFIG_PATH),
+        help="Path for --write-local-config. Defaults to .local/file-search-vector-stores.json.",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     return parser
 
@@ -113,15 +129,30 @@ def main() -> None:
         vector_store_id = vector_store.id
 
     uploaded = _upload_plan(client=client, vector_store_id=str(vector_store_id), plan=plan)
-    _print_output(
-        {
-            "dry_run": False,
-            "vector_store_id": vector_store_id,
-            "uploaded_count": len(uploaded),
-            "uploaded": uploaded,
-        },
-        json_output=args.json,
+    runtime_configuration = corpus_runtime_configuration_recommendation(
+        plan,
+        vector_store_id=str(vector_store_id),
     )
+    local_config_written = None
+    if args.write_local_config:
+        local_config_path = Path(args.local_config_path)
+        if not local_config_path.is_absolute():
+            local_config_path = PROJECT_ROOT / local_config_path
+        local_config_written = write_local_file_search_config(
+            path=local_config_path,
+            plan=plan,
+            vector_store_id=str(vector_store_id),
+        )
+    payload = {
+        "dry_run": False,
+        "vector_store_id": vector_store_id,
+        "uploaded_count": len(uploaded),
+        "uploaded": uploaded,
+        "runtime_configuration": runtime_configuration,
+    }
+    if local_config_written is not None:
+        payload["local_config_written"] = local_config_written
+    _print_output(payload, json_output=args.json)
 
 
 def _upload_plan(
@@ -175,6 +206,13 @@ def _print_output(payload: dict[str, Any], *, json_output: bool) -> None:
     print(
         f"Uploaded {payload['uploaded_count']} files to vector store {payload['vector_store_id']}."
     )
+    local_config = payload.get("local_config_written")
+    if isinstance(local_config, dict):
+        print(
+            "Updated local FileSearch config: "
+            f"{local_config.get('path')} "
+            f"({len(local_config.get('updated_agents') or [])} agents)."
+        )
 
 
 if __name__ == "__main__":

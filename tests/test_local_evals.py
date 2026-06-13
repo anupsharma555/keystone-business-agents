@@ -17,6 +17,7 @@ REQUIRED_DATASETS = {
     "orchestrator_routing.jsonl",
     "safety_refusals.jsonl",
     "source_attribution.jsonl",
+    "slack_research_workflow.jsonl",
     "opportunity_scoring.jsonl",
     "outreach_copy_constraints.jsonl",
     "skill_gate_failures.jsonl",
@@ -28,6 +29,7 @@ REQUIRED_TASKS = {
     "orchestrator_routing",
     "safety_refusal",
     "source_attribution",
+    "slack_research_workflow",
     "opportunity_scoring",
     "outreach_copy_constraints",
     "skill_gate_failures",
@@ -137,6 +139,23 @@ def test_local_eval_runner_exposes_research_and_scout_skill_metadata(capsys) -> 
         "business_research_specialist_contracts",
         "opportunity_scout_specialist_contracts",
     } <= specialist_skills
+
+
+def test_local_eval_runner_exposes_slack_research_workflow_eval(capsys) -> None:
+    exit_code = main(["--dataset", "slack_research_workflow", "--json"])
+    output = json.loads(capsys.readouterr().out)
+    result = output["results"][0]
+
+    assert exit_code == 0
+    assert output["failed"] == 0
+    assert result["surface"] == "slack"
+    assert result["observed"]["prompt_kind"] == "research_summary"
+    assert result["observed"]["comparison_ready"] is True
+    assert "candidate_discovery" in result["observed"]["pass_types"]
+    assert {"Character.AI", "ChatGPT", "Replika"} <= set(
+        result["observed"]["selected_targets"]
+    )
+    assert result["validates_skills"]
 
 
 def test_local_eval_runner_exposes_control_plane_skill_metadata(capsys) -> None:

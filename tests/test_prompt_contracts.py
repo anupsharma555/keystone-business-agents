@@ -590,6 +590,19 @@ def test_chief_of_staff_prompt_keeps_web_briefs_substantive() -> None:
     assert "Do not choose `reference-capture` for a question, brief, search, research" in text
 
 
+def test_chief_of_staff_prompt_defines_local_kni_document_guardrails() -> None:
+    text = _read_prompt("chief_of_staff.md")
+    normalized = " ".join(text.split())
+
+    assert "local-source Keystone Neuroinformatics document" in text
+    assert "model_context_allowed=true" in text
+    assert "bank/payment account details" in normalized
+    assert "PHI or patient identifiers" in text
+    assert "Legal, contract, finance, tax, insurance" in normalized
+    assert "must not be presented as legal, tax, insurance, or coverage advice" in normalized
+    assert "not approval to send, post, publish, submit, or share externally" in normalized
+
+
 def test_repo_guide_requires_visible_source_urls_for_external_facts() -> None:
     text = _read_repo_doc("AGENTS.md")
 
@@ -621,6 +634,29 @@ def test_shared_slack_rules_require_visible_source_urls() -> None:
     assert "Detailed Summary` must\n  start with a narrative summary paragraph" in text
     assert "A source list, provider-result list, or bullet list is not a substitute" in text
     assert "more useful than a generic web-search answer" in text
+
+
+def test_file_search_prompt_contract_separates_reference_local_and_live_sources() -> None:
+    tools = _read_prompt("tools.md")
+    research = _read_prompt("business_research_analyst.md")
+    orchestrator = _read_prompt("orchestrator.md")
+    normalized_tools = " ".join(tools.split())
+    normalized_research = " ".join(research.split())
+    normalized_orchestrator = " ".join(orchestrator.split())
+
+    assert ".local/file-search-vector-stores.json" in tools
+    assert "Hosted FileSearch is not local KNI document search and is not fresh web search" in tools
+    assert "Use local KNI document tools for Keystone Neuroinformatics folder evidence" in tools
+    assert "use `search_web` for current public facts" in tools
+    assert "when configured by the harness or local FileSearch config" in normalized_research
+    assert "not treat it as a substitute for source-backed company research" in normalized_research
+    assert "Use hosted `file_search`, when configured, only for stable approved reference" in orchestrator
+    assert "not a substitute for current public web search" in normalized_orchestrator
+    assert "route to Chief of Staff and preserve the local-doc requirement" in normalized_orchestrator
+    assert (
+        "Do not replace local KNI evidence with hosted FileSearch or generic web search"
+        in normalized_orchestrator
+    )
 
 
 def test_orchestrator_prompt_reminds_specialists_about_visible_source_urls() -> None:

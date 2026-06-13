@@ -65,8 +65,22 @@ readiness checks, not external test-pack cases.
 | --- | --- | --- |
 | Bridge passes selected thread replies into Keystone. | `tests/test_slack_agent_actions.py` verifies supplied `thread_messages` reach WorkItem Slack context and Chief of Staff live-SDK input context. | covered locally |
 | Bridge preserves context across modal open and submission. | `tests/test_slack_agent_actions.py` verifies modal private metadata can preserve either `context_file_path` or embedded `selected_context`. | covered locally |
+| Bridge preserves hidden eval metadata and reply guidance. | `test_slack_eval_message_action_records_run_and_reply_guidance` verifies hidden Slack eval metadata survives modal submission, records a local Slack eval run, and appends case id, run id, case dashboard link, and human review form link to the reply payload. The score-text parser remains a deterministic fallback when the form is unavailable. | covered locally |
 | Orchestrator receives selected Slack context before routing. | `tests/test_slack_agent_actions.py` and `tests/test_orchestrator.py` verify selected Slack metadata and a compact thread summary enter `workflow_state_summary` during Orchestrator preflight, even when database workflow state is loaded. | covered locally |
 | Direct Slack WorkItem actions attach preflight context. | `tests/test_slack_tool.py` verifies more-research/revision and continue actions pass compact Orchestrator preflight into `WorkflowRunRequest`. | covered locally |
+
+### Reusable Query Prompts + Multi-Target Research
+
+| Check | Expected evidence | Status |
+| --- | --- | --- |
+| Slack-origin research requests attach a reusable query prompt. | `tests/test_slack_query_prompts.py`, `tests/test_slack_agent_actions.py`, `tests/test_slack_tool.py`, and `tests/test_workflow_runner.py` verify modal submissions, direct Slack WorkItem actions, and workflow auto-attach produce `slack_query_prompt` metadata with bounded task brief, context flags, cost profile, dynamic-content hash, and deterministic-route mismatch diagnostics. | covered locally |
+| Prompt selection stays advisory and cannot authorize tools or side effects. | `tests/test_slack_query_prompts.py` verifies unsafe side-effect requests do not silently select a prompt, negated no-send/no-post constraints are preserved, and the rendered task brief states that deterministic gates remain authoritative. | covered locally |
+| Common Slack source-read comparisons route to multi-target research instead of single-company retrieval. | `tests/test_workflow_runner.py` verifies a category comparison dispatches the multi-target branch before the single-company `retrieve_company_profile_live` lane. | covered locally |
+| Multi-target search separates breadth from depth. | `tests/test_multi_target_research.py` verifies candidate discovery, one breadth repair pass, target selection, per-target depth, substitution, source sufficiency gates, and blocked depth gaps. | covered locally |
+| Product comparisons do not promote source organizations into targets. | `tests/test_slack_query_prompts.py` verifies the reusable prompt says source organizations, reports, media, regulators, and listicles are evidence only. `tests/test_multi_target_research.py` verifies AP News, CNN, FTC, Facebook, Brookings, Common Sense Media, Core Ethos-style adjacent safety products, and generic contact pages do not count as product targets or sufficient product evidence. | covered locally |
+| Multi-target runs are auditable after execution. | `tests/test_multi_target_research.py` verifies artifacts include `diagnostics.target_selection` with selected targets, top candidates, ranking scores, evidence counts, source sufficiency, and weak-target gaps. | covered locally |
+| The Slack source-read path has a repeatable local eval. | `evals/local/slack_research_workflow.jsonl` runs through `scripts/run_local_evals.py --dataset slack_research_workflow --json` and verifies reusable prompt selection, multi-target pass types, selected product targets, visible source URLs, and no source-organization target promotion. | covered locally |
+| Live Slack retest shows the same behavior in-channel. | Manual live proof should use a Slack `@KNI business research analyst` source-read comparison and inspect the WorkItem artifact/trace for `slack_query_prompt`, `multi_target_research.pass_types`, visible source URLs, and `diagnostics.target_selection`. This was intentionally paused after the latest repo-side patch. | pending live Slack proof |
 
 ### Safety Boundaries
 

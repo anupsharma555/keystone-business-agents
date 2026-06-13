@@ -184,11 +184,51 @@ or changing an agent, prompt, tool, schema, live flag, eval, or validation path:
 ```bash
 keystone agents list
 .venv/bin/python -m keystone_agents.cli agents list --json
+.venv/bin/python -m keystone_agents.cli agents tools
+.venv/bin/python -m keystone_agents.cli agents tools --agent chief_of_staff
 ```
 
 Expected routes: `gmail_triage`, `business_research_analyst`,
 `opportunity_scout`, `outreach_composer`, `orchestrator`, and
 `chief_of_staff`.
+
+The JSON output includes sanitized `runtime_tool_availability` for tool audits:
+hosted `file_search` status, shared `search_web` live-gate/provider status,
+local KNI document index status when attached, and MCP/dynamic tool-search
+readiness. MCP and tool search may report `sdk_available_not_configured` when
+the installed Agents SDK exposes the hosted primitives but Keystone has not yet
+registered a reviewed MCP server or dynamic loader for an agent. It reports
+counts and configuration sources, but does not print raw vector-store IDs, API
+keys, document snippets, or search results. Use `agents tools` for a compact
+text audit of actual runtime availability; use `agents list --json` when you
+need the full agent card payload.
+
+### Local KNI Document Debugging
+
+When a local KNI document question fails in Slack or CLI, debug the shared
+retrieval-and-reasoning path before editing agent answer logic. Use `agents
+tools --agent chief_of_staff` to confirm that `local_kni_documents` is ready,
+then inspect whether the local index returns the right candidate documents and
+whether the live Chief of Staff input received bounded document evidence.
+
+Do not fix one failed question by adding a deterministic branch for that exact
+wording or expected answer. Python may gate access, search/read local files,
+rank candidates, enforce sensitive-use guardrails, and require evidence paths,
+uncertainty, `local_only=true`, `send_enabled=false`, and human-review flags.
+The model should still interpret the document text and distinguish roles such
+as organizer, signer, registered agent, broker, producer, agency, insurer,
+coverholder, underwriter, owner, and accountable lead.
+
+If the same class of failure recurs, add a general eval or fixture that covers
+multiple phrasings over the same local-document QA contract. The desired fix is
+better source selection, context packing, tool-call encouragement, or output
+validation, not a one-off answer shortcut.
+
+If live synthesis answers the local-document question but omits an evidence path
+or review flag, repair the missing provenance from the bounded evidence packet
+and preserve the answer. Only fall back to the deterministic planner when the
+live output is unrelated, unsafe, or structurally unusable; planner text should
+not become the user-facing answer for a normal local-document QA request.
 
 ## WorkItem Natural-Language Smoke Test
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
@@ -19,6 +20,14 @@ WEB_STRUCTURING_ALLOWED_TOOLS = frozenset({"structure_web_data_for_schema"})
 PLAYWRIGHT_RESEARCH_ALLOWED_TOOLS = frozenset({"render_page"})
 BROWSER_DIAGNOSTIC_ALLOWED_TOOLS = frozenset(
     {"capture_browser_diagnostics", "summarize_rendered_page_diagnostics"}
+)
+LOCAL_KNI_DOCUMENT_TOOL_NAMES = frozenset(
+    {
+        "list_kni_document_folder",
+        "list_kni_document_sources",
+        "search_kni_documents",
+        "read_kni_document_file",
+    }
 )
 
 
@@ -44,6 +53,69 @@ class AgentToolPolicy:
     agent_name: str
     allowed_tool_names: frozenset[str]
     rationale: str
+
+
+SOURCE_LAYER_POLICIES: tuple[dict[str, object], ...] = (
+    {
+        "layer": "local_kni_documents",
+        "tools": [
+            "list_kni_document_sources",
+            "search_kni_documents",
+            "read_kni_document_file",
+        ],
+        "use_for": [
+            "Keystone Neuroinformatics local folder evidence",
+            "formation records, insurance/COI files, operating guides, policies, templates",
+            "questions asking for local evidence paths or internal document context",
+        ],
+        "not_for": [
+            "current public company, market, news, funding, or opportunity facts",
+            "OpenAI Agents SDK reference docs unless those docs are present in the local KNI folder",
+            "approval to send, post, publish, submit, or share content externally",
+        ],
+        "reasoning_contract": (
+            "Use as bounded local-only evidence. Re-rank candidate documents against the "
+            "latest user question and distinguish roles such as organizer, signer, "
+            "registered agent, insurer, coverholder, broker, producer, and agency."
+        ),
+    },
+    {
+        "layer": "hosted_file_search",
+        "tools": ["file_search"],
+        "use_for": [
+            "stable approved reference corpora",
+            "OpenAI Agents SDK/API docs, LangGraph docs, Slack/Gmail API contracts",
+            "Keystone operating policy only when that corpus was deliberately configured",
+        ],
+        "not_for": [
+            "local KNI folder evidence",
+            "fresh public facts, market signals, news, opportunities, or product claims",
+            "private messages, PHI, credentials, secrets, local databases, or raw sensitive artifacts",
+        ],
+        "reasoning_contract": (
+            "Use only when the reference corpus is relevant. Treat snippets as reference "
+            "context, not as permission to bypass source attribution or approval gates."
+        ),
+    },
+    {
+        "layer": "public_web_search",
+        "tools": ["search_web"],
+        "use_for": [
+            "current public facts",
+            "company, market, funding, product, policy, grant, RFP, and opportunity research",
+            "source freshness checks and public URL-backed claims",
+        ],
+        "not_for": [
+            "private/local KNI folder evidence",
+            "durable SDK/API docs already present in a configured hosted corpus unless freshness is needed",
+            "external sending, posting, publishing, or scheduling approval",
+        ],
+        "reasoning_contract": (
+            "Use provider results for discovery and read/extract selected URLs before "
+            "making detailed factual claims. Keep provider diagnostics secondary."
+        ),
+    },
+)
 
 
 CORE_READ_TOOL_NAMES = frozenset(
@@ -74,6 +146,9 @@ CORE_READ_TOOL_NAMES = frozenset(
         "search_slack_repo_context",
         "read_slack_repo_context_file",
         "lookup_slack_workflow_capability",
+        "list_kni_document_sources",
+        "search_kni_documents",
+        "read_kni_document_file",
         "list_automation_specs",
         "list_recent_automation_runs",
         "list_channel_automation_bindings",
@@ -337,6 +412,7 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "route_request_placeholder",
                 "load_orchestrator_workflow_state",
                 "load_pending_approval_items",
+                "file_search",
                 "search_web",
                 "extract_research_claims_from_html",
                 "business_research_analyst_research_brief",
@@ -370,6 +446,10 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "list_local_context_sources",
                 "search_local_context",
                 "read_local_context_file",
+                "list_kni_document_folder",
+                "list_kni_document_sources",
+                "search_kni_documents",
+                "read_kni_document_file",
                 "extract_research_claims_from_html",
                 "list_automation_specs",
                 "list_recent_automation_runs",
@@ -404,6 +484,28 @@ def tool_policy_for_agent(agent_name: str) -> AgentToolPolicy | None:
     """Return the declared tool policy for an agent name."""
 
     return AGENT_TOOL_POLICIES.get(str(agent_name or "").strip())
+
+
+def source_layer_policy_for_tools(
+    tool_names: Sequence[str] | frozenset[str],
+) -> tuple[dict[str, object], ...]:
+    """Return advisory source-layer guidance for a concrete tool surface.
+
+    This is intentionally not an intent classifier. It tells agents and
+    diagnostics which evidence layers are available and what each layer is for,
+    while leaving the model to reason from the latest user question and the
+    actual tool outputs.
+    """
+
+    declared = frozenset(str(name or "").strip() for name in tool_names)
+    policies: list[dict[str, object]] = []
+    for policy in SOURCE_LAYER_POLICIES:
+        tools = tuple(str(name) for name in policy.get("tools", ()))
+        if not tools:
+            continue
+        if all(name in declared for name in tools):
+            policies.append(dict(policy))
+    return tuple(policies)
 
 
 def tool_name_for_policy(tool: Any) -> str:

@@ -1,0 +1,27 @@
+description: Keystone Business Agents Slack ask evals
+
+prompts:
+  - "{{ user_input }}"
+
+providers:
+  - id: file://promptfoo/providers/keystone_agent_provider.py
+    label: kba-dry-run-slack-agent
+    config:
+      python: .venv/bin/python
+      agent: orchestrator
+      live_sdk: false
+      max_manager_steps: 1
+      timeout_seconds: 90
+
+defaultTest:
+  assert:
+    - type: python
+      value: file://promptfoo/assertions/kba_slack_invariants.py
+      metric: kba_slack_invariants
+
+tests:
+  - file://promptfoo/tests/slack_research.yaml
+  - file://promptfoo/tests/slack_retrieval_synthesis.yaml
+  - file://promptfoo/tests/slack_tool_safety.yaml
+  - file://promptfoo/tests/slack_agent_coverage.yaml
+  - file://promptfoo/tests/slack_agent_expansion_15.yaml

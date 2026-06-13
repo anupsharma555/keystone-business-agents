@@ -80,6 +80,13 @@ from keystone_agents.tools.internal_data_tools import (
     google_workspace_tools,
     read_linked_article,
 )
+from keystone_agents.tools.kni_document_tool import (
+    list_kni_document_folder,
+    list_kni_document_sources,
+    read_kni_document_file,
+    search_kni_documents,
+)
+from keystone_agents.local_kni_evidence import build_local_kni_evidence_packet_for_query
 from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
@@ -119,6 +126,10 @@ def _chief_of_staff_tools(request_text: str = "") -> list[Any]:
         publish_document_report,
         publish_table_mirror,
         publish_slack_summary,
+        list_kni_document_folder,
+        list_kni_document_sources,
+        search_kni_documents,
+        read_kni_document_file,
         list_local_context_sources,
         search_local_context,
         read_local_context_file,
@@ -136,9 +147,102 @@ def _chief_of_staff_tools(request_text: str = "") -> list[Any]:
     ]
     if explicit_full_article_read_requested(request_text):
         tools.append(read_linked_article)
+    if _local_kni_document_context_requested(request_text):
+        return tools
     return append_configured_file_search_tools(
         "chief_of_staff",
         tools,
+    )
+
+
+def _local_kni_document_context_requested(request_text: str) -> bool:
+    lowered = str(request_text or "").lower()
+    has_kni_scope = any(
+        marker in lowered
+        for marker in (
+            "local kni document",
+            "local kni documents",
+            "kni document",
+            "kni documents",
+            "keystone neuroinformatics",
+            "cfc insurance",
+            "cfc policy",
+            "proassurance",
+            "iao inc",
+            "iao, inc",
+        )
+    )
+    has_local_source_intent = any(
+        marker in lowered
+        for marker in (
+            "using local",
+            "local source",
+            "evidence path",
+            "formed",
+            "formation",
+            "date filed",
+            "certificate of organization",
+            "articles of organization",
+            "organizer",
+            "organized",
+            "organised",
+            "registered agent",
+            "registered office",
+            "signer",
+            "who filed",
+            "filer",
+            "formally organized",
+            "formally organised",
+            "insurance",
+            "policy",
+            "certificate of insurance",
+            "coi",
+            "peo",
+            "provider",
+            "carrier",
+            "broker",
+        )
+    )
+    return has_kni_scope and has_local_source_intent
+
+
+def _looks_like_local_kni_document_lookup_request(request_text: str) -> bool:
+    lowered = str(request_text or "").lower()
+    return _local_kni_document_context_requested(lowered) and any(
+        marker in lowered
+        for marker in (
+            "what date",
+            "when",
+            "who",
+            "which",
+            "formed",
+            "formation",
+            "date filed",
+            "certificate of organization",
+            "articles of organization",
+            "organizer",
+            "organized",
+            "organised",
+            "registered agent",
+            "registered office",
+            "signer",
+            "who filed",
+            "filer",
+            "formally organized",
+            "formally organised",
+            "evidence path",
+            "using local",
+            "search",
+            "read",
+            "insurance",
+            "policy",
+            "certificate of insurance",
+            "coi",
+            "peo",
+            "provider",
+            "carrier",
+            "broker",
+        )
     )
 
 
@@ -3545,6 +3649,146 @@ def _plan_web_search_brief_request(text: str) -> ChiefOfStaffResult:
     )
 
 
+def _plan_local_kni_document_lookup_request(text: str) -> ChiefOfStaffResult:
+    packet = build_local_kni_evidence_packet_for_query(text, max_candidate_documents=5)
+    diagnostics: dict[str, Any] = dict(packet.get("retrieval_diagnostics") or {})
+    diagnostics.setdefault("local_only", True)
+    diagnostics.setdefault("send_enabled", False)
+    diagnostics["candidate_document_count"] = len(packet.get("candidate_documents") or [])
+    candidate_documents = [
+        doc
+        for doc in list(packet.get("candidate_documents") or [])
+        if isinstance(doc, Mapping)
+    ]
+    evidence_paths = [
+        str(doc.get("relative_path") or "")
+        for doc in candidate_documents
+        if str(doc.get("relative_path") or "")
+    ]
+    lookup_kind = str(
+        diagnostics.get("effective_lookup_kind")
+        or diagnostics.get("lookup_kind")
+        or "generic"
+    )
+    answer_focus = str(diagnostics.get("effective_answer_focus") or "")
+
+    if not evidence_paths:
+        status = str(diagnostics.get("search_status") or "unknown")
+        summary = (
+            "I could not find candidate local KNI document evidence for this question. "
+            f"Search status: {status}. Refresh command: python3 -m kni_integrations.cli doc-index."
+        )
+        return ChiefOfStaffResult(
+            mode="deterministic",
+            intent=text[:500],
+            summary=summary,
+            synthesis=summary,
+            operating_capabilities=["local_kni_document_search"],
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="project-context-review",
+                command_text="@KNI chief of staff search local KNI documents",
+                target_channel="current-thread",
+                rationale=(
+                    "The request asks for local KNI document evidence, not Slack workflow routing."
+                ),
+                requires_live_connector=False,
+                requires_human_approval_before_post=True,
+            ),
+            recommended_actions=[
+                "Refresh the local index if the expected document was recently added.",
+                "Do not send, post, publish, or share local KNI document context externally.",
+            ],
+            blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+            approval_required=True,
+            human_review_required=True,
+            send_enabled=False,
+            slack_post_allowed=False,
+            sources=[],
+            context_sources_considered=["local_kni_document_index"],
+            retrieval_diagnostics=diagnostics,
+            audit_notes=[
+                "Query-driven local KNI document evidence lookup found no candidates.",
+                "No external search or hosted vector store was used.",
+            ],
+        )
+
+    path_list = "; ".join(evidence_paths[:3])
+    focus_note = f" answer focus `{answer_focus}`" if answer_focus else ""
+    summary = (
+        "Local KNI document evidence is available for Chief of Staff synthesis; "
+        f"lookup kind `{lookup_kind}`{focus_note}. Candidate evidence paths: {path_list}. "
+        "This deterministic planner does not decide the substantive answer."
+    )
+    synthesis = (
+        "Use the bounded local KNI evidence packet and guarded document tools for model "
+        "synthesis. The model should interpret roles and dates from document text, report "
+        "uncertainty, and include evidence paths. Local KNI context is read-only and not "
+        "approval to send, post, publish, submit, or share externally."
+    )
+    review_reasons = sorted(
+        {
+            str(reason)
+            for doc in candidate_documents
+            for reason in list(doc.get("review_reasons") or [])
+            if str(reason)
+        }
+    )
+    diagnostics.update(
+        {
+            "lookup_kind": lookup_kind,
+            "answer_focus": answer_focus,
+            "evidence_paths": evidence_paths[:5],
+            "review_required": any(bool(doc.get("review_required")) for doc in candidate_documents),
+            "review_reasons": review_reasons,
+        }
+    )
+    return ChiefOfStaffResult(
+        mode="deterministic",
+        intent=text[:500],
+        summary=summary,
+        synthesis=synthesis,
+        operating_capabilities=[
+            "local_kni_document_search",
+            "local_kni_document_read",
+            "sensitive_context_guardrails",
+        ],
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="project-context-review",
+            command_text="@KNI chief of staff search local KNI documents",
+            target_channel="current-thread",
+            rationale="The request asks for local KNI document evidence.",
+            requires_live_connector=False,
+            requires_human_approval_before_post=True,
+        ),
+        recommended_actions=[
+            "Use live Chief of Staff synthesis to interpret the bounded evidence packet before answering.",
+            f"Review candidate evidence path: {evidence_paths[0]}.",
+            "Do not send, post, publish, or share local KNI document context externally without explicit approval.",
+        ],
+        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        sources=[
+            ChiefOfStaffSourceRef(
+                title=relative_path,
+                url="",
+                source_type="local_kni_document",
+                note="Candidate local-only document evidence for model synthesis.",
+            )
+            for relative_path in evidence_paths[:5]
+        ],
+        context_sources_considered=["local_kni_document_index", "local_kni_document_file"],
+        retrieval_diagnostics=diagnostics,
+        audit_notes=[
+            "Query-driven local KNI document evidence packet prepared; no one-off answer branch used.",
+            "No external search or hosted vector store was used.",
+            "Local document context remains read-only and send-disabled.",
+        ],
+    )
+
+
 def plan_chief_of_staff_request(
     request_text: str,
     *,
@@ -3580,6 +3824,11 @@ def plan_chief_of_staff_request(
         return planned(
             _plan_finance_tracker_request(active_text, live=False),
             action="allowed_finance_tracker_shortcut",
+        )
+    if _looks_like_local_kni_document_lookup_request(active_text):
+        return planned(
+            _plan_local_kni_document_lookup_request(active_text),
+            action="allowed_local_kni_document_lookup",
         )
     if _looks_like_chief_memory_capture_request(text):
         return planned(
@@ -4287,6 +4536,7 @@ def build_chief_of_staff_agent(
     quality_budget: AgentQualityBudget | None = None,
     quality_mode: QualityMode | str | None = None,
     request_text: str = "",
+    context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
 ) -> Agent:
     """Build the KNI Chief of Staff SDK agent."""
@@ -4304,6 +4554,7 @@ def build_chief_of_staff_agent(
         skill_files=select_agent_skill_names(
             "chief_of_staff",
             request_text=request_text,
+            context_flags=context_flags,
             include_all=include_all_skills,
         ),
     )
@@ -4339,6 +4590,7 @@ def run_chief_of_staff_sdk(
     quality_budget: AgentQualityBudget | None = None,
     force_sdk_interpretation: bool = False,
     manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    context_flags: Mapping[str, bool] | None = None,
 ) -> TypedAgentRunResult[ChiefOfStaffResult]:
     """Run Chief of Staff through the shared typed SDK harness."""
 
@@ -4412,6 +4664,7 @@ def run_chief_of_staff_sdk(
             model=model,
             quality_budget=budget,
             request_text=request_text,
+            context_flags=context_flags,
         ),
         typed_input=typed_input_for_run,
         output_type=ChiefOfStaffResult,

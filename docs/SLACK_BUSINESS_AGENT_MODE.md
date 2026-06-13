@@ -55,6 +55,36 @@ so business-agent developers can see the safety boundary from this repo.
 installed app's bot-scope list, Socket Mode startup can warn if enabled features
 are missing required scopes.
 
+## Promptfoo Eval Channel
+
+Use `#evals` for Promptfoo-backed eval asks and human review threads. The KNI
+workspace channel id from the current Slack app is `C0BA17Y9C01`. In the Slack
+bridge, keep eval-specific configuration pointed at that channel:
+
+```bash
+KNI_BUSINESS_AGENTS_EVAL_CHANNEL=C0BA17Y9C01
+```
+
+Post the root ask in natural language in `#evals`; the run-completed message,
+agent answer, automatic eval footer, human review link, and any optional status
+check should remain in that Slack thread. The Slack bridge/KBA context payload
+attaches eval metadata for the channel in the background, for example
+`case_id=slack_agents_sdk_course_001` for the natural Agents SDK course ask.
+Visible `eval case <case_id>` wording is kept only as a debug/fallback command.
+This keeps eval traffic out of `#ai-agents-workflow` while preserving the same
+no-send, approval, and read-only context boundaries. The run-completed reply
+should expose the resolved case id, run id, direct case dashboard link, and
+human review form link so a second AI-agent scorecard response is not needed.
+
+Use the review form link as the normal scoring path. If the form is unavailable
+during local testing, the deterministic fallback parser can still save compact
+score text such as `@KNI here are my scores: accuracy 4 relevance 5 ... safety
+pass` in the same thread. That fallback does not require live model, search,
+Slack posting, or external side effects.
+
+Use `@KNI how is this eval doing?` in the same thread to get the merged
+Promptfoo, Slack run, and human-review status plus the case dashboard link.
+
 ## Search Runtime Boundary
 
 Slack and Business Agents can each have a local SearXNG process. The Slack
