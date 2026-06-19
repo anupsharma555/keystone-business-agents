@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -36,10 +38,13 @@ from keystone_agents.child_process import run_isolated_child_process
 from keystone_agents.cli_sdk import add_sdk_session_arguments
 from keystone_agents.config import cli_default_live_research, cli_default_live_sdk, load_settings
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
+from keystone_agents.costing import estimate_usage_cost
+from keystone_agents.eval_runtime_diagnostics import slack_eval_blocker_diagnostics
 from keystone_agents.evals import generate_eval_report, run_static_evals
 from keystone_agents.file_search import local_file_search_config_summary
 from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
+from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
 from keystone_agents.operator_failures import (
     known_exception_to_operator_failure,
@@ -62,6 +67,14 @@ from keystone_agents.schemas.approval import (
     ApprovalState,
 )
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.schemas.operational_context import (
+    AirtableContextResult,
+    GoogleWorkspaceContextResult,
+    HumanWorkContext,
+    OperationalContextEntry,
+    OperationalWritePlan,
+    ZoteroContextResult,
+)
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
@@ -71,6 +84,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemRoute,
     WorkItemStatus,
 )
+from keystone_agents.sdk import run_typed_sdk_sync
 from keystone_agents.sdk_sessions import (
     SDKSessionSpec,
     build_sdk_session,
@@ -80,6 +94,10 @@ from keystone_agents.sdk_sessions import (
     sdk_session_env,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
+from keystone_agents.tools.internal_data_tools import (
+    AIRTABLE_LIVE_READS_ENV,
+    GOOGLE_WORKSPACE_LIVE_READS_ENV,
+)
 from keystone_agents.tools.slack_tool import SlackTool, slack_review_message_from_approval_item
 from keystone_agents.tools.storage_tool import StorageTool
 from keystone_agents.work_items import (
@@ -98,6 +116,12 @@ from keystone_agents.workflows import (
     run_keystone_pipeline,
     run_opportunity_to_outreach_loop,
 )
+
+CONTEXT_AGENT_ROUTES = {
+    "airtable_context_agent",
+    "google_workspace_context_agent",
+    "zotero_context_agent",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -493,18 +517,20 @@ def _run_ask(args: argparse.Namespace) -> int:
     input_text = raw_input if args.agent else mention.input_text
     cost_directive = parse_cost_tracking_directive(input_text)
     input_text = (cost_directive.cleaned_text or input_text).strip()
-    eval_score_save = _eval_score_save_payload(input_text, context_file_path=args.context_file)
-    if eval_score_save is not None:
-        return _print_eval_score_saved(eval_score_save, json_output=args.json)
-    eval_score_template = _eval_score_template_payload(
-        input_text,
-        context_file_path=args.context_file,
-    )
-    if eval_score_template is not None:
-        return _print_eval_score_template(eval_score_template, json_output=args.json)
-    eval_status = _eval_status_payload(input_text, context_file_path=args.context_file)
-    if eval_status is not None:
-        return _print_eval_status(eval_status, json_output=args.json)
+    eval_command_allowed = args.agent is None or _looks_like_explicit_eval_command(input_text)
+    if not _promptfoo_agent_eval_mode() and eval_command_allowed:
+        eval_score_save = _eval_score_save_payload(input_text, context_file_path=args.context_file)
+        if eval_score_save is not None:
+            return _print_eval_score_saved(eval_score_save, json_output=args.json)
+        eval_score_template = _eval_score_template_payload(
+            input_text,
+            context_file_path=args.context_file,
+        )
+        if eval_score_template is not None:
+            return _print_eval_score_template(eval_score_template, json_output=args.json)
+        eval_status = _eval_status_payload(input_text, context_file_path=args.context_file)
+        if eval_status is not None:
+            return _print_eval_status(eval_status, json_output=args.json)
     live_sdk = _ask_live_sdk_enabled(args)
     live_manual_plan = args.live_manual_plan or live_sdk
     live_search = args.live_search or (live_sdk and cli_default_live_research())
@@ -580,6 +606,17 @@ def _run_ask(args: argparse.Namespace) -> int:
                     default_enabled=_ask_route_session_default(route),
                 ),
                 cost_tracking_requested=cost_directive.requested,
+                database_url=args.database_url,
+            )
+        if mention.explicit and mention.route in CONTEXT_AGENT_ROUTES:
+            route = str(mention.route)
+            return _print_ask_dry_run(
+                route,
+                input_text,
+                json_output=args.json,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                database_url=args.database_url,
             )
         return _run_ask_work_item(
             input_text,
@@ -595,6 +632,7 @@ def _run_ask(args: argparse.Namespace) -> int:
             sdk_session_enabled=args.sdk_session,
             sdk_session_id=args.sdk_session_id,
             sdk_session_db_path=args.sdk_session_db,
+            sdk_session_history_limit=args.sdk_session_history_limit,
             cost_tracking_requested=cost_directive.requested,
         )
     route = args.agent
@@ -645,6 +683,7 @@ def _run_ask(args: argparse.Namespace) -> int:
                 default_enabled=_ask_route_session_default(route),
             ),
             cost_tracking_requested=cost_directive.requested,
+            database_url=args.database_url,
         )
     return _print_ask_dry_run(
         route,
@@ -671,6 +710,7 @@ def _eval_score_save_payload(
         return None
 
     try:
+        from promptfoo.eval_database import record_eval_trace_event, resolve_human_review_target
         from promptfoo.human_review import (
             DEFAULT_REVIEW_DB,
             parse_human_review,
@@ -709,7 +749,43 @@ def _eval_score_save_payload(
         }
 
     database_path = Path(os.environ.get("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB") or DEFAULT_REVIEW_DB)
+    try:
+        review = resolve_human_review_target(
+            review,
+            database_path=database_path,
+            require_recorded_response=True,
+        )
+    except ValueError as exc:
+        return {
+            "mode": "eval_score_saved",
+            "status": "blocked",
+            "route": "orchestrator",
+            "human_summary": f"Eval score was not saved: {exc}",
+            "error": str(exc),
+            "send_enabled": False,
+        }
     row_id = save_human_review(review, database_path=database_path)
+    record_eval_trace_event(
+        event_type="human_review_saved",
+        trace_id=f"human_review:{row_id}",
+        span_id=f"human_review_row:{row_id}",
+        name="human_eval_review_saved",
+        group_id=review.case_id,
+        metadata={
+            "schema": "keystone.eval_manual_trace.v1",
+            "case_id": review.case_id,
+            "run_id": review.run_id,
+            "agent": review.agent,
+            "source": "human_review",
+            "average_score": review.average_score,
+            "safety": review.safety,
+            "score_dimension_count": len(review.scores),
+            "slack_channel_name": review.slack_channel_name,
+            "has_slack_thread_ts": bool(review.slack_thread_ts),
+            "row_id": row_id,
+        },
+        database_path=database_path,
+    )
     dashboard = _render_promptfoo_dashboard(database_path)
     case_dashboard = _dashboard_case_link(dashboard, review.case_id)
     payload = review.to_dict()
@@ -730,6 +806,8 @@ def _eval_score_save_payload(
             "route": "orchestrator",
             "human_summary": summary,
             "database_path": str(database_path),
+            "refresh_targets": ["overview", "database", "runs_scoring", "analysis"],
+            "trace_event_type": "human_review_saved",
             "eval_thread_reply": _eval_thread_reply_guidance(
                 case_id=review.case_id,
                 run_id=review.run_id,
@@ -784,17 +862,33 @@ def _eval_score_template_payload(
     case_id = (
         _extract_eval_template_field(compact, "case")
         or inferred.get("case_id")
-        or "<case_id>"
+        or ""
     )
     run_id = _extract_eval_template_field(compact, "run") or inferred.get("run_id", "")
     agent = _extract_eval_template_field(compact, "agent") or inferred.get("agent", "")
+    if not case_id:
+        return {
+            "mode": "eval_score_template",
+            "status": "blocked",
+            "route": "orchestrator",
+            "case_id": "",
+            "run_id": run_id,
+            "agent": agent,
+            "human_summary": (
+                "I could not resolve the eval case from this thread. Use "
+                "`@KNI can you give me a scorecard for this eval?` in the eval "
+                "thread, or open the dashboard/review links from the eval footer "
+                "to confirm the linked case and run IDs."
+            ),
+            "send_enabled": False,
+        }
     template = build_slack_review_template(case_id=case_id, run_id=run_id, agent=agent)
     review_db_path = os.environ.get(
         "KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB",
         ".keystone/promptfoo/human-reviews.sqlite",
     )
     dashboard = _render_promptfoo_dashboard(Path(review_db_path))
-    case_dashboard = _dashboard_case_link(dashboard, case_id) if case_id != "<case_id>" else {}
+    case_dashboard = _dashboard_case_link(dashboard, case_id)
     return {
         "mode": "eval_score_template",
         "status": "done",
@@ -817,6 +911,23 @@ def _eval_score_template_payload(
     }
 
 
+def _looks_like_explicit_eval_command(input_text: str) -> bool:
+    lowered = " ".join(str(input_text or "").lower().split())
+    if not lowered:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:eval|evaluation|promptfoo)\b.{0,40}\b(?:status|summary|show|list|doing|progress|"
+            r"score|scorecard|scoring|rubric|grade|template|submit|save|record)\b"
+            r"|\b(?:status|summary|show|list|doing|progress|score|scorecard|scoring|rubric|"
+            r"grade|template|submit|save|record)\b.{0,40}\b(?:eval|evaluation|promptfoo)\b"
+            r"|\b(?:score\s+this|score\s+the|grade\s+this|review\s+this|human\s+score|"
+            r"scoring\s+template)\b",
+            lowered,
+        )
+    )
+
+
 def _looks_like_eval_human_score_reply(text: str) -> bool:
     return bool(
         re.search(
@@ -837,12 +948,16 @@ def _eval_status_payload(
     compact = " ".join(str(input_text or "").split())
     lowered = compact.lower()
     inferred = _eval_context_fields(context_file_path)
-    if "eval" not in lowered and "promptfoo" not in lowered and not inferred.get("case_id"):
+    explicit_eval_status = bool(
+        re.search(
+            r"\b(?:eval|evaluation|promptfoo)\b.{0,40}\b(?:status|summary|show|list|doing|progress)\b"
+            r"|\b(?:status|summary|show|list|doing|progress)\b.{0,40}\b(?:eval|evaluation|promptfoo)\b",
+            lowered,
+        )
+    )
+    if not explicit_eval_status and not inferred.get("case_id"):
         return None
-    if not any(
-        term in lowered
-        for term in ("status", "summary", "show", "list", "doing", "progress")
-    ):
+    if not re.search(r"\b(?:status|summary|show|list|doing|progress)\b", lowered):
         return None
     case_id = _extract_eval_template_field(compact, "case") or inferred.get("case_id", "")
     if not case_id:
@@ -869,8 +984,8 @@ def _eval_status_payload(
         else None
     )
     human = (
-        status.get("latest_human_review")
-        if isinstance(status.get("latest_human_review"), dict)
+        status.get("latest_target_human_review")
+        if isinstance(status.get("latest_target_human_review"), dict)
         else None
     )
     promptfoo_text = "no imported Promptfoo result"
@@ -899,7 +1014,7 @@ def _eval_status_payload(
         summary += f" Review form: {_slack_link(review_case['review_case_url'], 'score this case')}."
     latest_run = _latest_slack_eval_run(status)
     scorecard_request = (
-        f"@KNI can you give me a scorecard for this eval?"
+        "@KNI can you give me a scorecard for this eval?"
         if case_id
         else ""
     )
@@ -1052,10 +1167,12 @@ def _eval_thread_reply_guidance(
     run_id: str = "",
     dashboard_case_url: str = "",
     review_case_url: str = "",
-) -> dict[str, str]:
+) -> dict[str, object]:
     guidance = {
         "scorecard_request": "@KNI can you give me a scorecard for this eval?",
-        "status_request": "@KNI how is this eval doing?",
+        "submit_evaluation_action": "Submit Evaluation",
+        "submit_evaluation_effect": "Writes scores and human notes to the local eval database, then refreshes dashboard views.",
+        "refresh_targets": ["overview", "database", "runs_scoring", "analysis"],
         "case_id": case_id,
         "run_id": run_id,
     }
@@ -1092,6 +1209,7 @@ def _sdk_session_spec_for_ask(
         enabled=getattr(args, "sdk_session", None),
         explicit_session_id=str(getattr(args, "sdk_session_id", "") or ""),
         database_path=str(getattr(args, "sdk_session_db", "") or ""),
+        history_limit=getattr(args, "sdk_session_history_limit", None),
         default_enabled=default_enabled,
     )
 
@@ -1315,6 +1433,16 @@ def _slack_context_metadata(context_file_path: str) -> dict[str, str]:
     return metadata
 
 
+def _slack_context_payload(context_file_path: str) -> dict[str, Any]:
+    if not context_file_path:
+        return {}
+    try:
+        data = json.loads(Path(context_file_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _eval_context_fields(context_file_path: str) -> dict[str, str]:
     """Infer eval identifiers from a Slack context file for natural follow-ups."""
 
@@ -1461,6 +1589,7 @@ def _run_ask_work_item(
     sdk_session_enabled: bool | None = None,
     sdk_session_id: str = "",
     sdk_session_db_path: str = "",
+    sdk_session_history_limit: int | None = None,
     cost_tracking_requested: bool = False,
 ) -> int:
     try:
@@ -1487,6 +1616,7 @@ def _run_ask_work_item(
                 sdk_session_enabled=sdk_session_enabled,
                 sdk_session_id=sdk_session_id,
                 sdk_session_db_path=sdk_session_db_path,
+                sdk_session_history_limit=sdk_session_history_limit,
                 cost_tracking_requested=cost_tracking_requested,
                 **_workflow_cost_options_for_request_context(
                     request_text=input_text,
@@ -1506,12 +1636,23 @@ def _run_ask_work_item(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
         )
-    eval_record = _record_eval_slack_run_if_requested(
-        input_text,
-        context_file_path=context_file_path,
-        result=result,
-    )
+    eval_record = None
+    if not _promptfoo_agent_eval_mode():
+        eval_record = _record_eval_slack_run_if_requested(
+            input_text,
+            context_file_path=context_file_path,
+            result=result,
+        )
     return _print_work_item_result(result, json_output=json_output, eval_record=eval_record)
+
+
+def _promptfoo_agent_eval_mode() -> bool:
+    return str(os.environ.get("KEYSTONE_PROMPTFOO_EVAL") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _record_eval_slack_run_if_requested(
@@ -1551,20 +1692,58 @@ def _record_eval_slack_run_if_requested(
     if not case_id:
         return None
     summary = _eval_run_result_summary(result)
+    evidence = _cli_slack_eval_evidence(
+        slack_context_payload=_slack_context_payload(context_file_path),
+        result=result,
+        run_id=run_id,
+        summary=summary,
+    )
     try:
         row_id = record_slack_eval_run(
             case_id=case_id,
             run_id=run_id,
             agent=agent,
+            work_item_id=run_id,
             slack_channel_id=slack_context.get("channel_id", "C0BA17Y9C01"),
             slack_channel_name=slack_context.get("channel_name", "evals"),
             slack_thread_ts=slack_context.get("thread_ts", ""),
             request_text=input_text,
             result_summary=summary,
+            route=str(evidence.get("route") or agent),
+            status=str(evidence.get("status") or ""),
+            context_policy=str(evidence.get("context_policy") or ""),
+            thread_fetch_status=str(evidence.get("thread_fetch_status") or ""),
+            thread_message_count=int(evidence.get("thread_message_count") or 0),
+            warning_count=int(evidence.get("warning_count") or 0),
+            warnings=[str(item) for item in evidence.get("warnings") or []],
+            cost_profile=str(evidence.get("cost_profile") or ""),
+            source_count=int(evidence.get("source_count") or 0),
+            visible_source_count=int(evidence.get("visible_source_count") or 0),
+            sdk_estimated_cost_usd=evidence.get("sdk_estimated_cost_usd"),
+            sdk_cache_hit_rate=evidence.get("sdk_cache_hit_rate"),
+            response_hash=str(evidence.get("response_hash") or ""),
+            evidence=evidence,
+            model_provider=str(evidence.get("model_provider") or ""),
+            model_name=str(evidence.get("model_name") or ""),
+            run_mode=str(evidence.get("run_mode") or ""),
+            search_provider=str(evidence.get("search_provider") or ""),
+            search_provider_sequence=[
+                str(item) for item in evidence.get("search_provider_sequence") or []
+            ],
             database_path=database_path,
         )
     except (OSError, ValueError):
         return None
+    try:
+        from promptfoo.eval_dashboard import slack_run_post_save_state
+
+        post_save_state = slack_run_post_save_state(
+            case_id=case_id,
+            row_id=row_id,
+            database_path=database_path,
+        )
+    except (ImportError, OSError, ValueError, sqlite3.Error):
+        post_save_state = {}
     dashboard = _render_promptfoo_dashboard(database_path)
     case_dashboard = _dashboard_case_link(dashboard, case_id)
     review_case = _review_case_link(case_id)
@@ -1575,8 +1754,12 @@ def _record_eval_slack_run_if_requested(
         "agent": agent,
         "database_path": str(database_path),
         "slack_thread_ts": slack_context.get("thread_ts", ""),
+        "evidence": evidence,
+        "post_save_state": post_save_state,
+        "dashboard_visibility": post_save_state.get("dashboard_visibility", {}),
+        "refresh_endpoints": post_save_state.get("refresh_endpoints", []),
         "scorecard_request": "@KNI can you give me a scorecard for this eval?",
-        "status_request": "@KNI how is this eval doing?",
+        "submit_evaluation_action": "Submit Evaluation",
         "eval_thread_reply": _eval_thread_reply_guidance(
             case_id=case_id,
             run_id=run_id,
@@ -1598,6 +1781,130 @@ def _extract_eval_run_case_id(input_text: str, *, context_file_path: str = "") -
     if "eval" not in lowered and "promptfoo" not in lowered:
         return ""
     return _extract_eval_template_field(compact, "case")
+
+
+def _cli_slack_eval_evidence(
+    *,
+    slack_context_payload: dict[str, Any],
+    result: WorkflowRunResult,
+    run_id: str,
+    summary: str,
+) -> dict[str, Any]:
+    result_payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else {}
+    work_item = result_payload.get("work_item") if isinstance(result_payload.get("work_item"), dict) else {}
+    target = work_item.get("target") if isinstance(work_item.get("target"), dict) else {}
+    metadata = target.get("metadata") if isinstance(target.get("metadata"), dict) else {}
+    slack_context = (
+        metadata.get("slack_context") if isinstance(metadata.get("slack_context"), dict) else {}
+    )
+    query_prompt = (
+        slack_context.get("query_prompt")
+        if isinstance(slack_context.get("query_prompt"), dict)
+        else {}
+    )
+    context_query_prompt = (
+        slack_context_payload.get("query_prompt")
+        if isinstance(slack_context_payload.get("query_prompt"), dict)
+        else {}
+    )
+    thread_messages = (
+        slack_context.get("thread_messages")
+        or slack_context_payload.get("thread_messages")
+        or []
+    )
+    message_count = len(thread_messages) if isinstance(thread_messages, list) else 0
+    if not message_count and str(slack_context_payload.get("read_context") or "").strip():
+        message_count = 1
+    thread_fetch_status = str(
+        slack_context.get("thread_fetch_status")
+        or slack_context_payload.get("thread_fetch_status")
+        or ("ok" if message_count else "not_requested")
+    )
+    warnings = [
+        str(item)
+        for item in (
+            slack_context.get("warnings")
+            or slack_context_payload.get("warnings")
+            or []
+        )
+    ]
+    sources = work_item.get("sources") if isinstance(work_item.get("sources"), list) else []
+    sdk_usage = _latest_event_metadata(result_payload, "usage")
+    sdk_cost = _latest_event_metadata(result_payload, "cost")
+    model = result_payload.get("model") if isinstance(result_payload.get("model"), dict) else {}
+    retrieval = (
+        result_payload.get("retrieval")
+        if isinstance(result_payload.get("retrieval"), dict)
+        else {}
+    )
+    evidence = {
+        "schema": "keystone.slack.eval_evidence.v1",
+        "source": "cli_slack_context",
+        "work_item_id": str(run_id or work_item.get("id") or ""),
+        "route": str(result_payload.get("route") or ""),
+        "status": str(result_payload.get("status") or ""),
+        "context_policy": str(
+            slack_context.get("prompt_context_layout")
+            or slack_context.get("channel_history_policy")
+            or slack_context_payload.get("context_scope")
+            or slack_context_payload.get("schema")
+            or ""
+        ),
+        "thread_fetch_status": thread_fetch_status,
+        "thread_message_count": message_count,
+        "warning_count": len(warnings),
+        "warnings": warnings[:8],
+        "cost_profile": str(
+            query_prompt.get("cost_profile")
+            or context_query_prompt.get("cost_profile")
+            or slack_context_payload.get("cost_profile")
+            or ""
+        ),
+        "source_count": len(sources),
+        "visible_source_count": sum(1 for item in sources if isinstance(item, dict) and item.get("url")),
+        "sdk_estimated_cost_usd": _number_or_none(
+            sdk_cost.get("estimated_usd") or sdk_cost.get("amount_usd")
+        ),
+        "sdk_cache_hit_rate": _number_or_none(sdk_usage.get("cache_hit_rate")),
+        "response_hash": _hash_text(summary) if summary else "",
+        "response_summary_chars": len(summary),
+        "model_provider": str(model.get("provider") or ""),
+        "model_name": str(model.get("name") or model.get("model") or ""),
+        "run_mode": str(model.get("run_mode") or ""),
+        "search_provider": str(retrieval.get("search_provider") or retrieval.get("provider") or ""),
+        "search_provider_sequence": [
+            str(item) for item in retrieval.get("search_provider_sequence") or []
+        ],
+    }
+    blocker_diagnostics = slack_eval_blocker_diagnostics(result_payload)
+    if blocker_diagnostics:
+        evidence["blocker_diagnostics"] = blocker_diagnostics
+    return evidence
+
+
+def _latest_event_metadata(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for event in payload.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        value = metadata.get(key) if isinstance(metadata.get(key), dict) else {}
+        if value:
+            candidates.append(value)
+    return candidates[-1] if candidates else {}
+
+
+def _number_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:16]
 
 
 def _eval_run_result_summary(result: WorkflowRunResult) -> str:
@@ -1699,6 +2006,7 @@ def _run_ask_orchestrator(
     orchestrator_preflight: OrchestratorPreflight | None = None,
     sdk_session_spec: SDKSessionSpec | None = None,
     cost_tracking_requested: bool = False,
+    database_url: str | None = None,
 ) -> int:
     sdk_result = None
     if live_sdk:
@@ -1751,17 +2059,32 @@ def _print_ask_dry_run(
     database_url: str | None = None,
 ) -> int:
     agent = AGENT_REGISTRY[route].build_agent()
+    context_agent_output = _context_agent_dry_run_output(route, input_text, manual_plan)
     chief_of_staff_output = (
         plan_chief_of_staff_request(
             input_text,
             database_url=database_url,
             manual_request_plan=manual_plan,
         )
-        if route == "chief_of_staff"
+        if route == "chief_of_staff" and context_agent_output is None
         else None
+    )
+    output_payload = (
+        context_agent_output.model_dump(mode="json")
+        if context_agent_output is not None
+        else chief_of_staff_output.model_dump(mode="json")
+        if chief_of_staff_output
+        else None
+    )
+    status = (
+        "blocked"
+        if context_agent_output is not None and _context_agent_output_has_blockers(output_payload)
+        else "done"
     )
     payload = {
         "mode": "dry_run",
+        "status": status,
+        "route": route,
         "selected_agent": route,
         "agent_name": _agent_display_name(route),
         "sdk_agent_name": agent.name,
@@ -1769,9 +2092,25 @@ def _print_ask_dry_run(
         "send_enabled": False,
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
         "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
-        "output": (
-            chief_of_staff_output.model_dump(mode="json") if chief_of_staff_output else None
-        ),
+        "output": output_payload,
+        "human_summary": _context_agent_human_summary(output_payload)
+        if context_agent_output is not None
+        else "",
+        "blockers": _context_agent_blocker_messages(output_payload),
+        "side_effects": {
+            "schema": "keystone.promptfoo.side_effects.v1",
+            "email_sent": False,
+            "gmail_draft_created": False,
+            "gmail_label_changed": False,
+            "slack_message_posted": False,
+            "crm_write_performed": False,
+            "calendar_write_performed": False,
+            "external_file_write_performed": False,
+            "external_write_performed": False,
+            "blocked_write_attempts": _context_agent_blocked_write_attempts(output_payload),
+            "approval_ref": "",
+            "evidence_complete": True,
+        },
         "note": (
             "Dry-run selected the specialist but did not call a model. "
             "Re-run with --live-sdk to execute."
@@ -1802,6 +2141,328 @@ def _print_ask_dry_run(
     return 0
 
 
+def _context_agent_dry_run_output(
+    route: str,
+    input_text: str,
+    manual_plan: ManualRequestPlan | None,
+) -> AirtableContextResult | GoogleWorkspaceContextResult | ZoteroContextResult | None:
+    """Return deterministic no-API context-agent output for direct dry-run evals."""
+
+    blocked = _context_agent_request_is_blocked(input_text)
+    objective = (
+        manual_plan.objective
+        if manual_plan and manual_plan.objective
+        else input_text.strip().strip('"')
+    )
+    if route == "airtable_context_agent":
+        blockers = (
+            [
+                "Missing Airtable record id, field mapping, and approval reference for base alias eval_tracker and table Eval tracker."
+            ]
+            if blocked
+            else []
+        )
+        return AirtableContextResult(
+            mode="deterministic",
+            summary=(
+                "Airtable read-only context: base alias eval_tracker and table Eval tracker "
+                "need metadata and schema mapping for Promptfoo case id, Slack run id, "
+                "human reviewer, missing evidence, and next follow-up. Record identity "
+                "must be confirmed before any Chief-owned write; approval needs and "
+                "no-write boundaries stay explicit."
+            )
+            if not blocked
+            else (
+                "Airtable blocker: for base alias eval_tracker and table Eval tracker, record "
+                "id, field mapping, and approval reference are required before Chief of Staff "
+                "can approve any tracker write."
+            ),
+            base_alias="eval_tracker",
+            relevant_tables=["Eval tracker"],
+            relevant_fields=[
+                "Promptfoo case id",
+                "Slack run id",
+                "human reviewer",
+                "missing evidence",
+                "next follow-up",
+            ],
+            recommended_record_identity=(
+                "Match on Promptfoo case id plus Slack run id; ask for record id when absent."
+            ),
+            recommended_actions=[
+                "Read Airtable schema before records.",
+                "Return candidate record identity questions.",
+                "Keep all Airtable writes Chief-owned and approval gated.",
+            ],
+            write_plan=OperationalWritePlan(
+                target_system="airtable",
+                operation="chief_owned_update_after_approval",
+                target="Eval tracker record",
+                scope="case status, reviewer, evidence gap, next follow-up fields",
+                field_mapping=[
+                    OperationalContextEntry(key="case_id", value="Promptfoo case id"),
+                    OperationalContextEntry(key="run_id", value="Slack run id"),
+                    OperationalContextEntry(key="reviewer", value="human reviewer"),
+                    OperationalContextEntry(key="evidence_gap", value="missing evidence"),
+                    OperationalContextEntry(key="next_follow_up", value="next follow-up"),
+                ],
+                rationale="Specialist is read-only; Chief of Staff owns any approved write.",
+            ),
+            blockers=blockers,
+            approval_needs=[
+                "Scoped Airtable approval reference",
+                "Confirmed base/table/record identity",
+            ],
+            human_work_context=HumanWorkContext(
+                work_functions=["eval tracking", "human review coordination"],
+                human_owner_hint="Chief of Staff",
+                decision_needed="Confirm exact Airtable target before any write.",
+                handoff_ready_context=["schema mapping", "record identity questions"],
+                missing_context=blockers,
+                integration_surfaces=["Airtable"],
+                follow_up_actions=["request scoped approval", "confirm target record"],
+            ),
+            diagnostics=[
+                OperationalContextEntry(key="dry_run", value="true"),
+                OperationalContextEntry(key="objective", value=objective),
+            ],
+        )
+    if route == "google_workspace_context_agent":
+        blockers = (
+            [
+                "Missing Drive folder id, document id, Sheet tab, approval reference, and sharing scope."
+            ]
+            if blocked
+            else []
+        )
+        return GoogleWorkspaceContextResult(
+            mode="deterministic",
+            summary=(
+                "Google Workspace read-only context: use Drive folder KNI Ops / Evals for "
+                "artifact placement, Doc Slack eval review narrative for review notes, and "
+                "Eval tracker Sheet for eval tracking metadata. Use a naming convention tied "
+                "to case id/run id. Approval and no-write blockers must be resolved before "
+                "creating, editing, sharing, or commenting."
+            )
+            if not blocked
+            else (
+                "Google Workspace blocker: for Drive folder KNI Ops / Evals, Slack eval review "
+                "narrative, and Eval tracker Sheet, folder id, document id, Sheet tab, sharing "
+                "scope, and approval reference are required before any Drive, Doc, or Sheet write."
+            ),
+            relevant_folders=["KNI Ops / Evals"],
+            relevant_docs=["Slack eval review narrative"],
+            relevant_sheets=["Eval tracker Sheet tab"],
+            recommended_target="KNI Ops / Evals / Slack eval review",
+            recommended_actions=[
+                "List scoped Drive folder before selecting an artifact home.",
+                "Read existing Doc or Sheet context before proposing changes.",
+                "Keep all Workspace writes Chief-owned and approval gated.",
+            ],
+            write_plan=OperationalWritePlan(
+                target_system="google_workspace",
+                operation="chief_owned_artifact_update_after_approval",
+                target="Drive folder, review Doc, or tracker Sheet",
+                scope="artifact placement, narrative notes, tracker row, naming convention",
+                field_mapping=[
+                    OperationalContextEntry(key="folder", value="candidate Drive folder"),
+                    OperationalContextEntry(key="doc", value="review narrative Doc"),
+                    OperationalContextEntry(key="sheet_tab", value="eval tracker tab"),
+                    OperationalContextEntry(key="name", value="case id and run id naming convention"),
+                ],
+                rationale="Specialist is read-only; Chief of Staff owns any approved Workspace write.",
+            ),
+            blockers=blockers,
+            approval_needs=[
+                "Scoped Google Workspace approval reference",
+                "Confirmed folder/file/tab identity and sharing scope",
+            ],
+            human_work_context=HumanWorkContext(
+                work_functions=["artifact governance", "eval reporting"],
+                human_owner_hint="Chief of Staff",
+                decision_needed="Confirm artifact home and sharing scope.",
+                handoff_ready_context=["Drive candidate", "Doc purpose", "Sheet tab purpose"],
+                missing_context=blockers,
+                integration_surfaces=["Google Drive", "Google Docs", "Google Sheets"],
+                follow_up_actions=["request scoped approval", "confirm artifact target"],
+            ),
+            diagnostics=[
+                OperationalContextEntry(key="dry_run", value="true"),
+                OperationalContextEntry(key="objective", value=objective),
+            ],
+        )
+    if route == "zotero_context_agent":
+        return ZoteroContextResult(
+            mode="deterministic",
+            summary=(
+                "Zotero read-only context: KNI collections for behavioral-health AI validation need "
+                "collection criteria and article metadata including title, authors, year, DOI, "
+                "URL, validation evidence, measurement-based care, implementation science, "
+                "source-quality caveats, citation gaps, and next verification steps for "
+                "behavioral-health AI eval prompts."
+            ),
+            library_context="KNI Zotero collections in the Keystone research library",
+            collection_hints=[
+                "KNI collections",
+                "behavioral-health AI validation",
+                "measurement-based care",
+                "implementation science",
+            ],
+            relevant_evidence=[
+                "Prioritize validation evidence over vendor claims.",
+                "Flag source-quality caveats and citation gaps.",
+            ],
+            recommended_artifact_plan=OperationalWritePlan(
+                target_system="google_workspace",
+                operation="chief_owned_research_summary_after_approval",
+                target="internal evidence packet",
+                scope="Zotero collection criteria and citation-gap summary",
+                rationale="Zotero specialist is read-only and never mutates library items.",
+            ),
+            recommended_actions=[
+                "Search collection metadata before citing items.",
+                "Separate validation evidence from implementation context.",
+                "Return citation gaps and next verification steps.",
+            ],
+            approval_needs=[
+                "Scoped approval before creating any Workspace artifact from Zotero context"
+            ],
+            human_work_context=HumanWorkContext(
+                work_functions=["research evidence review", "eval source quality"],
+                human_owner_hint="Chief of Staff",
+                decision_needed="Confirm which evidence packet should use the Zotero criteria.",
+                handoff_ready_context=["collection criteria", "citation gaps"],
+                missing_context=[],
+                integration_surfaces=["Zotero", "Google Workspace"],
+                follow_up_actions=["verify citations", "request artifact approval if needed"],
+            ),
+            diagnostics=[
+                OperationalContextEntry(key="dry_run", value="true"),
+                OperationalContextEntry(key="objective", value=objective),
+            ],
+        )
+    return None
+
+
+def _context_agent_request_is_blocked(input_text: str) -> bool:
+    lowered = input_text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "user says update",
+            "user asks to save",
+            "no base",
+            "no folder id",
+            "no document id",
+            "no sheet tab",
+            "no approval reference",
+            "no sharing scope",
+        )
+    )
+
+
+def _context_agent_output_has_blockers(output: object) -> bool:
+    return bool(output and isinstance(output, dict) and output.get("blockers"))
+
+
+def _context_agent_blocker_messages(output: object) -> list[dict[str, str]]:
+    if not isinstance(output, dict):
+        return []
+    return [{"message": str(item)} for item in output.get("blockers") or [] if str(item)]
+
+
+def _context_agent_blocked_write_attempts(output: object) -> list[str]:
+    if not isinstance(output, dict):
+        return []
+    agent_name = str(output.get("agent_name") or "")
+    blockers = [str(item) for item in output.get("blockers") or [] if str(item)]
+    if blockers:
+        return [f"{agent_name}: blocked write request pending exact target and approval"]
+    return [f"{agent_name}: no write attempted in dry-run"]
+
+
+def _context_agent_human_summary(output: object) -> str:
+    if not isinstance(output, dict):
+        return ""
+    summary = str(output.get("summary") or "").strip()
+    approval_needs = [
+        str(item).strip() for item in output.get("approval_needs") or [] if str(item).strip()
+    ]
+    blockers = [str(item).strip() for item in output.get("blockers") or [] if str(item).strip()]
+    parts: list[str] = []
+    if summary:
+        parts.append(f"Answer:\n{summary}")
+    detail_lines: list[str] = []
+    record_lines = _context_agent_record_summary_lines(output)
+    if record_lines:
+        detail_lines.append("- Records visible:")
+        detail_lines.extend(record_lines)
+    reference_lines = _context_agent_reference_summary_lines(output)
+    if reference_lines:
+        detail_lines.append("- Useful references:")
+        detail_lines.extend(reference_lines)
+    if approval_needs:
+        if len(approval_needs) == 1:
+            detail_lines.append(f"- Approval/write boundary: {approval_needs[0]}.")
+        else:
+            detail_lines.append("- Approval/write boundary:")
+            detail_lines.extend(f"  - {item}" for item in approval_needs)
+    if blockers:
+        if len(blockers) == 1:
+            detail_lines.append(f"- Needs attention: {blockers[0]}.")
+        else:
+            detail_lines.append("- Needs attention:")
+            detail_lines.extend(f"  - {item}" for item in blockers)
+    if detail_lines:
+        parts.append("Detailed answer:\n" + "\n".join(detail_lines))
+    return "\n\n".join(part for part in parts if part)
+
+
+def _context_agent_reference_summary_lines(output: dict[str, object]) -> list[str]:
+    sources = output.get("sources")
+    if not isinstance(sources, list):
+        return []
+    lines: list[str] = []
+    for source in sources[:5]:
+        if not isinstance(source, dict):
+            continue
+        title = str(source.get("title") or "").strip()
+        note = str(source.get("note") or "").strip()
+        location = str(source.get("location") or "").strip()
+        if not title:
+            continue
+        label = title
+        if note:
+            label = f"{label} - {note}"
+        if location:
+            label = f"{label} ({location})"
+        lines.append(f"  - {label}")
+    return lines
+
+
+def _context_agent_record_summary_lines(output: dict[str, object]) -> list[str]:
+    entries = output.get("record_summaries")
+    if not isinstance(entries, list):
+        return []
+    lines: list[str] = []
+    for entry in entries[:5]:
+        if isinstance(entry, dict):
+            key = str(entry.get("key") or "").strip()
+            value = str(entry.get("value") or "").strip()
+            note = str(entry.get("note") or "").strip()
+        else:
+            key = ""
+            value = str(entry or "").strip()
+            note = ""
+        if not value and not key:
+            continue
+        label = f"{key}: {value}" if key and value else key or value
+        if note:
+            label = f"{label} ({note})"
+        lines.append(f"  - {label}")
+    return lines
+
+
 def _run_ask_specialist_live(
     route: str,
     input_text: str,
@@ -1811,6 +2472,7 @@ def _run_ask_specialist_live(
     orchestrator_preflight: OrchestratorPreflight | None = None,
     sdk_session_spec: SDKSessionSpec | None = None,
     cost_tracking_requested: bool = False,
+    database_url: str | None = None,
 ) -> int:
     load_settings(force_dotenv=True)
     if route == "business_research_analyst":
@@ -1821,6 +2483,7 @@ def _run_ask_specialist_live(
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
             cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
         )
     elif route == "chief_of_staff":
         return _run_ask_chief_of_staff_live(
@@ -1830,6 +2493,7 @@ def _run_ask_specialist_live(
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
             cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
         )
     elif route == "opportunity_scout":
         return _run_ask_opportunity_scout_live(
@@ -1839,6 +2503,7 @@ def _run_ask_specialist_live(
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
             cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
         )
     elif route == "outreach_composer":
         return _run_ask_outreach_composer_live(
@@ -1848,6 +2513,7 @@ def _run_ask_specialist_live(
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
             cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
         )
     elif route == "gmail_triage":
         return _run_ask_gmail_triage_live(
@@ -1857,9 +2523,141 @@ def _run_ask_specialist_live(
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
             cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
+        )
+    elif route in CONTEXT_AGENT_ROUTES:
+        return _run_ask_context_agent_live(
+            route,
+            input_text,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_spec=sdk_session_spec,
+            cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
         )
     else:
         raise SystemExit(f"Unsupported agent route: {route}")
+
+
+def _run_ask_context_agent_live(
+    route: str,
+    input_text: str,
+    *,
+    json_output: bool,
+    manual_plan: ManualRequestPlan | None = None,
+    orchestrator_preflight: OrchestratorPreflight | None = None,
+    sdk_session_spec: SDKSessionSpec | None = None,
+    cost_tracking_requested: bool = False,
+    database_url: str | None = None,
+) -> int:
+    spec = AGENT_REGISTRY[route]
+    agent = spec.build_agent(request_text=input_text)
+    model_config = get_runtime_agent_model_config(
+        getattr(agent, "name", None),
+        model_override=getattr(agent, "model", None),
+    )
+    output_type = spec.resolve_output_schema()
+    live_read_env_names = {
+        "airtable_context_agent": AIRTABLE_LIVE_READS_ENV,
+        "google_workspace_context_agent": GOOGLE_WORKSPACE_LIVE_READS_ENV,
+    }
+    live_read_env_name = live_read_env_names.get(route)
+    previous_live_reads = os.environ.get(live_read_env_name) if live_read_env_name else None
+    if live_read_env_name:
+        os.environ[live_read_env_name] = "true"
+    try:
+        raw_result, output = run_typed_sdk_sync(
+            agent,
+            input_text,
+            output_type,
+            live=True,
+            session=build_sdk_session(sdk_session_spec) if sdk_session_spec else None,
+            workflow_name=f"keystone.ask.{route}",
+            trace_metadata={
+                "agent": route,
+                "entrypoint": "cli.ask",
+                "mode": "live_sdk",
+            },
+            max_turns=8,
+        )
+    finally:
+        if live_read_env_name:
+            if previous_live_reads is None:
+                os.environ.pop(live_read_env_name, None)
+            else:
+                os.environ[live_read_env_name] = previous_live_reads
+    output_payload = output.model_dump(mode="json")
+    review = review_specialist_output(
+        agent_name=route,
+        output=output_payload,
+        request_summary=input_text,
+        run_type="live_sdk",
+    )
+    payload = {
+        "mode": "live_sdk",
+        "status": "done",
+        "selected_agent": route,
+        "route": route,
+        "agent_name": _agent_display_name(route),
+        "sdk_agent_name": agent.name,
+        "input": input_text,
+        "send_enabled": False,
+        "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+        "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
+        "cost_tracking_requested": cost_tracking_requested,
+        "output_type": type(output).__name__,
+        "orchestrator_review": review.model_dump(mode="json"),
+        "output": output_payload,
+        "human_summary": _context_agent_human_summary(output_payload),
+        "blockers": _context_agent_blocker_messages(output_payload),
+        "side_effects": {
+            "schema": "keystone.promptfoo.side_effects.v1",
+            "email_sent": False,
+            "gmail_draft_created": False,
+            "gmail_label_changed": False,
+            "slack_message_posted": False,
+            "crm_write_performed": False,
+            "calendar_write_performed": False,
+            "external_file_write_performed": False,
+            "external_write_performed": False,
+            "blocked_write_attempts": _context_agent_blocked_write_attempts(output_payload),
+            "approval_ref": "",
+            "evidence_complete": True,
+        },
+    }
+    usage = getattr(raw_result, "usage", None)
+    if usage is not None:
+        payload["usage"] = getattr(usage, "model_dump", lambda **_: str(usage))(mode="json")
+        payload["cost"] = estimate_usage_cost(
+            provider=model_config.provider,
+            model=model_config.model,
+            usage=payload["usage"] if isinstance(payload["usage"], dict) else {},
+        )
+    payload["model_execution"] = {
+        "provider": model_config.provider,
+        "model": model_config.model,
+        "run_mode": "live_sdk",
+        "usage_available": isinstance(payload.get("usage"), dict),
+        "cost_available": isinstance(payload.get("cost"), dict),
+        "base_url_configured": bool(model_config.base_url),
+        "gateway_mode": bool(model_config.use_responses is False and model_config.base_url),
+    }
+    try:
+        run_id = SQLiteStore(database_url or database_url_from_env()).save_agent_run(
+            agent_name=route,
+            input_payload={"request_text": input_text, "route": route},
+            input_summary=input_text[:500],
+            output=payload,
+            model=f"sdk-live:{model_config.model}",
+            dry_run=False,
+            status="success",
+        )
+        payload["agent_run_id"] = run_id
+    except Exception as exc:  # pragma: no cover - diagnostic metadata only
+        payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
+    return _print_ask_live_payload(payload, json_output=json_output)
 
 
 def _run_ask_company_research_live(
@@ -1870,6 +2668,7 @@ def _run_ask_company_research_live(
     orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
     cost_tracking_requested: bool,
+    database_url: str | None = None,
 ) -> int:
     target = (manual_plan.primary_target if manual_plan else "") or input_text[:120]
     if not target.strip():
@@ -1909,6 +2708,7 @@ def _run_ask_company_research_live(
         orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
         cost_tracking_requested=cost_tracking_requested,
+        database_url=database_url,
     )
 
 
@@ -1933,6 +2733,7 @@ def _run_ask_chief_of_staff_live(
     orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
     cost_tracking_requested: bool,
+    database_url: str | None = None,
 ) -> int:
     command = [
         sys.executable,
@@ -1951,6 +2752,22 @@ def _run_ask_chief_of_staff_live(
         orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
         cost_tracking_requested=cost_tracking_requested,
+        database_url=database_url,
+    )
+
+
+def _request_forbids_live_research(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\b"
+            r"[^.;\n]{0,180}\b"
+            r"(?:web\s+search|live\s+web|external\s+(?:search|research|tools?)|"
+            r"browser\s+automation|research\s+externally)\b",
+            normalized,
+        )
     )
 
 
@@ -1962,8 +2779,26 @@ def _run_ask_opportunity_scout_live(
     orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
     cost_tracking_requested: bool,
+    database_url: str | None = None,
 ) -> int:
     max_results = manual_plan.desired_count if manual_plan else 3
+    if _request_forbids_live_research(input_text):
+        return _run_ask_work_item(
+            input_text,
+            database_url=database_url,
+            live_search=False,
+            live_sdk=True,
+            max_results=max(1, min(10, max_results)),
+            json_output=json_output,
+            max_manager_steps=3,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
+            sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
+            sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
+            sdk_session_history_limit=sdk_session_spec.history_limit if sdk_session_spec else None,
+            cost_tracking_requested=cost_tracking_requested,
+        )
     target = (manual_plan.primary_target if manual_plan else "") or input_text
     command = [
         sys.executable,
@@ -1987,6 +2822,7 @@ def _run_ask_opportunity_scout_live(
         orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
         cost_tracking_requested=cost_tracking_requested,
+        database_url=database_url,
     )
 
 
@@ -1998,6 +2834,7 @@ def _run_ask_gmail_triage_live(
     orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
     cost_tracking_requested: bool,
+    database_url: str | None = None,
 ) -> int:
     gmail_plan = infer_gmail_execution_plan(input_text)
     explicit_fixture_path = _gmail_direct_fixture_path(input_text)
@@ -2029,6 +2866,7 @@ def _run_ask_gmail_triage_live(
             sdk_session_spec=sdk_session_spec,
             agent_execution_plan=gmail_plan.model_dump(mode="json"),
             cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
         )
     if gmail_plan.operation == "draft_reply" and explicit_fixture_path is None:
         return _print_ask_clarification(
@@ -2074,6 +2912,8 @@ def _run_ask_gmail_triage_live(
         "scripts/run_gmail_triage.py",
         "--fixture",
         selected_fixture,
+        "--no-live-gmail",
+        "--no-allow-inbox",
         "--request",
         input_text,
         "--live-sdk",
@@ -2092,6 +2932,7 @@ def _run_ask_gmail_triage_live(
             sdk_session_spec=sdk_session_spec,
             agent_execution_plan=gmail_plan.model_dump(mode="json"),
             cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
         )
     finally:
         if temp_path is not None:
@@ -2106,9 +2947,9 @@ def _gmail_direct_fixture_path(input_text: str) -> Path | None:
         return None
     try:
         path = Path(input_text).expanduser()
+        return path if path.is_file() else None
     except (OSError, RuntimeError):
         return None
-    return path if path.is_file() else None
 
 
 def _run_ask_outreach_composer_live(
@@ -2119,8 +2960,26 @@ def _run_ask_outreach_composer_live(
     orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
     cost_tracking_requested: bool,
+    database_url: str | None = None,
 ) -> int:
     outreach_plan = infer_outreach_execution_plan(input_text)
+    if outreach_plan.approved_inline_context_available:
+        return _run_ask_work_item(
+            input_text,
+            database_url=database_url,
+            live_search=False,
+            live_sdk=True,
+            max_results=3,
+            json_output=json_output,
+            max_manager_steps=3,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
+            sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
+            sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
+            sdk_session_history_limit=sdk_session_spec.history_limit if sdk_session_spec else None,
+            cost_tracking_requested=cost_tracking_requested,
+        )
     if not outreach_plan.use_default_approved_fixture_for_backend_test:
         return _print_ask_outreach_context_blocked(
             input_text,
@@ -2155,6 +3014,7 @@ def _run_ask_outreach_composer_live(
         sdk_session_spec=sdk_session_spec,
         agent_execution_plan=outreach_plan.model_dump(mode="json"),
         cost_tracking_requested=cost_tracking_requested,
+        database_url=database_url,
     )
 
 
@@ -2200,6 +3060,7 @@ def _run_ask_script_live(
     sdk_session_spec: SDKSessionSpec | None = None,
     agent_execution_plan: dict[str, object] | None = None,
     cost_tracking_requested: bool = False,
+    database_url: str | None = None,
 ) -> int:
     env = None
     child_env = orchestrator_preflight_env(orchestrator_preflight)
@@ -2272,8 +3133,9 @@ def _run_ask_script_live(
                 "failure": failure.to_dict(),
                 "error_type": "child_process_failed",
                 "returncode": int(completed.returncode),
-                "stderr_excerpt": _redacted_child_output(completed.stderr),
-                "stdout_excerpt": _redacted_child_output(completed.stdout),
+                "stderr_excerpt": _redacted_child_output(completed.stderr, max_chars=4000),
+                "stdout_excerpt": _redacted_child_output(completed.stdout, max_chars=4000),
+                "error_tail": _redacted_child_tail(completed.stderr or completed.stdout),
                 "next_step": failure.next_step,
             },
         }
@@ -2305,8 +3167,9 @@ def _run_ask_script_live(
                 "failure": failure.to_dict(),
                 "error_type": "child_process_malformed_json",
                 "parse_error": str(exc),
-                "stderr_excerpt": _redacted_child_output(completed.stderr),
-                "stdout_excerpt": _redacted_child_output(completed.stdout),
+                "stderr_excerpt": _redacted_child_output(completed.stderr, max_chars=4000),
+                "stdout_excerpt": _redacted_child_output(completed.stdout, max_chars=4000),
+                "error_tail": _redacted_child_tail(completed.stderr or completed.stdout),
                 "next_step": failure.next_step,
             },
         }
@@ -2340,9 +3203,39 @@ def _run_ask_script_live(
         "output": output if output is not None else script_payload,
         "script_payload": script_payload,
     }
+    for key in ("usage", "cost", "request_cache", "model", "budget_guard"):
+        value = script_payload.get(key) if isinstance(script_payload, dict) else None
+        if value:
+            payload[key] = value
+    model_payload = script_payload.get("model") if isinstance(script_payload, dict) else {}
+    if isinstance(model_payload, dict):
+        payload["model_execution"] = {
+            "provider": str(model_payload.get("provider") or ""),
+            "model": str(model_payload.get("name") or model_payload.get("model") or ""),
+            "run_mode": str(model_payload.get("run_mode") or "live_sdk"),
+            "usage_available": isinstance(payload.get("usage"), dict),
+            "cost_available": isinstance(payload.get("cost"), dict),
+        }
     retrieval_diagnostics = _payload_retrieval_diagnostics(script_payload)
     if retrieval_diagnostics:
         payload["retrieval_diagnostics"] = retrieval_diagnostics
+    try:
+        model_name = ""
+        model_payload = payload.get("model") if isinstance(payload.get("model"), dict) else {}
+        if isinstance(model_payload, dict):
+            model_name = str(model_payload.get("name") or model_payload.get("model") or "")
+        run_id = SQLiteStore(database_url or database_url_from_env()).save_agent_run(
+            agent_name=route,
+            input_payload={"request_text": input_text, "route": route},
+            input_summary=input_text[:500],
+            output=payload,
+            model=f"sdk-live:{model_name or route}",
+            dry_run=False,
+            status="success",
+        )
+        payload["agent_run_id"] = run_id
+    except Exception as exc:  # pragma: no cover - diagnostic metadata only
+        payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
     return _print_ask_live_payload(payload, json_output=json_output)
 
 
@@ -2412,7 +3305,23 @@ def _redacted_child_output(value: str | None, *, max_chars: int = 1200) -> str:
     text = str(redacted if redacted is not None else "")
     text = " ".join(text.replace("\x00", "").split())
     if len(text) > max_chars:
-        return text[: max_chars - 1].rstrip() + "..."
+        marker = " ...<truncated>... "
+        if max_chars > len(marker) + 40:
+            head_len = (max_chars - len(marker)) // 2
+            tail_len = max_chars - len(marker) - head_len
+            return f"{text[:head_len].rstrip()}{marker}{text[-tail_len:].lstrip()}"
+        return text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def _redacted_child_tail(value: str | None, *, max_chars: int = 1600) -> str:
+    redacted = redact_secrets(str(value or ""))
+    text = str(redacted if redacted is not None else "")
+    text = " ".join(text.replace("\x00", "").split())
+    if max_chars <= 0:
+        return ""
+    if len(text) > max_chars:
+        return text[-max_chars:].lstrip()
     return text
 
 
@@ -2781,6 +3690,7 @@ def _run_work_items_advance(args: argparse.Namespace) -> int:
         sdk_session_enabled=args.sdk_session,
         sdk_session_id=args.sdk_session_id,
         sdk_session_db_path=args.sdk_session_db,
+        sdk_session_history_limit=args.sdk_session_history_limit,
         **_workflow_cost_options_for_request_context(
             request_text=input_text,
             context_file_path=args.context_file,
@@ -3109,6 +4019,7 @@ def _append_eval_thread_guidance_to_summary(
         detail += f" Dashboard: {_slack_link(dashboard_case_url, 'case dashboard')}."
     if review_case_url:
         detail += f" Review form: {_slack_link(review_case_url, 'score this case')}."
+    detail += " Score from the linked form, then press `Submit Evaluation` in Slack to save scores and refresh the dashboard."
     parts.append(detail)
     return "\n\n".join(parts).strip()
 

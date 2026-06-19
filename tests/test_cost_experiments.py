@@ -14,12 +14,22 @@ from keystone_agents.cost_experiments import (
     render_work_item_cost_summary_markdown,
     sdk_cost_record_from_payload,
 )
-from keystone_agents.schemas.work_item import WorkItemEvent
+from keystone_agents.schemas.work_item import WorkItem, WorkItemEvent, WorkItemKind
 from keystone_agents.storage.sqlite_store import SQLiteStore
 
 
 def _database_url(tmp_path) -> str:
     return f"sqlite:///{tmp_path / 'cost_experiments.db'}"
+
+
+def _save_cost_work_item(store: SQLiteStore, work_item_id: str) -> None:
+    store.save_work_item(
+        WorkItem(
+            id=work_item_id,
+            kind=WorkItemKind.OPPORTUNITY,
+            title="Cost experiment WorkItem",
+        )
+    )
 
 
 def _sdk_payload(
@@ -218,6 +228,7 @@ def test_annotate_actual_costs_for_database_selection_persists_comparison(tmp_pa
 def test_work_item_cost_summary_aggregates_retrieval_and_sdk_events(tmp_path) -> None:
     store = SQLiteStore(_database_url(tmp_path))
     work_item_id = "wi_cost_test"
+    _save_cost_work_item(store, work_item_id)
     store.save_work_item_event(
         work_item_id,
         WorkItemEvent(
@@ -330,6 +341,7 @@ def test_work_item_cost_summary_warns_when_slack_conservative_uses_non_mini_open
 ) -> None:
     store = SQLiteStore(_database_url(tmp_path))
     work_item_id = "wi_non_mini_model"
+    _save_cost_work_item(store, work_item_id)
     store.save_work_item_event(
         work_item_id,
         WorkItemEvent(
@@ -381,6 +393,7 @@ def test_work_item_cost_summary_warns_when_slack_conservative_uses_non_mini_open
 def test_work_item_actual_cost_annotation_persists_platform_comparison(tmp_path) -> None:
     store = SQLiteStore(_database_url(tmp_path))
     work_item_id = "wi_actual_cost"
+    _save_cost_work_item(store, work_item_id)
     store.save_work_item_event(
         work_item_id,
         WorkItemEvent(
@@ -427,6 +440,7 @@ def test_work_item_cost_summary_warns_when_search_run_lacks_retrieval_usage(
 ) -> None:
     store = SQLiteStore(_database_url(tmp_path))
     work_item_id = "wi_missing_retrieval_usage"
+    _save_cost_work_item(store, work_item_id)
     store.save_work_item_event(
         work_item_id,
         WorkItemEvent(

@@ -441,6 +441,30 @@ See `docs/SANDBOX_AGENTS.md` for the fuller setup plan and Unix-local scaffoldin
 - Do not invent APIs, endpoints, credentials, schemas, or production behavior.
 - Add or update tests when changing agents, prompts, tools, schemas, safety logic, or outbound workflows.
 
+## Repo-Local Codex Skills
+
+Repo-specific Codex-facing skills live under `codex-skills/`. Use them only for
+this repository; they are not global skills and should not be copied into other
+repos without review. When a task matches one of these entries, read the
+matching `SKILL.md` before touching repo files.
+
+- `codex-skills/kba-agent-contract-change/SKILL.md`: use when changing SDK
+  agents, prompts, schemas, tools, context packs, handoffs, runtime skills,
+  `AgentSpec` metadata, or related tests.
+- `codex-skills/kba-eval-readiness-triage/SKILL.md`: use when diagnosing or
+  changing Promptfoo evals, Slack eval readiness, eval dashboards, route
+  compaction, or trace summary behavior.
+- `codex-skills/kba-search-provider-eval/SKILL.md`: use when changing or
+  evaluating retrieval providers, source attribution, extraction, provider
+  budgets, or search/browser extraction evals.
+- `codex-skills/kba-workitem-orchestrator-ops/SKILL.md`: use when operating or
+  debugging `@KNI`, Orchestrator-first routing, WorkItems, context packs,
+  approval gates, Slack action continuations, or local state/audit flows.
+- `codex-skills/kba-live-sdk-smoke-and-cost/SKILL.md`: use when running or
+  debugging live SDK smoke tests, model/provider configuration,
+  `KEYSTONE_OPENAI_API_KEY`, SDK sessions, traces, rate limits, budget guards,
+  request-cache behavior, or cost telemetry.
+
 ## Agent Improvement Test Pack
 
 Use `docs/AGENT_IMPROVEMENT_TEST_PACK.md` as the standing backlog for deciding

@@ -1810,6 +1810,12 @@ def test_emergency_readiness_video_headline_is_not_scored_as_company_name() -> N
     assert "article headline" in reason
 
 
+def test_next_phase_headline_is_not_scored_as_company_name() -> None:
+    reason = scout_module._candidate_name_rejection_reason("From Copilots to Clinical Judgment")
+
+    assert "article headline" in reason
+
+
 def test_company_search_rejects_listicle_and_roundup_titles_as_company_names() -> None:
     assert "listicle" in scout_module._candidate_name_rejection_reason(
         "Top mental health startups 2026"

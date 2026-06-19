@@ -196,6 +196,7 @@ class WorkflowRunRequest(BaseModel):
     sdk_session_enabled: bool | None = None
     sdk_session_id: str = ""
     sdk_session_db_path: str = ""
+    sdk_session_history_limit: int | None = Field(default=None, ge=1)
     cost_profile: str = "standard"
     allow_manager_loop_repair: bool = True
     include_contact_enrichment: bool = True
@@ -219,3 +220,4 @@ class WorkflowRunResult(BaseModel):
     manual_request_plan: dict[str, Any] | None = None
     orchestrator_preflight: dict[str, Any] | None = None
     context_pack: dict[str, Any] | None = None
+    nested_specialist_results: list[dict[str, Any]] = Field(default_factory=list)

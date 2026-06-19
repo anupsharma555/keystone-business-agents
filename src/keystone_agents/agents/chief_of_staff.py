@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -14,6 +15,7 @@ from zoneinfo import ZoneInfo
 from keystone_agents.automation_inventory import build_automation_inventory_report
 from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.guardrails import keystone_guardrails
+from keystone_agents.local_kni_evidence import build_local_kni_evidence_packet_for_query
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.memory import (
     build_chief_of_staff_memory_context,
@@ -45,6 +47,10 @@ from keystone_agents.sdk import (
     compose_instructions,
 )
 from keystone_agents.skill_sets import select_agent_skill_names
+from keystone_agents.specialist_agent_tools import (
+    SpecialistToolMode,
+    build_specialist_agent_tools,
+)
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.automation_inventory_tool import (
     inspect_active_work_items,
@@ -86,7 +92,6 @@ from keystone_agents.tools.kni_document_tool import (
     read_kni_document_file,
     search_kni_documents,
 )
-from keystone_agents.local_kni_evidence import build_local_kni_evidence_packet_for_query
 from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
     read_local_context_file,
@@ -106,9 +111,147 @@ from keystone_agents.tools.web_structuring_tool import structure_web_data_for_sc
 CHIEF_OF_STAFF_REASONING_EFFORT = "low"
 CHIEF_OF_STAFF_VERBOSITY = "low"
 CHIEF_OF_STAFF_MAX_TOKENS = 2_500
+CHIEF_OF_STAFF_SPECIALIST_TOOLS_ENV = "KEYSTONE_CHIEF_OF_STAFF_SPECIALIST_TOOLS"
 
 
-def _chief_of_staff_tools(request_text: str = "") -> list[Any]:
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_specialist_tool_mode(value: str | SpecialistToolMode) -> SpecialistToolMode:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"read_plan", "approved_write"}:
+        return normalized  # type: ignore[return-value]
+    raise ValueError(
+        "Unsupported Chief of Staff specialist tool mode "
+        f"{value!r}; expected read_plan or approved_write."
+    )
+
+
+def chief_of_staff_should_use_specialist_tools(
+    request_text: str,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+) -> bool:
+    """Return true when Chief of Staff should consult specialist agents as tools."""
+
+    plan = _coerce_manual_request_plan(manual_request_plan)
+    text = _chief_positive_specialist_request_text(request_text)
+    if plan is not None and plan.intent in {
+        "company_research",
+        "research_brief",
+        "opportunity_search",
+        "opportunity_to_outreach_loop",
+        "gmail_triage",
+        "outreach_draft",
+        "browser_diagnostics",
+    }:
+        return _chief_text_has_positive_specialist_marker(text)
+    if plan is not None and plan.task_objective in {
+        "entity_research",
+        "source_research",
+        "opportunity_discovery",
+        "contact_discovery",
+        "outreach_draft",
+        "gmail_triage",
+        "browser_diagnostics",
+    }:
+        return _chief_text_has_positive_specialist_marker(text)
+    return _chief_text_has_positive_specialist_marker(text)
+
+
+def _chief_positive_specialist_request_text(request_text: str) -> str:
+    text = str(request_text or "").lower()
+    text = re.sub(
+        r"\b(?:do not|don't|dont|never|without|no)\b[^.\n;]{0,220}"
+        r"\b(?:gmail|inbox|email|e-mail|thread|outreach|draft|reply|respond|"
+        r"airtable|google drive|google doc|google sheet|workspace|zotero|live web|"
+        r"research externally|external(?:ly)?|crm|publish|post|schedule|send)\b"
+        r"[^.\n;]*",
+        " ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\b(?:sanitized|provided|inline)\b[^.\n;]{0,120}"
+        r"\b(?:gmail triage|email triage|outreach|airtable|google workspace|"
+        r"google drive|zotero)\b[^.\n;]{0,120}\b(?:diagnostic|context|output|result)\b",
+        " ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\b(?:from|based on)\b[^.\n;]{0,80}"
+        r"\b(?:gmail triage|email triage|outreach|airtable|google workspace|"
+        r"google drive|zotero)\b[^.\n;]{0,80}\b(?:diagnostic|context|output|result)\b",
+        " ",
+        text,
+        flags=re.I,
+    )
+    return " ".join(text.split())
+
+
+def _chief_text_has_positive_specialist_marker(text: str) -> bool:
+    cross_agent_markers = (
+        "business research",
+        "research analyst",
+        "research brief",
+        "source-backed",
+        "deeper search",
+        "find companies",
+        "company research",
+        "opportunity scout",
+        "opportunity search",
+        "grant",
+        "rfp",
+        "gmail",
+        "email thread",
+        "inbox",
+        "outreach",
+        "draft email",
+        "draft reply",
+        "outreach follow-up",
+        "outreach follow up",
+        "email follow-up",
+        "email follow up",
+        "airtable",
+        "base schema",
+        "record identity",
+        "field mapping",
+        "google drive",
+        "google doc",
+        "google sheet",
+        "drive folder",
+        "workspace folder",
+        "spreadsheet",
+        "kniops",
+        "zotero",
+        "zotero collection",
+        "zotero article",
+        "zotero library",
+        "literature collection",
+        "paper collection",
+        "article collection",
+        "compare agents",
+        "across agents",
+        "multiple agents",
+    )
+    if any(marker in text for marker in cross_agent_markers):
+        return True
+    next_action_markers = ("what should we do next", "next best action", "prioritize")
+    operating_surfaces = ("research", "opportunit", "outreach", "gmail", "email", "company")
+    return any(marker in text for marker in next_action_markers) and any(
+        surface in text for surface in operating_surfaces
+    )
+
+
+def _chief_of_staff_tools(
+    request_text: str = "",
+    *,
+    specialist_tools: list[Any] | None = None,
+) -> list[Any]:
     tools = [
         list_chief_of_staff_context_sources,
         summarize_slack_runtime_config,
@@ -143,6 +286,7 @@ def _chief_of_staff_tools(request_text: str = "") -> list[Any]:
         airtable_get_base_schema,
         airtable_read_records,
         airtable_write_record,
+        *(specialist_tools or []),
         *google_workspace_tools(),
     ]
     if explicit_full_article_read_requested(request_text):
@@ -4535,6 +4679,8 @@ def build_chief_of_staff_agent(
     *,
     quality_budget: AgentQualityBudget | None = None,
     quality_mode: QualityMode | str | None = None,
+    include_specialist_tools: bool | None = None,
+    specialist_tool_mode: SpecialistToolMode = "read_plan",
     request_text: str = "",
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
@@ -4558,11 +4704,25 @@ def build_chief_of_staff_agent(
             include_all=include_all_skills,
         ),
     )
+    resolved_include_specialist_tools = (
+        include_specialist_tools
+        if include_specialist_tools is not None
+        else _env_flag_enabled(CHIEF_OF_STAFF_SPECIALIST_TOOLS_ENV)
+    )
+    resolved_specialist_tool_mode = _normalize_specialist_tool_mode(specialist_tool_mode)
+    specialist_tools = (
+        build_specialist_agent_tools(
+            manager_agent_name="chief_of_staff",
+            mode=resolved_specialist_tool_mode,
+        )
+        if resolved_include_specialist_tools
+        else []
+    )
     return build_sdk_agent(
         name="chief_of_staff",
         instructions=instructions,
         output_type=ChiefOfStaffResult,
-        tools=_chief_of_staff_tools(request_text),
+        tools=_chief_of_staff_tools(request_text, specialist_tools=specialist_tools),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="chief_of_staff",
@@ -4591,6 +4751,8 @@ def run_chief_of_staff_sdk(
     force_sdk_interpretation: bool = False,
     manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     context_flags: Mapping[str, bool] | None = None,
+    include_specialist_tools: bool | None = None,
+    specialist_tool_mode: SpecialistToolMode = "read_plan",
 ) -> TypedAgentRunResult[ChiefOfStaffResult]:
     """Run Chief of Staff through the shared typed SDK harness."""
 
@@ -4598,6 +4760,11 @@ def run_chief_of_staff_sdk(
         request_text = str(typed_input.get("request") or "")
         manual_request_plan = manual_request_plan or _coerce_manual_request_plan(
             typed_input.get("manual_request_plan")
+        )
+        if include_specialist_tools is None and "include_specialist_tools" in typed_input:
+            include_specialist_tools = bool(typed_input.get("include_specialist_tools"))
+        specialist_tool_mode = _normalize_specialist_tool_mode(
+            typed_input.get("specialist_tool_mode") or specialist_tool_mode
         )
     else:
         request_text = str(typed_input or "")
@@ -4607,6 +4774,11 @@ def run_chief_of_staff_sdk(
     )
     active_request_text = _latest_slack_followup_request(request_text) or request_text
     request_plan = _chief_request_plan(request_text, manual_request_plan)
+    if include_specialist_tools is None:
+        include_specialist_tools = chief_of_staff_should_use_specialist_tools(
+            active_request_text,
+            request_plan,
+        )
     if (
         not force_sdk_interpretation
         and not live
@@ -4663,6 +4835,8 @@ def run_chief_of_staff_sdk(
         agent=build_chief_of_staff_agent(
             model=model,
             quality_budget=budget,
+            include_specialist_tools=include_specialist_tools,
+            specialist_tool_mode=specialist_tool_mode,
             request_text=request_text,
             context_flags=context_flags,
         ),

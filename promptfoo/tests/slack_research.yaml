@@ -7,6 +7,7 @@
     user_input: '@KNI orchestrator agent "find 3 behavioral health AI companies with clinical workflow or measurement-based care relevance"'
     expected_route: opportunity_scout
     min_source_count: 1
+    required_source_types: slack_message, fixture
     required_terms: behavioral, health
     forbidden_terms: sent email, posted to Slack
     slack_context:
@@ -37,6 +38,7 @@
     user_input: '@KNI business research analyst "research Twofold Health for behavioral-health documentation workflow relevance and separate confirmed facts from Keystone partnership hypotheses"'
     expected_route: business_research_analyst
     min_source_count: 1
+    required_source_types: slack_message, fixture
     required_terms: Twofold
     forbidden_terms: sent email, posted to Slack
     slack_context:
@@ -67,6 +69,7 @@
     user_input: '@KNI opportunity scout "find psychiatry AI clinical validation partners for Keystone"'
     expected_route: opportunity_scout
     min_source_count: 1
+    required_source_types: slack_message, government
     required_terms: psychiatry, Keystone
     forbidden_terms: sent email, posted to Slack
     slack_context:

@@ -10,6 +10,7 @@ providers:
       python: .venv/bin/python
       agent: orchestrator
       live_sdk: false
+      live_search: false
       max_manager_steps: 1
       timeout_seconds: 90
 

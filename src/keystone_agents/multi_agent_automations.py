@@ -22,10 +22,15 @@ from keystone_agents.agents.opportunity_scout import run_opportunity_scout_sdk
 from keystone_agents.agents.orchestrator import review_specialist_output, run_orchestrator_sdk
 from keystone_agents.config import load_settings
 from keystone_agents.models import OpportunityScoutSDKInput, ResearchSDKInput
+from keystone_agents.schemas.announcement_feed import (
+    AnnouncementFeedEvidence,
+    AnnouncementFeedItem,
+)
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.orchestrator import OrchestratorOutputReview, OrchestratorResult
 from keystone_agents.schemas.research import ResearchBrief
+from keystone_agents.storage.sqlite_store import SQLiteStore, stable_hash
 from keystone_agents.tools.search_provider import (
     SearchProviderConfigurationError,
     SearchProviderError,
@@ -204,6 +209,12 @@ class AnnouncementLinkInput(BaseModel):
     published_at: str = ""
     slack_link: str = ""
     relevance: list[str] = Field(default_factory=list)
+    authors: list[str] = Field(default_factory=list)
+    doi: str = ""
+    arxiv_id: str = ""
+    biorxiv_id: str = ""
+    medrxiv_id: str = ""
+    tags: list[str] = Field(default_factory=list)
     evidence: list[SearchEvidence] = Field(default_factory=list)
 
 
@@ -445,6 +456,8 @@ def run_announcements_research_synthesis(
     live_search: bool = False,
     min_items: int = MIN_ANNOUNCEMENT_ITEMS,
     max_items: int = MAX_ANNOUNCEMENT_ITEMS,
+    database_url: str | None = None,
+    automation_run_id: str = "",
 ) -> AnnouncementResearchAutomationResult:
     """Select salient announcement links and render source-backed summaries."""
 
@@ -477,10 +490,18 @@ def run_announcements_research_synthesis(
             live_sdk_requested=bool(live_sdk),
             live_search_requested=bool(live_search),
         )
-        return _attach_automation_orchestrator_review(
+        reviewed = _attach_automation_orchestrator_review(
             result,
             agent_name="business_research_analyst",
             request_summary="Scheduled announcements research synthesis",
+        )
+        return _persist_announcement_research_records(
+            reviewed,
+            links=links,
+            selected=selected,
+            summaries=[],
+            database_url=database_url,
+            automation_run_id=automation_run_id,
         )
 
     if len(summaries) < min_items:
@@ -517,10 +538,18 @@ def run_announcements_research_synthesis(
         live_sdk_requested=bool(live_sdk),
         live_search_requested=bool(live_search),
     )
-    return _attach_automation_orchestrator_review(
+    reviewed = _attach_automation_orchestrator_review(
         result,
         agent_name="business_research_analyst",
         request_summary="Scheduled announcements research synthesis",
+    )
+    return _persist_announcement_research_records(
+        reviewed,
+        links=links,
+        selected=selected,
+        summaries=summaries,
+        database_url=database_url,
+        automation_run_id=automation_run_id,
     )
 
 
@@ -1809,6 +1838,12 @@ def _announcement_links_from_payload(payload: dict[str, Any]) -> list[Announceme
                 published_at=str(row.get("published_at") or row.get("published") or ""),
                 slack_link=str(row.get("slack_link") or row.get("permalink") or ""),
                 relevance=_string_list(row.get("relevance")),
+                authors=_string_list(row.get("authors")),
+                doi=str(row.get("doi") or ""),
+                arxiv_id=str(row.get("arxiv_id") or row.get("arxiv") or ""),
+                biorxiv_id=str(row.get("biorxiv_id") or row.get("biorxiv") or ""),
+                medrxiv_id=str(row.get("medrxiv_id") or row.get("medrxiv") or ""),
+                tags=_string_list(row.get("tags")),
             )
         )
     return links
@@ -1996,6 +2031,108 @@ def _summaries_from_research_brief(
             )
         )
     return summaries
+
+
+def _persist_announcement_research_records(
+    result: AnnouncementResearchAutomationResult,
+    *,
+    links: list[AnnouncementLinkInput],
+    selected: list[AnnouncementLinkInput],
+    summaries: list[AnnouncementResearchSummary],
+    database_url: str | None,
+    automation_run_id: str,
+) -> AnnouncementResearchAutomationResult:
+    if not database_url:
+        return result
+    selected_keys = {_announcement_input_key(item) for item in selected}
+    summaries_by_key = {_announcement_input_key(item): item for item in summaries}
+    diagnostics = list(result.diagnostics)
+    saved = 0
+    try:
+        store = SQLiteStore(database_url)
+        for item in links:
+            summary = summaries_by_key.get(_announcement_input_key(item))
+            store.save_announcement_feed_item(
+                _announcement_feed_record(
+                    item,
+                    summary=summary,
+                    selected=_announcement_input_key(item) in selected_keys,
+                    automation_run_id=automation_run_id,
+                )
+            )
+            saved += 1
+    except Exception as exc:
+        diagnostics.append(
+            f"Announcement feed persistence failed: {type(exc).__name__}: {exc}"
+        )
+    else:
+        diagnostics.append(f"Persisted {saved} announcement feed item(s) to application data.")
+    return result.model_copy(update={"diagnostics": diagnostics})
+
+
+def _announcement_feed_record(
+    item: AnnouncementLinkInput,
+    *,
+    summary: AnnouncementResearchSummary | None,
+    selected: bool,
+    automation_run_id: str,
+) -> AnnouncementFeedItem:
+    evidence = [
+        AnnouncementFeedEvidence(
+            kind=evidence_item.kind,
+            title=evidence_item.title,
+            url=evidence_item.url,
+            snippet=evidence_item.snippet,
+            source=evidence_item.source,
+            status=evidence_item.status,
+            char_count=evidence_item.char_count,
+        )
+        for evidence_item in (summary.evidence if summary is not None else item.evidence)
+    ]
+    tags = list(dict.fromkeys([*item.relevance, *item.tags]))
+    summary_text = summary.summary if summary is not None else ""
+    selection_reason = summary.why_selected if summary is not None else _why_announcement_selected(item)
+    return AnnouncementFeedItem(
+        title=item.title,
+        url=item.url,
+        doi=item.doi,
+        arxiv_id=item.arxiv_id,
+        biorxiv_id=item.biorxiv_id,
+        medrxiv_id=item.medrxiv_id,
+        source=item.source,
+        feed=item.source,
+        authors=item.authors,
+        published_at=item.published_at,
+        tags=tags,
+        relevance_status="selected" if selected else "candidate",
+        selected=selected,
+        selection_reason=selection_reason if selected else "",
+        summary=summary_text,
+        evidence=evidence,
+        content_hash=stable_hash(
+            {
+                "title": item.title,
+                "url": item.url,
+                "snippet": item.snippet,
+                "summary": summary_text,
+                "evidence": [record.model_dump(mode="json") for record in evidence],
+            }
+        ),
+        automation_run_id=automation_run_id,
+        slack_link=item.slack_link,
+        review_metadata={
+            "kind": "announcements-research",
+            "selected": selected,
+            "source_snippet": item.snippet,
+            "source_basis": _announcement_summary_source_basis(item),
+        },
+    )
+
+
+def _announcement_input_key(item: AnnouncementLinkInput | AnnouncementResearchSummary) -> str:
+    if item.url:
+        return item.url.strip().lower().rstrip("/")
+    return _normalize_text(item.title)
 
 
 def _attach_search_evidence(items: list[MeetingPrepItem]) -> list[str]:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import uuid
 from collections.abc import Mapping, Sequence
@@ -147,7 +148,7 @@ def record_eval_summary(
                     _case_score(item),
                     _json(item.get("prompt_versions") or []),
                     _json(_compact_checks(item.get("checks"))),
-                    _json(item.get("failures") or []),
+                    _json(_compact_failures(item.get("failures"))),
                     _json(_observed_keys(item.get("observed"))),
                 )
                 for item in results
@@ -261,10 +262,16 @@ def _compact_checks(value: Any) -> list[dict[str, Any]]:
                 "name": str(item.get("name") or ""),
                 "passed": bool(item.get("passed")),
                 "score": _optional_float(item.get("score")),
-                "message": str(item.get("message") or "")[:240],
+                "message": _safe_benchmark_text(item.get("message"), max_chars=240),
             }
         )
     return checks
+
+
+def _compact_failures(value: Any) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    return [_safe_benchmark_text(item, max_chars=240) for item in value]
 
 
 def _observed_keys(value: Any) -> list[str]:
@@ -275,3 +282,27 @@ def _observed_keys(value: Any) -> list[str]:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True)
+
+
+def _safe_benchmark_text(value: Any, *, max_chars: int) -> str:
+    text = str(value or "")
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED]", text)
+    text = re.sub(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b", "Bearer [REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[REDACTED_EMAIL]", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(observed|actual|got)\s*[:=]\s*(['\"]).{12,}?\2",
+        r"\1=[REDACTED_OBSERVED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(observed|actual|got)\s*[:=]\s*(?:['\"][^'\"]{12,}['\"]|\S{24,})",
+        r"\1=[REDACTED_OBSERVED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = " ".join(text.split())
+    if len(text) > max_chars:
+        return text[:max_chars] + "...[truncated]"
+    return text

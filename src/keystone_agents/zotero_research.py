@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.context_env import context_env_path
 from keystone_agents.schemas.research import (
     ResearchArticleSummary,
     ResearchBrief,
@@ -23,6 +24,9 @@ from keystone_agents.tools.website_extraction_tool import (
 )
 
 DEFAULT_ZOTERO_IMPORT_CACHE = Path(".cache/zotero-import")
+DEFAULT_LOCAL_ZOTERO_IMPORT_REPO = Path(
+    os.getenv("KEYSTONE_ZOTERO_IMPORT_REPO_DEFAULT", "../zotero-import")
+)
 
 
 def looks_like_zotero_collection_request(text: str) -> bool:
@@ -494,10 +498,15 @@ def build_zotero_collection_research_brief(
             )
         )
 
+    collection_themes = _collection_theme_summary(article_summaries)
     summary = (
-        f"The Zotero collection {collection_name} contains {len(article_summaries)} source(s) "
-        "relevant to REACH-tDCS, Lindus/Sooma trial context, remote tDCS evidence, "
-        "durability, and acceptability."
+        f"The Zotero collection {collection_name} contains {len(article_summaries)} source(s). "
+        f"Visible local metadata suggests the main themes are {collection_themes}."
+    )
+    missing_text_count = sum(
+        1
+        for summary_item in article_summaries
+        if "no extracted abstract" in " ".join(summary_item.limitations).lower()
     )
     brief = ResearchBrief(
         target_name=collection_name,
@@ -506,24 +515,24 @@ def build_zotero_collection_research_brief(
         summary=summary,
         key_findings=[
             (
-                "The collection combines trial-registry or company-controlled context "
-                "with peer-reviewed remote tDCS evidence."
+                "The collection was resolved from local Zotero cache metadata, not by "
+                "mutating the Zotero library."
             ),
             (
-                "The strongest evidence sources are the randomized trial, follow-up, "
-                "feasibility, and acceptability papers."
+                f"The local cache returned {len(article_summaries)} item(s) with titles, "
+                "source IDs, and available URLs."
             ),
             (
-                "Webpage-only Zotero records should be page-extracted before "
-                "external-facing use because the local cache lacks abstracts for those items."
+                f"{missing_text_count} item(s) lack extracted abstracts or full text in the "
+                "local cache and need extraction before external-facing evidence use."
             ),
         ],
         article_summaries=article_summaries,
         facts=facts,
         inferences=[
             (
-                "The collection is useful for a Keystone review of Lindus/Sooma "
-                "clinical-trial operations and evidence positioning."
+                "Use this collection as internal literature context first; promote claims "
+                "to external-facing use only after reviewing the underlying sources."
             ),
         ],
         unknowns=[
@@ -534,8 +543,8 @@ def build_zotero_collection_research_brief(
         ],
         next_steps=[
             (
-                "Run page extraction for the ClinicalTrials.gov and Lindus pages "
-                "before using the brief for external outreach."
+                "Run page or full-text extraction for records without abstracts before "
+                "using those records as support for external-facing claims."
             ),
         ],
         sources=sources,
@@ -543,10 +552,44 @@ def build_zotero_collection_research_brief(
     return brief, paragraphs
 
 
+def _collection_theme_summary(article_summaries: list[ResearchArticleSummary]) -> str:
+    text = " ".join(item.title.lower() for item in article_summaries)
+    themes: list[str] = []
+    theme_markers = (
+        ("psychiatry and psychiatric diagnosis", ("psychiat", "dsm", "rdoc", "mental")),
+        ("depression and mood disorders", ("depress", "bipolar", "mood")),
+        ("biomarkers and neuroimaging", ("biomarker", "imaging", "neuroimaging", "brain")),
+        ("digital psychiatry and health technology", ("digital", "technology", "informatics", "ai")),
+        ("clinical trials and interventions", ("trial", "intervention", "treatment", "therapy")),
+        ("ethics, governance, or regulation", ("ethic", "governance", "regulat", "fda")),
+    )
+    for label, markers in theme_markers:
+        if any(marker in text for marker in markers):
+            themes.append(label)
+    if themes:
+        return ", ".join(themes[:4])
+    return "the titles represented in the local Zotero metadata"
+
+
 def _zotero_cache_dir() -> Path:
-    return Path(
-        os.getenv("KEYSTONE_ZOTERO_IMPORT_CACHE", str(DEFAULT_ZOTERO_IMPORT_CACHE))
-    ).expanduser()
+    configured_cache = context_env_path("KEYSTONE_ZOTERO_IMPORT_CACHE", "")
+    if str(configured_cache) != "." and configured_cache.exists():
+        return configured_cache
+    cache_dir = context_env_path("KEYSTONE_ZOTERO_IMPORT_CACHE", str(DEFAULT_ZOTERO_IMPORT_CACHE))
+    if cache_dir.exists() and cache_dir != Path("."):
+        return cache_dir
+    collection_cache = context_env_path("ZOTERO_COLLECTION_CACHE", "")
+    if collection_cache.name == "zotero_collections.json":
+        return collection_cache.parent
+    import_repo = context_env_path("KEYSTONE_ZOTERO_IMPORT_REPO", str(DEFAULT_LOCAL_ZOTERO_IMPORT_REPO))
+    if import_repo.exists():
+        repo_cache = import_repo / ".cache"
+        if repo_cache.exists():
+            return repo_cache
+    default_local_cache = DEFAULT_LOCAL_ZOTERO_IMPORT_REPO / ".cache"
+    if default_local_cache.exists():
+        return default_local_cache
+    return cache_dir
 
 
 def _load_collections(cache_path: Path) -> dict[str, str]:
@@ -567,6 +610,11 @@ def _load_items(cache_path: Path) -> list[dict[str, Any]]:
 
 def _resolve_collection(collections: dict[str, str], hint: str) -> tuple[str, str]:
     cleaned_hint = _normalize_collection_code(hint)
+    alias_match = _resolve_collection_alias(collections, cleaned_hint)
+    if alias_match is not None:
+        return alias_match
+    if _is_generic_kni_collection_hint(cleaned_hint):
+        return _default_kni_collection(collections)
     if not cleaned_hint:
         raise ValueError("A Zotero collection hint is required.")
     lowered = cleaned_hint.lower()
@@ -589,6 +637,57 @@ def _resolve_collection(collections: dict[str, str], hint: str) -> tuple[str, st
             if lowered_code in name.lower():
                 return name, key
     raise ValueError(f"No Zotero collection matched: {cleaned_hint}")
+
+
+def _resolve_collection_alias(collections: dict[str, str], hint: str) -> tuple[str, str] | None:
+    normalized = re.sub(r"[^a-z0-9]+", " ", hint.lower()).strip()
+    if not normalized:
+        return None
+    alias_markers = (
+        ("kni 00 foundational texts reviews", ("kni", "foundational", "texts", "reviews")),
+        ("kni 00 foundational texts reviews", ("kni", "foundational", "text", "review")),
+        ("kni 00 foundational texts reviews", ("foundational", "texts", "reviews")),
+        ("kni 00 foundational texts reviews", ("foundational", "text", "review")),
+    )
+    target_code = ""
+    for code, required_terms in alias_markers:
+        if all(term in normalized for term in required_terms):
+            target_code = code
+            break
+    if not target_code:
+        return None
+    target_terms = target_code.split()
+    for name, key in sorted(collections.items()):
+        haystack = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+        if all(term in haystack for term in target_terms):
+            return name, key
+    return None
+
+
+def _is_generic_kni_collection_hint(hint: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", hint.lower()).strip()
+    return normalized in {
+        "kni",
+        "kni collection",
+        "kni collections",
+        "default kni collection",
+        "default kni collections",
+        "bounded kni collection",
+        "bounded kni collections",
+        "one kni collection",
+        "local kni collection",
+        "local kni collections",
+    }
+
+
+def _default_kni_collection(collections: dict[str, str]) -> tuple[str, str]:
+    for name in sorted(collections):
+        if name.lower().startswith("kni "):
+            return name, collections[name]
+    for name in sorted(collections):
+        if name.lower().startswith("kni"):
+            return name, collections[name]
+    raise ValueError("No KNI Zotero collection is available in the local cache.")
 
 
 def _collection_items(items: list[dict[str, Any]], collection_key: str) -> list[dict[str, Any]]:

@@ -21,6 +21,8 @@ from keystone_agents.model_provider import (
     OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL,
     OPENAI_ORCHESTRATOR_DEFAULT_MODEL,
     MissingOpenAIAPIKeyError,
+    ModelConfig,
+    ModelProviderConfigurationError,
     TraceConfig,
     UnsafeTraceMetadataError,
     UnsupportedModelProviderError,
@@ -330,6 +332,13 @@ def test_litellm_gateway_mode_does_not_add_python_litellm_dependency() -> None:
     assert not any(dependency.lower().startswith("litellm") for dependency in dependencies)
 
 
+def test_live_model_config_rejects_unknown_pricing_alias_before_execution() -> None:
+    config = ModelConfig(provider="openai", model="gpt-5.5", api_key="unit-test-key")
+
+    with pytest.raises(ModelProviderConfigurationError, match="openai/gpt-5\\.5"):
+        config.require_live_execution_ready()
+
+
 def test_settings_expose_model_provider_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_model_env(monkeypatch)
     monkeypatch.setenv("MODEL_PROVIDER", "openai")
@@ -414,10 +423,10 @@ def test_runtime_agent_model_config_supports_gemini_for_gmail_and_outreach(
     clear_model_env(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEY", "unit-test-gemini-key")
     monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER", "gemini")
-    monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_MODEL", "gemini-gmail-fixture")
+    monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_MODEL", "gemini-2.5-flash")
     monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_BASE_URL", "http://localhost:4000/v1")
     monkeypatch.setenv("KEYSTONE_OUTREACH_COMPOSER_MODEL_PROVIDER", "gemini")
-    monkeypatch.setenv("KEYSTONE_OUTREACH_COMPOSER_MODEL", "gemini-outreach-fixture")
+    monkeypatch.setenv("KEYSTONE_OUTREACH_COMPOSER_MODEL", "gemini-2.5-flash-lite")
     monkeypatch.setenv("KEYSTONE_OUTREACH_COMPOSER_BASE_URL", "http://localhost:4000/v1")
 
     gmail_config = get_runtime_agent_model_config("gmail_triage")
@@ -425,7 +434,7 @@ def test_runtime_agent_model_config_supports_gemini_for_gmail_and_outreach(
     settings = load_settings()
 
     assert gmail_config.provider == "gemini"
-    assert gmail_config.model == "gemini-gmail-fixture"
+    assert gmail_config.model == "gemini-2.5-flash"
     assert gmail_config.base_url == "http://localhost:4000/v1"
     assert gmail_config.openai_provider_kwargs() == {
         "api_key": "unit-test-gemini-key",
@@ -434,10 +443,10 @@ def test_runtime_agent_model_config_supports_gemini_for_gmail_and_outreach(
     }
     gmail_config.require_live_execution_ready()
     assert outreach_config.provider == "gemini"
-    assert outreach_config.model == "gemini-outreach-fixture"
+    assert outreach_config.model == "gemini-2.5-flash-lite"
     assert settings.runtime_agent_models["gmail_triage"]["provider"] == "gemini"
     assert settings.runtime_agent_models["outreach_composer"]["model"] == (
-        "gemini-outreach-fixture"
+        "gemini-2.5-flash-lite"
     )
 
 
@@ -576,7 +585,7 @@ def test_gemini_runtime_keeps_litellm_as_optional_base_url_override(
     clear_model_env(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEY", "unit-test-gemini-key")
     monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER", "gemini")
-    monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_MODEL", "gemini-gmail-fixture")
+    monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_MODEL", "gemini-2.5-flash")
     monkeypatch.setenv("LITELLM_BASE_URL", "http://localhost:4000/v1")
 
     config = get_runtime_agent_model_config("gmail_triage")
@@ -628,7 +637,10 @@ def test_live_run_config_exposes_safe_trace_metadata_without_model_calls(
 ) -> None:
     clear_model_env(monkeypatch)
     config = get_model_config()
-    config = config.__class__(model="test-model", api_key="unit-test-openai-key")
+    config = config.__class__(
+        model="gpt-5.4-mini-2026-06-01",
+        api_key="unit-test-openai-key",
+    )
 
     run_config = build_live_run_config(
         config,
@@ -644,7 +656,7 @@ def test_live_run_config_exposes_safe_trace_metadata_without_model_calls(
         trace_include_sensitive_data=True,
     )
 
-    assert run_config.model == "test-model"
+    assert run_config.model == "gpt-5.4-mini-2026-06-01"
     assert run_config.workflow_name == "Keystone unit workflow"
     assert run_config.group_id == "unit-group-1"
     assert run_config.trace_metadata == {

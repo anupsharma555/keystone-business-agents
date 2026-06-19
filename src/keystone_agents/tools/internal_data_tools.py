@@ -7,10 +7,11 @@ import os
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from keystone_agents.config import parse_bool
+from keystone_agents.context_env import context_env_path, context_env_value
 from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
 from keystone_agents.memory import chief_of_staff_memory_item
 from keystone_agents.schemas.airtable import (
@@ -43,6 +44,7 @@ AIRTABLE_BASE_ALIAS_PREFIXES = {
     "kniops": "AIRTABLE_KNI_OPS",
     "ops": "AIRTABLE_KNI_OPS",
 }
+AIRTABLE_LIVE_READS_ENV = "KEYSTONE_AIRTABLE_LIVE_READS"
 GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 GOOGLE_SHEET_MIME_TYPE = "application/vnd.google-apps.spreadsheet"
 DEFAULT_GOOGLE_SHEET_TABS = [
@@ -57,6 +59,8 @@ GOOGLE_WORKSPACE_TOOL_NAMES: tuple[str, ...] = (
     "google_doc_read",
     "google_doc_write",
     "google_drive_list_folder",
+    "google_drive_search_files",
+    "google_drive_get_file_metadata",
     "google_drive_create_folder",
     "google_drive_rename_folder",
     "google_drive_remove_folder",
@@ -71,6 +75,15 @@ GOOGLE_WORKSPACE_TOOL_NAMES: tuple[str, ...] = (
     "google_sheet_remove_tab",
     "google_sheet_trash",
 )
+GOOGLE_WORKSPACE_LIVE_READS_ENV = "KEYSTONE_GOOGLE_WORKSPACE_LIVE_READS"
+
+
+def _airtable_live_reads_default() -> bool:
+    return parse_bool(os.getenv(AIRTABLE_LIVE_READS_ENV))
+
+
+def _google_workspace_live_reads_default() -> bool:
+    return parse_bool(os.getenv(GOOGLE_WORKSPACE_LIVE_READS_ENV))
 
 
 def google_workspace_tools() -> list[Any]:
@@ -80,6 +93,8 @@ def google_workspace_tools() -> list[Any]:
         google_doc_read,
         google_doc_write,
         google_drive_list_folder,
+        google_drive_search_files,
+        google_drive_get_file_metadata,
         google_drive_create_folder,
         google_drive_rename_folder,
         google_drive_remove_folder,
@@ -353,7 +368,7 @@ def airtable_get_base_schema(
             base_alias=base_alias,
             base_id=base_id,
             base_name=base_name,
-            live=live,
+            live=live or _airtable_live_reads_default(),
             persist_memory=persist_memory,
             write_context_doc=write_context_doc,
             database_url=database_url or None,
@@ -378,7 +393,14 @@ def airtable_read_records_impl(
 ) -> dict[str, Any]:
     """Read Airtable records through the same env-backed config shape as Keystone Slack."""
 
-    config = _airtable_base_config(base_alias=base_alias, base_id=base_id)
+    config = _airtable_base_config(
+        base_alias=_infer_airtable_base_alias(
+            base_alias=base_alias,
+            base_id=base_id,
+            table=table,
+        ),
+        base_id=base_id,
+    )
     table_name = _airtable_table(table, config=config)
     record_limit = int(max_records or 0)
     if fetch_all:
@@ -488,7 +510,7 @@ def airtable_read_records(
             filter_formula=filter_formula,
             max_records=max_records,
             fetch_all=fetch_all,
-            live=live,
+            live=live or _airtable_live_reads_default(),
         ),
         ensure_ascii=True,
         sort_keys=True,
@@ -511,7 +533,14 @@ def airtable_write_record_impl(
     """Create or update Airtable records behind explicit approval and env gates."""
 
     fields = _json_object(fields_json, "fields_json")
-    config = _airtable_base_config(base_alias=base_alias, base_id=base_id)
+    config = _airtable_base_config(
+        base_alias=_infer_airtable_base_alias(
+            base_alias=base_alias,
+            base_id=base_id,
+            table=table,
+        ),
+        base_id=base_id,
+    )
     table_name = _airtable_table(table, config=config)
     clean_record_id = record_id.strip()
     clean_operation = str(operation or "create").strip().lower()
@@ -711,7 +740,7 @@ def google_doc_read(
             document_id_or_url,
             folder_path=folder_path,
             max_chars=max_chars,
-            live=live,
+            live=live or _google_workspace_live_reads_default(),
         ),
         ensure_ascii=True,
         sort_keys=True,
@@ -865,7 +894,194 @@ def google_drive_list_folder(
         google_drive_list_folder_impl(
             folder_path,
             max_items=max_items,
-            live=live,
+            live=live or _google_workspace_live_reads_default(),
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def google_drive_search_files_impl(
+    query: str = "",
+    *,
+    folder_path: str = "",
+    mime_type: str = "",
+    max_items: int = 25,
+    live: bool = False,
+) -> dict[str, Any]:
+    """Search scoped Google Drive files by title text and optional MIME type."""
+
+    target_folder_path = _google_docs_folder_path(folder_path)
+    bounded_items = min(max(int(max_items or 25), 1), 100)
+    clean_query = " ".join(str(query or "").split())
+    clean_mime_type = str(mime_type or "").strip()
+    if not live:
+        return {
+            "status": "dry-run",
+            "query": clean_query,
+            "mime_type": clean_mime_type,
+            "folder_path": target_folder_path,
+            "max_items": bounded_items,
+            "items": [],
+            "send_enabled": False,
+            "notes": [
+                "Use mime_type='image/' to discover image files by MIME prefix.",
+                "This tool returns Drive metadata only; it does not download file bytes.",
+            ],
+        }
+    services = _google_workspace_services()
+    drive_service = services["drive"]
+    _assert_configured_google_account(drive_service)
+    folder_id = _find_drive_folder_path(drive_service, target_folder_path)
+    if not folder_id:
+        return {
+            "status": "missing",
+            "folder_path": target_folder_path,
+            "items": [],
+            "send_enabled": False,
+        }
+    filters = [f"'{folder_id}' in parents", "trashed = false"]
+    if clean_query:
+        escaped_query = clean_query.replace("'", "\\'")
+        filters.append(f"name contains '{escaped_query}'")
+    if clean_mime_type:
+        if clean_mime_type.endswith("/"):
+            filters.append(f"mimeType contains '{clean_mime_type}'")
+        else:
+            filters.append(f"mimeType = '{clean_mime_type}'")
+    payload = (
+        drive_service.files()
+        .list(
+            q=" and ".join(filters),
+            spaces="drive",
+            fields="files(id,name,mimeType,webViewLink,modifiedTime,size,imageMediaMetadata)",
+            pageSize=bounded_items,
+            orderBy="modifiedTime desc,name",
+        )
+        .execute()
+    )
+    files = payload.get("files", []) if isinstance(payload, dict) else []
+    return {
+        "status": "success",
+        "folder_id": folder_id,
+        "folder_path": target_folder_path,
+        "query": clean_query,
+        "mime_type": clean_mime_type,
+        "items": [_safe_drive_item(item) for item in files if isinstance(item, dict)],
+        "send_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def google_drive_search_files(
+    query: str = "",
+    folder_path: str = "",
+    mime_type: str = "",
+    max_items: int = 25,
+    live: bool = False,
+) -> str:
+    """Search scoped Drive file metadata, including Docs, Sheets, PDFs, and images."""
+
+    return json.dumps(
+        google_drive_search_files_impl(
+            query,
+            folder_path=folder_path,
+            mime_type=mime_type,
+            max_items=max_items,
+            live=live or _google_workspace_live_reads_default(),
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def google_drive_get_file_metadata_impl(
+    file_id_or_url: str,
+    *,
+    folder_path: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Read scoped Drive metadata for a specific file, including image metadata."""
+
+    file_id = _google_drive_file_id(file_id_or_url)
+    target_folder_path = _google_docs_folder_path(folder_path)
+    if not file_id:
+        raise ValueError("file_id_or_url is required.")
+    if not live:
+        return {
+            "status": "dry-run",
+            "file_id": file_id,
+            "folder_path": target_folder_path,
+            "send_enabled": False,
+            "metadata_fields": [
+                "id",
+                "name",
+                "mimeType",
+                "webViewLink",
+                "modifiedTime",
+                "createdTime",
+                "size",
+                "imageMediaMetadata",
+                "description",
+            ],
+            "notes": [
+                "Returns Drive metadata only; it does not download file bytes.",
+                "Image support includes width, height, and rotation metadata when Drive provides it.",
+            ],
+        }
+    services = _google_workspace_services()
+    drive_service = services["drive"]
+    _assert_configured_google_account(drive_service)
+    folder_id = _find_drive_folder_path(drive_service, target_folder_path)
+    if not folder_id:
+        return {
+            "status": "missing",
+            "file_id": file_id,
+            "folder_path": target_folder_path,
+            "reason": "Allowed folder path was not found.",
+            "send_enabled": False,
+        }
+    metadata = (
+        drive_service.files()
+        .get(
+            fileId=file_id,
+            fields=(
+                "id,name,mimeType,webViewLink,modifiedTime,createdTime,size,"
+                "imageMediaMetadata,description,trashed,parents"
+            ),
+            supportsAllDrives=False,
+        )
+        .execute()
+    )
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Google Drive returned non-object file metadata.")
+    _assert_drive_file_under_folder(drive_service, file_id, folder_id)
+    return {
+        "status": "success",
+        "folder_path": target_folder_path,
+        "file": _safe_drive_item(metadata),
+        "created_time": str(metadata.get("createdTime", "")),
+        "description": str(metadata.get("description", ""))[:1200],
+        "trashed": bool(metadata.get("trashed")),
+        "send_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def google_drive_get_file_metadata(
+    file_id_or_url: str,
+    folder_path: str = "",
+    live: bool = False,
+) -> str:
+    """Read scoped Drive file metadata for Docs, Sheets, PDFs, images, and other files."""
+
+    return json.dumps(
+        google_drive_get_file_metadata_impl(
+            file_id_or_url,
+            folder_path=folder_path,
+            live=live or _google_workspace_live_reads_default(),
         ),
         ensure_ascii=True,
         sort_keys=True,
@@ -1123,7 +1339,11 @@ def google_sheet_list(
     """List spreadsheet files inside the scoped KNIOps Google Drive boundary."""
 
     return json.dumps(
-        google_sheet_list_impl(folder_path, max_items=max_items, live=live),
+        google_sheet_list_impl(
+            folder_path,
+            max_items=max_items,
+            live=live or _google_workspace_live_reads_default(),
+        ),
         ensure_ascii=True,
         sort_keys=True,
         default=str,
@@ -1287,7 +1507,7 @@ def google_sheet_read_table(
             sheet_name=sheet_name,
             range_a1=range_a1,
             max_rows=max_rows,
-            live=live,
+            live=live or _google_workspace_live_reads_default(),
         ),
         ensure_ascii=True,
         sort_keys=True,
@@ -1912,13 +2132,44 @@ def _airtable_alias_prefix(base_alias: str) -> str:
     return AIRTABLE_BASE_ALIAS_PREFIXES.get(normalized, "")
 
 
+def _normalize_airtable_lookup_text(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _infer_airtable_base_alias(
+    *,
+    base_alias: str = "",
+    base_id: str = "",
+    base_name: str = "",
+    table: str = "",
+) -> str:
+    """Infer a known base alias from explicit user-facing base or table names."""
+
+    clean_alias = str(base_alias or "").strip()
+    if clean_alias or str(base_id or "").strip():
+        return clean_alias
+    normalized_base = _normalize_airtable_lookup_text(base_name)
+    finance_base_names = {
+        _normalize_airtable_lookup_text(FINANCE_TAX_TRACKER_BASE_NAME),
+        "finance_tax_tracker",
+        "tax_tracker",
+    }
+    if normalized_base in finance_base_names or (
+        "finance" in normalized_base and "tax" in normalized_base and "tracker" in normalized_base
+    ):
+        return "finance_tax_tracker"
+    if str(table or "").strip() in FINANCE_TAX_TRACKER_TABLES:
+        return "finance_tax_tracker"
+    return ""
+
+
 def _airtable_csv_env(name: str) -> tuple[str, ...]:
-    return tuple(item.strip() for item in os.getenv(name, "").split(",") if item.strip())
+    return tuple(item.strip() for item in context_env_value(name).split(",") if item.strip())
 
 
 def _airtable_int_env(name: str, default: int) -> int:
     try:
-        return max(1, int(os.getenv(name, str(default))))
+        return max(1, int(context_env_value(name, str(default))))
     except ValueError:
         return default
 
@@ -1941,28 +2192,33 @@ def _airtable_base_config(
     base_name: str = "",
     default_allowed_tables: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    prefix = _airtable_alias_prefix(base_alias)
+    inferred_alias = _infer_airtable_base_alias(
+        base_alias=base_alias,
+        base_id=base_id,
+        base_name=base_name,
+    )
+    prefix = _airtable_alias_prefix(inferred_alias)
     resolved_base_id = (
         base_id.strip()
-        or (os.getenv(f"{prefix}_BASE_ID", "").strip() if prefix else "")
-        or os.getenv("AIRTABLE_BASE_ID", "").strip()
+        or (context_env_value(f"{prefix}_BASE_ID").strip() if prefix else "")
+        or context_env_value("AIRTABLE_BASE_ID").strip()
     )
     resolved_base_name = (
         base_name.strip()
-        or (os.getenv(f"{prefix}_BASE_NAME", "").strip() if prefix else "")
-        or os.getenv("AIRTABLE_BASE_NAME", "").strip()
+        or (context_env_value(f"{prefix}_BASE_NAME").strip() if prefix else "")
+        or context_env_value("AIRTABLE_BASE_NAME").strip()
     )
-    access_token = (os.getenv(f"{prefix}_ACCESS_TOKEN", "").strip() if prefix else "") or os.getenv(
-        "AIRTABLE_ACCESS_TOKEN", ""
-    ).strip()
+    access_token = (
+        context_env_value(f"{prefix}_ACCESS_TOKEN").strip() if prefix else ""
+    ) or context_env_value("AIRTABLE_ACCESS_TOKEN").strip()
     default_table = (
-        os.getenv(f"{prefix}_DEFAULT_TABLE", "").strip() if prefix else ""
-    ) or os.getenv("AIRTABLE_DEFAULT_TABLE", "").strip()
-    default_view = (os.getenv(f"{prefix}_DEFAULT_VIEW", "").strip() if prefix else "") or os.getenv(
-        "AIRTABLE_DEFAULT_VIEW", ""
-    ).strip()
+        context_env_value(f"{prefix}_DEFAULT_TABLE").strip() if prefix else ""
+    ) or context_env_value("AIRTABLE_DEFAULT_TABLE").strip()
+    default_view = (
+        context_env_value(f"{prefix}_DEFAULT_VIEW").strip() if prefix else ""
+    ) or context_env_value("AIRTABLE_DEFAULT_VIEW").strip()
     return {
-        "base_alias": str(base_alias or "").strip(),
+        "base_alias": inferred_alias,
         "env_prefix": prefix,
         "base_id": resolved_base_id,
         "base_name": resolved_base_name,
@@ -1993,14 +2249,14 @@ def _airtable_base_schema_url(base_id: str) -> str:
 
 def _airtable_table_url(table_name: str, *, base_id: str = "") -> str:
     if not base_id:
-        base_id = os.getenv("AIRTABLE_BASE_ID", "").strip() or "app_dry_run"
+        base_id = context_env_value("AIRTABLE_BASE_ID").strip() or "app_dry_run"
     return f"https://api.airtable.com/v0/{base_id}/{quote(table_name, safe='')}"
 
 
 def _require_airtable_credentials(*, base_id: str = "", access_token: str = "") -> None:
-    if not (base_id or os.getenv("AIRTABLE_BASE_ID", "").strip()):
+    if not (base_id or context_env_value("AIRTABLE_BASE_ID").strip()):
         raise RuntimeError("Missing Airtable configuration: AIRTABLE_BASE_ID.")
-    if not (access_token or os.getenv("AIRTABLE_ACCESS_TOKEN", "").strip()):
+    if not (access_token or context_env_value("AIRTABLE_ACCESS_TOKEN").strip()):
         raise RuntimeError("Missing Airtable configuration: AIRTABLE_ACCESS_TOKEN.")
 
 
@@ -2010,11 +2266,11 @@ def _airtable_send(request: dict[str, Any], *, access_token: str = "") -> dict[s
     payload = request.get("payload")
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     outbound = Request(request_url, data=body, method=str(request["method"]))
-    token = access_token or os.environ["AIRTABLE_ACCESS_TOKEN"]
+    token = access_token or context_env_value("AIRTABLE_ACCESS_TOKEN")
     outbound.add_header("Authorization", f"Bearer {token}")
     outbound.add_header("Content-Type", "application/json")
     outbound.add_header("Accept", "application/json")
-    timeout_seconds = int(os.getenv("AIRTABLE_REQUEST_TIMEOUT_SECONDS", "20"))
+    timeout_seconds = int(context_env_value("AIRTABLE_REQUEST_TIMEOUT_SECONDS", "20"))
     with urlopen(outbound, timeout=timeout_seconds) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -2111,6 +2367,21 @@ def _google_sheet_id(spreadsheet_id_or_url: str) -> str:
     return match.group(1) if match else value
 
 
+def _google_drive_file_id(file_id_or_url: str) -> str:
+    value = str(file_id_or_url or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.netloc:
+        query_id = parse_qs(parsed.query).get("id", [""])[0]
+        if query_id:
+            return query_id
+        match = re.search(r"/(?:file|document|spreadsheets|presentation)/d/([^/]+)", parsed.path)
+        if match:
+            return match.group(1)
+    return value
+
+
 def _google_workspace_services() -> dict[str, Any]:
     try:
         from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -2121,9 +2392,10 @@ def _google_workspace_services() -> dict[str, Any]:
             "Install google-api-python-client and google-auth to use live Google Workspace tools."
         ) from exc
 
-    token_path = Path(
-        os.getenv("GOOGLE_WORKSPACE_OAUTH_TOKEN_PATH", ".local/google-workspace-oauth-token.json")
-    ).expanduser()
+    token_path = context_env_path(
+        "GOOGLE_WORKSPACE_OAUTH_TOKEN_PATH",
+        ".local/google-workspace-oauth-token.json",
+    )
     if not token_path.exists():
         raise RuntimeError(f"Google Workspace OAuth token is missing at {token_path}.")
     credentials = Credentials.from_authorized_user_file(str(token_path), GOOGLE_WORKSPACE_SCOPES)
@@ -2158,8 +2430,8 @@ def _google_docs_folder_path(folder_path: str = "") -> str:
 
 def _google_drive_base_folder_path() -> str:
     return (
-        os.getenv("KEYSTONE_GOOGLE_DOCS_FOLDER", "").strip()
-        or os.getenv("GOOGLE_DRIVE_KNI_OPS_FOLDER", "").strip()
+        context_env_value("KEYSTONE_GOOGLE_DOCS_FOLDER").strip()
+        or context_env_value("GOOGLE_DRIVE_KNI_OPS_FOLDER").strip()
         or DEFAULT_GOOGLE_DOCS_FOLDER
     )
 
@@ -2187,8 +2459,9 @@ def _require_google_workspace_write_approval(approval_reference: str) -> None:
 
 
 def _assert_configured_google_account(drive_service: Any) -> None:
-    expected = os.getenv("GOOGLE_DRIVE_ACCOUNT", "").strip().lower()
-    if not expected or not parse_bool(os.getenv("GOOGLE_WORKSPACE_REQUIRE_ACCOUNT_MATCH", "true")):
+    expected = context_env_value("GOOGLE_DRIVE_ACCOUNT").strip().lower()
+    require_match = context_env_value("GOOGLE_WORKSPACE_REQUIRE_ACCOUNT_MATCH", "true")
+    if not expected or not parse_bool(require_match):
         return
     payload = drive_service.about().get(fields="user(emailAddress)").execute()
     user = payload.get("user", {}) if isinstance(payload, dict) else {}
@@ -2578,7 +2851,7 @@ def _google_doc_text(document: dict[str, Any]) -> str:
     return "".join(parts).strip()
 
 
-def _safe_drive_item(item: dict[str, Any]) -> dict[str, str]:
+def _safe_drive_item(item: dict[str, Any]) -> dict[str, Any]:
     mime_type = str(item.get("mimeType", ""))
     if mime_type == GOOGLE_FOLDER_MIME_TYPE:
         item_type = "folder"
@@ -2588,7 +2861,7 @@ def _safe_drive_item(item: dict[str, Any]) -> dict[str, str]:
         item_type = "google_sheet"
     else:
         item_type = "file"
-    return {
+    payload: dict[str, Any] = {
         "id": str(item.get("id", "")),
         "name": str(item.get("name", "")),
         "mime_type": mime_type,
@@ -2596,6 +2869,16 @@ def _safe_drive_item(item: dict[str, Any]) -> dict[str, str]:
         "url": str(item.get("webViewLink", "")),
         "modified_time": str(item.get("modifiedTime", "")),
     }
+    if item.get("size") is not None:
+        payload["size"] = str(item.get("size", ""))
+    if isinstance(item.get("imageMediaMetadata"), dict):
+        metadata = item["imageMediaMetadata"]
+        payload["image_media_metadata"] = {
+            "width": str(metadata.get("width", "")),
+            "height": str(metadata.get("height", "")),
+            "rotation": str(metadata.get("rotation", "")),
+        }
+    return payload
 
 
 def _replace_doc_requests(docs_service: Any, document_id: str, body: str) -> list[dict[str, Any]]:

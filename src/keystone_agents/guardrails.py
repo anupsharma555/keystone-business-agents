@@ -38,6 +38,7 @@ class GuardrailAssessment:
 _PHI_PATTERNS = (
     re.compile(r"\b(?:mrn|medical record number)\b", re.IGNORECASE),
     re.compile(r"\b(?:dob|date of birth)\b", re.IGNORECASE),
+    re.compile(r"\bnamed\s+patient\s+story\b", re.IGNORECASE),
     re.compile(
         r"\bpatient\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b[^.\n]{0,180}\b"
         r"(?:diagnos(?:is|ed)|treatment|medication|therapy|depression|anxiety|bipolar|"
@@ -343,7 +344,10 @@ def assess_tool_payload_guardrails(
     claim_scan_text = (
         f"tool_name: {tool_name}\n{stringify_payload_for_outreach_claim_scan(payload)}"
     )
-    assessment = assess_text_guardrails(claim_scan_text, check_outreach_claims=True)
+    assessment = assess_text_guardrails(
+        claim_scan_text,
+        check_outreach_claims=not output,
+    )
     risk_flags = list(assessment.risk_flags)
     reasons = list(assessment.reasons)
 

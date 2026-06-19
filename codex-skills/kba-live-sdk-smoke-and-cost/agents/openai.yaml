@@ -1,0 +1,4 @@
+interface:
+  display_name: "KBA Live SDK Smoke And Cost"
+  short_description: "Run safe Keystone live SDK checks"
+  default_prompt: "Use $kba-live-sdk-smoke-and-cost to run safe Keystone live SDK smoke, model, trace, rate-limit, or cost checks."

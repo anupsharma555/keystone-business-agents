@@ -38,15 +38,13 @@ try:
         FileSearchTool as SDKFileSearchTool,
     )
     from agents import (
-        HostedMCPTool as SDKHostedMCPTool,
-    )
-    from agents import (
         GuardrailFunctionOutput,
         ModelSettings,
         OpenAIProvider,
         RunConfig,
         RunContextWrapper,
         Runner,
+        SessionSettings,
         SQLiteSession,
         ToolGuardrailFunctionOutput,
         ToolInputGuardrailData,
@@ -57,10 +55,13 @@ try:
         tool_output_guardrail,
     )
     from agents import (
-        WebSearchTool as SDKWebSearchTool,
+        HostedMCPTool as SDKHostedMCPTool,
     )
     from agents import (
         ToolSearchTool as SDKToolSearchTool,
+    )
+    from agents import (
+        WebSearchTool as SDKWebSearchTool,
     )
     from agents import (
         function_tool as _sdk_function_tool,
@@ -76,6 +77,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional local insta
     RunConfig = Any  # type: ignore
     RunContextWrapper = Any  # type: ignore
     Runner = Any  # type: ignore
+    SessionSettings = Any  # type: ignore
     SQLiteSession = Any  # type: ignore
     _sdk_function_tool = None  # type: ignore[assignment]
     AsyncOpenAI = Any  # type: ignore
@@ -466,6 +468,34 @@ class LocalAgent:
     input_guardrails: list[Any] = field(default_factory=list)
     output_guardrails: list[Any] = field(default_factory=list)
 
+    def as_tool(
+        self,
+        *,
+        tool_name: str,
+        tool_description: str,
+        max_turns: int | None = None,
+        **_: Any,
+    ) -> LocalAgentTool:
+        """Return an inert local stand-in for `Agent.as_tool()`."""
+
+        return LocalAgentTool(
+            name=tool_name,
+            description=tool_description,
+            agent=self,
+            max_turns=max_turns,
+        )
+
+
+@dataclass
+class LocalAgentTool:
+    """Inert stand-in for SDK agent tools when the SDK is unavailable."""
+
+    name: str
+    description: str
+    agent: Any
+    max_turns: int | None = None
+    params_json_schema: dict[str, Any] = field(default_factory=dict)
+
 
 Agent = SDKAgent or LocalAgent
 SandboxAgent = SDKSandboxAgent
@@ -497,17 +527,27 @@ def validate_sdk_available() -> bool:
     return True
 
 
-def build_sqlite_session(session_id: str, database_path: str | Path | None = None) -> Any:
+def build_sqlite_session(
+    session_id: str,
+    database_path: str | Path | None = None,
+    *,
+    session_history_limit: int | None = None,
+) -> Any:
     """Build an Agents SDK SQLiteSession through the centralized SDK import boundary."""
 
     validate_sdk_available()
     if not session_id:
         raise ValueError("session_id is required for SDK SQLite sessions.")
+    settings = (
+        SessionSettings(limit=session_history_limit)
+        if session_history_limit is not None
+        else None
+    )
     if database_path:
         path = Path(database_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        return SQLiteSession(session_id, str(path))
-    return SQLiteSession(session_id)
+        return SQLiteSession(session_id, str(path), session_settings=settings)
+    return SQLiteSession(session_id, session_settings=settings)
 
 
 def validate_sandbox_sdk_available() -> bool:
@@ -1027,6 +1067,9 @@ def build_live_run_config(
     )
     model_config.require_live_execution_ready()
     validate_sdk_available()
+    from keystone_agents.trace_processor import register_configured_trace_processor
+
+    register_configured_trace_processor()
     provider_kwargs = model_config.openai_provider_kwargs()
     openai_client = AsyncOpenAI(
         api_key=provider_kwargs.get("api_key"),

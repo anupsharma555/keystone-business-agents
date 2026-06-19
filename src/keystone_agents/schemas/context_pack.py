@@ -6,6 +6,7 @@ from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, Field
 
+from keystone_agents.schemas.handoff_types import HandoffTypeContract, build_handoff_type_contract
 from keystone_agents.schemas.work_item import (
     WorkItemApprovalGate,
     WorkItemArtifactRef,
@@ -51,6 +52,12 @@ class ContextPackBase(BaseModel):
     """Common WorkItem state shared by every specialist context pack."""
 
     pack_type: str
+    handoff_type_contract: HandoffTypeContract = Field(default_factory=HandoffTypeContract)
+    input_type: str = "keystone_agents.schemas.work_item.WorkItem"
+    satisfies_input_type: str = ""
+    expected_output_type: str = ""
+    next_input_type: str = ""
+    type_compatibility_status: str = "unknown"
     work_item_id: str
     route: WorkItemRoute
     current_status: WorkItemStatus
@@ -81,6 +88,24 @@ class ResearchContextPack(ContextPackBase):
     """Context contract for company or account research."""
 
     pack_type: Literal["research"] = "research"
+    handoff_type_contract: HandoffTypeContract = Field(
+        default_factory=lambda: build_handoff_type_contract(
+            source_agent="work_item_manager",
+            target_agent="business_research_analyst",
+            source_output_type="keystone_agents.schemas.work_item.WorkItem",
+            target_input_type="keystone_agents.schemas.context_pack.ResearchContextPack",
+            target_output_type="keystone_agents.schemas.research.ResearchBrief",
+            payload_mode="adapted",
+            parsed_output_status="parsed",
+            compatibility_notes=[
+                "WorkItem state has been adapted into a ResearchContextPack before specialist execution."
+            ],
+        )
+    )
+    satisfies_input_type: str = "keystone_agents.schemas.context_pack.ResearchContextPack"
+    expected_output_type: str = "keystone_agents.schemas.research.ResearchBrief"
+    next_input_type: str = "keystone_agents.schemas.context_pack.OutreachContextPack"
+    type_compatibility_status: str = "compatible"
     route: WorkItemRoute = WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     research_goal: str = ""
     source_bundle_summary: str = ""
@@ -93,6 +118,24 @@ class OpportunityContextPack(ContextPackBase):
     """Context contract for opportunity scouting."""
 
     pack_type: Literal["opportunity"] = "opportunity"
+    handoff_type_contract: HandoffTypeContract = Field(
+        default_factory=lambda: build_handoff_type_contract(
+            source_agent="work_item_manager",
+            target_agent="opportunity_scout",
+            source_output_type="keystone_agents.schemas.work_item.WorkItem",
+            target_input_type="keystone_agents.schemas.context_pack.OpportunityContextPack",
+            target_output_type="keystone_agents.schemas.opportunity.OpportunityScoutResult",
+            payload_mode="adapted",
+            parsed_output_status="parsed",
+            compatibility_notes=[
+                "WorkItem state has been adapted into an OpportunityContextPack before specialist execution."
+            ],
+        )
+    )
+    satisfies_input_type: str = "keystone_agents.schemas.context_pack.OpportunityContextPack"
+    expected_output_type: str = "keystone_agents.schemas.opportunity.OpportunityScoutResult"
+    next_input_type: str = "keystone_agents.schemas.context_pack.ResearchContextPack"
+    type_compatibility_status: str = "compatible"
     route: WorkItemRoute = WorkItemRoute.OPPORTUNITY_SCOUT
     objective: str = ""
     constraints: list[str] = Field(default_factory=list)
@@ -123,6 +166,24 @@ class OutreachContextPack(ContextPackBase):
     """Context contract for draft-only outbound outreach."""
 
     pack_type: Literal["outreach"] = "outreach"
+    handoff_type_contract: HandoffTypeContract = Field(
+        default_factory=lambda: build_handoff_type_contract(
+            source_agent="work_item_manager",
+            target_agent="outreach_composer",
+            source_output_type="keystone_agents.schemas.work_item.WorkItem",
+            target_input_type="keystone_agents.schemas.context_pack.OutreachContextPack",
+            target_output_type="keystone_agents.schemas.outreach.OutreachDraft",
+            payload_mode="adapted",
+            parsed_output_status="parsed",
+            compatibility_notes=[
+                "WorkItem state has been adapted into an OutreachContextPack before draft-only execution."
+            ],
+        )
+    )
+    satisfies_input_type: str = "keystone_agents.schemas.context_pack.OutreachContextPack"
+    expected_output_type: str = "keystone_agents.schemas.outreach.OutreachDraft"
+    next_input_type: str = "keystone_agents.schemas.orchestrator.OrchestratorResult"
+    type_compatibility_status: str = "compatible"
     route: WorkItemRoute = WorkItemRoute.OUTREACH_COMPOSER
     selected_company_artifact: WorkItemArtifactRef | None = None
     selected_opportunity_artifact: WorkItemArtifactRef | None = None
@@ -141,6 +202,24 @@ class GmailContextPack(ContextPackBase):
     """Context contract for Gmail triage or draft-only reply work."""
 
     pack_type: Literal["gmail"] = "gmail"
+    handoff_type_contract: HandoffTypeContract = Field(
+        default_factory=lambda: build_handoff_type_contract(
+            source_agent="work_item_manager",
+            target_agent="gmail_triage",
+            source_output_type="keystone_agents.schemas.work_item.WorkItem",
+            target_input_type="keystone_agents.schemas.context_pack.GmailContextPack",
+            target_output_type="keystone_agents.schemas.email_triage.EmailTriageResult",
+            payload_mode="adapted",
+            parsed_output_status="parsed",
+            compatibility_notes=[
+                "WorkItem state has been adapted into a GmailContextPack before triage execution."
+            ],
+        )
+    )
+    satisfies_input_type: str = "keystone_agents.schemas.context_pack.GmailContextPack"
+    expected_output_type: str = "keystone_agents.schemas.email_triage.EmailTriageResult"
+    next_input_type: str = "keystone_agents.schemas.context_pack.ResearchContextPack"
+    type_compatibility_status: str = "compatible"
     route: WorkItemRoute = WorkItemRoute.GMAIL_TRIAGE
     thread_id: str = ""
     message_id: str = ""

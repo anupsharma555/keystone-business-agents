@@ -20,6 +20,7 @@ class OutreachExecutionPlan(BaseModel):
     source: str = "heuristic"
     operation: OutreachExecutionOperation = "draft_initial_outreach"
     approved_context_required: bool = True
+    approved_inline_context_available: bool = False
     use_default_approved_fixture_for_backend_test: bool = False
     include_follow_up_schedule: bool = False
     include_reply_tracking_plan: bool = False

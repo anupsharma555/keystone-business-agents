@@ -75,6 +75,46 @@ def test_benchmark_summary_reports_recent_runs(tmp_path: Path, capsys) -> None:
     assert output["runs"][0]["run_label"] == "baseline"
 
 
+def test_record_eval_summary_redacts_failure_and_check_messages(tmp_path: Path) -> None:
+    db_path = tmp_path / "benchmark.sqlite"
+    summary = {
+        "total": 1,
+        "passed": 0,
+        "failed": 1,
+        "results": [
+            {
+                "id": "raw_observed_case",
+                "dataset": "promptfoo",
+                "task": "orchestrator",
+                "passed": False,
+                "score": 0,
+                "checks": [
+                    {
+                        "name": "observed",
+                        "passed": False,
+                        "message": "observed='email jane@example.com token sk-SECRETSECRETSECRET'",
+                    }
+                ],
+                "failures": [
+                    "actual='reply to jane@example.com with sk-SECRETSECRETSECRET'"
+                ],
+                "observed": {"raw_response": "not stored"},
+            }
+        ],
+    }
+
+    record_eval_summary(summary, suite="promptfoo", db_path=db_path, run_label="safe")
+
+    with sqlite3.connect(db_path) as conn:
+        checks_json, failures_json = conn.execute(
+            "SELECT checks_json, failures_json FROM benchmark_case_scores"
+        ).fetchone()
+    serialized = checks_json + failures_json
+    assert "jane@example.com" not in serialized
+    assert "sk-SECRET" not in serialized
+    assert "[REDACTED_OBSERVED]" in serialized
+
+
 def test_eval_cli_record_benchmark_keeps_json_stdout(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "benchmark.sqlite"
 

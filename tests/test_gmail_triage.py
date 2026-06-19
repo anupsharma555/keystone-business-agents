@@ -792,6 +792,52 @@ def test_live_cli_read_only_skips_label_and_draft_mutations(
     assert message["draft_api"]["approval_required"] is True
 
 
+def test_gmail_sdk_payload_repairs_mixed_script_recommendation_noise() -> None:
+    import scripts.run_gmail_triage as cli
+
+    payload = {
+        "input": (
+            "Use only this inline context. Subject: Partnership follow-up for remote "
+            "patient monitoring validation From: Alex Rivera Body: Could Keystone help?"
+        ),
+        "output_type": "EmailTriageResult",
+        "output": {
+            "subject": "Manual Gmail triage request",
+            "category": "collaboration_opportunity",
+            "needs_reply": True,
+            "recommended_action": (
+                "Reply with a brief note and առաջարկing a short call if helpful."
+            ),
+            "triage_limitations": ["Only inline sanitized context was provided."],
+        },
+    }
+
+    repaired = cli._repair_gmail_triage_output_hygiene(payload)
+
+    action = repaired["output"]["recommended_action"]
+    assert repaired["output"]["subject"] == (
+        "Partnership follow-up for remote patient monitoring validation"
+    )
+    assert "առաջարկing" not in action
+    assert "suggesting a short call" in action
+    assert repaired["output_hygiene"]["repaired_fields"] == [
+        "subject",
+        "recommended_action",
+    ]
+    assert any(
+        "mixed-script noise" in item
+        for item in repaired["output"]["triage_limitations"]
+    )
+
+    clean_payload = {
+        "output_type": "EmailTriageResult",
+        "output": {
+            "recommended_action": "Reply to José and review 株式会社 context manually.",
+        },
+    }
+    assert cli._repair_gmail_triage_output_hygiene(clean_payload) == clean_payload
+
+
 def test_live_cli_passes_gmail_query_for_targeted_read_only_triage(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

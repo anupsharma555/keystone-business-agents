@@ -4,6 +4,8 @@ Tool instances are inert by default. Instantiate with `live=True` only after add
 approval, and audit handling.
 """
 
+from importlib import import_module
+
 from keystone_agents.tools.apify_tool import ApifyTool
 from keystone_agents.tools.approval_tool import ApprovalTool, post_approval_request
 from keystone_agents.tools.browserless_tool import BrowserlessTool
@@ -24,6 +26,12 @@ from keystone_agents.tools.gmail_tool import (
 from keystone_agents.tools.html_review_tool import (
     HtmlReviewResult,
     extract_research_claims_from_html,
+)
+from keystone_agents.tools.internal_data_tools import (
+    google_drive_get_file_metadata,
+    google_drive_get_file_metadata_impl,
+    google_drive_search_files,
+    google_drive_search_files_impl,
 )
 from keystone_agents.tools.local_context_tool import (
     list_local_context_sources,
@@ -83,6 +91,10 @@ __all__ = [
     "list_threads_by_label_filter",
     "HtmlReviewResult",
     "extract_research_claims_from_html",
+    "google_drive_get_file_metadata",
+    "google_drive_get_file_metadata_impl",
+    "google_drive_search_files",
+    "google_drive_search_files_impl",
     "list_local_context_sources",
     "search_local_context",
     "read_local_context_file",
@@ -114,7 +126,27 @@ __all__ = [
     "WebScrapeTool",
     "WebsiteExtractionTool",
     "extract_website_content",
+    "DEFAULT_ZOTERO_IMPORTER_SCRIPT",
+    "ZOTERO_CONTEXT_TOOL_NAMES",
+    "ZOTERO_IMPORT_TOOL_NAMES",
+    "ZOTERO_READ_CONTEXT_TOOL_NAMES",
+    "zotero_import_article_with_backend",
+    "zotero_read_api_metadata",
+    "zotero_resolve_article_context",
+    "zotero_resolve_collection_context",
 ]
+
+
+_ZOTERO_CONTEXT_EXPORTS = {
+    "DEFAULT_ZOTERO_IMPORTER_SCRIPT",
+    "ZOTERO_CONTEXT_TOOL_NAMES",
+    "ZOTERO_IMPORT_TOOL_NAMES",
+    "ZOTERO_READ_CONTEXT_TOOL_NAMES",
+    "zotero_import_article_with_backend",
+    "zotero_read_api_metadata",
+    "zotero_resolve_article_context",
+    "zotero_resolve_collection_context",
+}
 
 
 def __getattr__(name: str):
@@ -122,4 +154,7 @@ def __getattr__(name: str):
         from keystone_agents.tools.serper_tool import SerperTool
 
         return SerperTool
+    if name in _ZOTERO_CONTEXT_EXPORTS:
+        zotero_context_tools = import_module("keystone_agents.tools.zotero_context_tools")
+        return getattr(zotero_context_tools, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

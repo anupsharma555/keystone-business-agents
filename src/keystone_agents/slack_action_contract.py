@@ -26,6 +26,7 @@ KBA_APPROVE_EXTERNAL_USE = "kba_approve_external_use"
 KBA_REVISE_DRAFT = "kba_revise_draft"
 KBA_MORE_RESEARCH = "kba_more_research"
 KBA_FIND_CONTACT = "kba_find_contact"
+KBA_EVAL_REVIEW = "kba_eval_review"
 KBA_OVERFLOW = "kba_overflow"
 KBA_COS_AUDIT_AUTOMATIONS = "kba_cos_audit_automations"
 KBA_COS_GENERATE_DOC = "kba_cos_generate_doc"
@@ -53,6 +54,7 @@ KBA_ACTION_IDS = frozenset(
         KBA_REVISE_DRAFT,
         KBA_MORE_RESEARCH,
         KBA_FIND_CONTACT,
+        KBA_EVAL_REVIEW,
         KBA_OVERFLOW,
         KBA_COS_AUDIT_AUTOMATIONS,
         KBA_COS_GENERATE_DOC,
@@ -69,6 +71,7 @@ KBA_INTENT_REVISE_DRAFT = "revise_draft"
 KBA_INTENT_MORE_RESEARCH = "more_research"
 KBA_INTENT_RESEARCH_ALL_CANDIDATES = "research_all_candidates"
 KBA_INTENT_FIND_CONTACT = "find_contact"
+KBA_INTENT_EVAL_REVIEW = "eval_review"
 KBA_INTENT_SHOW_SOURCES = "show_sources"
 KBA_INTENT_OPEN_WORK_ITEM = "open_work_item"
 KBA_INTENT_RUN_AGAIN = "run_again"
@@ -87,6 +90,7 @@ KBA_INTENTS = frozenset(
         KBA_INTENT_MORE_RESEARCH,
         KBA_INTENT_RESEARCH_ALL_CANDIDATES,
         KBA_INTENT_FIND_CONTACT,
+        KBA_INTENT_EVAL_REVIEW,
         KBA_INTENT_SHOW_SOURCES,
         KBA_INTENT_OPEN_WORK_ITEM,
         KBA_INTENT_RUN_AGAIN,

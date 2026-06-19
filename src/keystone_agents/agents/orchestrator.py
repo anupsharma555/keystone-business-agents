@@ -12,8 +12,8 @@ from pydantic import BaseModel, Field
 
 from keystone_agents.agent_registry import SPECIALIST_AGENT_SPECS, specialist_handoff_specs
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
-from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.feedback import build_operator_feedback_request
+from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.guardrails import (
     assess_text_guardrails,
     keystone_guardrails,
@@ -80,6 +80,11 @@ from keystone_agents.sdk import (
 )
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.source_layer_context import runtime_source_layer_policy_context
+from keystone_agents.specialist_agent_tools import build_specialist_agent_tools
+from keystone_agents.specialist_tool_names import (
+    ORCHESTRATOR_BUSINESS_RESEARCH_TOOL_NAME,
+    ORCHESTRATOR_OPPORTUNITY_SCOUT_TOOL_NAME,
+)
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
 from keystone_agents.tools.browser_diagnostics_tool import (
     capture_browser_diagnostics,
@@ -108,8 +113,8 @@ ORCHESTRATOR_REASONING_EFFORT = "low"
 ORCHESTRATOR_REVIEW_VERBOSITY = "low"
 ORCHESTRATOR_REVIEW_MAX_TOKENS = 1800
 ORCHESTRATOR_SPECIALIST_TOOLS_ENV = "KEYSTONE_ORCHESTRATOR_SPECIALIST_TOOLS"
-BUSINESS_RESEARCH_TOOL_NAME = "business_research_analyst_research_brief"
-OPPORTUNITY_SCOUT_TOOL_NAME = "opportunity_scout_read_only"
+BUSINESS_RESEARCH_TOOL_NAME = ORCHESTRATOR_BUSINESS_RESEARCH_TOOL_NAME
+OPPORTUNITY_SCOUT_TOOL_NAME = ORCHESTRATOR_OPPORTUNITY_SCOUT_TOOL_NAME
 
 
 _HANDOFF_BY_ROUTE = {handoff.route: handoff for handoff in INTENDED_HANDOFFS}
@@ -729,6 +734,31 @@ def _state_has_approved_context(state: Mapping[str, Any]) -> bool:
     return False
 
 
+def _request_has_inline_approved_outreach_context(text: str) -> bool:
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return False
+    if _looks_like_send_side_effect(cleaned):
+        return False
+    if not _OUTREACH_RE.search(cleaned) and not _looks_like_email(None, cleaned):
+        return False
+    if not re.search(r"\b(?:draft|write|compose|prepare)\b", cleaned, flags=re.I):
+        return False
+    approved_context_label = re.search(
+        r"\b(?:"
+        r"approved(?:\s+(?:inline|source|source-backed|source backed))?\s+"
+        r"(?:context|facts|evidence|background|grounding|rationale)"
+        r"|source[-\s]+backed\s+(?:context|facts|evidence|background|grounding)"
+        r"|context\s+approved\s+for\s+(?:drafting|draft-only\s+use|draft\s+only\s+use)"
+        r")\s*:",
+        cleaned,
+        flags=re.I,
+    )
+    if not approved_context_label:
+        return False
+    return bool(re.search(r"\b(?:do not send|no send|draft-only|draft only)\b", cleaned, flags=re.I))
+
+
 def _to_mapping(value: Any) -> Mapping[str, Any] | None:
     if value is None:
         return None
@@ -1004,17 +1034,28 @@ def _send_refusal(
 ) -> OrchestratorResult:
     return _result(
         route="clarification",
-        rationale="The request asks for email sending, which is outside the v1 safety boundary.",
+        rationale=(
+            "The request asks for an external send, post, or live action, which is outside "
+            "the v1 safety boundary without explicit approval."
+        ),
         refused=True,
         stop_reason=(
-            "Email sending is not allowed. The orchestrator can only route to draft-only workflows."
+            "Email sending is not allowed from this dry-run eval. External sending, posting, "
+            "or live API use is not allowed; the orchestrator can only route to draft-only "
+            "workflows after human approval."
         ),
-        clarification_request="Confirm whether you want a draft-only workflow for human approval.",
+        clarification_request=(
+            "Confirm whether you want a draft-only workflow for human approval; no live APIs, "
+            "Slack post, Gmail draft, send, or external write was performed."
+        ),
         approved_context_present=approved_context_present,
         approval_scope=ApprovalScope.EXTERNAL_USE,
-        approval_rationale="External-use approval does not enable automatic email sending.",
+        approval_rationale=(
+            "External-use approval is required and does not enable automatic email sending "
+            "or posting from this dry-run eval."
+        ),
         workflow_state=workflow_state,
-        audit_notes=["Hard Python send gate ran before any LLM routing."],
+        audit_notes=["Hard Python send gate ran before any LLM routing; no live APIs were called."],
     )
 
 
@@ -1094,6 +1135,27 @@ def _requested_cross_agent_workflow(text: str, *, start_route: str) -> list[str]
     return list(dict.fromkeys(workflow))
 
 
+def _mixed_outreach_request_requires_context_gate(
+    text: str,
+    *,
+    approved_context_present: bool,
+) -> bool:
+    if approved_context_present:
+        return False
+    lower = str(text or "").lower()
+    if re.search(r"\b(?:score\s+the\s+workflow|coordinate\s+the\s+agents)\b", lower):
+        return False
+    if re.search(r"\b(?:not|no)\s+outreach\b", lower):
+        return False
+    if not re.search(
+        r"\b(?:draft|write|compose|prepare|outline)\b[\s\S]{0,160}\b"
+        r"(?:outreach|email|reply|response|follow-up|followup|next\s+steps?)\b",
+        lower,
+    ):
+        return False
+    return _requires_research_before_outreach(text)
+
+
 def _requires_research_before_outreach(text: str) -> bool:
     cleaned = str(text or "")
     lower = cleaned.lower()
@@ -1171,6 +1233,38 @@ def _safe_discovery_outreach_workflow_result(
     return OrchestratorResult.model_validate(payload)
 
 
+def _research_first_outreach_workflow_result(
+    *,
+    request_text: str,
+    workflow_state: Mapping[str, Any],
+    routing_mode: str = "deterministic",
+    audit_notes: list[str] | None = None,
+) -> OrchestratorResult:
+    return _result(
+        route="business_research_analyst",
+        rationale=(
+            "The request asks for outreach after research; research must run first so "
+            "drafting can use approved, source-backed context."
+        ),
+        approval_scope=ApprovalScope.DRAFTING,
+        approval_rationale=(
+            "Draft-only outreach is downstream of source-backed research and still requires "
+            "human approval before any external use."
+        ),
+        routing_mode=routing_mode,
+        workflow_state=workflow_state,
+        audit_notes=[
+            *(audit_notes or []),
+            "Safe workflow sequence preserved: research, draft-only outreach.",
+        ],
+        retrieval_hint=_route_retrieval_hint(
+            "business_research_analyst",
+            request_text=request_text,
+        ),
+        workflow=["business_research_analyst", "outreach_composer"],
+    )
+
+
 def _missing_outreach_context_refusal(
     *,
     workflow_state: Mapping[str, Any],
@@ -1180,11 +1274,12 @@ def _missing_outreach_context_refusal(
         rationale="Outreach drafting requires approved company or opportunity context.",
         refused=True,
         stop_reason=(
-            "Approved CompanyProfile or approved OpportunityRecord is required before outreach."
+            "Approved CompanyProfile or approved OpportunityRecord, plus recipient/contact "
+            "context, is required before outreach."
         ),
         clarification_request=(
-            "Provide an approved CompanyProfile or OpportunityRecord before requesting "
-            "an outreach draft."
+            "Provide an approved CompanyProfile or OpportunityRecord plus recipient/contact "
+            "context before requesting an outreach draft."
         ),
         approval_scope=ApprovalScope.DRAFTING,
         approval_rationale=(
@@ -2679,6 +2774,39 @@ def _route_from_manual_plan(
         result.audit_notes = [*result.audit_notes, *audit_notes]
         return result
     route = plan.target_agent
+    if (
+        not approved_context_present
+        and route == "outreach_composer"
+        and _requires_research_before_outreach(request_text)
+        and _requested_cross_agent_workflow(
+            request_text,
+            start_route="business_research_analyst",
+        )
+    ):
+        return _research_first_outreach_workflow_result(
+            request_text=request_text,
+            workflow_state=workflow_state,
+            routing_mode=plan.source
+            if plan.source in {"llm", "llm_unavailable"}
+            else "deterministic",
+            audit_notes=audit_notes,
+        )
+    if _mixed_outreach_request_requires_context_gate(
+        request_text,
+        approved_context_present=approved_context_present,
+    ):
+        requested_workflow = _requested_cross_agent_workflow(
+            request_text,
+            start_route=route if route not in {"orchestrator", "clarification"} else "business_research_analyst",
+        )
+        has_research_first_path = "outreach_composer" in requested_workflow and any(
+            step in requested_workflow[: requested_workflow.index("outreach_composer")]
+            for step in ("business_research_analyst", "opportunity_scout", "gmail_triage")
+        )
+        if not has_research_first_path and (route != "gmail_triage" or not _gmail_cross_agent_workflow(request_text)):
+            result = _missing_outreach_context_refusal(workflow_state=workflow_state)
+            result.audit_notes = [*result.audit_notes, *audit_notes]
+            return result
     if route in {"orchestrator", "clarification"}:
         return None
     if route == "outreach_composer":
@@ -2794,6 +2922,7 @@ def route_request(
             or _mapping_value(request, "approved_opportunity_record") is not None,
         )
         or bool(state_context.get("approved_context_available"))
+        or _request_has_inline_approved_outreach_context(text)
     )
     resolved_manual_plan = _manual_plan_for_request(
         request,
@@ -2858,6 +2987,21 @@ def route_request(
             )
         )
 
+    if _OUTREACH_RE.search(lower_text) and _request_has_inline_approved_outreach_context(text):
+        return finish(
+            _result(
+                route="outreach_composer",
+                rationale="The request asks for draft outreach from approved inline context.",
+                approved_context_present=True,
+                approval_scope=ApprovalScope.EXTERNAL_USE,
+                approval_rationale=(
+                    "Inline context is approved for draft-only use; any external use remains "
+                    "approval-gated."
+                ),
+                workflow_state=state_context,
+            )
+        )
+
     if _looks_like_email(request, text):
         return finish(
             _result(
@@ -2879,27 +3023,25 @@ def route_request(
         )
 
     if _OUTREACH_RE.search(lower_text):
-        if _requires_research_before_outreach(text) and not approved_context_present:
+        if (
+            not approved_context_present
+            and _requires_research_before_outreach(text)
+            and _requested_cross_agent_workflow(
+                text,
+                start_route="business_research_analyst",
+            )
+        ):
             return finish(
-                _result(
-                    route="business_research_analyst",
-                    rationale=(
-                        "The request asks for research plus later outreach; research must "
-                        "run first so any draft can use approved source-backed context."
-                    ),
-                    approval_scope=ApprovalScope.DRAFTING,
-                    approval_state=ApprovalState.PENDING,
-                    approval_rationale=(
-                        "Outreach remains blocked until the research artifact is reviewed "
-                        "and approved for drafting context."
-                    ),
+                _research_first_outreach_workflow_result(
+                    request_text=text,
                     workflow_state=state_context,
-                    retrieval_hint=_route_retrieval_hint(
-                        "business_research_analyst",
-                        request_text=text,
-                    ),
                 )
             )
+        if _mixed_outreach_request_requires_context_gate(
+            text,
+            approved_context_present=approved_context_present,
+        ):
+            return finish(_missing_outreach_context_refusal(workflow_state=state_context))
         if not approved_context_present:
             return finish(_missing_outreach_context_refusal(workflow_state=state_context))
         return finish(
@@ -3029,55 +3171,28 @@ def _attach_handoff_metadata(agent: Agent) -> Agent:
 
 
 def _build_read_only_specialist_tools() -> list[Any]:
-    from keystone_agents.agents.business_research_analyst import (
-        build_business_research_analyst_research_brief_agent,
+    return build_specialist_agent_tools(
+        manager_agent_name="orchestrator",
+        include_routes={"business_research_analyst", "opportunity_scout"},
+        route_tool_name_overrides={
+            "business_research_analyst": BUSINESS_RESEARCH_TOOL_NAME,
+            "opportunity_scout": OPPORTUNITY_SCOUT_TOOL_NAME,
+        },
+        route_descriptions={
+            "business_research_analyst": (
+                "Run the Business Research Analyst for internal, source-attributed "
+                "research synthesis only. This tool is read/plan-only and cannot send, "
+                "publish, schedule, create approval items, or persist memory; Python gates "
+                "and approval policy remain authoritative."
+            ),
+            "opportunity_scout": (
+                "Run Opportunity Scout for read-only discovery, ranking, and internal "
+                "candidate synthesis. This tool cannot save opportunities, persist memory, "
+                "write Airtable/Google Workspace records, send, post, schedule, or create "
+                "approval items."
+            ),
+        },
     )
-    from keystone_agents.agents.opportunity_scout import build_opportunity_scout_agent
-
-    business_research_agent = build_business_research_analyst_research_brief_agent()
-    business_research_agent.tools = [
-        tool
-        for tool in business_research_agent.tools
-        if _tool_name(tool) in _READ_ONLY_BUSINESS_RESEARCH_TOOL_NAMES
-    ]
-
-    tools: list[Any] = []
-    research_as_tool = getattr(business_research_agent, "as_tool", None)
-    if callable(research_as_tool):
-        tools.append(
-            research_as_tool(
-                tool_name=BUSINESS_RESEARCH_TOOL_NAME,
-                tool_description=(
-                    "Run the Business Research Analyst for internal, source-attributed "
-                    "research synthesis only. This tool is read-only and cannot send, publish, "
-                    "schedule, create approval items, or persist memory; Python gates and "
-                    "approval policy remain authoritative."
-                ),
-                max_turns=6,
-            )
-        )
-
-    opportunity_agent = build_opportunity_scout_agent()
-    opportunity_agent.tools = [
-        tool
-        for tool in opportunity_agent.tools
-        if _tool_name(tool) in _READ_ONLY_OPPORTUNITY_SCOUT_TOOL_NAMES
-    ]
-    opportunity_as_tool = getattr(opportunity_agent, "as_tool", None)
-    if callable(opportunity_as_tool):
-        tools.append(
-            opportunity_as_tool(
-                tool_name=OPPORTUNITY_SCOUT_TOOL_NAME,
-                tool_description=(
-                    "Run Opportunity Scout for read-only discovery, ranking, and internal "
-                    "candidate synthesis. This tool cannot save opportunities, persist memory, "
-                    "write Airtable/Google Workspace records, send, post, schedule, or create "
-                    "approval items."
-                ),
-                max_turns=6,
-            )
-        )
-    return tools
 
 
 def build_orchestrator_agent(
@@ -3104,7 +3219,9 @@ def build_orchestrator_agent(
             include_all=include_all_skills,
         ),
     )
-    handoffs = [spec.build_agent() for spec in SPECIALIST_AGENT_SPECS] if include_handoffs else []
+    handoffs = [
+        spec.build_agent() for spec in SPECIALIST_AGENT_SPECS if spec.handoff_enabled
+    ] if include_handoffs else []
     specialist_tools = (
         _build_read_only_specialist_tools()
         if (

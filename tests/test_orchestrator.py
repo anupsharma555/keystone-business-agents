@@ -865,6 +865,39 @@ def test_outreach_request_with_approved_profile_routes_to_composer() -> None:
     assert "external-use approval" in result.approval_rationale
 
 
+def test_outreach_request_with_approved_inline_context_routes_to_composer() -> None:
+    result = route_request(
+        "outreach composer agent: diagnostic case diag_outreach "
+        "Use only this approved inline context from a sanitized Gmail triage diagnostic. "
+        "Do not research externally. Target recipient: Alex Rivera, Partnerships Lead, "
+        "Example Health. Approved context: Alex asked whether Keystone could help review "
+        "Example Health's remote patient monitoring AI validation workflow before a July "
+        "pilot proposal. No PHI is included. Return a human-useful draft-only email "
+        "paragraph plus brief caveats. Do not send email, create a Gmail draft, publish, "
+        "or post elsewhere."
+    )
+
+    assert result.route == "outreach_composer"
+    assert result.approved_context_present is True
+    assert result.send_enabled is False
+    assert result.external_use_approval_required is True
+
+
+def test_outreach_request_accepts_flexible_approved_context_labels() -> None:
+    result = route_request(
+        "outreach composer agent: diagnostic case diag_outreach flexible labels "
+        "Prepare a draft-only email paragraph. Target contact: Alex Rivera at Example "
+        "Health. Approved evidence: Example Health asked whether Keystone could review "
+        "its remote patient monitoring AI validation workflow before a July pilot. "
+        "No PHI is included. Do not send email, create a Gmail draft, publish, or post."
+    )
+
+    assert result.route == "outreach_composer"
+    assert result.approved_context_present is True
+    assert result.send_enabled is False
+    assert result.external_use_approval_required is True
+
+
 def test_orchestrator_can_attach_optional_operator_feedback_request() -> None:
     profile = CompanyProfile(
         name="NeuroFlow",
@@ -1214,12 +1247,15 @@ def test_workflow_state_context_summarizes_storage_without_bodies(tmp_path) -> N
 def test_handoff_metadata_or_intended_handoff_list_exists() -> None:
     agent = build_orchestrator_agent()
 
-    assert len(INTENDED_HANDOFFS) == 4
+    assert len(INTENDED_HANDOFFS) == 7
     assert {handoff.agent_name for handoff in INTENDED_HANDOFFS} == {
         "Gmail Inbound Triage Agent",
         "Business Research Analyst",
         "Opportunity Scout Agent",
         "Outreach Composer Agent",
+        "Airtable Context Agent",
+        "Google Workspace Context Agent",
+        "Zotero Context Agent",
     }
     assert getattr(agent, "handoffs", None)
     assert getattr(agent, "intended_handoffs", None) or getattr(agent, "handoff_contract", None)

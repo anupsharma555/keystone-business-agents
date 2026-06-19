@@ -1076,6 +1076,66 @@ def test_kba_more_research_records_event_and_duplicate_is_idempotent(
     assert len(calls) == 1
     events = store.list_work_item_events(item.id)
     assert any(event.event_type == "slack_action_intent" for event in events)
+    action_events = [
+        event for event in events if event.event_type == "slack_action_intent"
+    ]
+    assert [event.metadata["status"] for event in action_events] == [
+        "started",
+        "completed",
+    ]
+
+
+def test_kba_more_research_retry_after_started_event_is_not_deduped(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
+    store = SQLiteStore(database_url)
+    item = _save_linked_work_item_approval(store)
+    calls: list[object] = []
+
+    def fake_advance(request, **_kwargs):
+        calls.append(request)
+        if len(calls) == 1:
+            raise RuntimeError("simulated crash after action intent")
+        loaded = SQLiteStore(database_url).get_work_item(item.id)
+        assert loaded is not None
+        return WorkflowRunResult(
+            work_item=loaded,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=loaded.status,
+            advanced=False,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
+        fake_advance,
+    )
+    payload = _kba_payload(
+        action_id=KBA_MORE_RESEARCH,
+        intent=KBA_INTENT_MORE_RESEARCH,
+        approval_id="approval-workitem",
+        work_item_id=item.id,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        handle_slack_approval_interaction(payload, database_url=database_url)
+    retry = handle_slack_approval_interaction(payload, database_url=database_url)
+    duplicate = handle_slack_approval_interaction(payload, database_url=database_url)
+
+    assert retry.outcome == "research_retry_completed"
+    assert duplicate.idempotent is True
+    assert len(calls) == 2
+    events = [
+        event
+        for event in store.list_work_item_events(item.id)
+        if event.event_type == "slack_action_intent"
+    ]
+    assert [event.metadata["status"] for event in events] == [
+        "started",
+        "started",
+        "completed",
+    ]
 
 
 def test_kba_more_research_reports_still_blocked_after_retry(
@@ -1408,6 +1468,59 @@ def test_kba_continue_work_item_uses_langgraph_thread_when_enabled(
     )
     assert graph_event.metadata["checkpoint_key"] == f"work-item:{item.id}"
     assert graph_event.metadata["runtime"] in {"langgraph", "dependency_free_fallback"}
+
+
+def test_kba_continue_work_item_preserves_live_execution_flags(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNI_BUSINESS_AGENTS_LIVE_SEARCH", "true")
+    monkeypatch.setenv("KNI_BUSINESS_AGENTS_LIVE_SDK", "true")
+    database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
+    store = SQLiteStore(database_url)
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        status=WorkItemStatus.IN_PROGRESS,
+        title="Research NeuroFlow",
+        request_text="research NeuroFlow",
+        target=WorkItemTarget(name="NeuroFlow", object_type="company"),
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+    )
+    store.save_work_item(item)
+    captured: list[object] = []
+
+    def fake_advance(request, **_kwargs):
+        captured.append(request)
+        loaded = SQLiteStore(database_url).get_work_item(item.id)
+        assert loaded is not None
+        return WorkflowRunResult(
+            work_item=loaded,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=loaded.status,
+            advanced=False,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
+        fake_advance,
+    )
+
+    result = handle_slack_approval_interaction(
+        _kba_payload(
+            action_id=KBA_COS_CONTINUE_WORK_ITEM,
+            intent=KBA_INTENT_CONTINUE_WORK_ITEM,
+            approval_id="",
+            work_item_id=item.id,
+        ),
+        database_url=database_url,
+    )
+
+    assert result.outcome == "continued"
+    assert result.send_enabled is False
+    assert captured
+    request = captured[0]
+    assert request.live_search is True
+    assert request.live_sdk is True
 
 
 def test_kba_overflow_show_sources_and_open_work_item_are_read_only(tmp_path) -> None:

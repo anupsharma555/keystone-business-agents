@@ -21,6 +21,7 @@ from keystone_agents.agent_tool_policy import (
     disallowed_tool_names,
     source_layer_policy_for_tools,
     tool_policy_for_agent,
+    tool_tier_for_name,
     unclassified_tool_names,
 )
 from keystone_agents.agents.business_research_analyst import (
@@ -36,6 +37,7 @@ from keystone_agents.sdk import (
     skill_metadata_for_files,
 )
 from keystone_agents.skill_sets import AGENT_SKILL_NAMES
+from keystone_agents.specialist_tool_names import specialist_agent_tool_name
 from keystone_agents.tools.gmail_tool import get_gmail_message
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -44,34 +46,49 @@ SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "136f0d985a644d4e83a17841182a7a6cc682330d38bccc896ae13d7c7aeabca9",
-        "tool_names_sha256": "7f8aa859104bbb74f20effcc9ea3df828444a7a5e6ee333faaa4308f214a7b1a",
-        "output_schema_sha256": "563358d4e138654b23fb9567b06c639a66127dcfd6a3182a497b20a32dc166de",
+        "instructions_sha256": "5c14ccf60fe817f25bac8f60d6f291b9f981a73de10448b230682ce1af09eb06",
+        "tool_names_sha256": "5666cdbfcc42bfd14f3dcd75c544302d6fa9aa7f76697b1d24fdb87a5880dd76",
+        "output_schema_sha256": "519be6127e040ff904066e7dd8efe671ce88a3c4c527bdcb730a6e5f131d3345",
     },
     "business_research_analyst": {
-        "instructions_sha256": "f81ed08dabb3e1fc350de2884a6bb546ed2755e0058783bac065f6ff8b87a72a",
-        "tool_names_sha256": "dc99c3bef9ef99b28c0fefeb017783195c895dc2c819670275e860e8b2fc16fa",
+        "instructions_sha256": "6d5d3f656bc6b974aef819ad911f10d915131ca6bf409006cc37cffe20e4dc47",
+        "tool_names_sha256": "8c128ab9eee684363954e52c9b1b8a29e27df6b1509647f4b39479f37ddf1bc1",
         "output_schema_sha256": "b8218a333d85d2f3850203f5ee48b7ec535a6f924a8851c513f1f2b2afeef6e0",
     },
     "opportunity_scout": {
-        "instructions_sha256": "1388420f2192e3688472b57d482ff09c9d66cf0df36f7c8e332b173b1e926061",
-        "tool_names_sha256": "cfd3e659bff1d1d5a9d2c9d3ed823f9261df6f5e5197fd50d51d96c069b34e66",
+        "instructions_sha256": "7ae98a1a9bdb6fc0a1a41f06ef42374d4910c4e1975eba01e2505b29acab50b5",
+        "tool_names_sha256": "38c690f9feef3bcb9699511283538d4448fe33a4e1f82d68acab135f51e4d51b",
         "output_schema_sha256": "2e91674be427e59361cfb5a9c275a048bf4166fbcd9f88f6e06405a235ab59e8",
     },
     "outreach_composer": {
-        "instructions_sha256": "201376da278381c2be3e4d5d841aa10513bdb1d32d2c26364dbca4cd0675d7f1",
-        "tool_names_sha256": "ef26ea7d5fdaaa5e435c8e4d6dee0521dd07a8ddf663dc12bcec3116a9592585",
+        "instructions_sha256": "14405e5a2ac419dad2c18c8277d04bf81d0021ee07e06c68baa543d6ec6dd1d2",
+        "tool_names_sha256": "b86270338a35685eb23e446ca5ec82e4ff7849e71356129b7920ca33c454de68",
         "output_schema_sha256": "167da45f0bb07c0a255c4115b52e9510272a22cc1c479abe9e97c88693d44b34",
     },
+    "airtable_context_agent": {
+        "instructions_sha256": "f4cb19d488cf50cb5e56335125d9585ccf673ca28b96c3d92e9786352572b77a",
+        "tool_names_sha256": "8dbe88d3c4789ad1579d96c16bdd4136d16b69801d0b0402e92cbd83c2eb2f23",
+        "output_schema_sha256": "e472babb0c090889cbd7a6afa92dce58e4006e6895754c48d0fe2b5e661e1442",
+    },
+    "google_workspace_context_agent": {
+        "instructions_sha256": "b3c6b1bd9913553f7c0657b50d15cc861ddd1ebd8ba62f16444ddc8e728bdf53",
+        "tool_names_sha256": "a20b54ebe4e23acf72fbab3fcba4d67150a81fefc03d00d16c5b94ce9f56c760",
+        "output_schema_sha256": "28dc3fc15522eeaf4693d4e5787f1927f9913a180a958ca1f3228d0fd6741731",
+    },
+    "zotero_context_agent": {
+        "instructions_sha256": "80f3dfd83bbd552fbc1eb2eb93dc9d274c502729292c33decba0433e4289c05b",
+        "tool_names_sha256": "4b5242fa381337a43a5dbb560a8c99a956ebe2540d011369aa5238236f402b96",
+        "output_schema_sha256": "948058c91335bafdbc38116beb87fc71b8b874ce8c7d2a1b6626bf07893f9426",
+    },
     "orchestrator": {
-        "instructions_sha256": "252ae339fc80c3bedfd79ee9626891972c92514b48b782c78b8eb9b808d69574",
-        "tool_names_sha256": "1c2bf4210e21e89f1381c3fc9e33b1480130220b362593845c47475e93b2f925",
-        "output_schema_sha256": "89d3c6cd618bcd2546fd63fdbd9de221cf4db20af407030347d7f64c0a646e8b",
+        "instructions_sha256": "4419b0f64167bcd129e407ed0288bfa577bf578ab3d4099e8e48a58af09f2902",
+        "tool_names_sha256": "65a79825b11ddc73b9418be488895e8ba03e4c3d9e9b5a68bc0dd9eb8775cb72",
+        "output_schema_sha256": "f2b89a6fe10345179f00847ec38056860c89a58bd2b1da5b6686a40cc6de649f",
     },
     "chief_of_staff": {
-        "instructions_sha256": "4a02f59f82e94e283114b17eb7b6d0a161b6b71fbb5b2eb2a92c66b33216043d",
-        "tool_names_sha256": "79a314c867ddd181048dccef8b3f943fa71b034a0a68c5d6fe54e3d1802e72b5",
-        "output_schema_sha256": "132332f59ebca8c234b91d6f51380f7e18effd7dc623c77d104774f1003cbe3f",
+        "instructions_sha256": "cca0078ebca3c06005c3f12b4f9f8a733fc15fde2dcd16ddc46bed1eddb19f68",
+        "tool_names_sha256": "b1deac379e2121c7c1d4e6c69471845228ce3b6f3accf8e85754ca089b0ce18d",
+        "output_schema_sha256": "c8b0252319afa129becdea43ebbb25b262fbf10f4cda9f4284cf09ad5d0a1cd7",
     },
 }
 
@@ -112,6 +129,9 @@ def test_registry_has_canonical_agents() -> None:
         "business_research_analyst",
         "opportunity_scout",
         "outreach_composer",
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
         "orchestrator",
         "chief_of_staff",
     }
@@ -120,6 +140,9 @@ def test_registry_has_canonical_agents() -> None:
         "business_research_analyst",
         "opportunity_scout",
         "outreach_composer",
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
         "orchestrator",
         "chief_of_staff",
     ]
@@ -199,6 +222,94 @@ def test_registered_builders_match_declared_schema_and_tools() -> None:
         assert agent.handoff_description
         assert agent.input_guardrails
         assert agent.output_guardrails
+
+
+def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> None:
+    for route_name in (
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+    ):
+        spec = AGENT_REGISTRY[route_name]
+        assert spec.eval_datasets == ("promptfoo/tests/slack_agent_expansion_15.yaml",)
+        assert spec.handoff_enabled is True
+
+    airtable = AGENT_REGISTRY["airtable_context_agent"].build_agent()
+    workspace = AGENT_REGISTRY["google_workspace_context_agent"].build_agent()
+    zotero = AGENT_REGISTRY["zotero_context_agent"].build_agent()
+    airtable_tool_names = _tool_names(airtable)
+    workspace_tool_names = _tool_names(workspace)
+    zotero_tool_names = _tool_names(zotero)
+
+    assert {"airtable_get_base_schema", "airtable_read_records"} <= airtable_tool_names
+    assert "airtable_write_record" in airtable_tool_names
+    assert workspace_tool_names == {
+        "google_doc_read",
+        "google_doc_write",
+        "google_drive_list_folder",
+        "google_drive_search_files",
+        "google_drive_get_file_metadata",
+        "google_drive_create_folder",
+        "google_drive_rename_folder",
+        "google_drive_remove_folder",
+        "google_sheet_list",
+        "google_sheet_create",
+        "google_sheet_read_table",
+        "google_sheet_append_rows",
+        "google_sheet_update_row",
+        "google_sheet_delete_rows",
+        "google_sheet_create_tab",
+        "google_sheet_update_tab",
+        "google_sheet_remove_tab",
+        "google_sheet_trash",
+    }
+    assert {
+        "list_local_context_sources",
+        "search_local_context",
+        "read_local_context_file",
+        "zotero_resolve_collection_context",
+        "zotero_resolve_article_context",
+        "zotero_read_api_metadata",
+        "zotero_import_article_with_backend",
+        "google_drive_list_folder",
+        "google_drive_search_files",
+        "google_drive_get_file_metadata",
+        "google_doc_read",
+        "google_doc_write",
+        "google_drive_create_folder",
+        "google_sheet_list",
+        "google_sheet_create",
+        "google_sheet_read_table",
+        "google_sheet_append_rows",
+        "google_sheet_update_row",
+    } <= zotero_tool_names
+    assert disallowed_tool_names("airtable_context_agent", sorted(airtable_tool_names)) == []
+    assert disallowed_tool_names(
+        "google_workspace_context_agent",
+        sorted(workspace_tool_names),
+    ) == []
+    assert disallowed_tool_names("zotero_context_agent", sorted(zotero_tool_names)) == []
+    assert tool_tier_for_name("airtable_write_record") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("google_doc_write") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("zotero_import_article_with_backend") == ToolTier.INTERNAL_WRITE
+
+    nested_airtable = AGENT_REGISTRY["airtable_context_agent"].build_agent(
+        tool_tier=ToolTier.DIAGNOSTIC
+    )
+    nested_workspace = AGENT_REGISTRY["google_workspace_context_agent"].build_agent(
+        tool_tier=ToolTier.DIAGNOSTIC
+    )
+    nested_zotero = AGENT_REGISTRY["zotero_context_agent"].build_agent(
+        tool_tier=ToolTier.DIAGNOSTIC
+    )
+    nested_tool_names = (
+        _tool_names(nested_airtable) | _tool_names(nested_workspace) | _tool_names(nested_zotero)
+    )
+    assert "airtable_write_record" not in nested_tool_names
+    assert "google_drive_get_file_metadata" in nested_tool_names
+    assert "google_doc_write" not in nested_tool_names
+    assert "google_sheet_append_rows" not in nested_tool_names
+    assert "zotero_import_article_with_backend" not in nested_tool_names
 
 
 def test_build_model_settings_defaults_to_usage_and_prompt_cache(monkeypatch) -> None:
@@ -384,6 +495,23 @@ def test_orchestrator_registry_declares_read_only_specialist_tools() -> None:
         assert tool_name in opted_in_tool_names
 
 
+def test_chief_of_staff_registry_declares_all_specialist_tools() -> None:
+    spec = AGENT_REGISTRY["chief_of_staff"]
+    policy = tool_policy_for_agent("chief_of_staff")
+    agent = spec.build_agent(include_specialist_tools=True)
+    generated_tool_names = {
+        specialist_agent_tool_name(specialist.route_name) for specialist in SPECIALIST_AGENT_SPECS
+    }
+    tool_names = _tool_names(agent)
+
+    assert generated_tool_names <= set(spec.optional_tools)
+    assert generated_tool_names <= tool_names
+    assert disallowed_tool_names("chief_of_staff", sorted(generated_tool_names)) == []
+    assert policy is not None
+    for tool_name in generated_tool_names:
+        assert tool_tier_for_name(tool_name) == ToolTier.DEEP_RETRIEVAL
+
+
 def test_orchestrator_registry_declares_control_plane_bridge_coverage() -> None:
     spec = AGENT_REGISTRY["orchestrator"]
 
@@ -423,10 +551,43 @@ def test_orchestrator_handoffs_derive_from_specialist_registry() -> None:
     assert INTENDED_HANDOFFS == specialist_handoff_specs()
 
     agent = build_orchestrator_agent()
-    assert len(agent.handoffs) == len(SPECIALIST_AGENT_SPECS)
+    handoff_enabled_specs = [spec for spec in SPECIALIST_AGENT_SPECS if spec.handoff_enabled]
+    assert len(agent.handoffs) == len(handoff_enabled_specs)
     assert [handoff.name for handoff in agent.handoffs] == [
-        spec.route_name for spec in SPECIALIST_AGENT_SPECS
+        spec.route_name for spec in handoff_enabled_specs
     ]
+    assert "airtable_context_agent" in [handoff.name for handoff in agent.handoffs]
+    assert "google_workspace_context_agent" in [handoff.name for handoff in agent.handoffs]
+    assert "zotero_context_agent" in [handoff.name for handoff in agent.handoffs]
+
+
+def test_orchestrator_handoff_specs_expose_typed_contracts() -> None:
+    handoffs = {handoff.route: handoff for handoff in specialist_handoff_specs()}
+
+    assert set(handoffs) == {spec.route_name for spec in SPECIALIST_AGENT_SPECS}
+    research = handoffs["business_research_analyst"]
+    assert research.contract_version == "keystone.handoff_spec.v1"
+    assert research.input_schema == "keystone_agents.schemas.context_pack.ResearchContextPack"
+    assert research.input_contract_type == "ResearchContextPack"
+    assert research.output_schema == "keystone_agents.schemas.research.ResearchBrief"
+    assert research.output_contract_type == "ResearchBrief"
+    assert research.type_contract.source_output_type == (
+        "keystone_agents.schemas.orchestrator.OrchestratorResult"
+    )
+    assert research.type_contract.target_input_type == research.input_schema
+    assert research.type_contract.target_output_type == research.output_schema
+    assert research.type_contract.payload_mode == "adapted"
+    assert research.type_contract.compatibility_status == "compatible"
+
+    assert handoffs["airtable_context_agent"].input_schema == (
+        "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput"
+    )
+    assert handoffs["google_workspace_context_agent"].output_schema.endswith(
+        ".GoogleWorkspaceContextResult"
+    )
+    assert handoffs["zotero_context_agent"].type_contract.target_output_type.endswith(
+        ".ZoteroContextResult"
+    )
 
 
 def test_agent_cards_are_json_safe_extension_metadata() -> None:
@@ -440,6 +601,7 @@ def test_agent_cards_are_json_safe_extension_metadata() -> None:
         assert isinstance(card["tools"], list)
         assert isinstance(card["optional_tools"], list)
         assert isinstance(card["safety_notes"], list)
+        assert card["input_schema"]
         assert "skills.md" not in card["prompt_files"]
         assert tuple(card["skills"]) == AGENT_SKILL_NAMES[card["route_name"]]
         assert "evidence_attribution_and_claim_mapping" in card["skills"]

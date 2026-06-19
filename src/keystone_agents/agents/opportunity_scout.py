@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,6 +74,7 @@ from keystone_agents.sdk import (
     compose_instructions,
     function_tool,
 )
+from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.source_quality import (
     score_source_quality,
@@ -3925,8 +3926,11 @@ def _candidate_name_rejection_reason(company_name: str) -> str:
         "study tools",
         "study:",
         "guides @",
+        "next phase",
     )
     if any(marker in lowered for marker in headline_markers):
+        return "candidate name is an article headline rather than an organization"
+    if lowered.startswith("from ") and " to " in lowered:
         return "candidate name is an article headline rather than an organization"
     if lowered.startswith("top ") and any(
         marker in lowered for marker in ("startup", "startups", "compan", "vendors", "platforms")
@@ -6836,12 +6840,19 @@ def run_opportunity_scout_sdk(
     session: Any | None = None,
     context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
+    max_turns: int | None = None,
 ) -> TypedAgentRunResult[OpportunityScoutResult]:
     """Run Opportunity Scout through the typed SDK harness."""
 
     resolved_tool_tier = tool_tier or _default_opportunity_scout_sdk_tool_tier(
         typed_input,
         live=live,
+    )
+    turn_policy = resolve_sdk_turn_policy(
+        "opportunity_scout",
+        request_text=skill_request_text(typed_input),
+        live_search=live,
+        explicit_max_turns=max_turns,
     )
     return run_typed_sdk_agent(
         agent=build_opportunity_scout_agent(
@@ -6855,6 +6866,7 @@ def run_opportunity_scout_sdk(
         run_config=run_config,
         live=live,
         session=session,
+        max_turns=turn_policy.max_turns,
     )
 
 

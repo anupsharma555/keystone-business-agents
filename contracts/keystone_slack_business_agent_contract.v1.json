@@ -8,6 +8,7 @@
     "kba_cos_show_blockers",
     "kba_cos_sync_airtable",
     "kba_create_gmail_draft",
+    "kba_eval_review",
     "kba_find_contact",
     "kba_more_research",
     "kba_overflow",
@@ -39,6 +40,7 @@
     "audit_automations",
     "continue_work_item",
     "create_gmail_draft",
+    "eval_review",
     "find_contact",
     "generate_doc",
     "more_research",
@@ -240,6 +242,11 @@
           "default": "",
           "title": "Channel Name",
           "type": "string"
+        },
+        "eval": {
+          "additionalProperties": true,
+          "title": "Eval",
+          "type": "object"
         },
         "metadata": {
           "additionalProperties": true,

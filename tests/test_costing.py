@@ -14,6 +14,7 @@ from keystone_agents.costing import (
     estimate_usage_cost,
     fetch_provider_cost_window,
     gemini_free_tier_usage_context,
+    pricing_metadata_available,
     summarize_cache_experiment,
 )
 
@@ -41,6 +42,13 @@ def test_estimate_usage_cost_uses_local_pricing_table_for_openai() -> None:
         "cached_input": 0.000015,
         "output": 0.00225,
     }
+
+
+def test_pricing_metadata_available_accepts_priced_prefix_aliases() -> None:
+    assert pricing_metadata_available(provider="openai", model="gpt-5.4-mini")
+    assert pricing_metadata_available(provider="openai", model="gpt-5.4-mini-2026-06-01")
+    assert pricing_metadata_available(provider="gemini", model="gemini-2.5-flash")
+    assert pricing_metadata_available(provider="openai", model="gpt-5.5") is False
 
 
 def test_compare_estimated_to_actual_cost_reports_delta_without_secret_inputs() -> None:

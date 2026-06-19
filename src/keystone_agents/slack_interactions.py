@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -584,7 +585,7 @@ def _handle_kba_steering_action(
         )
 
     dedupe_key = _kba_dedupe_key(action_id, action_payload)
-    if _has_recorded_kba_action(store, work_item.id, dedupe_key):
+    if _has_completed_kba_action(store, work_item.id, dedupe_key):
         return _kba_result(
             action_payload,
             action_id=action_id,
@@ -633,6 +634,8 @@ def _handle_kba_steering_action(
             action_id=action_id,
             reviewer=reviewer,
             dedupe_key=dedupe_key,
+            attempt_id=_new_kba_action_attempt_id(),
+            status="completed",
             summary="Slack action skipped this company candidate.",
         )
         store.save_work_item(updated)
@@ -652,6 +655,7 @@ def _handle_kba_steering_action(
 
     work_item = _select_action_artifact_if_present(store, work_item, action_payload)
     route = _route_for_steering_intent(intent, work_item)
+    attempt_id = _new_kba_action_attempt_id()
     _record_kba_action_event(
         store,
         work_item,
@@ -659,6 +663,8 @@ def _handle_kba_steering_action(
         action_id=action_id,
         reviewer=reviewer,
         dedupe_key=dedupe_key,
+        attempt_id=attempt_id,
+        status="started",
         summary=f"Slack action queued `{intent}` via `{route.value}`.",
     )
     advance = _advance_work_item_for_intent(
@@ -668,6 +674,22 @@ def _handle_kba_steering_action(
         feedback="",
         database_url=database_url,
         route=route,
+    )
+    _record_kba_action_event(
+        store,
+        advance.work_item,
+        action_payload,
+        action_id=action_id,
+        reviewer=reviewer,
+        dedupe_key=dedupe_key,
+        attempt_id=attempt_id,
+        status="completed",
+        summary=f"Slack action completed `{intent}` via `{advance.route.value}`.",
+        result={
+            "route": advance.route.value,
+            "status": advance.status.value,
+            "advanced": bool(advance.advanced),
+        },
     )
     outcome, followup = _steering_action_outcome_and_followup(
         intent,
@@ -755,6 +777,7 @@ def _handle_research_all_candidates_action(
             work_item=work_item,
         )
 
+    attempt_id = _new_kba_action_attempt_id()
     _record_kba_action_event(
         store,
         work_item,
@@ -762,6 +785,8 @@ def _handle_research_all_candidates_action(
         action_id=action_id,
         reviewer=reviewer,
         dedupe_key=dedupe_key,
+        attempt_id=attempt_id,
+        status="started",
         summary=(
             "Slack action queued `research_all_candidates` for "
             f"{len(opportunity_refs)} opportunity candidate(s)."
@@ -809,6 +834,25 @@ def _handle_research_all_candidates_action(
             + "."
         )
         activity["researched_candidates"] = researched_titles
+    _record_kba_action_event(
+        store,
+        current,
+        action_payload,
+        action_id=action_id,
+        reviewer=reviewer,
+        dedupe_key=dedupe_key,
+        attempt_id=attempt_id,
+        status="completed",
+        summary=(
+            "Slack action completed `research_all_candidates` for "
+            f"{len(researched_titles)} opportunity candidate(s)."
+        ),
+        result={
+            "route": WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+            "status": current.status.value,
+            "researched_candidate_count": len(researched_titles),
+        },
+    )
 
     return _kba_result(
         action_payload,
@@ -906,12 +950,12 @@ def _handle_chief_of_staff_action(
             not in {WorkItemRoute.ORCHESTRATOR, WorkItemRoute.CLARIFICATION}
             else "orchestrator"
         )
+        live_search = _slack_work_item_live_search_enabled()
+        live_sdk = _slack_work_item_live_sdk_enabled(default=live_search)
         orchestrator_preflight = run_orchestrator_preflight(
             "continue",
             requested_agent=requested_agent,
-            live_manual_plan=_slack_work_item_live_sdk_enabled(
-                default=_slack_work_item_live_search_enabled()
-            ),
+            live_manual_plan=live_sdk,
             database_url=database_url,
         )
         slack_query_prompt = _slack_query_prompt_for_work_item_action(
@@ -939,6 +983,8 @@ def _handle_chief_of_staff_action(
                 work_item_id=work_item_id,
                 save=True,
                 database_url=database_url,
+                live_search=live_search,
+                live_sdk=live_sdk,
                 orchestrator_preflight=compact_orchestrator_preflight_payload(
                     orchestrator_preflight
                 ),
@@ -1647,7 +1693,10 @@ def _record_kba_action_event(
     action_id: str,
     reviewer: str,
     dedupe_key: str,
+    attempt_id: str,
+    status: str,
     summary: str,
+    result: dict[str, Any] | None = None,
 ) -> None:
     record_event(
         work_item,
@@ -1662,6 +1711,10 @@ def _record_kba_action_event(
             "gate_scope": action_payload.gate_scope,
             "artifact_id": action_payload.artifact_id,
             "dedupe_key": dedupe_key,
+            "attempt_id": attempt_id,
+            "status": status,
+            "terminal": status in {"completed", "failed", "cancelled"},
+            "result": result or {},
             "slack": {
                 "channel_id": action_payload.source_channel_id,
                 "message_ts": action_payload.source_message_ts,
@@ -1672,11 +1725,20 @@ def _record_kba_action_event(
     )
 
 
-def _has_recorded_kba_action(store: SQLiteStore, work_item_id: str, dedupe_key: str) -> bool:
+def _new_kba_action_attempt_id() -> str:
+    return f"slack_action_{uuid.uuid4().hex}"
+
+
+def _has_completed_kba_action(store: SQLiteStore, work_item_id: str, dedupe_key: str) -> bool:
     if not dedupe_key:
         return False
     return any(
-        event.event_type == "slack_action_intent" and event.metadata.get("dedupe_key") == dedupe_key
+        event.event_type == "slack_action_intent"
+        and event.metadata.get("dedupe_key") == dedupe_key
+        and (
+            event.metadata.get("status") == "completed"
+            or event.metadata.get("terminal") is True
+        )
         for event in store.list_work_item_events(work_item_id)
     )
 

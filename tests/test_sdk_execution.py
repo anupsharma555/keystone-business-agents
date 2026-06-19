@@ -5,9 +5,15 @@ import json
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+import keystone_agents.agents.business_research_analyst as business_research_module
+import keystone_agents.agents.gmail_triage as gmail_triage_module
+import keystone_agents.agents.opportunity_scout as opportunity_scout_module
+import keystone_agents.agents.outreach_composer as outreach_composer_module
 
 try:
     from agents.exceptions import (
@@ -16,6 +22,7 @@ try:
         OutputGuardrailTripwireTriggered,
     )
     from agents.models.interface import Model, ModelProvider, ModelResponse
+    from agents.tool_context import ToolContext
     from agents.usage import Usage
     from openai.types.responses import (
         ResponseFunctionToolCall,
@@ -31,7 +38,10 @@ from keystone_agents.agents.business_research_analyst import (
     run_business_research_analyst_focused_brief_sdk,
     run_business_research_analyst_sdk,
 )
-from keystone_agents.agents.chief_of_staff import run_chief_of_staff_sdk
+from keystone_agents.agents.chief_of_staff import (
+    build_chief_of_staff_agent,
+    run_chief_of_staff_sdk,
+)
 from keystone_agents.agents.gmail_triage import (
     build_gmail_triage_agent,
     run_gmail_priority_grouping_sdk,
@@ -72,16 +82,18 @@ from keystone_agents.run import (
     run_retrieved_sdk_synthesis,
     run_typed_sdk_agent,
 )
-from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
+from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult, ChiefSpecialistToolInput
 from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
 from keystone_agents.schemas.email_triage import EmailTriageResult, GmailPriorityGroupingResult
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.orchestrator import OrchestratorOutputReview, OrchestratorResult
 from keystone_agents.schemas.outreach import OutreachDraft
 from keystone_agents.sdk import Runner, build_local_run_config
+from promptfoo.eval_database import list_eval_trace_events
 
 RUNTIME_MODEL_ENV_VARS = (
     "KEYSTONE_OPENAI_API_KEY",
+    "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
     "KEYSTONE_OPENAI_BASE_URL",
@@ -111,6 +123,10 @@ RUNTIME_MODEL_ENV_VARS = (
     "GEMINI_API_KEY",
     "LITELLM_BASE_URL",
     "KEYSTONE_AGENT_RUN_BUDGET_USD",
+    "KEYSTONE_SDK_SESSIONS",
+    "KEYSTONE_SDK_SESSION_ID",
+    "KEYSTONE_SDK_SESSION_DB",
+    "KEYSTONE_SDK_SESSION_HISTORY_LIMIT",
 )
 
 
@@ -304,6 +320,42 @@ def _company_focused_brief_payload(**overrides: Any) -> dict[str, Any]:
             {
                 "source_id": "fixture:curebase_company",
                 "title": "Curebase fixture company profile",
+                "url": "fixture://sample_company_curebase.json",
+                "source_type": "fixture",
+            }
+        ],
+        "raw_source_content_included": False,
+        "send_enabled": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _research_brief_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "target_name": "Curebase",
+        "target_type": "company",
+        "research_goal": "Assess source-backed advisory relevance for Chief of Staff.",
+        "summary": "Curebase has relevant clinical trial software context for CoS synthesis.",
+        "key_findings": ["Clinical trial software context is relevant to evidence workflows."],
+        "facts": [
+            {
+                "text": "Curebase is a clinical trial software company.",
+                "source_ids": ["fixture:curebase"],
+                "confidence": 0.82,
+            }
+        ],
+        "inferences": [
+            "Potential advisory relevance should be validated against current sources."
+        ],
+        "unknowns": ["Leadership and current traction need source review."],
+        "limitations": ["Fixture data only."],
+        "next_steps": ["Have Chief decide whether to request live research."],
+        "source_ids_used": ["fixture:curebase"],
+        "sources": [
+            {
+                "source_id": "fixture:curebase",
+                "title": "Fixture record for Curebase",
                 "url": "fixture://sample_company_curebase.json",
                 "source_type": "fixture",
             }
@@ -561,6 +613,281 @@ def test_prompt_from_typed_input_renders_structured_context_as_json() -> None:
     assert "'target_agent'" not in prompt
 
 
+def _airtable_context_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "agent_name": "airtable_context_agent",
+        "mode": "llm",
+        "summary": "Resolved Airtable schema context.",
+        "base_alias": "eval_tracker",
+        "base_id": "app_eval",
+        "relevant_tables": ["Eval Runs"],
+        "relevant_fields": ["Status"],
+        "candidate_record_ids": ["rec1"],
+        "recommended_record_identity": "rec1",
+        "recommended_actions": ["Ask Chief to confirm record before any write."],
+        "write_plan": {
+            "target_system": "airtable",
+            "operation": "update",
+            "target": "Eval Runs rec1",
+            "scope": "status note",
+            "field_mapping": {"Status": "Ready for review"},
+            "approval_required": True,
+            "approval_reference_needed": True,
+            "live_write_allowed_for_specialist": False,
+            "rationale": "Chief-owned write only.",
+        },
+        "blockers": ["Approval reference missing."],
+        "approval_needs": ["Scoped Airtable approval required."],
+        "human_work_context": {
+            "work_functions": ["eval tracking"],
+            "human_owner_hint": "Chief of Staff",
+            "decision_needed": "Confirm target record",
+            "handoff_ready_context": ["schema"],
+            "missing_context": ["approval"],
+            "integration_surfaces": ["Airtable"],
+            "follow_up_actions": ["request approval"],
+        },
+        "sources": [],
+        "diagnostics": {"fixture": "true"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _google_workspace_context_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "agent_name": "google_workspace_context_agent",
+        "mode": "llm",
+        "summary": "Resolved Google Workspace artifact context.",
+        "relevant_folders": ["KNI Ops / Evals"],
+        "relevant_files": ["CoS eval tracker"],
+        "relevant_docs": ["Chief of Staff run notes"],
+        "relevant_sheets": ["Eval Runs"],
+        "recommended_target": "KNI Ops / Evals / CoS eval tracker",
+        "recommended_actions": ["Ask Chief to update the eval tracker after approval."],
+        "write_plan": {
+            "target_system": "google_workspace",
+            "operation": "update_sheet",
+            "target": "CoS eval tracker",
+            "scope": "append run summary row",
+            "field_mapping": {"Status": "Ready for review"},
+            "approval_required": True,
+            "approval_reference_needed": True,
+            "live_write_allowed_for_specialist": False,
+            "rationale": "Chief-owned Workspace write only.",
+        },
+        "blockers": ["Workspace approval reference missing."],
+        "approval_needs": ["Scoped Google Workspace approval required."],
+        "human_work_context": {
+            "work_functions": ["eval reporting"],
+            "human_owner_hint": "Chief of Staff",
+            "decision_needed": "Confirm target folder and tracker.",
+            "handoff_ready_context": ["folder", "file", "tab"],
+            "missing_context": ["approval"],
+            "integration_surfaces": ["Google Drive", "Google Sheets"],
+            "follow_up_actions": ["request approval"],
+        },
+        "sources": [],
+        "diagnostics": {"fixture": "true"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _zotero_context_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "agent_name": "zotero_context_agent",
+        "mode": "llm",
+        "summary": "Resolved Zotero literature context.",
+        "library_context": "Keystone research library",
+        "collection_hints": ["behavioral health AI"],
+        "collection_keys": ["COLL1"],
+        "article_titles": ["Measurement-based care AI evaluation"],
+        "zotero_item_keys": ["ITEM1"],
+        "source_ids": ["zotero:ITEM1"],
+        "relevant_evidence": ["Article supports measurement workflow context."],
+        "recommended_artifact_plan": {
+            "target_system": "google_workspace",
+            "operation": "create_doc",
+            "target": "Zotero literature synthesis",
+            "scope": "draft internal summary",
+            "approval_required": True,
+            "approval_reference_needed": True,
+            "live_write_allowed_for_specialist": False,
+            "rationale": "Chief-owned artifact write only.",
+        },
+        "zotero_write_supported": False,
+        "recommended_actions": ["Use these citations in the Chief synthesis."],
+        "blockers": ["Confirm collection scope before artifact write."],
+        "approval_needs": ["Scoped Workspace approval required before creating artifact."],
+        "human_work_context": {
+            "work_functions": ["literature triage"],
+            "human_owner_hint": "Chief of Staff",
+            "decision_needed": "Confirm which collection is in scope.",
+            "handoff_ready_context": ["collection", "article", "source id"],
+            "missing_context": ["collection confirmation"],
+            "integration_surfaces": ["Zotero", "Google Docs"],
+            "follow_up_actions": ["confirm collection"],
+        },
+        "sources": [
+            {
+                "source_id": "zotero:ITEM1",
+                "title": "Measurement-based care AI evaluation",
+                "location": "zotero://select/items/ITEM1",
+                "source_type": "zotero",
+                "note": "Fixture Zotero item.",
+            }
+        ],
+        "diagnostics": {"fixture": "true"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "route_name", "payload", "expected_validation"),
+    [
+        (
+            "gmail_triage_as_specialist_tool",
+            "gmail_triage",
+            _email_triage_payload(
+                summary="Triaged Gmail thread context for Chief.",
+                human_work_context={
+                    "work_functions": ["email triage"],
+                    "human_owner_hint": "Chief of Staff",
+                    "decision_needed": "Approve draft before any send.",
+                    "integration_surfaces": ["Gmail"],
+                },
+            ),
+            "needs_review",
+        ),
+        (
+            "business_research_analyst_as_specialist_tool",
+            "business_research_analyst",
+            _research_brief_payload(),
+            "ok",
+        ),
+        (
+            "opportunity_scout_as_specialist_tool",
+            "opportunity_scout",
+            _opportunity_scout_payload(),
+            "ok",
+        ),
+        (
+            "outreach_composer_as_specialist_tool",
+            "outreach_composer",
+            _outreach_draft_payload(),
+            "needs_review",
+        ),
+        (
+            "airtable_context_agent_as_specialist_tool",
+            "airtable_context_agent",
+            _airtable_context_payload(),
+            "blocked",
+        ),
+        (
+            "google_workspace_context_agent_as_specialist_tool",
+            "google_workspace_context_agent",
+            _google_workspace_context_payload(),
+            "blocked",
+        ),
+        (
+            "zotero_context_agent_as_specialist_tool",
+            "zotero_context_agent",
+            _zotero_context_payload(),
+            "blocked",
+        ),
+    ],
+)
+def test_chief_specialist_agent_tools_invoke_nested_agents_with_fake_model(
+    tool_name: str,
+    route_name: str,
+    payload: dict[str, Any],
+    expected_validation: str,
+) -> None:
+    model = FakeModel(outputs=[[_structured_message(payload)]])
+    agent = build_chief_of_staff_agent(include_specialist_tools=True)
+    tool = next(
+        item
+        for item in agent.tools
+        if getattr(item, "name", "") == tool_name
+    )
+    tool_input = ChiefSpecialistToolInput(
+        raw_operator_request=(
+            f"@KNI chief of staff use {route_name} for this #evals tracker question"
+        ),
+        specialist_task=f"Resolve {route_name} context and return blockers.",
+        decision_context={
+            "intent_family": "eval readiness",
+            "desired_deliverable": "Chief-owned work plan",
+            "success_criteria": "Friday Slack eval pilot is ready or blockers are explicit",
+        },
+        target_context={
+            "channel": "evals",
+            "tracker": "CoS eval tracker",
+            "specialist_route": route_name,
+        },
+        coordination_context={
+            "sibling_specialists": (
+                "Gmail Triage, Business Research, Opportunity Scout, Outreach Composer, "
+                "Airtable Context, Google Workspace Context, Zotero Context"
+            ),
+            "merge_need": "Chief integrates each specialist result into one recommendation.",
+        },
+        provider_call_context={
+            "provider": route_name,
+            "read_scope": "bounded eval readiness context",
+            "date_window": "current eval cycle",
+            "target_object": "CoS eval tracker or source thread",
+            "approval_reference": "pending",
+        },
+        source_layer_manifest={"requested": route_name},
+        approval_context={"approval_id": "pending"},
+        side_effect_boundaries=["no_nested_live_write"],
+    ).model_dump(mode="json")
+    context = ToolContext(
+        context=None,
+        run_config=build_local_run_config(FakeProvider(model)),
+        tool_name=tool.name,
+        tool_call_id="call_airtable_context_test",
+        tool_arguments=json.dumps(tool_input),
+    )
+
+    async def invoke_tool() -> str:
+        return await tool.on_invoke_tool(context, json.dumps(tool_input))
+
+    import asyncio
+
+    envelope = json.loads(asyncio.run(invoke_tool()))
+
+    assert envelope["route_name"] == route_name
+    assert envelope["tool_name"] == tool_name
+    assert envelope["parsed_output_status"] == "parsed"
+    assert envelope["summary"]
+    assert envelope["validation_status"] == expected_validation
+    assert envelope["target_input_type"] == (
+        "keystone_agents.schemas.chief_of_staff.ChiefNestedSpecialistResult"
+    )
+    assert envelope["payload_mode"] == "adapted"
+    assert envelope["type_compatibility_status"] == "compatible"
+    assert envelope["type_contract"]["target_agent"] == "chief_of_staff"
+    assert envelope["type_contract"]["target_output_type"] == (
+        "keystone_agents.schemas.chief_of_staff.ChiefOfStaffResult"
+    )
+    assert envelope["source_output_type"]
+    nested_prompt = _model_input_text(model.calls[0]["input"])
+    assert "Raw Operator Request" in nested_prompt
+    assert route_name in nested_prompt
+    assert "decision_context" in nested_prompt
+    assert "target_context" in nested_prompt
+    assert "coordination_context" in nested_prompt
+    assert "provider_call_context" in nested_prompt
+    assert "Friday Slack eval pilot" in nested_prompt
+    assert "bounded eval readiness context" in nested_prompt
+    assert "source_layer_manifest" in nested_prompt
+    assert "no_nested_live_write" in nested_prompt
+
+
 def _tool_call(name: str, arguments: dict[str, Any]) -> ResponseFunctionToolCall:
     return ResponseFunctionToolCall(
         type="function_call",
@@ -707,6 +1034,84 @@ def test_run_typed_sdk_agent_retries_live_rate_limit_once(
     assert result.request_cache["rate_limit_retries"] == 1
 
 
+def test_run_typed_sdk_agent_records_sdk_run_summary_trace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "evals.sqlite"
+
+    class FakeAgent:
+        name = "business_research_analyst"
+        model = "gpt-test"
+        instructions = "Return a structured summary."
+        tools = [SimpleNamespace(name="search_web")]
+        output_type = ChiefOfStaffResult
+
+    def fake_run_typed_sdk_sync(
+        *_args: Any, **_kwargs: Any
+    ) -> tuple[dict[str, Any], ChiefOfStaffResult]:
+        return (
+            {
+                "usage": {
+                    "requests": 1,
+                    "input_tokens": 100,
+                    "output_tokens": 25,
+                    "total_tokens": 125,
+                },
+                "new_items": [{"type": "function_call", "name": "search_web"}],
+            },
+            ChiefOfStaffResult(
+                mode="llm",
+                summary="Traceable result.",
+                audit_notes=[],
+            ),
+        )
+
+    monkeypatch.setenv("KEYSTONE_TRACE_PROCESSOR", "eval_summary")
+    monkeypatch.setenv("KEYSTONE_TRACE_SUMMARY_DB", str(database_path))
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(
+        "keystone_agents.run.enforce_agent_run_budget",
+        lambda **_kwargs: {"status": "ok", "exceeded": False},
+    )
+
+    result = run_typed_sdk_agent(
+        agent=FakeAgent(),
+        typed_input={"request": "Summarize current source-backed evidence."},
+        output_type=ChiefOfStaffResult,
+        live=True,
+        config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+        max_turns=2,
+        trace_metadata={
+            "route": "business_research_analyst",
+            "case_id": "case_trace_001",
+            "work_item_id": "wi_trace_001",
+            "run_id": "run_trace_001",
+            "slack_channel_id": "C123",
+            "slack_thread_ts": "1715366400.000100",
+        },
+    )
+
+    rows = list_eval_trace_events(database_path=database_path)
+    summary = rows[0]["metadata"]
+    assert result.output.summary == "Traceable result."
+    assert rows[0]["event_type"] == "sdk_run_summary"
+    assert rows[0]["trace_id"] == "run_trace_001"
+    assert rows[0]["group_id"] == "case_trace_001"
+    assert summary["schema"] == "keystone.sdk_run_summary.v1"
+    assert summary["agent"] == "business_research_analyst"
+    assert summary["route"] == "business_research_analyst"
+    assert summary["status"] == "ok"
+    assert summary["correlation"]["work_item_id"] == "wi_trace_001"
+    assert summary["model_provider"] == "openai"
+    assert summary["model_name"] == "gpt-test"
+    assert summary["max_turns"] == 2
+    assert summary["sdk_request_count"] == 1
+    assert summary["tool_call_counts"] == {"search_web": 1}
+    assert summary["redaction"]["raw_tool_io_included"] is False
+    assert "Summarize current source-backed evidence" not in str(rows)
+
+
 @pytest.mark.parametrize(
     (
         "builder",
@@ -781,6 +1186,7 @@ def test_all_specialist_agents_run_with_fake_model_without_openai_key(
     monkeypatch.delenv("KEYSTONE_SDK_SESSIONS", raising=False)
     monkeypatch.delenv("KEYSTONE_SDK_SESSION_ID", raising=False)
     monkeypatch.delenv("KEYSTONE_SDK_SESSION_DB", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSION_HISTORY_LIMIT", raising=False)
     model = FakeModel(outputs=[[_structured_message(payload)]])
 
     result = _run_with_fake_model(builder(), model, prompt)
@@ -858,6 +1264,11 @@ def test_typed_specialist_runtime_harness_uses_fake_model_without_openai_key(
 ) -> None:
     monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSIONS", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSION_ID", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSION_DB", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSION_HISTORY_LIMIT", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_SESSION_HISTORY_LIMIT", raising=False)
     model = FakeModel(outputs=[[_structured_message(payload)]])
     provider = FakeProvider(model)
 
@@ -877,7 +1288,89 @@ def test_typed_specialist_runtime_harness_uses_fake_model_without_openai_key(
     assert result.request_cache["repo_instruction_profile"] == "compact-runtime-policy"
     assert len(result.request_cache["static_prefix_sha256"]) == 64
     assert len(result.request_cache["dynamic_prompt_sha256"]) == 64
+    assert result.request_cache["max_turns"] == 4
+    assert result.request_cache["max_turns_source"] == "caller"
+    assert result.request_cache["session_attached"] is False
+    assert result.request_cache["session_history_mode"] == ""
+    assert result.request_cache["session_history_limit"] == 0
+    assert result.request_cache["session_truncation_configured"] is False
     assert model.calls
+
+
+def test_direct_specialist_sdk_wrappers_pass_resolved_max_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def capture(module: Any) -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+
+        def fake_run_typed_sdk_agent(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(module, "run_typed_sdk_agent", fake_run_typed_sdk_agent)
+        return captured
+
+    research = capture(business_research_module)
+    scout = capture(opportunity_scout_module)
+    gmail = capture(gmail_triage_module)
+    outreach = capture(outreach_composer_module)
+
+    run_business_research_analyst_sdk(BusinessResearchSDKInput(company_name="Curebase"))
+    run_opportunity_scout_sdk(OpportunityScoutSDKInput(topic="behavioral health AI"))
+    run_gmail_triage_sdk(
+        GmailTriageSDKInput(
+            subject="Potential project",
+            body="Could Keystone help us evaluate a workflow?",
+        )
+    )
+    run_gmail_priority_grouping_sdk(
+        GmailPriorityGroupingSDKInput(
+            messages=[],
+            request="Group recent messages.",
+        )
+    )
+    run_outreach_composer_sdk(
+        OutreachComposerSDKInput(
+            company_name="Curebase",
+            approved_context="Approved fixture context.",
+        )
+    )
+
+    assert research["max_turns"] == 4
+    assert scout["max_turns"] == 4
+    assert gmail["max_turns"] == 4
+    assert outreach["max_turns"] == 4
+
+
+def test_direct_specialist_sdk_turn_policy_supports_quality_and_explicit_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    def fake_run_typed_sdk_agent(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(
+        business_research_module,
+        "run_typed_sdk_agent",
+        fake_run_typed_sdk_agent,
+    )
+
+    run_business_research_analyst_sdk(
+        BusinessResearchSDKInput(
+            company_name="OpenAI",
+            context="Use the supplied company context.",
+        ),
+        live=True,
+    )
+    assert captured["max_turns"] == 8
+
+    run_business_research_analyst_sdk(
+        BusinessResearchSDKInput(company_name="OpenAI"),
+        max_turns=2,
+    )
+    assert captured["max_turns"] == 2
 
 
 def test_business_research_analyst_focused_brief_runtime_uses_llm_output_contract(
@@ -1075,8 +1568,7 @@ def test_orchestrator_sdk_infers_tiered_tools_for_default_and_deep_runs(
 def test_orchestrator_live_sdk_input_includes_runtime_source_layer_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    _clear_runtime_model_env(monkeypatch)
     monkeypatch.setenv("KEYSTONE_ORCHESTRATOR_FILE_SEARCH_VECTOR_STORE_IDS", "vs_router")
     model = FakeModel(outputs=[[_structured_message(_orchestrator_payload())]])
 

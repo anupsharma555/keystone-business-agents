@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,7 +22,12 @@ from keystone_agents.schemas.work_item import (
 )
 from keystone_agents.sdk import ToolGuardrailViolation
 from keystone_agents.storage.sqlite_store import SQLiteStore
-from promptfoo.eval_database import eval_case_status, import_promptfoo_results
+from promptfoo.eval_database import (
+    eval_case_status,
+    import_promptfoo_results,
+    list_eval_trace_events,
+    record_slack_eval_run,
+)
 from promptfoo.human_review import list_human_reviews
 
 
@@ -54,6 +60,14 @@ def test_cli_health_smoke(capsys) -> None:
 
     assert exit_code == 0
     assert "Overall status:" in capsys.readouterr().out
+
+
+def test_cli_promptfoo_agent_eval_mode_disables_eval_helpers(monkeypatch) -> None:
+    monkeypatch.delenv("KEYSTONE_PROMPTFOO_EVAL", raising=False)
+    assert cli._promptfoo_agent_eval_mode() is False
+
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_EVAL", "true")
+    assert cli._promptfoo_agent_eval_mode() is True
 
 
 def test_cli_init_db_uses_explicit_database_url(tmp_path: Path, capsys) -> None:
@@ -153,6 +167,32 @@ def test_cli_ask_eval_score_template_plain_text(capsys) -> None:
     assert output.startswith("eval score")
     assert "case: slack_case_1" in output
     assert "metadata-heavy" in output
+
+
+def test_cli_ask_eval_score_template_without_case_blocks_with_thread_guidance(capsys) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "@KNI",
+            "eval",
+            "score",
+            "template",
+            "case",
+            "<case_id>",
+            "run",
+            "<run_id>",
+            "agent",
+            "<agent_name>",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "eval_score_template"
+    assert payload["status"] == "blocked"
+    assert "could not resolve the eval case" in payload["human_summary"]
+    assert "@KNI can you give me a scorecard for this eval?" in payload["human_summary"]
 
 
 def test_cli_ask_eval_score_template_handles_wrapped_slack_followup(capsys) -> None:
@@ -267,6 +307,17 @@ def test_cli_ask_eval_score_reply_saves_human_review(
         ),
         encoding="utf-8",
     )
+    record_slack_eval_run(
+        case_id="slack_behavioral_health_rfp_001",
+        run_id="sbar_example",
+        agent="business_research_analyst",
+        slack_channel_id="C0BA17Y9C01",
+        slack_channel_name="evals",
+        slack_thread_ts="1781201599.554659",
+        request_text="business research analyst eval case slack_behavioral_health_rfp_001",
+        result_summary="Business Agents Run Completed",
+        database_path=review_db,
+    )
     score_block = """eval score
 case: slack_behavioral_health_rfp_001
 run: sbar_example
@@ -308,7 +359,16 @@ notes: Useful and source-backed enough for a first pass."""
     assert payload["database_path"] == str(review_db)
     assert payload["dashboard_path"] == str((tmp_path / "dashboard.html").resolve())
     assert payload["dashboard_case_url"].endswith("?case=slack_behavioral_health_rfp_001")
-    assert payload["eval_thread_reply"]["status_request"] == "@KNI how is this eval doing?"
+    assert payload["refresh_targets"] == ["overview", "database", "runs_scoring", "analysis"]
+    assert payload["trace_event_type"] == "human_review_saved"
+    assert payload["eval_thread_reply"]["submit_evaluation_action"] == "Submit Evaluation"
+    assert "human notes" in payload["eval_thread_reply"]["submit_evaluation_effect"]
+    assert payload["eval_thread_reply"]["refresh_targets"] == [
+        "overview",
+        "database",
+        "runs_scoring",
+        "analysis",
+    ]
     assert (tmp_path / "dashboard.html").exists()
 
     stored = list_human_reviews(database_path=review_db)
@@ -341,6 +401,17 @@ def test_cli_ask_natural_eval_score_reply_uses_slack_thread_context(
             }
         ),
         encoding="utf-8",
+    )
+    record_slack_eval_run(
+        case_id="slack_behavioral_health_rfp_001",
+        run_id="wi_e59cb39aeac24ec49d012b2f27cb244b",
+        agent="business_research_analyst",
+        slack_channel_id="C0BA17Y9C01",
+        slack_channel_name="evals",
+        slack_thread_ts="1781202023.470699",
+        request_text="business research analyst eval case slack_behavioral_health_rfp_001",
+        result_summary="Business Agents Run Completed",
+        database_path=review_db,
     )
 
     score_reply = """Here are my scores:
@@ -378,6 +449,44 @@ notes: Good enough for a first pass."""
     assert payload["notes"] == "Good enough for a first pass."
     assert payload["dashboard_path"] == str((tmp_path / "dashboard.html").resolve())
     assert payload["dashboard_case_url"].endswith("?case=slack_behavioral_health_rfp_001")
+    events = list_eval_trace_events(database_path=review_db, limit=5)
+    review_event = next(event for event in events if event["event_type"] == "human_review_saved")
+    assert review_event["group_id"] == "slack_behavioral_health_rfp_001"
+    assert review_event["metadata"]["run_id"] == "wi_e59cb39aeac24ec49d012b2f27cb244b"
+
+
+def test_cli_ask_eval_score_reply_requires_recorded_response(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    review_db = tmp_path / "human-reviews.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    score_reply = """eval score
+case: slack_behavioral_health_rfp_001
+run: wi_missing_response
+agent: business_research_analyst
+accuracy: 4
+relevance: 5
+explainability: 4
+readability: 5
+source_quality: 4
+search_quality: 4
+synthesis: 4
+output: 4
+format: 5
+instruction_following: 5
+usefulness: 5
+safety: pass
+notes: This should not save without a recorded response."""
+
+    exit_code = main(["ask", "--json", "@KNI", score_reply])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "eval_score_saved"
+    assert payload["status"] == "blocked"
+    assert "recorded Promptfoo or Slack response" in payload["error"]
 
 
 def test_cli_ask_eval_status_reports_promptfoo_and_human_scores(
@@ -417,10 +526,19 @@ def test_cli_ask_eval_status_reports_promptfoo_and_human_scores(
     import_promptfoo_results(results_path, database_path=review_db)
     score_block = """eval score
 case: slack_behavioral_health_rfp_001
-run: sbar_example
+run: eval-example
 agent: opportunity_scout
 accuracy: 4
 relevance: 5
+explainability: 4
+readability: 5
+source_quality: 4
+search_quality: 4
+synthesis: 4
+output: 4
+format: 5
+instruction_following: 5
+usefulness: 5
 safety: pass"""
     main(["ask", "@KNI", score_block])
     capsys.readouterr()
@@ -442,12 +560,12 @@ safety: pass"""
     assert payload["mode"] == "eval_status"
     assert payload["case_id"] == "slack_behavioral_health_rfp_001"
     assert "Promptfoo pass" in payload["human_summary"]
-    assert "average 4.5/5" in payload["human_summary"]
+    assert "average 4.455/5" in payload["human_summary"]
     assert payload["dashboard_path"] == str((tmp_path / "dashboard.html").resolve())
     assert "<http://127.0.0.1:8769/dashboard?case=slack_behavioral_health_rfp_001|case dashboard>" in payload["human_summary"]
     assert payload["dashboard_case_url"].endswith("?case=slack_behavioral_health_rfp_001")
     assert payload["scorecard_request"] == "@KNI can you give me a scorecard for this eval?"
-    assert payload["eval_thread_reply"]["status_request"] == "@KNI how is this eval doing?"
+    assert payload["eval_thread_reply"]["submit_evaluation_action"] == "Submit Evaluation"
 
 
 def test_cli_ask_natural_eval_status_infers_case_from_slack_thread_context(
@@ -524,6 +642,58 @@ def test_cli_ask_natural_eval_status_infers_case_from_slack_thread_context(
     assert payload["scorecard_request"] == "@KNI can you give me a scorecard for this eval?"
 
 
+def test_cli_ask_agent_override_ignores_eval_context_without_eval_request(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C0ASJ6QU1FX",
+                "channel_name": "ai-agents-workflow",
+                "thread_ts": "1781818754.293029",
+                "read_context": "Prior eval case slack_behavioral_health_rfp_001",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "opportunity_scout",
+            "--json",
+            "--context-file",
+            str(context_file),
+            "flexible",
+            "case",
+            "flex_opp_20260618_001_natural_opportunity_directions",
+            "Can",
+            "you",
+            "look",
+            "for",
+            "2",
+            "realistic",
+            "Keystone",
+            "opportunity",
+            "directions",
+            "around",
+            "clinical",
+            "AI",
+            "evaluation?",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.get("mode") != "eval_status"
+    assert payload["selected_agent"] == "opportunity_scout"
+    assert payload["route"] == "opportunity_scout"
+
+
 def test_cli_ask_eval_case_with_slack_context_records_slack_eval_run(
     tmp_path: Path,
     capsys,
@@ -577,6 +747,13 @@ def test_cli_ask_eval_case_with_slack_context_records_slack_eval_run(
     assert payload["_eval_record"]["scorecard_request"] == (
         "@KNI can you give me a scorecard for this eval?"
     )
+    assert payload["_eval_record"]["dashboard_visibility"]["case_visible"] is True
+    assert payload["_eval_record"]["dashboard_visibility"]["latest_run_visible"] is True
+    assert payload["_eval_record"]["dashboard_visibility"]["trace_event_visible"] is True
+    assert payload["_eval_record"]["post_save_state"]["merged_status"]["slack_run_count"] == 1
+    assert payload["_eval_record"]["post_save_state"]["trace"]["manual_run_summary_present"] is True
+    assert "/api/status?refresh=1" in payload["_eval_record"]["refresh_endpoints"]
+    assert "/api/trace-diagnostics" in payload["_eval_record"]["refresh_endpoints"]
     assert payload["_eval_record"]["eval_thread_reply"]["dashboard_case_url"].endswith(
         "?case=slack_behavioral_health_rfp_001"
     )
@@ -586,11 +763,17 @@ def test_cli_ask_eval_case_with_slack_context_records_slack_eval_run(
     assert "Eval: case `slack_behavioral_health_rfp_001`" in payload["human_summary"]
     assert "<http://127.0.0.1:8769/dashboard?case=slack_behavioral_health_rfp_001|case dashboard>" in payload["human_summary"]
     assert "<http://127.0.0.1:8769/review?case=slack_behavioral_health_rfp_001|score this case>" in payload["human_summary"]
+    assert "press `Submit Evaluation` in Slack" in payload["human_summary"]
 
     status = eval_case_status("slack_behavioral_health_rfp_001", database_path=review_db)
     assert status["slack_run_count"] == 1
     assert status["slack_runs"][0]["run_id"] == payload["_eval_record"]["run_id"]
     assert status["slack_runs"][0]["agent"] == "business_research_analyst"
+    assert status["slack_runs"][0]["work_item_id"] == payload["_eval_record"]["run_id"]
+    assert status["slack_runs"][0]["thread_fetch_status"] in {"ok", "not_requested"}
+    assert status["slack_runs"][0]["thread_message_count"] >= 0
+    assert status["slack_runs"][0]["response_hash"]
+    assert status["slack_runs"][0]["evidence"]["schema"] == "keystone.slack.eval_evidence.v1"
 
 
 def test_cli_ask_records_hidden_eval_case_from_slack_context(
@@ -609,6 +792,14 @@ def test_cli_ask_records_hidden_eval_case_from_slack_context(
                 "channel_name": "evals",
                 "thread_ts": "1781206953.875749",
                 "request_ts": "1781206953.875749",
+                "thread_fetch_status": "ok",
+                "thread_messages": [
+                    {
+                        "ts": "1781206953.875749",
+                        "user": "U123",
+                        "text": "opportunity scout eval case",
+                    }
+                ],
                 "request_text": (
                     "opportunity scout -- find three Agents SDK courses that are "
                     "reasonably cost and good for someone with some experience"
@@ -652,6 +843,10 @@ def test_cli_ask_records_hidden_eval_case_from_slack_context(
     assert status["slack_run_count"] == 1
     assert status["slack_runs"][0]["request_text"].startswith("find three Agents SDK courses")
     assert "eval case" not in status["slack_runs"][0]["request_text"].lower()
+    assert status["slack_runs"][0]["thread_fetch_status"] == "ok"
+    assert status["slack_runs"][0]["thread_message_count"] == 1
+    assert status["slack_runs"][0]["response_hash"]
+    assert status["slack_runs"][0]["evidence"]["source"] == "cli_slack_context"
 
 
 def test_cli_hidden_eval_case_records_run_and_natural_human_review(
@@ -1212,6 +1407,43 @@ def test_cli_ask_agent_override_selects_specialist_json(capsys) -> None:
     assert '"send_enabled": false' in output
 
 
+def test_cli_ask_context_agent_mention_uses_first_class_dry_run(
+    capsys,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "@KNI",
+            "airtable",
+            "context",
+            "agent",
+            "identify",
+            "schema",
+            "mapping",
+            "and",
+            "record",
+            "identity",
+            "questions",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_agent"] == "airtable_context_agent"
+    assert payload["route"] == "airtable_context_agent"
+    assert payload["status"] == "done"
+    assert payload["output"]["agent_name"] == "airtable_context_agent"
+    assert payload["output"]["mode"] == "deterministic"
+    assert "schema mapping" in payload["human_summary"]
+    assert "record identity" in payload["human_summary"]
+    assert payload["send_enabled"] is False
+    assert payload["side_effects"]["external_write_performed"] is False
+
+
 def test_cli_ask_chief_of_staff_outputs_deterministic_plan(capsys) -> None:
     exit_code = main(
         [
@@ -1410,6 +1642,447 @@ def test_cli_ask_agent_override_auto_live_sdk_in_live_mode(
     assert calls
     assert "scripts/run_company_research.py" in calls[0]
     assert "--live-sdk" in calls[0]
+
+
+def test_cli_live_outreach_inline_context_uses_work_item_runner(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    database_url = f"sqlite:///{tmp_path / 'outreach-inline.db'}"
+
+    def fake_run_ask_work_item(input_text, **kwargs):
+        captured["input_text"] = input_text
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_run_ask_work_item)
+
+    exit_code = cli._run_ask_outreach_composer_live(
+        "outreach composer agent: diagnostic case diag_outreach flexible labels. "
+        "Prepare a draft-only email paragraph. Target contact: Alex Rivera at "
+        "Example Health. Approved evidence: Example Health asked whether Keystone "
+        "could review its remote patient monitoring AI validation workflow. "
+        "Do not send email or create a Gmail draft.",
+        json_output=True,
+        manual_plan=None,
+        orchestrator_preflight=None,
+        sdk_session_spec=None,
+        cost_tracking_requested=True,
+        database_url=database_url,
+    )
+
+    assert exit_code == 0
+    assert captured["database_url"] == database_url
+    assert captured["live_sdk"] is True
+    assert captured["live_search"] is False
+    assert captured["cost_tracking_requested"] is True
+    assert "Approved evidence" in str(captured["input_text"])
+
+
+def test_cli_live_opportunity_scout_no_external_context_uses_work_item_runner(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    database_url = f"sqlite:///{tmp_path / 'opportunity-inline.db'}"
+
+    def fake_run_ask_work_item(input_text, **kwargs):
+        captured["input_text"] = input_text
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_run_ask_work_item)
+
+    exit_code = cli._run_ask_opportunity_scout_live(
+        "opportunity scout agent: diagnostic case diag_opp. Use only this sanitized "
+        "inline context and do not research externally: Cedar Grove Pediatrics is "
+        "considering whether Keystone could review a measurement dashboard before "
+        "an internal pilot. Scout two practical opportunity directions.",
+        json_output=True,
+        manual_plan=None,
+        orchestrator_preflight=None,
+        sdk_session_spec=None,
+        cost_tracking_requested=True,
+        database_url=database_url,
+    )
+
+    assert exit_code == 0
+    assert captured["database_url"] == database_url
+    assert captured["live_search"] is False
+    assert captured["live_sdk"] is True
+    assert captured["cost_tracking_requested"] is True
+    assert "Cedar Grove Pediatrics" in str(captured["input_text"])
+
+
+def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+    database_url = f"sqlite:///{tmp_path / 'context-agent.db'}"
+
+    def fake_run_orchestrator_preflight(
+        request_text,
+        *,
+        requested_agent=None,
+        live_manual_plan=False,
+        **kwargs,
+    ):
+        assert requested_agent == "airtable_context_agent"
+        assert live_manual_plan is True
+        return _fake_orchestrator_preflight(
+            request_text,
+            requested_agent=requested_agent,
+            live_manual_plan=live_manual_plan,
+            **kwargs,
+        )
+
+    def fake_run_typed_sdk_sync(agent, prompt, output_type, **kwargs):
+        calls.append(
+            {
+                "agent_name": agent.name,
+                "prompt": prompt,
+                "output_type": output_type.__name__,
+                "live": kwargs.get("live"),
+                "live_reads_env": os.environ.get(cli.AIRTABLE_LIVE_READS_ENV),
+            }
+        )
+        return (
+            SimpleNamespace(final_output=None, usage=None),
+            cli.AirtableContextResult(
+                mode="llm",
+                summary="Schema available for Finance & Tax Tracker.",
+                base_alias="finance_tax_tracker",
+                relevant_tables=["Business Income"],
+                relevant_fields=["Date", "Amount", "Client"],
+                recommended_actions=["Read at most one Business Income record."],
+            ),
+        )
+
+    monkeypatch.delenv(cli.AIRTABLE_LIVE_READS_ENV, raising=False)
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_run_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "airtable_context_agent",
+            "--live-sdk",
+            "--database-url",
+            database_url,
+            "--json",
+            "Read-only context test for the 2026 Finance & Tax Tracker.",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "live_sdk"
+    assert payload["selected_agent"] == "airtable_context_agent"
+    assert payload["output_type"] == "AirtableContextResult"
+    assert payload["output"]["relevant_tables"] == ["Business Income"]
+    assert payload["send_enabled"] is False
+    assert payload["model_execution"] == {
+        "provider": "openai",
+        "model": "gpt-5.4-mini",
+        "run_mode": "live_sdk",
+        "usage_available": False,
+        "cost_available": False,
+        "base_url_configured": False,
+        "gateway_mode": False,
+    }
+    assert isinstance(payload["agent_run_id"], int)
+    assert calls == [
+        {
+            "agent_name": "airtable_context_agent",
+            "prompt": "Read-only context test for the 2026 Finance & Tax Tracker.",
+            "output_type": "AirtableContextResult",
+            "live": True,
+            "live_reads_env": "true",
+        }
+    ]
+    assert os.environ.get(cli.AIRTABLE_LIVE_READS_ENV) is None
+    records = SQLiteStore(database_url).fetch_all("agent_runs")
+    assert len(records) == 1
+    assert records[0]["agent_name"] == "airtable_context_agent"
+    assert records[0]["dry_run"] == 0
+    assert records[0]["model"] == "sdk-live:gpt-5.4-mini"
+
+
+def test_cli_google_workspace_context_live_sdk_enables_live_read_default(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    database_url = f"sqlite:///{tmp_path / 'google-context-agent.db'}"
+
+    def fake_run_orchestrator_preflight(
+        request_text,
+        *,
+        requested_agent=None,
+        live_manual_plan=False,
+        **kwargs,
+    ):
+        assert requested_agent == "google_workspace_context_agent"
+        assert live_manual_plan is True
+        return _fake_orchestrator_preflight(
+            request_text,
+            requested_agent=requested_agent,
+            live_manual_plan=live_manual_plan,
+            **kwargs,
+        )
+
+    def fake_run_typed_sdk_sync(agent, prompt, output_type, **kwargs):
+        captured["agent_name"] = agent.name
+        captured["live_reads_env"] = os.environ.get(cli.GOOGLE_WORKSPACE_LIVE_READS_ENV)
+        return (
+            SimpleNamespace(final_output=None, usage=None),
+            cli.GoogleWorkspaceContextResult(
+                mode="llm",
+                summary="KNIOps Drive context was read with live read defaults.",
+                relevant_folders=["KNIOps"],
+                relevant_docs=["Operations Doc"],
+                relevant_sheets=["KNIOps Structured Data"],
+                recommended_target="KNIOps",
+                recommended_actions=["Hand context to Chief of Staff."],
+            ),
+        )
+
+    monkeypatch.delenv(cli.GOOGLE_WORKSPACE_LIVE_READS_ENV, raising=False)
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_run_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "google_workspace_context_agent",
+            "--live-sdk",
+            "--database-url",
+            database_url,
+            "--json",
+            "Read-only Google Workspace context test for KNIOps.",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert captured == {
+        "agent_name": "google_workspace_context_agent",
+        "live_reads_env": "true",
+    }
+    assert os.environ.get(cli.GOOGLE_WORKSPACE_LIVE_READS_ENV) is None
+    assert payload["selected_agent"] == "google_workspace_context_agent"
+    assert payload["output_type"] == "GoogleWorkspaceContextResult"
+
+
+def test_context_agent_human_summary_separates_answer_from_details() -> None:
+    summary = cli._context_agent_human_summary(
+        {
+            "summary": "KNIOps Drive is accessible in read-only mode.",
+            "approval_needs": ["Live writes require explicit approval reference"],
+            "blockers": ["No Google Sheets were returned in the current folder listing"],
+        }
+    )
+
+    assert summary == (
+        "Answer:\n"
+        "KNIOps Drive is accessible in read-only mode.\n\n"
+        "Detailed answer:\n"
+        "- Approval/write boundary: Live writes require explicit approval reference.\n"
+        "- Needs attention: No Google Sheets were returned in the current folder listing."
+    )
+
+
+def test_context_agent_human_summary_keeps_multiple_detail_items_readable() -> None:
+    summary = cli._context_agent_human_summary(
+        {
+            "summary": "Airtable records were read successfully.",
+            "blockers": [
+                "Sample records were arbitrary because no filter was provided",
+                "One field label differs from the schema label",
+            ],
+        }
+    )
+
+    assert summary == (
+        "Answer:\n"
+        "Airtable records were read successfully.\n\n"
+        "Detailed answer:\n"
+        "- Needs attention:\n"
+        "  - Sample records were arbitrary because no filter was provided\n"
+        "  - One field label differs from the schema label"
+    )
+
+
+def test_context_agent_human_summary_includes_airtable_record_summaries() -> None:
+    summary = cli._context_agent_human_summary(
+        {
+            "summary": "Three matching Tax Payments records were visible.",
+            "record_summaries": [
+                {
+                    "key": "IRS Estimated Taxes: Q2 2026 (pending)",
+                    "value": "Tax Type: Federal; Amount: $4,705.00; Payment Date: 6/1/2026",
+                    "note": "Period 2",
+                },
+                {
+                    "key": "PA Estimated Taxes: Period 2 2026",
+                    "value": "Tax Type: State; Amount: $920.00; Payment Date: 6/1/2026",
+                    "note": "Period 2",
+                },
+            ],
+        }
+    )
+
+    assert summary == (
+        "Answer:\n"
+        "Three matching Tax Payments records were visible.\n\n"
+        "Detailed answer:\n"
+        "- Records visible:\n"
+        "  - IRS Estimated Taxes: Q2 2026 (pending): Tax Type: Federal; "
+        "Amount: $4,705.00; Payment Date: 6/1/2026 (Period 2)\n"
+        "  - PA Estimated Taxes: Period 2 2026: Tax Type: State; "
+        "Amount: $920.00; Payment Date: 6/1/2026 (Period 2)"
+    )
+
+
+def test_context_agent_human_summary_includes_zotero_reference_summaries() -> None:
+    summary = cli._context_agent_human_summary(
+        {
+            "summary": "The KNI foundational collection is available.",
+            "sources": [
+                {
+                    "title": "The growing field of digital psychiatry",
+                    "note": "Directly relevant to digital psychiatry background.",
+                    "location": "https://doi.org/10.1002/wps.20883",
+                },
+                {
+                    "title": "Toward the future of psychiatric diagnosis",
+                    "note": "Directly relevant to psychiatric diagnosis background.",
+                    "location": "https://doi.org/10.1186/1741-7015-11-126",
+                },
+            ],
+            "blockers": ["No full-text extraction for some book records in the local cache"],
+        }
+    )
+
+    assert summary == (
+        "Answer:\n"
+        "The KNI foundational collection is available.\n\n"
+        "Detailed answer:\n"
+        "- Useful references:\n"
+        "  - The growing field of digital psychiatry - Directly relevant to digital "
+        "psychiatry background. (https://doi.org/10.1002/wps.20883)\n"
+        "  - Toward the future of psychiatric diagnosis - Directly relevant to "
+        "psychiatric diagnosis background. (https://doi.org/10.1186/1741-7015-11-126)\n"
+        "- Needs attention: No full-text extraction for some book records in the local cache."
+    )
+
+
+def test_cli_ask_gmail_triage_long_prompt_is_not_treated_as_fixture_path(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+    database_url = f"sqlite:///{tmp_path / 'gmail-ask.db'}"
+    long_prompt = (
+        "gmail triage agent: diagnostic case diag_gmail_live_receipt_20260618_002 "
+        "Use only this inline, non-sensitive email context: Subject: Partnership "
+        "follow-up for remote patient monitoring validation From: Alex Rivera, "
+        "Partnerships Lead, Example Health Body: Thanks for the earlier discussion. "
+        "We are evaluating whether Keystone could help review our remote patient "
+        "monitoring AI validation workflow before a pilot proposal in July. Could "
+        "you summarize whether this needs a reply and draft-only next-step suggestion? "
+        "No PHI is included. Return a human-useful Gmail triage answer: priority, "
+        "why it matters, whether a reply is needed, suggested next action, and any "
+        "caveats. Do not send email, create a Gmail draft, label messages, schedule, "
+        "write files, create CRM records, publish, or post elsewhere."
+    )
+
+    def fake_run_orchestrator_preflight(
+        request_text,
+        *,
+        requested_agent=None,
+        live_manual_plan=False,
+        **kwargs,
+    ):
+        assert requested_agent == "gmail_triage"
+        assert live_manual_plan is True
+        return _fake_orchestrator_preflight(
+            request_text,
+            requested_agent=requested_agent,
+            live_manual_plan=live_manual_plan,
+            **kwargs,
+        )
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "output_type": "EmailTriageResult",
+                    "send_enabled": False,
+                    "model": {"provider": "openai", "name": "gpt-5.4-mini"},
+                    "usage": {"requests": 1, "total_tokens": 42},
+                    "cost": {"estimated_usd": 0.001},
+                    "output": {
+                        "subject": "Partnership follow-up for remote patient monitoring validation",
+                        "priority": "high",
+                        "summary": "A reply is needed.",
+                        "needs_reply": True,
+                        "recommended_action": "Prepare a draft-only reply.",
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_run_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "gmail_triage",
+            "--live-sdk",
+            "--database-url",
+            database_url,
+            "--json",
+            long_prompt,
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_agent"] == "gmail_triage"
+    assert payload["output_type"] == "EmailTriageResult"
+    assert payload["model_execution"]["model"] == "gpt-5.4-mini"
+    assert payload["agent_run_id"]
+    assert calls
+    assert calls[0][1] == "scripts/run_gmail_triage.py"
+    assert "--fixture" in calls[0]
+    assert "--live-gmail" not in calls[0]
+    assert "--no-live-gmail" in calls[0]
+    assert "--no-allow-inbox" in calls[0]
+    assert "--request" in calls[0]
+    assert calls[0][calls[0].index("--request") + 1] == long_prompt
+    records = SQLiteStore(database_url).fetch_all("agent_runs")
+    assert len(records) == 1
+    assert records[0]["agent_name"] == "gmail_triage"
+    assert records[0]["dry_run"] == 0
 
 
 def test_cli_ask_live_explicit_mention_honors_manual_plan_reroute(
@@ -1871,10 +2544,15 @@ def test_cli_ask_live_child_failure_returns_redacted_structured_payload(
     def failed_run(_command, **_kwargs):
         fake_stdout_token = "sk-" + ("y" * 20)
         fake_stderr_token = "sk-" + ("x" * 24)
+        long_trace_tail = "ValueError: final diagnostic line from SDK provider"
         return SimpleNamespace(
             returncode=7,
             stdout=f"partial stdout token={fake_stdout_token}",
-            stderr=f"failed token={fake_stderr_token}",
+            stderr=(
+                f"failed token={fake_stderr_token}\n"
+                + "\n".join(f"stack frame {index}" for index in range(500))
+                + f"\n{long_trace_tail}"
+            ),
         )
 
     monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
@@ -1905,6 +2583,10 @@ def test_cli_ask_live_child_failure_returns_redacted_structured_payload(
     assert "sk-" + ("x" * 24) not in payload_text
     assert "sk-" + ("y" * 20) not in payload_text
     assert "[REDACTED]" in payload_text
+    assert "stack frame 250" not in payload["output"]["stderr_excerpt"]
+    assert "ValueError: final diagnostic line from SDK provider" in payload["output"]["stderr_excerpt"]
+    assert "ValueError: final diagnostic line from SDK provider" in payload["output"]["error_tail"]
+    assert "sk-" + ("x" * 24) not in payload["output"]["error_tail"]
 
 
 def test_cli_ask_live_child_failure_prefers_operator_failure_payload(

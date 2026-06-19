@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import json
 import re
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -145,6 +147,7 @@ def test_non_sdk_modules_do_not_call_raw_agents_runner() -> None:
         Path("src/keystone_agents/sdk.py"),
         Path("src/keystone_agents/run.py"),
         Path("src/keystone_agents/sandboxing.py"),
+        Path("src/keystone_agents/cli.py"),
     }
     offenders: list[str] = []
     for path in (KEYSTONE_AGENTS_ROOT).rglob("*.py"):
@@ -212,6 +215,23 @@ def test_context_source_catalog_declares_required_contracts() -> None:
             else:
                 module_path = PROJECT_ROOT / (owner.replace(".", "/") + ".py")
                 assert module_path.exists(), f"{source.source_id}: {owner}"
+
+
+def test_fresh_process_imports_core_zotero_paths_without_cycles() -> None:
+    for module_name in (
+        "keystone_agents.manual_request",
+        "keystone_agents.zotero_research",
+        "keystone_agents.tools",
+    ):
+        completed = subprocess.run(
+            [sys.executable, "-c", f"import {module_name}"],
+            cwd=PROJECT_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
 
 
 def test_live_context_sources_declare_live_flags_and_approval_boundaries() -> None:

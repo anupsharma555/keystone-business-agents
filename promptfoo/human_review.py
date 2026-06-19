@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-UTC = timezone.utc
+UTC = UTC
 
 DEFAULT_REVIEW_DB = Path(".keystone/promptfoo/human-reviews.sqlite")
 
@@ -106,12 +108,15 @@ class HumanEvalReview:
     agent: str = ""
     reviewer: str = "anup"
     scores: dict[str, float] = field(default_factory=dict)
-    safety: str = "pass"
+    safety: str = ""
     notes: str = ""
     slack_channel_id: str = "C0BA17Y9C01"
     slack_channel_name: str = "evals"
     slack_thread_ts: str = ""
     raw_text: str = ""
+    storage_mode: str = "local_review"
+    raw_text_hash: str = ""
+    notes_hash: str = ""
     created_at: str = field(
         default_factory=lambda: datetime.now(UTC).replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
@@ -140,6 +145,7 @@ def parse_human_review(
     slack_channel_id: str = "C0BA17Y9C01",
     slack_channel_name: str = "evals",
     slack_thread_ts: str = "",
+    storage_mode: str = "local_review",
 ) -> HumanEvalReview:
     """Parse a Slack-thread score reply into a normalized review record."""
 
@@ -150,7 +156,7 @@ def parse_human_review(
     fields = _extract_fields(raw_text)
     scores: dict[str, float] = {}
     parsed_notes = ""
-    safety = "pass"
+    safety = ""
     parsed_case_id = case_id.strip()
     parsed_run_id = run_id.strip()
     parsed_agent = agent.strip()
@@ -181,6 +187,13 @@ def parse_human_review(
         raise ValueError("case_id is required in args or review text")
     if not scores:
         raise ValueError("at least one 0-5 score is required")
+    missing_scores = [dimension for dimension in SCORE_DIMENSIONS if dimension not in scores]
+    if missing_scores:
+        raise ValueError(
+            "complete scorecard is required; missing scores: " + ", ".join(missing_scores)
+        )
+    if safety not in {"pass", "fail"}:
+        raise ValueError("safety is required and must be pass or fail")
 
     return HumanEvalReview(
         case_id=parsed_case_id,
@@ -194,6 +207,7 @@ def parse_human_review(
         slack_channel_name=slack_channel_name.strip(),
         slack_thread_ts=slack_thread_ts.strip(),
         raw_text=raw_text,
+        storage_mode=str(storage_mode or "local_review").strip() or "local_review",
     )
 
 
@@ -204,17 +218,27 @@ def save_human_review(
 ) -> int:
     """Save a human eval review in the repo-local Promptfoo review database."""
 
+    _validate_review_for_storage(review)
     path = Path(database_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         _ensure_schema(connection)
+        storage_mode = str(review.storage_mode or "local_review").strip() or "local_review"
+        notes_hash = review.notes_hash or _text_hash(review.notes)
+        raw_text_hash = review.raw_text_hash or _text_hash(review.raw_text)
+        stored_notes = review.notes
+        stored_raw_text = review.raw_text
+        if storage_mode == "api_redacted":
+            stored_notes = _redact_review_text(review.notes, max_chars=500)
+            stored_raw_text = _redact_review_text(review.raw_text, max_chars=1200)
         cursor = connection.execute(
             """
             INSERT INTO human_eval_reviews (
                 case_id, run_id, agent, reviewer, scores_json, average_score,
                 safety, notes, slack_channel_id, slack_channel_name,
-                slack_thread_ts, raw_text, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                slack_thread_ts, raw_text, storage_mode, raw_text_hash,
+                notes_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 review.case_id,
@@ -224,11 +248,14 @@ def save_human_review(
                 json.dumps(review.scores, ensure_ascii=True, sort_keys=True),
                 review.average_score,
                 review.safety,
-                review.notes,
+                stored_notes,
                 review.slack_channel_id,
                 review.slack_channel_name,
                 review.slack_thread_ts,
-                review.raw_text,
+                stored_raw_text,
+                storage_mode,
+                raw_text_hash,
+                notes_hash,
                 review.created_at,
             ),
         )
@@ -251,7 +278,7 @@ def list_human_reviews(
     if case_id:
         where = "WHERE case_id = ?"
         params = (case_id,)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.row_factory = sqlite3.Row
         _ensure_schema(connection)
         rows = connection.execute(
@@ -287,7 +314,7 @@ def build_slack_review_template(
             "format: ",
             "instruction_following: ",
             "usefulness: ",
-            "safety: pass",
+            "safety: ",
             "notes: ",
         ]
     )
@@ -311,16 +338,22 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             reviewer TEXT NOT NULL DEFAULT '',
             scores_json TEXT NOT NULL DEFAULT '{}',
             average_score REAL,
-            safety TEXT NOT NULL DEFAULT 'pass',
+            safety TEXT NOT NULL DEFAULT '',
             notes TEXT NOT NULL DEFAULT '',
             slack_channel_id TEXT NOT NULL DEFAULT '',
             slack_channel_name TEXT NOT NULL DEFAULT '',
             slack_thread_ts TEXT NOT NULL DEFAULT '',
             raw_text TEXT NOT NULL DEFAULT '',
+            storage_mode TEXT NOT NULL DEFAULT 'local_review',
+            raw_text_hash TEXT NOT NULL DEFAULT '',
+            notes_hash TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         )
         """
     )
+    _add_column_if_missing(connection, "human_eval_reviews", "storage_mode", "TEXT NOT NULL DEFAULT 'local_review'")
+    _add_column_if_missing(connection, "human_eval_reviews", "raw_text_hash", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "human_eval_reviews", "notes_hash", "TEXT NOT NULL DEFAULT ''")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_human_eval_reviews_case ON human_eval_reviews(case_id)"
     )
@@ -361,6 +394,22 @@ def _extract_fields(text: str) -> dict[str, str]:
     return fields
 
 
+def _validate_review_for_storage(review: HumanEvalReview) -> None:
+    if not str(review.case_id or "").strip():
+        raise ValueError("case_id is required")
+    if not review.scores:
+        raise ValueError("at least one 0-5 score is required")
+    invalid_scores = [
+        key
+        for key, value in review.scores.items()
+        if not isinstance(value, int | float) or float(value) < 0 or float(value) > 5
+    ]
+    if invalid_scores:
+        raise ValueError("scores must be numeric values between 0 and 5")
+    if str(review.safety or "").strip() not in {"pass", "fail"}:
+        raise ValueError("safety is required and must be pass or fail")
+
+
 def _normalize_key(value: str) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
 
@@ -388,6 +437,38 @@ def _row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
     payload = dict(row)
     payload["scores"] = _normalize_scores(json.loads(str(payload.pop("scores_json") or "{}")))
     return payload
+
+
+def _add_column_if_missing(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name not in columns:
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+
+
+def _text_hash(value: str) -> str:
+    if not value:
+        return ""
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _redact_review_text(value: str, *, max_chars: int) -> str:
+    text = str(value or "")
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED]", text)
+    text = re.sub(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[REDACTED_EMAIL]", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b", "[REDACTED_PHONE]", text)
+    text = " ".join(text.split())
+    if len(text) > max_chars:
+        return text[:max_chars] + "...[truncated]"
+    return text
 
 
 def _normalize_scores(scores: dict[str, Any]) -> dict[str, Any]:

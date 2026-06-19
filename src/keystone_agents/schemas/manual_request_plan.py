@@ -13,6 +13,9 @@ ManualTargetAgent = Literal[
     "opportunity_scout",
     "outreach_composer",
     "chief_of_staff",
+    "airtable_context_agent",
+    "google_workspace_context_agent",
+    "zotero_context_agent",
     "clarification",
 ]
 
@@ -27,6 +30,7 @@ ManualRequestIntent = Literal[
     "slack_operations",
     "browser_diagnostics",
     "reference_capture",
+    "context_lookup",
     "continue_work_item",
     "blocked_send",
     "clarification",
@@ -43,6 +47,7 @@ ManualTaskObjective = Literal[
     "slack_operations",
     "browser_diagnostics",
     "reference_capture",
+    "context_lookup",
     "blocked_side_effect",
     "clarification",
 ]
@@ -58,6 +63,7 @@ ManualExpectedArtifactType = Literal[
     "slack_ops_summary",
     "browser_diagnostics_report",
     "reference_note",
+    "context_summary",
 ]
 
 ManualTargetType = Literal[
@@ -72,6 +78,7 @@ ManualTargetType = Literal[
     "topic",
     "opportunity",
     "operator_reference",
+    "business_system_context",
     "slack_channel",
     "url",
     "unknown",

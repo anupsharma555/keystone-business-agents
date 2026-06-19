@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import re
+import unicodedata
 from dataclasses import replace
 from email.utils import parseaddr
 from pathlib import Path
@@ -359,7 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--live-gmail",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=live_gmail_default,
         help="Use live Gmail API access.",
     )
@@ -438,7 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--allow-inbox",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=live_gmail_default,
         help="Allow live Gmail to read INBOX when no label filter is supplied.",
     )
@@ -667,6 +669,7 @@ def _run_sdk_synthesis(
         provider_cost_window_seconds=args.provider_cost_window_seconds,
         openai_cost_project_id=args.openai_cost_project_id,
     )
+    _repair_gmail_triage_output_hygiene(payload)
     if args.orchestrator_review:
         payload["orchestrator_review"] = build_cli_orchestrator_review(
             args,
@@ -681,6 +684,98 @@ def _run_sdk_synthesis(
         )
     attach_orchestrator_preflight_payload(payload, args)
     return payload
+
+
+def _repair_gmail_triage_output_hygiene(payload: dict[str, Any]) -> dict[str, Any]:
+    """Repair narrow mixed-script glitches in human-facing Gmail triage fields."""
+
+    if str(payload.get("output_type") or "").strip() != "EmailTriageResult":
+        return payload
+    output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
+    if not output:
+        return payload
+    repaired_fields: list[str] = []
+    request_text = str(payload.get("input") or "")
+    extracted_subject = _extract_inline_subject(request_text)
+    current_subject = str(output.get("subject") or "").strip()
+    if extracted_subject and _is_generic_gmail_subject(current_subject):
+        output["subject"] = extracted_subject
+        repaired_fields.append("subject")
+    recommended_action = str(output.get("recommended_action") or "").strip()
+    if _has_mixed_latin_non_latin_token(recommended_action):
+        output["recommended_action"] = _fallback_recommended_action(output)
+        repaired_fields.append("recommended_action")
+        limitations = [
+            str(item).strip()
+            for item in output.get("triage_limitations") or []
+            if str(item).strip()
+        ]
+        limitations.append(
+            "Generated recommendation text contained mixed-script noise and was replaced with a conservative English fallback."
+        )
+        output["triage_limitations"] = list(dict.fromkeys(limitations))
+    if repaired_fields:
+        payload["output_hygiene"] = {
+            "schema": "keystone.gmail_triage.output_hygiene.v1",
+            "repair_applied": True,
+            "repair_reason": ",".join(repaired_fields),
+            "repaired_fields": repaired_fields,
+        }
+    return payload
+
+
+def _extract_inline_subject(value: str) -> str:
+    match = re.search(
+        r"\bSubject:\s*(.+?)(?=\s+\b(?:From|Body):|\n|$)",
+        str(value or ""),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return ""
+    return " ".join(match.group(1).split())[:200]
+
+
+def _is_generic_gmail_subject(value: str) -> bool:
+    normalized = " ".join(str(value or "").lower().split())
+    return normalized in {
+        "",
+        "gmail triage result",
+        "manual gmail triage request",
+        "manual triage request",
+    }
+
+
+def _has_mixed_latin_non_latin_token(value: str) -> bool:
+    for token in re.findall(r"\S+", str(value or "")):
+        has_latin = False
+        has_non_latin = False
+        for char in token:
+            if not char.isalpha():
+                continue
+            name = unicodedata.name(char, "")
+            if "LATIN" in name:
+                has_latin = True
+            else:
+                has_non_latin = True
+        if has_latin and has_non_latin:
+            return True
+    return False
+
+
+def _fallback_recommended_action(output: dict[str, Any]) -> str:
+    needs_reply = bool(output.get("needs_reply"))
+    category = str(output.get("category") or "").strip()
+    if needs_reply and category in {"collaboration_opportunity", "consulting_opportunity"}:
+        return (
+            "Reply with a brief note confirming interest, asking for scope and timing, "
+            "and suggesting a short call or written summary review if helpful."
+        )
+    if needs_reply:
+        return (
+            "Review the message and prepare a concise reply for human approval before "
+            "taking any external action."
+        )
+    return "No reply appears required from the sanitized context; review manually if context changes."
 
 
 def _priority_grouping_source_label(args: argparse.Namespace) -> str:

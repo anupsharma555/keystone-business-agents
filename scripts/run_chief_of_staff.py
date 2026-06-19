@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from keystone_agents.agents.chief_of_staff import (
+    chief_of_staff_should_use_specialist_tools,
     plan_chief_of_staff_request,
     render_chief_of_staff_result,
     run_chief_of_staff_sdk,
@@ -19,6 +20,13 @@ from keystone_agents.agents.orchestrator import review_specialist_output, run_or
 from keystone_agents.cli_sdk import add_sdk_session_arguments, sdk_session_from_args
 from keystone_agents.config import load_settings
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
+from keystone_agents.local_kni_evidence import (
+    build_local_kni_evidence_packet,
+    build_local_kni_evidence_packet_for_query,
+    local_kni_evidence_paths,
+    local_kni_live_instruction,
+    looks_like_local_kni_evidence_lookup,
+)
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
 from keystone_agents.operator_failures import known_exception_to_operator_failure
@@ -30,13 +38,6 @@ from keystone_agents.orchestrator.preflight_context import (
 from keystone_agents.quality_budget import AgentQualityBudget, chief_of_staff_quality_budget
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffSourceRef
 from keystone_agents.source_layer_context import runtime_source_layer_policy_context
-from keystone_agents.local_kni_evidence import (
-    build_local_kni_evidence_packet,
-    build_local_kni_evidence_packet_for_query,
-    local_kni_evidence_paths,
-    local_kni_live_instruction,
-    looks_like_local_kni_evidence_lookup,
-)
 from keystone_agents.visible_sources import append_visible_source_urls_to_output
 
 
@@ -540,6 +541,10 @@ def main(argv: list[str] | None = None) -> int:
                 "slack_repo_path": args.slack_repo_path,
                 "approval_reference": _approval_reference_for_request(input_text),
                 "side_effect_policy": _live_side_effect_policy(input_text),
+                "include_specialist_tools": chief_of_staff_should_use_specialist_tools(
+                    input_text,
+                    manual_plan,
+                ),
                 "manual_request_plan": manual_plan.model_dump(mode="json"),
                 "orchestrator_preflight": orchestrator_preflight,
                 "runtime_source_layer_policy": runtime_source_layer_policy_context(
@@ -557,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
                 session=sdk_session,
                 force_sdk_interpretation=True,
                 manual_request_plan=manual_plan,
+                include_specialist_tools=bool(typed_input["include_specialist_tools"]),
             )
             result = typed_result.output
             result = append_visible_source_urls_to_output(result)

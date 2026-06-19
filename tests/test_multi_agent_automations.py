@@ -20,6 +20,7 @@ from keystone_agents.schemas.research import (
     ResearchBriefFact,
     ResearchSourceCitation,
 )
+from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.tools.search_provider import SearchResult, SearxngSearchError
 from keystone_agents.tools.website_extraction_tool import (
     WebsiteExtractionError,
@@ -716,6 +717,61 @@ def test_announcements_research_selects_three_to_five_and_keeps_summaries_bounde
     assert result.orchestrator_review.approval_boundary_ok is True
     assert any("Orchestrator automation review:" in item for item in result.diagnostics)
     assert "Business Research Analyst weekly announcement synthesis" in result.slack_text
+
+
+def test_announcements_research_persists_seen_items_and_dedupes(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'announcements.db'}"
+    payload = {
+        "links": [
+            {
+                "title": "medRxiv depression AI preprint",
+                "url": "https://doi.org/10.1101/2026.01.02.234567?utm_campaign=rss",
+                "snippet": "Preprint evaluates AI methods for depression research.",
+                "source": "medRxiv",
+                "doi": "10.1101/2026.01.02.234567",
+                "relevance": ["clinical_ai", "preprint"],
+            },
+            {
+                "title": "medRxiv depression AI preprint duplicate",
+                "url": "https://doi.org/10.1101/2026.01.02.234567",
+                "snippet": "Duplicate feed item.",
+                "source": "medRxiv",
+                "doi": "10.1101/2026.01.02.234567",
+                "relevance": ["clinical_ai"],
+            },
+            {
+                "title": "FDA AI guidance update",
+                "url": "https://example.org/fda-ai-guidance",
+                "snippet": "Guidance for healthcare AI.",
+                "source": "FDA",
+            },
+        ]
+    }
+
+    result = run_announcements_research_synthesis(
+        payload,
+        min_items=1,
+        max_items=2,
+        database_url=database_url,
+        automation_run_id="auto_run_123",
+    )
+    run_announcements_research_synthesis(
+        payload,
+        min_items=1,
+        max_items=2,
+        database_url=database_url,
+        automation_run_id="auto_run_124",
+    )
+    store = SQLiteStore(database_url)
+    items = store.list_announcement_feed_items(query="depression")
+
+    assert result.status == "ok"
+    assert any("Persisted 3 announcement feed item" in item for item in result.diagnostics)
+    assert len(items) == 1
+    assert items[0].canonical_key == "doi:10.1101/2026.01.02.234567"
+    assert items[0].seen_count == 4
+    assert items[0].selected is True
+    assert items[0].automation_run_id == "auto_run_124"
 
 
 def test_announcements_research_reports_live_search_diagnostics(

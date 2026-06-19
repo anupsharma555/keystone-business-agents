@@ -101,6 +101,18 @@ def estimate_usage_cost(
     }
 
 
+def pricing_metadata_available(
+    *,
+    provider: str,
+    model: str,
+    pricing_table_path: str | Path | None = None,
+) -> bool:
+    """Return whether the checked-in pricing table explicitly covers provider/model."""
+
+    table = load_pricing_table(pricing_table_path)
+    return _match_pricing_entry(table, provider=provider, model=model) is not None
+
+
 def compare_estimated_to_actual_cost(
     *,
     cost: dict[str, Any],

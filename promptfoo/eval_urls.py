@@ -30,3 +30,14 @@ def eval_review_case_url(case_id: str) -> str:
         base_url = dashboard_url.replace("/dashboard?", "/review?", 1)
     separator = "&" if "?" in base_url else "?"
     return f"{base_url}{separator}case={quote(str(case_id or '').strip())}"
+
+
+def eval_case_bundle_url(case_id: str) -> str:
+    """Return the local JSON bundle URL for one eval case."""
+    dashboard_url = eval_dashboard_url()
+    if dashboard_url.endswith("/dashboard"):
+        base_url = f"{dashboard_url[:-len('/dashboard')]}/api/eval-case-bundle"
+    else:
+        base_url = dashboard_url.replace("/dashboard?", "/api/eval-case-bundle?", 1)
+    separator = "&" if "?" in base_url else "?"
+    return f"{base_url}{separator}case={quote(str(case_id or '').strip())}"

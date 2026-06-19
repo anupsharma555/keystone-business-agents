@@ -29,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--live-sdk", action="store_true")
     parser.add_argument("--live-search", action="store_true")
+    parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional SQLite database URL for durable application-data persistence.",
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON.")
     parser.add_argument("--max-items", type=int, default=None)
     parser.add_argument("--min-items", type=int, default=None)
@@ -52,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             live_search=args.live_search,
             min_items=args.min_items or 3,
             max_items=args.max_items or 5,
+            database_url=args.database_url,
         )
     else:
         result = run_github_repo_opportunities(

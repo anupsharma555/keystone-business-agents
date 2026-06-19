@@ -89,7 +89,7 @@ class UserFacingResponseSynthesisInput(BaseModel):
                 "- Do not say search was limited when retrieval diagnostics show broad search execution; say independent corroboration or selected evidence is limited instead.",
                 "- Put partial, blocked, not decision-ready, and approval/no-send notes in caveats.",
                 "- Leave key_points and next_step empty when they would repeat the answer, blockers, or caveats.",
-                "- Use Orchestrator review feedback to surface gaps without repeating workflow metadata.",
+                "- Do not expose raw Orchestrator review feedback, evaluator gap labels, or workflow metadata in the user-facing answer.",
                 "- If the result is blocked or off-target, explain why in caveats instead of opening with it.",
                 "- Keep approval/no-send/write safety boundaries intact.",
                 "- Do not use 'If you want...' follow-up offers; include only concrete next actions required by the request or safety state.",
@@ -1037,6 +1037,7 @@ def format_user_response_synthesis(
     *,
     sources: Any | None = None,
     metadata_lines: list[str] | None = None,
+    low_metadata: bool = False,
 ) -> str:
     """Render synthesized response fields into compact Slack-readable text."""
 
@@ -1101,7 +1102,7 @@ def format_user_response_synthesis(
         lines.extend(["", "Source evidence"])
         lines.extend(f"* {item}" for item in source_evidence)
     terms = _clean_section_items(getattr(synthesis, "terms", []), rendered_text="\n".join(lines))
-    if terms:
+    if terms and not low_metadata:
         lines.extend(["", "Terms"])
         lines.extend(f"* {item}" for item in terms)
     recommended_actions = _clean_section_items(
@@ -1117,10 +1118,14 @@ def format_user_response_synthesis(
     if recommended_actions:
         lines.extend(["", "Recommended actions"])
         lines.extend(f"* {item}" for item in recommended_actions)
-    if caveats:
+    if caveats and not low_metadata:
         lines.extend(["", "Run notes"])
         lines.extend(f"* {item}" for item in caveats)
-    metadata = _clean_section_items(metadata_lines or [], rendered_text="\n".join(lines))
+    metadata = (
+        []
+        if low_metadata
+        else _clean_section_items(metadata_lines or [], rendered_text="\n".join(lines))
+    )
     body_text = "\n".join(line for line in lines if line is not None).strip()
     body_text = append_visible_source_urls_to_text(body_text, sources)
     if metadata and not _has_section_heading(body_text, "metadata"):
@@ -1130,6 +1135,16 @@ def format_user_response_synthesis(
         text = body_text
     text = _repair_ambiguous_apa_terms(text)
     return text
+
+
+def low_metadata_requested(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    return bool(
+        re.search(
+            r"\b(?:low[- ]metadata|minimal\s+metadata|no\s+metadata|metadata[- ]light)\b",
+            normalized,
+        )
+    )
 
 
 def _source_evidence_lines(
@@ -1587,8 +1602,6 @@ def _compact_orchestrator_reviews(result: WorkflowRunResult) -> list[dict[str, A
                     "review_status",
                     "overall_score",
                     "approval_boundary_ok",
-                    "observed_gaps",
-                    "recommended_next_step",
                 )
                 if key in item and item[key] not in (None, "", [])
             }

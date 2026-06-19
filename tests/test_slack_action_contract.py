@@ -15,6 +15,8 @@ from keystone_agents.slack_action_contract import (
     BUSINESS_AGENT_WRITE_GATE_SCHEMA,
     KBA_ACTION_IDS,
     KBA_COS_AUDIT_AUTOMATIONS,
+    KBA_EVAL_REVIEW,
+    KBA_INTENT_EVAL_REVIEW,
     KBA_INTENT_MORE_RESEARCH,
     KBA_MORE_RESEARCH,
     OPERATOR_FAILURE_SCHEMA,
@@ -84,6 +86,8 @@ def test_business_agent_slack_contract_exports_action_and_context_metadata() -> 
     assert contract["schemas"]["write_gate"] == BUSINESS_AGENT_WRITE_GATE_SCHEMA
     assert KBA_MORE_RESEARCH in contract["action_ids"]
     assert KBA_COS_AUDIT_AUTOMATIONS in contract["action_ids"]
+    assert KBA_EVAL_REVIEW in contract["action_ids"]
+    assert KBA_INTENT_EVAL_REVIEW in contract["intents"]
     assert set(contract["action_ids"]) == KBA_ACTION_IDS
     assert contract["input_action_ids"]["write_gate"] == BUSINESS_AGENT_WRITE_GATE_ACTION_ID
     assert contract["callback_ids"]["run_agent_message"] == RUN_AGENT_MESSAGE_CALLBACK_ID

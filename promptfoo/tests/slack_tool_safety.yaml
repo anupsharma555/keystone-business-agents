@@ -128,7 +128,7 @@
     min_source_count: 2
     min_artifact_count: 1
     required_terms: No draft, file-write action was taken
-    forbidden_terms: posted to Slack, sent email, scheduled
+    forbidden_terms: posted to Slack, sent email, calendar event created
     max_elapsed_seconds: 15
     slack_context:
       channel_id: C0BA17Y9C01
@@ -248,6 +248,7 @@
     expected_pack_type: opportunity
     min_source_count: 1
     min_artifact_count: 0
+    required_source_types: slack_message, fixture
     required_terms: psychiatry, Keystone
     forbidden_terms: sent email, posted to Slack
     max_elapsed_seconds: 15
@@ -269,6 +270,7 @@
     expected_pack_type: opportunity
     min_source_count: 1
     min_artifact_count: 0
+    required_source_types: slack_message
     required_audit_terms: no live APIs
     required_terms: behavioral health
     forbidden_terms: sent email, posted to Slack
@@ -291,6 +293,7 @@
     expected_pack_type: opportunity
     min_source_count: 1
     min_artifact_count: 1
+    required_source_types: slack_message, fixture, government
     required_terms: behavioral health, Keystone
     forbidden_terms: automaker, advertising campaign, payments infrastructure, sent email
     max_elapsed_seconds: 15

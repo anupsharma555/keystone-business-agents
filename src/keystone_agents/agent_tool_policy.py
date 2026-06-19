@@ -7,11 +7,24 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
+from keystone_agents.specialist_tool_names import is_specialist_agent_tool_name
 from keystone_agents.tools.internal_data_tools import GOOGLE_WORKSPACE_TOOL_NAMES
+from keystone_agents.tools.zotero_context_tools import (
+    ZOTERO_CONTEXT_TOOL_NAMES,
+    ZOTERO_IMPORT_TOOL_NAMES,
+    ZOTERO_READ_CONTEXT_TOOL_NAMES,
+)
 
 GOOGLE_WORKSPACE_ALLOWED_TOOLS = frozenset(GOOGLE_WORKSPACE_TOOL_NAMES)
 GOOGLE_WORKSPACE_READ_TOOLS = frozenset(
-    {"google_doc_read", "google_drive_list_folder", "google_sheet_list", "google_sheet_read_table"}
+    {
+        "google_doc_read",
+        "google_drive_list_folder",
+        "google_drive_search_files",
+        "google_drive_get_file_metadata",
+        "google_sheet_list",
+        "google_sheet_read_table",
+    }
 )
 GOOGLE_WORKSPACE_WRITE_TOOLS = GOOGLE_WORKSPACE_ALLOWED_TOOLS - GOOGLE_WORKSPACE_READ_TOOLS
 AIRTABLE_READ_ALLOWED_TOOLS = frozenset({"airtable_get_base_schema", "airtable_read_records"})
@@ -23,8 +36,8 @@ BROWSER_DIAGNOSTIC_ALLOWED_TOOLS = frozenset(
 )
 LOCAL_KNI_DOCUMENT_TOOL_NAMES = frozenset(
     {
-        "list_kni_document_folder",
         "list_kni_document_sources",
+        "list_kni_document_folder",
         "search_kni_documents",
         "read_kni_document_file",
     }
@@ -146,6 +159,7 @@ CORE_READ_TOOL_NAMES = frozenset(
         "search_slack_repo_context",
         "read_slack_repo_context_file",
         "lookup_slack_workflow_capability",
+        "list_kni_document_folder",
         "list_kni_document_sources",
         "search_kni_documents",
         "read_kni_document_file",
@@ -158,6 +172,7 @@ CORE_READ_TOOL_NAMES = frozenset(
         "read_linked_article",
         "get_gmail_message",
         "file_search",
+        *ZOTERO_READ_CONTEXT_TOOL_NAMES,
         *GOOGLE_WORKSPACE_READ_TOOLS,
         *AIRTABLE_READ_ALLOWED_TOOLS,
     }
@@ -230,6 +245,7 @@ INTERNAL_WRITE_TOOL_NAMES = (
             "save_outreach_dedup_memory",
             "learn_email_style_profile",
             "save_initial_outreach_tracking_record",
+            *ZOTERO_IMPORT_TOOL_NAMES,
         }
     )
 )
@@ -401,6 +417,41 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
             "context, can update internal trackers, and remain draft-only."
         ),
     ),
+    "airtable_context_agent": AgentToolPolicy(
+        agent_name="airtable_context_agent",
+        allowed_tool_names=AIRTABLE_READ_ALLOWED_TOOLS | AIRTABLE_WRITE_ALLOWED_TOOLS,
+        rationale=(
+            "The Airtable context agent reads schema and capped records, may perform "
+            "direct approved create/update writes, and remains advisory when nested "
+            "under Chief of Staff."
+        ),
+    ),
+    "google_workspace_context_agent": AgentToolPolicy(
+        agent_name="google_workspace_context_agent",
+        allowed_tool_names=GOOGLE_WORKSPACE_ALLOWED_TOOLS,
+        rationale=(
+            "The Google Workspace context agent lists, searches, reads, and may "
+            "perform direct approved Drive/Docs/Sheets writes; nested Chief calls "
+            "remain advisory and write-plan only."
+        ),
+    ),
+    "zotero_context_agent": AgentToolPolicy(
+        agent_name="zotero_context_agent",
+        allowed_tool_names=frozenset(
+            {
+                "list_local_context_sources",
+                "search_local_context",
+                "read_local_context_file",
+            }
+        )
+        | frozenset(ZOTERO_CONTEXT_TOOL_NAMES)
+        | GOOGLE_WORKSPACE_ALLOWED_TOOLS,
+        rationale=(
+            "The Zotero context agent reads local/API Zotero metadata and may perform "
+            "direct approved Google Workspace artifact writes; Zotero library mutation "
+            "is limited to the guarded backend importer, and nested Chief calls remain advisory."
+        ),
+    ),
     "orchestrator": AgentToolPolicy(
         agent_name="orchestrator",
         allowed_tool_names=frozenset(
@@ -534,7 +585,12 @@ def disallowed_tool_names(agent_name: str, tool_names: list[str]) -> list[str]:
     policy = tool_policy_for_agent(agent_name)
     if policy is None:
         return []
-    return sorted(name for name in tool_names if name not in policy.allowed_tool_names)
+    return sorted(
+        name
+        for name in tool_names
+        if name not in policy.allowed_tool_names
+        and not (policy.agent_name == "chief_of_staff" and is_specialist_agent_tool_name(name))
+    )
 
 
 def normalize_tool_tier(value: ToolTier | str | int | None) -> ToolTier:
@@ -561,13 +617,16 @@ def normalize_tool_tier(value: ToolTier | str | int | None) -> ToolTier:
 def tool_tier_for_name(tool_name: str) -> ToolTier | None:
     """Return the declared tier for a stable tool name, if known."""
 
-    return TOOL_TIER_BY_NAME.get(str(tool_name or "").strip())
+    normalized = str(tool_name or "").strip()
+    if is_specialist_agent_tool_name(normalized):
+        return ToolTier.DEEP_RETRIEVAL
+    return TOOL_TIER_BY_NAME.get(normalized)
 
 
 def unclassified_tool_names(tool_names: list[str] | tuple[str, ...] | frozenset[str]) -> list[str]:
     """Return stable tool names that lack an explicit tier assignment."""
 
-    return sorted(name for name in tool_names if name not in TOOL_TIER_BY_NAME)
+    return sorted(name for name in tool_names if tool_tier_for_name(name) is None)
 
 
 def allowed_tool_names_for_tier(
@@ -616,7 +675,12 @@ def validate_agent_tool_policy(
             )
         return tool_names
 
-    disallowed = sorted(name for name in tool_names if name not in policy.allowed_tool_names)
+    disallowed = sorted(
+        name
+        for name in tool_names
+        if name not in policy.allowed_tool_names
+        and not (policy.agent_name == "chief_of_staff" and is_specialist_agent_tool_name(name))
+    )
     if disallowed:
         raise AgentToolPolicyError(
             "Agent "

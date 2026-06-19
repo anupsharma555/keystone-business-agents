@@ -10,8 +10,13 @@ import pytest
 import keystone_agents.agents.chief_of_staff as chief_of_staff_module
 import keystone_agents.local_kni_evidence as local_kni_evidence
 import keystone_agents.tools.internal_data_tools as internal_data_tools
-from keystone_agents.agent_registry import AGENT_REGISTRY
-from keystone_agents.agent_tool_policy import disallowed_tool_names, tool_policy_for_agent
+from keystone_agents.agent_registry import AGENT_REGISTRY, SPECIALIST_AGENT_SPECS
+from keystone_agents.agent_tool_policy import (
+    ToolTier,
+    disallowed_tool_names,
+    tool_policy_for_agent,
+    tool_tier_for_name,
+)
 from keystone_agents.agents.chief_of_staff import (
     build_chief_of_staff_agent,
     plan_chief_of_staff_request,
@@ -26,11 +31,26 @@ from keystone_agents.orchestrator.preflight_context import (
 from keystone_agents.quality_budget import QualityMode, chief_of_staff_quality_budget
 from keystone_agents.schemas.airtable import airtable_base_schema_summary_from_metadata
 from keystone_agents.schemas.chief_of_staff import (
+    ChiefNestedSpecialistResult,
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
     ChiefOfStaffSourceRef,
+    ChiefSpecialistToolInput,
 )
+from keystone_agents.schemas.email_triage import EmailTriageResult
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.schemas.operational_context import (
+    AirtableContextResult,
+    GoogleWorkspaceContextResult,
+    HumanWorkContext,
+    OperationalWritePlan,
+    ZoteroContextResult,
+)
+from keystone_agents.specialist_agent_tools import (
+    build_chief_specialist_tool_input,
+    extract_nested_specialist_result,
+)
+from keystone_agents.specialist_tool_names import specialist_agent_tool_name
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.tools.chief_of_staff_tool import (
     list_chief_of_staff_context_sources,
@@ -48,9 +68,11 @@ from keystone_agents.tools.internal_data_tools import (
     google_doc_read_impl,
     google_doc_write_impl,
     google_drive_create_folder_impl,
+    google_drive_get_file_metadata_impl,
     google_drive_list_folder_impl,
     google_drive_remove_folder_impl,
     google_drive_rename_folder_impl,
+    google_drive_search_files_impl,
     google_sheet_append_rows_impl,
     google_sheet_create_impl,
     google_sheet_create_tab_impl,
@@ -115,6 +137,373 @@ def test_chief_of_staff_builder_matches_schema_and_policy() -> None:
     policy = tool_policy_for_agent("chief_of_staff")
     assert policy is not None
     assert "search_official_operations_docs" in policy.allowed_tool_names
+
+
+def test_chief_of_staff_specialist_tools_are_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(chief_of_staff_module.CHIEF_OF_STAFF_SPECIALIST_TOOLS_ENV, raising=False)
+    agent = build_chief_of_staff_agent()
+    tool_names = {getattr(tool, "name", "") for tool in agent.tools}
+
+    for spec in SPECIALIST_AGENT_SPECS:
+        assert specialist_agent_tool_name(spec.route_name) not in tool_names
+
+
+def test_chief_of_staff_can_opt_into_all_specialists_as_tools() -> None:
+    agent = build_chief_of_staff_agent(include_specialist_tools=True)
+    tools_by_name = {getattr(tool, "name", ""): tool for tool in agent.tools}
+    tool_names = set(tools_by_name)
+    specialist_tool_names = {
+        specialist_agent_tool_name(spec.route_name) for spec in SPECIALIST_AGENT_SPECS
+    }
+
+    assert specialist_tool_names <= tool_names
+    assert "orchestrator_as_specialist_tool" not in tool_names
+    assert "chief_of_staff_as_specialist_tool" not in tool_names
+    assert disallowed_tool_names("chief_of_staff", sorted(tool_names)) == []
+    assert "candidate record identity" in getattr(
+        tools_by_name["airtable_context_agent_as_specialist_tool"],
+        "description",
+        "",
+    )
+    assert "Drive folder/file" in getattr(
+        tools_by_name["google_workspace_context_agent_as_specialist_tool"],
+        "description",
+        "",
+    )
+    assert "thread/message context" in getattr(
+        tools_by_name["gmail_triage_as_specialist_tool"],
+        "description",
+        "",
+    )
+    assert "Zotero library" in getattr(
+        tools_by_name["zotero_context_agent_as_specialist_tool"],
+        "description",
+        "",
+    )
+    for tool_name in (
+        "gmail_triage_as_specialist_tool",
+        "business_research_analyst_as_specialist_tool",
+        "opportunity_scout_as_specialist_tool",
+        "outreach_composer_as_specialist_tool",
+        "airtable_context_agent_as_specialist_tool",
+        "google_workspace_context_agent_as_specialist_tool",
+        "zotero_context_agent_as_specialist_tool",
+    ):
+        assert "human" in getattr(tools_by_name[tool_name], "description", "").lower()
+
+
+def test_chief_of_staff_specialist_tool_env_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(chief_of_staff_module.CHIEF_OF_STAFF_SPECIALIST_TOOLS_ENV, "1")
+    agent = build_chief_of_staff_agent()
+    tool_names = {getattr(tool, "name", "") for tool in agent.tools}
+
+    assert specialist_agent_tool_name("gmail_triage") in tool_names
+    assert specialist_agent_tool_name("outreach_composer") in tool_names
+    assert specialist_agent_tool_name("airtable_context_agent") in tool_names
+    assert specialist_agent_tool_name("google_workspace_context_agent") in tool_names
+    assert specialist_agent_tool_name("zotero_context_agent") in tool_names
+
+
+def test_chief_of_staff_specialist_tools_are_advisory_not_write_tools() -> None:
+    agent = build_chief_of_staff_agent(
+        include_specialist_tools=True,
+        specialist_tool_mode="approved_write",
+    )
+    specialist_tools = [
+        tool
+        for tool in agent.tools
+        if str(getattr(tool, "name", "")).endswith("_as_specialist_tool")
+    ]
+
+    assert {getattr(tool, "name", "") for tool in specialist_tools} == {
+        specialist_agent_tool_name(spec.route_name) for spec in SPECIALIST_AGENT_SPECS
+    }
+    for tool in specialist_tools:
+        assert getattr(tool, "specialist_write_authorized", False) is False
+        for nested_tool_name in getattr(tool, "nested_tool_names", ()):
+            tier = tool_tier_for_name(str(nested_tool_name))
+            assert tier is not None
+            assert tier <= ToolTier.DIAGNOSTIC
+
+
+def test_chief_specialist_tools_use_typed_context_input_contract() -> None:
+    agent = build_chief_of_staff_agent(include_specialist_tools=True)
+    tool = next(
+        item
+        for item in agent.tools
+        if getattr(item, "name", "") == "gmail_triage_as_specialist_tool"
+    )
+    schema = getattr(tool, "params_json_schema", {})
+
+    assert getattr(tool, "specialist_input_model", None) is ChiefSpecialistToolInput
+    assert getattr(tool, "specialist_result_model", None) is ChiefNestedSpecialistResult
+    type_contract = getattr(tool, "specialist_type_contract", {})
+    assert type_contract["source_output_type"] == (
+        "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput"
+    )
+    assert type_contract["target_input_type"] == (
+        "keystone_agents.schemas.context_pack.GmailContextPack"
+    )
+    assert type_contract["target_output_type"] == (
+        "keystone_agents.schemas.email_triage.EmailTriageResult"
+    )
+    assert type_contract["payload_mode"] == "adapted"
+    assert type_contract["compatibility_status"] == "compatible"
+    assert "raw_operator_request" in schema["properties"]
+    assert "decision_context" in schema["properties"]
+    assert "target_context" in schema["properties"]
+    assert "coordination_context" in schema["properties"]
+    assert "provider_call_context" in schema["properties"]
+    assert "slack_context" in schema["properties"]
+    assert "gmail_context" in schema["properties"]
+    assert "work_item_context" in schema["properties"]
+    assert "source_layer_manifest" in schema["properties"]
+    assert "approval_context" in schema["properties"]
+    assert "side_effect_boundaries" in schema["properties"]
+    assert schema["additionalProperties"] is False
+
+
+def test_chief_specialist_tool_input_builder_preserves_context_and_boundaries() -> None:
+    payload = ChiefSpecialistToolInput(
+        raw_operator_request="Summarize this Slack thread and triage the linked Gmail context.",
+        specialist_task="Review the Gmail context and return blockers.",
+        decision_context={
+            "desired_deliverable": "meeting follow-up brief",
+            "success_criteria": "identify reply blockers",
+        },
+        target_context={"gmail_thread_id": "thr_123", "artifact": "follow-up note"},
+        coordination_context={
+            "sibling_specialists": "Gmail Triage, Google Workspace Context",
+            "merge_need": "Chief integrates email and artifact placement",
+        },
+        provider_call_context={
+            "provider": "gmail",
+            "thread_id": "thr_123",
+            "requested_action": "read thread and recommend draft-only follow-up",
+        },
+        slack_context={"channel_id": "C123", "thread_ts": "1710000000.000100"},
+        gmail_context={"thread_id": "thr_123"},
+        work_item_context={"work_item_id": "wi_123"},
+        source_layer_manifest={"requested": "gmail, slack"},
+        approval_context={"approval_id": "appr_123", "status": "pending"},
+        side_effect_boundaries=["no_send"],
+    )
+
+    rendered = build_chief_specialist_tool_input(
+        {
+            "params": payload.model_dump(mode="json"),
+            "summary": "Chief specialist input schema summary.",
+        }
+    )
+
+    assert "Raw Operator Request" in rendered
+    assert "thr_123" in rendered
+    assert "C123" in rendered
+    assert "decision_context" in rendered
+    assert "target_context" in rendered
+    assert "coordination_context" in rendered
+    assert "provider_call_context" in rendered
+    assert "meeting follow-up brief" in rendered
+    assert "read thread and recommend draft-only follow-up" in rendered
+    assert "source_layer_manifest" in rendered
+    assert "approval_context" in rendered
+    assert "no_nested_live_write" in rendered
+    assert "Do not send, publish, schedule, mutate provider state" in rendered
+
+
+def test_nested_specialist_output_extractor_returns_reviewable_envelope() -> None:
+    output = AirtableContextResult(
+        summary="Resolved candidate Airtable record context.",
+        candidate_record_ids=["rec123"],
+        blockers=["Confirm exact target record before write."],
+        approval_needs=["Approval reference required for update."],
+        human_work_context=HumanWorkContext(
+            work_functions=["data cleanup"],
+            decision_needed="Choose the target record.",
+            integration_surfaces=["Airtable", "Approvals"],
+        ),
+    )
+    result = extract_nested_specialist_result(
+        run_result=SimpleNamespace(final_output=output),
+        route_name="airtable_context_agent",
+        tool_name="airtable_context_agent_as_specialist_tool",
+    )
+
+    assert result.route_name == "airtable_context_agent"
+    assert result.tool_name == "airtable_context_agent_as_specialist_tool"
+    assert result.parsed_output_status == "parsed"
+    assert result.source_output_type == (
+        "keystone_agents.schemas.operational_context.AirtableContextResult"
+    )
+    assert result.target_input_type == (
+        "keystone_agents.schemas.chief_of_staff.ChiefNestedSpecialistResult"
+    )
+    assert result.payload_mode == "adapted"
+    assert result.type_compatibility_status == "compatible"
+    assert result.type_contract.target_agent == "chief_of_staff"
+    assert result.summary == "Resolved candidate Airtable record context."
+    assert result.blockers == ["Confirm exact target record before write."]
+    assert result.approval_needs == ["Approval reference required for update."]
+    assert any(
+        item.key == "work_functions" and item.value == "data cleanup"
+        for item in result.human_work_context
+    )
+    assert result.validation_status == "blocked"
+
+
+def test_nested_specialist_missing_output_becomes_blocked_envelope() -> None:
+    result = extract_nested_specialist_result(
+        run_result=SimpleNamespace(final_output=None),
+        route_name="gmail_triage",
+        tool_name="gmail_triage_as_specialist_tool",
+    )
+
+    assert result.parsed_output_status == "missing"
+    assert result.validation_status == "blocked"
+    assert any(
+        item.key == "final_output_present" and item.value == "False"
+        for item in result.diagnostics
+    )
+
+
+def test_operational_context_results_include_human_work_context_without_nested_writes() -> None:
+    human_context = HumanWorkContext(
+        work_functions=["approval review", "data cleanup"],
+        human_owner_hint="Chief of Staff",
+        decision_needed="Confirm target record before updating Airtable.",
+        handoff_ready_context=["Base schema and candidate record summary"],
+        missing_context=["approved scoped write reference"],
+        integration_surfaces=["Airtable", "WorkItems", "Approvals"],
+        follow_up_actions=["Ask Anup to confirm the target record"],
+    )
+    write_plan = OperationalWritePlan(
+        target_system="airtable",
+        operation="update",
+        target="Personal Expenses",
+        live_write_allowed_for_specialist=True,
+    )
+    airtable = AirtableContextResult(
+        summary="Candidate record context is available.",
+        human_work_context=human_context,
+        write_plan=write_plan,
+    )
+    workspace = GoogleWorkspaceContextResult(
+        summary="Artifact placement context is available.",
+        human_work_context=human_context,
+        write_plan=OperationalWritePlan(
+            target_system="google_workspace",
+            operation="create_doc",
+            target="KNIOps / Reports",
+            live_write_allowed_for_specialist=True,
+        ),
+    )
+    zotero = ZoteroContextResult(
+        summary="Article context is available.",
+        human_work_context=human_context,
+        recommended_artifact_plan=OperationalWritePlan(
+            target_system="airtable",
+            operation="create_note",
+            target="Zotero literature review",
+            live_write_allowed_for_specialist=True,
+        ),
+        zotero_write_supported=True,
+    )
+
+    assert airtable.human_work_context.work_functions == ["approval review", "data cleanup"]
+    assert airtable.direct_write_supported is True
+    assert airtable.executed_write_results == []
+    assert airtable.write_plan.live_write_allowed_for_specialist is False
+    assert workspace.human_work_context.integration_surfaces == [
+        "Airtable",
+        "WorkItems",
+        "Approvals",
+    ]
+    assert workspace.direct_write_supported is True
+    assert workspace.media_context_supported is True
+    assert workspace.executed_write_results == []
+    assert workspace.write_plan.live_write_allowed_for_specialist is False
+    assert zotero.zotero_write_supported is False
+    assert zotero.backend_importer_supported is True
+    assert zotero.direct_workspace_write_supported is True
+    assert zotero.executed_import_results == []
+    assert zotero.executed_workspace_write_results == []
+    assert zotero.recommended_artifact_plan.target_system == "google_workspace"
+    assert zotero.recommended_artifact_plan.live_write_allowed_for_specialist is False
+
+
+def test_gmail_triage_result_can_pass_human_work_context_to_chief() -> None:
+    result = EmailTriageResult(
+        category="consulting_opportunity",
+        confidence=0.92,
+        subject="Potential project",
+        sender_email="client@example.com",
+        summary="The sender asks about a possible consulting project.",
+        reasoning="The message describes a project inquiry and asks for next steps.",
+        needs_reply=True,
+        recommended_labels=["Keystone/Consulting Opportunity"],
+        recommended_action="Draft a Slack-thread-only reply for human review.",
+        approval_required=True,
+        draft_reply="Thanks for reaching out. I can review and follow up after approval.",
+        human_work_context=HumanWorkContext(
+            work_functions=["inbox triage", "reply review", "opportunity follow-up"],
+            human_owner_hint="Anup",
+            decision_needed="Decide whether to pursue the project.",
+            handoff_ready_context=["Sender, subject, reply need, and risk flags"],
+            missing_context=["approved external-use claims"],
+            integration_surfaces=["Gmail", "Slack", "Approvals", "Outreach tracking"],
+            follow_up_actions=["Route to Outreach Composer after approval"],
+        ),
+    )
+
+    assert result.human_work_context.work_functions == [
+        "inbox triage",
+        "reply review",
+        "opportunity follow-up",
+    ]
+    assert "Gmail" in result.human_work_context.integration_surfaces
+    assert result.approval_required is True
+
+
+def test_chief_of_staff_enables_specialists_for_airtable_and_workspace_context() -> None:
+    assert chief_of_staff_module.chief_of_staff_should_use_specialist_tools(
+        "chief of staff map this Airtable base schema before updating the record"
+    )
+    assert chief_of_staff_module.chief_of_staff_should_use_specialist_tools(
+        "chief of staff decide which Google Drive folder and Google Sheet tab should receive this"
+    )
+
+
+def test_chief_of_staff_ignores_negated_specialist_context_mentions() -> None:
+    request = (
+        "chief of staff diagnostic case diag_chief_of_staff. Use only this sanitized "
+        "inline context from a Gmail triage diagnostic. Do not access Gmail, Airtable, "
+        "Google Drive, Zotero, or live web. Example Health asked whether Keystone could "
+        "review its remote patient monitoring AI validation workflow before a July pilot. "
+        "Return a concise handoff. Do not draft outreach, send email, create a Gmail "
+        "draft, label messages, schedule, write files, create CRM records, publish, or "
+        "post elsewhere."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="gmail_triage",
+        task_objective="gmail_triage",
+        draft_policy="no_drafts_requested",
+    )
+
+    assert chief_of_staff_module.chief_of_staff_should_use_specialist_tools(request) is False
+    assert (
+        chief_of_staff_module.chief_of_staff_should_use_specialist_tools(request, plan)
+        is False
+    )
+
+
+def test_chief_of_staff_still_enables_positive_cross_agent_planning() -> None:
+    assert chief_of_staff_module.chief_of_staff_should_use_specialist_tools(
+        "chief of staff decide what we should do next across business research, "
+        "opportunity scout, and outreach for this Slack thread"
+    )
 
 
 def test_chief_of_staff_local_kni_document_request_skips_hosted_file_search(
@@ -198,10 +587,8 @@ def test_chief_of_staff_local_kni_document_fallback_returns_evidence_packet(
     monkeypatch.setattr(local_kni_evidence, "read_kni_document_file_impl", fake_read)
 
     result = plan_chief_of_staff_request(
-        (
             "Using local KNI documents, what date was Keystone Neuroinformatics LLC "
             "formed? Return the date, evidence path, and uncertainty if any."
-        )
     )
 
     assert result.recommended_route.workflow_type == "project-context-review"
@@ -727,6 +1114,8 @@ def test_run_script_live_sdk_runs_orchestrator_preflight_when_parent_absent(
     payload = _payload(capsys.readouterr().out)
     assert captured["preflight_kwargs"]["live_manual_plan"] is True
     assert captured["sdk_kwargs"]["manual_request_plan"] is plan
+    assert captured["sdk_kwargs"]["include_specialist_tools"] is False
+    assert captured["sdk_args"][0]["include_specialist_tools"] is False
     assert payload["manual_request_plan"]["source"] == "llm"
     assert payload["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
 
@@ -750,6 +1139,7 @@ def test_run_script_falls_back_when_live_sdk_misroutes_search_to_reference_captu
         task_objective="source_research",
         expected_artifact_type="research_brief",
     )
+    captured: dict[str, object] = {}
 
     class FakeModelConfig:
         def as_log_dict(self) -> dict[str, str]:
@@ -770,6 +1160,8 @@ def test_run_script_falls_back_when_live_sdk_misroutes_search_to_reference_captu
         )
 
     def fake_run_chief_of_staff_sdk(*args: object, **kwargs: object) -> TypedAgentRunResult:
+        captured["sdk_args"] = args
+        captured["sdk_kwargs"] = kwargs
         output = ChiefOfStaffResult(
             mode="llm",
             summary="Captured as a reference note for later research, not executed as a live brief.",
@@ -814,6 +1206,8 @@ def test_run_script_falls_back_when_live_sdk_misroutes_search_to_reference_captu
 
     payload = _payload(capsys.readouterr().out)
     output = payload["output"]
+    assert captured["sdk_kwargs"]["include_specialist_tools"] is True
+    assert captured["sdk_args"][0]["include_specialist_tools"] is True
     assert output["recommended_route"]["workflow_type"] != "reference-capture"
     assert "Captured as a reference note" not in output["summary"]
     assert any(
@@ -2527,6 +2921,24 @@ def test_internal_data_tools_dry_run_are_gated(monkeypatch: pytest.MonkeyPatch) 
     doc_read = google_doc_read_impl("https://docs.google.com/document/d/doc123/edit")
     assert doc_read["status"] == "dry-run"
     assert doc_read["document_id"] == "doc123"
+
+    drive_image_search = google_drive_search_files_impl(
+        "diagram",
+        folder_path="Research",
+        mime_type="image/",
+    )
+    assert drive_image_search["status"] == "dry-run"
+    assert drive_image_search["mime_type"] == "image/"
+    assert "does not download file bytes" in " ".join(drive_image_search["notes"])
+
+    drive_file_metadata = google_drive_get_file_metadata_impl(
+        "https://drive.google.com/file/d/file123/view",
+        folder_path="Research",
+    )
+    assert drive_file_metadata["status"] == "dry-run"
+    assert drive_file_metadata["file_id"] == "file123"
+    assert "imageMediaMetadata" in drive_file_metadata["metadata_fields"]
+    assert "does not download file bytes" in " ".join(drive_file_metadata["notes"])
 
     doc_write = google_doc_write_impl("Company Note", "Source-backed note.")
     assert doc_write["status"] == "dry-run"

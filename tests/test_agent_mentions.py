@@ -44,6 +44,22 @@ def test_parse_kni_chief_of_staff_alias() -> None:
     assert mention.input_text == "route calendar update to #meetings"
 
 
+def test_parse_kni_context_agent_aliases() -> None:
+    airtable = parse_agent_mention("@KNI airtable context agent inspect tracker schema")
+    workspace = parse_agent_mention("@KNI google workspace context plan eval artifact")
+    zotero = parse_agent_mention("@KNI zotero context agent map collection criteria")
+
+    assert airtable.route == "airtable_context_agent"
+    assert airtable.agent_name == "Airtable Context Agent"
+    assert airtable.input_text == "inspect tracker schema"
+    assert workspace.route == "google_workspace_context_agent"
+    assert workspace.agent_name == "Google Workspace Context Agent"
+    assert workspace.input_text == "plan eval artifact"
+    assert zotero.route == "zotero_context_agent"
+    assert zotero.agent_name == "Zotero Context Agent"
+    assert zotero.input_text == "map collection criteria"
+
+
 def test_parse_without_mention_defaults_to_orchestrator_context() -> None:
     mention = parse_agent_mention("research Curebase")
 

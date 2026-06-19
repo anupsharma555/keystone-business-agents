@@ -99,6 +99,15 @@ def add_sdk_session_arguments(parser: argparse.ArgumentParser) -> None:
         default="",
         help="Optional SQLite path for local SDK session history.",
     )
+    parser.add_argument(
+        "--sdk-session-history-limit",
+        type=int,
+        default=None,
+        help=(
+            "Maximum recent SDK session items to retrieve for a run. Defaults to the "
+            "central session policy."
+        ),
+    )
 
 
 def sdk_execution_requested(args: argparse.Namespace) -> bool:
@@ -151,6 +160,7 @@ def sdk_session_from_args(
         getattr(args, "sdk_session", None) is not None
         or bool(getattr(args, "sdk_session_id", ""))
         or bool(getattr(args, "sdk_session_db", ""))
+        or getattr(args, "sdk_session_history_limit", None) is not None
     )
     if explicit:
         spec = resolve_sdk_session_spec(
@@ -159,6 +169,7 @@ def sdk_session_from_args(
             enabled=getattr(args, "sdk_session", None),
             explicit_session_id=str(getattr(args, "sdk_session_id", "") or ""),
             database_path=str(getattr(args, "sdk_session_db", "") or ""),
+            history_limit=getattr(args, "sdk_session_history_limit", None),
             default_enabled=default_enabled,
         )
         apply_sdk_session_env(spec)
@@ -172,6 +183,7 @@ def sdk_session_from_args(
         enabled=None,
         explicit_session_id="",
         database_path="",
+        history_limit=getattr(args, "sdk_session_history_limit", None),
         default_enabled=default_enabled,
     )
     apply_sdk_session_env(spec)
@@ -191,6 +203,7 @@ def configure_sdk_session_from_args(
         getattr(args, "sdk_session", None) is None
         and not getattr(args, "sdk_session_id", "")
         and not getattr(args, "sdk_session_db", "")
+        and getattr(args, "sdk_session_history_limit", None) is None
     ):
         return
     spec = resolve_sdk_session_spec(
@@ -199,6 +212,7 @@ def configure_sdk_session_from_args(
         enabled=getattr(args, "sdk_session", None),
         explicit_session_id=str(getattr(args, "sdk_session_id", "") or ""),
         database_path=str(getattr(args, "sdk_session_db", "") or ""),
+        history_limit=getattr(args, "sdk_session_history_limit", None),
         default_enabled=default_enabled,
     )
     apply_sdk_session_env(spec)

@@ -11,6 +11,7 @@ from keystone_agents.operator_failures import known_exception_to_operator_failur
 from keystone_agents.slack_action_contract import slack_agent_feedback_event
 from keystone_agents.slack_actions import handle_run_agent_interaction
 from keystone_agents.storage.sqlite_store import database_url_from_env
+from keystone_agents.structured_logging import structured_log_event
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +48,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _stream_feedback_jsonl(event_type: str, payload: dict) -> None:
     event = slack_agent_feedback_event(event_type, payload)
+    event["structured_log"] = structured_log_event(
+        component="slack_agent_action",
+        event=event_type,
+        level=(
+            "error"
+            if str(payload.get("status") or "").lower() == "error" or "error" in event_type
+            else "info"
+        ),
+        payload=payload,
+    )
     print(json.dumps(event, ensure_ascii=True, sort_keys=True), file=sys.stderr, flush=True)
 
 

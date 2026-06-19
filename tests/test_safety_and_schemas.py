@@ -35,6 +35,37 @@ def test_guardrail_assessment_blocks_phi_advice_and_secrets() -> None:
     assert "secret-like content" in tool_assessment.reasons
 
 
+def test_tool_output_guardrail_allows_drive_metadata_clients_label_without_weakening_secrets() -> None:
+    drive_output = assess_tool_payload_guardrails(
+        "google_drive_list_folder",
+        {
+            "status": "success",
+            "items": [
+                {
+                    "name": "Clients",
+                    "type": "folder",
+                    "mime_type": "application/vnd.google-apps.folder",
+                }
+            ],
+            "send_enabled": False,
+        },
+        output=True,
+    )
+    secret_output = assess_tool_payload_guardrails(
+        "google_drive_list_folder",
+        {"api_key": "REDACTED_TEST_VALUE_123456"},
+        output=True,
+    )
+    text_assessment = assess_text_guardrails("Our clients and case studies prove results.")
+
+    assert drive_output.allowed
+    assert "unsupported_claim" not in drive_output.risk_flags
+    assert not secret_output.allowed
+    assert "secret" in secret_output.risk_flags
+    assert not text_assessment.allowed
+    assert "unsupported_claim" in text_assessment.risk_flags
+
+
 def test_input_guardrail_trips_on_patient_specific_content() -> None:
     result = keystone_input_guardrail.guardrail_function(
         None,
@@ -44,6 +75,17 @@ def test_input_guardrail_trips_on_patient_specific_content() -> None:
 
     assert result.tripwire_triggered
     assert "possible PHI or patient-specific content" in result.output_info["reasons"]
+
+
+def test_input_guardrail_trips_on_named_patient_story_outreach() -> None:
+    result = keystone_input_guardrail.guardrail_function(
+        None,
+        None,
+        "Draft outreach using this named patient story as proof.",
+    )
+
+    assert result.tripwire_triggered
+    assert "possible_phi" in result.output_info["risk_flags"]
 
 
 def test_input_guardrail_allows_source_context_for_outreach_agent() -> None:

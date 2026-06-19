@@ -10,10 +10,13 @@ from typing import Any
 from pydantic import BaseModel
 
 from keystone_agents.agent_tool_policy import ToolTier, tool_policy_for_agent, tool_tier_for_name
+from keystone_agents.schemas.handoff_types import build_handoff_type_contract
 from keystone_agents.schemas.orchestrator import HandoffSpec
 from keystone_agents.skill_sets import AGENT_SKILL_NAMES
+from keystone_agents.specialist_tool_names import specialist_agent_tool_name
 from keystone_agents.tool_availability import runtime_tool_availability_for_agent
 from keystone_agents.tools.internal_data_tools import GOOGLE_WORKSPACE_TOOL_NAMES
+from keystone_agents.tools.zotero_context_tools import ZOTERO_CONTEXT_TOOL_NAMES
 
 AIRTABLE_READ_TOOL_NAMES = ("airtable_get_base_schema", "airtable_read_records")
 AIRTABLE_WRITE_TOOL_NAMES = ("airtable_write_record",)
@@ -23,6 +26,20 @@ BROWSER_DIAGNOSTIC_TOOL_NAMES = (
     "capture_browser_diagnostics",
     "summarize_rendered_page_diagnostics",
 )
+
+DEFAULT_AGENT_INPUT_SCHEMAS: dict[str, str] = {
+    "gmail_triage": "keystone_agents.schemas.context_pack.GmailContextPack",
+    "business_research_analyst": "keystone_agents.schemas.context_pack.ResearchContextPack",
+    "opportunity_scout": "keystone_agents.schemas.context_pack.OpportunityContextPack",
+    "outreach_composer": "keystone_agents.schemas.context_pack.OutreachContextPack",
+    "airtable_context_agent": "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput",
+    "google_workspace_context_agent": (
+        "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput"
+    ),
+    "zotero_context_agent": "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput",
+    "orchestrator": "keystone_agents.schemas.manual_request_plan.ManualRequestPlan",
+    "chief_of_staff": "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput",
+}
 
 
 @dataclass(frozen=True)
@@ -38,6 +55,7 @@ class AgentSpec:
     builder: str
     output_schema: str
     prompt_files: tuple[str, ...]
+    input_schema: str = ""
     # Prompt files are instruction fragments only. `skills.md` is not a runtime
     # capability registry and must not imply hidden routing or dynamic tools.
     skills: tuple[str, ...] = ()
@@ -48,6 +66,7 @@ class AgentSpec:
     validation_paths: tuple[str, ...] = ()
     handoff_description: str = ""
     safety_notes: tuple[str, ...] = ()
+    handoff_enabled: bool = True
 
     @property
     def builder_name(self) -> str:
@@ -70,6 +89,15 @@ class AgentSpec:
             raise TypeError(f"{self.output_schema} is not a Pydantic BaseModel schema")
         return schema
 
+    @property
+    def input_contract_schema(self) -> str:
+        """Return the stable input contract schema name for this agent."""
+
+        return self.input_schema or DEFAULT_AGENT_INPUT_SCHEMAS.get(
+            self.route_name,
+            "keystone_agents.schemas.manual_request_plan.ManualRequestPlan",
+        )
+
     def build_agent(self, **kwargs: Any) -> Any:
         """Build the SDK agent for this spec."""
 
@@ -83,6 +111,22 @@ class AgentSpec:
             agent_name=self.agent_name,
             builder=self.builder_name,
             description=self.handoff_description,
+            input_contract_type=self.input_contract_schema.rsplit(".", maxsplit=1)[-1],
+            input_schema=self.input_contract_schema,
+            output_contract_type=self.output_schema.rsplit(".", maxsplit=1)[-1],
+            output_schema=self.output_schema,
+            type_contract=build_handoff_type_contract(
+                source_agent="orchestrator",
+                target_agent=self.route_name,
+                source_output_type="keystone_agents.schemas.orchestrator.OrchestratorResult",
+                target_input_type=self.input_contract_schema,
+                target_output_type=self.output_schema,
+                payload_mode="adapted",
+                parsed_output_status="parsed",
+                compatibility_notes=[
+                    "Orchestrator route metadata must be adapted into the target input contract before execution."
+                ],
+            ),
         )
 
     def to_card(self) -> dict[str, Any]:
@@ -103,6 +147,7 @@ class AgentSpec:
             "route_name": self.route_name,
             "agent_name": self.agent_name,
             "builder": self.builder,
+            "input_schema": self.input_contract_schema,
             "output_schema": self.output_schema,
             "prompt_files": list(self.prompt_files),
             "skills": list(self.skills),
@@ -112,6 +157,7 @@ class AgentSpec:
             "eval_datasets": list(self.eval_datasets),
             "validation_paths": list(self.validation_paths),
             "handoff_description": self.handoff_description,
+            "handoff_enabled": self.handoff_enabled,
             "safety_notes": list(self.safety_notes),
             "tool_policy": (
                 {
@@ -323,6 +369,140 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "Google Workspace writes require live flags and approval references",
         ),
     ),
+    AgentSpec(
+        route_name="airtable_context_agent",
+        agent_name="Airtable Context Agent",
+        builder="keystone_agents.agents.airtable_context:build_airtable_context_agent",
+        output_schema="keystone_agents.schemas.operational_context.AirtableContextResult",
+        prompt_files=(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "airtable_context.md",
+        ),
+        skills=AGENT_SKILL_NAMES["airtable_context_agent"],
+        tools=(
+            "airtable_get_base_schema",
+            "airtable_read_records",
+            "airtable_write_record",
+        ),
+        live_flags_required=("--live-sdk",),
+        eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
+        validation_paths=("tests/test_agent_registry.py", "tests/test_chief_of_staff.py"),
+        handoff_description=(
+            "Read Airtable base, table, field, and candidate record context, perform "
+            "direct approved create/update writes, or return nested Chief-owned "
+            "write-plan guidance."
+        ),
+        safety_notes=(
+            "Direct writes require live flags and approval references",
+            "No nested live writes",
+            "Chief of Staff owns writes when this agent is nested as a specialist tool",
+            "Return blockers when record identity or field mapping is ambiguous",
+        ),
+        handoff_enabled=True,
+    ),
+    AgentSpec(
+        route_name="google_workspace_context_agent",
+        agent_name="Google Workspace Context Agent",
+        builder=(
+            "keystone_agents.agents.google_workspace_context:"
+            "build_google_workspace_context_agent"
+        ),
+        output_schema=(
+            "keystone_agents.schemas.operational_context."
+            "GoogleWorkspaceContextResult"
+        ),
+        prompt_files=(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "google_workspace_context.md",
+        ),
+        skills=AGENT_SKILL_NAMES["google_workspace_context_agent"],
+        tools=(
+            "google_doc_read",
+            "google_doc_write",
+            "google_drive_list_folder",
+            "google_drive_search_files",
+            "google_drive_get_file_metadata",
+            "google_drive_create_folder",
+            "google_drive_rename_folder",
+            "google_drive_remove_folder",
+            "google_sheet_list",
+            "google_sheet_create",
+            "google_sheet_read_table",
+            "google_sheet_append_rows",
+            "google_sheet_update_row",
+            "google_sheet_delete_rows",
+            "google_sheet_create_tab",
+            "google_sheet_update_tab",
+            "google_sheet_remove_tab",
+            "google_sheet_trash",
+        ),
+        live_flags_required=("--live-sdk",),
+        eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
+        validation_paths=("tests/test_agent_registry.py", "tests/test_chief_of_staff.py"),
+        handoff_description=(
+            "Read scoped Google Drive, Docs, Sheets, and file/image metadata, perform "
+            "direct approved Workspace writes, or return nested Chief-owned "
+            "write-plan guidance."
+        ),
+        safety_notes=(
+            "Direct writes require live flags and approval references",
+            "No nested live writes",
+            "Chief of Staff owns writes when this agent is nested as a specialist tool",
+            "Drive image/media support is metadata-only until download/OCR tooling is added",
+            "Return blockers when folder, file, Doc, Sheet, or tab identity is ambiguous",
+        ),
+        handoff_enabled=True,
+    ),
+    AgentSpec(
+        route_name="zotero_context_agent",
+        agent_name="Zotero Context Agent",
+        builder="keystone_agents.agents.zotero_context:build_zotero_context_agent",
+        output_schema="keystone_agents.schemas.operational_context.ZoteroContextResult",
+        prompt_files=(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "local_context.md",
+            "zotero_context.md",
+        ),
+        skills=AGENT_SKILL_NAMES["zotero_context_agent"],
+        tools=(
+            "list_local_context_sources",
+            "search_local_context",
+            "read_local_context_file",
+            *ZOTERO_CONTEXT_TOOL_NAMES,
+            "google_drive_list_folder",
+            "google_drive_search_files",
+            "google_drive_get_file_metadata",
+            "google_doc_read",
+            "google_doc_write",
+            "google_drive_create_folder",
+            "google_sheet_list",
+            "google_sheet_create",
+            "google_sheet_read_table",
+            "google_sheet_append_rows",
+            "google_sheet_update_row",
+        ),
+        live_flags_required=("--live-sdk",),
+        eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
+        validation_paths=("tests/test_agent_registry.py", "tests/test_chief_of_staff.py"),
+        handoff_description=(
+            "Read local/API Zotero library, collection, item, article, importer, and "
+            "evidence context, perform direct approved Workspace artifact writes, "
+            "or return detailed Chief-owned artifact and follow-up guidance."
+        ),
+        safety_notes=(
+            "Direct backend importer writes require live flags and approval references",
+            "No Zotero library mutation except through the guarded backend importer",
+            "Chief of Staff owns writes when this agent is nested as a specialist tool",
+            "Return blockers when library, collection, article, or item identity is ambiguous",
+        ),
+        handoff_enabled=True,
+    ),
 )
 
 ORCHESTRATOR_AGENT_SPEC = AgentSpec(
@@ -431,7 +611,10 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         *BROWSER_DIAGNOSTIC_TOOL_NAMES,
         *GOOGLE_WORKSPACE_TOOL_NAMES,
     ),
-    optional_tools=("file_search",),
+    optional_tools=(
+        "file_search",
+        *(specialist_agent_tool_name(spec.route_name) for spec in SPECIALIST_AGENT_SPECS),
+    ),
     live_flags_required=("--live-sdk",),
     eval_datasets=(),
     validation_paths=("tests/test_chief_of_staff.py",),
@@ -476,7 +659,7 @@ def get_agent_spec(route_name: str) -> AgentSpec:
 def specialist_handoff_specs() -> tuple[HandoffSpec, ...]:
     """Return orchestrator handoff specs derived from registered specialists."""
 
-    return tuple(spec.to_handoff_spec() for spec in SPECIALIST_AGENT_SPECS)
+    return tuple(spec.to_handoff_spec() for spec in SPECIALIST_AGENT_SPECS if spec.handoff_enabled)
 
 
 def agent_cards() -> list[dict[str, Any]]:

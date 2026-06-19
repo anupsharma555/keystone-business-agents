@@ -276,7 +276,19 @@ before testing:
 Then start the local dashboard server so Slack case links open directly:
 
 ```bash
-npm run eval:promptfoo:dashboard:server
+npm run eval:promptfoo:dashboard:start
+```
+
+The dashboard manager lives at
+`<repo>/scripts/manage_eval_dashboard.sh`.
+If a launcher reports `Missing manager script:
+keystone-business-agents/scripts/manage_eval_dashboard.sh`, it is resolving that
+relative path from the wrong working directory. Run the command above from the
+repo root, call the absolute manager path directly, or set the Slack dashboard
+environment to:
+
+```bash
+KNI_BUSINESS_AGENTS_REPO=/path/to/keystone-business-agents
 ```
 
 Then use one root ask in `#evals` and keep every follow-up in that thread.
@@ -347,6 +359,76 @@ For a complete local cycle:
    cases. The local dashboard server defaults to
    `http://127.0.0.1:8769/dashboard`; case links use
    `?case=<case_id>` so a Slack thread can point directly to the reviewed case.
+
+### Manual No-API Slack Run Recording
+
+Use this path when a Slack eval run exists but you want to record it from copied
+metadata without making any Slack, OpenAI, or search API call from the dashboard
+or clipboard review flow. It is also the fallback when the Slack footer or
+automatic eval link was missing but the run can still be tied to a case.
+
+```bash
+.venv/bin/python scripts/promptfoo_eval_db.py record-slack-run \
+  --case-id slack_business_research_analyst_using_the_selected_slack_thread_as_001 \
+  --run-id wi_92104e59970c47259abaf60a3a0fc0df \
+  --work-item-id wi_92104e59970c47259abaf60a3a0fc0df \
+  --agent business_research_analyst \
+  --route business_research_analyst \
+  --status done \
+  --slack-thread-ts 1715366400.000100 \
+  --thread-fetch-status ok \
+  --thread-message-count 1 \
+  --warning visible_source_gap \
+  --source-count 2 \
+  --visible-source-count 1 \
+  --model-provider openai \
+  --model-name gpt-5.4-mini \
+  --run-mode manual_slack_no_api \
+  --search-provider searxng \
+  --search-provider-sequence searxng \
+  --request-text "@KNI business research analyst summarize selected thread" \
+  --result-summary "Copied from the saved Slack eval run." \
+  --evidence-json '{"orchestrator_preflight":{"blocker_count":0},"orchestrator_review":{"feedback_count":1},"web_extraction":{"status":"partial","issue_count":1},"tool_summary":{"tool_call_count":2,"failed_tool_call_count":0,"tool_names":["search_web"]},"approval":{"approval_required":false,"send_enabled":false},"retry_state":{"retry_count":0,"status":"not_retried"}}'
+```
+
+Keep trace metadata normalized and compact. Useful trace additions are timing,
+model/tool/retrieval metadata, approval gates, and normalized error/retry state.
+For run diagnosis, also include categorical signals when they apply:
+orchestrator preflight/review feedback, web extraction status and issue count,
+source visibility, tool failures, live-provider reachability, approval blocking,
+side-effect blocking, retry count, and response hash. Put verbose source text,
+raw Slack messages, raw prompts, full responses, stack traces, and private
+payloads in redacted logs or artifacts instead of trace metadata.
+
+After recording a manual run, verify the joins and dashboard analysis:
+
+```bash
+.venv/bin/python scripts/promptfoo_eval_db.py status --case-id <case_id>
+curl -fsS http://127.0.0.1:8769/api/follow-up-queue
+curl -fsS http://127.0.0.1:8769/api/trace-diagnostics
+```
+
+The `record-slack-run` JSON response should already include the case dashboard
+URL, review URL, case bundle URL, merged Slack/Promptfoo/human-review counts,
+current follow-up summary, refresh endpoints, a dashboard visibility check, and
+a `manual_run_summary_present` trace check. Treat a missing manual trace summary,
+blank `slack_run_created_at`, false `dashboard_visibility.case_visible`, false
+`dashboard_visibility.latest_run_visible`, or false
+`dashboard_visibility.trace_event_visible` as a local ingestion bug before
+scoring the run. A false `trace_diagnostic_category_visible` only means the run
+has no chartable warning category. The command accepts either the canonical
+`case_id` or the dashboard's visible display case id; seeded display ids are
+resolved back to the canonical case id before the Slack run is saved.
+The Traces menu summarizes diagnostic categories both as current totals and as
+daily category trends, so repeated issues such as extraction failures, missing
+retrieval metadata, retries, approval gates, or tool failures can be separated
+from one-off historical cleanup work.
+
+Then open `http://127.0.0.1:8769/dashboard?case=<case_id>`. The follow-up queue
+should show exactly what remains missing, usually human review, machine check,
+Slack run, Slack evidence, or analysis inclusion. The Traces menu should show
+the run under the categorical trace analysis chart so repeated failure modes can
+be grouped across runs rather than reviewed one event at a time.
 
 1. Capture real Slack asks only after redaction. Keep names, private text,
    customer context, PHI, credentials, and raw email bodies out of committed

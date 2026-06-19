@@ -15,7 +15,9 @@ from keystone_agents.sdk import build_sqlite_session
 SDK_SESSIONS_ENABLED_ENV = "KEYSTONE_SDK_SESSIONS"
 SDK_SESSION_ID_ENV = "KEYSTONE_SDK_SESSION_ID"
 SDK_SESSION_DB_ENV = "KEYSTONE_SDK_SESSION_DB"
+SDK_SESSION_HISTORY_LIMIT_ENV = "KEYSTONE_SDK_SESSION_HISTORY_LIMIT"
 DEFAULT_SESSION_DB_PATH = ".keystone/sdk_sessions.sqlite3"
+DEFAULT_SESSION_HISTORY_LIMIT = 24
 
 _FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
@@ -32,6 +34,7 @@ class SDKSessionSpec:
     database_path: str = ""
     scope: str = ""
     source: str = ""
+    history_limit: int = DEFAULT_SESSION_HISTORY_LIMIT
 
     def log_metadata(self) -> dict[str, Any]:
         """Return audit-safe metadata without raw source identifiers."""
@@ -42,6 +45,9 @@ class SDKSessionSpec:
             "source": self.source,
             "session_id_hash": _short_hash(self.session_id) if self.session_id else "",
             "database_path": self.database_path if self.enabled else "",
+            "session_history_mode": "recent_items",
+            "session_history_limit": self.history_limit if self.enabled else 0,
+            "session_truncation_configured": self.enabled and self.history_limit > 0,
         }
 
 
@@ -64,6 +70,15 @@ def default_session_database_path() -> str:
 
     configured = os.environ.get(SDK_SESSION_DB_ENV, "").strip()
     return configured or DEFAULT_SESSION_DB_PATH
+
+
+def default_session_history_limit() -> int:
+    """Return the bounded recent-item limit for SDK session retrieval."""
+
+    return _positive_int_env(
+        SDK_SESSION_HISTORY_LIMIT_ENV,
+        default=DEFAULT_SESSION_HISTORY_LIMIT,
+    )
 
 
 def derive_sdk_session_id(scope: str, components: tuple[str, ...] | list[str]) -> str:
@@ -90,6 +105,7 @@ def resolve_sdk_session_spec(
     enabled: bool | None = None,
     explicit_session_id: str = "",
     database_path: str = "",
+    history_limit: int | None = None,
     default_enabled: bool = False,
 ) -> SDKSessionSpec:
     """Resolve a local SDK session spec from CLI/env policy."""
@@ -111,6 +127,7 @@ def resolve_sdk_session_spec(
         database_path=database_path.strip() or default_session_database_path(),
         scope=_safe_scope(scope),
         source="explicit" if explicit_session_id else "derived",
+        history_limit=_resolve_history_limit(history_limit),
     )
 
 
@@ -123,6 +140,7 @@ def sdk_session_env(spec: SDKSessionSpec) -> dict[str, str]:
         SDK_SESSIONS_ENABLED_ENV: "true",
         SDK_SESSION_ID_ENV: spec.session_id,
         SDK_SESSION_DB_ENV: spec.database_path,
+        SDK_SESSION_HISTORY_LIMIT_ENV: str(spec.history_limit),
     }
 
 
@@ -138,7 +156,11 @@ def build_sdk_session(spec: SDKSessionSpec) -> Any | None:
 
     if not spec.enabled:
         return None
-    session = build_sqlite_session(spec.session_id, spec.database_path)
+    session = build_sqlite_session(
+        spec.session_id,
+        spec.database_path,
+        session_history_limit=spec.history_limit,
+    )
     return _annotate_session(session, spec.log_metadata())
 
 
@@ -149,7 +171,12 @@ def build_sdk_session_from_env() -> Any | None:
     if not session_id or not sdk_sessions_enabled(default=True):
         return None
     database_path = default_session_database_path()
-    session = build_sqlite_session(session_id, database_path)
+    history_limit = default_session_history_limit()
+    session = build_sqlite_session(
+        session_id,
+        database_path,
+        session_history_limit=history_limit,
+    )
     return _annotate_session(
         session,
         {
@@ -158,6 +185,9 @@ def build_sdk_session_from_env() -> Any | None:
             "source": "env",
             "session_id_hash": _short_hash(session_id),
             "database_path": database_path,
+            "session_history_mode": "recent_items",
+            "session_history_limit": history_limit,
+            "session_truncation_configured": history_limit > 0,
         },
     )
 
@@ -174,6 +204,13 @@ def session_audit_metadata(session: Any | None) -> dict[str, Any]:
         "scope": str(getattr(session, "_keystone_scope", "") or ""),
         "source": str(getattr(session, "_keystone_source", "") or ""),
         "session_id_hash": str(getattr(session, "_keystone_session_id_hash", "") or ""),
+        "session_history_mode": str(getattr(session, "_keystone_session_history_mode", "") or ""),
+        "session_history_limit": _int_or_zero(
+            getattr(session, "_keystone_session_history_limit", 0)
+        ),
+        "session_truncation_configured": bool(
+            getattr(session, "_keystone_session_truncation_configured", False)
+        ),
     }
 
 
@@ -228,6 +265,36 @@ def _annotate_session(session: Any, metadata: dict[str, Any]) -> Any:
         except Exception:
             continue
     return session
+
+
+def _resolve_history_limit(value: int | None) -> int:
+    if value is None:
+        return default_session_history_limit()
+    return _validate_history_limit(value)
+
+
+def _positive_int_env(key: str, *, default: int) -> int:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    return _validate_history_limit(raw)
+
+
+def _validate_history_limit(value: int | str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SDK session history limit must be a positive integer.") from exc
+    if parsed <= 0:
+        raise ValueError("SDK session history limit must be a positive integer.")
+    return parsed
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _short_hash(value: str) -> str:

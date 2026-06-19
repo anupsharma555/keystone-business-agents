@@ -39,6 +39,17 @@ def test_pipeline_exposes_valid_handoff_contracts() -> None:
     }
     assert all(contract.valid for contract in contracts.values())
     assert contracts["opportunity_scout_to_business_research_analyst"].source_ids_required
+    assert contracts["opportunity_scout_to_business_research_analyst"].source_output_type == (
+        "keystone_agents.schemas.opportunity.OpportunityRecord"
+    )
+    assert contracts["opportunity_scout_to_business_research_analyst"].target_input_type == (
+        "keystone_agents.schemas.context_pack.ResearchContextPack"
+    )
+    assert contracts["opportunity_scout_to_business_research_analyst"].payload_mode == "native"
+    assert (
+        contracts["opportunity_scout_to_business_research_analyst"].type_compatibility_status
+        == "compatible"
+    )
     assert contracts["business_research_analyst_to_outreach_composer"].missing_evidence_present
     assert contracts["outreach_composer_to_orchestrator"].source_ids_required
     assert set(contracts["outreach_composer_to_orchestrator"].source_ids_required) <= set(
@@ -148,3 +159,11 @@ def test_orchestrator_handoff_contract_accepts_explicit_sdk_handoff_metadata() -
     assert contract.valid is True
     assert metadata["valid"] is True
     assert metadata["contract_name"] == "orchestrator_to_approval_review"
+    assert metadata["type_compatibility_status"] == "compatible"
+    assert metadata["source_output_type"] == (
+        "keystone_agents.schemas.orchestrator.OrchestratorResult"
+    )
+    assert metadata["target_input_type"] == (
+        "keystone_agents.schemas.orchestrator.OrchestratorResult"
+    )
+    assert metadata["type_contract"]["payload_mode"] == "native"

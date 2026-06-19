@@ -60,6 +60,7 @@ from keystone_agents.schemas.outreach import (
     default_follow_up_date,
 )
 from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
+from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.tools.approval_tool import create_approval_queue_item
 from keystone_agents.tools.email_style_tool import (
@@ -1083,7 +1084,11 @@ def compose_outreach_draft_fixture(
     signal = signal_claim.claim_text if signal_claim else ""
 
     if signal:
-        opening = f"I noticed {company_name}'s work around {_sentence_fragment(signal)}."
+        signal_fragment = _sentence_fragment(signal)
+        if "exploring review support" in signal_fragment:
+            opening = f"I saw that {signal_fragment}."
+        else:
+            opening = f"I noticed {company_name}'s work around {signal_fragment}."
     else:
         opening = f"I came across {company_name} and wanted to reach out."
 
@@ -1597,6 +1602,7 @@ def run_outreach_composer_sdk(
     model: str | None = None,
     session: Any | None = None,
     context_flags: Mapping[str, bool] | None = None,
+    max_turns: int | None = None,
 ) -> TypedAgentRunResult[OutreachDraft]:
     """Run Outreach Composer through the typed SDK harness."""
 
@@ -1615,6 +1621,11 @@ def run_outreach_composer_sdk(
             "use the Outreach Composer CLI SDK synthesis path."
         )
 
+    turn_policy = resolve_sdk_turn_policy(
+        "outreach_composer",
+        request_text=skill_request_text(typed_input),
+        explicit_max_turns=max_turns,
+    )
     return run_typed_sdk_agent(
         agent=build_outreach_composer_agent(
             model=model,
@@ -1627,4 +1638,5 @@ def run_outreach_composer_sdk(
         run_config=run_config,
         live=live,
         session=session,
+        max_turns=turn_policy.max_turns,
     )

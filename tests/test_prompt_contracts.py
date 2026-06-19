@@ -204,7 +204,10 @@ def test_dynamic_skill_selector_includes_core_and_specialist_contracts() -> None
         assert set(CORE_SKILL_NAMES) <= set(selected)
         assert SPECIALIST_SKILL_NAMES[agent_name] in selected
         assert set(selected) <= set(AGENT_SKILL_NAMES[agent_name])
-        assert len(selected) < len(AGENT_SKILL_NAMES[agent_name])
+        if set(selected) == set(AGENT_SKILL_NAMES[agent_name]):
+            assert agent_name.endswith("_context_agent")
+        else:
+            assert len(selected) < len(AGENT_SKILL_NAMES[agent_name])
 
 
 def test_dynamic_skill_selector_adds_relevant_optional_contracts() -> None:
@@ -387,6 +390,24 @@ def test_shared_agent_operating_architecture_covers_schemas_tools_helpers() -> N
     assert "`CommunicationDraftContext`" in text
     assert "`OutboundConversationTracker`" in text
     assert "`DataQualityIssue`" in text
+
+
+def test_context_agent_prompts_require_live_read_tools_for_live_read_only_invocation() -> None:
+    airtable = _read_prompt("airtable_context.md")
+    workspace = _read_prompt("google_workspace_context.md")
+    zotero = _read_prompt("zotero_context.md")
+
+    assert "directly invoked in live SDK mode for a read-only lookup" in airtable
+    assert "airtable_get_base_schema" in airtable
+    assert "live=true" in airtable
+    assert "directly invoked in live SDK mode for a read-only lookup" in workspace
+    assert "tool's live-read equivalent" in workspace
+    assert "directly invoked in live SDK mode for a read-only lookup" in zotero
+    assert "one KNI collection" in zotero
+    assert "KNI foundational texts/reviews" in zotero
+    assert "KNI 00 - Foundational Texts & Reviews" in zotero
+    assert "zotero_resolve_collection_context" in zotero
+    assert "Do not import or mutate Zotero" in zotero
 
 
 def test_agents_guide_contains_tool_use_decision_rules() -> None:
@@ -640,7 +661,6 @@ def test_file_search_prompt_contract_separates_reference_local_and_live_sources(
     tools = _read_prompt("tools.md")
     research = _read_prompt("business_research_analyst.md")
     orchestrator = _read_prompt("orchestrator.md")
-    normalized_tools = " ".join(tools.split())
     normalized_research = " ".join(research.split())
     normalized_orchestrator = " ".join(orchestrator.split())
 

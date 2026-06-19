@@ -207,7 +207,7 @@ def automation_spec_for_command(command: str, *, stage: str = "") -> AutomationS
         return DEFAULT_AUTOMATION_SPECS[1].model_copy(update={"metadata": {"last_stage": stage}})
     if normalized == "chief-of-staff-weekly-meeting-prep":
         return DEFAULT_AUTOMATION_SPECS[3].model_copy(update={"metadata": {"last_stage": stage}})
-    if normalized == "announcements-weekly-research-synthesis":
+    if normalized in {"announcements-weekly-research-synthesis", "announcements-research"}:
         return DEFAULT_AUTOMATION_SPECS[4].model_copy(update={"metadata": {"last_stage": stage}})
     if normalized == "github-repo-opportunities-weekly":
         return DEFAULT_AUTOMATION_SPECS[5].model_copy(update={"metadata": {"last_stage": stage}})

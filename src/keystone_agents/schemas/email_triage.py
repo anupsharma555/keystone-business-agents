@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
+from keystone_agents.schemas.operational_context import HumanWorkContext
+
 EmailCategory = Literal[
     "consulting_opportunity",
     "collaboration_opportunity",
@@ -239,6 +241,7 @@ class EmailTriageResult(BaseModel):
     style_profile_id: str = ""
     approval_required: bool = False
     requires_human_review: bool = True
+    human_work_context: HumanWorkContext = Field(default_factory=HumanWorkContext)
 
     @field_validator(
         "subject",

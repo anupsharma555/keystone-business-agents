@@ -51,6 +51,40 @@ def test_sqlite_store_persists_work_item_events_and_artifacts(tmp_path: Path) ->
     assert store.list_work_item_artifacts(item.id)[0].artifact_id == "42"
 
 
+def test_sqlite_store_rejects_orphan_work_item_event(tmp_path: Path) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+
+    try:
+        store.save_work_item_event(
+            "missing-work-item",
+            WorkItemEvent(event_type="advance_started", summary="Should not persist."),
+        )
+    except ValueError as exc:
+        assert "missing WorkItem" in str(exc)
+        assert "missing-work-item" in str(exc)
+    else:
+        raise AssertionError("Expected missing WorkItem event save to fail.")
+
+
+def test_sqlite_store_rejects_orphan_work_item_artifact(tmp_path: Path) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+
+    try:
+        store.save_work_item_artifact(
+            "missing-work-item",
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="42",
+                title="Lindus Health",
+            ),
+        )
+    except ValueError as exc:
+        assert "missing WorkItem" in str(exc)
+        assert "missing-work-item" in str(exc)
+    else:
+        raise AssertionError("Expected missing WorkItem artifact save to fail.")
+
+
 def test_storage_tool_lists_work_items(tmp_path: Path) -> None:
     tool = StorageTool(_database_url(tmp_path))
     item = WorkItem(kind=WorkItemKind.OPPORTUNITY, title="Scout opportunities")

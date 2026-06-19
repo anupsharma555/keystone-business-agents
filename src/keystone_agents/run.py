@@ -146,9 +146,12 @@ def run_typed_sdk_agent(
         agent=agent,
         prompt=prompt,
         session=resolved_session,
+        max_turns=max_turns,
     )
     retry_count = 0
     max_rate_limit_retries = _sdk_rate_limit_max_retries(live=live, run_config=run_config)
+    started_at = time.time()
+    model_run_mode = "local_sdk" if run_config is not None else ("live_sdk" if live else "sdk")
     while True:
         reset_sdk_search_telemetry()
         set_sdk_search_request_context(prompt)
@@ -172,20 +175,78 @@ def run_typed_sdk_agent(
             search_telemetry = consume_sdk_search_telemetry()
             break
         except Exception as exc:
-            consume_sdk_search_telemetry()
+            search_telemetry = consume_sdk_search_telemetry()
             if retry_count >= max_rate_limit_retries or not _is_sdk_rate_limit_error(exc):
+                _record_sdk_run_summary_safely(
+                    agent_name=agent.name,
+                    model_provider=model_provider,
+                    model_name=model_name,
+                    model_run_mode=model_run_mode,
+                    live=live,
+                    request_cache=request_cache,
+                    usage={},
+                    cost={},
+                    budget_guard={},
+                    search_telemetry=search_telemetry,
+                    raw_result=None,
+                    trace_metadata=trace_metadata,
+                    status="error",
+                    failure_kind=_failure_kind(exc),
+                    retry_count=retry_count,
+                    duration_ms=round((time.time() - started_at) * 1000, 3),
+                )
                 raise
             retry_count += 1
             time.sleep(_sdk_rate_limit_retry_delay_seconds(exc, retry_count))
     output = _attach_retrieval_diagnostics(output, search_telemetry)
+    search_diagnostics = sdk_search_diagnostics_from_telemetry(search_telemetry)
     usage = _extract_sdk_usage(raw_result)
     cost = estimate_usage_cost(provider=model_provider, model=model_name, usage=usage)
-    budget_guard = enforce_agent_run_budget(
+    try:
+        budget_guard = enforce_agent_run_budget(
+            agent_name=agent.name,
+            provider=model_provider,
+            model=model_name,
+            cost=cost,
+            strict_unknown_cost=live and run_config is None,
+        )
+    except Exception as exc:
+        _record_sdk_run_summary_safely(
+            agent_name=agent.name,
+            model_provider=model_provider,
+            model_name=model_name,
+            model_run_mode=model_run_mode,
+            live=live,
+            request_cache=request_cache,
+            usage=usage,
+            cost=cost,
+            budget_guard={},
+            search_telemetry=search_telemetry,
+            raw_result=raw_result,
+            trace_metadata=trace_metadata,
+            status="error",
+            failure_kind=_failure_kind(exc),
+            retry_count=retry_count,
+            duration_ms=round((time.time() - started_at) * 1000, 3),
+        )
+        raise
+    _record_sdk_run_summary_safely(
         agent_name=agent.name,
-        provider=model_provider,
-        model=model_name,
+        model_provider=model_provider,
+        model_name=model_name,
+        model_run_mode=model_run_mode,
+        live=live,
+        request_cache=request_cache,
+        usage=usage,
         cost=cost,
-        strict_unknown_cost=live and run_config is None,
+        budget_guard=budget_guard,
+        search_telemetry=search_telemetry,
+        search_diagnostics=search_diagnostics,
+        raw_result=raw_result,
+        trace_metadata=trace_metadata,
+        status="ok",
+        retry_count=retry_count,
+        duration_ms=round((time.time() - started_at) * 1000, 3),
     )
     return TypedAgentRunResult(
         agent_name=agent.name,
@@ -428,6 +489,7 @@ def _sdk_request_cache_metadata(
     agent: AgentLike,
     prompt: str,
     session: Any | None,
+    max_turns: int | None,
 ) -> dict[str, Any]:
     """Return audit-safe fingerprints for cache-sensitive SDK request layout."""
 
@@ -450,6 +512,8 @@ def _sdk_request_cache_metadata(
         "output_schema_sha256": static_payload["output_schema_sha256"],
         "dynamic_prompt_sha256": _sha256(prompt),
         "dynamic_prompt_chars": len(prompt),
+        "max_turns": max_turns,
+        "max_turns_source": "caller" if max_turns is not None else "sdk_default",
         "session_attached": session is not None,
         **session_metadata,
         "note": (
@@ -459,18 +523,96 @@ def _sdk_request_cache_metadata(
     }
 
 
+def _record_sdk_run_summary_safely(
+    *,
+    agent_name: str,
+    model_provider: str,
+    model_name: str,
+    model_run_mode: str,
+    live: bool,
+    request_cache: dict[str, Any],
+    usage: dict[str, Any],
+    cost: dict[str, Any],
+    budget_guard: dict[str, Any],
+    search_telemetry: list[dict[str, Any]],
+    raw_result: Any,
+    trace_metadata: TraceMetadata | None,
+    status: str,
+    failure_kind: str = "",
+    retry_count: int = 0,
+    duration_ms: float | None = None,
+    search_diagnostics: dict[str, Any] | None = None,
+) -> None:
+    try:
+        from keystone_agents.trace_processor import record_sdk_run_summary_trace_event
+
+        diagnostics = search_diagnostics or sdk_search_diagnostics_from_telemetry(search_telemetry)
+        metadata = dict(trace_metadata or {})
+        record_sdk_run_summary_trace_event(
+            agent_name=agent_name,
+            route=str(metadata.get("route") or ""),
+            stage=str(metadata.get("stage") or "sdk_agent_run"),
+            live=live,
+            run_mode=model_run_mode,
+            model_provider=model_provider,
+            model_name=model_name,
+            request_cache=request_cache,
+            usage=usage,
+            cost=cost,
+            budget_guard=budget_guard,
+            search_diagnostics=diagnostics,
+            orchestrator_diagnostics=_orchestrator_diagnostics_from_trace_metadata(metadata),
+            raw_result=raw_result,
+            trace_metadata=metadata,
+            status=status,
+            failure_kind=failure_kind,
+            retry_count=retry_count,
+            duration_ms=duration_ms,
+        )
+    except Exception:
+        return None
+
+
+def _orchestrator_diagnostics_from_trace_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Extract chartable orchestrator diagnostics from already-sanitized trace metadata."""
+
+    return {
+        "has_preflight": bool(metadata.get("orchestrator_has_preflight")),
+        "has_review": bool(metadata.get("orchestrator_has_review")),
+        "selected_route": str(
+            metadata.get("orchestrator_selected_route") or metadata.get("route") or ""
+        ).strip(),
+        "route_confidence": metadata.get("orchestrator_route_confidence"),
+        "feedback_count": metadata.get("orchestrator_feedback_count"),
+        "blocker_count": metadata.get("orchestrator_blocker_count"),
+        "review_status": str(metadata.get("orchestrator_review_status") or "").strip(),
+    }
+
+
+def _failure_kind(exc: BaseException) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", type(exc).__name__.strip().lower()).strip("_")
+
+
 def _session_audit_metadata(session: Any | None) -> dict[str, Any]:
     if session is None:
         return {
             "session_scope": "",
             "session_source": "",
             "session_id_hash": "",
+            "session_history_mode": "",
+            "session_history_limit": 0,
+            "session_truncation_configured": False,
         }
     metadata = session_audit_metadata(session)
     return {
         "session_scope": str(metadata.get("scope") or ""),
         "session_source": str(metadata.get("source") or ""),
         "session_id_hash": str(metadata.get("session_id_hash") or ""),
+        "session_history_mode": str(metadata.get("session_history_mode") or ""),
+        "session_history_limit": int(metadata.get("session_history_limit") or 0),
+        "session_truncation_configured": bool(
+            metadata.get("session_truncation_configured")
+        ),
     }
 
 

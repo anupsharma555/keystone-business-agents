@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 import scripts.handle_slack_agent_action as slack_agent_action_cli
 from keystone_agents.cli import main as cli_main
+from keystone_agents.eval_dashboard_health import eval_dashboard_readiness
 from keystone_agents.slack_action_contract import (
     RUN_AGENT_MESSAGE_CALLBACK_ID,
     RUN_AGENT_TASK_ACTION_ID,
@@ -30,11 +31,13 @@ from keystone_agents.slack_action_contract import (
 from keystone_agents.slack_actions import handle_run_agent_interaction
 from promptfoo.eval_dashboard import (
     CORE_EVAL_AGENTS,
-    EVAL_CASE_TARGET_PER_AGENT,
+    EVAL_CASE_AGENT_TARGETS,
+    EVAL_CASE_DEFAULT_TARGET_PER_AGENT,
     render_dashboard,
 )
-from promptfoo.eval_database import eval_case_status
 from promptfoo.eval_dashboard_server import build_parser as build_dashboard_server_parser
+from promptfoo.eval_database import eval_case_status
+from promptfoo.eval_sanitizer import scan_promptfoo_case_files
 
 EXPECTED_EVAL_CHANNEL_ID = "C0BA17Y9C01"
 EXPECTED_EVAL_CHANNEL_NAME = "evals"
@@ -43,7 +46,6 @@ REQUIRED_SLACK_EVAL_SCOPES = {
     "app_mentions:read",
     "chat:write",
     "channels:history",
-    "groups:history",
 }
 
 
@@ -61,6 +63,7 @@ def main() -> int:
                     tmp_dir=tmp_dir,
                     eval_db=eval_db,
                     live_slack_probe=args.live_slack_probe,
+                    dashboard_server_will_start=args.dashboard_server_will_start,
                 )
             )
         finally:
@@ -116,6 +119,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run read-only Slack Web API checks for token and #evals history access.",
     )
+    parser.add_argument(
+        "--dashboard-server-will-start",
+        action="store_true",
+        help=(
+            "Allow the dashboard URL to be offline during this preflight because "
+            "the wrapper process will start it next."
+        ),
+    )
     return parser
 
 
@@ -124,9 +135,11 @@ def _run_checks(
     tmp_dir: Path,
     eval_db: Path,
     live_slack_probe: bool = False,
+    dashboard_server_will_start: bool = False,
 ) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     checks.append(_coverage_check())
+    checks.append(_promptfoo_case_sanitation_check())
     checks.append(_eval_channel_config_check())
     checks.append(_keystone_slack_bridge_contract_check())
     checks.append(_keystone_slack_runtime_env_check())
@@ -134,6 +147,11 @@ def _run_checks(
     if live_slack_probe:
         checks.append(_keystone_slack_live_read_probe())
     checks.append(_keystone_slack_socket_status_check())
+    checks.append(
+        _eval_dashboard_manager_check(
+            dashboard_server_will_start=dashboard_server_will_start,
+        )
+    )
     bridge = _slack_bridge_check(tmp_dir=tmp_dir, eval_db=eval_db)
     private_metadata = str(bridge.pop("private_metadata", "") or "")
     context_file_path = str(bridge.pop("context_file_path", "") or "")
@@ -165,16 +183,16 @@ def _run_checks(
 
 def _eval_channel_config_check() -> dict[str, Any]:
     configured = str(os.environ.get("KNI_BUSINESS_AGENTS_EVAL_CHANNEL") or "").strip()
-    if configured and configured != EXPECTED_EVAL_CHANNEL_ID:
+    if configured and configured not in _expected_eval_channel_values():
         return _check(
             "eval channel config",
             "fail",
             (
                 "KNI_BUSINESS_AGENTS_EVAL_CHANNEL is "
-                f"{configured}; expected {EXPECTED_EVAL_CHANNEL_ID} for #{EXPECTED_EVAL_CHANNEL_NAME}"
+                f"{configured}; expected {EXPECTED_EVAL_CHANNEL_ID} or #{EXPECTED_EVAL_CHANNEL_NAME}"
             ),
         )
-    if configured == EXPECTED_EVAL_CHANNEL_ID:
+    if configured:
         return _check(
             "eval channel config",
             "pass",
@@ -187,6 +205,27 @@ def _eval_channel_config_check() -> dict[str, Any]:
             "KNI_BUSINESS_AGENTS_EVAL_CHANNEL is not set in this shell; "
             f"keystone-slack defaults to {EXPECTED_EVAL_CHANNEL_ID}, export it if overriding"
         ),
+    )
+
+
+def _promptfoo_case_sanitation_check() -> dict[str, Any]:
+    result = scan_promptfoo_case_files(root=Path.cwd())
+    if result["status"] == "pass":
+        return _check(
+            "promptfoo case sanitation",
+            "pass",
+            f"{result['case_count']} committed cases passed sanitation scan",
+            sanitation=result,
+        )
+    samples = [
+        f"{issue.get('path')}:{issue.get('case_id')}:{issue.get('field')}:{issue.get('kind')}"
+        for issue in result["issues"][:5]
+    ]
+    return _check(
+        "promptfoo case sanitation",
+        "fail",
+        "unsafe Promptfoo case content found: " + "; ".join(samples),
+        sanitation=result,
     )
 
 
@@ -214,10 +253,10 @@ def _keystone_slack_bridge_contract_check() -> dict[str, Any]:
         )
     contents = {name: path.read_text(encoding="utf-8") for name, path in files.items()}
     required_snippets = {
-        ".env.example": [f"KNI_BUSINESS_AGENTS_EVAL_CHANNEL={EXPECTED_EVAL_CHANNEL_ID}"],
+        ".env.example": [("eval_channel", _expected_eval_channel_assignment_values())],
         "config": [
             "KNI_BUSINESS_AGENTS_EVAL_CHANNEL",
-            EXPECTED_EVAL_CHANNEL_ID,
+            ("eval_channel_default", _expected_eval_channel_values()),
         ],
         "business_agents_bridge": [
             "_hidden_eval_case_id_for_context",
@@ -236,10 +275,10 @@ def _keystone_slack_bridge_contract_check() -> dict[str, Any]:
         ],
     }
     missing = [
-        f"{name}:{snippet}"
+        f"{name}:{_snippet_label(snippet)}"
         for name, snippets in required_snippets.items()
         for snippet in snippets
-        if snippet not in contents[name]
+        if not _snippet_satisfied(contents[name], snippet)
     ]
     if missing:
         return _check(
@@ -297,16 +336,32 @@ def _keystone_slack_scope_declaration_check() -> dict[str, Any]:
     )
     declared = {item.strip() for item in raw.split(",") if item.strip()}
     if not env_path.is_file() and not declared:
+        manifest_scopes = _slack_manifest_bot_scopes(repo)
+        missing_from_manifest = sorted(REQUIRED_SLACK_EVAL_SCOPES - manifest_scopes)
+        if not missing_from_manifest:
+            return _check(
+                "keystone-slack scope declaration",
+                "pass",
+                "Slack app manifest declares eval flow bot scopes; runtime scope env is optional",
+            )
         return _check(
             "keystone-slack scope declaration",
             "warn",
-            "no local Slack .env found; verify app_mentions:read, chat:write, channels:history, and groups:history in Slack app settings",
+            "no local Slack .env found; verify app_mentions:read, chat:write, and channels:history in Slack app settings",
         )
     if not declared:
+        manifest_scopes = _slack_manifest_bot_scopes(repo)
+        missing_from_manifest = sorted(REQUIRED_SLACK_EVAL_SCOPES - manifest_scopes)
+        if not missing_from_manifest:
+            return _check(
+                "keystone-slack scope declaration",
+                "pass",
+                "Slack app manifest declares eval flow bot scopes; runtime scope env is optional",
+            )
         return _check(
             "keystone-slack scope declaration",
             "warn",
-            "SLACK_CONFIGURED_BOT_SCOPES is not declared; verify app_mentions:read, chat:write, channels:history, and groups:history in Slack app settings",
+            "SLACK_CONFIGURED_BOT_SCOPES is not declared; verify app_mentions:read, chat:write, and channels:history in Slack app settings",
         )
     missing = sorted(REQUIRED_SLACK_EVAL_SCOPES - declared)
     if missing:
@@ -320,6 +375,45 @@ def _keystone_slack_scope_declaration_check() -> dict[str, Any]:
         "pass",
         "declared Slack bot scopes cover app mentions, threaded replies, and history context",
     )
+
+
+def _expected_eval_channel_values() -> set[str]:
+    return {EXPECTED_EVAL_CHANNEL_ID, f"#{EXPECTED_EVAL_CHANNEL_NAME}", EXPECTED_EVAL_CHANNEL_NAME}
+
+
+def _expected_eval_channel_assignment_values() -> set[str]:
+    return {
+        f"KNI_BUSINESS_AGENTS_EVAL_CHANNEL={value}"
+        for value in _expected_eval_channel_values()
+    }
+
+
+def _snippet_satisfied(content: str, snippet: str | tuple[str, set[str]]) -> bool:
+    if isinstance(snippet, tuple):
+        _, alternatives = snippet
+        return any(value in content for value in alternatives)
+    return snippet in content
+
+
+def _snippet_label(snippet: str | tuple[str, set[str]]) -> str:
+    if isinstance(snippet, tuple):
+        label, alternatives = snippet
+        return f"{label} one of {sorted(alternatives)}"
+    return snippet
+
+
+def _slack_manifest_bot_scopes(repo: Path) -> set[str]:
+    manifest = repo / "slack" / "kni-app-manifest.yaml"
+    if not manifest.is_file():
+        return set()
+    scopes: set[str] = set()
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            value = stripped[2:].strip().strip("'\"")
+            if ":" in value:
+                scopes.add(value)
+    return scopes
 
 
 def _keystone_slack_live_read_probe() -> dict[str, Any]:
@@ -476,7 +570,10 @@ def _coverage_check() -> dict[str, Any]:
             stripped = line.strip()
             if stripped.startswith("agent_under_test:"):
                 counts[stripped.split(":", 1)[1].strip()] += 1
-    expected = {agent: EVAL_CASE_TARGET_PER_AGENT for agent in CORE_EVAL_AGENTS}
+    expected = {
+        agent: EVAL_CASE_AGENT_TARGETS.get(agent, EVAL_CASE_DEFAULT_TARGET_PER_AGENT)
+        for agent in CORE_EVAL_AGENTS
+    }
     mismatches = {
         agent: counts.get(agent, 0)
         for agent, target in expected.items()
@@ -491,7 +588,7 @@ def _coverage_check() -> dict[str, Any]:
     return _check(
         "prompt coverage",
         "pass",
-        f"{EVAL_CASE_TARGET_PER_AGENT} cases for each core agent",
+        "seed case counts match configured per-agent targets",
     )
 
 
@@ -546,6 +643,59 @@ def _dashboard_link_target_check(*, dashboard_url: str) -> dict[str, Any]:
     if not ok:
         detail = f"dashboard_url={dashboard_url!r}, expected http://{expected_netloc}/dashboard"
     return _check("dashboard link target", "pass" if ok else "fail", detail)
+
+
+def _eval_dashboard_manager_check(
+    *,
+    dashboard_server_will_start: bool = False,
+) -> dict[str, Any]:
+    readiness = eval_dashboard_readiness(
+        manager_path=os.environ.get("KEYSTONE_EVAL_DASHBOARD_MANAGER"),
+    )
+    issues = [str(item) for item in readiness.get("issues") or []]
+    if issues:
+        return _check(
+            "eval dashboard manager",
+            "fail",
+            "; ".join(issues),
+            readiness=readiness,
+        )
+    if not readiness.get("dashboard_reachable"):
+        if dashboard_server_will_start:
+            return _check(
+                "eval dashboard manager",
+                "pass",
+                (
+                    f"manager ready at {readiness['manager_path']}; "
+                    f"dashboard health endpoint is not reachable yet at "
+                    f"{readiness.get('health_url') or readiness['dashboard_url']} "
+                    "because this wrapper will start the dashboard server next"
+                ),
+                readiness=readiness,
+            )
+        return _check(
+            "eval dashboard manager",
+            "warn",
+            (
+                f"manager ready at {readiness['manager_path']}; "
+                f"dashboard health endpoint was not reachable from this process at "
+                f"{readiness.get('health_url') or readiness['dashboard_url']}; "
+                f"port_open={str(bool(readiness.get('port_open'))).lower()}; "
+                f"launchd_running={str(bool(readiness.get('launchd_running'))).lower()}; "
+                "run `./scripts/manage_eval_dashboard.sh restart` before treating Slack dashboard links as usable"
+            ),
+            readiness=readiness,
+        )
+    return _check(
+        "eval dashboard manager",
+        "pass",
+        (
+            f"manager ready at {readiness['manager_path']}; "
+            f"dashboard health endpoint reachable at {readiness.get('health_url') or readiness['dashboard_url']}; "
+            f"dashboard links target {readiness['dashboard_url']}"
+        ),
+        readiness=readiness,
+    )
 
 
 def _slack_bridge_cli_check(*, tmp_dir: Path, private_metadata: str) -> dict[str, Any]:
@@ -622,8 +772,8 @@ def _dashboard_workflow_readiness_check(*, tmp_dir: Path, eval_db: Path) -> dict
         "Agent thread reply": "One agent run per accepted Slack root prompt",
         "Promptfoo machine summary": "Use imported Promptfoo result by case_id; do not rerun Promptfoo from Slack thread",
         "Retrieval/source evidence": "Use dry-run fixtures/cache first; cap live retrieval to accepted root run",
-        "Human review form open": "No model call; form uses saved case, run id, thread, and response context",
-        "Human review save": "No model call; no Slack post",
+        "Slack review form open": "No model call; form uses saved case, run id, thread, and response context",
+        "Submit Evaluation": "No model call; no Slack post; writes one review row, then refreshes Database, Runs & Scoring, and Analysis from saved rows",
         "Analysis inclusion": "No rerun; recalculates from database rows",
     }
     if readiness.get("mode") != "local_preview":
@@ -781,7 +931,7 @@ def _score_save_cli_check(
         ]
     )
     status = eval_case_status(case_id, database_path=eval_db)
-    latest_review = status.get("latest_human_review")
+    latest_review = status.get("latest_target_human_review")
     ok = (
         payload.get("mode") == "eval_score_saved"
         and payload.get("case_id") == case_id
@@ -800,8 +950,8 @@ def _status_cli_check(*, case_id: str) -> dict[str, Any]:
     payload = _run_cli_json(["ask", "--json", "@KNI", "eval", "status", "case", case_id])
     eval_status = payload.get("eval_status") if isinstance(payload.get("eval_status"), dict) else {}
     latest_review = (
-        eval_status.get("latest_human_review")
-        if isinstance(eval_status.get("latest_human_review"), dict)
+        eval_status.get("latest_target_human_review")
+        if isinstance(eval_status.get("latest_target_human_review"), dict)
         else {}
     )
     ok = (
@@ -914,7 +1064,7 @@ def _app_mention_thread_flow_check(*, tmp_dir: Path, eval_db: Path) -> dict[str,
         and status_payload.get("mode") == "eval_status"
         and status_payload.get("case_id") == case_id
         and status.get("slack_run_count") == 1
-        and isinstance(status.get("latest_human_review"), dict)
+        and isinstance(status.get("latest_target_human_review"), dict)
     )
     detail = (
         "app-mention history context supports root ask, review link, "
@@ -1026,8 +1176,8 @@ def _write_history_context(
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
-def _check(name: str, status: str, detail: str) -> dict[str, Any]:
-    return {"name": name, "status": status, "detail": detail}
+def _check(name: str, status: str, detail: str, **extra: Any) -> dict[str, Any]:
+    return {"name": name, "status": status, "detail": detail, **extra}
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
@@ -1054,9 +1204,10 @@ def _tomorrow_operator_steps() -> dict[str, str]:
             "in the Slack bridge environment if it is overridden."
         ),
         "dashboard_server": (
-            "Run `export SLACK_CONFIGURED_BOT_SCOPES=app_mentions:read,chat:write,channels:history,groups:history` "
-            "then `npm run eval:slack:strict-live-test-server`; paste the printed committed eval prompt for the "
-            "shown agent into #evals and leave the server running before clicking Slack case links."
+            "Run `npm run eval:slack:strict-live-test-server`; ensure the Slack app has "
+            "app_mentions:read, chat:write, and channels:history for public #evals, then paste the "
+            "printed committed eval prompt for the shown agent into #evals and leave the server "
+            "running before clicking Slack case links."
         ),
         "slack_thread_flow": (
             "Keep the root ask, automatic eval footer, human review form save, and optional status request in one thread."

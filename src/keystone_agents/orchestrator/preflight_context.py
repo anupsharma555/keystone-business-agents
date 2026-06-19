@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.temporal_policy import temporal_depth_policy
 
 ORCHESTRATOR_PREFLIGHT_ENV = "KEYSTONE_ORCHESTRATOR_PREFLIGHT_JSON"
 MANUAL_REQUEST_PLAN_ENV = "KEYSTONE_MANUAL_REQUEST_PLAN_JSON"
@@ -168,6 +169,7 @@ def _preflight_memo_payload(preflight: Mapping[str, Any]) -> dict[str, Any]:
         "orchestrator_rationale": route_result.get("rationale"),
         "orchestrator_refused": route_result.get("refused"),
         "orchestrator_stop_reason": route_result.get("stop_reason"),
+        "temporal_depth_policy": temporal_depth_policy(str(preflight.get("request_text") or "")),
         "source_visibility_requirement": (
             "If the specialist answer includes source-backed external facts, current "
             "claims, dates, deadlines, rates, filings, policies, company facts, roles, "

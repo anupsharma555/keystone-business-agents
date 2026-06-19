@@ -1,0 +1,4 @@
+interface:
+  display_name: "KBA Agent Contract Change"
+  short_description: "Update Keystone agent contracts safely"
+  default_prompt: "Use $kba-agent-contract-change to make a safe Keystone agent, prompt, schema, tool, or registry change."

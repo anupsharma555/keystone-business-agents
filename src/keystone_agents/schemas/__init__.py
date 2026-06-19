@@ -5,6 +5,10 @@ from keystone_agents.schemas.airtable import (
     AirtableFieldSummary,
     AirtableTableSummary,
 )
+from keystone_agents.schemas.announcement_feed import (
+    AnnouncementFeedEvidence,
+    AnnouncementFeedItem,
+)
 from keystone_agents.schemas.approval import (
     ApprovalDecisionRecord,
     ApprovalRequest,
@@ -98,6 +102,14 @@ from keystone_agents.schemas.handoff import (
     validate_orchestrator_to_approval_review,
     validate_outreach_composer_to_orchestrator,
     validate_pipeline_handoff_contracts,
+)
+from keystone_agents.schemas.handoff_types import (
+    HANDOFF_TYPE_CONTRACT_VERSION,
+    HandoffCompatibilityStatus,
+    HandoffParsedOutputStatus,
+    HandoffPayloadMode,
+    HandoffTypeContract,
+    build_handoff_type_contract,
 )
 from keystone_agents.schemas.manual_request_plan import (
     ManualRequestIntent,
@@ -234,6 +246,8 @@ __all__ = [
     "ApprovalRequest",
     "ApprovalScope",
     "ApprovalState",
+    "AnnouncementFeedEvidence",
+    "AnnouncementFeedItem",
     "AutomationArtifactRef",
     "AutomationChannelBinding",
     "AutomationFinding",
@@ -285,6 +299,12 @@ __all__ = [
     "HandoffContractResult",
     "HandoffIssue",
     "HandoffIssueSeverity",
+    "HANDOFF_TYPE_CONTRACT_VERSION",
+    "HandoffCompatibilityStatus",
+    "HandoffParsedOutputStatus",
+    "HandoffPayloadMode",
+    "HandoffTypeContract",
+    "build_handoff_type_contract",
     "handoff_contracts_metadata",
     "raise_for_invalid_handoffs",
     "validate_business_research_analyst_to_outreach_composer",

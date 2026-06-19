@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -213,6 +214,21 @@ def test_manual_plan_routes_generic_opportunity_to_outreach_loop_to_workflow() -
     assert "behavioral health" in plan.constraints
 
 
+def test_manual_plan_blocks_opportunity_to_outreach_loop_when_draft_outreach_is_negated() -> None:
+    plan = infer_manual_request_plan(
+        "Find 2 lightweight opportunity directions for Keystone related to behavioral health AI "
+        "validation or safety review. Do not draft outreach, send, publish, schedule, write files, "
+        "create CRM records, or post elsewhere.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.intent == "opportunity_search"
+    assert plan.task_objective == "opportunity_discovery"
+    assert plan.side_effect_policy == "draft_or_read_only"
+    assert plan.expected_artifact_type == "opportunity_record"
+
+
 def test_manual_plan_preserves_safe_workflow_for_find_and_send_request() -> None:
     plan = infer_manual_request_plan(
         "Find and send outreach to the best three companies.",
@@ -415,6 +431,56 @@ def test_manual_plan_routes_unnamed_multi_company_business_research_to_scout() -
     )
     assert plan.desired_count == 3
     assert plan.requires_live_search is True
+
+
+def test_manual_plan_routes_source_backed_vendor_table_to_business_research() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "make a source-backed table comparing three behavioral-health workflow "
+            "vendors for Keystone relevance"
+        ),
+        requested_agent="orchestrator",
+    )
+
+    assert plan.requested_agent == "orchestrator"
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.task_objective == "source_research"
+    assert plan.expected_artifact_type == "source_summary"
+    assert "comparison-format" in plan.constraints
+
+
+def test_manual_plan_routes_source_provided_vendor_summary_table_to_business_research() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "make a table of buyer, evidence, risk, and next safe action from these "
+            "two vendor summaries: Vendor A sells behavioral-health workflow analytics. "
+            "Vendor B sells employer mental-health navigation."
+        ),
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.task_objective == "source_research"
+    assert plan.target_type == "company"
+
+
+def test_manual_plan_routes_eval_scorecard_followup_to_chief_of_staff() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "make a scorecard for this eval case using these details: prompt tested "
+            "source visibility, response cited one fixture source, human reviewer "
+            "noted missing primary URL and unclear caveats. Return scores, missing "
+            "evidence, and next fix; do not save the scorecard unless explicitly approved."
+        ),
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.intent == "slack_operations"
+    assert plan.task_objective == "slack_operations"
+    assert plan.expected_artifact_type == "slack_ops_summary"
 
 
 def test_manual_plan_cleans_quoted_direct_agent_discovery_prompt() -> None:
@@ -937,6 +1003,21 @@ def test_gmail_execution_plan_maps_recent_actionable_threads_to_priority_groupin
     assert "gmail_priority_grouping_sdk" in plan.candidate_helpers
 
 
+def test_gmail_execution_plan_keeps_inline_email_context_off_live_gmail() -> None:
+    plan = infer_gmail_execution_plan(
+        "Use only this inline, non-sensitive email context: Subject: Partnership follow-up "
+        "for remote patient monitoring validation. Return a human-useful Gmail triage "
+        "answer: priority, why it matters, whether a reply is needed, suggested next action, "
+        "and any caveats. Do not access Gmail live."
+    )
+
+    assert plan.operation == "single_message_triage"
+    assert plan.live_read_required is False
+    assert plan.source_label == "inline_context"
+    assert plan.gmail_query == ""
+    assert "inline_email_context_triage" in plan.candidate_helpers
+
+
 def test_outreach_execution_plan_keeps_drafts_gated_and_tracks_replies() -> None:
     plan = infer_outreach_execution_plan(
         "draft a concise follow-up email for a source-backed Keystone opportunity, and "
@@ -951,8 +1032,27 @@ def test_outreach_execution_plan_keeps_drafts_gated_and_tracks_replies() -> None
     assert plan.side_effect_policy == "draft_only_never_send"
 
 
-def test_cli_live_gmail_priority_grouping_uses_agent_execution_plan(monkeypatch, capsys) -> None:
+def test_outreach_execution_plan_accepts_approved_inline_context_labels() -> None:
+    plan = infer_outreach_execution_plan(
+        "outreach composer agent: diagnostic case diag_outreach flexible labels. "
+        "Prepare a draft-only email paragraph. Target contact: Alex Rivera at "
+        "Example Health. Approved evidence: Example Health asked whether Keystone "
+        "could review its remote patient monitoring AI validation workflow. "
+        "Do not send email or create a Gmail draft."
+    )
+
+    assert plan.approved_inline_context_available is True
+    assert plan.approved_context_required is True
+    assert plan.use_default_approved_fixture_for_backend_test is False
+
+
+def test_cli_live_gmail_priority_grouping_uses_agent_execution_plan(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
     captured: dict[str, list[str]] = {}
+    database_url = f"sqlite:///{tmp_path / 'gmail-priority.db'}"
 
     def fake_run(command, **kwargs):
         captured["command"] = list(command)
@@ -978,6 +1078,8 @@ def test_cli_live_gmail_priority_grouping_uses_agent_execution_plan(monkeypatch,
                 "--agent",
                 "gmail_triage",
                 "--live-sdk",
+                "--database-url",
+                database_url,
                 "--json",
                 (
                     "review recent Gmail threads from the last 7 days related to "

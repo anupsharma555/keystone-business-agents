@@ -4,6 +4,7 @@ from keystone_agents.response_synthesis import (
     _user_response_synthesis_input,
     format_user_response_synthesis,
     latest_user_request,
+    low_metadata_requested,
     response_synthesis_metadata_lines,
     response_synthesis_ordered_sources,
     response_synthesis_provider_results,
@@ -219,6 +220,36 @@ def test_format_user_response_synthesis_appends_compact_metadata_footer() -> Non
     assert "* Search query: `OpenAI mental health safety`" in text
     assert "* Search providers: searxng, agents-web-search, exa" in text
     assert text.index("*Detailed Summary:*") < text.index("Metadata")
+
+
+def test_format_user_response_synthesis_can_suppress_metadata_sections() -> None:
+    synthesis = UserFacingResponseSynthesis(
+        title="Recommended handoff",
+        answer="Route this to Chief of Staff first.",
+        synthesis="The next step is scope clarification before any outreach.",
+        terms=["PHI: Protected health information."],
+        recommended_actions=["Confirm requester and scope."],
+        caveats=["No source links are available in the payload."],
+    )
+
+    text = format_user_response_synthesis(
+        synthesis,
+        metadata_lines=["Source focus: no_source_context_sample"],
+        low_metadata=True,
+    )
+
+    assert "*Answer:*" in text
+    assert "*Detailed Summary:*" in text
+    assert "Recommended actions" in text
+    assert "Terms" not in text
+    assert "Run notes" not in text
+    assert "Metadata" not in text
+
+
+def test_low_metadata_requested_detects_operator_instruction() -> None:
+    assert low_metadata_requested("Keep the main answer concise and low-metadata.")
+    assert low_metadata_requested("Use minimal metadata in the Slack reply.")
+    assert not low_metadata_requested("Use compact source metadata for research.")
 
 
 def test_format_user_response_synthesis_keeps_metadata_last_after_source_url_repair() -> None:

@@ -7,6 +7,9 @@ applies_to:
   - business_research_analyst
   - opportunity_scout
   - outreach_composer
+  - airtable_context_agent
+  - google_workspace_context_agent
+  - zotero_context_agent
   - orchestrator
   - chief_of_staff
 eval_datasets:

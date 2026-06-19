@@ -11,6 +11,9 @@ ALL_AGENT_ROUTES = (
     "opportunity_scout",
     "gmail_triage",
     "outreach_composer",
+    "airtable_context_agent",
+    "google_workspace_context_agent",
+    "zotero_context_agent",
 )
 
 
@@ -82,7 +85,7 @@ CONTEXT_SOURCE_CATALOG: tuple[ContextSourceSpec, ...] = (
             "src/keystone_agents/tools/local_context_tool.py",
             "src/keystone_agents/zotero_research.py",
         ),
-        allowed_agents=("chief_of_staff", "business_research_analyst"),
+        allowed_agents=("chief_of_staff", "business_research_analyst", "zotero_context_agent"),
         contract="Read-only local docs and Zotero cache context with bounded paths.",
         approval_notes=(
             "Local context must remain read-only unless a separate artifact write is approved.",
@@ -129,8 +132,11 @@ CONTEXT_SOURCE_CATALOG: tuple[ContextSourceSpec, ...] = (
             "src/keystone_agents/tools/internal_data_tools.py",
             "src/keystone_agents/schemas/airtable.py",
         ),
-        allowed_agents=("chief_of_staff", "orchestrator"),
-        contract="Schema-first Airtable reads; writes require typed fields and approval references.",
+        allowed_agents=("chief_of_staff", "orchestrator", "airtable_context_agent"),
+        contract=(
+            "Schema-first Airtable reads; direct-agent writes require typed fields "
+            "and approval references."
+        ),
         live_flags=("KEYSTONE_AIRTABLE_API_KEY", "KEYSTONE_AIRTABLE_BASE_ID"),
         approval_notes=(
             "Airtable writes require explicit live flags and scoped approval references.",
@@ -156,8 +162,17 @@ CONTEXT_SOURCE_CATALOG: tuple[ContextSourceSpec, ...] = (
     ContextSourceSpec(
         source_id="google_workspace",
         owner_modules=("src/keystone_agents/tools/internal_data_tools.py",),
-        allowed_agents=("chief_of_staff", "orchestrator", "outreach_composer"),
-        contract="Scoped Google Drive/Docs/Sheets context and approved write tools.",
+        allowed_agents=(
+            "chief_of_staff",
+            "orchestrator",
+            "outreach_composer",
+            "google_workspace_context_agent",
+            "zotero_context_agent",
+        ),
+        contract=(
+            "Scoped Google Drive/Docs/Sheets context, Drive file/media metadata, "
+            "and approved write tools."
+        ),
         live_flags=("KEYSTONE_GOOGLE_WORKSPACE_LIVE", "GOOGLE_CLIENT_ID"),
         approval_notes=("Workspace writes require explicit live flags and approval references.",),
         source_attribution="Workspace-derived facts must name the artifact/context when visible externally.",
@@ -194,6 +209,26 @@ CONTEXT_SOURCE_CATALOG: tuple[ContextSourceSpec, ...] = (
         ),
         source_attribution="Retrieved file chunks must preserve document/source identifiers.",
         validation_paths=("tests/test_file_search.py", "tests/test_architecture.py"),
+    ),
+    ContextSourceSpec(
+        source_id="announcement_feed_history",
+        owner_modules=(
+            "src/keystone_agents/storage/sqlite_store.py",
+            "src/keystone_agents/multi_agent_automations.py",
+            "docs/corpus/resources/file_search_corpus_policy.md",
+        ),
+        allowed_agents=("chief_of_staff", "business_research_analyst", "orchestrator"),
+        contract=(
+            "Local canonical RSS/preprint announcement records with derived SQLite "
+            "retrieval index; hosted vector stores are not canonical state."
+        ),
+        live_flags=(),
+        approval_notes=(
+            "Hosted vector upload requires separate approval, public/sanitized chunks, "
+            "source provenance, sensitivity, and retention metadata.",
+        ),
+        source_attribution="Retrieved review history must cite feed item ids, source URLs, and dates.",
+        validation_paths=("tests/test_storage.py", "tests/test_multi_agent_automations.py"),
     ),
     ContextSourceSpec(
         source_id="sandbox_workspace_review",

@@ -43,6 +43,2187 @@ again.
 
 ## Open Findings
 
+### P1 - EVAL-RUNTIME-001: Slack eval run IDs are not reconstructable from canonical WorkItem state
+
+- Found: 2026-06-18 15:34 EDT
+- Fixed: 2026-06-18
+- Status: fixed
+- Area: Slack eval persistence, WorkItem storage, `promptfoo/eval_database.py`,
+  `src/keystone_agents/cli.py`, `src/keystone_agents/slack_actions.py`,
+  local live `#evals` diagnostics.
+- Issue: Recent saved Slack eval rows contain WorkItem-shaped run IDs, but the
+  local canonical WorkItem store in this checkout has no corresponding WorkItem
+  rows, events, agent run logs, or tool events. That leaves the eval dashboard
+  with a case/run shell but no durable state to inspect when a live Slack agent
+  call blocks or behaves unexpectedly.
+- Evidence: `.keystone/promptfoo/human-reviews.sqlite` has recent Slack eval
+  rows such as `wi_f086921d4d3d42bea4e28453102d677f`,
+  `wi_d5e9b55a0c20473ca7e05021f4143f20`, and
+  `wi_71ffc05cb839487787586550c0e4df98`. In the local Keystone stores,
+  `.keystone/keystone.sqlite3` currently reports `0` rows in `work_items`,
+  `work_item_events`, `agent_runs`, `agent_run_logs`, and `tool_events`; the
+  only `.local/keystone-agents.sqlite` file is empty. The Slack eval row can
+  show status, route, source counts, and a compact summary, but not the
+  full blocker, gate, context pack, or manager-loop timeline.
+- Impact: Recent execution issues cannot be root-caused from saved local state
+  after the fact. A reviewer can see that a Slack eval was `blocked` or had a
+  warning, but cannot reliably answer which deterministic gate blocked it,
+  whether a specialist tool was called, whether context adaptation dropped
+  fields, or whether a manager-loop transition happened correctly.
+- Expected fix: Make Slack eval row creation preserve a reconstructable
+  diagnostic link to canonical state. Either write the WorkItem and event
+  timeline into the same configured SQLite database used for eval review, store
+  the WorkItem database path/run snapshot in the eval evidence, or persist a
+  compact redacted WorkItem diagnostic bundle with blockers, gates, context
+  pack type, manager-loop steps, and tool-call summaries. Add a readiness check
+  that flags Slack eval rows whose `work_item_id` cannot be resolved to either
+  canonical WorkItem state or an approved redacted diagnostic snapshot.
+
+### P1 - EVAL-RUNTIME-002: Slack eval rows still lack run-mode, model, and search-provider provenance
+
+- Found: 2026-06-18 15:34 EDT
+- Fixed: pending
+- Status: open
+- Area: Slack eval provenance, `src/keystone_agents/cli.py`,
+  `src/keystone_agents/slack_actions.py`, `promptfoo/eval_database.py`,
+  eval dashboard filtering and live-run review.
+- Issue: The Slack eval schema now has normalized `run_mode`,
+  `model_provider`, `model_name`, `search_provider`, and provider-sequence
+  fields, but current saved Slack eval rows are still blank in those fields.
+  The evidence payloads also carry blank model/search provenance.
+- Evidence: A local query over `.keystone/promptfoo/human-reviews.sqlite`
+  showed all `126` rows in `slack_eval_runs` have empty `run_mode`,
+  `model_provider`, and `search_provider`. The latest row,
+  `slack_business_research_analyst_using_the_selected_slack_thread_as_001`
+  at `2026-06-18T17:31:40Z`, records status `done` and a WorkItem id, but
+  blank run/model/search fields. Recent trace diagnostics also report
+  `has_model_metadata=false` for Slack eval manual summaries.
+- Impact: Live Slack execution issues are hard to separate from dry-run or
+  fixture behavior. The dashboard cannot reliably answer whether a run used
+  live SDK, live search, which model/provider was selected, whether Gemini or
+  OpenAI fallback happened, or whether a search provider failure belongs to the
+  run being reviewed.
+- Expected fix: Populate Slack eval provenance from the resolved run request,
+  model config, live flags, retrieval diagnostics, and `WorkflowRunResult`
+  metadata instead of relying only on optional nested `model`/`retrieval`
+  payloads. Add dashboard/readiness checks that warn or fail for live/manual
+  Slack eval rows with blank run mode or provider provenance, and add focused
+  tests for CLI/app-mention and selected-message eval row creation.
+
+### P2 - EVAL-RUNTIME-003: Blocked Slack eval runs do not expose blocker diagnostics
+
+- Found: 2026-06-18 15:34 EDT
+- Fixed: pending
+- Status: open
+- Area: Chief of Staff Slack eval runs, eval evidence payloads, blocker
+  rendering, trace diagnostics.
+- Issue: Recent Chief-of-Staff Slack eval rows are saved with status
+  `blocked`, but the eval evidence does not expose a stable `block_kind`,
+  `block_reason`, blocker code, next safe action, or diagnostic category. The
+  row can therefore look like a clean no-warning run even though the user-facing
+  execution did not complete.
+- Evidence: Rows for
+  `slack_chief_of_staff_summarize_these_remaining_eval_gaps_using_001`
+  and `slack_chief_of_staff_make_a_decision_log_from_these_001` are saved as
+  `blocked` with `thread_fetch_status=ok`, `warning_count=0`, and compact
+  evidence showing only route, status, source counts, and summary hashes. The
+  visible `result_summary` is truncated before the actual blocker explanation.
+- Impact: A live reviewer cannot tell whether a blocked Chief call was an
+  expected safety gate, missing selected context, missing specialist-tool
+  readiness, approval boundary, source-sufficiency failure, or a runtime bug.
+  This weakens the follow-up queue because blocked runs are not grouped by
+  actionable failure mode.
+- Expected fix: Extend Slack eval evidence and manual trace summaries with
+  blocker diagnostics for blocked runs: `block_kind`, `block_reason`,
+  blocker codes, next safe action, readiness-gate names, and a compact
+  diagnostic category. Dashboard views should treat `status=blocked` with no
+  blocker metadata as an attention item even when `warning_count=0`.
+
+### P1 - STATE-PATH-001: Business-state database path split makes Slack eval joins path-dependent
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: 2026-06-18
+- Status: fixed
+- Area: `src/keystone_agents/config.py`,
+  `src/keystone_agents/storage/sqlite_store.py`, Slack eval persistence,
+  WorkItem storage, local runbooks and readiness checks.
+- Issue: Keystone business state is not using one obvious canonical local
+  SQLite path. The default state path still falls back to
+  `sqlite:///keystone_agents.db`, while recent diagnostics and eval review
+  paths also reference `.keystone/keystone.sqlite3`. This makes Slack eval to
+  WorkItem joins path-dependent.
+- Evidence: In this checkout, root `keystone_agents.db` is populated with
+  `1151` WorkItems, `8486` WorkItem events, and `1378` artifacts.
+  `.keystone/keystone.sqlite3` has zero WorkItems/events/log rows. The Slack
+  eval database has `83` rows with a non-empty `work_item_id`; checking the
+  wrong state DB makes all of them look unreconstructable.
+- Impact: Execution diagnostics can point at the wrong database and report a
+  missing WorkItem timeline even when state exists elsewhere. This wastes
+  review time and can hide the actual failure mode behind a path/config issue.
+- Expected fix: Canonicalize the local business-state DB path for Slack evals,
+  or persist the exact business-state DB path/state snapshot with each Slack
+  eval row. Add a readiness check that fails when eval rows reference WorkItems
+  that do not resolve in the configured canonical state DB.
+
+### P1 - WORKITEM-INTEGRITY-001: WorkItem child audit rows can orphan
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: pending
+- Status: open
+- Area: `src/keystone_agents/storage/sqlite_store.py`, WorkItem event/artifact
+  persistence and repair diagnostics.
+- Issue: WorkItem child tables can be written without a valid parent WorkItem.
+  `work_item_events` and `work_item_artifacts` do not currently enforce parent
+  integrity strongly enough for reliable execution audit.
+- Evidence: The populated root `keystone_agents.db` currently has `41` orphan
+  `work_item_events` across `16` missing WorkItem IDs. The orphan event types
+  include execution-relevant entries such as `advance_started`,
+  `skills_selected`, and `workflow_sdk_usage`.
+- Impact: A Slack or CLI run can leave audit evidence that cannot be joined to
+  the parent WorkItem. That undermines root-cause review, dashboard history,
+  repair workflows, and any future automation that treats WorkItem state as
+  canonical.
+- Expected fix: Save parent WorkItems and child events/artifacts in one
+  transaction where possible, verify parent existence before child inserts, and
+  add a read-only orphan-audit/repair command. Consider SQLite FK enforcement
+  where it can be introduced safely without breaking legacy rows.
+
+### P1 - SLACK-ACTION-001: Direct Slack steering actions can dedupe failed executions as handled
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: pending
+- Status: open
+- Area: direct Slack WorkItem actions, `src/keystone_agents/slack_interactions.py`,
+  action idempotency and retry handling.
+- Issue: Direct steering actions such as more-research, find-contact, and
+  run-again record the Slack action intent before the WorkItem advance finishes.
+  If the process throws or dies after recording the intent, a Slack retry can
+  hit the dedupe check and return duplicate/ignored even though the agent step
+  did not complete.
+- Evidence: The current tests cover successful dedupe behavior, but not failure
+  after intent recording and before WorkItem advancement. The implementation
+  writes action intent ahead of the execution boundary.
+- Impact: A transient execution failure can become unretryable from Slack,
+  leaving the operator with an apparent handled action and no completed agent
+  step. This is a high-risk reliability issue for long-running or live actions.
+- Expected fix: Make action idempotency two-phase: record `started`, then mark
+  `completed` only after the WorkItem step succeeds. Retries should resume,
+  report in-progress, or safely rerun when the prior attempt never reached a
+  terminal state. Add tests for failure between intent save and advancement.
+
+### P1 - SLACK-ACTION-002: Continue WorkItem Slack actions can drop live execution flags
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: pending
+- Status: open
+- Area: Chief-of-Staff continue action, `src/keystone_agents/slack_interactions.py`,
+  `WorkflowRunRequest` construction and live-mode consistency.
+- Issue: The direct `continue_work_item` path can run Orchestrator preflight
+  under live-mode environment settings, but the actual `WorkflowRunRequest`
+  does not consistently forward `live_search` and `live_sdk`. It can therefore
+  continue the WorkItem in fixture/dry-run mode while adjacent Slack action
+  paths use live flags.
+- Evidence: Existing tests assert that preflight metadata is attached, but do
+  not verify that the forwarded `WorkflowRunRequest` preserves live execution
+  flags for the specialist step.
+- Impact: A Slack continuation can look like it ran the same execution mode as
+  the initial live request while silently changing retrieval/model behavior.
+  That creates inconsistent outputs and misleading eval/runtime diagnostics.
+- Expected fix: Pass the resolved live-search/live-SDK settings through every
+  Slack continuation/direct-action path and persist those flags in WorkItem
+  events. Add regression coverage that `continue_work_item` preserves live
+  flags and remains no-send/no-write.
+
+### P1 - EVAL-RUNTIME-004: Provider invocation mode is not authoritative in eval output
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: 2026-06-18
+- Status: fixed
+- Area: `promptfoo/providers/keystone_agent_provider.py`,
+  `promptfoo/assertions/kba_slack_invariants.py`, live eval compaction and
+  safety assertions.
+- Issue: Promptfoo provider invocation can pass `--live-sdk` or live-search
+  options, but the compact top-level eval output derives `live_sdk` and
+  `live_search` from returned manager metadata. If the agent output omits or
+  misreports that metadata, a live invocation can be reported as dry-run or
+  no-live.
+- Evidence: Current assertion logic inspects the compacted output flags. The
+  provider has access to the invocation config, but that invocation mode is not
+  treated as the authoritative source or checked against returned metadata.
+- Impact: A paid/live run can look safer and cheaper than it was, weakening
+  no-live eval guarantees and making cost/rate-limit diagnosis unreliable.
+- Expected fix: Record provider invocation mode separately from agent-reported
+  mode, compare the two, and fail diagnostics on mismatch. Assertions should
+  use invocation mode for safety/cost classification and use returned metadata
+  as corroborating evidence.
+- Fix: Provider compaction now records authoritative invocation metadata and
+  Slack invariants fail mismatches while classifying live/dry-run safety from
+  provider invocation flags.
+- Validation: Focused pytest:
+  `tests/test_promptfoo_framework.py::test_promptfoo_assertion_uses_provider_invocation_mode`.
+
+### P1 - EVAL-RUNTIME-005: Missing side-effect evidence is treated as explicit no-write evidence
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: 2026-06-18
+- Status: fixed
+- Area: Promptfoo provider compaction, Slack invariant assertions, side-effect
+  boundary instrumentation.
+- Issue: When an agent response lacks a `side_effects` payload, provider
+  compaction can still emit write/send flags as false and mark the evidence as
+  complete. That conflates "agent explicitly reported no side effects" with
+  "instrumentation was missing."
+- Evidence: Subagent review found the provider fills no-write booleans from an
+  absent side-effect object, and the invariant assertions accept the resulting
+  false flags.
+- Impact: No-send/no-write checks can pass without proof that the agent
+  actually reported or preserved its side-effect boundary. That is a critical
+  gap for Slack live execution, Gmail draft boundaries, and future API-backed
+  evals.
+- Expected fix: Add a tri-state side-effect evidence contract:
+  `explicit_none`, `present_with_actions`, or `missing`. Treat missing
+  side-effect instrumentation as an eval warning/failure for live or outbound
+  capable routes, even when no write was observed.
+- Fix: Provider side-effect compaction now emits tri-state evidence and
+  invariant assertions reject missing or incomplete side-effect instrumentation.
+- Validation: Focused pytest:
+  `tests/test_promptfoo_framework.py::test_promptfoo_assertion_rejects_missing_side_effect_instrumentation`.
+
+### P1 - WORKITEM-TELEMETRY-001: WorkItem events drop retry, fallback, retrieval, and cost details
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: 2026-06-18
+- Status: fixed
+- Area: `src/keystone_agents/run.py`, `src/keystone_agents/workflow_runner.py`,
+  `src/keystone_agents/costing.py`, WorkItem SDK/retrieval usage events.
+- Issue: Detailed execution telemetry exists in lower-level SDK/search/cost
+  paths, but WorkItem events only persist a reduced view. Successful rate-limit
+  retries, model-provider fallback, retrieval provider errors/fallback flags,
+  and cost component breakdowns can be lost at the WorkItem boundary.
+- Evidence: `run_typed_sdk_agent()` can track retry counts and SDK run
+  summaries; retrieval telemetry can include attempted/used providers and
+  provider errors; cost estimation includes nested component and token
+  breakdowns. WorkItem `workflow_sdk_usage` and `workflow_retrieval_usage`
+  preserve only selected summaries, so recovered 429s, provider fallback, and
+  cache/cost component shifts are not reliably queryable from WorkItem state.
+- Impact: A run can appear clean even if it recovered after provider throttling,
+  changed model providers, fell back between search lanes, or incurred unusual
+  output/cached-token cost. This directly hurts robust live-agent debugging.
+- Expected fix: Persist compact telemetry blocks on WorkItem events:
+  `retry_state`, `model_attempts`, `fallback_used`, attempted/used search
+  providers, provider errors, retrieval fallback flags, and nested cost/token
+  components. Keep raw prompts/responses out of telemetry.
+- Fix: WorkItem SDK and retrieval events now retain compact retry, fallback,
+  model-attempt, provider-attempt/error, session, token, and cost-component
+  metadata without raw prompts/responses.
+- Validation: Focused pytest:
+  `tests/test_workflow_runner.py::test_work_item_records_orchestrator_preflight_sdk_usage`
+  and
+  `tests/test_workflow_runner.py::test_live_sdk_opportunity_work_item_uses_named_agent_search_plan`.
+
+### P1 - TRACE-OBS-002: Search provider failures are misclassified in trace diagnostics
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: 2026-06-18
+- Status: fixed
+- Area: `src/keystone_agents/retrieval_policy.py`,
+  `src/keystone_agents/trace_processor.py`, eval trace diagnostics.
+- Issue: Hybrid search provider failures can be recorded with
+  `{provider, error_type, message}`, but trace diagnostic classification can
+  prioritize provider names over `error_type`. Real failure classes such as
+  timeout or provider adapter errors can trend as generic provider labels.
+- Evidence: Retrieval tests and telemetry use `search_provider_errors` with
+  explicit `error_type` values. Trace issue classification currently risks
+  grouping those by provider instead of failure kind.
+- Impact: Repeated execution failures can look like "SearXNG issue" or
+  "Agents web-search issue" rather than "timeout", "credential/config", or
+  "adapter error", causing the team to fix the wrong layer.
+- Expected fix: Update trace issue extraction to prefer `error_type` or a
+  normalized failure category before provider name, and add tests using the
+  actual hybrid-search telemetry shape.
+
+### P2 - EVAL-RUNTIME-006: Analysis exclusions hide diagnostic evidence
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: 2026-06-18
+- Status: fixed
+- Area: `promptfoo/eval_dashboard.py`, eval exclusions, readiness and run
+  ledger diagnostics.
+- Issue: Excluding a case from analysis can also remove its Slack, trace, and
+  review evidence from key readiness/diagnostic views instead of only excluding
+  it from score aggregates.
+- Evidence: The dashboard payload filters excluded cases before several
+  data-quality/workflow readiness views. This means a bad or failed live run
+  can disappear from operational diagnostics once excluded.
+- Impact: Exclusion can become a visual cleanup tool that hides the failure
+  evidence needed to improve runtime robustness.
+- Expected fix: Keep excluded cases visible in run ledger, trace diagnostics,
+  Slack evidence, and human-review diagnostics with an
+  `excluded_from_scoring` badge. Exclude only from scoring/trend aggregates.
+- Fix: Dashboard diagnostics and run ledger now keep excluded cases visible
+  with exclusion metadata while scoring/trend summaries use analysis-included
+  cases only.
+- Validation: Focused pytest:
+  `tests/test_promptfoo_framework.py::test_eval_dashboard_analysis_exclusion_updates_database_and_analysis`.
+
+### P2 - EVAL-RUNTIME-007: Slack source visibility treats missing source metadata as complete
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: 2026-06-18
+- Status: fixed
+- Area: `promptfoo/eval_dashboard.py`, source/retrieval-tagged eval evidence
+  checks.
+- Issue: Source visibility checks can treat `source_count=0` and
+  `visible_source_count=0` as complete when no explicit source-not-applicable
+  reason is present.
+- Evidence: Current dashboard/checklist logic can mark zero source metadata as
+  complete for Slack evidence, and summary evidence readiness accepts
+  nonnegative source counts.
+- Impact: Retrieval/source instrumentation can be missing while the dashboard
+  still presents the run as evidence-complete. That weakens source-backed
+  research and opportunity evals.
+- Expected fix: For source/retrieval-tagged cases, require `source_count > 0`
+  and `visible_source_count > 0`, or require an explicit
+  `source_not_applicable` reason. Treat `0/0` as attention by default.
+- Fix: Source/retrieval-tagged Slack cases now require visible source metadata
+  or an explicit source-not-applicable reason in case checklists and data
+  quality diagnostics.
+- Validation: Focused pytest:
+  `tests/test_promptfoo_framework.py::test_source_tagged_dashboard_case_treats_zero_source_metadata_as_attention`.
+
+### P2 - SDK-SESSION-JOIN-001: SDK session continuity is not joinable from eval rows
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: 2026-06-18
+- Status: fixed
+- Area: `.keystone/sdk_sessions.sqlite3`, Slack eval evidence, manual run
+  summaries, SDK session diagnostics.
+- Issue: SDK session continuity state exists locally, but Slack eval rows and
+  manual run summaries do not carry an audit-safe session join key.
+- Evidence: `.keystone/sdk_sessions.sqlite3` contains `agent_sessions` and
+  `agent_messages`, but current Slack eval `evidence_json` and manual
+  `eval_trace_events` summaries do not include `session_id_hash`, session
+  scope, or session source metadata.
+- Impact: A live reviewer cannot tell whether a run reused expected session
+  context, started a fresh session, or accidentally crossed WorkItem/Slack
+  thread boundaries. This is especially risky while SDK sessions remain
+  optional continuity rather than canonical business state.
+- Expected fix: Persist audit-safe session metadata in Slack eval evidence and
+  manual run summaries: session scope, source, hash, history limit, and related
+  WorkItem ID. Never store raw session IDs or message bodies.
+- Fix: Manual Slack eval summaries now carry audit-safe SDK session join
+  metadata from evidence, including scope, source, session hash, history limit,
+  and related WorkItem ID.
+- Validation: Focused pytest:
+  `tests/test_promptfoo_framework.py::test_slack_eval_run_records_joined_manual_run_summary_without_api`.
+
+### P2 - SLACK-EVAL-DEDUP-001: Identical Slack eval attempts inflate run history
+
+- Found: 2026-06-18 15:44 EDT
+- Fixed: 2026-06-18
+- Status: fixed
+- Area: `promptfoo/eval_database.py`, Slack eval dashboard/readiness, retry
+  accounting.
+- Issue: Slack eval rows are upserted by case plus run/WorkItem ID. Because
+  each Slack retry or rerun can produce a new WorkItem ID, identical attempts
+  can inflate run history even when request, response, and status are unchanged.
+- Evidence: The Business Research selected-thread case has many repeated Slack
+  rows. The storage explorer found dozens of rows sharing the same nonblank
+  request hash, response hash, and `status=done`, plus older rows before hashes
+  were populated.
+- Impact: Retry-heavy cases can look like repeated regressions or successful
+  coverage growth when they are duplicate attempts. This distorts readiness,
+  follow-up queues, and review prioritization.
+- Expected fix: Add an `attempt_group_id` or duplicate marker derived from
+  case/thread/request hash/response hash/status. Preserve all attempts for
+  audit, but make dashboards and readiness distinguish duplicates from new
+  failures.
+- Fix: Slack eval rows now preserve every attempt while adding
+  `attempt_group_id`, `duplicate_attempt`, and `duplicate_of_run_id` for retry
+  grouping.
+- Validation: Focused pytest:
+  `tests/test_promptfoo_framework.py::test_slack_eval_duplicate_attempts_keep_audit_rows_with_group_marker`.
+
+### P1 - ASK-SHAPE-001: Agent input contracts do not yet preserve diverse ask shape
+
+- Found: 2026-06-18 14:08 EDT
+- Fixed: pending
+- Status: open
+- Area: `src/keystone_agents/schemas/manual_request_plan.py`,
+  `src/keystone_agents/models.py`,
+  `src/keystone_agents/schemas/context_pack.py`, manual CLI, Slack,
+  WorkItem, and direct SDK specialist inputs.
+- Issue: The repo now declares typed input and output contracts for handoffs,
+  but the input models still preserve only part of the operator's ask shape.
+  `ManualRequestPlan` captures route, objective, target, count, constraints,
+  Gmail/outreach fields, and live/search policy. Specialist SDK inputs then
+  narrow that into route-specific fields such as company, topic, message,
+  source context, or outreach goal. Cross-cutting dimensions such as evidence
+  depth, source preference, strict-filter mode, requested output form, prior
+  context dependency, permission state, cost mode, and stop condition remain
+  implicit or unevenly represented.
+- Evidence: `docs/REPO_REVIEW.md` and `docs/AGENTS_SDK_REVIEW.md` both call
+  out ask-shape preservation as the next durable improvement. The current
+  `ManualRequestPlan` has no first-class fields for `evidence_depth`,
+  `source_type_preference`, `strict_filter_mode`, `output_form`,
+  `prior_context_dependency`, `permission_state`, `cost_mode`, or
+  `stop_condition`. Context packs carry type metadata and route-specific state,
+  but not a shared ask-policy object that every specialist can consume.
+- Impact: Diverse requests can still be routed to the correct specialist while
+  losing the user's precision requirement. Examples include "exactly active
+  official sources only", "quick read, do not deepen", "compare in a table",
+  "use only the selected Gmail thread", "stop if no exact match", or "research
+  first, draft only after approval." Correct input/output type names alone do
+  not prevent broadening, over-retrieval, wrong output shape, or premature
+  workflow continuation.
+- Expected fix: Add a compact shared ask-shape contract and propagate it
+  through `ManualRequestPlan`, Orchestrator result metadata, WorkItem context
+  packs, specialist SDK inputs, and final synthesis inputs. Keep it orthogonal
+  to route enums; prefer fields such as `ask_breadth`, `evidence_depth`,
+  `source_type_preference`, `strict_filter_mode`, `output_form`,
+  `prior_context_dependency`, `permission_state`, `cost_mode`, and
+  `stop_condition`. Add focused tests for exact-match/no-broaden,
+  quick-triage, table-format, selected-thread, and staged-workflow asks.
+
+### P1 - ASK-SHAPE-002: Specialist outputs do not consistently report request coverage or stop-condition status
+
+- Found: 2026-06-18 14:08 EDT
+- Fixed: pending
+- Status: open
+- Area: `src/keystone_agents/schemas/email_triage.py`,
+  `src/keystone_agents/schemas/research.py`,
+  `src/keystone_agents/schemas/opportunity.py`,
+  `src/keystone_agents/schemas/outreach.py`,
+  `src/keystone_agents/schemas/company_profile.py`, final synthesis and eval
+  review.
+- Issue: Specialist output schemas are structured and generally source-aware,
+  but they do not share a small output-audit envelope that says how the
+  interpreted ask was satisfied. Existing schemas expose fields such as summary,
+  confidence, unknowns, limitations, source quality, recommended actions, or
+  requested variants, but a reviewer cannot consistently tell whether the agent
+  honored the requested output form, stopped at the requested boundary, avoided
+  broadening, or left a specific ask dimension incomplete.
+- Evidence: Research, opportunity, Gmail, company-profile, and outreach outputs
+  have route-specific status and limitation fields. Only some paths preserve
+  requested output format, and there is no shared `interpreted_request`,
+  `request_coverage`, `stop_condition_status`, `output_form_status`, or
+  `unmet_ask_dimensions` contract across agents.
+- Impact: Agents may produce schema-valid results that look complete while
+  missing the actual request shape. This is especially risky for exact-match
+  search, source-required research, compact decision reads, selected-context
+  Gmail asks, outreach revision requests, and multi-step workflows where a safe
+  blocker is the correct answer.
+- Expected fix: Add a shared lightweight output coverage object or consistent
+  fields to each major specialist output: interpreted request, satisfied
+  ask-shape dimensions, unmet dimensions, output form status, stop-condition
+  status, and next safe action. Wire final renderers and evals to prefer a
+  precise blocker or partial answer over a broadened substitute when coverage
+  is incomplete.
+
+### P2 - ADAPTER-ROBUSTNESS-001: Typed handoff metadata does not prove request-shape adaptation is lossless
+
+- Found: 2026-06-18 14:08 EDT
+- Fixed: pending
+- Status: open
+- Area: `src/keystone_agents/agent_registry.py`,
+  `src/keystone_agents/schemas/handoff_types.py`,
+  `src/keystone_agents/schemas/context_pack.py`,
+  `src/keystone_agents/manual_request.py`, specialist SDK input builders and
+  handoff validators.
+- Issue: Handoff specs and context packs now record source output type, target
+  input type, target output type, payload mode, parser status, and compatibility
+  status. That metadata confirms that a boundary is typed, but it does not
+  validate whether a rich Orchestrator plan or WorkItem context was adapted into
+  the concrete specialist SDK input without dropping material ask-shape fields.
+- Evidence: Registry handoffs use `payload_mode="adapted"` from
+  `OrchestratorResult` into target context packs. Context packs declare the
+  downstream input/output type and compatibility status. `HandoffTypeContract`
+  records compatibility notes, but not adapter-required fields, missing fields,
+  lossy fields, or clarification requirements.
+- Impact: Connected workflows can pass type compatibility checks while losing
+  important constraints such as "official sources only", "do not broaden",
+  "draft only after approval", "use this selected thread", "produce table", or
+  "stop after quick read." Debugging then sees a compatible handoff even though
+  the specialist received an under-specified prompt.
+- Expected fix: Add deterministic adapter validation for each route transition.
+  The result should report `compatible`, `compatible_with_warnings`,
+  `needs_clarification`, or `blocked`, plus missing required fields, lossy
+  ask-shape fields, defaulted policy fields, and the safe next action. Add tests
+  for Orchestrator-to-Gmail, Gmail-to-research, opportunity-to-research,
+  research-to-outreach, and Chief-to-context-agent adaptation.
+
+### P1 - HANDOFF-TYPES-001: Handoff specs do not declare typed input and output contracts
+
+- Found: 2026-06-18 13:47 EDT
+- Fixed: 2026-06-18 13:51 EDT
+- Status: fixed
+- Area: `src/keystone_agents/agent_registry.py`,
+  `src/keystone_agents/schemas/orchestrator.py`, Orchestrator intended
+  handoff metadata and AgentSpec cards.
+- Issue: `AgentSpec` records each agent's `output_schema`, and SDK builders
+  expose concrete Pydantic `output_type`, but the Orchestrator-facing
+  `HandoffSpec` only contains route, agent name, builder, and prose
+  description. It does not declare the input contract the target agent expects
+  or the output contract it will return.
+- Evidence: `AgentSpec.to_handoff_spec()` builds `HandoffSpec(route,
+  agent_name, builder, description)` only. `HandoffSpec` has no
+  `input_type`, `input_schema`, `output_type`, or `output_schema` field.
+  Existing `input_type` appears on `OrchestratorArtifacts`, not on the handoff
+  contract, and `output_type` appears in run/review traces rather than in the
+  route-to-agent contract itself.
+- Impact: The Orchestrator can list intended handoffs, but downstream code and
+  evals cannot validate compatibility before execution. This makes connected
+  workflows more likely to route a Gmail thread, source summary, WorkItem
+  context pack, or Chief nested tool request into an agent that expects a
+  different input shape.
+- Expected fix: Extend the registry/handoff metadata with stable typed
+  contracts, such as `input_contract_type`, `input_schema`, `output_contract_type`,
+  `output_schema`, and contract version. Keep the fields derived from
+  `AgentSpec` or route-specific typed input models, not hand-written prose.
+  Add tests that every registered handoff exposes input/output contract metadata
+  and that Orchestrator results preserve it in `intended_handoffs`.
+- Fix: `HandoffSpec` now carries contract version, input/output contract names,
+  input/output schema paths, and a reusable `HandoffTypeContract`. `AgentSpec`
+  derives these fields for Orchestrator handoffs and agent cards, including
+  Airtable, Google Workspace, and Zotero context-agent handoffs.
+- Verification: `tests/test_agent_registry.py::test_orchestrator_handoff_specs_expose_typed_contracts`
+  and full `tests/test_agent_registry.py` passed.
+
+### P1 - HANDOFF-TYPES-002: WorkItem context-pack transitions lack expected next input/output type checks
+
+- Found: 2026-06-18 13:47 EDT
+- Fixed: 2026-06-18 13:51 EDT
+- Status: fixed
+- Area: `src/keystone_agents/schemas/context_pack.py`,
+  `src/keystone_agents/work_items.py`, `src/keystone_agents/workflow_runner.py`,
+  connected WorkItem manager-loop handoffs.
+- Issue: WorkItem context packs are typed by route (`ResearchContextPack`,
+  `OpportunityContextPack`, `OutreachContextPack`, `GmailContextPack`), but the
+  pack itself does not declare which downstream input type it satisfies or what
+  output type the current step is expected to produce. Manager-loop transitions
+  therefore rely on route names, artifact presence, and ad hoc gates rather
+  than a first-class handoff type compatibility check.
+- Evidence: `ContextPackBase` carries `pack_type`, `route`, request text,
+  artifacts, sources, blockers, gates, and readiness fields. It does not carry
+  `satisfies_input_type`, `expected_output_type`, `next_input_type`, or a
+  handoff contract version. `_context_pack_payload()` adds only
+  `agent = pack.route.value`.
+- Impact: A multi-step request can lose the intended shape between steps, such
+  as Gmail-thread triage to research, Opportunity Scout source summary to
+  Business Research, or approved research context to Outreach Composer. This is
+  especially relevant to connected-workflow failures because "route is correct"
+  is weaker than "this context pack satisfies the next agent's typed input."
+- Expected fix: Add compact type metadata to context packs and WorkItem events:
+  current `input_type`, produced `output_type`, downstream `required_input_type`,
+  and compatibility status. Use deterministic gates to block or request
+  clarification when a pack does not satisfy the next specialist's input
+  contract. Add focused tests for Gmail-to-research, Scout-to-research,
+  Research-to-outreach, and Chief-to-context-agent transitions.
+- Fix: WorkItem context packs now carry `input_type`, `satisfies_input_type`,
+  `expected_output_type`, `next_input_type`, `type_compatibility_status`, and a
+  shared `handoff_type_contract` for Gmail, Research, Opportunity, and Outreach
+  transitions. Serialized context payloads preserve the same metadata for
+  downstream runner and eval inspection.
+- Verification: `tests/test_context_packs.py::test_build_context_pack_for_route_selects_specialist_pack`,
+  `tests/test_context_packs.py::test_context_pack_payload_preserves_ordered_sources_for_followups`,
+  and full `tests/test_context_packs.py` passed.
+
+### P2 - HANDOFF-TYPES-003: Cross-agent handoff validators report fields but not source/target type compatibility
+
+- Found: 2026-06-18 13:47 EDT
+- Fixed: 2026-06-18 13:51 EDT
+- Status: fixed
+- Area: `src/keystone_agents/schemas/handoff.py`,
+  `src/keystone_agents/reporting.py`, handoff audit metadata and approval
+  review.
+- Issue: The cross-agent handoff validators check concrete payload fields and
+  source IDs, but `HandoffContractResult` does not record the source
+  `output_type`, target `input_type`, schema version, parser status, or whether
+  the handoff is a native typed object versus a summarized/adapted payload.
+- Evidence: `HandoffContractResult` includes contract name, from/to agent,
+  required fields, optional fields, source IDs, unsupported claims, missing
+  evidence, validity, issues, and audit notes. It does not include type
+  compatibility metadata. By contrast, the Chief nested-specialist envelope
+  does preserve `output_type` and parsed-output status, but that pattern is not
+  generalized to ordinary handoff validators.
+- Impact: Human approval review and eval dashboards can see that certain fields
+  are present, but not whether the handoff crossed a schema boundary safely.
+  That makes it harder to debug adapter drift, fixture-shaped payloads,
+  summarized handoffs, or future context-agent writes.
+- Expected fix: Add type compatibility metadata to `HandoffContractResult` and
+  its approval metadata: `source_output_type`, `target_input_type`,
+  `contract_version`, `payload_mode` (`native`, `adapted`, `summarized`,
+  `malformed`), and `parsed_output_status`. Preserve the existing field/source
+  checks, but make type mismatch an explicit error or warning depending on
+  route. Add reporting coverage so Slack/eval review can surface this compactly
+  without dumping raw payloads.
+- Fix: Cross-agent `HandoffContractResult` now records the shared
+  `HandoffTypeContract`, source output type, target input type, target output
+  type, payload mode, parsed-output status, and compatibility status. Approval
+  metadata surfaces the same compact fields. Chief-of-Staff nested specialist
+  envelopes and specialist tools now use the same compatibility contract.
+- Verification: `tests/test_handoff_contracts.py::test_pipeline_exposes_valid_handoff_contracts`,
+  `tests/test_handoff_contracts.py::test_orchestrator_handoff_contract_accepts_explicit_sdk_handoff_metadata`,
+  `tests/test_chief_of_staff.py::test_chief_specialist_tools_use_typed_context_input_contract`,
+  `tests/test_chief_of_staff.py::test_nested_specialist_output_extractor_returns_reviewable_envelope`,
+  full `tests/test_handoff_contracts.py`, and the focused Chief specialist-tool
+  tests passed.
+
+### P1 - RUNTIME-IMPORT-001: Zotero context tools create a fresh-process circular import
+
+- Found: 2026-06-18 13:32 EDT
+- Fixed: 2026-06-18 13:44 EDT
+- Status: fixed
+- Area: `src/keystone_agents/zotero_research.py`,
+  `src/keystone_agents/tools/__init__.py`,
+  `src/keystone_agents/tools/zotero_context_tools.py`, fresh CLI child imports.
+- Issue: A fresh Python process cannot import `keystone_agents.manual_request`
+  or `keystone_agents.zotero_research` directly because `zotero_research`
+  imports `keystone_agents.tools.search_provider`, which executes
+  `tools/__init__.py`, which imports `zotero_context_tools`, which imports
+  unfinished symbols back from `zotero_research`.
+- Evidence: `.venv/bin/python -c "import keystone_agents.manual_request"` and
+  `.venv/bin/python -c "import keystone_agents.zotero_research"` both failed
+  with `ImportError: cannot import name 'build_zotero_article_research_brief'
+  from partially initialized module 'keystone_agents.zotero_research'`.
+  Importing `keystone_agents.tools` alone still succeeds, which means the
+  failure depends on import order and can escape normal tests.
+- Impact: Fresh CLI child processes, ad hoc smoke checks, or sandboxed runners
+  can fail before Orchestrator preflight or safety gates execute. This is
+  especially risky for `@KNI` paths because `manual_request` is a core planning
+  module.
+- Expected fix: Break the package-level import cycle by keeping
+  `tools/__init__.py` from eagerly importing Zotero context tools, or by moving
+  the Zotero research imports inside the individual tool functions. Add a
+  regression test that imports `keystone_agents.manual_request`,
+  `keystone_agents.zotero_research`, and `keystone_agents.tools` in isolated
+  fresh processes.
+- Fix: `tools/__init__.py` now lazy-loads Zotero context exports instead of
+  eagerly importing `zotero_context_tools`, breaking the fresh-process cycle
+  while preserving package-level tool exports.
+- Verification: `.venv/bin/python -c "import keystone_agents.manual_request;
+  import keystone_agents.zotero_research; import keystone_agents.tools"` passed,
+  and `tests/test_architecture.py::test_fresh_process_imports_core_zotero_paths_without_cycles`
+  passed.
+
+### P1 - REGISTRY-COVERAGE-001: New context agents are only partially propagated through registry, skill, and eval contracts
+
+- Found: 2026-06-18 13:32 EDT
+- Fixed: 2026-06-18 13:44 EDT
+- Status: fixed
+- Area: `src/keystone_agents/agent_registry.py`,
+  `src/keystone_agents/skill_sets.py`, `src/keystone_agents/skills/*`,
+  `evals/local/skill_task_matrix.jsonl`,
+  `evals/local/skill_contracts.jsonl`, registry fingerprint tests.
+- Issue: Airtable, Google Workspace, and Zotero context agents are now in the
+  registry and intended handoff set, but the surrounding static contracts are
+  incomplete or stale. The result is a mixed rollout where runtime surfaces,
+  prompt contracts, skill coverage, and eval matrices disagree about what the
+  registered agent set is.
+- Evidence: Full pytest failed registry and prompt-contract checks:
+  `test_context_agents_support_direct_writes_but_nested_tier_is_advisory`
+  found an unexpected `google_drive_get_file_metadata` tool in the direct
+  Google Workspace builder, `test_registered_agent_static_prefix_fingerprints_are_stable`
+  found a changed tool-name fingerprint, new context-agent skills are missing
+  required sections such as `## Flexible Behavior`, `skill_contracts.jsonl`
+  lacks cases for the new specialist skills, and `skill_task_matrix.jsonl`
+  still covers only the pre-existing six agents.
+- Impact: Agent construction may be correct in one path but rejected by
+  architecture/eval gates in another. More importantly, the repo loses its
+  ability to tell whether new context agents are safe direct writers,
+  Chief-owned advisory tools, or fully eval-ready specialists.
+- Expected fix: Finish the context-agent rollout as one contract update:
+  decide the intended direct tool set, refresh static fingerprints only after
+  reviewing the tool surface, add missing skill sections, add skill-contract and
+  skill-task eval rows for Airtable, Google Workspace, and Zotero, and run the
+  focused registry/prompt/skill eval tests before the full suite.
+- Fix: Airtable, Google Workspace, and Zotero specialist skills now include the
+  required reasoning-contract sections, `skill_contracts.jsonl` includes
+  focused coverage rows for all three context-agent specialist skills, and
+  static registry fingerprints were refreshed after reviewing the direct tool
+  surface.
+- Verification: `tests/test_prompt_contracts.py::test_skill_bundles_define_reasoning_contracts_not_tools`,
+  `tests/test_prompt_contracts.py::test_skill_contract_eval_cases_cover_shared_and_specialist_skills`,
+  and `tests/test_agent_registry.py` passed.
+
+### P1 - CONNECTED-WF-001: Connected multi-step requests route to clarification instead of preserving the safe workflow
+
+- Found: 2026-06-18 13:32 EDT
+- Fixed: 2026-06-18 13:44 EDT
+- Status: fixed
+- Area: `src/keystone_agents/orchestrator/routing.py`,
+  `src/keystone_agents/manual_request.py`,
+  `src/keystone_agents/slack_actions.py`, connected Gmail/research/opportunity
+  and research-to-outreach workflows.
+- Issue: Several safe connected-workflow prompts now fall into
+  `clarification` instead of starting with the owning specialist and preserving
+  the downstream draft-only or approval-gated steps. The approval wording is
+  being treated as a stop condition too early, rather than as a downstream gate
+  attached to the workflow.
+- Evidence: Full pytest failed
+  `test_gmail_first_cross_agent_request_preserves_downstream_workflow`,
+  `test_research_then_outreach_request_routes_to_research_first`, the OR-2
+  workflow preservation case, and the Slack modal Gmail workflow check. Focused
+  rerun confirmed the Gmail consulting inquiry routes to `clarification`
+  instead of `gmail_triage`, and `Research Mentavi and prepare draft-only
+  outreach only after approval` routes to `clarification` instead of
+  `business_research_analyst`.
+- Impact: Natural Slack and CLI asks that should be safe read/research/draft
+  workflows become generic clarification or malformed result payloads. This
+  weakens the Orchestrator-first model because Python no longer preserves the
+  intended specialist sequence, while the user still receives no external write
+  or send.
+- Expected fix: Treat approval-gated downstream wording as workflow metadata,
+  not an immediate refusal, unless the user asks to send/post/write now. Restore
+  deterministic connected-workflow planning for Gmail-first and research-first
+  requests, attach approval/no-send gates to the later draft step, and ensure
+  Slack modal results return the expected blocker payload shape when context is
+  missing.
+- Fix: Manual-plan routing now preserves Gmail-first workflows before applying
+  the standalone outreach context refusal, and research-before-draft requests
+  route to Business Research with a downstream draft-only outreach workflow and
+  approval gates intact.
+- Verification: `tests/test_orchestrator.py::test_gmail_first_cross_agent_request_preserves_downstream_workflow`
+  and `tests/test_orchestrator.py::test_research_then_outreach_request_routes_to_research_first`
+  passed.
+
+### P1 - EVAL-UX-028: Strict eval readiness can pass while the dashboard endpoint is unreachable
+
+- Found: 2026-06-18 13:32 EDT
+- Fixed: 2026-06-18 13:44 EDT
+- Status: fixed
+- Area: `scripts/check_eval_slack_readiness.py`,
+  `src/keystone_agents/eval_dashboard_health.py`,
+  `tests/test_promptfoo_framework.py`, eval dashboard launchd readiness.
+- Issue: Standalone strict readiness can still return overall `pass` when
+  `http://127.0.0.1:8769/api/status` is unreachable and `port_open=false`, as
+  long as launchd reports the dashboard service as running. That makes Slack
+  dashboard links look ready when the endpoint is not actually reachable.
+- Evidence: `.venv/bin/python scripts/check_eval_slack_readiness.py --strict
+  --json` returned `"status": "pass"` and `"warning_count": 0`, while the eval
+  dashboard readiness payload had `"port_open": false`,
+  `"dashboard_reachable": false`, and `"health_reachable": false`. The current
+  test `test_eval_dashboard_manager_allows_launchd_running_when_probe_blocked`
+  encodes this pass behavior.
+- Impact: The pre-live `#evals` gate can green-light a run whose dashboard and
+  review links fail for the operator. This partially reopens the earlier
+  dashboard readiness issue because launchd state is being treated as enough
+  evidence of link usability.
+- Expected fix: In standalone strict readiness, require a reachable health
+  endpoint or an explicit wrapper pre-start mode. Launchd running can remain a
+  diagnostic hint, but it should be a warning/failure when the endpoint is
+  unreachable and the wrapper is not about to start the server. Update tests so
+  only `--dashboard-server-will-start` allows a temporarily offline dashboard.
+- Fix: Launchd-running without reachable dashboard health now reports a warning
+  in readiness output, which makes `--strict` fail unless
+  `--dashboard-server-will-start` explicitly declares wrapper-managed startup.
+- Verification: `tests/test_promptfoo_framework.py::test_eval_dashboard_manager_warns_when_launchd_running_but_probe_blocked`
+  and wrapper pre-start coverage passed. `.venv/bin/python
+  scripts/check_eval_slack_readiness.py --strict --json` now fails with one
+  dashboard warning when the endpoint is unreachable, while the same command
+  with `--dashboard-server-will-start` passes.
+
+### P1 - EVAL-UX-029: Human review storage still defaults missing safety to `pass`
+
+- Found: 2026-06-18 13:32 EDT
+- Fixed: 2026-06-18 13:44 EDT
+- Status: fixed
+- Area: `promptfoo/human_review.py`, `promptfoo/eval_dashboard_server.py`,
+  human review persistence and scorecard safety.
+- Issue: The UI and parser paths now require an explicit safety choice, but the
+  underlying `HumanEvalReview` dataclass still defaults `safety` to `pass`, and
+  the SQLite schema still declares `safety TEXT NOT NULL DEFAULT 'pass'`.
+  Direct programmatic saves can therefore create positive safety reviews without
+  an explicit reviewer decision.
+- Evidence: A fresh local check constructed
+  `HumanEvalReview(case_id='case_1', scores={...})`, called
+  `save_human_review(...)`, and `list_human_reviews(...)` returned
+  `safety == 'pass'`. The focused Promptfoo tests pass because parser and
+  dashboard payload paths validate safety before construction, but the lower
+  storage contract remains biased.
+- Impact: Future scripts, migrations, or direct helper calls can silently
+  create completed-looking positive scorecards, undermining human-review
+  readiness and benchmark rollups.
+- Expected fix: Remove the `pass` default from the dataclass/storage contract.
+  Make `save_human_review()` reject missing or invalid safety regardless of the
+  caller, migrate or tolerate legacy rows explicitly, and add a direct-save
+  regression proving safety must be selected before persistence.
+- Fix: `HumanEvalReview` no longer defaults missing safety to `pass`, and
+  `save_human_review()` validates case ID, score presence/range, and explicit
+  `pass`/`fail` safety before persistence. New SQLite tables default missing
+  safety to an empty value instead of pass.
+- Verification: `tests/test_promptfoo_framework.py::test_human_review_requires_explicit_safety`
+  and `tests/test_promptfoo_framework.py::test_human_review_storage_requires_explicit_safety`
+  passed.
+
+### P1 - SECRET-HYGIENE-001: Test fixture secrets match live secret scanner patterns
+
+- Found: 2026-06-18 13:32 EDT
+- Fixed: 2026-06-18 13:44 EDT
+- Status: fixed
+- Area: `tests/test_promptfoo_framework.py`, `scripts/scan_repo_secrets.py`,
+  publish and repository hygiene gates.
+- Issue: Promptfoo live-policy tests use fake OpenAI key strings that match the
+  repo secret scanner's `openai_api_key` pattern. The strings are fixtures, but
+  the scanner is intentionally unable to infer that from the value alone.
+- Evidence: Full pytest failed both
+  `test_no_obvious_repo_secrets_present` and
+  `test_scan_repo_secrets_reports_current_repo_clean`; the scanner reported
+  three findings in `tests/test_promptfoo_framework.py`, including
+  line 6151 with sample `sk-t***3456`.
+- Impact: The local publish/backup gate is blocked and future real findings can
+  be hidden by known fixture noise. Secret-hygiene tests should remain strict
+  and boring.
+- Expected fix: Replace fake key literals with scanner-safe placeholders that
+  do not match live token patterns, or add a narrow fixture allowlist with exact
+  path/line/sample justification. Prefer changing the fixture values so the
+  scanner stays simple.
+- Fix: Promptfoo live-policy fixture keys now use scanner-safe placeholders
+  rather than fake `sk-...` strings, so the secret scanner remains strict
+  without fixture allowlists.
+- Verification: `.venv/bin/python scripts/scan_repo_secrets.py`,
+  `tests/test_architecture.py::test_no_obvious_repo_secrets_present`, and
+  `tests/test_scan_repo_secrets.py::test_scan_repo_secrets_reports_current_repo_clean`
+  passed.
+
+### P1 - EVAL-UX-001: `#evals` app mentions can route to unsupported `/kni`
+
+- Found: 2026-06-14 10:39 EDT
+- Fixed: 2026-06-14 11:12 EDT
+- Status: fixed
+- Area: sibling `keystone-slack` Slack app-mention routing,
+  `docs/SLACK_BUSINESS_AGENT_MODE.md`, eval-channel live flow.
+- Issue: Recent live `#evals` messages that visibly mention KNI were handled as
+  unsupported `/kni` commands instead of the business-agent eval flow. This
+  prevents a Slack run from being recorded and leaves the operator with a
+  generic slash-command help response rather than a case dashboard or review
+  link.
+- Evidence: In `#evals` thread `1781206953.875749`, the prompt
+  `opportunity scout: eval case slack_agents_sdk_course_001` received
+  `Unsupported KNI Command` with `Requested: /kni opportunity scout...` and no
+  Slack eval run was recorded for `slack_agents_sdk_course_001`. A separate
+  score-template thread `1781202864.139419` hit the same unsupported `/kni`
+  path.
+- Expected fix: In the Slack bridge, normalize ChatGPT-forwarded or app-mention
+  eval prompts so `#evals` business-agent asks enter the same Orchestrator-first
+  KBA child-run path as manual `@KNI` prompts. Add a live-shape fixture that
+  includes the `Sent using ChatGPT` footer and verifies the prompt records a
+  Slack eval run with dashboard/review links instead of falling through to slash
+  command help.
+- Fix: The sibling Slack `/kni` business-agent delegation now passes a bounded
+  `SlackBusinessAgentContext` into `handle_business_agents_request`, preserving
+  channel, request timestamp, and user context for eval-channel hidden metadata
+  and follow-up scoring/status resolution. A live-shape slash-command
+  regression with `opportunity scout: eval case ...` and the ChatGPT footer now
+  verifies the request delegates to business agents instead of unsupported help.
+- Verification: KBA focused eval tests passed; sibling Slack focused
+  `/kni` delegation and app-mention scorecard tests passed; eval readiness
+  preflight passed for the eval bridge path with unrelated warnings for
+  dashboard reachability and scope metadata.
+
+### P1 - EVAL-UX-002: Eval threads expose run and route mismatch instead of a clean case journey
+
+- Found: 2026-06-14 10:39 EDT
+- Fixed: 2026-06-14 11:12 EDT
+- Status: fixed
+- Area: Slack eval rendering, WorkItem manager loop result framing, eval footer
+  handoff.
+- Issue: The live `#evals` thread for a Business Research Analyst case quickly
+  surfaced an Opportunity Scout continuation and route metadata. The operator
+  sees multiple statuses, blockers, route transitions, and action buttons before
+  a clear case/run/review handoff, making it hard to know which result should be
+  scored.
+- Evidence: In `#evals` thread `1781202023.470699`, the root ask says
+  `business research analyst: eval case slack_behavioral_health_rfp_001`, but
+  the first KNI reply reports a blocked Opportunity Scout continuation for
+  WorkItem `wi_e59cb39aeac24ec49d012b2f27cb244b`; a later reply says manager
+  loop routes `business_research_analyst -> opportunity_scout`, and the final
+  visible result remains `Status: blocked` with Opportunity Scout buttons.
+- Expected fix: For eval-channel runs, render one primary scoring target per
+  root prompt: resolved case id, resolved run id, selected scoring response,
+  route transitions only as compact diagnostics, and explicit review/dashboard
+  links. If the manager loop changes specialist route or blocks, mark the run as
+  blocked/not-score-ready and avoid showing downstream action buttons as the
+  main scoring surface.
+- Fix: KBA eval Slack results now clear `slack_actions` and
+  `slack_overflow_actions` when an eval record is attached, so downstream
+  WorkItem actions do not become the primary eval scoring surface. The visible
+  summary keeps the case id, run id, dashboard link, review form link, and
+  natural same-thread score/status prompts as the scoring handoff.
+- Verification: Focused `tests/test_slack_agent_actions.py` coverage verifies
+  eval runs still record the case and evidence but no longer return Slack action
+  buttons in the eval result payload.
+
+### P2 - EVAL-UX-003: Score-template fallback requires exact IDs the thread does not reliably expose
+
+- Found: 2026-06-14 10:39 EDT
+- Fixed: 2026-06-14 11:12 EDT
+- Status: fixed
+- Area: Slack fallback scoring commands, in-thread eval status, human review
+  handoff.
+- Issue: The fallback score-template path asks the operator to provide
+  `case_id`, `run_id`, and `agent_name`, but live thread output can make the
+  correct run ambiguous or unavailable. This leads to placeholder score-template
+  attempts and unsupported-command replies instead of a saved scorecard.
+- Evidence: In `#evals` thread `1781202023.470699`, the operator tried
+  `eval score template case <case_id> run <run_id> agent <agent_name>` and then
+  `run sbar_14ff...`, while the root run previously exposed
+  `sbar_bd1fe1d83aca4f93864a03c0618c5dfc`. The later standalone score-template
+  thread `1781202864.139419` also routed to unsupported `/kni`.
+- Expected fix: Prefer same-thread context inference for fallback scoring:
+  `@KNI score this eval` or the existing natural score reply should resolve the
+  latest eligible case/run from local Slack eval records. If multiple run
+  candidates exist, return a short disambiguation with exact run ids and status
+  instead of requiring the operator to reconstruct IDs manually.
+- Fix: Scorecard guidance now consistently points to natural same-thread
+  requests (`@KNI can you give me a scorecard for this eval?` and
+  `@KNI how is this eval doing?`). Explicit placeholder score-template requests
+  such as `case <case_id> run <run_id>` now block with guidance to use the
+  same-thread resolver instead of producing a fake template with unresolved
+  identifiers.
+- Verification: Focused CLI tests cover placeholder blocking, wrapped Slack
+  follow-up scorecard parsing, natural score replies, and natural status
+  inference from Slack thread context.
+
+### P2 - EVAL-UX-004: Dashboard manager can report ready while the localhost dashboard is unreachable
+
+- Found: 2026-06-14 10:39 EDT
+- Fixed: 2026-06-14 11:05 EDT
+- Status: fixed
+- Area: `scripts/manage_eval_dashboard.sh`,
+  `src/keystone_agents/eval_dashboard_health.py`,
+  `scripts/check_eval_slack_readiness.py`.
+- Issue: The eval dashboard health surface can say the manager is ready even
+  when `http://127.0.0.1:8769/dashboard` is not reachable. This creates a poor
+  handoff from Slack links to the Keystone Eval Dashboard because the operator
+  may click a link that cannot load even after readiness passes with warnings.
+- Evidence: `./scripts/manage_eval_dashboard.sh status` reported the launchd
+  job as running, but the dashboard was not reachable at the canonical URL. The
+  readiness JSON classified the eval dashboard manager check as pass while
+  noting `port_open: false` and `dashboard port was not reachable from this
+  process`.
+- Expected fix: Split manager availability from dashboard reachability in the
+  readiness contract. Strict live-test readiness should fail when the dashboard
+  URL is unreachable, and `manage_eval_dashboard.sh status` should surface
+  actionable remediation based on logs, stale launchd state, or port-bind
+  failures before Slack links are treated as usable.
+- Fix: Dashboard readiness now keeps manager checks separate from endpoint
+  reachability and returns a warning when the manager exists but
+  `http://127.0.0.1:8769/dashboard` is unreachable, which makes strict
+  readiness fail before Slack links are trusted. `manage_eval_dashboard.sh
+  status` now reports restart remediation, stale PID files, and port listener
+  state when health fails.
+- Verification: `.venv/bin/python -m pytest tests/test_promptfoo_framework.py`;
+  `.venv/bin/python -m pytest tests/test_slack_agent_actions.py`;
+  `.venv/bin/python -m py_compile promptfoo/eval_dashboard.py
+  promptfoo/eval_dashboard_server.py scripts/check_eval_slack_readiness.py
+  src/keystone_agents/eval_dashboard_health.py`; `zsh -n
+  scripts/manage_eval_dashboard.sh`.
+
+### P2 - EVAL-UX-005: Review form defaults can bias human scores
+
+- Found: 2026-06-14 10:39 EDT
+- Fixed: 2026-06-14 16:18 EDT
+- Status: fixed
+- Area: `promptfoo/eval_dashboard.py`,
+  `promptfoo/eval_dashboard_server.py`, `promptfoo/human_review.py`,
+  human review UI and Slack score templates.
+- Issue: When a case has a recorded response but no saved human review, every
+  score selector defaults to `4` and safety defaults to `pass`. That makes the
+  fastest path through the review form a positive scorecard, even if the user
+  intended to inspect first or mark a problematic run.
+- Evidence: `scoreOptions()` and `_review_html()` both select
+  `Number(selected ?? 4)`, while `save_human_review_payload()` accepts any
+  submitted score values. This affects the dashboard scoring panel and
+  standalone `/review?case=...` form.
+- Expected fix: Default unscored review controls to `tbd` even when a recorded
+  response exists, require an explicit user-selected value for each submitted
+  score dimension, and keep safety unset until the reviewer chooses pass or
+  fail. Existing saved reviews should still preload their stored values.
+- Fix: Dashboard and standalone review forms now default unscored score and
+  safety controls to `tbd`, block client-side submission until every score
+  dimension and safety choice is explicit, and preserve saved review values
+  when present. The server-side save path now rejects missing score dimensions
+  and missing safety instead of defaulting safety to `pass`.
+- Verification: `.venv/bin/python -m pytest tests/test_promptfoo_framework.py`;
+  `.venv/bin/python -m pytest tests/test_slack_agent_actions.py`;
+  `.venv/bin/python -m py_compile promptfoo/eval_dashboard.py
+  promptfoo/eval_dashboard_server.py scripts/check_eval_slack_readiness.py
+  src/keystone_agents/eval_dashboard_health.py`; `zsh -n
+  scripts/manage_eval_dashboard.sh`.
+- Regression evidence at 2026-06-14 12:36 EDT: the current Slack score template
+  path still pre-fills `safety: pass` in `build_slack_review_template()`. The
+  dashboard and standalone review form no longer default safety, but a user
+  asking for the Slack score template can still paste a positive safety choice
+  without actively selecting pass/fail.
+- Remaining expected fix: keep all human-review entry surfaces consistent.
+  Slack-generated score templates should leave safety blank or `tbd`, and
+  tests should verify the template does not bias the safety decision while the
+  save path still rejects missing safety.
+- Regression fix: `build_slack_review_template()` now leaves `safety:` blank
+  instead of pre-filling `pass`, so Slack-generated score templates require the
+  reviewer to actively choose pass or fail.
+- Regression verification: Ran `.venv/bin/python -m py_compile
+  promptfoo/human_review.py tests/test_promptfoo_framework.py`; ran focused
+  human-review and CLI score-save tests covering unbiased template generation,
+  explicit safety rejection, parsed explicit safety, and natural/thread score
+  save paths.
+
+### P1 - EVAL-UX-006: Strict eval test-server readiness can block its own dashboard start
+
+- Found: 2026-06-14 11:24 EDT
+- Fixed: 2026-06-14 11:58 EDT
+- Status: fixed
+- Area: `scripts/run_eval_slack_test_server.py`,
+  `scripts/check_eval_slack_readiness.py`,
+  `scripts/manage_eval_dashboard.sh`, live Slack eval launcher.
+- Issue: `run_eval_slack_test_server.py --strict-readiness` runs
+  `check_eval_slack_readiness.py --strict` before the dashboard server starts.
+  Strict readiness treats dashboard reachability warnings as failures, so a
+  stopped dashboard can make the wrapper exit before it reaches
+  `dashboard_server_main()`, even though that wrapper is the path intended to
+  start the local dashboard for the live Slack test.
+- Evidence: The wrapper builds and runs the readiness command before starting
+  the dashboard server. The readiness script marks warnings as failures in
+  strict mode, and the dashboard manager check now warns when
+  `port_open=false`. A local JSON readiness run passed with warnings while
+  reporting the canonical dashboard URL unreachable.
+- Expected fix: Split standalone strict readiness from wrapper pre-start
+  readiness. Either start and health-check the dashboard before strict checks
+  that require reachability, or add an explicit wrapper-only mode that accepts
+  the pre-start dashboard state while preserving standalone strict failure when
+  Slack dashboard links are expected to be usable.
+- Fix: `check_eval_slack_readiness.py` now supports an explicit
+  `--dashboard-server-will-start` mode. The live Slack test-server wrapper uses
+  that mode before starting the dashboard, so an offline dashboard URL is
+  allowed only for the wrapper pre-start check; standalone strict readiness
+  still treats unresolved warnings as failures when Slack links are expected to
+  be usable.
+- Verification: Focused Promptfoo readiness/launcher tests passed, including
+  strict standalone warning failure, wrapper pre-start dashboard allowance, and
+  wrapper argv clearing. `.venv/bin/python scripts/check_eval_slack_readiness.py
+  --json --dashboard-server-will-start` passed with the dashboard manager check
+  marked pass and only unrelated Slack bridge/scope metadata warnings.
+- Regression evidence at 2026-06-14 12:10 EDT: the current wrapper still builds
+  `readiness_command = [sys.executable, "scripts/check_eval_slack_readiness.py"]`
+  and appends `--strict` plus `--live-slack-probe`, but it does not append
+  `--dashboard-server-will-start`. Current launcher tests assert the readiness
+  command suffix is only `["--strict", "--live-slack-probe"]`, so the documented
+  wrapper-only pre-start mode is not enforced by the current worktree.
+- Remaining expected fix: make the strict test-server wrapper pass
+  `--dashboard-server-will-start` for its pre-start readiness run, keep
+  standalone strict readiness failing when the dashboard URL is unreachable, and
+  update launcher coverage so it proves the wrapper uses the pre-start allowance
+  only in the server-launch path.
+
+### P2 - EVAL-UX-007: Slack/CLI score-save path can store incomplete human scorecards
+
+- Found: 2026-06-14 11:24 EDT
+- Fixed: 2026-06-14 11:29 EDT
+- Status: fixed
+- Area: `src/keystone_agents/cli.py`, `promptfoo/human_review.py`,
+  `scripts/add_promptfoo_human_review.py`, `promptfoo/eval_dashboard.py`,
+  `promptfoo/eval_dashboard_server.py`.
+- Issue: The dashboard review form now requires every score dimension and an
+  explicit safety choice, but the Slack/CLI score-save path still uses
+  `parse_human_review()`, which accepts any review containing at least one
+  valid 0-5 score. That can save a partial rubric while the dashboard and
+  readiness language imply complete scorecards.
+- Evidence: `_eval_score_save_payload()` parses and saves natural Slack score
+  replies directly. `parse_human_review()` raises only when no scores are
+  present. Existing CLI eval-status coverage saves a review with only
+  `accuracy` and `relevance` and reports `average 4.5/5`, while the dashboard
+  server save path rejects missing dimensions.
+- Expected fix: Decide whether paid/API readiness requires complete human
+  scorecards across all save paths. If yes, add complete-score validation for
+  Slack/CLI/manual score saves and update tests/docs. If partial reviews remain
+  allowed, label them as partial and exclude them from completed scorecard
+  readiness counts until the full rubric is filled.
+- Fix: Slack/CLI/manual score saves now use the same complete-scorecard
+  contract as the dashboard form: every `SCORE_DIMENSIONS` rubric dimension must
+  be present and safety must be explicitly `pass` or `fail`. Existing complete
+  natural Slack score replies still save normally; incomplete replies now block
+  before writing a human review row.
+- Verification: Focused parser, CLI score-save/status, dashboard payload, and
+  readiness score-save tests passed. Regression coverage now rejects incomplete
+  Slack scorecards and missing safety while preserving complete scorecard
+  rollups and dashboard/status summaries.
+
+### P1 - EVAL-UX-008: Human review saves are not validated against the recorded Slack run
+
+- Found: 2026-06-14 11:29 EDT
+- Fixed: 2026-06-14 11:41 EDT
+- Status: fixed
+- Area: `promptfoo/eval_dashboard.py`,
+  `promptfoo/eval_dashboard_server.py`, `promptfoo/eval_database.py`,
+  `promptfoo/human_review.py`, analysis rollups.
+- Issue: The Slack-to-dashboard data flow is covered at the case level, but the
+  human-review save path does not validate that the submitted `run_id`, agent,
+  and Slack thread belong to a recorded Promptfoo or Slack response for the same
+  case. `save_human_review_payload(..., require_recorded_response=True)` only
+  checks that some response exists for the case, then stores the submitted review
+  fields. Analysis later aggregates human reviews by case/day/agent without
+  confirming the review is attached to the specific Slack run it was meant to
+  score.
+- Evidence: Slack runs persist `case_id`, `run_id`, `agent`,
+  `slack_thread_ts`, response summary, and evidence in `slack_eval_runs`.
+  Dashboard and standalone forms post `case_id`, `run_id`, `agent`,
+  `slack_thread_ts`, scores, safety, and notes to `/api/human-review`. The
+  server constructs `HumanEvalReview` directly and saves it; current tests cover
+  recorded-response presence, complete scores, ledgers, and data-quality gates,
+  but do not reject a review whose run/thread/agent does not match the saved
+  Slack run for that case.
+- Expected fix: Add a run-level review target contract before paid/API evals:
+  resolve the review target from the latest eligible saved Slack or Promptfoo
+  run, include channel/thread identity in form payloads, validate submitted
+  `run_id`, agent, and Slack thread against the stored run for the case, and
+  surface mismatches in data-quality/readiness instead of counting them as
+  completed human scorecards.
+- Fix: `validate_human_review_target()` now checks submitted human-review
+  targets against saved Promptfoo or Slack responses before save. Dashboard form
+  saves and natural Slack/CLI score saves reject mismatched run IDs, agents, or
+  Slack thread timestamps instead of storing a detached scorecard.
+- Verification: Focused dashboard-server and CLI regressions now cover both
+  matching and mismatched Slack review targets. The broader Promptfoo/CLI eval
+  suite passed with 49 tests.
+
+### P1 - EVAL-UX-009: Analysis exclusion does not cover Slack runs or human-review rows
+
+- Found: 2026-06-14 11:31 EDT
+- Fixed: 2026-06-14 11:41 EDT
+- Status: fixed
+- Area: `promptfoo/eval_database.py`, `promptfoo/eval_dashboard.py`,
+  `promptfoo/eval_dashboard_server.py`, analysis inclusion controls.
+- Issue: The analysis inclusion toggle only applies to Promptfoo machine result
+  rows keyed by `eval_id` and `case_id`. Slack run records and human-review rows
+  remain included in the run ledger and human trend rollups even when an eval
+  case/result is marked as a duplicate retry, problem run, or otherwise excluded
+  from analysis. This can make the human trend and agent score analysis disagree
+  with the operator's inclusion decision before paid/API evals.
+- Evidence: `set_promptfoo_analysis_exclusion()` requires a matching
+  `promptfoo_case_results` row and writes only to
+  `promptfoo_analysis_exclusions`. `_promptfoo_analysis()` filters machine
+  `promptfoo_case_results` through that table, but reads all
+  `human_eval_reviews` without joining any exclusion state. `_eval_run_ledger()`
+  also lists all Slack and human rows. Existing exclusion coverage verifies
+  `run_trends` and `case_trends` are empty after excluding a Promptfoo row, but
+  does not cover Slack or human-review exclusion behavior.
+- Expected fix: Extend the analysis inclusion contract to the full eval data
+  model. Either add row-level inclusion state for Slack runs and human reviews,
+  or derive their inclusion from the validated review target/run. Human trend
+  rollups, agent score trends, run ledger summaries, readiness counts, and
+  exports should visibly exclude or flag duplicate/problem Slack and human rows
+  consistently with Promptfoo rows.
+- Fix: Dashboard analysis now derives included cases once and applies that
+  inclusion state to summary counts, readiness gates, Promptfoo trends, Slack
+  run ledger rows, human ledger rows, human-review trends, and agent score
+  trends. Exclusion flags remain visible on case records even when the
+  Promptfoo prompt snapshot is stale.
+- Verification: Regression coverage now imports Promptfoo results, records a
+  Slack run and human review for the same case, excludes the case, and verifies
+  Slack/human ledger and trend data are removed from analysis rollups.
+
+### P1 - EVAL-UX-010: Normal Slack/app-mention eval runs save less evidence than selected-message runs
+
+- Found: 2026-06-14 11:32 EDT
+- Fixed: 2026-06-14 11:41 EDT
+- Status: fixed
+- Area: `src/keystone_agents/cli.py`,
+  `src/keystone_agents/slack_actions.py`, `promptfoo/eval_database.py`,
+  `promptfoo/eval_dashboard.py`, Slack eval readiness/data-quality checks.
+- Issue: The selected-message Slack action path records rich eval evidence for
+  saved Slack runs, including thread fetch status, message count, warning count,
+  cost profile, source counts, SDK cost/cache summaries, response hash, and a
+  structured evidence payload. The normal Slack/app-mention child-run path in
+  the CLI records only case/run/thread/request/summary. That means the workflow
+  that most closely matches live `@KNI` eval usage can enter the same database
+  with missing evidence needed for paid/API readiness, cost comparison, and
+  failure diagnosis.
+- Evidence: `_record_eval_run_for_slack_bridge()` in `slack_actions.py` builds
+  `_slack_eval_evidence()` and passes its fields into `record_slack_eval_run()`.
+  `_record_eval_slack_run_if_requested()` in `cli.py` calls
+  `record_slack_eval_run()` without thread fetch status, message count, warning
+  count, cost profile, source counts, SDK cost/cache values, response hash, or
+  evidence. CLI eval tests assert case/run/thread links, while selected-message
+  tests assert thread evidence and response hash. Dashboard data-quality checks
+  then warn on missing Slack thread evidence for such rows.
+- Expected fix: Normalize Slack eval evidence capture across both entrypoints.
+  The CLI/app-mention path should extract safe thread context metadata,
+  cost/cache summaries, source counts, warning counts, route/status, response
+  hash, and redacted evidence from the same bounded context/result sources used
+  by the selected-message path, then add focused tests proving app-mention eval
+  rows satisfy the dashboard data-quality checks before live paid/API runs.
+- Fix: The normal CLI/app-mention Slack eval path now records structured
+  evidence, route/status, context policy, thread fetch status, thread message
+  count, warnings, source counts, cost/cache summaries, response hash, and
+  WorkItem identity when saving `slack_eval_runs`.
+- Verification: CLI eval regressions now assert app-mention and hidden eval
+  rows persist thread evidence, response hashes, and
+  `keystone.slack.eval_evidence.v1` payloads. Readiness also passes the
+  app-mention thread flow and dashboard workflow checks.
+
+### P2 - EVAL-UX-011: Promptfoo eval database lacks normalized prompt/model provenance
+
+- Found: 2026-06-14 11:36 EDT
+- Fixed: 2026-06-14 11:58 EDT
+- Status: fixed
+- Area: `promptfoo/eval_database.py`, `promptfoo/eval_dashboard.py`,
+  `scripts/check_eval_slack_readiness.py`, Promptfoo/API eval reporting.
+- Issue: The local static and benchmark eval paths record prompt-version
+  provenance, but the Promptfoo dashboard database does not normalize prompt
+  versions, prompt metadata, model/provider labels, git revision, or live-run
+  labels for imported Promptfoo runs or saved Slack eval rows. Future API-backed
+  evals need those fields to compare regressions across prompt changes, model
+  changes, and live/dry-run settings without relying on a movable raw result
+  file path or unindexed nested JSON.
+- Evidence: `docs/EVALS.md` says eval output includes `prompt_metadata` and
+  `prompt_versions` so results can be traced from agent to prompt version to
+  dataset row, and `benchmark_tracking.py` stores `prompt_versions_json` for
+  benchmark case scores. In contrast, `promptfoo_eval_runs` stores run summary
+  fields plus `result_path`, and `promptfoo_case_results` stores score fields
+  plus raw `vars_json` and `output_json`; neither schema has normalized
+  prompt/model/provider provenance columns. `slack_eval_runs` captures Slack
+  evidence and cost fields, but also lacks prompt/model provenance fields.
+- Expected fix: Extend Promptfoo/Slack eval persistence before future API runs
+  to capture normalized run provenance: prompt version references, prompt
+  metadata hashes or references, model provider/name, live/dry-run mode, search
+  provider mode where relevant, git revision, and import/source result path.
+  Add dashboard/readiness checks and focused tests that prove API-backed eval
+  runs can be grouped and filtered by prompt version and model/provider.
+- Fix: Promptfoo eval runs, Promptfoo case rows, and Slack eval rows now carry
+  normalized prompt versions, prompt metadata/hash, model provider/name,
+  run mode, search provider sequence, git revision, and run label. Promptfoo
+  imports extract provenance from compact provider output or case vars, and
+  Slack eval recorders pass through optional model/search provenance.
+- Verification: Regression coverage imports a compact provider result with
+  model/search/prompt provenance, records a linked Slack run, and verifies the
+  normalized Promptfoo and Slack rows deserialize with the expected fields.
+
+### P1 - EVAL-UX-012: Promptfoo live SDK path lacks budget and max-case guards
+
+- Found: 2026-06-14 11:39 EDT
+- Fixed: 2026-06-14 11:58 EDT
+- Status: fixed
+- Area: `promptfoo/providers/keystone_agent_provider.py`,
+  `promptfooconfig.yaml`, `package.json`, live/API eval runner setup.
+- Issue: The default Promptfoo configuration is dry-run, but the provider will
+  pass `--live-sdk` whenever a case or provider config sets `live_sdk: true`.
+  There is no Promptfoo-side live-run budget, max-case count, allowlist,
+  expected spend estimate, or explicit approval reference before the full
+  Promptfoo suite can be run through paid model calls. That is acceptable for
+  the current dry-run suite, but it is not ready for future API-backed evals.
+- Evidence: `promptfoo/providers/keystone_agent_provider.py` appends
+  `--live-sdk` when `vars.live_sdk` or `config.live_sdk` is truthy; otherwise it
+  appends `--no-live-sdk`. `promptfooconfig.yaml` currently sets
+  `live_sdk: false`, and no committed Promptfoo cases opt in to live SDK, but
+  `package.json` runs the full Promptfoo config with no budget or case-limit
+  arguments. `docs/EVALS.md` Phase 6 says the live runner should require
+  explicit live flags, `KEYSTONE_OPENAI_API_KEY`, budget, max-case-count, and
+  model/provider arguments; `promptfoo/eval_manifest.yaml` says live reviewed
+  cases should run only when budget and approvals are set.
+- Expected fix: Before enabling paid Promptfoo/API evals, add a separate live
+  eval runner or provider guard that requires an explicit budget amount, max
+  case count, approved case allowlist, model/provider label, and approval/run
+  label. It should fail closed when `live_sdk: true` is present without those
+  controls, estimate or record expected spend, and keep the existing dry-run
+  `npm run eval:promptfoo*` commands incapable of accidentally running the full
+  suite through live SDK calls.
+- Fix: The Promptfoo provider now fails closed for `live_sdk=true` unless the
+  case/config supplies approval, budget, max-case count, approved case
+  allowlist, run label, and model provider/name. The committed Promptfoo config
+  remains explicit dry-run/no-live-search by default.
+- Verification: Provider regression coverage confirms missing live controls
+  block before `ask_agent.py` runs, while a fully controlled live-search config
+  passes `--live-sdk`, `--live-search`, budget metadata, and model/search
+  provenance into the compact output.
+
+### P2 - EVAL-UX-013: Slack eval context files lack retention and redaction guardrails
+
+- Found: 2026-06-14 11:40 EDT
+- Fixed: 2026-06-14 11:58 EDT
+- Status: fixed
+- Area: `src/keystone_agents/slack_actions.py`,
+  `promptfoo/providers/keystone_agent_provider.py`, eval Slack context storage.
+- Issue: The selected-message eval path writes the selected Slack message and
+  bounded thread context to disk under `artifacts/slack_contexts`, and the
+  Promptfoo provider writes `slack_context` fixtures to a temporary directory,
+  but there is no eval-specific retention, cleanup, redaction, or sensitivity
+  classification contract for those context files. This is separate from SDK
+  trace capture: the raw context file can persist message text before a future
+  API-backed run ever reaches tracing.
+- Evidence: `write_selected_message_context_file()` serializes the full
+  `SlackSelectedMessageContext`, including `selected_message.text` and
+  `thread_messages`, to `artifacts/slack_contexts`. The Promptfoo provider
+  creates `kba-promptfoo-slack-*` directories with `tempfile.mkdtemp()` and
+  writes `slack-context.json` when a case includes `slack_context`; the provider
+  does not remove that directory after `ask_agent.py` exits. Current docs say
+  Slack context should be bounded, read-only, and sanitized for Promptfoo
+  fixtures, but they do not define retention or redaction guarantees for the
+  files created during live eval workflows.
+- Expected fix: Add an eval context-file lifecycle contract before richer live
+  Slack/API evals: store only the minimum bounded context needed for review,
+  redact or hash sensitive fields where possible, tag context files with
+  sensitivity and eval run metadata, clean temporary Promptfoo context
+  directories after provider execution, and add an operator cleanup/readiness
+  check for persisted `artifacts/slack_contexts` files that are no longer needed
+  for review.
+- Fix: Selected-message context files now include local-only sensitivity,
+  retention, and bounded raw-text metadata. Promptfoo provider context fixtures
+  are tagged similarly and their temporary `kba-promptfoo-slack-*` directories
+  are removed after the child process unless explicitly kept for debugging.
+- Verification: Provider coverage asserts the temporary context file exists
+  during child execution, includes sensitivity metadata, and is deleted after a
+  failed provider run.
+
+### P1 - EVAL-UX-014: Promptfoo assertions do not prove no external writes
+
+- Found: 2026-06-14 11:42 EDT
+- Fixed: 2026-06-14 11:58 EDT
+- Status: fixed
+- Area: `promptfoo/providers/keystone_agent_provider.py`,
+  `promptfoo/assertions/kba_slack_invariants.py`, live/API eval side-effect
+  gates.
+- Issue: The live API eval requirements say benchmark runs must not send email,
+  post Slack messages, schedule follow-ups, create Gmail drafts, or write
+  external systems without scoped approval. The current Promptfoo compact
+  payload and invariant only check `can_send_email`, `send_enabled`, and whether
+  `send_email` appears in `forbidden_actions`. That proves the email-send flag
+  is off, but it does not prove the run avoided Slack posts, Gmail drafts,
+  labels, calendar/scheduling writes, CRM writes, file writes, or other
+  side-effect paths.
+- Evidence: `kba_slack_invariants.py` implements `enforce_no_send` by checking
+  `payload.get("can_send_email")`, `payload.get("send_enabled")`, and the
+  presence of `send_email` in `forbidden_actions`. The provider compact output
+  includes those email fields, but does not normalize `slack_post_allowed`,
+  `external_write_performed`, Gmail draft/label flags, CRM write blockers, or a
+  general side-effect ledger. `docs/EVALS.md` Phase 6 requires the live runner
+  to preserve draft-only/no-send/no-external-write behavior and to avoid Gmail,
+  Slack, CRM, scheduling, and other external write paths.
+- Expected fix: Before paid API evals, extend the compact Promptfoo payload and
+  invariant contract with a general side-effect proof: normalized booleans or a
+  ledger for email sends, Gmail drafts/labels, Slack posts, CRM writes,
+  scheduling/calendar writes, file/external writes, approval references, and any
+  blocked write attempts. The default assertion should fail if any unapproved
+  side-effect flag is true or if the run cannot provide side-effect evidence
+  for live/API eval mode.
+- Fix: Compact Promptfoo output now includes
+  `keystone.promptfoo.side_effects.v1` evidence for email, Gmail, Slack, CRM,
+  calendar, and external file writes. The default Slack invariant fails when
+  side-effect evidence is missing/incomplete or any unapproved external-write
+  flag is true.
+- Verification: Assertion coverage now accepts safe no-write payloads and
+  rejects a payload that reports a Slack post/external write.
+
+### P1 - EVAL-UX-015: Promptfoo/Slack evals do not write to the benchmark store
+
+- Found: 2026-06-14 11:43 EDT
+- Fixed: 2026-06-14 11:58 EDT
+- Status: fixed
+- Area: `promptfoo/eval_database.py`, `src/keystone_agents/benchmark_tracking.py`,
+  `scripts/promptfoo_eval_db.py`, `scripts/summarize_benchmark_results.py`.
+- Issue: Static and local eval runs can be recorded in the benchmark store, but
+  Promptfoo imports and Slack eval runs are stored only in the Promptfoo eval
+  database. A future live/API eval run through the Slack-shaped Promptfoo path
+  therefore cannot be compared directly with static/local baseline runs through
+  `scripts/summarize_benchmark_results.py` unless an operator manually converts
+  rows or runs a separate benchmark harness.
+- Evidence: `scripts/run_evals.py` and `scripts/run_local_evals.py` call
+  `record_eval_summary()` when `--record-benchmark` is passed, which writes
+  `benchmark_runs` and `benchmark_case_scores` in `.keystone/state/benchmark_evals.sqlite`.
+  Promptfoo import code writes `promptfoo_eval_runs` and
+  `promptfoo_case_results`; Slack eval saves write `slack_eval_runs`; neither
+  path imports `benchmark_tracking` or records to the benchmark store.
+  `docs/EVALS.md` Phase 6 says live runs should record to the benchmark store
+  and be comparable with static/local baselines, while `docs/PROMPTFOO_EVALS.md`
+  says budgeted live benchmarks should use the existing benchmark store.
+- Expected fix: Add an explicit bridge from imported Promptfoo/Slack eval rows
+  to the benchmark store before future API runs. It should map case IDs,
+  agents, scores, prompt/model provenance, human/machine score status, and run
+  labels into benchmark rows without raw private content, and expose a command
+  or guarded import path so live Slack-shaped evals can be compared with
+  `baseline-static` and `baseline-local` runs through the existing benchmark
+  summary tooling.
+- Fix: Added `record_promptfoo_eval_to_benchmark()` and
+  `scripts/promptfoo_eval_db.py record-benchmark` to export imported Promptfoo
+  rows plus linked Slack eval rows into the existing benchmark store without
+  raw request/response bodies.
+- Verification: Regression coverage records Promptfoo and Slack eval rows to a
+  temp benchmark DB and verifies benchmark case scores preserve case IDs,
+  agents, prompt versions, and provenance keys for comparison with baseline
+  runs.
+
+### P1 - EVAL-UX-016: Promptfoo provider failure payloads can persist raw child output
+
+- Found: 2026-06-14 11:45 EDT
+- Fixed: 2026-06-14 11:58 EDT
+- Status: fixed
+- Area: `promptfoo/providers/keystone_agent_provider.py`,
+  `.keystone/promptfoo/latest-eval.json`, Promptfoo logs and error imports.
+- Issue: Failed Promptfoo provider runs return raw child `stdout` and `stderr`
+  in the provider output payload. During future live/API evals, child output can
+  include the original prompt, Slack context snippets, provider diagnostics, or
+  exception text. Because Promptfoo JSON results and logs are stored locally
+  under `.keystone/promptfoo/`, a failed run can retain more raw eval context
+  than the compact successful-output contract intends.
+- Evidence: `call_api()` runs `scripts/ask_agent.py` with
+  `capture_output=True`. On non-zero exit it calls `_provider_error(...,
+  stderr=completed.stderr, stdout=completed.stdout)`. On JSON parse failure it
+  also includes full `completed.stdout` and `completed.stderr`. `_provider_error()`
+  copies all non-empty extras into the JSON `output` string. The npm
+  `eval:promptfoo:json` path writes Promptfoo results to
+  `.keystone/promptfoo/latest-eval.json`, and the docs state Promptfoo run
+  history, results, cache, and logs are kept under `.keystone/promptfoo/`.
+- Expected fix: Redact and cap Promptfoo provider failure payloads before live
+  API evals. Store structured failure kind, return code, timeout flag, elapsed
+  seconds, and short redacted excerpts only; remove raw prompt/context text and
+  secret-shaped values from stdout/stderr. Add regression coverage for non-zero
+  exit, timeout, and non-JSON stdout paths, and include a data-quality check that
+  failed Promptfoo/API eval rows do not contain raw Slack context or secrets.
+- Fix: Provider errors now emit structured failure metadata with capped,
+  redacted `stdout_excerpt`/`stderr_excerpt` fields. Raw `stdout`/`stderr`
+  keys are no longer persisted, context-bearing lines are replaced, and
+  secret-shaped values are redacted.
+- Verification: Provider failure coverage asserts non-zero child output omits
+  raw stdout/stderr, redacts secret-shaped tokens, strips raw Slack context
+  lines, and still reports a structured failure kind.
+
+### P1 - EVAL-UX-017: Promptfoo live-search activation is implicit and not case-scoped
+
+- Found: 2026-06-14 11:46 EDT
+- Fixed: 2026-06-14 11:58 EDT
+- Status: fixed
+- Area: `promptfoo/providers/keystone_agent_provider.py`,
+  `src/keystone_agents/cli.py`, `src/keystone_agents/config.py`,
+  Promptfoo live/API eval configuration.
+- Issue: The Promptfoo provider exposes a `live_sdk` switch, but it does not
+  expose an explicit `live_search` switch, search-provider selection, or
+  per-case retrieval budget. When `--live-sdk` is passed, the CLI can enable
+  live search implicitly from `KEYSTONE_LIVE_MODE`, `KEYSTONE_DRY_RUN`, and
+  `KEYSTONE_ENABLE_LIVE_RESEARCH`. That makes future Promptfoo/API eval
+  retrieval behavior depend on ambient shell state instead of the case row or
+  run label.
+- Evidence: `keystone_agent_provider.call_api()` appends `--live-sdk` or
+  `--no-live-sdk`, but never appends `--live-search` or a search provider
+  option. `_run_ask()` sets `live_search = args.live_search or (live_sdk and
+  cli_default_live_research())`; `cli_default_live_research()` reads
+  `KEYSTONE_ENABLE_LIVE_RESEARCH` and live-mode env state. Existing CLI coverage
+  verifies that named-agent asks receive `--live-search` when those env flags
+  are set. The Promptfoo dry-run suite has a case proving live-search wording
+  remains dry-run-safe, but there is no corresponding case-scoped live-search
+  opt-in contract for API evals.
+- Expected fix: Before paid Promptfoo/API evals, make live retrieval explicit in
+  the eval-run contract. Provider config and/or case vars should declare
+  `live_search`, search provider, fallback provider, max search calls/results,
+  extraction policy, and budget label; the provider should fail closed if
+  ambient env would enable live search without the case/run opting in. Persist
+  the resolved retrieval mode and provider sequence in eval provenance so runs
+  are reproducible.
+- Fix: Promptfoo provider config/case vars now support explicit `live_search`,
+  search provider/fallback provider, max search calls, and max search results.
+  The provider passes `--live-search` only for explicit opt-in, forces
+  `KEYSTONE_ENABLE_LIVE_RESEARCH=false` for non-live-search cases, and blocks
+  ambient live-search activation when live SDK is enabled without case opt-in.
+- Verification: Provider regression coverage confirms ambient live-search env
+  blocks without case opt-in, and explicit live-search config passes the CLI
+  flag, provider env, and provenance fields.
+
+### P1 - EVAL-UX-018: Promptfoo case intake lacks an automated sanitation gate
+
+- Found: 2026-06-14 11:48 EDT
+- Fixed: 2026-06-14 15:08 EDT
+- Status: fixed
+- Area: `promptfoo/tests/*.yaml`, `scripts/check_eval_slack_readiness.py`,
+  `promptfoo/eval_dashboard.py`, live Slack ask promotion workflow.
+- Issue: The eval docs require committed Promptfoo cases and promoted live
+  Slack asks to be sanitized before use, but the current eval workflow does not
+  appear to have an automated case-intake gate for raw private names, email
+  bodies, PHI, credentials, customer context, or secret-like values. Before
+  future API evals, relying only on manual redaction creates a high-risk path
+  where an unsanitized Slack ask or fixture row can become model input,
+  dashboard HTML, Promptfoo JSON output, or benchmark metadata.
+- Evidence: `docs/PROMPTFOO_EVALS.md` says real Slack asks should be captured
+  only after redaction and converted into sanitized Promptfoo rows. `docs/EVALS.md`
+  says fixture inputs must keep raw private messages, credentials, PHI, and
+  unredacted customer data out. Current Promptfoo tests/readiness checks inspect
+  case inventory, prompt text presence, and whether source/thread cases include
+  self-contained context, but the searched eval workflow did not show a
+  Promptfoo-specific sanitizer or readiness check that scans `user_input`,
+  `slack_context.thread_messages`, source excerpts, required terms, or notes for
+  common private-data and secret patterns before API runs.
+- Expected fix: Add a Promptfoo/eval sanitation gate before paid API evals. It
+  should scan committed case YAML and any promoted Slack ask artifact for
+  high-signal secrets, email addresses, phone numbers, raw Gmail headers,
+  patient/PHI-like content, private customer names, and unapproved raw Slack
+  excerpts; emit case-id-specific blockers; and integrate with strict readiness
+  so API evals cannot start until every selected case has passed redaction
+  review or carries an explicit sanitized-fixture exemption.
+- Fix: Added a Promptfoo case sanitizer, wired it into Slack eval readiness,
+  scanned both `tests:` mapping files and top-level-list files, and failed
+  unsafe case content unless explicitly exempted.
+- Verification: Regression coverage exercises unsafe top-level-list fixtures;
+  readiness now reports the committed Promptfoo case sanitation check.
+
+### P1 - EVAL-UX-019: Promptfoo live evals inherit the full parent environment
+
+- Found: 2026-06-14 11:49 EDT
+- Fixed: 2026-06-14 15:08 EDT
+- Status: fixed
+- Area: `promptfoo/providers/keystone_agent_provider.py`,
+  `src/keystone_agents/config.py`, `src/keystone_agents/model_provider.py`,
+  live/API eval child-process setup.
+- Issue: Promptfoo provider child runs inherit the full parent environment.
+  Future live/API evals should use the repo-local `KEYSTONE_OPENAI_API_KEY` and
+  only the credentials explicitly allowed for that eval lane, but the current
+  provider passes all ambient env vars through to `scripts/ask_agent.py`. That
+  can make a paid eval depend on unrelated local credentials or live-integration
+  toggles from the operator shell.
+- Evidence: `keystone_agent_provider.call_api()` builds `env = os.environ.copy()`
+  and only adds `KEYSTONE_PROMPTFOO_EVAL` plus `KEYSTONE_EVAL_SURFACE` before
+  launching the child process. The model provider correctly requires
+  `KEYSTONE_OPENAI_API_KEY` for OpenAI live model execution, but the broader
+  config also reads ambient `GEMINI_API_KEY`, `LITELLM_BASE_URL`,
+  `SLACK_BOT_TOKEN`, Gmail/Google credential env vars, and live-mode toggles.
+  `EVAL-UX-017` covers implicit live-search activation; this issue is broader
+  because any inherited credential or live toggle can change what tools are
+  reachable during an API eval.
+- Expected fix: Add a Promptfoo/API eval environment allowlist before paid runs.
+  The provider should construct a minimal child env from explicit eval-run
+  config: repo-local model credentials, model/provider labels, selected
+  retrieval credentials only when the case opts in, eval DB paths, and safe
+  tracing/readiness flags. It should clear unrelated Gmail, Slack, CRM, Google,
+  generic `OPENAI_API_KEY`, and gateway credentials unless the run contract
+  explicitly allows them, and record the allowed credential categories in
+  sanitized provenance.
+- Fix: Promptfoo child runs now use a minimal allowlisted environment,
+  preserve repo-local OpenAI credentials only for approved OpenAI live evals,
+  avoid generic `OPENAI_API_KEY` and unrelated Slack/Gmail credentials, and
+  record allowed credential categories in provenance.
+- Verification: Provider regression coverage confirms the live child env keeps
+  `KEYSTONE_OPENAI_API_KEY` plus selected search credentials and excludes
+  unrelated ambient credentials.
+
+### P1 - EVAL-UX-020: Promptfoo successful-result storage can retain raw API eval text
+
+- Found: 2026-06-14 11:57 EDT
+- Fixed: 2026-06-14 15:08 EDT
+- Status: fixed
+- Area: `promptfoo/eval_database.py`, `promptfoo/eval_dashboard.py`,
+  `promptfoo/providers/keystone_agent_provider.py`, future Promptfoo/API eval
+  storage and review exports.
+- Issue: Successful Promptfoo imports store full case vars and full provider
+  response payloads in the local eval database, then dashboard views and exports
+  surface prompt and response text directly. That is acceptable for local
+  sanitized dry-run fixtures, but future paid/API evals need a stronger
+  storage-mode distinction so raw prompts, raw model responses, Slack snippets,
+  drafts, or private request content do not become the durable default for
+  successful runs.
+- Evidence: `_insert_promptfoo_case_result()` upserts `eval_cases.user_input`
+  from `vars.user_input` and stores `json.dumps(vars_)` plus
+  `json.dumps(response)` into `promptfoo_case_results.vars_json` and
+  `output_json`. `eval_case_status()` rehydrates those JSON columns. The
+  dashboard maps `user_input` to `prompt`, derives `response_text` from
+  Promptfoo output, renders both in case/database tables, and includes
+  `latest_response` in exports. `docs/EVALS.md` says benchmark storage should
+  track observed output keys, not raw observed payloads, drafts, email bodies,
+  or private request content; `docs/PROMPTFOO_EVALS.md` says real Slack asks
+  should be captured only after redaction.
+- Expected fix: Add an API-eval-safe storage mode for Promptfoo results. For
+  live/API evals, persist compact redacted prompt and response summaries,
+  hashes, schema keys, assertion outcomes, source counts, route/tool metadata,
+  and provenance instead of full raw `vars_json`/`output_json`. Keep any raw
+  local-review payload behind an explicit local-only mode with retention
+  controls, and make dashboard/export UI label redacted vs local-review rows.
+  Add a readiness/data-quality check that blocks paid API evals when selected
+  cases or successful result rows would store raw private inputs or raw observed
+  outputs by default.
+- Fix: Promptfoo live/API result imports now default to `api_redacted` storage,
+  persist prompt/response hashes plus compact redacted summaries and safe
+  metadata, and expose storage mode/hash fields to dashboard data-quality
+  checks.
+- Verification: Import/benchmark regression coverage proves live Promptfoo rows
+  do not retain raw email or secret-shaped values and data-quality checks
+  recognize API-safe storage.
+
+### P2 - EVAL-UX-021: Trace readiness reports env state instead of effective SDK trace safety
+
+- Found: 2026-06-14 12:05 EDT
+- Fixed: 2026-06-14 15:08 EDT
+- Status: fixed
+- Area: `promptfoo/eval_dashboard.py`, `src/keystone_agents/model_provider.py`,
+  `src/keystone_agents/sdk.py`, trace readiness/data-quality reporting.
+- Issue: The Traces tab and data-quality card report trace readiness from
+  display-oriented environment values instead of the effective Keystone SDK
+  trace configuration. This can show `Sensitive capture: not_set` even when
+  Keystone live/local run config defaults `trace_include_sensitive_data` to
+  `False`, and it can make the top Traces cards feel repetitive or less useful
+  for deciding whether future API eval traces are safe and diagnosable.
+- Evidence: `_trace_dashboard_summary()` reads
+  `OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA` into `sensitive_data_env` and
+  the Traces tab renders that as the `Sensitive capture` card. The dashboard
+  readiness check only verifies whether `KEYSTONE_TRACE_PROCESSOR=eval_summary`
+  is enabled. In contrast, `get_trace_config()` reads
+  `KEYSTONE_TRACE_INCLUDE_SENSITIVE_DATA` with default `False`, and
+  `build_live_run_config()` passes the effective
+  `trace_include_sensitive_data` value into the Agents SDK `RunConfig`.
+- Expected fix: Replace the Traces tab top boxes with API-eval-specific
+  readiness signals derived from effective runtime state, not only raw env
+  strings. Suggested cards: effective sensitive capture state, trace join
+  coverage by case/run, unjoined or missing trace events, last trace flush/write
+  status, and API-eval-safe storage mode. The data-quality/readiness check
+  should pass only when the effective trace config is safe, the eval summary
+  processor is enabled for the selected API-eval lane, and the dashboard labels
+  whether rows are sanitized trace summaries rather than raw prompts/responses.
+- Fix: Trace readiness now derives effective sensitive-capture and tracing
+  state from Keystone trace config, uses the repo's
+  `KEYSTONE_TRACE_INCLUDE_SENSITIVE_DATA` default, and adds a data-quality gate
+  for effective sensitive capture.
+- Verification: Dashboard regression coverage asserts effective sensitive
+  capture is disabled by default and the data-quality check passes on that
+  effective state.
+
+### P1 - EVAL-UX-022: Slack benchmark bridge can mark rows passing from run status alone
+
+- Found: 2026-06-14 12:16 EDT
+- Fixed: 2026-06-14 15:08 EDT
+- Status: fixed
+- Area: `promptfoo/eval_database.py`, `scripts/promptfoo_eval_db.py`,
+  `src/keystone_agents/benchmark_tracking.py`, Promptfoo/Slack benchmark
+  scoring.
+- Issue: The Promptfoo-to-benchmark bridge can record linked Slack eval rows as
+  passing based only on a saved run status, and an empty status currently counts
+  as pass. Future API eval trend data should not treat a Slack run as a passed
+  benchmark case unless the required safety invariants, source/thread evidence,
+  and quality or human-review thresholds are present and passing.
+- Evidence: `_benchmark_slack_result()` sets `passed = status in {"done",
+  "complete", "completed"} or not status` and writes a single
+  `slack_run_status` check. It does not join the latest human review, safety
+  pass/fail, source visibility thresholds, side-effect evidence, or Promptfoo
+  assertion outcome before assigning `score=1.0`. Existing benchmark bridge
+  coverage verifies that Promptfoo and Slack rows are written with provenance,
+  but it does not assert that Slack benchmark rows require explicit safety and
+  quality gates. `docs/EVALS.md` says a benchmark case passes only when all
+  required safety invariants pass and the quality score meets the threshold.
+- Expected fix: Make Slack benchmark rows non-passing until they have explicit
+  evidence for the selected scoring contract: linked run id, thread/source
+  evidence, side-effect/no-write proof, human safety, required quality scores
+  or machine assertions, and any case-specific thresholds. Empty status should
+  not pass. Add tests for a done Slack run without human safety/evidence
+  remaining non-passing, and for a fully reviewed Slack/API eval row mapping
+  safety, rubric subscores, and observed-key-only provenance into the benchmark
+  store.
+- Fix: Slack benchmark rows now require explicit completed status, thread
+  evidence, source/response evidence, side-effect/no-write evidence, passing
+  human safety, and a human quality threshold before passing.
+- Verification: Benchmark bridge regression coverage records one incomplete
+  Slack row as failed and one fully reviewed Slack row as passed.
+
+### P1 - EVAL-UX-023: Slack and human-review eval rows keep raw text in the review database and exports
+
+- Found: 2026-06-14 12:28 EDT
+- Fixed: 2026-06-14 15:08 EDT
+- Status: fixed
+- Area: `promptfoo/eval_database.py`, `promptfoo/human_review.py`,
+  `promptfoo/eval_dashboard.py`, Slack eval persistence and dashboard exports.
+- Issue: Slack eval runs and human scorecards persist raw operator-facing text
+  separately from the Promptfoo result payload path. Before future API evals,
+  the local review database and CSV/dashboard exports need the same
+  storage-mode distinction as Promptfoo results so raw Slack requests, raw agent
+  summaries, full score replies, or free-form review notes do not become durable
+  or exportable by default.
+- Evidence: `record_slack_eval_run()` writes `request_text` to both
+  `eval_cases.user_input` and `slack_eval_runs.request_text`, and writes
+  `result_summary` to `slack_eval_runs.result_summary`. `parse_human_review()`
+  stores the complete score reply as `HumanEvalReview.raw_text`, and
+  `save_human_review()` persists it in `human_eval_reviews.raw_text` while also
+  saving free-form `notes`. The dashboard uses `latest_slack_summary` and
+  `human_notes` in case views, and `dashboard_case_export_csv()` exports
+  `prompt`, `latest_response`, and `human_notes`.
+- Expected fix: Add an eval DB storage policy for Slack run and human-review
+  text before paid/API evals. Store hashes, compact redacted summaries, schema
+  keys, review scores, safety, and join IDs by default; keep raw request,
+  response, raw score reply, and notes only in an explicit local-review mode
+  with retention/redaction controls. Dashboard tables and CSV exports should
+  label redacted rows, avoid exporting raw prompt/response/notes in API-eval
+  safe mode, and add readiness checks that fail paid runs when raw Slack or
+  review text would be persisted/exported by default.
+- Fix: Slack live eval rows and opt-in human reviews now support
+  `api_redacted` storage with redacted text plus request/result/raw-review/note
+  hashes; live SDK Slack rows choose API-safe storage automatically.
+- Verification: Regression coverage proves Slack run text and human-review
+  notes/raw replies do not retain raw email or secret-shaped values in
+  API-redacted mode.
+
+### P1 - EVAL-UX-024: Promptfoo live max-case guard is declared but not enforced against selected cases
+
+- Found: 2026-06-14 12:33 EDT
+- Fixed: 2026-06-14 15:08 EDT
+- Status: fixed
+- Area: `promptfoo/providers/keystone_agent_provider.py`,
+  `scripts/check_eval_slack_readiness.py`, `promptfoo/tests/*.yaml`,
+  Promptfoo live/API eval runner setup.
+- Issue: The current live guard requires a positive `max_cases`, but it does
+  not enforce that cap against the approved case allowlist, the selected
+  Promptfoo test set, or any Promptfoo matrix expansion. A paid eval can
+  therefore look budget-controlled because `max_cases` is present while still
+  running more live cases than the operator intended.
+- Evidence: `_live_eval_guard()` parses `max_cases` and only checks that it is
+  present and greater than zero. It verifies that the current `case_id` is in
+  `case_allowlist`, but it does not compare `len(case_allowlist)` to
+  `max_cases`, does not track how many cases have already run in the current
+  Promptfoo invocation, and does not validate the actual expanded Promptfoo case
+  count before model calls. The docs warn that list-valued `vars` can trigger
+  Promptfoo matrix expansion, while current readiness coverage counts committed
+  prompts by scanning `agent_under_test:` lines rather than validating the
+  selected live run cardinality.
+- Expected fix: Move max-case enforcement to an eval-run preflight or shared
+  live-run state, not only a per-case provider check. The live runner should
+  resolve the exact selected/expanded case IDs before calling the model, fail if
+  that count exceeds `max_cases` or the approved allowlist, reject unintended
+  matrix expansion unless explicitly requested, and persist selected-case count
+  plus estimated spend in run provenance/readiness output.
+- Fix: Promptfoo live guard now rejects allowlists, selected case lists, and
+  selected-case counts that exceed `max_cases`, and rejects selected cases not
+  present in the approved allowlist.
+- Verification: Provider regression coverage blocks allowlists and
+  selected-case counts larger than the approved `max_cases` cap.
+
+### P1 - EVAL-UX-025: Benchmark failure and check messages can persist raw observed values
+
+- Found: 2026-06-14 12:40 EDT
+- Fixed: 2026-06-14 15:08 EDT
+- Status: fixed
+- Area: `src/keystone_agents/benchmark_tracking.py`,
+  `scripts/run_local_evals.py`, local/static benchmark storage.
+- Issue: The benchmark tracker intentionally stores only observed output keys,
+  but failure strings and check messages are stored verbatim. That leaves a
+  second path for raw observed values, draft text, email snippets, Slack text,
+  or other private fixture content to enter `.keystone/state/benchmark_evals.sqlite`
+  when a case fails or a grader includes observed values in its message.
+- Evidence: `record_eval_summary()` writes `failures_json` directly from
+  `item.get("failures")` and `_compact_checks()` stores
+  `str(item.get("message") or "")[:240]`. Local eval helpers such as `_fail()`
+  append messages shaped like `field: observed {observed!r}, expected
+  {expected!r}`, and other local graders append missing/forbidden text details.
+  `docs/EVALS.md` says benchmark storage should keep observed output keys only,
+  not raw observed payloads, drafts, email bodies, or private request content.
+- Expected fix: Add a benchmark-safe failure-message contract. Store structured
+  failure codes, field names, expectation labels, and short redacted summaries
+  instead of raw observed values; cap and redact all check messages before
+  writing `checks_json` or `failures_json`; and add regression coverage with a
+  failing case containing secret-shaped, email-body, and draft-like observed
+  text to prove benchmark rows do not retain the raw payload.
+- Fix: Benchmark storage now redacts and caps check messages and failure
+  strings, including secret-shaped values, emails, bearer tokens, and long
+  observed/actual/got payloads.
+- Verification: Benchmark regression coverage stores a failing row containing
+  raw email and secret-shaped observed values and confirms only redacted
+  summaries persist.
+
+### P1 - EVAL-UX-026: Promptfoo sanitizer ignores the current top-level-list case files
+
+- Found: 2026-06-14 12:51 EDT
+- Fixed: 2026-06-14 15:08 EDT
+- Status: fixed
+- Area: `promptfoo/eval_sanitizer.py`,
+  `scripts/check_eval_slack_readiness.py`, `promptfoo/eval_dashboard.py`,
+  `promptfoo/tests/*.yaml`, API eval sanitation readiness.
+- Issue: The eval sanitizer exists, but it only scans Promptfoo files shaped as
+  a mapping with a `tests:` key. The committed Promptfoo case files are
+  top-level YAML lists, so the sanitizer can report `status=pass` after
+  scanning zero cases. That leaves the Slack-to-evals case-intake path without
+  an effective automated sanitation gate before future API runs.
+- Evidence: `scan_promptfoo_case_files()` sets `cases = data.get("tests") if
+  isinstance(data, dict) else []`. The committed Promptfoo files such as
+  `promptfoo/tests/slack_research.yaml`,
+  `promptfoo/tests/slack_retrieval_synthesis.yaml`,
+  `promptfoo/tests/slack_tool_safety.yaml`,
+  `promptfoo/tests/slack_agent_coverage.yaml`, and
+  `promptfoo/tests/slack_agent_expansion_15.yaml` all begin with top-level
+  `- description:` entries. A local scanner check returned
+  `{"case_count": 0, "issue_count": 0, "status": "pass"}`, and the strict Slack
+  eval readiness script/dashboard data-quality checks do not currently call the
+  sanitizer.
+- Expected fix: Support both Promptfoo root shapes (`tests:` mappings and
+  top-level lists), fail closed when expected case files produce zero scanned
+  cases, wire the sanitizer into strict Slack/API eval readiness, and add
+  regression coverage proving the current committed cases are scanned and an
+  unsafe top-level-list fixture fails without an explicit reviewed exemption.
+- Fix: Promptfoo sanitation scanning now supports top-level-list case files,
+  fails closed on empty expected files, and is part of strict readiness.
+- Verification: Sanitizer regression coverage proves unsafe top-level-list
+  fixtures fail and the committed case scan covers the current Promptfoo files.
+
+### P2 - EVAL-UX-027: Trace summary scalar fields are not sanitized like trace metadata
+
+- Found: 2026-06-14 12:58 EDT
+- Fixed: 2026-06-14 15:08 EDT
+- Status: fixed
+- Area: `src/keystone_agents/trace_processor.py`,
+  `src/keystone_agents/model_provider.py`, `promptfoo/eval_database.py`,
+  trace summary storage and dashboard rendering.
+- Issue: The eval trace processor rejects unsafe `metadata`, but it persists
+  trace scalar fields such as workflow/span name, group id, parent id, trace id,
+  and span id after only newline removal and truncation. Future API eval traces
+  should treat those fields as join keys and labels, not as a place where raw
+  Slack text, prompts, customer names, or secret-shaped values can survive.
+- Evidence: `KeystoneEvalTraceProcessor._metadata()` calls
+  `sanitize_trace_metadata()` and replaces unsafe metadata with
+  `metadata_status=rejected_unsafe`. In contrast, `_safe_trace_payload()` writes
+  `trace_id`, `span_id`, `parent_id`, `name`, and `group_id` from SDK objects
+  through `_clean_scalar()`, which only strips whitespace, removes newlines, and
+  truncates to 160 characters. `TraceConfig.__post_init__()` sanitizes
+  `trace_metadata`, but `workflow_name` and `group_id` are only stripped and can
+  also come from `KEYSTONE_TRACE_WORKFLOW_NAME` and `KEYSTONE_TRACE_GROUP_ID`.
+  `record_eval_trace_event()` then persists those scalar fields directly into
+  `eval_trace_events`.
+- Expected fix: Add a trace-summary scalar-field safety contract before enabling
+  API eval trace capture. Restrict names and group IDs to approved labels or
+  join-key patterns, hash or reject unsafe/free-form values, and add tests where
+  workflow name, group id, span name, or trace ids contain email, secret-like,
+  PHI-like, or Slack-message text to prove the local trace DB and dashboard do
+  not retain the raw value.
+- Fix: Trace summary scalar fields now use identifier-safe join keys or
+  redacted hash labels, and workflow/span names redact or hash unsafe text
+  before persistence.
+- Verification: Trace processor regression coverage proves raw email and
+  secret-shaped scalar values are absent from persisted trace rows.
+
+### P1 - SDK-SESSION-001: SDK session history is reused without a retrieval cap or compaction policy
+
+- Found: 2026-06-14 15:31 EDT
+- Fixed: 2026-06-14 15:59 EDT
+- Status: fixed
+- Area: `src/keystone_agents/sdk_sessions.py`, `src/keystone_agents/sdk.py`,
+  `src/keystone_agents/workflow_runner.py`, Slack/WorkItem live SDK continuity
+  and cost controls.
+- Issue: Local SDK sessions improve follow-up context by reusing a stable
+  SQLite-backed conversation for Slack threads and WorkItems, but the current
+  session builder retrieves the full stored history by default. A long Slack
+  thread or repeated WorkItem follow-up can therefore keep appending old user
+  inputs, assistant outputs, tool calls, and final synthesis turns into every
+  future model call. That improves continuity, but it can also drive up input
+  tokens, increase stale-context risk, and dilute the carefully bounded
+  WorkItem/context-pack state that should remain canonical.
+- Evidence: `build_sdk_session()` delegates to `build_sqlite_session()` with
+  only a derived session id and database path. `build_sqlite_session()` creates
+  the Agents SDK `SQLiteSession(session_id, db_path)` without
+  `SessionSettings(limit=...)`, a `RunConfig.session_settings` override, a
+  `session_input_callback`, or a compaction wrapper. The installed Agents SDK
+  default is `SessionSettings(limit=None)`, which retrieves all available
+  session items. The repo already documents that WorkItems remain canonical
+  state and that thread-specific sessions are intended for follow-up wording and
+  cache grouping, not unlimited business-state replay.
+- Expected fix: Add a Keystone SDK session retention policy before broad live
+  Slack/API use. Keep WorkItems, context packs, approvals, audit rows, and
+  artifacts canonical, while using SDK sessions as bounded conversation
+  continuity. Configure per-scope defaults such as recent-item limits,
+  session-input filtering, or Responses compaction for long sessions; exclude
+  final-response-only or intermediate repair turns when they would pollute
+  specialist context; expose env/CLI overrides; and record audit-safe
+  `session_item_count`, `session_items_sent`, limit/compaction mode, and
+  truncation status in request-cache metadata.
+- Fix: Added the centralized `KEYSTONE_SDK_SESSION_HISTORY_LIMIT` policy with a
+  default recent-item cap, passed it into Agents SDK `SQLiteSession` through
+  `SessionSettings(limit=...)`, exposed `--sdk-session-history-limit`, carried
+  the value through `WorkflowRunRequest`, and recorded audit-safe session
+  history mode/limit/truncation metadata on SDK request-cache and WorkItem
+  events.
+- Verification: Ran `.venv/bin/python -m py_compile ...` across the changed SDK
+  session, CLI, run, workflow, schema, and test files; ran `.venv/bin/python -m
+  pytest tests/test_sdk_sessions.py tests/test_sdk_execution.py
+  tests/test_model_provider.py
+  tests/test_workflow_runner.py::test_manager_loop_final_synthesis_uses_configured_sdk_session`
+  with 108 passing tests.
+
+### P1 - SDK-TURNS-001: Specialist SDK turn limits bypass the repo's quality budgets
+
+- Found: 2026-06-14 15:31 EDT
+- Fixed: 2026-06-14 15:51 EDT
+- Status: fixed
+- Area: `src/keystone_agents/agents/business_research_analyst.py`,
+  `src/keystone_agents/agents/opportunity_scout.py`,
+  `src/keystone_agents/agents/gmail_triage.py`,
+  `src/keystone_agents/agents/outreach_composer.py`,
+  `src/keystone_agents/quality_budget.py`, centralized SDK run loop policy.
+- Issue: Keystone has explicit quality budgets for cost/performance tradeoffs,
+  but most direct specialist SDK wrappers do not pass a `max_turns` value into
+  the centralized runner. They silently inherit the OpenAI Agents SDK default of
+  `max_turns=10`, regardless of whether the task is a fast Slack follow-up,
+  balanced research, deep research, simple Gmail triage, or draft-only outreach.
+  That makes cost and tool-loop behavior less predictable than the repo's
+  quality-mode policy suggests.
+- Evidence: `run_typed_sdk_agent()` and `run_typed_sdk_sync()` accept
+  `max_turns`, and the installed Agents SDK `Runner.run`/`run_sync` default is
+  `max_turns=10`. `run_chief_of_staff_sdk()` already passes
+  `budget.max_turns` from `chief_of_staff_quality_budget()` with fast,
+  balanced, and deep values of 4/8/14. Orchestrator specialist-as-tool calls use
+  `max_turns=6`, and final response synthesis uses `max_turns=2`. In contrast,
+  Business Research Analyst, Opportunity Scout, Gmail Triage, and Outreach
+  Composer direct SDK wrappers pass no `max_turns`, even though
+  `quality_budget.py` defines search-heavy budgets of 4/8/12 turns and the docs
+  say quality budgets map fast/balanced/deep modes to model settings, max
+  turns, retrieval caps, and hosted-search caps.
+- Expected fix: Centralize per-agent SDK turn policy and apply it consistently
+  across direct wrappers, WorkItem manager-loop calls, CLI child paths,
+  Promptfoo/API eval paths, and Orchestrator-as-tool execution. Suggested
+  defaults: small caps for Gmail triage and final synthesis, balanced caps for
+  ordinary Business Research/Opportunity Scout, deep caps only when the request
+  explicitly asks for deep/more research or formal evidence, and conservative
+  caps for Outreach Composer because it is draft-only and approval-gated. Add
+  tests that each live/local specialist wrapper passes the resolved
+  `max_turns`, records it in trace/request-cache metadata, and preserves an
+  explicit override for experiments.
+- Fix: Added a centralized direct-wrapper SDK turn policy and wired Business
+  Research Analyst, Opportunity Scout, Gmail Triage, Gmail priority grouping,
+  and Outreach Composer SDK wrappers to pass explicit `max_turns` instead of
+  inheriting the SDK default of 10. Search-heavy agents now use the existing
+  fast/balanced/deep quality budgets; Gmail and Outreach use conservative
+  fixed defaults; every wrapper preserves an explicit `max_turns` override.
+  Request-cache metadata now records the applied cap.
+- Verification: Focused wrapper tests prove resolved defaults, live balanced
+  quality-budget behavior, explicit overrides, and request-cache max-turn
+  metadata. SDK/model regression suite passed.
+
+### P1 - TRACE-OBS-001: Local trace summaries lack a run-level SDK execution record
+
+- Found: 2026-06-14 16:14 EDT
+- Fixed: 2026-06-14 16:59 EDT
+- Status: fixed
+- Area: `src/keystone_agents/trace_processor.py`, `src/keystone_agents/run.py`,
+  `src/keystone_agents/workflow_runner.py`, `promptfoo/eval_database.py`,
+  `promptfoo/eval_dashboard.py`, local eval trace processor and dashboard.
+- Issue: The local eval trace processor stores sanitized trace/span lifecycle
+  events, and WorkItem events can store SDK usage/request-cache metadata, but
+  there is not one durable, sanitized run-summary trace row that explains what
+  happened in an agent run. That makes it hard to inspect a future API eval run
+  and answer basic questions such as which agent/route ran, which WorkItem or
+  eval case it belonged to, which model/provider and session scope were used,
+  how many turns actually ran, how many tool calls happened, whether retries or
+  repair loops occurred, and whether the run ended cleanly.
+- Evidence: `_trace_dashboard_summary()` lists stored trace fields as
+  `event_type`, trace/span IDs, parent ID, name, group ID, sanitized metadata,
+  duration, and created_at. `_safe_trace_payload()` records SDK trace/span
+  identifiers and sanitized SDK metadata only. `_record_workflow_sdk_cost_event()`
+  separately records token usage, cost, and request-cache hashes in WorkItem
+  events, including configured request-cache metadata, but those fields are not
+  joined into `eval_trace_events`. Direct SDK request-cache metadata now records
+  the configured `max_turns`, but the local trace store does not record
+  observed `turns_used`, tool-call counts, handoff counts, retry counts,
+  output-validation or repair status, or normalized failure kind for each run.
+- Expected fix: Add a sanitized `sdk_run_summary` trace event or equivalent
+  run-level trace contract emitted by the centralized SDK runner and WorkItem
+  manager loop. It should include safe join keys (`case_id`, `eval_id`,
+  `work_item_id`, `run_id`, Slack channel/thread IDs where available), agent,
+  route, run stage, live/dry mode, model provider/model, session scope/source
+  and session hash, configured `max_turns`, observed `turns_used` with source,
+  SDK request count, tool-call count by tool name, handoff count, retry count,
+  repair-loop count, retrieval provider summary, prompt/cache hashes, token/cost
+  summary, status, failure kind, and duration. Keep raw prompts, responses, tool
+  inputs/outputs, Slack text, secrets, and PHI out of trace metadata, and add
+  dashboard/readiness coverage proving the run summary joins to eval cases and
+  WorkItems.
+- Fix: Added `keystone.sdk_run_summary.v1` run-level trace events emitted by the
+  centralized SDK runner when eval trace summaries are enabled. The summary
+  persists safe join keys, agent/route/stage, live/run mode, provider/model,
+  session scope/source/hash, max-turn metadata, observed turns source, SDK
+  request count, observed tool-call counts by tool name, handoff count, retry
+  count, retrieval-provider summary, prompt/cache hashes, token/cost summary,
+  status/failure kind, duration, and explicit redaction provenance. WorkItem
+  live Outreach SDK synthesis now passes WorkItem/Slack join metadata through
+  the existing safe trace metadata path.
+- Verification: `.venv/bin/python -m pytest tests/test_trace_processor.py
+  tests/test_sdk_execution.py::test_run_typed_sdk_agent_records_sdk_run_summary_trace
+  tests/test_promptfoo_framework.py::test_eval_dashboard_renders_promptfoo_slack_and_human_state`
+  passed.
+
+### P1 - LOG-OBS-001: Runtime logs are not consistently structured or correlated with trace/run IDs
+
+- Found: 2026-06-14 16:14 EDT
+- Fixed: 2026-06-14 16:26 EDT
+- Status: fixed
+- Area: `scripts/manage_eval_dashboard.sh`,
+  `scripts/run_eval_slack_test_server.py`,
+  `promptfoo/providers/keystone_agent_provider.py`,
+  `scripts/handle_slack_agent_action.py`, child-process logging, dashboard
+  logs, Slack feedback JSONL, and WorkItem event logs.
+- Issue: Keystone has multiple local log surfaces: dashboard stdout/stderr log
+  files, Promptfoo child stdout/stderr capture, Slack feedback JSONL on stderr,
+  WorkItem event rows, and eval database trace rows. Several raw-output leakage
+  issues have been fixed, but these surfaces still do not share a consistent
+  structured log envelope or correlation contract. When an agent run behaves
+  badly, the operator has to stitch together process logs, WorkItem events,
+  eval rows, Slack run IDs, and trace rows manually, and some logs remain plain
+  stdout/stderr lines without severity, component, stage, run ID, trace ID, or
+  redaction provenance.
+- Evidence: `manage_eval_dashboard.sh` writes dashboard stdout/stderr to
+  `.keystone/promptfoo/logs/*.log` and its `logs` command tails plain files.
+  `run_eval_slack_test_server.py` prints readiness and starter-prompt guidance
+  to stdout before serving the dashboard. Promptfoo provider failure handling
+  now stores redacted excerpts instead of raw stdout/stderr, and the backlog
+  already tracks older stderr/feedback issues, but there is no shared local log
+  schema tying log lines to `trace_id`, `run_id`, `case_id`, `work_item_id`,
+  child process ID, route, agent, status, or failure kind.
+- Expected fix: Define a local structured logging contract for eval and
+  business-agent runs. Use JSONL or another machine-readable envelope with
+  timestamp, level, component, event name, agent, route, run stage, process ID,
+  child command kind, case/run/work_item/slack/thread/trace correlation IDs,
+  duration, status, failure kind, and redaction status. Keep human-readable
+  stdout for operator prompts when needed, but mirror diagnostics to structured
+  redacted logs with retention rules. Add tests that failed child runs,
+  dashboard startup failures, Slack feedback events, and SDK trace summaries can
+  be joined by correlation IDs without storing raw prompts, responses, Slack
+  message text, secrets, PHI, or tool I/O.
+- Fix: Added the shared `keystone.structured_log.v1` local log envelope and
+  documentation, with redaction of raw body-like fields and obvious secrets.
+  Slack action feedback JSONL now carries a structured log envelope, Promptfoo
+  provider failures attach redacted structured diagnostics with case/run/Slack
+  correlation where available, the strict Slack eval test server emits
+  structured readiness/starter-prompt failures to stderr, and
+  `manage_eval_dashboard.sh` writes a dashboard manager JSONL sidecar at
+  `.keystone/promptfoo/logs/eval-dashboard.structured.jsonl` while keeping
+  human-readable stdout/stderr.
+- Verification: `zsh -n scripts/manage_eval_dashboard.sh`;
+  `.venv/bin/python -m py_compile src/keystone_agents/structured_logging.py
+  scripts/handle_slack_agent_action.py scripts/run_eval_slack_test_server.py
+  promptfoo/providers/keystone_agent_provider.py
+  tests/test_slack_agent_actions.py tests/test_promptfoo_framework.py`;
+  `.venv/bin/python -m pytest
+  tests/test_slack_agent_actions.py::test_structured_log_event_redacts_secrets_and_body_text
+  tests/test_slack_agent_actions.py::test_slack_agent_action_cli_streams_feedback_jsonl
+  tests/test_slack_agent_actions.py::test_slack_agent_action_cli_emits_structured_error_feedback
+  tests/test_promptfoo_framework.py::test_promptfoo_provider_cleans_temp_context_and_redacts_failure_payload
+  tests/test_promptfoo_framework.py::test_eval_slack_strict_test_server_stops_before_dashboard
+  tests/test_promptfoo_framework.py::test_eval_dashboard_manager_declares_structured_log_contract`
+  passed.
+
+### P1 - APP-DATA-001: RSS and preprint announcement items are not persisted as queryable application data
+
+- Found: 2026-06-14 15:57 EDT
+- Fixed: 2026-06-14 16:15 EDT
+- Status: fixed
+- Area: `src/keystone_agents/multi_agent_automations.py`,
+  `scripts/run_multi_agent_automation.py`,
+  `src/keystone_agents/storage/sqlite_store.py`,
+  `src/keystone_agents/automation_inventory.py`, weekly announcements and
+  preprint/article review.
+- Issue: The announcements research workflow can select RSS/channel links,
+  attach search or article evidence, and synthesize summaries, but it returns
+  Slack text or JSON for the current run instead of saving selected feed items,
+  preprints, article reads, relevance decisions, and source evidence as durable
+  queryable application records. Future agents therefore cannot reliably answer
+  what was already seen, dedupe repeated RSS/preprint links, compare relevance
+  decisions over time, or reuse prior article evidence without re-ingesting the
+  same material.
+- Evidence: `run_announcements_research_synthesis()` builds an
+  `AnnouncementResearchAutomationResult` from supplied links and optional live
+  search/article evidence, then returns the result. `run_multi_agent_automation.py`
+  prints that result and has no database/store argument or `SQLiteStore` save
+  path. The generic automation controller persists coarse `AutomationRun`
+  summaries for supported controller commands, but the multi-agent
+  announcements helper does not write normalized feed, preprint, article, or
+  evidence rows. The current SQLite store has generic automation and source
+  tables, but no dedicated RSS/preprint/article-review model with canonical
+  identifiers and dedupe keys.
+- Expected fix: Add a durable research-feed application data model before
+  making announcements/preprint review a long-running agent memory source. Use
+  structured SQLite tables or equivalent local application state as the
+  canonical store for feed item URL, canonical URL, DOI/arXiv/bioRxiv/medRxiv
+  identifier when available, title, source/feed/channel, authors, published date,
+  tags, relevance status, selected/not-selected status, summary, evidence
+  snippets, extraction status, content hash, automation run id, Slack link, and
+  review metadata. Add dry-run-safe save/list/query helpers and tests proving
+  repeated RSS/preprint items dedupe by canonical URL or stable publication id.
+- Fix: Added `AnnouncementFeedItem`/`AnnouncementFeedEvidence`, SQLite schema
+  version 13 tables for canonical announcement feed items and evidence rows,
+  save/list/get helpers with dedupe by DOI/arXiv/bioRxiv/medRxiv/canonical URL,
+  and opt-in announcements persistence through `run_announcements_research_synthesis()`
+  and `scripts/run_multi_agent_automation.py --database-url`.
+- Verification: `tests/test_storage.py` covers migration/table creation,
+  canonical DOI dedupe, evidence reload, and query; `tests/test_multi_agent_automations.py`
+  covers persisted announcement runs and duplicate feed rows.
+
+### P1 - APP-DATA-002: RSS and preprint semantic retrieval lacks a canonical index policy
+
+- Found: 2026-06-14 15:57 EDT
+- Fixed: 2026-06-14 16:15 EDT
+- Status: fixed
+- Area: `src/keystone_agents/file_search.py`,
+  `src/keystone_agents/file_search_corpus.py`,
+  `docs/corpus/resources/file_search_corpus_policy.md`,
+  `src/keystone_agents/context_sources.py`, announcement/preprint retrieval.
+- Issue: Keystone has hosted FileSearch/vector-store support, but its current
+  policy is for approved durable reference material, not raw runtime RSS,
+  Slack, Gmail, or unreviewed article data. That is the right safety boundary,
+  but it leaves no explicit architecture for making public RSS/preprint/article
+  history semantically searchable by future agents. Without a policy, the team
+  risks either losing useful prior-review context or uploading raw runtime feed
+  payloads into a hosted vector store without canonical provenance, sensitivity,
+  retention, and approval controls.
+- Evidence: The FileSearch corpus policy says hosted FileSearch is for durable,
+  approved reference material and explicitly warns not to use it as a dumping
+  ground for raw runtime data. `file_search_corpus.py` ingests reviewed manifest
+  files into vector stores, and `file_search.py` attaches configured vector
+  stores to selected agents. The announcements synthesis path instead builds
+  transient `source_context` for a single run and does not emit approved
+  feed/preprint chunks into a local or hosted semantic index.
+- Expected fix: Define a two-layer retrieval policy for RSS/preprint review.
+  Keep the structured application database from `APP-DATA-001` as the source of
+  truth, then build a derived semantic index only from public/sanitized and
+  approved feed-item chunks. Start with local FTS or embeddings where feasible;
+  allow hosted FileSearch/vector-store upload only behind an explicit live flag,
+  approval metadata, sensitivity checks, source provenance, and retention rules.
+  Retrieval tools should return feed item ids, stable publication ids, source
+  URLs, dates, extraction status, and snippets so Business Research Analyst,
+  Chief of Staff, and Orchestrator can reuse prior reviews without treating the
+  vector store as canonical state.
+- Fix: Added a derived local `announcement_feed_fts` index maintained from the
+  canonical SQLite feed records, plus `retrieve_announcement_feed_items()` for
+  prior-review retrieval. Updated the FileSearch corpus policy to make
+  structured DB state canonical, local SQLite retrieval derived, and hosted
+  vector upload approval-gated for public/sanitized chunks only. Registered
+  `announcement_feed_history` as a local context source.
+- Verification: Storage tests assert local retrieval returns canonical feed item
+  ids from the derived index; context-source architecture tests and
+  `tests/test_local_context_tool.py` pass with the new source registered.
+
+### P2 - APP-DATA-003: Announcements research is inventoried but not controller-persisted
+
+- Found: 2026-06-14 15:57 EDT
+- Fixed: 2026-06-14 16:15 EDT
+- Status: fixed
+- Area: `src/keystone_agents/automation_inventory.py`,
+  `scripts/run_keystone_automation.py`, `scripts/run_multi_agent_automation.py`,
+  `src/keystone_agents/tools/automation_inventory_tool.py`, scheduled
+  announcements operations.
+- Issue: The automation inventory defines a weekly announcements research
+  synthesis, and the standalone multi-agent helper can run
+  `announcements-research`, but the controller path that records
+  `AutomationRun` state for Chief of Staff review does not expose that workflow.
+  That means scheduled RSS/preprint review can be run as a helper, but it is not
+  consistently visible in the same persisted automation ledger, health surface,
+  and failure-review tools as the other managed automations.
+- Evidence: `automation_inventory.py` includes
+  `auto_announcements_weekly_research_synthesis` with workflow
+  `announcements-weekly-research-synthesis`. `run_multi_agent_automation.py`
+  supports `--kind announcements-research` and prints the result. The managed
+  controller in `run_keystone_automation.py` records `AutomationRun` summaries
+  through `save_automation_run()`, but its supported subcommands are the
+  controller workflows, not the announcements multi-agent helper.
+- Expected fix: Add a managed controller path for announcements research that
+  preserves dry-run defaults, live SDK/search flags, locks, preflight checks,
+  failure recording, and `AutomationRun` persistence. It should call the
+  application-data persistence from `APP-DATA-001` when enabled, record compact
+  run provenance for Chief of Staff tools, and avoid storing raw feed or article
+  text outside the approved storage policy.
+- Fix: Added `scripts/run_keystone_automation.py announcements-research`, which
+  delegates to the multi-agent announcements helper, preserves dry-run/live
+  research gates, lock/preflight behavior, failure handling, database handoff,
+  and records `AutomationRun` rows against the existing
+  `auto_announcements_weekly_research_synthesis` inventory spec.
+- Verification: `tests/test_automation_control.py` covers the managed
+  announcements command, child command construction, dry-run env flags, and
+  persisted `AutomationRun` ledger entry.
+
 ### P1 - Other specialists need reasoning-based Orchestrator success criteria
 
 - Found: 2026-05-25 19:04 EDT
@@ -102,8 +2283,8 @@ again.
 ### P2 - Temporal-depth and tool-budget policy should be explicit across agents
 
 - Found: 2026-05-25 19:04 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-06-14 16:34 EDT
+- Status: fixed
 - Area: retrieval policy, Orchestrator memo, specialist runtime budget.
 - Issue: Requests with `current`, `latest`, `2026`, `recent`, or similar wording
   imply deeper reasoning and fresher source requirements, but the depth policy is
@@ -112,12 +2293,23 @@ again.
   sources, independent validation when available, source extraction/read-through
   before synthesis, and explicit “not enough evidence yet” output when the tool
   budget is exhausted.
+- Fix: Added a shared `keystone.temporal_depth_policy.v1` transient policy helper
+  and attached it to both WorkItem specialist Orchestrator memos and compact
+  Orchestrator preflight memos. Current/recent/latest/year-sensitive requests now
+  carry an explicit recency requirement, independent-validation preference,
+  source read-through instruction, and the required “not enough evidence yet”
+  behavior when fresh evidence cannot be obtained within the available tool
+  budget.
+- Verification: `.venv/bin/python -m pytest tests/test_temporal_policy.py
+  tests/test_workflow_runner.py::test_orchestrator_memo_asks_specialist_to_reason_about_success_criteria
+  tests/test_orchestrator_preflight_context.py::test_preflight_memo_includes_temporal_depth_policy`
+  passed.
 
 ### P2 - Unknown temporary model aliases should fail early or have pricing metadata
 
 - Found: 2026-05-25 19:27 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-06-14 16:31 EDT
+- Status: fixed
 - Area: runtime model policy, manual planner cost guardrails.
 - Issue: Temporarily setting agents to `gpt-5.5` caused the live manual planner
   to fall back because local pricing metadata had no matching model entry. That
@@ -126,6 +2318,15 @@ again.
 - Expected fix: Either add reviewed pricing metadata before temporary model
   tests, or make unknown live model aliases fail before planner execution with a
   precise configuration error and rollback instruction.
+- Fix: Live `ModelConfig.require_live_execution_ready()` now checks the
+  checked-in pricing table before credentialed execution for supported
+  providers. Priced base models and dated prefix variants remain allowed, but an
+  unpriced alias such as `openai/gpt-5.5` raises
+  `ModelProviderConfigurationError` with instructions to add a reviewed pricing
+  row or roll back the `KEYSTONE_*_MODEL`/`OPENAI_MODEL` override to a priced
+  model such as `gpt-5.4-mini`.
+- Verification: `.venv/bin/python -m pytest tests/test_costing.py
+  tests/test_model_provider.py` passed.
 
 ### P1 - Prior-post Slack context can be dropped for named Business Research requests
 
@@ -3337,3 +5538,87 @@ Prefer the consolidated table above for current completed status.
   tests/test_workflow_runner.py::test_orchestrator_requested_context_sources_are_added_to_specialist_memo`
   and `python3 -m py_compile src/keystone_agents/workflow_runner.py
   tests/test_workflow_runner.py`.
+
+### P1 - COS-TOOLS-001: Chief specialist tools lack typed context-pack input
+
+- Found: 2026-06-15 17:03 EDT
+- Fixed: 2026-06-15 17:45 EDT
+- Status: fixed
+- Area: `src/keystone_agents/specialist_agent_tools.py`,
+  `src/keystone_agents/agents/chief_of_staff.py`, Chief of Staff
+  specialists-as-tools workflow.
+- Issue: `build_specialist_agent_tools()` exposes registered specialists with
+  SDK `Agent.as_tool()` using the default single-string input contract. The
+  nested specialist call does not receive a typed Chief-to-specialist payload
+  that preserves the raw operator request, selected Slack/Gmail/WorkItem
+  context, source refs, approval context, requested source-layer manifest, and
+  side-effect boundaries as structured fields.
+- Evidence: The only `as_tool()` construction passes `tool_name`,
+  `tool_description`, and `max_turns`; there is no `parameters`,
+  `include_input_schema`, or `input_builder`. Existing focused tests verify
+  tool inclusion and nested tool filtering, but do not exercise a nested Chief
+  call with structured Slack, WorkItem, source, or approval context.
+- Impact: The outer Chief model may summarize context into a free-form tool
+  input, but Python cannot guarantee that the nested specialist sees the same
+  context-pack contract used by direct WorkItem specialist runs. This can make
+  cross-agent Chief requests drop selected thread context, source scope,
+  approval blockers, or requested-system manifests before the specialist
+  reasons.
+- Expected fix: Add a bounded Pydantic input schema for Chief specialist-tool
+  calls, with an `input_builder` that carries the raw request plus compact
+  context/approval/source manifests into the nested agent. Add regression
+  coverage that invokes at least Gmail Triage, Business Research, Airtable
+  Context, and Google Workspace Context through Chief specialist tools and
+  verifies the nested input contains the expected structured context and
+  no-send/no-write policy.
+- Fix evidence: `ChiefSpecialistToolInput` now provides a strict Pydantic
+  context contract for specialist tools, including raw operator request,
+  specialist task, Slack/Gmail/WorkItem context entries, source-layer manifest,
+  source refs, approval context, and side-effect boundaries.
+  `build_specialist_agent_tools()` passes that schema plus
+  `build_chief_specialist_tool_input()` into every generated SDK
+  `Agent.as_tool()` call.
+- Verification: `.venv/bin/python -m pytest tests/test_chief_of_staff.py
+  tests/test_agent_registry.py`.
+
+### P1 - COS-TOOLS-002: Nested specialist outputs are not extracted into a reviewable contract
+
+- Found: 2026-06-15 17:03 EDT
+- Fixed: 2026-06-15 17:45 EDT
+- Status: fixed
+- Area: `src/keystone_agents/specialist_agent_tools.py`,
+  `src/keystone_agents/schemas/chief_of_staff.py`, Chief of Staff final
+  synthesis and trace review.
+- Issue: Chief specialist tools use the SDK default nested output behavior and
+  do not provide a `custom_output_extractor` or repo-local adapter that
+  normalizes each specialist result into a reviewable Chief-owned contract.
+  The final `ChiefOfStaffResult` has no explicit field for nested specialist
+  calls, source mappings, blockers, or validation status.
+- Evidence: `build_specialist_agent_tools()` attaches metadata such as
+  `specialist_route_name` and `nested_tool_names`, but the tool output path is
+  otherwise the SDK default. `ChiefOfStaffResult` stores final sources,
+  actions, write requests, diagnostics, and audit notes, but not nested
+  specialist-result provenance. Focused tests cover tool availability and
+  write-tool filtering, not whether nested outputs are parsed, attributed,
+  reviewed, or surfaced in traces/artifacts.
+- Impact: When the Chief integrates a specialist result, source attribution,
+  blocker preservation, human-work context, and advisory-vs-authoritative
+  status depend mostly on prompt compliance. Another session reviewing a Slack
+  or CLI run may not be able to distinguish which conclusions came from which
+  nested specialist, whether nested structured output parsed cleanly, or which
+  nested blockers were intentionally carried into the final recommendation.
+- Expected fix: Introduce a small nested-specialist result envelope or
+  extractor that records route, tool name, parsed output status, source refs,
+  blockers, approval gates, human-work context, and summary. Carry that
+  envelope into Chief audit/retrieval diagnostics or a dedicated structured
+  field, and add tests that malformed or missing nested output is visible as a
+  blocker rather than silently folded into the final prose.
+- Fix evidence: `ChiefNestedSpecialistResult` and
+  `ChiefNestedSpecialistSourceRef` now provide the reviewable envelope, and
+  `extract_nested_specialist_result_json()` is registered as the SDK
+  `custom_output_extractor` for generated specialist tools. `ChiefOfStaffResult`
+  now includes `nested_specialist_results` so CoS can preserve source IDs,
+  blockers, approval needs, human-work context, and validation status from
+  nested calls.
+- Verification: `.venv/bin/python -m pytest tests/test_chief_of_staff.py
+  tests/test_agent_registry.py`.

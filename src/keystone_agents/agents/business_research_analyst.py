@@ -51,12 +51,13 @@ from keystone_agents.schemas.company_profile import (
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
 from keystone_agents.schemas.research import ResearchBrief
 from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
+from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
-from keystone_agents.source_layer_context import append_runtime_source_layer_policy_text
 from keystone_agents.source_enrichment import (
     dedupe_and_rank_source_records,
     normalize_source_record,
 )
+from keystone_agents.source_layer_context import append_runtime_source_layer_policy_text
 from keystone_agents.tools.apify_tool import fetch_linkedin_or_profile_placeholder
 from keystone_agents.tools.browser_diagnostics_tool import (
     capture_browser_diagnostics,
@@ -810,6 +811,7 @@ def run_business_research_analyst_sdk(
     session: Any | None = None,
     context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
+    max_turns: int | None = None,
 ) -> TypedAgentRunResult[CompanyProfile]:
     """Run Business Research Analyst through the typed SDK harness."""
 
@@ -818,6 +820,12 @@ def run_business_research_analyst_sdk(
         live=live,
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
+    turn_policy = resolve_sdk_turn_policy(
+        "business_research_analyst",
+        request_text=skill_request_text(typed_input),
+        live_search=live,
+        explicit_max_turns=max_turns,
+    )
     return run_typed_sdk_agent(
         agent=build_business_research_analyst_agent(
             model=model,
@@ -830,6 +838,7 @@ def run_business_research_analyst_sdk(
         run_config=run_config,
         live=live,
         session=session,
+        max_turns=turn_policy.max_turns,
     )
 
 
@@ -841,6 +850,7 @@ def run_business_research_analyst_focused_brief_sdk(
     model: str | None = None,
     session: Any | None = None,
     tool_tier: str | int | None = None,
+    max_turns: int | None = None,
 ) -> TypedAgentRunResult[CompanyResearchFocusedBrief]:
     """Run Business Research Analyst through the SDK for a BR-1 focused brief."""
 
@@ -849,6 +859,12 @@ def run_business_research_analyst_focused_brief_sdk(
         live=live,
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
+    turn_policy = resolve_sdk_turn_policy(
+        "business_research_analyst",
+        request_text=skill_request_text(typed_input),
+        live_search=live,
+        explicit_max_turns=max_turns,
+    )
     return run_typed_sdk_agent(
         agent=build_business_research_analyst_focused_brief_agent(
             model=model,
@@ -860,6 +876,7 @@ def run_business_research_analyst_focused_brief_sdk(
         run_config=run_config,
         live=live,
         session=session,
+        max_turns=turn_policy.max_turns,
     )
 
 
@@ -871,6 +888,7 @@ def run_business_research_analyst_research_brief_sdk(
     model: str | None = None,
     session: Any | None = None,
     tool_tier: str | int | None = None,
+    max_turns: int | None = None,
 ) -> TypedAgentRunResult[ResearchBrief]:
     """Run the broader Business Research Analyst through the typed SDK harness."""
 
@@ -879,6 +897,12 @@ def run_business_research_analyst_research_brief_sdk(
         live=live,
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
+    turn_policy = resolve_sdk_turn_policy(
+        "business_research_analyst",
+        request_text=skill_request_text(typed_input),
+        live_search=live,
+        explicit_max_turns=max_turns,
+    )
     return run_typed_sdk_agent(
         agent=build_business_research_analyst_research_brief_agent(
             model=model,
@@ -890,6 +914,7 @@ def run_business_research_analyst_research_brief_sdk(
         run_config=run_config,
         live=live,
         session=session,
+        max_turns=turn_policy.max_turns,
     )
 
 

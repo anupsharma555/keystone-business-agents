@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -172,6 +173,45 @@ def test_reusable_slack_query_prompt_task_brief_reaches_specialist_context(
     assert "Resolve three named products" in prompt["task_brief"]
     assert "does not grant tool access" in prompt["specialist_use"]
     assert prompt["context_flags"]["needs_source_triage"] is True
+
+
+def test_work_item_sdk_trace_metadata_includes_orchestrator_diagnostics() -> None:
+    work_item = WorkItem(
+        id="wi_trace_orchestrator_001",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Trace diagnostics",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        target=WorkItemTarget(
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1715366400.000100",
+                },
+                "orchestrator_reviews": [
+                    {
+                        "route": "business_research_analyst",
+                        "review_status": "partial",
+                        "review_decision": "block",
+                        "observed_gaps": ["missing primary source", "weak caveat"],
+                    }
+                ],
+            }
+        ),
+    )
+
+    metadata = workflow_runner._work_item_sdk_trace_metadata(
+        work_item,
+        stage="work_item_business_research_analyst",
+    )
+
+    assert metadata["orchestrator_has_preflight"] is True
+    assert metadata["orchestrator_has_review"] is True
+    assert metadata["orchestrator_selected_route"] == "business_research_analyst"
+    assert metadata["orchestrator_feedback_count"] == 2
+    assert metadata["orchestrator_blocker_count"] == 1
+    assert metadata["orchestrator_review_status"] == "partial"
+    assert metadata["slack_channel_id"] == "C123"
+    assert metadata["slack_thread_ts"] == "1715366400.000100"
 
 
 def test_business_research_category_comparison_dispatches_multi_target_branch(
@@ -3615,6 +3655,7 @@ def test_manager_loop_final_synthesis_uses_configured_sdk_session(
             sdk_session_enabled=True,
             sdk_session_id="operator-thread-123",
             sdk_session_db_path=str(tmp_path / "sessions.sqlite3"),
+            sdk_session_history_limit=9,
         ),
         max_steps=3,
     )
@@ -3624,6 +3665,7 @@ def test_manager_loop_final_synthesis_uses_configured_sdk_session(
     assert spec.enabled is True
     assert spec.source == "explicit"
     assert spec.database_path == str(tmp_path / "sessions.sqlite3")
+    assert spec.history_limit == 9
     assert captured["sdk_session"] == {
         "session_id": spec.session_id,
         "database_path": str(tmp_path / "sessions.sqlite3"),
@@ -4800,6 +4842,64 @@ def test_manager_loop_blocks_crm_write_boundary_on_opportunity_request(
     assert "No CRM write was performed" in result.blockers[-1].message
 
 
+def test_manager_loop_does_not_treat_negated_record_update_as_crm_write() -> None:
+    request = (
+        "summarize eval gaps using agents-as-tools only for advisory context, "
+        "but do not mark anything complete or update records: Airtable Context "
+        "should identify tracker fields and Google Workspace Context should "
+        "identify where an eval review artifact would live."
+    )
+
+    assert workflow_runner._manager_loop_requests_crm_write(request) is False
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Create no CRM records; summarize the provided context only.",
+        "Create zero CRM records and do not write to Airtable.",
+        "Research the company, but create no CRM records or opportunity records.",
+        "Prepare the draft-only answer, create 0 CRM records, and post nowhere.",
+    ],
+)
+def test_manager_loop_does_not_treat_zero_record_constraints_as_write_requests(
+    request_text: str,
+) -> None:
+    assert workflow_runner._manager_loop_requests_opportunity_record(request_text) is False
+    assert workflow_runner._manager_loop_requests_crm_write(request_text) is False
+
+
+def test_manager_loop_does_not_treat_negated_send_list_as_send_request() -> None:
+    request = (
+        "Do not draft outreach, send email, create a Gmail draft, label messages, "
+        "schedule, write files, create CRM records, publish, or post elsewhere."
+    )
+
+    assert workflow_runner.looks_like_send_side_effect(request) is False
+
+
+def test_manager_loop_does_not_treat_negated_email_draft_as_outreach_request() -> None:
+    request = (
+        "make a decision log from these notes and use specialist tools only as "
+        "read/plan advisors. Gmail Triage should flag whether any email follow-up "
+        "is implied. Do not update Airtable, create Drive files, draft email, "
+        "post, or schedule."
+    )
+
+    assert workflow_runner._manager_loop_requests_outreach_draft(request) is False
+
+
+def test_gmail_context_gate_message_names_missing_boundary_context() -> None:
+    message = workflow_runner._gmail_context_gate_message(
+        "draft a reply but the recipient and email thread are not identified; "
+        "do not create a Gmail draft or send anything"
+    )
+
+    assert "Recipient identity" in message
+    assert "Approval is required" in message
+    assert "No Gmail draft" in message
+
+
 def test_orchestrator_test_pack_prompts_enter_safe_specialist_manager_loop(
     tmp_path: Path,
 ) -> None:
@@ -5673,6 +5773,165 @@ def test_advance_work_item_opportunity_scout_attaches_opportunity_artifacts(
     assert result.next_action.agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
 
 
+@pytest.mark.parametrize("live_search", [True, False])
+def test_advance_opportunity_scout_no_external_context_skips_live_retrieval(
+    tmp_path: Path,
+    monkeypatch,
+    live_search: bool,
+) -> None:
+    def fail_live_retrieval(**_: object):
+        raise AssertionError("live retrieval should not run for no-external context")
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fail_live_retrieval,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "opportunity scout agent: diagnostic case diag_opp. Use only this "
+                "sanitized inline context and do not research externally: Rowan Recovery "
+                "is considering whether Keystone could review a group-therapy outcomes "
+                "dashboard before an internal pilot. No PHI is included. Scout two "
+                "practical opportunity directions."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=live_search,
+            live_sdk=True,
+            max_results=2,
+        )
+    )
+
+    assert result.advanced is True
+    assert result.route == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert len(result.artifact_refs) == 2
+    source_refs = result.artifact_refs[0].metadata["source_refs"]
+    assert source_refs[0]["title"] == "Provided inline context"
+    assert source_refs[0]["url"] == "fixture://source-provided/slack-context"
+    assert not any(
+        str(ref.get("url", "")).startswith(("http://", "https://"))
+        for artifact in result.artifact_refs
+        for ref in artifact.metadata["source_refs"]
+    )
+    assert any("forbids external research" in note.lower() for note in result.audit_notes)
+    assert any("source-provided" in note.lower() for note in result.audit_notes)
+    assert "Rowan Recovery" in result.artifact_refs[0].title
+
+
+def test_manager_loop_no_external_opportunity_scout_finishes_with_direction_summary(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "opportunity scout agent: diagnostic case diag_opp. Use only this sanitized "
+        "inline context and do not research externally: Baylight Rehab is considering "
+        "whether Keystone could help review a physical-therapy exercise-adherence "
+        "outcomes dashboard before a January internal pilot. No PHI is included. "
+        "Could you scout two practical, lightweight opportunity directions Keystone "
+        "might consider here? Keep it internal and decision-useful. Do not draft "
+        "outreach, send, schedule, write files, create CRM records, publish, or post elsewhere."
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=False,
+            live_sdk=False,
+            max_results=2,
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "opportunity_scout",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": "Baylight Rehab",
+                "desired_count": 2,
+                "requires_live_search": False,
+                "task_objective": "opportunity_discovery",
+            },
+        ),
+        max_steps=3,
+    )
+
+    assert result.route == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert result.status == WorkItemStatus.DONE
+    assert result.blockers == []
+    assert len(result.artifact_refs) == 2
+    assert "Opportunity directions for Baylight Rehab" in result.human_summary
+    assert "Validation workflow review" in result.human_summary
+    assert "Pilot readiness scoping" in result.human_summary
+    assert "Baylight Rehab, and Baylight Rehab" not in result.human_summary
+    assert "Used only the provided inline context" in result.human_summary
+    assert "No external search" in result.human_summary
+
+
+def test_no_external_opportunity_scout_honors_two_directions_request_when_plan_undercounts(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "opportunity scout agent: diagnostic case diag_opp. Use only this sanitized "
+        "inline context and do not research externally: Lakeside Home Health is "
+        "considering whether Keystone could help review a medication-adherence "
+        "reporting dashboard before a March internal pilot. No PHI is included. "
+        "Could you scout two practical, lightweight opportunity directions Keystone "
+        "might consider here? Keep it internal and decision-useful."
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=False,
+            live_sdk=False,
+            max_results=1,
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "opportunity_scout",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": "Lakeside Home Health",
+                "desired_count": 1,
+                "requires_live_search": False,
+                "task_objective": "opportunity_discovery",
+            },
+        ),
+        max_steps=3,
+    )
+
+    assert result.status == WorkItemStatus.DONE
+    assert len(result.artifact_refs) == 2
+    assert "2 practical directions stand out for Lakeside Home Health" in result.human_summary
+    assert "1 practical direction" not in result.human_summary
+    assert "Pilot readiness scoping" in result.human_summary
+
+
+def test_no_external_opportunity_scout_with_negated_outreach_does_not_route_outreach(
+    tmp_path: Path,
+) -> None:
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "opportunity scout agent: Use only this sanitized inline context and "
+                "do not research externally: Harbor Swim Therapy is considering whether "
+                "Keystone could review an outcomes dashboard. Do not draft outreach, "
+                "send, schedule, write files, or create CRM records."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=False,
+            max_results=1,
+        )
+    )
+
+    assert result.route == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert result.route != WorkItemRoute.OUTREACH_COMPOSER
+    assert result.blockers == []
+    assert result.artifact_refs
+
+
 def test_work_item_cost_tracking_directive_is_recorded_and_removed_from_task(
     tmp_path: Path,
 ) -> None:
@@ -6018,16 +6277,33 @@ def test_work_item_records_orchestrator_preflight_sdk_usage(
                     "cache_hit_rate": 0.25,
                     "prompt_cache_key_present": True,
                     "prompt_cache_key_hash": "preflight-key",
+                    "retry_state": {
+                        "retry_count": 1,
+                        "recovered": True,
+                        "last_error_type": "rate_limit",
+                    },
+                    "model_attempts": [
+                        {"provider": "gemini", "model": "gemini-2.5-flash", "status": "failed"},
+                        {"provider": "openai", "model": "gpt-5.4-mini", "status": "succeeded", "fallback": True},
+                    ],
+                    "fallback_used": True,
+                    "token_components": {"prompt": 1000, "completion": 100},
                 },
                 "cost": {
                     "estimated_usd": 0.004,
                     "pricing_model": "gpt-5.4-mini",
                     "source": "local_pricing_table",
+                    "components": {"input_usd": 0.001, "output_usd": 0.003},
                 },
                 "request_cache": {
                     "static_prefix_sha256": "preflight-static",
                     "dynamic_prompt_sha256": "preflight-dynamic",
                     "dynamic_prompt_chars": 500,
+                    "session_attached": True,
+                    "session_id_hash": "session-hash",
+                    "session_scope": "workitem",
+                    "session_source": "derived",
+                    "session_history_limit": 6,
                 },
             }
         ],
@@ -6050,6 +6326,12 @@ def test_work_item_records_orchestrator_preflight_sdk_usage(
     assert sdk_event.metadata["usage"]["cache_hit_rate"] == 0.25
     assert sdk_event.metadata["cost"]["estimated_usd"] == 0.004
     assert sdk_event.metadata["request_cache"]["static_prefix_sha256"] == "preflight-static"
+    assert sdk_event.metadata["retry_state"]["retry_count"] == 1
+    assert sdk_event.metadata["fallback_used"] is True
+    assert sdk_event.metadata["model_attempts"][1]["fallback"] is True
+    assert sdk_event.metadata["token_components"]["prompt"] == 1000
+    assert sdk_event.metadata["cost_components"]["output_usd"] == 0.003
+    assert sdk_event.metadata["sdk_session"]["session_id_hash"] == "session-hash"
 
 
 def test_state_followup_records_orchestrator_preflight_sdk_usage(
@@ -6174,8 +6456,17 @@ def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
                         "requests_attempted": 1,
                         "requests_succeeded": 1,
                         "raw_result_count": 2,
+                    },
+                    "agents-web-search": {
+                        "requests_attempted": 1,
+                        "requests_succeeded": 0,
+                        "raw_result_count": 0,
                     }
                 },
+                "search_provider_errors": [
+                    {"provider": "agents-web-search", "error_type": "timeout"}
+                ],
+                "search_provider_fallback_used": True,
                 "retrieval_diagnostics": {
                     "provider_summary": "searxng",
                     "retrieval_ladder": [{"rung": "search_discovery", "raw_result_count": 2}],
@@ -6226,6 +6517,15 @@ def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
     assert retrieval_event.metadata["agent_name"] == "opportunity_scout"
     assert retrieval_event.metadata["query_count"] == 1
     assert retrieval_event.metadata["aggregate_usage"]["requests_succeeded"] == 1
+    assert retrieval_event.metadata["attempted_providers"] == [
+        "searxng",
+        "agents-web-search",
+    ]
+    assert retrieval_event.metadata["used_providers"] == ["searxng"]
+    assert retrieval_event.metadata["provider_errors"] == [
+        {"provider": "agents-web-search", "error_type": "timeout"}
+    ]
+    assert retrieval_event.metadata["fallback_used"] is True
     assert planner_event.metadata["usage"]["input_tokens"] == 1000
 
 
@@ -6554,6 +6854,59 @@ def test_current_year_business_research_deepens_initial_query_plan(
     assert "funding valuation revenue growth" in query_text
     assert "partnership customers product roadmap" in query_text
     assert "current-activity query deepening" in " ".join(result.audit_notes).lower()
+
+
+def test_slack_business_research_diagnostic_query_terms_ignore_admin_words(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_retrieve_company_profile_live(*, company: str, **kwargs: object):
+        query_builder = kwargs.get("query_builder")
+        assert callable(query_builder)
+        captured["queries"] = query_builder(company, None)
+        return research_company_fixture(company_name=company), {
+            "debug_notes": ["fake live retrieval"]
+        }
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.retrieve_company_profile_live",
+        fake_retrieve_company_profile_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "business research analyst agent: diagnostic case "
+                "diag_business_research_20260618_001 Research Flourish as a behavioral "
+                "health AI company using live public sources if available. Keep this "
+                "diagnostic and compact. Return a human-useful source-backed answer with "
+                "validation or safety-review signals and visible source URLs. Do not "
+                "draft outreach, send email, create a Gmail draft, label messages, "
+                "schedule, write files, create CRM records, publish, or post elsewhere."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            cost_profile="slack_research_balanced",
+            manual_request_plan={
+                "source": "llm",
+                "requested_agent": "business_research_analyst",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "Flourish",
+            },
+        )
+    )
+
+    query_text = "\n".join(captured["queries"]).lower()
+    assert result.advanced is True
+    assert "flourish 2026 behavioral health" in query_text
+    assert "validation" in query_text
+    assert "diagnostic" not in query_text
+    assert "agent diagnostic case" not in query_text
+    assert "diag_business" not in query_text
 
 
 def test_deeper_business_research_uses_deep_quality_budget(
@@ -7182,11 +7535,19 @@ def test_orchestrator_memo_asks_specialist_to_reason_about_success_criteria() ->
 
     checklist = payload["response_quality_checklist"]
     memo_text = " ".join(checklist).lower()
+    temporal_policy = payload["temporal_depth_policy"]
     assert "advisory guidance" in memo_text
     assert "derive task-specific success criteria" in memo_text
     assert "available tools" in memo_text
     assert "precise blocker" in memo_text
-    assert "freshness" in memo_text
+    assert "temporal_depth_policy" in memo_text
+    assert "not enough evidence yet" in memo_text
+    assert temporal_policy["schema"] == "keystone.temporal_depth_policy.v1"
+    assert temporal_policy["temporal_intent"] is True
+    assert "2026" in temporal_policy["trigger_terms"]
+    assert temporal_policy["source_recency_requirement"] == "recent_or_current"
+    assert temporal_policy["independent_validation"] == "required_when_available"
+    assert temporal_policy["source_read_through"] == "read_selected_sources_before_synthesis"
 
 
 def test_orchestrator_memo_includes_latest_review_feedback_for_repair() -> None:
@@ -7320,7 +7681,7 @@ def test_live_work_item_runs_user_facing_response_synthesis(
     assert sdk_event.metadata["request_cache"]["session_scope"] == "workitem"
 
 
-def test_user_response_synthesis_receives_orchestrator_review_feedback(
+def test_user_response_synthesis_suppresses_raw_orchestrator_review_feedback(
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -7379,15 +7740,11 @@ def test_user_response_synthesis_receives_orchestrator_review_feedback(
 
     typed_input = captured["typed_input"]
     assert typed_input.orchestrator_reviews[0]["review_status"] == "partial"
-    assert typed_input.orchestrator_reviews[0]["observed_gaps"] == [
-        "Needs source-backed architecture evidence."
-    ]
-    assert typed_input.orchestrator_reviews[0]["recommended_next_step"] == (
-        "Deepen with repo context."
-    )
+    assert "observed_gaps" not in typed_input.orchestrator_reviews[0]
+    assert "recommended_next_step" not in typed_input.orchestrator_reviews[0]
     prompt = typed_input.to_prompt()
-    assert "Orchestrator review feedback" in prompt
-    assert "Needs source-backed architecture evidence." in prompt
+    assert "raw Orchestrator review feedback" in prompt
+    assert "Needs source-backed architecture evidence." not in prompt
     assert "Answer in KNI's operator voice" in prompt
     assert "the evidence does answer the core request" in prompt
 
@@ -7463,6 +7820,159 @@ def test_advance_work_item_outreach_blocks_without_approved_context(tmp_path: Pa
     assert result.context_pack is not None
     assert result.context_pack["can_synthesize"] is False
     assert result.context_pack["missing_requirements"]
+
+
+def test_advance_work_item_outreach_accepts_approved_inline_context_labels(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "outreach composer agent: diagnostic case diag_outreach "
+                "Use only this approved inline context from a sanitized Gmail triage "
+                "diagnostic. Do not research externally. Target recipient: Alex Rivera, "
+                "Partnerships Lead, Example Health. Approved context: Alex asked whether "
+                "Keystone could help review Example Health's remote patient monitoring AI "
+                "validation workflow before a July pilot proposal. No PHI is included. "
+                "Return a human-useful draft-only email paragraph plus brief caveats. "
+                "Keep it concise and low-metadata. Do not send email, create a Gmail "
+                "draft, publish, or post elsewhere."
+            ),
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert result.advanced is True
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert result.blockers == []
+    assert result.artifact_refs[0].artifact_type == "outreach_draft"
+    assert "outreach_requires_approved_context" not in {
+        blocker.code for blocker in result.work_item.blockers
+    }
+    profile_refs = [
+        ref for ref in result.work_item.artifact_refs if ref.artifact_type == "company_profile"
+    ]
+    assert profile_refs
+    assert profile_refs[0].title == "Example Health"
+    assert profile_refs[0].approval_state == ApprovalState.APPROVED_FOR_DRAFTING.value
+    assert profile_refs[0].metadata["inline_natural_language_context"] is True
+    assert store.count("outreach_drafts") == 1
+
+
+def test_advance_work_item_outreach_accepts_flexible_inline_context_labels(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "outreach composer agent: diagnostic case diag_outreach flexible labels. "
+                "Prepare a draft-only email paragraph. Target contact: Alex Rivera at "
+                "Example Health. Approved evidence: Example Health asked whether Keystone "
+                "could review its remote patient monitoring AI validation workflow before "
+                "a July pilot. No PHI is included. Caveats: use only this provided context. "
+                "Do not send email, create a Gmail draft, publish, or post elsewhere."
+            ),
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert result.advanced is True
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.blockers == []
+    profile_refs = [
+        ref for ref in result.work_item.artifact_refs if ref.artifact_type == "company_profile"
+    ]
+    assert profile_refs
+    assert profile_refs[0].title == "Example Health"
+    assert profile_refs[0].metadata["inline_natural_language_context"] is True
+    draft_row = store.fetch_all("outreach_drafts")[0]
+    draft_body = str(draft_row["email_body"])
+    draft_body_lower = draft_body.lower()
+    assert "diag_outreach" not in draft_body_lower
+    assert "return a human-useful" not in draft_body_lower
+    assert "keep the main answer" not in draft_body_lower
+    assert "do not send" not in draft_body_lower
+    assert "saw that example health is exploring review support" in draft_body_lower
+    assert "discuss review scope and timing" in draft_body_lower
+    assert "remote patient monitoring ai validation workflow" in draft_body_lower
+    assert "Email draft\nSubject:" in result.human_summary
+    assert "\n*Review notes:*\n- Rationale:" in result.human_summary
+    assert "- Source basis: user-provided approved context, Keystone profile" in result.human_summary
+    assert "Source IDs used" not in result.human_summary
+    email_section = result.human_summary.split("\n*Review notes:*", 1)[0]
+    assert "Rationale:" not in email_section
+    assert "Source basis:" not in email_section
+    assert "Safety:" not in email_section
+    assert store.count("outreach_drafts") == 1
+
+
+def test_manager_loop_ignores_negated_crm_record_creation() -> None:
+    assert workflow_runner._manager_loop_requests_opportunity_record(
+        "prepare a draft-only email paragraph. do not send email, create a gmail "
+        "draft, label messages, schedule, write files, create crm records, publish, "
+        "or post elsewhere."
+    ) is False
+    assert workflow_runner._manager_loop_requests_crm_write(
+        "prepare a draft-only email paragraph. do not send email, create a gmail "
+        "draft, label messages, schedule, write files, create crm records, publish, "
+        "or post elsewhere."
+    ) is False
+
+
+def test_live_work_item_rendering_suppresses_operational_footer() -> None:
+    rendered = render_work_item_result_text(
+        SimpleNamespace(
+            human_summary=(
+                "Draft email for Example Health\n\n"
+                "Body:\nHello,\n\nI saw that Example Health is exploring review support."
+            ),
+            artifact_refs=[
+                SimpleNamespace(
+                    artifact_type="outreach_draft",
+                    artifact_id="22",
+                    approval_state="pending",
+                    title="Example Health research workflow discussion",
+                )
+            ],
+            blockers=[],
+            next_action=SimpleNamespace(
+                action="review_outreach_draft",
+                description="Review the draft approval item before any external use.",
+                command_hint="",
+            ),
+            work_item=SimpleNamespace(id="wi_live", title="diagnostic title"),
+            route=WorkItemRoute.OUTREACH_COMPOSER,
+            status=WorkItemStatus.DONE,
+            advanced=True,
+            manual_request_plan={},
+            context_pack={
+                "summary": {
+                    "target": {
+                        "metadata": {
+                            "live_sdk": True,
+                            "live_search": True,
+                        }
+                    }
+                }
+            },
+        )
+    )
+
+    assert "I saw that Example Health is exploring review support" in rendered
+    assert "Artifacts:" not in rendered
+    assert "WorkItem:" not in rendered
+    assert "Run metadata:" not in rendered
+    assert "Live SDK" not in rendered
+    assert "Route:" not in rendered
 
 
 def test_thread_local_outreach_draft_can_proceed_without_approved_context(
@@ -7653,8 +8163,8 @@ def test_chief_of_staff_email_reply_workflow_delegates_to_gmail_then_outreach(
     monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
     monkeypatch.setattr(
         workflow_runner,
-        "_maybe_synthesize_user_facing_response",
-        lambda result, **_kwargs: result,
+        "synthesize_user_facing_work_item_response_sdk_result",
+        lambda *_args, **_kwargs: pytest.fail("source-provided handoff should skip generic synthesis"),
     )
 
     result = advance_work_item_manager_loop(
@@ -7695,6 +8205,134 @@ def test_chief_of_staff_email_reply_workflow_delegates_to_gmail_then_outreach(
         and event.metadata.get("run_stage") == "chief_of_staff.live_sdk"
     )
     assert chief_cost_event.metadata["cost"]["estimated_usd"] == 0.0042
+
+
+def test_chief_of_staff_negated_gmail_context_does_not_delegate_to_gmail(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "orchestrator agent: diagnostic case diag_orchestrator_handoff_decision "
+        "Use only this sanitized inline context. Do not access Gmail, Airtable, "
+        "Google Drive, Zotero, or live web for this test. Context: A potential "
+        "partner asked whether Keystone could review a remote patient monitoring "
+        "AI validation workflow before a July pilot proposal. No PHI is included. "
+        "The operator wants to know which agent should handle follow-up and what "
+        "information is needed before any outreach. Do not draft outreach, send "
+        "email, create a Gmail draft, label messages, schedule, write files, "
+        "create CRM records, publish, or post elsewhere."
+    )
+
+    result = workflow_runner._advance_work_item_one_step(
+        WorkflowRunRequest(
+            request_text=request_text,
+            requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=False,
+        ),
+        synthesize_user_response=False,
+    )
+
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert result.status == WorkItemStatus.DONE
+    assert result.next_action is not None
+    assert result.next_action.action == "review_chief_of_staff_plan"
+    assert result.next_action.agent == WorkItemRoute.CHIEF_OF_STAFF
+
+
+def test_chief_of_staff_handoff_to_business_research_executes_next_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_chief_of_staff_sdk(
+        sdk_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult[object]:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary=(
+                    "Hand off to Business Research Agent for a source-backed review "
+                    "of Example Health's remote patient monitoring AI validation workflow."
+                ),
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="internal-review",
+                    target_channel="current thread",
+                ),
+                approval_required=False,
+                audit_notes=[],
+            ),
+            raw_result=None,
+            live=True,
+        )
+
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(
+        workflow_runner,
+        "_maybe_synthesize_user_facing_response",
+        lambda result, **_kwargs: result,
+    )
+
+    request_text = (
+        "chief of staff agent: Use only sanitized inline context. Example Health asked "
+        "whether Keystone could help review its remote patient monitoring AI validation "
+        "workflow before a July pilot proposal. No PHI is included. Then hand off to "
+        "Business Research Agent for a source-backed internal review. Do not access web "
+        "search, browser automation, or external tools. Keep the answer low-metadata."
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            live_sdk=True,
+            manual_request_plan={
+                "source": "test",
+                "target_agent": "chief_of_staff",
+                "intent": "internal_review_handoff",
+                "primary_target": "Example Health",
+            },
+        ),
+        max_steps=3,
+    )
+
+    assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.advanced is True
+    assert result.artifact_refs[0].source_agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert "Source-provided Business Research" in " ".join(result.audit_notes)
+    assert "Live company retrieval executed" not in " ".join(result.audit_notes)
+    assert "Example Health" in result.human_summary
+    assert "diag_" not in result.human_summary
+    assert "Manager loop steps:" not in result.human_summary
+
+
+def test_chief_of_staff_negated_business_research_handoff_stays_review_only(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "chief of staff agent: Use only sanitized inline context. Example Health asked "
+        "whether Keystone could help review a validation workflow. Do not handoff to "
+        "Business Research Agent; only identify the owner and blockers."
+    )
+
+    result = workflow_runner._advance_work_item_one_step(
+        WorkflowRunRequest(
+            request_text=request_text,
+            requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=False,
+        ),
+        synthesize_user_response=False,
+    )
+
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert result.next_action is not None
+    assert result.next_action.action == "review_chief_of_staff_plan"
+    assert result.next_action.agent == WorkItemRoute.CHIEF_OF_STAFF
 
 
 def test_chief_of_staff_email_reply_recovers_from_live_schema_error(
@@ -8132,6 +8770,7 @@ def test_live_outreach_handoff_includes_orchestrator_memo_and_raw_request(
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
     assert result.artifact_refs[0].artifact_type == "outreach_draft"
     assert any("Outreach Composer live SDK draft created" in note for note in result.audit_notes)
+    assert "Live user-facing response synthesis executed." in result.audit_notes
     assert any("draft artifact is canonical" in note for note in result.audit_notes)
     assert "Orchestrator memo for this specialist WorkItem run" in captured["approved_context"]
     assert (

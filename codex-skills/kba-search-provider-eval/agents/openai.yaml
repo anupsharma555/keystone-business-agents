@@ -1,0 +1,4 @@
+interface:
+  display_name: "KBA Search Provider Eval"
+  short_description: "Evaluate Keystone retrieval providers"
+  default_prompt: "Use $kba-search-provider-eval to change or evaluate Keystone search, retrieval, extraction, or provider budget behavior."

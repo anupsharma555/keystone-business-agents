@@ -296,9 +296,15 @@ def render_review_card_slack_text(
     return "\n".join(line for line in lines if _clean(line))
 
 
-def render_work_item_result_text(result: Any) -> str:
+def render_work_item_result_text(
+    result: Any,
+    *,
+    include_operational_details: bool | None = None,
+) -> str:
     """Render WorkItem advancement output with human synthesis before run metadata."""
 
+    if include_operational_details is None:
+        include_operational_details = not _work_item_result_is_live(result)
     lines: list[str] = ["Keystone Business Agents Workflow Review", ""]
     summary = _clean(getattr(result, "human_summary", ""))
     lines.append(summary or "Business Agents WorkItem result is ready for review.")
@@ -309,7 +315,7 @@ def render_work_item_result_text(result: Any) -> str:
         _append_spaced_lines(lines, source_lines)
 
     artifact_refs = list(getattr(result, "artifact_refs", []) or [])
-    if artifact_refs:
+    if include_operational_details and artifact_refs:
         lines.extend(
             [
                 "",
@@ -342,12 +348,15 @@ def render_work_item_result_text(result: Any) -> str:
         lines.extend(f"- {item}" for item in limitations[:8])
 
     next_action = getattr(result, "next_action", None)
-    if next_action is not None:
+    if include_operational_details and next_action is not None:
         lines.extend(["", "Next action:", f"- {_clean(next_action.action)}"])
         if getattr(next_action, "description", ""):
             lines.append(f"- {_clean(next_action.description)}")
         if getattr(next_action, "command_hint", ""):
             lines.append(f"- CLI: {_clean(next_action.command_hint)}")
+
+    if not include_operational_details:
+        return "\n".join(line for line in lines if line is not None)
 
     lines.extend(["", "Run metadata:"])
     work_item = getattr(result, "work_item", None)
@@ -366,6 +375,22 @@ def render_work_item_result_text(result: Any) -> str:
         )
     lines.extend(_latest_live_flags_from_context_pack(getattr(result, "context_pack", None)))
     return "\n".join(line for line in lines if line is not None)
+
+
+def _work_item_result_is_live(result: Any) -> bool:
+    pack = getattr(result, "context_pack", None)
+    if not isinstance(pack, dict):
+        return False
+    summary = pack.get("summary")
+    if not isinstance(summary, dict):
+        return False
+    target = summary.get("target")
+    if not isinstance(target, dict):
+        return False
+    metadata = target.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return bool(metadata.get("live_sdk") or metadata.get("live_search"))
 
 
 def _append_spaced_lines(lines: list[str], items: list[str]) -> None:

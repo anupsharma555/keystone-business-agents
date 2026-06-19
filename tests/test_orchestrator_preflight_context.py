@@ -409,3 +409,23 @@ def test_orchestrator_preflight_env_omits_raw_workflow_state() -> None:
     assert "private Slack thread text" not in serialized
     assert "operator feedback" not in serialized
     assert preflight["preflight_memo"]["orchestrator_route"] == "chief_of_staff"
+
+
+def test_preflight_memo_includes_temporal_depth_policy() -> None:
+    env = orchestrator_preflight_env(
+        {
+            "request_text": "Find the latest 2026 behavioral health AI partnerships.",
+            "advisory_only": True,
+            "execution_allowed": True,
+            "route_result": {"route": "opportunity_scout", "refused": False},
+        }
+    )
+
+    preflight = json.loads(env[ORCHESTRATOR_PREFLIGHT_ENV])
+    policy = preflight["preflight_memo"]["temporal_depth_policy"]
+
+    assert policy["schema"] == "keystone.temporal_depth_policy.v1"
+    assert policy["temporal_intent"] is True
+    assert {"latest", "2026"}.issubset(set(policy["trigger_terms"]))
+    assert policy["independent_validation"] == "required_when_available"
+    assert "not enough evidence yet" in policy["completion_rule"]

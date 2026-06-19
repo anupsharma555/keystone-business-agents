@@ -197,6 +197,27 @@
       "secret": false
     },
     {
+      "category": "context",
+      "default_notes": "Defaults to false; true lets linked context repo env override local read config.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_CONTEXT_CONFIG_OVERRIDE",
+      "secret": false
+    },
+    {
+      "category": "context",
+      "default_notes": "Comma-separated allowlist of linked context repo env keys that may override local values.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_CONTEXT_CONFIG_OVERRIDE_KEYS",
+      "secret": false
+    },
+    {
+      "category": "context",
+      "default_notes": "Optional path to a sibling repo .env for allowlisted read context config.",
+      "display_safety": "path",
+      "name": "KEYSTONE_CONTEXT_CONFIG_REPO",
+      "secret": false
+    },
+    {
       "category": "model",
       "default_notes": "Fallback model when agent-specific settings are absent.",
       "display_safety": "safe",
@@ -646,6 +667,9 @@
       "KEYSTONE_CHIEF_OF_STAFF_BASE_URL",
       "KEYSTONE_CHIEF_OF_STAFF_MODEL",
       "KEYSTONE_CHIEF_OF_STAFF_MODEL_PROVIDER",
+      "KEYSTONE_CONTEXT_CONFIG_OVERRIDE",
+      "KEYSTONE_CONTEXT_CONFIG_OVERRIDE_KEYS",
+      "KEYSTONE_CONTEXT_CONFIG_REPO",
       "KEYSTONE_DEFAULT_MODEL",
       "KEYSTONE_DRY_RUN",
       "KEYSTONE_ENABLE_LIVE_GMAIL",

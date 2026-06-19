@@ -42,6 +42,22 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         default_notes="Defaults to local SQLite unless overridden.",
     ),
     EnvVarContract(
+        "KEYSTONE_CONTEXT_CONFIG_OVERRIDE",
+        "context",
+        default_notes="Defaults to false; true lets linked context repo env override local read config.",
+    ),
+    EnvVarContract(
+        "KEYSTONE_CONTEXT_CONFIG_OVERRIDE_KEYS",
+        "context",
+        default_notes="Comma-separated allowlist of linked context repo env keys that may override local values.",
+    ),
+    EnvVarContract(
+        "KEYSTONE_CONTEXT_CONFIG_REPO",
+        "context",
+        display_safety="path",
+        default_notes="Optional path to a sibling repo .env for allowlisted read context config.",
+    ),
+    EnvVarContract(
         "FIRECRAWL_API_KEY",
         "website_extraction",
         secret=True,

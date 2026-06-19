@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.company_profile import CompanyProfile
+from keystone_agents.schemas.handoff_types import HandoffTypeContract, build_handoff_type_contract
 from keystone_agents.schemas.opportunity import OpportunityRecord as ScoutOpportunityRecord
 from keystone_agents.schemas.orchestrator import OrchestratorResult
 from keystone_agents.schemas.outreach import OutreachDraft
@@ -20,6 +21,29 @@ HandoffContractName = Literal[
     "orchestrator_to_approval_review",
 ]
 HandoffIssueSeverity = Literal["error", "warning"]
+
+_CONTRACT_TYPE_METADATA: dict[HandoffContractName, tuple[str, str, str]] = {
+    "opportunity_scout_to_business_research_analyst": (
+        "keystone_agents.schemas.opportunity.OpportunityRecord",
+        "keystone_agents.schemas.context_pack.ResearchContextPack",
+        "keystone_agents.schemas.research.ResearchBrief",
+    ),
+    "business_research_analyst_to_outreach_composer": (
+        "keystone_agents.schemas.company_profile.CompanyProfile",
+        "keystone_agents.schemas.context_pack.OutreachContextPack",
+        "keystone_agents.schemas.outreach.OutreachDraft",
+    ),
+    "outreach_composer_to_orchestrator": (
+        "keystone_agents.schemas.outreach.OutreachDraft",
+        "keystone_agents.schemas.orchestrator.OrchestratorResult",
+        "keystone_agents.schemas.orchestrator.OrchestratorResult",
+    ),
+    "orchestrator_to_approval_review": (
+        "keystone_agents.schemas.orchestrator.OrchestratorResult",
+        "keystone_agents.schemas.orchestrator.OrchestratorResult",
+        "keystone_agents.schemas.orchestrator.OrchestratorResult",
+    ),
+}
 
 
 def _is_empty_required_value(value: Any) -> bool:
@@ -40,6 +64,13 @@ class HandoffContractResult(BaseModel):
     contract_name: HandoffContractName
     from_agent: str
     to_agent: str
+    type_contract: HandoffTypeContract = Field(default_factory=HandoffTypeContract)
+    source_output_type: str = ""
+    target_input_type: str = ""
+    target_output_type: str = ""
+    payload_mode: str = "native"
+    parsed_output_status: str = "parsed"
+    type_compatibility_status: str = "unknown"
     required_fields: list[str] = Field(default_factory=list)
     allowed_optional_fields: list[str] = Field(default_factory=list)
     source_ids_required: list[str] = Field(default_factory=list)
@@ -60,6 +91,13 @@ class HandoffContractResult(BaseModel):
             "from_agent": self.from_agent,
             "to_agent": self.to_agent,
             "valid": self.valid,
+            "type_contract": self.type_contract.model_dump(mode="json"),
+            "source_output_type": self.source_output_type,
+            "target_input_type": self.target_input_type,
+            "target_output_type": self.target_output_type,
+            "payload_mode": self.payload_mode,
+            "parsed_output_status": self.parsed_output_status,
+            "type_compatibility_status": self.type_compatibility_status,
             "source_ids": {
                 "required": self.source_ids_required,
                 "present": self.source_ids_present,
@@ -182,6 +220,9 @@ def _build_result(
     issues: Sequence[HandoffIssue],
     audit_notes: Sequence[str],
 ) -> HandoffContractResult:
+    source_output_type, target_input_type, target_output_type = _CONTRACT_TYPE_METADATA[
+        contract_name
+    ]
     required_sources = _unique(source_ids_required)
     present_sources = _unique(source_ids_present)
     source_issues = [
@@ -192,10 +233,30 @@ def _build_result(
         for source_id in sorted(set(required_sources) - set(present_sources))
     ]
     all_issues = [*issues, *source_issues]
+    type_contract = build_handoff_type_contract(
+        source_agent=from_agent,
+        target_agent=to_agent,
+        source_output_type=source_output_type,
+        target_input_type=target_input_type,
+        target_output_type=target_output_type,
+        payload_mode="native",
+        parsed_output_status="parsed",
+        compatibility_status="compatible",
+        compatibility_notes=[
+            "Cross-agent validator received a native structured object for this handoff."
+        ],
+    )
     return HandoffContractResult(
         contract_name=contract_name,
         from_agent=from_agent,
         to_agent=to_agent,
+        type_contract=type_contract,
+        source_output_type=source_output_type,
+        target_input_type=target_input_type,
+        target_output_type=target_output_type,
+        payload_mode=type_contract.payload_mode,
+        parsed_output_status=type_contract.parsed_output_status,
+        type_compatibility_status=type_contract.compatibility_status,
         required_fields=list(required_fields),
         allowed_optional_fields=list(allowed_optional_fields),
         source_ids_required=required_sources,

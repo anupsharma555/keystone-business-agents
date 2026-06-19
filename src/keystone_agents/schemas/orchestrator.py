@@ -11,6 +11,7 @@ from pydantic.json_schema import SkipJsonSchema
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.decision_trace import DecisionTrace
 from keystone_agents.schemas.feedback import OperatorFeedbackRequest
+from keystone_agents.schemas.handoff_types import HandoffTypeContract
 from keystone_agents.schemas.retrieval import RetrievalHint
 
 RouteName = Literal[
@@ -19,6 +20,9 @@ RouteName = Literal[
     "opportunity_scout",
     "outreach_composer",
     "chief_of_staff",
+    "airtable_context_agent",
+    "google_workspace_context_agent",
+    "zotero_context_agent",
     "clarification",
 ]
 RoutingMode = Literal["deterministic", "llm", "llm_unavailable"]
@@ -30,10 +34,16 @@ OutputReviewMode = Literal["deterministic", "llm", "llm_unavailable"]
 class HandoffSpec(BaseModel):
     """Intended SDK handoff contract for a specialist agent."""
 
+    contract_version: str = "keystone.handoff_spec.v1"
     route: RouteName
     agent_name: str
     builder: str
     description: str
+    input_contract_type: str = ""
+    input_schema: str = ""
+    output_contract_type: str = ""
+    output_schema: str = ""
+    type_contract: HandoffTypeContract = Field(default_factory=HandoffTypeContract)
 
 
 class OrchestratorArtifactField(BaseModel):

@@ -33,6 +33,7 @@ from keystone_agents.slack_actions import (
     slack_message_action_manifest_patch,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore
+from keystone_agents.structured_logging import structured_log_event
 
 
 def _database_url(tmp_path: Path) -> str:
@@ -402,12 +403,35 @@ def test_slack_eval_message_action_records_run_and_reply_guidance(
     assert eval_record["scorecard_request"] == (
         "@KNI can you give me a scorecard for this eval?"
     )
+    assert eval_record["dashboard_visibility"]["case_visible"] is True
+    assert eval_record["dashboard_visibility"]["latest_run_visible"] is True
+    assert eval_record["dashboard_visibility"]["trace_event_visible"] is True
+    assert eval_record["post_save_state"]["merged_status"]["slack_run_count"] == 1
+    assert eval_record["post_save_state"]["trace"]["manual_run_summary_present"] is True
+    assert "/api/status?refresh=1" in eval_record["refresh_endpoints"]
+    assert "/api/trace-diagnostics" in eval_record["refresh_endpoints"]
     assert result_payload["eval_record"] == eval_record
+    assert result_payload["slack_actions"][0]["label"] == "Submit Evaluation"
+    assert result_payload["slack_actions"][0]["action_id"] == "kba_eval_review"
+    assert result_payload["slack_actions"][0]["intent"] == "eval_review"
+    assert result_payload["slack_actions"][0]["style"] == "primary"
+    assert (
+        result_payload["slack_actions"][0]["metadata"]["eval_record"]["case_id"]
+        == "slack_bridge_hidden_eval_001"
+    )
+    assert (
+        result_payload["slack_actions"][0]["metadata"]["eval_record"]["run_id"]
+        == run_result.work_item["id"]
+    )
+    assert result_payload["slack_overflow_actions"] == []
+    assert eval_record["slack_actions"][0] == result_payload["slack_actions"][0]
+    assert eval_record["eval_thread_reply"]["slack_actions"][0] == result_payload["slack_actions"][0]
     assert "Eval: case `slack_bridge_hidden_eval_001`" in result_payload["human_summary"]
     assert (
         "<http://127.0.0.1:8769/dashboard?case=slack_bridge_hidden_eval_001|case dashboard>"
         in result_payload["human_summary"]
     )
+    assert "press `Submit Evaluation` in Slack" in result_payload["human_summary"]
     assert (
         "<http://127.0.0.1:8769/review?case=slack_bridge_hidden_eval_001|score this case>"
         in result_payload["human_summary"]
@@ -416,6 +440,12 @@ def test_slack_eval_message_action_records_run_and_reply_guidance(
     status = eval_case_status("slack_bridge_hidden_eval_001", database_path=review_db)
     assert status["slack_run_count"] == 1
     assert status["slack_runs"][0]["run_id"] == run_result.work_item["id"]
+    assert status["slack_runs"][0]["work_item_id"] == run_result.work_item["id"]
+    assert status["slack_runs"][0]["thread_fetch_status"] in {"not_requested", "ok"}
+    assert status["slack_runs"][0]["thread_message_count"] >= 1
+    assert status["slack_runs"][0]["response_hash"]
+    assert status["slack_runs"][0]["evidence"]["schema"] == "keystone.slack.eval_evidence.v1"
+    assert eval_record["evidence"]["work_item_id"] == run_result.work_item["id"]
 
 
 def test_modal_submission_selects_reusable_prompt_for_multi_target_source_read(
@@ -812,7 +842,35 @@ def test_slack_agent_action_cli_streams_feedback_jsonl(
     assert output["stage"] == "work_item"
     assert events[0]["schema"] == "keystone.slack.agent_feedback_event.v1"
     assert events[0]["event_type"] == "orchestrator_preflight"
+    assert events[0]["structured_log"]["schema"] == "keystone.structured_log.v1"
+    assert events[0]["structured_log"]["component"] == "slack_agent_action"
+    assert events[0]["structured_log"]["event"] == "orchestrator_preflight"
+    assert events[0]["structured_log"]["redaction"]["raw_payload_included"] is False
     assert any(event["event_type"] == "manager_loop_review" for event in events)
+
+
+def test_structured_log_event_redacts_secrets_and_body_text() -> None:
+    event = structured_log_event(
+        component="promptfoo_provider",
+        event="child_failed",
+        level="error",
+        payload={
+            "run_id": "run_123",
+            "case_id": "case_abc",
+            "status": "error",
+            "stdout": "raw answer sk-testSECRET123456 should not be stored",
+            "api_key": "sk-testSECRET123456",
+        },
+    )
+
+    serialized = json.dumps(event, sort_keys=True)
+    assert event["schema"] == "keystone.structured_log.v1"
+    assert event["correlation"]["run_id"] == "run_123"
+    assert event["correlation"]["case_id"] == "case_abc"
+    assert event["redaction"]["raw_payload_included"] is False
+    assert "stdout_summary" in event["payload"]
+    assert "stdout" not in event["payload"]
+    assert "sk-testSECRET123456" not in serialized
 
 
 def test_slack_agent_action_cli_prints_thread_reply_for_local_setup(
@@ -898,6 +956,10 @@ def test_slack_agent_action_cli_emits_structured_error_feedback(
     assert events[-1]["payload"]["failure"]["schema"] == "keystone.operator_failure.v1"
     assert events[-1]["payload"]["failure"]["kind"] == "schema_or_parse_error"
     assert events[-1]["payload"]["next_step"]
+    assert events[-1]["structured_log"]["schema"] == "keystone.structured_log.v1"
+    assert events[-1]["structured_log"]["level"] == "error"
+    assert events[-1]["structured_log"]["correlation"]["failure_kind"] == "schema_or_parse_error"
+    assert events[-1]["structured_log"]["redaction"]["raw_payload_included"] is False
 
 
 def test_thread_fetch_failure_warns_but_run_proceeds(tmp_path: Path) -> None:
@@ -1155,6 +1217,8 @@ def test_slack_thread_follow_up_can_reach_chief_of_staff_live_sdk(
     assert run_result.route == "chief_of_staff"
     assert run_result.work_item["last_agent"] == "chief_of_staff"
     assert captured["kwargs"]["force_sdk_interpretation"] is True
+    assert captured["kwargs"]["include_specialist_tools"] is False
+    assert captured["typed_input"]["include_specialist_tools"] is False
     slack_context = captured["typed_input"]["slack_context"]
     orchestrator_context = captured["typed_input"]["orchestrator_context"]
     assert slack_context["channel_id"] == "C123"
@@ -1167,6 +1231,127 @@ def test_slack_thread_follow_up_can_reach_chief_of_staff_live_sdk(
     )
     assert orchestrator_context["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
     assert orchestrator_context["slack_context"]["channel_id"] == "C123"
+
+
+def test_slack_chief_of_staff_cross_agent_ask_enables_specialist_tools(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_chief_of_staff_sdk(typed_input, **kwargs):
+        captured["typed_input"] = typed_input
+        captured["kwargs"] = kwargs
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary="Integrated research, opportunity, and outreach context.",
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="portfolio-prioritization",
+                    target_channel="bizdev",
+                ),
+                send_enabled=False,
+                slack_post_allowed=False,
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_chief_of_staff_sdk",
+        fake_run_chief_of_staff_sdk,
+    )
+    payload = _message_action_payload()
+    payload["channel"] = {"id": "CWORKFLOW", "name": "ai-agents-workflow"}
+    modal_result = handle_run_agent_interaction(
+        payload,
+        context_dir=tmp_path / "contexts",
+        thread_messages=[
+            {"ts": "1715366400.000100", "user": "U456", "text": "New company lead"},
+            {"ts": "1715366460.000200", "user": "U789", "text": "Could be an outreach target"},
+        ],
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task=(
+                "chief of staff what should we do next across research, "
+                "opportunities, and outreach for this Slack thread?"
+            ),
+        ),
+        database_url=_database_url(tmp_path),
+        live_sdk=True,
+    )
+
+    assert run_result.route == "chief_of_staff"
+    assert captured["kwargs"]["include_specialist_tools"] is True
+    assert captured["typed_input"]["include_specialist_tools"] is True
+    assert captured["typed_input"]["slack_context"]["channel_name"] == "ai-agents-workflow"
+    assert captured["typed_input"]["orchestrator_context"]["raw_request"] == (
+        "chief of staff what should we do next across research, "
+        "opportunities, and outreach for this Slack thread?"
+    )
+
+
+def test_slack_chief_of_staff_negated_context_mentions_do_not_enable_specialist_tools(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_chief_of_staff_sdk(typed_input, **kwargs):
+        captured["typed_input"] = typed_input
+        captured["kwargs"] = kwargs
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary="Read-only handoff ready.",
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="slack-follow-up-review",
+                    target_channel="ai-agents-workflow",
+                ),
+                send_enabled=False,
+                slack_post_allowed=False,
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_chief_of_staff_sdk",
+        fake_run_chief_of_staff_sdk,
+    )
+    payload = _message_action_payload()
+    payload["channel"] = {"id": "CWORKFLOW", "name": "ai-agents-workflow"}
+    modal_result = handle_run_agent_interaction(
+        payload,
+        context_dir=tmp_path / "contexts",
+        thread_messages=[
+            {"ts": "1715366400.000100", "user": "U456", "text": "Inline diagnostic context"},
+        ],
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task=(
+                "chief of staff use only this sanitized inline context from a Gmail triage "
+                "diagnostic. Do not access Gmail, Airtable, Google Drive, Zotero, or live "
+                "web. Return a concise handoff. Do not draft outreach, send email, create "
+                "a Gmail draft, label messages, schedule, write files, create CRM records, "
+                "publish, or post elsewhere."
+            ),
+        ),
+        database_url=_database_url(tmp_path),
+        live_sdk=True,
+    )
+
+    assert run_result.route == "chief_of_staff"
+    assert captured["kwargs"]["include_specialist_tools"] is False
+    assert captured["typed_input"]["include_specialist_tools"] is False
 
 
 def test_slack_chief_of_staff_local_kni_followup_gets_evidence_packet(

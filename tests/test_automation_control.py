@@ -88,6 +88,59 @@ def test_weekly_dry_run_uses_save_without_live_flags(
     assert runs[0].approval_count == 1
 
 
+def test_announcements_research_records_managed_automation_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[dict[str, Any]] = []
+    payload = {
+        "kind": "announcements-research",
+        "status": "ok",
+        "selected_count": 1,
+        "summaries": [],
+        "diagnostics": ["Persisted 1 announcement feed item(s) to application data."],
+    }
+
+    def fake_run(command: list[str], **kwargs: Any) -> _Completed:
+        calls.append({"command": command, "env": kwargs["env"]})
+        return _Completed(stdout=json.dumps(payload))
+
+    monkeypatch.setattr(automation, "run_isolated_child_process", fake_run)
+    db_url = _db_url(tmp_path / "announcements.db")
+
+    assert (
+        automation.main(
+            [
+                *_base_args(tmp_path),
+                "announcements-research",
+                "--database-url",
+                db_url,
+                "--input-json",
+                json.dumps({"links": []}),
+            ]
+        )
+        == 0
+    )
+
+    command = calls[0]["command"]
+    env = calls[0]["env"]
+    output = json.loads(capsys.readouterr().out)
+    runs = SQLiteStore(db_url).list_automation_runs(limit=5)
+
+    assert "run_multi_agent_automation.py" in " ".join(command)
+    assert "--kind" in command
+    assert "announcements-research" in command
+    assert "--database-url" in command
+    assert "--live-search" not in command
+    assert env["KEYSTONE_DRY_RUN"] == "true"
+    assert env["KEYSTONE_ENABLE_LIVE_RESEARCH"] == "false"
+    assert output["automation"]["external_writes_enabled"] is False
+    assert runs[0].automation_id == "auto_announcements_weekly_research_synthesis"
+    assert runs[0].stage == "dry-run"
+    assert runs[0].status.value == "dry_run"
+
+
 def test_weekly_live_research_requires_operator_confirmation(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="--confirm-live"):
         automation.main(

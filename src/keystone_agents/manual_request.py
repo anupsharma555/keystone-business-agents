@@ -50,6 +50,19 @@ _AGENT_ALIASES: dict[str, ManualTargetAgent] = {
     "kni chief of staff": "chief_of_staff",
     "slack operations": "chief_of_staff",
     "slack ops": "chief_of_staff",
+    "airtable context agent": "airtable_context_agent",
+    "airtable context": "airtable_context_agent",
+    "airtable agent": "airtable_context_agent",
+    "google workspace context agent": "google_workspace_context_agent",
+    "google workspace context": "google_workspace_context_agent",
+    "workspace context agent": "google_workspace_context_agent",
+    "workspace context": "google_workspace_context_agent",
+    "google drive context": "google_workspace_context_agent",
+    "google docs context": "google_workspace_context_agent",
+    "google sheets context": "google_workspace_context_agent",
+    "zotero context agent": "zotero_context_agent",
+    "zotero context": "zotero_context_agent",
+    "zotero agent": "zotero_context_agent",
 }
 _ROUTE_INTENT: dict[ManualTargetAgent, ManualRequestIntent] = {
     "business_research_analyst": "company_research",
@@ -57,6 +70,9 @@ _ROUTE_INTENT: dict[ManualTargetAgent, ManualRequestIntent] = {
     "gmail_triage": "gmail_triage",
     "outreach_composer": "outreach_draft",
     "chief_of_staff": "slack_operations",
+    "airtable_context_agent": "context_lookup",
+    "google_workspace_context_agent": "context_lookup",
+    "zotero_context_agent": "context_lookup",
     "orchestrator": "route_request",
     "clarification": "clarification",
 }
@@ -66,6 +82,9 @@ _ROUTE_TARGET_TYPE: dict[ManualTargetAgent, ManualTargetType] = {
     "gmail_triage": "gmail_thread",
     "outreach_composer": "company",
     "chief_of_staff": "slack_channel",
+    "airtable_context_agent": "business_system_context",
+    "google_workspace_context_agent": "business_system_context",
+    "zotero_context_agent": "business_system_context",
     "orchestrator": "unknown",
     "clarification": "unknown",
 }
@@ -111,6 +130,19 @@ _OPPORTUNITY_TO_OUTREACH_RE = re.compile(
     r"\bopportunit(?:y|ies)\b.*\boutreach\b.*\b(loop|draft|email|approval|collaboration)\b"
     r"|"
     r"\boutreach\b.*\bopportunit(?:y|ies)\b.*\b(loop|draft|email|approval|collaboration)\b",
+    re.I,
+)
+_NO_OUTREACH_DRAFT_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\s+"
+    r"(?:create\s+|queue\s+|produce\s+)?"
+    r"(?:draft|drafting|compose|write|prepare)\b.{0,50}\b(?:outreach|emails?|messages?)\b"
+    r"|"
+    r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\s+"
+    r"(?:create\s+|queue\s+|produce\s+)?(?:outreach|email|message)\s+drafts?\b"
+    r"|"
+    r"\b(?:outreach|emails?|messages?)\b.{0,50}\b"
+    r"(?:do\s+not|don't|dont|never|no|without|avoid|skip)\s+"
+    r"(?:create\s+|queue\s+|produce\s+)?(?:draft|drafting|compose|write|prepare)\b",
     re.I,
 )
 _LOOP_TOPIC_STOP_RE = re.compile(
@@ -333,6 +365,10 @@ def _semantic_target_agent(
         return "opportunity_scout"
     if requested_agent and requested_agent != "orchestrator":
         return requested_agent
+    if _looks_like_eval_scorecard_review(lower):
+        return "chief_of_staff"
+    if _looks_like_research_table_synthesis(text):
+        return "business_research_analyst"
     if _looks_like_chief_of_staff_operational_request(lower):
         return "chief_of_staff"
     if _looks_like_gmail_label_request(lower):
@@ -401,6 +437,8 @@ def _intent_for_target(
         return "blocked_send"
     if target_agent == "business_research_analyst" and _company_comparison_target(text):
         return "company_research"
+    if target_agent == "business_research_analyst" and _looks_like_research_table_synthesis(text):
+        return "company_research"
     if looks_like_resume_request(text):
         return "continue_work_item"
     if target_agent == "business_research_analyst" and "zotero" in lower:
@@ -439,6 +477,8 @@ def _looks_like_slack_operations_request(lower: str) -> bool:
 
 
 def _looks_like_chief_of_staff_operational_request(lower: str) -> bool:
+    if _looks_like_eval_scorecard_review(lower):
+        return True
     if _looks_like_slack_operations_request(lower):
         return True
     action_markers = (
@@ -484,8 +524,37 @@ def _looks_like_chief_of_staff_operational_request(lower: str) -> bool:
         "wrong response",
         "agent path",
         "backlog",
+        "finance operations",
+        "finance operations context",
     )
     return any(marker in lower for marker in operational_markers)
+
+
+def _looks_like_eval_scorecard_review(lower: str) -> bool:
+    if "coordinate the agents" in lower and "company research brief" in lower:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:scorecard|score\s+the\s+workflow|human\s+reviewer|"
+            r"here\s+are\s+my\s+scores|my\s+scores)\b",
+            lower,
+        )
+        and re.search(r"\b(?:eval|promptfoo|case|workflow|scores?|missing\s+evidence)\b", lower)
+    )
+
+
+def _looks_like_research_table_synthesis(text: str) -> bool:
+    lower = str(text or "").lower()
+    if not re.search(r"\b(?:table|comparison|compare|matrix)\b", lower):
+        return False
+    if not re.search(r"\b(?:vendor|vendors|company|companies|platform|platforms)\b", lower):
+        return False
+    return bool(
+        re.search(r"\bsource[- ]backed\b", lower)
+        or re.search(r"\bsource[- ]provided\b", lower)
+        or re.search(r"\bvendor\s+(?:summaries|summary|a|b)\b", lower)
+        or re.search(r"\b(?:buyer|evidence|risk|next\s+safe\s+action)\b", lower)
+    )
 
 
 def _looks_like_gmail_label_request(lower: str) -> bool:
@@ -827,6 +896,8 @@ def _task_objective(
         return "browser_diagnostics"
     if intent == "reference_capture":
         return "reference_capture"
+    if intent == "context_lookup":
+        return "context_lookup"
     if intent == "gmail_triage":
         return "gmail_triage"
     if intent == "outreach_draft":
@@ -836,7 +907,11 @@ def _task_objective(
     if intent == "opportunity_to_outreach_loop":
         return "opportunity_discovery"
     if intent == "company_research":
-        return "source_research" if _looks_like_source_summary_request(lower) else "entity_research"
+        return (
+            "source_research"
+            if _looks_like_source_summary_request(lower) or _looks_like_research_table_synthesis(lower)
+            else "entity_research"
+        )
     if intent == "research_brief":
         return "source_research"
     if intent == "opportunity_search":
@@ -875,6 +950,8 @@ def _expected_artifact_type(
         return "browser_diagnostics_report"
     if objective == "reference_capture":
         return "reference_note"
+    if objective == "context_lookup":
+        return "context_summary"
     return "none"
 
 
@@ -1120,7 +1197,10 @@ def _exclusion_constraints(text: str) -> list[str]:
 def looks_like_opportunity_to_outreach_loop(text: str) -> bool:
     """Return whether text asks for the integrated opportunity -> outreach workflow."""
 
-    return bool(_OPPORTUNITY_TO_OUTREACH_RE.search(str(text or "")))
+    raw_text = str(text or "")
+    if _NO_OUTREACH_DRAFT_RE.search(raw_text):
+        return False
+    return bool(_OPPORTUNITY_TO_OUTREACH_RE.search(raw_text))
 
 
 def _looks_like_discovery_outreach_workflow(text: str) -> bool:

@@ -1,0 +1,4 @@
+interface:
+  display_name: "KBA WorkItem Orchestrator Ops"
+  short_description: "Operate Keystone WorkItem flows"
+  default_prompt: "Use $kba-workitem-orchestrator-ops to debug or operate Keystone @KNI, WorkItem, context-pack, approval, or Orchestrator flows."

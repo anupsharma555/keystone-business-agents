@@ -16,12 +16,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from keystone_agents.agents.orchestrator import run_orchestrator_preflight
 from keystone_agents.automation_inventory import build_automation_inventory_report
+from keystone_agents.eval_runtime_diagnostics import slack_eval_blocker_diagnostics
 from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
 )
 from keystone_agents.schemas.work_item import WorkflowRunRequest
 from keystone_agents.sdk_sessions import build_sdk_session, resolve_sdk_session_spec
 from keystone_agents.slack_action_contract import (
+    KBA_EVAL_REVIEW,
+    KBA_INTENT_EVAL_REVIEW,
     RUN_AGENT_MESSAGE_CALLBACK_ID,
     RUN_AGENT_TASK_ACTION_ID,
     RUN_AGENT_TASK_BLOCK_ID,
@@ -245,9 +248,16 @@ def write_selected_message_context_file(
     safe_ts = re.sub(r"[^0-9A-Za-z_-]+", "-", context.selected_message_ts or "message")
     filename = f"slack-context-{safe_ts}-{digest}.json"
     path = (context_dir / filename).resolve()
+    payload = context.model_dump(mode="json", by_alias=True)
+    metadata = payload.setdefault("metadata", {})
+    if isinstance(metadata, dict):
+        metadata.setdefault("sensitivity", "slack_context_local_only")
+        metadata.setdefault("retention", "operator_review_artifact_cleanup_when_no_longer_needed")
+        metadata.setdefault("context_scope", "selected_message_or_thread_recent_window")
+        metadata.setdefault("raw_text_persistence", "bounded_operator_selected_context")
     path.write_text(
         json.dumps(
-            context.model_dump(mode="json", by_alias=True),
+            payload,
             ensure_ascii=True,
             indent=2,
             sort_keys=True,
@@ -620,7 +630,10 @@ def handle_run_agent_interaction(
             run_provenance=run_provenance,
         )
         if eval_record is not None:
+            eval_review_action = _eval_review_slack_action(eval_record)
             result_payload["eval_record"] = eval_record
+            result_payload["slack_actions"] = [eval_review_action]
+            result_payload["slack_overflow_actions"] = []
             result_payload["human_summary"] = _append_eval_thread_guidance(
                 str(result_payload.get("human_summary") or ""),
                 eval_record=eval_record,
@@ -683,24 +696,72 @@ def _record_eval_run_for_slack_bridge(
         return None
 
     run_id = str(run_provenance.get("work_item_id") or "").strip()
+    evidence = _slack_eval_evidence(
+        context=context,
+        result=result,
+        run_provenance=run_provenance,
+    )
     try:
         row_id = record_slack_eval_run(
             case_id=case_id,
             run_id=run_id,
             agent=agent,
+            work_item_id=run_id,
             slack_channel_id=context.channel_id,
             slack_channel_name=context.channel_name,
             slack_thread_ts=context.thread_ts or context.selected_message_ts,
+            permalink=context.permalink,
             request_text=request_text,
             result_summary=str(getattr(result, "human_summary", "") or ""),
+            route=str(evidence.get("route") or agent),
+            status=str(evidence.get("status") or ""),
+            context_policy=str(evidence.get("context_policy") or ""),
+            thread_fetch_status=str(evidence.get("thread_fetch_status") or ""),
+            thread_message_count=int(evidence.get("thread_message_count") or 0),
+            warning_count=int(evidence.get("warning_count") or 0),
+            warnings=[str(item) for item in evidence.get("warnings") or []],
+            cost_profile=str(evidence.get("cost_profile") or ""),
+            source_count=int(evidence.get("source_count") or 0),
+            visible_source_count=int(evidence.get("visible_source_count") or 0),
+            sdk_estimated_cost_usd=evidence.get("sdk_estimated_cost_usd"),
+            sdk_cache_hit_rate=evidence.get("sdk_cache_hit_rate"),
+            response_hash=str(evidence.get("response_hash") or ""),
+            evidence=evidence,
+            model_provider=str(evidence.get("model_provider") or ""),
+            model_name=str(evidence.get("model_name") or ""),
+            run_mode=str(evidence.get("run_mode") or ""),
+            search_provider=str(evidence.get("search_provider") or ""),
+            search_provider_sequence=[
+                str(item) for item in evidence.get("search_provider_sequence") or []
+            ],
             database_path=database_path,
         )
     except (OSError, ValueError):
         return None
 
+    try:
+        from promptfoo.eval_dashboard import slack_run_post_save_state
+
+        post_save_state = slack_run_post_save_state(
+            case_id=case_id,
+            row_id=row_id,
+            database_path=database_path,
+        )
+    except (ImportError, OSError, ValueError, sqlite3.Error):
+        post_save_state = {}
     dashboard = _render_eval_dashboard(database_path)
     dashboard_case_url = _eval_dashboard_case_url(case_id)
     review_case_url = _eval_review_case_url(case_id)
+    eval_review_action = _eval_review_slack_action(
+        {
+            "case_id": case_id,
+            "run_id": run_id,
+            "agent": agent,
+            "slack_thread_ts": context.thread_ts or context.selected_message_ts,
+            "dashboard_case_url": dashboard_case_url,
+            "review_case_url": review_case_url,
+        }
+    )
     return {
         "id": row_id,
         "case_id": case_id,
@@ -713,17 +774,131 @@ def _record_eval_run_for_slack_bridge(
         "review_case_url": review_case_url,
         "dashboard_path": dashboard.get("dashboard_path", ""),
         "dashboard_relative_path": dashboard.get("dashboard_relative_path", ""),
+        "evidence": evidence,
+        "post_save_state": post_save_state,
+        "dashboard_visibility": post_save_state.get("dashboard_visibility", {}),
+        "refresh_endpoints": post_save_state.get("refresh_endpoints", []),
         "scorecard_request": "@KNI can you give me a scorecard for this eval?",
-        "status_request": "@KNI how is this eval doing?",
+        "submit_evaluation_action": "Submit Evaluation",
+        "slack_actions": [eval_review_action],
         "eval_thread_reply": {
             "case_id": case_id,
             "run_id": run_id,
             "dashboard_case_url": dashboard_case_url,
             "review_case_url": review_case_url,
             "scorecard_request": "@KNI can you give me a scorecard for this eval?",
-            "status_request": "@KNI how is this eval doing?",
+            "submit_evaluation_action": "Submit Evaluation",
+            "submit_evaluation_effect": "Writes scores and human notes to the local eval database, then refreshes dashboard views.",
+            "slack_actions": [eval_review_action],
         },
     }
+
+
+def _slack_eval_evidence(
+    *,
+    context: SlackSelectedMessageContext,
+    result: Any,
+    run_provenance: dict[str, Any],
+) -> dict[str, Any]:
+    work_item = getattr(result, "work_item", None)
+    work_item_payload = (
+        work_item.model_dump(mode="json") if hasattr(work_item, "model_dump") else {}
+    )
+    target = work_item_payload.get("target") if isinstance(work_item_payload.get("target"), dict) else {}
+    metadata = target.get("metadata") if isinstance(target.get("metadata"), dict) else {}
+    slack_context = (
+        metadata.get("slack_context") if isinstance(metadata.get("slack_context"), dict) else {}
+    )
+    query_prompt = (
+        slack_context.get("query_prompt")
+        if isinstance(slack_context.get("query_prompt"), dict)
+        else {}
+    )
+    sources = work_item_payload.get("sources") if isinstance(work_item_payload.get("sources"), list) else []
+    warnings = [str(item) for item in slack_context.get("warnings") or context.warnings or []]
+    human_summary = str(getattr(result, "human_summary", "") or "")
+    sdk_usage = _latest_sdk_usage_from_result(result)
+    sdk_cost = _latest_sdk_cost_from_result(result)
+    result_payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else {}
+    model = result_payload.get("model") if isinstance(result_payload.get("model"), dict) else {}
+    retrieval = (
+        result_payload.get("retrieval")
+        if isinstance(result_payload.get("retrieval"), dict)
+        else {}
+    )
+    thread_messages = slack_context.get("thread_messages") or context.thread_messages or []
+    selected_message_count = 1 if (context.selected_message.ts or context.selected_message.text) else 0
+    thread_message_count = len(thread_messages) if thread_messages else selected_message_count
+    evidence = {
+        "schema": "keystone.slack.eval_evidence.v1",
+        "work_item_id": str(run_provenance.get("work_item_id") or work_item_payload.get("id") or ""),
+        "route": str(run_provenance.get("route") or getattr(getattr(result, "route", ""), "value", "") or ""),
+        "status": str(run_provenance.get("status") or getattr(getattr(result, "status", ""), "value", "") or ""),
+        "permalink": context.permalink,
+        "context_policy": str(
+            slack_context.get("prompt_context_layout")
+            or slack_context.get("channel_history_policy")
+            or (context.metadata or {}).get("context_scope")
+            or ""
+        ),
+        "thread_fetch_status": str(slack_context.get("thread_fetch_status") or context.thread_fetch_status or ""),
+        "thread_message_count": thread_message_count,
+        "warning_count": len(warnings),
+        "warnings": warnings[:8],
+        "cost_profile": str(query_prompt.get("cost_profile") or ""),
+        "source_count": len(sources),
+        "visible_source_count": sum(1 for item in sources if isinstance(item, dict) and item.get("url")),
+        "sdk_estimated_cost_usd": _number_or_none(sdk_cost.get("estimated_usd") or sdk_cost.get("amount_usd")),
+        "sdk_cache_hit_rate": _number_or_none(sdk_usage.get("cache_hit_rate")),
+        "response_hash": _hash_text(human_summary) if human_summary else "",
+        "response_summary_chars": len(human_summary),
+        "model_provider": str(model.get("provider") or ""),
+        "model_name": str(model.get("name") or model.get("model") or ""),
+        "run_mode": str(model.get("run_mode") or ""),
+        "search_provider": str(retrieval.get("search_provider") or retrieval.get("provider") or ""),
+        "search_provider_sequence": [
+            str(item) for item in retrieval.get("search_provider_sequence") or []
+        ],
+    }
+    blocker_diagnostics = slack_eval_blocker_diagnostics(result_payload)
+    if blocker_diagnostics:
+        evidence["blocker_diagnostics"] = blocker_diagnostics
+    return evidence
+
+
+def _latest_sdk_usage_from_result(result: Any) -> dict[str, Any]:
+    payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else {}
+    candidates: list[dict[str, Any]] = []
+    for event in payload.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else {}
+        if usage:
+            candidates.append(usage)
+    return candidates[-1] if candidates else {}
+
+
+def _latest_sdk_cost_from_result(result: Any) -> dict[str, Any]:
+    payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else {}
+    candidates: list[dict[str, Any]] = []
+    for event in payload.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        cost = metadata.get("cost") if isinstance(metadata.get("cost"), dict) else {}
+        if cost:
+            candidates.append(cost)
+    return candidates[-1] if candidates else {}
+
+
+def _number_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _render_eval_dashboard(database_path: Path) -> dict[str, str]:
@@ -790,8 +965,36 @@ def _append_eval_thread_guidance(summary: str, *, eval_record: dict[str, Any]) -
         detail += f" Dashboard: <{dashboard_case_url}|case dashboard>."
     if review_case_url:
         detail += f" Review form: <{review_case_url}|score this case>."
+    detail += " Score from the linked form, then press `Submit Evaluation` in Slack to save scores and refresh the dashboard."
     parts.append(detail)
     return "\n\n".join(parts).strip()
+
+
+def _eval_review_slack_action(eval_record: dict[str, Any]) -> dict[str, Any]:
+    """Return the renderer-ready Slack button descriptor for eval scoring."""
+
+    case_id = _clean_scalar(eval_record.get("case_id"))
+    run_id = _clean_scalar(eval_record.get("run_id"))
+    agent = _clean_scalar(eval_record.get("agent"))
+    slack_thread_ts = _clean_scalar(eval_record.get("slack_thread_ts"))
+    dashboard_case_url = _clean_scalar(eval_record.get("dashboard_case_url"))
+    review_case_url = _clean_scalar(eval_record.get("review_case_url"))
+    return {
+        "label": "Submit Evaluation",
+        "action_id": KBA_EVAL_REVIEW,
+        "intent": KBA_INTENT_EVAL_REVIEW,
+        "style": "primary",
+        "metadata": {
+            "eval_record": {
+                "case_id": case_id,
+                "run_id": run_id,
+                "agent": agent,
+                "slack_thread_ts": slack_thread_ts,
+                "dashboard_case_url": dashboard_case_url,
+                "review_case_url": review_case_url,
+            }
+        },
+    }
 
 
 def _blocked_slack_agent_result(

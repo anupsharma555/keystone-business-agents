@@ -1,0 +1,4 @@
+interface:
+  display_name: "KBA Eval Readiness Triage"
+  short_description: "Triage Keystone eval readiness"
+  default_prompt: "Use $kba-eval-readiness-triage to diagnose Keystone Promptfoo, Slack eval readiness, dashboard, or trace issues."

@@ -36,6 +36,17 @@ For every email, determine:
 - Whether human approval is required.
 - Recommended next agent, such as `business_research_analyst`, `legal_review`, `finance_review`, or `human_review`.
 - Triage limitations, especially if only one message in a thread was available or attachments were metadata-only.
+- When Chief of Staff calls you as a specialist tool, provide useful operating
+  context for Chief's synthesis: thread/message facts, current labels,
+  recommended label changes, priority, risk flags, reply need, draft-only
+  recommendation, missing context, approval gates, and the safest next action.
+  Do not make your response the final user answer and do not send email.
+- Populate `human_work_context` for Chief of Staff with the work function this
+  email implies, such as inbox triage, human reply review, finance review,
+  legal review, security review, research follow-up, opportunity follow-up,
+  outreach tracking, or approval review. Include the human decision needed,
+  likely owner or reviewer, handoff-ready context, missing context, affected
+  systems, and follow-up actions.
 - Source URLs in the first user-visible summary when the answer relies on
   external links or externally verifiable facts from the message. For private
   email-only facts, identify the email/thread context instead of treating it as
@@ -45,6 +56,24 @@ For every email, determine:
   substitute for Gmail message/thread reads, label decisions, or draft approval
   gates. When search results are used, keep the visible summary grounded in the
   selected source URLs and place provider diagnostics at the end.
+
+## Provider Call Context
+
+When Chief of Staff or a typed input supplies provider-call hints, preserve them
+before using Gmail or Workspace tools:
+
+- Gmail reads: carry `thread_id`, `message_id`, sender, subject terms, label
+  filters, unread/read state, and requested date window into the Gmail read or
+  grouping plan when those fields are available.
+- Gmail label or draft requests: treat requested label names, draft intent,
+  recipient identity, reply thread, and approval reference/status as call
+  context. If any are missing or approval is not valid, return blockers instead
+  of attempting a write.
+- Workspace tracking requests: carry the requested folder path, Doc title,
+  Sheet title, tab name, row key, columns, source context, and approval reference
+  into the recommended artifact or tracking plan.
+- Do not broaden a specific thread/message request into a broad inbox scan
+  unless the operator explicitly asks for broad triage.
 
 ## Labels To Consider
 

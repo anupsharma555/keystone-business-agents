@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import yaml
 
+from keystone_agents.structured_logging import structured_log_event
 from promptfoo.eval_dashboard_server import main as dashboard_server_main
 from promptfoo.eval_urls import eval_dashboard_case_url, eval_dashboard_url
 
@@ -24,6 +26,7 @@ def main() -> int:
         readiness_command = [sys.executable, "scripts/check_eval_slack_readiness.py"]
         if args.strict_readiness:
             readiness_command.append("--strict")
+            readiness_command.append("--dashboard-server-will-start")
         if args.live_slack_probe:
             readiness_command.append("--live-slack-probe")
         completed = subprocess.run(
@@ -32,6 +35,16 @@ def main() -> int:
             check=False,
         )
         if completed.returncode != 0:
+            _emit_structured_log(
+                event="readiness_failed",
+                level="error",
+                payload={
+                    "stage": "readiness",
+                    "status": "error",
+                    "return_code": completed.returncode,
+                    "command": readiness_command,
+                },
+            )
             return completed.returncode
     try:
         starter_prompt = _resolve_starter_eval_prompt(
@@ -40,6 +53,15 @@ def main() -> int:
             case_id=args.case_id,
         )
     except ValueError as exc:
+        _emit_structured_log(
+            event="starter_prompt_failed",
+            level="error",
+            payload={
+                "stage": "starter_prompt",
+                "status": "error",
+                "error": str(exc),
+            },
+        )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     print(
@@ -99,6 +121,28 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def _emit_structured_log(
+    *,
+    event: str,
+    level: str = "info",
+    payload: dict[str, object] | None = None,
+) -> None:
+    print(
+        json.dumps(
+            structured_log_event(
+                component="eval_slack_test_server",
+                event=event,
+                level=level,
+                payload=dict(payload or {}),
+            ),
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _resolve_starter_eval_prompt(

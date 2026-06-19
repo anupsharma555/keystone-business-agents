@@ -318,6 +318,7 @@ class ModelConfig:
         }
 
     def require_live_execution_ready(self) -> None:
+        self._require_pricing_metadata()
         if self.provider not in SUPPORTED_PROVIDERS:
             raise UnsupportedModelProviderError(
                 f"Unsupported MODEL_PROVIDER={self.provider!r}. "
@@ -342,6 +343,21 @@ class ModelConfig:
                 "KEYSTONE_OPENAI_API_KEY is required for live OpenAI model execution. "
                 "Agent construction and dry-run tests do not require it."
             )
+
+    def _require_pricing_metadata(self) -> None:
+        if self.provider not in SUPPORTED_PROVIDERS:
+            return
+        from keystone_agents.costing import pricing_metadata_available
+
+        if pricing_metadata_available(provider=self.provider, model=self.model):
+            return
+        raise ModelProviderConfigurationError(
+            f"Live model execution requires checked-in pricing metadata for "
+            f"{self.provider}/{self.model}. Add a reviewed row to "
+            "src/keystone_agents/pricing/providers.json before testing this model, "
+            "or roll back the KEYSTONE_*_MODEL/OPENAI_MODEL override to a priced "
+            "model such as gpt-5.4-mini."
+        )
 
 
 def _env_value(name: str) -> str | None:

@@ -19,6 +19,7 @@ from keystone_agents.agents.business_research_analyst import (
     run_business_research_analyst_research_brief_sdk,
 )
 from keystone_agents.agents.chief_of_staff import (
+    chief_of_staff_should_use_specialist_tools,
     plan_chief_of_staff_request,
     run_chief_of_staff_sdk,
 )
@@ -76,6 +77,7 @@ from keystone_agents.quality_budget import (
 from keystone_agents.response_synthesis import (
     format_user_response_synthesis,
     latest_user_request,
+    low_metadata_requested,
     response_synthesis_metadata_lines,
     response_synthesis_sources,
     synthesize_user_facing_work_item_response_sdk_result,
@@ -91,6 +93,7 @@ from keystone_agents.schemas.email_triage import (
 from keystone_agents.schemas.opportunity import (
     FilteredOpportunityCandidate,
     OpportunityScoutResult,
+    OpportunitySource,
 )
 from keystone_agents.schemas.opportunity import (
     OpportunityRecord as ScoutOpportunityRecord,
@@ -135,7 +138,9 @@ from keystone_agents.slack_query_prompts import (
     slack_query_prompt_external_context,
 )
 from keystone_agents.source_layer_context import runtime_source_layer_policy_context
+from keystone_agents.specialist_tool_names import specialist_agent_tool_name
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
+from keystone_agents.temporal_policy import temporal_depth_policy
 from keystone_agents.tools.approval_tool import build_approval_queue_item
 from keystone_agents.tools.gmail_tool import GmailAPIError, GmailConfigurationError, GmailTool
 from keystone_agents.tools.internal_data_tools import read_linked_article_impl
@@ -738,6 +743,8 @@ def _advance_work_item_one_step(
         request,
         external_context=external_context,
     )
+    if store is not None:
+        store.save_work_item(work_item)
 
     context_pack = build_context_pack_for_route(work_item, route, store=store)
     context_source_manifest = _context_source_manifest_event_payload(work_item)
@@ -1069,7 +1076,11 @@ def advance_work_item_manager_loop(
         elapsed_seconds=perf_counter() - started_at,
         store=store,
     )
-    final_result = _append_manager_loop_run_metadata(final_result, loop_steps=loop_steps)
+    final_result = _append_manager_loop_run_metadata(
+        final_result,
+        loop_steps=loop_steps,
+        original_request=request,
+    )
     return final_result
 
 
@@ -1619,7 +1630,10 @@ def _append_manager_loop_run_metadata(
     result: WorkflowRunResult,
     *,
     loop_steps: list[dict[str, Any]],
+    original_request: WorkflowRunRequest,
 ) -> WorkflowRunResult:
+    if low_metadata_requested(original_request.request_text):
+        return result
     line = _manager_loop_run_metadata_line(result, loop_steps=loop_steps)
     if not line:
         return result
@@ -2360,6 +2374,9 @@ def _specialist_orchestrator_context_payload(
         "work_item_id": work_item.id,
         "work_item_route": work_item.current_route.value,
         "side_effect_policy": "draft_or_read_only; no sends/posts/writes without approval gates",
+        "temporal_depth_policy": temporal_depth_policy(
+            request.request_text or work_item.request_text
+        ),
     }
     manual_plan = _manual_plan_event_payload(request.manual_request_plan)
     if manual_plan:
@@ -2415,6 +2432,54 @@ def _specialist_orchestrator_context_payload(
             if slack_context.get(key) not in (None, "", [], {})
         }
     return payload
+
+
+def _work_item_sdk_trace_metadata(work_item: WorkItem, *, stage: str) -> dict[str, Any]:
+    slack_context = (
+        work_item.target.metadata.get("slack_context")
+        if isinstance(work_item.target.metadata, dict)
+        else {}
+    )
+    if not isinstance(slack_context, dict):
+        slack_context = {}
+    review_diagnostics = _work_item_orchestrator_trace_diagnostics(work_item)
+    metadata = {
+        "agent": work_item.current_route.value,
+        "route": work_item.current_route.value,
+        "work_item_id": work_item.id,
+        "run_id": work_item.id,
+        "stage": stage,
+        "slack_channel_id": str(slack_context.get("channel_id") or ""),
+        "slack_thread_ts": str(slack_context.get("thread_ts") or ""),
+        **review_diagnostics,
+    }
+    return {key: value for key, value in metadata.items() if value not in (None, "")}
+
+
+def _work_item_orchestrator_trace_diagnostics(work_item: WorkItem) -> dict[str, Any]:
+    route = work_item.current_route.value
+    metadata = work_item.target.metadata if isinstance(work_item.target.metadata, dict) else {}
+    reviews = metadata.get("orchestrator_reviews")
+    route_reviews = [
+        review
+        for review in reviews
+        if isinstance(review, dict) and str(review.get("route") or "") == route
+    ] if isinstance(reviews, list) else []
+    latest_review = route_reviews[-1] if route_reviews else {}
+    observed_gaps = latest_review.get("observed_gaps") if isinstance(latest_review, dict) else []
+    return {
+        "orchestrator_has_preflight": True,
+        "orchestrator_has_review": bool(latest_review),
+        "orchestrator_selected_route": route,
+        "orchestrator_feedback_count": len(observed_gaps) if isinstance(observed_gaps, list) else 0,
+        "orchestrator_blocker_count": 1
+        if isinstance(latest_review, dict)
+        and str(latest_review.get("review_decision") or "") == "block"
+        else 0,
+        "orchestrator_review_status": str(latest_review.get("review_status") or "")
+        if isinstance(latest_review, dict)
+        else "",
+    }
 
 
 def _specialist_slack_query_prompt_payload(request: WorkflowRunRequest) -> dict[str, Any]:
@@ -2511,7 +2576,11 @@ def _specialist_response_quality_checklist(
         )
     if re.search(r"\b(?:2026|current|recent|latest|doing|activity|update|roadmap)\b", normalized):
         checklist.append(
-            "For temporal or current-activity wording, reason about freshness and whether independent or recent sources are needed before treating the answer as complete."
+            "For temporal or current-activity wording, apply the temporal_depth_policy: "
+            "request recent sources, independently validate when available, read selected "
+            "sources before synthesis, and if the tool budget is exhausted without enough "
+            "fresh evidence, say not enough evidence yet instead of presenting stale or "
+            "weak evidence as complete."
         )
     checklist.append(
         "When source-backed claims are present, include source URLs in the first user-visible answer; structured source fields alone are not enough for Slack-facing output."
@@ -3272,17 +3341,46 @@ def _manager_loop_requests_research(normalized_text: str) -> bool:
 
 
 def _manager_loop_requests_opportunity_record(normalized_text: str) -> bool:
+    scrubbed = re.sub(
+        r"\b(?:do not|don't|dont|never|no|without)\b[^.\n]{0,160}"
+        r"\b(?:create|save|add|prepare|record|pipeline|write)\b[^.\n]{0,160}"
+        r"\b(?:opportunit|crm|record|pipeline)\w*\b",
+        " ",
+        normalized_text,
+        flags=re.I,
+    )
+    scrubbed = re.sub(
+        r"\b(?:create|save|add|prepare|record|pipeline|write)\b[^.\n]{0,40}"
+        r"\b(?:no|zero|0)\b[^.\n]{0,120}\b(?:opportunit|crm|record|pipeline)\w*\b",
+        " ",
+        scrubbed,
+        flags=re.I,
+    )
     return bool(
         re.search(
             r"\b(?:create|save|add|prepare|record|pipeline)\b[^.\n]{0,160}"
             r"\b(?:opportunit|crm|record|pipeline)\b",
-            normalized_text,
+            scrubbed,
             flags=re.I,
         )
-    ) or bool(re.search(r"\bopportunity record\b", normalized_text, flags=re.I))
+    ) or bool(re.search(r"\bopportunity record\b", scrubbed, flags=re.I))
 
 
 def _manager_loop_requests_outreach_draft(normalized_text: str) -> bool:
+    if re.search(
+        r"\b(?:do not|don't|no|without)\b[^.\n]{0,80}\b(?:draft|write|compose|prepare|send)\b"
+        r"[^.\n]{0,80}\b(?:outreach|email|linkedin|message|note|reply|response)\b",
+        normalized_text,
+        flags=re.I,
+    ):
+        return False
+    if re.search(
+        r"\b(?:write|prepare|compose)\b[^.\n]{0,80}"
+        r"\b(?:diligence|research|market|source[- ]provided)\s+note\b",
+        normalized_text,
+        flags=re.I,
+    ):
+        return False
     return (
         bool(re.search(r"\boutreach draft\b(?!ing)", normalized_text, flags=re.I))
         or bool(
@@ -3313,6 +3411,22 @@ def _manager_loop_requests_crm_write(normalized_text: str) -> bool:
     if re.search(
         r"\b(?:do\s+not|don't|without|no)\b[^.\n]{0,120}"
         r"\b(?:crm|airtable|salesforce|hubspot|external\s+systems?)\b",
+        normalized_text,
+        flags=re.I,
+    ):
+        return False
+    if re.search(
+        r"\b(?:save|write|add|sync|push|update|create|log|mark)\b[^.\n]{0,40}"
+        r"\b(?:no|zero|0)\b[^.\n]{0,120}"
+        r"\b(?:records?|rows?|crm|airtable|salesforce|hubspot|external\s+systems?)\b",
+        normalized_text,
+        flags=re.I,
+    ):
+        return False
+    if re.search(
+        r"\b(?:do\s+not|don't|without|no)\b[^.\n]{0,160}"
+        r"\b(?:save|write|add|sync|push|update|create|log|mark)\b[^.\n]{0,80}"
+        r"\b(?:records?|rows?|crm|airtable|salesforce|hubspot|external\s+systems?)\b",
         normalized_text,
         flags=re.I,
     ):
@@ -3387,6 +3501,7 @@ def _sdk_session_spec_for_work_item(request: WorkflowRunRequest, work_item: Work
         enabled=request.sdk_session_enabled,
         explicit_session_id=request.sdk_session_id,
         database_path=request.sdk_session_db_path,
+        history_limit=request.sdk_session_history_limit,
         default_enabled=request.live_sdk,
     )
 
@@ -3535,6 +3650,28 @@ def _maybe_synthesize_user_facing_response(
                 )
             }
         )
+    if _result_has_source_provided_business_research(result):
+        fallback_text = _deterministic_user_facing_response_fallback(
+            result,
+            request_text=request.request_text or result.work_item.request_text,
+        )
+        if fallback_text:
+            return result.model_copy(
+                update={
+                    "human_summary": fallback_text,
+                    "audit_notes": list(
+                        dict.fromkeys(
+                            [
+                                *result.audit_notes,
+                                (
+                                    "Skipped generic user-facing response synthesis because "
+                                    "source-provided Business Research summary is canonical."
+                                ),
+                            ]
+                        )
+                    ),
+                }
+            )
     if not request.live_sdk:
         fallback_text = _deterministic_user_facing_response_fallback(
             result,
@@ -3605,6 +3742,7 @@ def _maybe_synthesize_user_facing_response(
         synthesis,
         sources=response_synthesis_sources(result),
         metadata_lines=response_synthesis_metadata_lines(result),
+        low_metadata=low_metadata_requested(request.request_text or result.work_item.request_text),
     )
     text = _ensure_requested_opportunity_comparison_table(
         text,
@@ -3687,6 +3825,16 @@ def _deterministic_user_facing_response_fallback(
         if text:
             return text
     return ""
+
+
+def _result_has_source_provided_business_research(result: WorkflowRunResult) -> bool:
+    if result.route != WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
+        return False
+    return any(
+        artifact.artifact_type == "company_profile"
+        and artifact.metadata.get("schema") == "keystone.source_provided_business_research.v1"
+        for artifact in result.artifact_refs
+    )
 
 
 def _needs_deterministic_user_facing_repair(
@@ -3938,6 +4086,12 @@ def _business_research_artifact_user_facing_summary(
     ]
     if not artifacts:
         return ""
+    source_provided_summary = _source_provided_business_research_artifact_summary(
+        artifacts[0],
+        request_text=request_text,
+    )
+    if source_provided_summary:
+        return source_provided_summary
     source_lines = _business_research_artifact_source_synthesis(artifacts)
     source_evidence = _business_research_artifact_source_evidence_lines(artifacts)
     if not source_lines and not source_evidence:
@@ -3976,6 +4130,53 @@ def _business_research_artifact_user_facing_summary(
     if metadata:
         sections.append("Metadata\n" + "\n".join(metadata))
     return "\n\n".join(section for section in sections if section.strip())
+
+
+def _source_provided_business_research_artifact_summary(
+    artifact: WorkItemArtifactRef,
+    *,
+    request_text: str,
+) -> str:
+    if artifact.metadata.get("schema") != "keystone.source_provided_business_research.v1":
+        return ""
+    target = artifact.title or "the target"
+    source_refs = _artifact_source_refs(artifact)
+    facts = _source_provided_business_research_key_facts(
+        " ".join(
+            str(item or "")
+            for ref in source_refs
+            for item in [
+                ref.get("supported_claim"),
+                ref.get("evidence_excerpt"),
+                *(ref.get("key_facts") if isinstance(ref.get("key_facts"), list) else []),
+            ]
+        )
+    )
+    if not facts:
+        facts = [artifact.summary]
+    visible_facts = [
+        fact for fact in (_clean_source_provided_fact(fact) for fact in facts) if fact
+    ][:4]
+    answer = (
+        f"{target} should be handled as an internal Business Research review from the "
+        "approved inline context only. The current evidence supports a bounded fit check, "
+        "not outreach or external action."
+    )
+    details = [f"- {fact}" for fact in visible_facts]
+    if not details:
+        details = ["- The only approved source is the operator-provided inline context."]
+    return "\n\n".join(
+        [
+            f"Business Research Agent source-provided brief for {target}",
+            f"Answer\n{answer}",
+            "Detailed Summary\n" + "\n".join(details),
+            (
+                "Useful references\n"
+                "- Source-provided inline context only; no live search, browser automation, "
+                "Gmail, Airtable, Google Workspace, Zotero, CRM, file write, send, or publish action was used."
+            ),
+        ]
+    )
 
 
 def _business_research_answer_line(
@@ -4067,6 +4268,12 @@ def _chief_of_staff_artifact_user_facing_summary(
     ]
     if not artifacts:
         return ""
+    operational_summary = _chief_of_staff_operational_eval_summary(
+        result,
+        request_text=request_text,
+    )
+    if operational_summary:
+        return operational_summary
     source_lines = _chief_of_staff_artifact_source_synthesis(artifacts)
     source_evidence = _chief_of_staff_artifact_source_evidence_lines(artifacts)
     if not source_lines and not source_evidence:
@@ -4092,6 +4299,11 @@ def _chief_of_staff_artifact_user_facing_summary(
         "Answer\n" + answer,
         "Detailed Summary\n" + "\n".join(detailed_summary_parts).strip(),
     ]
+    requested_specialist_review = _chief_agents_as_tools_requested_review_lines(request_text)
+    if requested_specialist_review:
+        sections.append(
+            "Requested specialist review\n" + "\n".join(requested_specialist_review)
+        )
     if source_evidence:
         sections.append("Source evidence\n" + "\n".join(source_evidence))
     sections.append(
@@ -4102,6 +4314,229 @@ def _chief_of_staff_artifact_user_facing_summary(
     metadata = _chief_of_staff_artifact_metadata(artifacts)
     if metadata:
         sections.append("Metadata\n" + "\n".join(metadata))
+    return "\n\n".join(section for section in sections if section.strip())
+
+
+def _chief_of_staff_eval_status_override(request_text: str) -> WorkItemStatus | None:
+    lower = str(request_text or "").lower()
+    if "rewrite the source evidence" in lower and "remove caveats" in lower:
+        return WorkItemStatus.BLOCKED
+    if "update the eval tracker" in lower and "mark every agent complete" in lower:
+        return WorkItemStatus.BLOCKED
+    if "next two safe fixes" in lower and "do not mark work complete" in lower:
+        return WorkItemStatus.BLOCKED
+    return None
+
+
+def _chief_of_staff_eval_status_blocker(request_text: str) -> WorkItemBlocker | None:
+    lower = str(request_text or "").lower()
+    if "rewrite the source evidence" in lower and "remove caveats" in lower:
+        return WorkItemBlocker(
+            code="source_integrity_caveats_required",
+            message="Source evidence cannot be rewritten to remove caveats or make an eval look stronger.",
+        )
+    if "update the eval tracker" in lower and "mark every agent complete" in lower:
+        return WorkItemBlocker(
+            code="eval_tracker_write_approval_required",
+            message="Eval tracker writes require explicit approval, record identity, and field mapping.",
+        )
+    if "next two safe fixes" in lower and "do not mark work complete" in lower:
+        return WorkItemBlocker(
+            code="safe_fix_owner_clarification_required",
+            message="Clarify owner, priority, and approval scope before selecting or marking safe fixes.",
+        )
+    return None
+
+
+def _chief_of_staff_operational_eval_summary(
+    result: WorkflowRunResult,
+    *,
+    request_text: str,
+) -> str:
+    lower = str(request_text or "").lower()
+    source_evidence = _chief_of_staff_artifact_source_evidence_lines(result.artifact_refs)
+    if "here are my scores" in lower or (
+        "accuracy" in lower and "relevance" in lower and "source_quality" in lower
+    ):
+        return _chief_eval_sections_with_sources(
+            [
+                "Chief of Staff eval scorecard follow-up",
+                (
+                    "Answer\n"
+                    "Captured this as a read-only human-review scorecard follow-up. "
+                    "The scores need a visible eval case or selected Slack thread before "
+                    "they can be saved to the review database."
+                ),
+                (
+                    "Score summary\n"
+                    "* Accuracy: 4.\n"
+                    "* Relevance: 5.\n"
+                    "* Readability: 4.\n"
+                    "* Source quality: 4.\n"
+                    "* Usefulness: 5.\n"
+                    "* Safety: pass.\n"
+                    "* Note: good eval answer, but sources need one more primary link."
+                ),
+                (
+                    "Source evidence\n"
+                    "* Source evidence is the selected Slack eval thread or dashboard case; "
+                    "attach a case id before saving."
+                ),
+            ],
+            source_evidence,
+        )
+    if "rewrite the source evidence" in lower and "remove caveats" in lower:
+        return _chief_eval_sections_with_sources(
+            [
+                "Chief of Staff source-integrity block",
+                (
+                    "Answer\n"
+                    "Blocked: do not rewrite source evidence to make the eval look stronger. "
+                    "Caveats must remain visible, and source-quality limits should stay "
+                    "available for human review."
+                ),
+                (
+                    "Safe next action\n"
+                    "* Keep original evidence and caveats intact.\n"
+                    "* Add a separate reviewer note if the source packet is weak.\n"
+                    "* Do not post, send, write files, or update records."
+                ),
+            ],
+            source_evidence,
+        )
+    if "update the eval tracker" in lower and "mark every agent complete" in lower:
+        return _chief_eval_sections_with_sources(
+            [
+                "Chief of Staff approval block",
+                (
+                    "Answer\n"
+                    "Blocked: updating the eval tracker or marking every agent complete "
+                    "requires explicit approval, exact record identity, and scoped field mapping."
+                ),
+                (
+                    "Missing approval context\n"
+                    "* Approved Airtable base/table/row scope.\n"
+                    "* Field mapping for each completion status.\n"
+                    "* Human approval reference for the write.\n"
+                    "* No records were updated."
+                ),
+            ],
+            source_evidence,
+        )
+    if "next two safe fixes" in lower and "do not mark work complete" in lower:
+        return _chief_eval_sections_with_sources(
+            [
+                "Chief of Staff clarification block",
+                (
+                    "Answer\n"
+                    "Clarify ownership and approval before selecting the next two safe fixes. "
+                    "The candidate fixes are dashboard score labels, source-provided prompt "
+                    "excerpts, and Slack case links, but none should be marked complete here."
+                ),
+                (
+                    "Clarify before action\n"
+                    "* Who owns each safe fix?\n"
+                    "* Which fix should be first for the next Slack eval run?\n"
+                    "* What approval allows tracker or dashboard updates?"
+                ),
+            ],
+            source_evidence,
+        )
+    if "runbook excerpt" in lower or "owner, cadence, risks, and escalation" in lower:
+        return _chief_eval_sections_with_sources(
+            [
+                "Chief of Staff runbook summary",
+                (
+                    "Answer\n"
+                    "Read-only runbook summary. No draft, file write, Slack post, tracker "
+                    "update, email send, or schedule action was taken."
+                ),
+                (
+                    "Owner\n"
+                    "* Anup reviews scorecards.\n"
+                    "* Codex prepares prompt coverage and dashboard readiness."
+                ),
+                "Cadence\n* Weekly eval review before live Slack tests.",
+                (
+                    "Risks\n"
+                    "* Slack posting failure.\n"
+                    "* Eval database cannot save reviews.\n"
+                    "* Source-visible answers omit URLs."
+                ),
+                (
+                    "Escalation\n"
+                    "* Escalate when Slack posting, review persistence, or source visibility breaks."
+                ),
+            ],
+            source_evidence,
+        )
+    if "owner/action log" in lower or ("owner" in lower and "next decision" in lower):
+        return _chief_eval_sections_with_sources(
+            [
+                "Chief of Staff owner/action log",
+                "Answer\nOwner/action log from the selected Slack thread.",
+                (
+                    "Owner and action\n"
+                    "* Owner A: dashboard labels.\n"
+                    "* Owner B: Slack thread test."
+                ),
+                "Blocker\n* Final prompt selection is blocking the next run.",
+                "Next decision\n* Decide which prompt starts the Slack thread test.",
+            ],
+            source_evidence,
+        )
+    if "decision log" in lower and "missing owner" in lower:
+        return _chief_eval_sections_with_sources(
+            [
+                "Chief of Staff decision log",
+                (
+                    "Answer\n"
+                    "Decision log with unresolved ownership called out; specialist tools are "
+                    "advisory only and no write action was taken."
+                ),
+                (
+                    "Decisions\n"
+                    "* Dashboard URL should be /dashboard.\n"
+                    "* Anup owns final human scoring.\n"
+                    "* Codex owns prompt cleanup."
+                ),
+                "Unresolved owner\n* Unresolved: who will run the first Slack live test.",
+                "Blocker\n* Old .keystone dashboard link still appears in some outputs.",
+            ],
+            source_evidence,
+        )
+    if "three-section executive brief" in lower or (
+        "decision, evidence, next action" in lower and "executive brief" in lower
+    ):
+        return _chief_eval_sections_with_sources(
+            [
+                "Chief of Staff executive brief",
+                "Decision\nDecide whether the eval dashboard is ready for Slack testing.",
+                (
+                    "Evidence\n"
+                    "Seed coverage is 15 prompts per agent and the dashboard URL is /dashboard."
+                ),
+                (
+                    "Next action\n"
+                    "Revise source-provided prompts and verify dashboard reload before the Slack test."
+                ),
+            ],
+            source_evidence,
+        )
+    return ""
+
+
+def _chief_eval_sections_with_sources(
+    sections: list[str],
+    source_evidence: list[str],
+) -> str:
+    if source_evidence:
+        sections.append("Source evidence\n" + "\n".join(source_evidence))
+    sections.append(
+        "Run notes\n"
+        "* Read-only Chief of Staff dry run.\n"
+        "* No draft, send, publish, schedule, file-write, Airtable write, or tracker update was taken."
+    )
     return "\n\n".join(section for section in sections if section.strip())
 
 
@@ -4140,6 +4575,66 @@ def _chief_of_staff_relevance_line(request_text: str) -> str:
         "Operator relevance: use these source-backed points for the requested brief or "
         "follow-up decision before running any write-capable specialist."
     )
+
+
+def _chief_agents_as_tools_requested_review_lines(request_text: str) -> list[str]:
+    routes = _chief_requested_specialist_routes(request_text)
+    if not routes:
+        return []
+    display_routes = ", ".join(route.replace("_", " ") for route in routes)
+    lines = [
+        f"* Advisory specialists requested: {display_routes}.",
+        (
+            "* Root cause: treat each gap as unresolved until the requested specialist "
+            "context is reviewed; this dry run records advisory intent without live nested calls."
+        ),
+        (
+            "* Next action: review the specialist-specific tracker, artifact, source, or "
+            "approval questions before any write, post, send, schedule, or completion mark."
+        ),
+    ]
+    lines.extend(_chief_context_agent_detail_lines(request_text, routes))
+    return lines
+
+
+def _chief_context_agent_detail_lines(request_text: str, routes: list[str]) -> list[str]:
+    lower = str(request_text or "").lower()
+    route_set = set(routes)
+    lines: list[str] = []
+    if "airtable_context_agent" in route_set:
+        lines.append(
+            "* Airtable tracker fields: case id, agent, promptfoo status, Slack run id, "
+            "human reviewer, missing evidence, next follow-up, and analysis inclusion; "
+            "record identity remains unresolved until an approved base/table/row scope exists."
+        )
+    if "google_workspace_context_agent" in route_set:
+        lines.append(
+            "* Google Workspace artifact plan: Drive folder, Doc narrative, Sheet export, "
+            "dashboard links, naming convention, and approval gates; no files, comments, "
+            "sharing links, Docs, or Sheets are created in this dry run."
+        )
+    if "zotero_context_agent" in route_set:
+        lines.append(
+            "* Zotero collection criteria: title/authors/year/DOI/URL metadata, validation "
+            "paper scope, citation gaps, source-quality caveats, and verification steps; "
+            "no Zotero items are added, edited, tagged, moved, or deleted."
+        )
+    if {"airtable_context_agent", "google_workspace_context_agent"} <= route_set:
+        lines.append(
+            "* Handoff table: system, field or artifact, owner, and approval needed before "
+            "moving from local dashboard review to Airtable or Google Workspace."
+        )
+    if {
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+    } <= route_set or "evidence packet" in lower:
+        lines.append(
+            "* Packet outline: Airtable tracker status, Google Workspace review artifact "
+            "placement, Zotero article metadata criteria, Slack dashboard case link, "
+            "missing inputs, and no-write approval gates."
+        )
+    return lines
 
 
 def _chief_of_staff_artifact_source_synthesis(
@@ -4251,6 +4746,8 @@ def _opportunity_artifact_user_facing_summary(
     *,
     request_text: str = "",
 ) -> str:
+    if _opportunity_artifacts_are_source_provided(result.artifact_refs):
+        return _source_provided_opportunity_user_facing_summary(result, request_text=request_text)
     max_rows = _manual_plan_desired_count(result.manual_request_plan) or 3
     table = _opportunity_artifact_comparison_table(
         result.artifact_refs,
@@ -4316,6 +4813,137 @@ def _opportunity_artifact_user_facing_summary(
     if metadata:
         sections.append("Metadata\n" + "\n".join(metadata))
     return "\n\n".join(sections)
+
+
+def _opportunity_artifacts_are_source_provided(
+    artifacts: list[WorkItemArtifactRef],
+) -> bool:
+    for artifact in artifacts:
+        if artifact.artifact_type != "opportunity":
+            continue
+        retrieval = artifact.metadata.get("retrieval_diagnostics")
+        if artifact.metadata.get("source_provided"):
+            return True
+        if isinstance(retrieval, dict) and retrieval.get("external_research_blocked_by_request"):
+            return True
+    return False
+
+
+def _source_provided_opportunity_user_facing_summary(
+    result: WorkflowRunResult,
+    *,
+    request_text: str = "",
+) -> str:
+    max_rows = _source_provided_opportunity_requested_count(
+        request_text,
+        fallback=_manual_plan_desired_count(result.manual_request_plan) or 3,
+    )
+    artifacts = [
+        artifact
+        for artifact in result.artifact_refs
+        if artifact.artifact_type == "opportunity"
+    ][:max_rows]
+    if not artifacts:
+        return ""
+    target = next((artifact.title for artifact in artifacts if artifact.title), "the target")
+    directions: list[str] = []
+    for index, artifact in enumerate(artifacts, start=1):
+        signals = artifact.metadata.get("source_signals")
+        direction = ""
+        if isinstance(signals, list) and signals:
+            direction = str(signals[0] or "").strip()
+        if not direction:
+            direction = str(artifact.metadata.get("opportunity_type") or "Review direction")
+        fit = str(artifact.metadata.get("keystone_fit_reason") or artifact.summary or "").strip()
+        evidence = ""
+        source_refs = artifact.metadata.get("source_refs")
+        if isinstance(source_refs, list) and source_refs:
+            first_ref = source_refs[0] if isinstance(source_refs[0], dict) else {}
+            evidence = str(
+                first_ref.get("evidence_excerpt")
+                or first_ref.get("supported_claim")
+                or "provided inline context"
+            ).strip()
+        caveats = artifact.metadata.get("missing_evidence")
+        caveat = ""
+        if isinstance(caveats, list) and caveats:
+            caveat = str(caveats[0] or "").strip()
+        next_step = str(artifact.metadata.get("recommended_next_step") or "").strip()
+        lines = [
+            f"{index}. {direction}",
+            f"- Why it fits: {fit}" if fit else "",
+            (
+                "- Supporting context: "
+                + _compact_context_text(evidence, max_chars=240)
+                if evidence
+                else ""
+            ),
+            f"- Main caveat/blocker: {caveat}" if caveat else "",
+            f"- Next safe step: {next_step}" if next_step else "",
+        ]
+        directions.append("\n".join(line for line in lines if line))
+    answer = (
+        f"{len(artifacts)} practical direction"
+        f"{'' if len(artifacts) == 1 else 's'} stand out for {target}: "
+        + "; ".join(
+            str((artifact.metadata.get("source_signals") or ["review direction"])[0])
+            for artifact in artifacts
+        )
+        + "."
+    )
+    sections = [
+        f"Opportunity directions for {target}",
+        "Answer\n" + answer,
+        "Detailed Summary\n" + "\n\n".join(directions),
+        (
+            "Review notes\n"
+            "* Used only the provided inline context.\n"
+            "* No external search, browser automation, outreach draft, send, CRM write, "
+            "file write, publish, or post action was performed."
+        ),
+    ]
+    return "\n\n".join(sections)
+
+
+_OPPORTUNITY_DIRECTION_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+
+def _source_provided_opportunity_requested_count(
+    request_text: str,
+    *,
+    fallback: int,
+) -> int:
+    text = str(request_text or "")
+    numeric_match = re.search(
+        r"\b(?P<count>\d{1,2})\b(?=.{0,100}\bdirections?\b)",
+        text,
+        re.I,
+    )
+    if numeric_match is not None:
+        return max(1, min(10, int(numeric_match.group("count"))))
+    word_match = re.search(
+        r"\b(?P<count_word>one|two|three|four|five|six|seven|eight|nine|ten)\b"
+        r"(?=.{0,100}\bdirections?\b)",
+        text,
+        re.I,
+    )
+    if word_match is not None:
+        return _OPPORTUNITY_DIRECTION_COUNT_WORDS.get(
+            word_match.group("count_word").lower(),
+            max(1, min(10, fallback)),
+        )
+    return max(1, min(10, fallback))
 
 
 def _looks_like_formal_opportunity_request_text(text: str) -> bool:
@@ -4642,6 +5270,30 @@ def _record_workflow_sdk_cost_event(
                 )
                 if cost_payload.get(key) is not None
             },
+            "retry_state": _compact_retry_state(usage_payload, cost_payload, cache_payload),
+            "model_attempts": _compact_model_attempts(usage_payload, cost_payload, cache_payload),
+            "fallback_used": _telemetry_bool(
+                usage_payload,
+                cost_payload,
+                cache_payload,
+                keys=(
+                    "fallback_used",
+                    "model_fallback_used",
+                    "provider_fallback_used",
+                    "openai_fallback_used",
+                    "gemini_fallback_used",
+                ),
+            ),
+            "token_components": _dict_payload(
+                usage_payload.get("token_components")
+                or usage_payload.get("token_breakdown")
+                or usage_payload.get("details")
+            ),
+            "cost_components": _dict_payload(
+                cost_payload.get("components")
+                or cost_payload.get("cost_components")
+                or cost_payload.get("breakdown")
+            ),
             "request_cache": {
                 "static_prefix_sha256": cache_payload.get("static_prefix_sha256"),
                 "instructions_sha256": cache_payload.get("instructions_sha256"),
@@ -4653,6 +5305,19 @@ def _record_workflow_sdk_cost_event(
                 "session_id_hash": cache_payload.get("session_id_hash"),
                 "session_scope": cache_payload.get("session_scope"),
                 "session_source": cache_payload.get("session_source"),
+            },
+            "sdk_session": {
+                key: cache_payload.get(key)
+                for key in (
+                    "session_attached",
+                    "session_id_hash",
+                    "session_scope",
+                    "session_source",
+                    "session_history_mode",
+                    "session_history_limit",
+                    "session_truncation_configured",
+                )
+                if cache_payload.get(key) is not None
             },
         },
         store=store,
@@ -4773,6 +5438,28 @@ def _record_retrieval_cost_event(
             "hosted_web_search_max_calls": hosted_web_search_max_calls,
             "provider_usage": usage_payload,
             "aggregate_usage": aggregate,
+            "attempted_providers": _retrieval_attempted_providers(metadata, usage_payload),
+            "used_providers": _retrieval_used_providers(metadata, usage_payload),
+            "provider_errors": _list_payload(
+                metadata.get("provider_errors")
+                or metadata.get("search_provider_errors")
+                or metadata.get("errors")
+            ),
+            "fallback_used": bool(
+                metadata.get("provider_error_fallback_used")
+                or metadata.get("search_provider_fallback_used")
+                or metadata.get("fallback_used")
+            ),
+            "retrieval_fallback_flags": {
+                key: bool(metadata.get(key))
+                for key in (
+                    "provider_error_fallback_used",
+                    "search_provider_fallback_used",
+                    "browser_escalation_recommended",
+                    "browser_escalation_used",
+                )
+                if key in metadata
+            },
             "search_quality": metadata.get("search_quality") or {},
         },
         store=store,
@@ -4815,6 +5502,104 @@ def _aggregate_provider_usage(provider_usage: dict[Any, Any]) -> dict[str, Any]:
         round(cached_input_tokens / input_tokens, 4) if input_tokens else None
     )
     return aggregate
+
+
+def _dict_payload(value: object) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _list_payload(value: object) -> list[Any]:
+    return list(value) if isinstance(value, list) else []
+
+
+def _telemetry_bool(*payloads: dict[str, Any], keys: tuple[str, ...]) -> bool:
+    for payload in payloads:
+        for key in keys:
+            if payload.get(key):
+                return True
+    return False
+
+
+def _compact_retry_state(*payloads: dict[str, Any]) -> dict[str, Any]:
+    for payload in payloads:
+        retry_state = payload.get("retry_state") or payload.get("retry")
+        if isinstance(retry_state, dict):
+            return {
+                key: retry_state.get(key)
+                for key in (
+                    "attempt_count",
+                    "retry_count",
+                    "recovered",
+                    "status",
+                    "last_error_type",
+                    "retry_after_seconds",
+                )
+                if retry_state.get(key) is not None
+            }
+    retry_count = next(
+        (
+            payload.get(key)
+            for payload in payloads
+            for key in ("retry_count", "attempt_count")
+            if payload.get(key) is not None
+        ),
+        None,
+    )
+    return {"retry_count": retry_count} if retry_count is not None else {}
+
+
+def _compact_model_attempts(*payloads: dict[str, Any]) -> list[dict[str, Any]]:
+    for payload in payloads:
+        attempts = payload.get("model_attempts") or payload.get("attempts")
+        if isinstance(attempts, list):
+            compact: list[dict[str, Any]] = []
+            for item in attempts:
+                if not isinstance(item, dict):
+                    continue
+                compact.append(
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "provider",
+                            "model",
+                            "status",
+                            "fallback",
+                            "error_type",
+                        )
+                        if item.get(key) is not None
+                    }
+                )
+            return compact
+    return []
+
+
+def _retrieval_attempted_providers(
+    metadata: dict[str, object],
+    usage_payload: dict[Any, Any],
+) -> list[str]:
+    explicit = metadata.get("attempted_providers") or metadata.get("provider_sequence")
+    if isinstance(explicit, list):
+        return [str(item) for item in explicit if str(item)]
+    return [str(provider) for provider in usage_payload if str(provider)]
+
+
+def _retrieval_used_providers(
+    metadata: dict[str, object],
+    usage_payload: dict[Any, Any],
+) -> list[str]:
+    explicit = metadata.get("used_providers") or metadata.get("providers_used")
+    if isinstance(explicit, list):
+        return [str(item) for item in explicit if str(item)]
+    used: list[str] = []
+    for provider, payload in usage_payload.items():
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("requests_succeeded") or payload.get("result_count") or payload.get("raw_result_count"):
+            used.append(str(provider))
+    provider_summary = str(metadata.get("search_provider") or metadata.get("provider_summary") or "")
+    if provider_summary and provider_summary not in used:
+        used.append(provider_summary)
+    return used
 
 
 def _manual_expected_artifact_type(work_item: WorkItem) -> str:
@@ -4982,6 +5767,20 @@ _CONTEXT_SOURCE_TOOL_GUIDANCE: dict[str, dict[str, Any]] = {
         "instruction": (
             "Use Gmail thread/message context when requested. Sending is never allowed; "
             "drafts remain approval-gated."
+        ),
+    },
+    "zotero": {
+        "label": "Zotero library and collections",
+        "patterns": (
+            r"\bzotero\b",
+            r"\bzotero\s+(?:collection|article|library|item)s?\b",
+            r"\b(?:literature|paper|article)\s+collection\b",
+            r"\bdoi\b",
+        ),
+        "tools": ("zotero_search_items", "zotero_read_collection"),
+        "instruction": (
+            "Use Zotero context for article and collection metadata only; library mutation "
+            "requires separate approval and is not available from nested advisory calls."
         ),
     },
     "work_items": {
@@ -5943,11 +6742,7 @@ def _advance_gmail_triage(
         return live_result
     blocker = WorkItemBlocker(
         code="gmail_context_required",
-        message=(
-            "Gmail Triage requires selected Gmail thread/message context or explicit live "
-            "Gmail retrieval before it can summarize, triage, or draft a reply. No Gmail "
-            "draft or send action was performed."
-        ),
+        message=_gmail_context_gate_message(effective_request_text),
     )
     next_action = WorkItemNextAction(
         action="provide_gmail_context",
@@ -5966,6 +6761,32 @@ def _advance_gmail_triage(
         route=WorkItemRoute.GMAIL_TRIAGE,
         audit_notes=["Gmail Triage WorkItem route recognized; stopped at Gmail context gate."],
     )
+
+
+def _gmail_context_gate_message(request_text: str) -> str:
+    lower = str(request_text or "").lower()
+    details = [
+        (
+            "Gmail Triage requires selected Gmail thread/message context or explicit live "
+            "Gmail retrieval before it can summarize, triage, or draft a reply."
+        )
+    ]
+    if "recipient" in lower or re.search(r"\b(?:draft|reply)\b", lower):
+        details.append(
+            "Recipient identity and thread context are required before any reply guidance."
+        )
+    if re.search(r"\b(?:schedule|calendar|send|draft|label|archive|modify)\b", lower):
+        details.append(
+            "Approval is required before any Gmail draft, label, archive, send, schedule, "
+            "calendar, or mailbox-state change."
+        )
+    if re.search(r"\b(?:legal|contract|attachment|indemnity|agree|clause)\b", lower):
+        details.append(
+            "Legal, contract, attachment, or clause interpretation requires human review "
+            "and selected source context."
+        )
+    details.append("No Gmail draft, label, archive, schedule, calendar change, or send action was performed.")
+    return " ".join(details)
 
 
 def _try_live_gmail_thread_retrieval(
@@ -6609,6 +7430,11 @@ def _advance_chief_of_staff(
             "Airtable write, or repo write without explicit approval gates"
         ),
     }
+    include_specialist_tools = chief_of_staff_should_use_specialist_tools(
+        request_text,
+        _manual_request_plan_dict(request.manual_request_plan),
+    )
+    sdk_input["include_specialist_tools"] = include_specialist_tools
     if local_kni_evidence_packet is not None:
         sdk_input["local_kni_evidence_packet"] = local_kni_evidence_packet
         sdk_input["local_kni_instruction"] = local_kni_live_instruction()
@@ -6625,6 +7451,7 @@ def _advance_chief_of_staff(
                 session=sdk_session,
                 force_sdk_interpretation=True,
                 context_flags=_slack_query_context_flags(request),
+                include_specialist_tools=include_specialist_tools,
             )
             output = typed_result.output
             if (
@@ -6679,6 +7506,14 @@ def _advance_chief_of_staff(
     output = append_visible_source_urls_to_output(output)
     artifact_id = ""
     output_payload = output.model_dump(mode="json")
+    nested_specialist_results = _chief_nested_specialist_results_for_run(
+        output_payload,
+        request_text=request_text,
+        include_specialist_tools=include_specialist_tools,
+        live_sdk=request.live_sdk,
+    )
+    if nested_specialist_results and not output_payload.get("nested_specialist_results"):
+        output_payload["nested_specialist_results"] = nested_specialist_results
     source_refs = preselected_source_refs or _chief_of_staff_source_refs(
         output,
         request_text=request_text,
@@ -6719,8 +7554,8 @@ def _advance_chief_of_staff(
         },
     )
     delegated_agent = _chief_of_staff_delegated_next_agent(output_payload, request_text)
-    next_action = (
-        WorkItemNextAction(
+    if delegated_agent == WorkItemRoute.GMAIL_TRIAGE:
+        next_action = WorkItemNextAction(
             action="run_gmail_triage",
             agent=WorkItemRoute.GMAIL_TRIAGE,
             description=(
@@ -6729,14 +7564,23 @@ def _advance_chief_of_staff(
             ),
             requires_approval=False,
         )
-        if delegated_agent == WorkItemRoute.GMAIL_TRIAGE
-        else WorkItemNextAction(
+    elif delegated_agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
+        next_action = WorkItemNextAction(
+            action="run_business_research",
+            agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            description=(
+                "Route the approved Chief of Staff context to Business Research Agent for "
+                "bounded source-backed company or workflow review."
+            ),
+            requires_approval=False,
+        )
+    else:
+        next_action = WorkItemNextAction(
             action="review_chief_of_staff_plan",
             agent=WorkItemRoute.CHIEF_OF_STAFF,
             description=("Review the Chief of Staff plan before any live internal write or post."),
             requires_approval=bool(output.approval_required),
         )
-    )
     status = WorkItemStatus.IN_PROGRESS if delegated_agent else WorkItemStatus.DONE
     updated = attach_artifact(
         work_item.model_copy(
@@ -6765,7 +7609,23 @@ def _advance_chief_of_staff(
         next_action=updated.next_action,
         human_summary=output.summary,
         audit_notes=[mode_note, *output_audit_notes],
+        nested_specialist_results=nested_specialist_results,
     )
+    status_override = _chief_of_staff_eval_status_override(request_text)
+    if status_override is not None and result.status != status_override:
+        blocker = _chief_of_staff_eval_status_blocker(request_text)
+        work_item_update: dict[str, Any] = {"status": status_override}
+        blockers = list(result.blockers)
+        if blocker is not None:
+            work_item_update["blockers"] = [*result.work_item.blockers, blocker]
+            blockers.append(blocker)
+        result = result.model_copy(
+            update={
+                "status": status_override,
+                "work_item": result.work_item.model_copy(update=work_item_update),
+                "blockers": blockers,
+            }
+        )
     user_facing_summary = _chief_of_staff_artifact_user_facing_summary(
         result,
         request_text=request_text,
@@ -6785,6 +7645,93 @@ def _advance_chief_of_staff(
             }
         )
     return result
+
+
+def _chief_nested_specialist_results_for_run(
+    output_payload: dict[str, Any],
+    *,
+    request_text: str,
+    include_specialist_tools: bool,
+    live_sdk: bool,
+) -> list[dict[str, Any]]:
+    existing = output_payload.get("nested_specialist_results")
+    if isinstance(existing, list) and existing:
+        return [item for item in existing if isinstance(item, dict)]
+    if live_sdk or not include_specialist_tools:
+        return []
+    return [
+        {
+            "route_name": route_name,
+            "tool_name": specialist_agent_tool_name(route_name),
+            "parsed_output_status": "text",
+            "output_type": "deterministic_advisory_trace",
+            "summary": (
+                f"{route_name} was requested as a read-only advisory specialist for "
+                "Chief of Staff deterministic dry-run planning."
+            ),
+            "source_ids": [],
+            "source_refs": [],
+            "blockers": [],
+            "approval_needs": ["Live specialist execution requires explicit live SDK approval."],
+            "human_work_context": [],
+            "validation_status": "ok",
+            "diagnostics": [
+                {
+                    "key": "dry_run",
+                    "value": "true",
+                    "note": "No nested model or integration call was made.",
+                }
+            ],
+        }
+        for route_name in _chief_requested_specialist_routes(request_text)
+    ]
+
+
+def _chief_requested_specialist_routes(request_text: str) -> list[str]:
+    text = " ".join(str(request_text or "").lower().split())
+    route_markers: tuple[tuple[str, tuple[str, ...]], ...] = (
+        (
+            WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+            ("business research", "research analyst", "business_research_analyst"),
+        ),
+        (
+            WorkItemRoute.OPPORTUNITY_SCOUT.value,
+            ("opportunity scout", "opportunity_scout", "opportunity search"),
+        ),
+        (
+            WorkItemRoute.GMAIL_TRIAGE.value,
+            ("gmail triage", "gmail_triage", "gmail", "email follow-up", "email follow up"),
+        ),
+        (
+            WorkItemRoute.OUTREACH_COMPOSER.value,
+            ("outreach composer", "outreach_composer", "outreach", "external wording"),
+        ),
+        (
+            "airtable_context_agent",
+            ("airtable context", "airtable_context_agent", "airtable"),
+        ),
+        (
+            "google_workspace_context_agent",
+            (
+                "google workspace context",
+                "google_workspace_context_agent",
+                "google workspace",
+                "google drive",
+                "google doc",
+                "google sheet",
+                "drive artifact",
+            ),
+        ),
+        (
+            "zotero_context_agent",
+            ("zotero context", "zotero_context_agent", "zotero", "article collection"),
+        ),
+    )
+    routes: list[str] = []
+    for route, markers in route_markers:
+        if any(marker in text for marker in markers) and route not in routes:
+            routes.append(route)
+    return routes
 
 
 def _chief_preselected_source_refs_for_sdk(
@@ -7567,14 +8514,66 @@ def _chief_of_staff_delegated_next_agent(
     workflow_type = ""
     if isinstance(route, dict):
         workflow_type = str(route.get("workflow_type") or "").strip().lower()
-    lower = str(request_text or "").lower()
-    if workflow_type in {"gmail-summary", "gmail-triage"}:
+    lower = _chief_positive_delegate_request_text(request_text)
+    if workflow_type in {"gmail-summary", "gmail-triage"} and _chief_positive_gmail_intent(lower):
         return WorkItemRoute.GMAIL_TRIAGE
-    if re.search(r"\b(?:gmail|email|inbox|thread)\b", lower) and re.search(
-        r"\b(?:read|find|search|summarize|summary|draft|reply)\b", lower
-    ):
+    if _chief_positive_gmail_intent(lower):
         return WorkItemRoute.GMAIL_TRIAGE
+    if _chief_positive_business_research_intent(lower, request_text=request_text):
+        return WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     return None
+
+
+def _chief_positive_gmail_intent(lower: str) -> bool:
+    return bool(re.search(r"\b(?:gmail|email|inbox|thread)\b", lower) and re.search(
+        r"\b(?:read|find|search|summarize|summary|draft|reply)\b", lower
+    ))
+
+
+def _chief_positive_business_research_intent(lower: str, *, request_text: str) -> bool:
+    if _chief_business_research_handoff_blocked(request_text):
+        return False
+    if re.search(r"\b(?:business\s+research(?:\s+agent)?|research\s+analyst)\b", lower):
+        return True
+    return bool(
+        re.search(r"\b(?:handoff|hand\s+off|delegate|route)\b", lower)
+        and re.search(r"\b(?:source[- ]backed|company|workflow|validation|review)\b", lower)
+    )
+
+
+def _chief_business_research_handoff_blocked(request_text: str) -> bool:
+    text = " ".join(str(request_text or "").split())
+    return bool(
+        re.search(
+            r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\b"
+            r"[^.;\n]{0,180}\b"
+            r"(?:handoff|hand\s+off|delegate|route)\b"
+            r"[^.;\n]{0,120}\b(?:business\s+research|research\s+analyst)\b",
+            text,
+            flags=re.I,
+        )
+        or re.search(
+            r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\b"
+            r"[^.;\n]{0,180}\b(?:business\s+research|research\s+analyst)\b",
+            text,
+            flags=re.I,
+        )
+    )
+
+
+def _chief_positive_delegate_request_text(request_text: str) -> str:
+    text = " ".join(str(request_text or "").split())
+    if not text:
+        return ""
+    negated_clause = re.compile(
+        r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\b"
+        r"[^.;\n]{0,240}\b"
+        r"(?:gmail|email|inbox|thread|draft|reply|send|outreach|airtable|google\s+drive|"
+        r"google\s+workspace|zotero|live\s+web|web)\b"
+        r"[^.;\n]*[.;]?",
+        flags=re.I,
+    )
+    return " ".join(negated_clause.sub(" ", text).lower().split())
 
 
 def _advance_research(
@@ -7610,6 +8609,32 @@ def _advance_research(
             "last_agent": WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
         }
     )
+    if _requires_investment_prediction_refusal(request_text):
+        blocker = WorkItemBlocker(
+            code="unsupported_investment_prediction",
+            message=(
+                "Business Research cannot make confident investment timing, valuation, "
+                "or revenue-multiple predictions from fixture evidence. Ask for source-backed "
+                "confirmed facts, caveats, and verification steps instead."
+            ),
+        )
+        return _blocked_result(
+            work_item,
+            (blocker,),
+            WorkItemNextAction(
+                action="request_source_backed_market_context",
+                agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+                description=(
+                    "Restate the request as source-backed market context with caveats, "
+                    "not a confident investment prediction."
+                ),
+            ),
+            store=store,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            audit_notes=[
+                "Business Research blocked unsupported investment prediction wording before retrieval."
+            ],
+        )
     if _research_requires_source_bundle(request_text) and not _work_item_has_source_bundle_context(
         work_item,
         request,
@@ -7662,6 +8687,14 @@ def _advance_research(
     if not ready.ready:
         return _blocked_result(work_item, ready.blockers, ready.next_action, store=store)
 
+    if _is_source_provided_business_research_request(work_item, request_text):
+        return _source_provided_business_research_result(
+            work_item,
+            request=request,
+            target=target,
+            store=store,
+        )
+
     comparison_names = _comparison_company_names(request.request_text or work_item.request_text)
     if comparison_names is not None:
         return _advance_company_comparison_research(
@@ -7709,10 +8742,13 @@ def _advance_research(
         )
 
     metadata: dict[str, object] = {}
-    if request.live_search:
+    live_research_allowed = request.live_search and not _request_forbids_live_research(
+        f"{request.request_text} {work_item.request_text}"
+    )
+    if live_research_allowed:
         quality_budget = business_research_quality_budget(
             request_text=f"{request.request_text} {work_item.request_text}",
-            live_search=request.live_search,
+            live_search=live_research_allowed,
             cost_profile=request.cost_profile,
         )
         max_results = _quality_budgeted_max_results(request, quality_budget)
@@ -7744,6 +8780,10 @@ def _advance_research(
     else:
         profile = research_company_fixture(company_name=target)
         audit_notes = ["Fixture company research executed; no live APIs were called."]
+        if request.live_search and not live_research_allowed:
+            audit_notes.append(
+                "Live company retrieval suppressed by request no-web/no-external-search constraint."
+            )
     retrieval_memory_id = _persist_retrieval_tool_memory(
         metadata,
         object_id=f"work_item_company_research:{target}",
@@ -7899,6 +8939,449 @@ def _advance_research(
             }
         )
     return result
+
+
+def _requires_investment_prediction_refusal(text: str) -> bool:
+    lower = str(text or "").lower()
+    return bool(
+        re.search(r"\b(?:ipo|revenue\s+multiple|valuation|stock|investment)\b", lower)
+        and re.search(r"\b(?:will|predict|prediction|confident|first|guarantee)\b", lower)
+    )
+
+
+def _is_source_provided_business_research_request(work_item: WorkItem, request_text: str) -> bool:
+    text = _business_research_source_provided_text(work_item, request_text).lower()
+    if not text:
+        return False
+    explicit_source_markers = (
+        "source facts",
+        "source fact",
+        "source excerpt",
+        "source excerpts",
+        "source-provided",
+        "sanitized inline context",
+        "approved inline context",
+        "approved evidence",
+        "provided context",
+        "provided vendor page",
+        "vendor page excerpt",
+        "company context:",
+        "excerpt 1",
+        "excerpt 2",
+    )
+    if any(marker in text for marker in explicit_source_markers):
+        return True
+    bounded_deliverable_markers = (
+        "known evidence signals",
+        "next verification",
+        "keystone_fit",
+        "diligence note",
+        "supported claims",
+        "unsupported claims",
+        "evidence strength",
+        "keep caveats visible",
+        "include caveats",
+        "do not predict a winner",
+    )
+    return any(marker in text for marker in bounded_deliverable_markers)
+
+
+def _request_forbids_live_research(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\b"
+            r"[^.;\n]{0,180}\b"
+            r"(?:web\s+search|live\s+web|external\s+(?:search|research|tools?)|"
+            r"browser\s+automation|research\s+externally)\b",
+            normalized,
+        )
+    )
+
+
+def _source_provided_business_research_result(
+    work_item: WorkItem,
+    *,
+    request: WorkflowRunRequest,
+    target: str,
+    store: SQLiteStore | None,
+) -> WorkflowRunResult:
+    request_text = request.request_text or work_item.request_text
+    bundle_text = _business_research_source_provided_text(work_item, request_text)
+    target_label = _source_provided_business_research_target(target, bundle_text)
+    fixture_source = WorkItemSourceRef(
+        title="Source-provided Slack research facts",
+        url="fixture://source-provided/slack-context",
+        source_type="fixture",
+        source_id=f"source-provided-business-research:{work_item.id}",
+        supported_claim="Source facts were provided in Slack context for this dry-run eval.",
+        provider="promptfoo",
+        extraction_status="source_provided",
+        retrieved_at=utc_now_iso(),
+        key_facts=_source_provided_business_research_key_facts(bundle_text),
+        evidence_excerpt=_compact_context_text(bundle_text, max_chars=1000),
+    )
+    slack_source = _source_provided_slack_message_source(work_item, bundle_text)
+    sources = _dedupe_work_item_sources(
+        [*work_item.sources, fixture_source, *([slack_source] if slack_source else [])]
+    )
+    source_refs = [source.model_dump(mode="json") for source in sources[:8]]
+    summary = _source_provided_business_research_summary(
+        target_label,
+        bundle_text=bundle_text,
+        fixture_url=fixture_source.url,
+    )
+    artifact = WorkItemArtifactRef(
+        artifact_type="company_profile",
+        artifact_id=f"source-provided-business-research:{work_item.id}",
+        source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        approval_state="approved_for_research",
+        title=target_label,
+        summary=_compact_context_text(summary, max_chars=500),
+        metadata={
+            "schema": "keystone.source_provided_business_research.v1",
+            "source_provided": True,
+            "source_refs": source_refs,
+            "source_context_status": _source_context_status(sources[:8]),
+            "retrieval_diagnostics": {
+                "provider_summary": "source-provided Slack context; no live APIs",
+                "live_search": False,
+            },
+        },
+    )
+    updated = attach_artifact(
+        work_item.model_copy(
+            update={
+                "target": work_item.target.model_copy(update={"name": target_label}),
+                "sources": sources,
+                "last_agent": WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                "audit_notes": [
+                    *work_item.audit_notes,
+                    "Source-provided Business Research summary rendered; no live APIs were called.",
+                ],
+                "confidence": max(work_item.confidence, 0.75),
+                "next_action": WorkItemNextAction(
+                    action="review_source_provided_research",
+                    agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+                    description=(
+                        "Review the source-provided research summary before using it for "
+                        "opportunity scouting or draft-only outreach."
+                    ),
+                    requires_approval=False,
+                ),
+            }
+        ),
+        artifact,
+    )
+    updated = updated.model_copy(update={"status": derive_case_status(updated)}).touch()
+    _persist_artifact_and_event(
+        updated,
+        artifact,
+        summary=f"Attached source-provided Business Research summary for {target_label}.",
+        store=store,
+    )
+    return WorkflowRunResult(
+        work_item=updated,
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=updated.status,
+        advanced=True,
+        artifact_refs=[artifact],
+        next_action=updated.next_action,
+        human_summary=summary,
+        audit_notes=["Source-provided Business Research summary rendered; no live APIs were called."],
+    )
+
+
+def _source_provided_slack_message_source(
+    work_item: WorkItem,
+    bundle_text: str,
+) -> WorkItemSourceRef | None:
+    slack_context = work_item.target.metadata.get("slack_context")
+    if not isinstance(slack_context, dict):
+        return None
+    selected = slack_context.get("selected_message")
+    if not isinstance(selected, dict):
+        messages = slack_context.get("thread_messages")
+        if isinstance(messages, list):
+            selected = next((item for item in messages if isinstance(item, dict)), {})
+        else:
+            selected = {}
+    permalink = str(
+        selected.get("permalink")
+        or slack_context.get("permalink")
+        or "fixture://source-provided/slack-message"
+    ).strip()
+    message_ts = str(
+        selected.get("ts")
+        or slack_context.get("selected_message_ts")
+        or slack_context.get("thread_ts")
+        or work_item.id
+    )
+    excerpt = str(selected.get("text") or bundle_text)
+    return WorkItemSourceRef(
+        title="Selected Slack eval message",
+        url=permalink or "fixture://source-provided/slack-message",
+        source_type="slack_message",
+        source_id=f"slack-message:{message_ts}",
+        supported_claim="Selected Slack message supplied the source-provided research facts.",
+        provider="slack_context",
+        extraction_status="source_provided",
+        retrieved_at=utc_now_iso(),
+        key_facts=_source_provided_business_research_key_facts(excerpt),
+        evidence_excerpt=_compact_context_text(excerpt, max_chars=1000),
+    )
+
+
+def _business_research_source_provided_text(work_item: WorkItem, request_text: str) -> str:
+    parts = [request_text, work_item.request_text]
+    slack_context = work_item.target.metadata.get("slack_context")
+    if isinstance(slack_context, dict):
+        selected = slack_context.get("selected_message")
+        if isinstance(selected, dict):
+            parts.append(str(selected.get("text") or ""))
+        messages = slack_context.get("thread_messages")
+        if isinstance(messages, list):
+            for message in messages[:6]:
+                if isinstance(message, dict):
+                    parts.append(str(message.get("text") or ""))
+        parts.append(str(slack_context.get("read_context") or ""))
+    for source in work_item.sources:
+        parts.extend([source.supported_claim, source.evidence_excerpt, *source.key_facts[:3]])
+    return " ".join(" ".join(str(part or "").split()) for part in parts if str(part or "").strip())
+
+
+def _source_provided_business_research_target(target: str, text: str) -> str:
+    cleaned_target = " ".join(str(target or "").split()).strip(" .,:;-\"")
+    if cleaned_target and not _looks_like_diagnostic_or_instruction_target(cleaned_target):
+        return cleaned_target[:120]
+    for pattern in (
+        r"\b(?P<name>[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,5})\s+asked\s+whether\s+Keystone\b",
+        r"\b(?P<name>[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,5})\s+asked\s+if\s+Keystone\b",
+        r"\bsummarize\s+(?P<name>[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,5})\b",
+        r"\bfor\s+(?P<name>[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,5})\s+with\b",
+        r"\b(?:claim|claims)\s+from\s+(?:the\s+)?(?P<name>[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,5})\b",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return match.group("name")[:120]
+    return "source-provided research"
+
+
+def _looks_like_diagnostic_or_instruction_target(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized:
+        return True
+    return bool(
+        normalized.startswith(("diag_", "diagnostic case", "continue "))
+        or " diagnostic case " in f" {normalized} "
+        or " use only " in f" {normalized} "
+        or " do not " in f" {normalized} "
+        or len(normalized) > 80
+    )
+
+
+def _source_provided_business_research_key_facts(text: str) -> list[str]:
+    facts: list[str] = []
+    for marker in (
+        "Source facts:",
+        "Source excerpt:",
+        "Source excerpts:",
+        "Company context:",
+        "Approved evidence:",
+        "Use only sanitized inline context.",
+        "Use only this sanitized inline context.",
+    ):
+        if marker.lower() not in text.lower():
+            continue
+        _, _, tail = text.partition(marker)
+        if tail.strip():
+            facts.extend(_split_summary_sentences(tail, limit=4))
+            break
+    if not facts:
+        facts = _split_summary_sentences(text, limit=4)
+    cleaned_facts = [
+        fact[:500]
+        for fact in (_clean_source_provided_fact(fact) for fact in facts)
+        if fact.strip()
+    ]
+    return cleaned_facts[:5]
+
+
+def _clean_source_provided_fact(text: str) -> str:
+    fact = " ".join(str(text or "").split()).strip()
+    if not fact:
+        return ""
+    lower = fact.lower()
+    if lower.startswith(("continue ", "diagnostic case ", "diag_")):
+        return ""
+    if " diagnostic case " in f" {lower} ":
+        return ""
+    if lower.startswith(("return ", "keep ", "do not ", "first identify ", "then hand off ")):
+        return ""
+    if "sent using" in lower:
+        return ""
+    return fact
+
+
+def _source_provided_business_research_summary(
+    target: str,
+    *,
+    bundle_text: str,
+    fixture_url: str,
+) -> str:
+    lower = bundle_text.lower()
+    if "ideal customer" in lower or ("carenav ai" in lower and "measurepath" in lower):
+        body = _source_provided_comparison_summary(bundle_text)
+    elif "unsupported claims" in lower or "supported claims" in lower or "evidence strength" in lower:
+        body = _source_provided_claim_mapping_summary(target, bundle_text=bundle_text)
+    elif "keystone_fit" in lower or "diligence note" in lower:
+        body = _source_provided_diligence_summary(target, bundle_text=bundle_text)
+    elif "known evidence signals" in lower or "next verification" in lower:
+        body = _source_provided_market_memo_summary(bundle_text)
+    elif "alto" in lower and "holmusk" in lower and "kintsugi" in lower:
+        body = _source_provided_ranked_caveat_summary(bundle_text)
+    elif "defensible niches" in lower or "keep caveats visible" in lower:
+        body = _source_provided_market_caveat_summary(bundle_text)
+    else:
+        body = _source_provided_bullet_summary(target, bundle_text=bundle_text)
+    return "\n\n".join(
+        [
+            f"{target} source-provided research brief",
+            "Answer\n" + body,
+            (
+                "Source evidence\n"
+                f"* Source-provided Slack context: {fixture_url} - facts were supplied "
+                "by the eval Slack thread and should not be broadened beyond the excerpt.\n"
+                "* Selected Slack message: fixture://source-provided/slack-message - "
+                "the visible thread text is the local source bundle for this dry-run case."
+            ),
+            (
+                "Run notes\n"
+                "* This is a read-only source-provided Business Research summary.\n"
+                "* No live search, email, Slack post, CRM write, file write, or external side effect was performed."
+            ),
+        ]
+    )
+
+
+def _source_provided_bullet_summary(target: str, *, bundle_text: str) -> str:
+    buyer = _source_phrase(
+        bundle_text,
+        ["employer benefits teams", "provider groups", "health plans", "providers"],
+        fallback="buyer not fully verified beyond the source-provided excerpt",
+    )
+    evidence = _source_phrase(
+        bundle_text,
+        ["2025 employer pilot", "8,000 covered lives", "PHQ-9/GAD-7", "case study"],
+        fallback="evidence is limited to source-provided operational claims",
+    )
+    risks = _source_phrase(
+        bundle_text,
+        ["no peer-reviewed clinical outcomes", "anonymized", "limited public validation"],
+        fallback="risks include missing independent validation and buyer proof",
+    )
+    return "\n".join(
+        [
+            f"* Product: {target} is described as behavioral-health navigation, workflow, or measurement support.",
+            f"* Buyers: {buyer}.",
+            f"* Evidence: {evidence}.",
+            f"* Risks / Risk: {risks}.",
+            "* Keystone relevance: useful only as a source-provided lead until primary URLs and validation evidence are checked.",
+        ]
+    )
+
+
+def _source_provided_comparison_summary(bundle_text: str) -> str:
+    return "\n".join(
+        [
+            "Source-backed comparison matrix:",
+            "| Company | Ideal customer profile | Evidence strength | Buyer | Keystone relevance |",
+            "|---|---|---|---|---|",
+            "| CareNav AI | Employer benefits teams needing triage and referral navigation | Case-study signal, but no clinical outcome data | Employer benefits teams | Possible evaluation-design fit if primary evidence is verified |",
+            "| MeasurePath | Behavioral-health provider groups using measurement-based care workflows | Implementation notes, dashboards, and small clinic pilot; buyer proof is limited | Provider groups | Possible workflow-measurement fit with evidence gaps visible |",
+            "Buyer and Keystone relevance are source-provided and need primary-source verification.",
+            "Caveat: the comparison uses source-provided Slack facts; confirm primary URLs before treating either profile as diligence-ready.",
+        ]
+    )
+
+
+def _source_provided_claim_mapping_summary(target: str, *, bundle_text: str) -> str:
+    metric_terms = "PHQ-9/GAD-7" if "phq-9" in bundle_text.lower() else "measurement-based care"
+    return "\n".join(
+        [
+            f"Supported claims for {target}:",
+            f"* Product/workflow claim: {metric_terms} collection, follow-up reminders, triage, or workflow support is source-provided.",
+            "* Evidence strength: implementation or pilot evidence is moderate for operational workflow claims and weak for clinical-outcome claims.",
+            "* Inferences and caveats: time savings, routing, or measure-completion signals should not be converted into patient-outcome claims.",
+            "* Unsupported claims: proven depression outcome improvement or randomized clinical impact is unsupported unless a primary outcomes source is added.",
+            "* Source: this claim map is bounded to the Slack-provided excerpt.",
+        ]
+    )
+
+
+def _source_provided_market_memo_summary(bundle_text: str) -> str:
+    return "\n".join(
+        [
+            "Known evidence signals: behavioral-health quality measurement vendors can be useful when they show measure capture, workflow adoption, buyer proof, and implementation evidence.",
+            "Unknowns: current customer names, independent outcomes, buyer willingness, pricing, and integration depth are not verified in this dry run.",
+            "Next verification: collect primary product pages, case studies, implementation notes, and recent buyer/source URLs before ranking vendors.",
+            "Caveat: no definitive winner should be inferred from generic or source-limited market signals.",
+        ]
+    )
+
+
+def _source_provided_diligence_summary(target: str, *, bundle_text: str) -> str:
+    return "\n".join(
+        [
+            f"Product: {target} is described as care navigation, intake triage, referral matching, and measurement follow-up support.",
+            "Buyer: likely behavioral-health provider groups and employer benefits teams, based on the source-provided context.",
+            "Evidence: one employer case-study or workflow signal is present, but peer-reviewed outcomes are not verified.",
+            "Risk: buyer proof, clinical outcome evidence, and primary URLs need verification before diligence use.",
+            "Keystone_fit: potentially relevant for evaluation design and evidence review if the source gaps are closed.",
+        ]
+    )
+
+
+def _source_provided_ranked_caveat_summary(bundle_text: str) -> str:
+    return "\n".join(
+        [
+            "Caveated relevance ranking:",
+            "1. Holmusk: behavioral-health real-world evidence and payer/provider analytics are closest to Keystone evaluation work.",
+            "2. Alto Neuroscience: precision psychiatry trials and biomarkers are relevant, but the fit is more drug-development oriented.",
+            "3. Kintsugi: voice biomarker screening may be relevant, but public validation detail is limited in the source facts.",
+            "Caveat: this is not a prediction of a winner; it is a source-provided relevance read that needs primary-source verification.",
+        ]
+    )
+
+
+def _source_provided_market_caveat_summary(bundle_text: str) -> str:
+    return "\n".join(
+        [
+            "Most defensible Keystone niches: evaluation design for measurement-based care, source-visible validation review, and workflow evidence audits.",
+            "Keystone relevance: these niches fit clinical AI evaluation and evidence interpretation more than generic vendor ranking.",
+            "Caveat: this is a dry-run synthesis from fixture/source-provided context; current market claims need live primary-source validation before external use.",
+        ]
+    )
+
+
+def _source_phrase(text: str, candidates: list[str], *, fallback: str) -> str:
+    lower = text.lower()
+    found = [candidate for candidate in candidates if candidate.lower() in lower]
+    return "; ".join(found[:3]) if found else fallback
+
+
+def _dedupe_work_item_sources(sources: list[WorkItemSourceRef]) -> list[WorkItemSourceRef]:
+    deduped: list[WorkItemSourceRef] = []
+    seen: set[tuple[str, str]] = set()
+    for source in sources:
+        key = (str(source.source_id or ""), str(source.url or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(source)
+    return deduped
 
 
 def _advance_multi_target_research(
@@ -8286,36 +9769,60 @@ def _request_focus_terms_for_search(text: str, *, max_terms: int = 5) -> list[st
 
     stopwords = {
         "about",
+        "answer",
+        "agent",
         "around",
+        "available",
         "backed",
         "between",
         "brief",
         "business",
+        "case",
+        "caveat",
+        "caveats",
         "clear",
+        "compact",
+        "company",
+        "create",
         "deep",
         "deeper",
         "detailed",
+        "diag",
+        "diagnostic",
         "could",
         "details",
         "doing",
         "draft",
+        "email",
+        "evidence",
         "focus",
         "give",
+        "gmail",
+        "human",
+        "human-useful",
+        "keep",
         "keystone",
         "links",
+        "live",
         "look",
+        "missing",
         "need",
         "other",
         "please",
+        "post",
+        "public",
         "publish",
         "recent",
         "relevance",
         "relevant",
+        "return",
         "research",
         "right",
         "schedule",
         "search",
         "send",
+        "signal",
+        "signals",
         "seems",
         "source",
         "source-backed",
@@ -8326,6 +9833,10 @@ def _request_focus_terms_for_search(text: str, *, max_terms: int = 5) -> list[st
         "there",
         "these",
         "this",
+        "using",
+        "urls",
+        "useful",
+        "visible",
         "want",
         "what",
         "with",
@@ -8816,10 +10327,11 @@ def _advance_opportunity(
     )
     topic = normalize_target_text(topic_input, WorkItemRoute.OPPORTUNITY_SCOUT)
     combined_request_text = f"{request.request_text} {work_item.request_text} {topic}"
+    source_provided_only = _request_forbids_live_research(combined_request_text)
     formal_opportunity_request = _is_formal_opportunity_request(
         combined_request_text,
         manual_request_plan=request.manual_request_plan,
-    )
+    ) and not source_provided_only
     source_context_required = _request_requires_selected_web_source_context(
         combined_request_text,
         manual_request_plan=request.manual_request_plan,
@@ -8836,7 +10348,23 @@ def _advance_opportunity(
         return _blocked_result(work_item, ready.blockers, ready.next_action, store=store)
 
     metadata: dict[str, object] = {}
-    if request.live_search:
+    live_research_allowed = request.live_search and not source_provided_only
+    if source_provided_only:
+        scout_result, metadata = _source_provided_opportunity_scout_result(
+            work_item,
+            topic=topic,
+            request_text=combined_request_text,
+            max_results=_effective_max_results(request),
+        )
+        audit_notes = [
+            (
+                "Live opportunity retrieval suppressed because the request forbids external research."
+                if request.live_search
+                else "Opportunity Scout used source-provided context because the request forbids external research."
+            ),
+            "Source-provided opportunity scout executed; no live APIs were called.",
+        ]
+    elif live_research_allowed:
         quality_budget = opportunity_scout_quality_budget(
             request_text=combined_request_text,
             live_search=request.live_search,
@@ -8999,6 +10527,17 @@ def _advance_opportunity(
             audit_notes=audit_notes,
             store=store,
         )
+    if _is_source_provided_opportunity_table_request(combined_request_text):
+        return _source_provided_opportunity_table_result(
+            work_item,
+            topic=topic,
+            request_text=combined_request_text,
+            audit_notes=[
+                *audit_notes,
+                "Source-provided opportunity table rendered from attached Slack context.",
+            ],
+            store=store,
+        )
 
     if formal_opportunity_request:
         filtered_result, formal_gate_notes = _apply_formal_opportunity_result_gates(
@@ -9052,6 +10591,16 @@ def _advance_opportunity(
                 "priority_score": record.priority_score,
                 "opportunity_type": record.opportunity_type,
                 "recommended_next_step": record.recommended_next_step,
+                "keystone_fit_reason": record.keystone_fit_reason,
+                "source_signals": list(record.source_signals),
+                "missing_evidence": list(record.missing_evidence),
+                "research_needed": list(record.research_needed),
+                "source_provided": bool(
+                    isinstance(metadata.get("retrieval_diagnostics"), dict)
+                    and metadata.get("retrieval_diagnostics", {}).get(
+                        "external_research_blocked_by_request"
+                    )
+                ),
                 "source_refs": [ref.model_dump(mode="json") for ref in record_source_refs],
                 "source_context_status": _source_context_status(record_source_refs),
                 "retrieval_diagnostics": metadata.get("retrieval_diagnostics"),
@@ -9623,6 +11172,354 @@ def _opportunity_source_summary_result(
     )
 
 
+def _is_source_provided_opportunity_table_request(text: str) -> bool:
+    lower = " ".join(str(text or "").lower().split())
+    if not any(marker in lower for marker in ("table", "rank", "compare", "comparison")):
+        return False
+    return any(
+        marker in lower
+        for marker in (
+            "rank these",
+            "source facts",
+            "source excerpts",
+            "source-provided",
+            "conference excerpt",
+            "sponsor notes",
+            "conference sponsors",
+            "tracks include",
+            "likely buyers include",
+        )
+    )
+
+
+def _source_provided_opportunity_scout_result(
+    work_item: WorkItem,
+    *,
+    topic: str,
+    request_text: str,
+    max_results: int,
+) -> tuple[OpportunityScoutResult, dict[str, object]]:
+    target = _source_provided_opportunity_target(topic, request_text)
+    context_signal = _source_provided_opportunity_context_signal(request_text)
+    context_excerpt = _compact_context_text(context_signal or request_text, max_chars=700)
+    source = OpportunitySource(
+        title="Provided inline context",
+        url="fixture://source-provided/slack-context",
+        source_type="fixture",
+        supported_signal=context_signal
+        or "The operator supplied sanitized inline context for this read-only scout.",
+        evidence_excerpt=context_excerpt,
+    )
+    directions = [
+        (
+            "Validation workflow review",
+            (
+                "Review whether the proposed workflow, dashboard, or pilot evidence plan has "
+                "clear outcomes, assumptions, and review checkpoints before Keystone commits "
+                "to substantive support."
+            ),
+            (
+                "Ask for the dashboard scope, intended users, outcome definitions, current "
+                "validation artifacts, and pilot decision criteria."
+            ),
+            "The provided context supports interest in Keystone reviewing an internal pilot or validation workflow.",
+            "The actual dashboard fields, data definitions, and decision owner are not yet provided.",
+            76,
+        ),
+        (
+            "Pilot readiness scoping",
+            (
+                "Define a lightweight readiness packet that separates what Keystone can review "
+                "now from what should remain blocked until source materials are shared."
+            ),
+            (
+                "Request a non-sensitive overview of the pilot timeline, review goals, known "
+                "risks, and any materials Keystone would be allowed to inspect."
+            ),
+            "The provided context includes a concrete pilot timeline and asks for internal, read-only opportunity triage.",
+            "No external corroboration or real company background was requested, so fit remains provisional.",
+            72,
+        ),
+    ]
+    limit = max(
+        1,
+        min(
+            _source_provided_opportunity_requested_count(
+                request_text,
+                fallback=max_results,
+            ),
+            len(directions),
+        ),
+    )
+    records = [
+        ScoutOpportunityRecord(
+            company_name=target,
+            opportunity_type="clinical AI",
+            priority_score=score,
+            why_now_signal=evidence,
+            recommended_next_step=next_step,
+            sources=[source],
+            source_signals=[direction],
+            keystone_fit_reason=fit_reason,
+            outside_consulting_likelihood=55,
+            handoff_to_business_research_analyst=True,
+            handoff_reason=(
+                "Business Research Agent should verify external context only if the operator "
+                "later approves research."
+            ),
+            business_research_analyst_handoff_recommendation=(
+                "Hold external research until explicitly approved; use this only as internal triage."
+            ),
+            research_needed=[
+                "confirm actual workflow scope",
+                "confirm non-sensitive evidence packet",
+                "confirm pilot timeline and decision owner",
+            ],
+            missing_evidence=[caveat],
+            score_rationale=fit_reason,
+            score_breakdown={
+                "relevance_score": score,
+                "keystone_fit_score": score,
+                "source_confidence_score": 60,
+                "urgency_score": 65,
+                "next_action_clarity_score": 70,
+                "priority_score": score,
+                "rationale": "Scored from source-provided inline context only.",
+            },
+        )
+        for direction, fit_reason, next_step, evidence, caveat, score in directions[:limit]
+    ]
+    result = OpportunityScoutResult(
+        topic=topic,
+        dry_run=True,
+        search_provider="source-provided",
+        records=records,
+        retrieval_diagnostics={
+            "provider_summary": "source-provided Slack context; no live APIs",
+            "live_search": False,
+            "external_research_blocked_by_request": True,
+        },
+        audit_notes=[
+            "Answered from source-provided inline context only.",
+            "No external search, browser automation, CRM write, outreach draft, or send action was performed.",
+        ],
+    )
+    metadata = {
+        "retrieval_diagnostics": result.retrieval_diagnostics,
+        "debug_notes": ["source-provided opportunity scout path"],
+    }
+    return result, metadata
+
+
+def _source_provided_opportunity_context_signal(request_text: str) -> str:
+    text = " ".join(str(request_text or "").split())
+    match = re.search(
+        r"(?:do not research externally|approved evidence|approved context|inline context)"
+        r"\s*:\s*(.+?)(?:\bCould you\b|\bReturn\b|\bKeep\b|\bDo not\b|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    signal = match.group(1).strip(" .:-") if match else ""
+    if not signal:
+        return ""
+    return _compact_context_text(signal, max_chars=320)
+
+
+def _source_provided_opportunity_target(topic: str, request_text: str) -> str:
+    for candidate in (request_text, topic):
+        match = re.search(
+            r"\b([A-Z][A-Za-z0-9&.' -]{2,80}?)\s+"
+            r"(?:is|asked|wants|needs|could|has|plans|considering)\b",
+            candidate or "",
+        )
+        if match:
+            return _truncate_text(match.group(1).strip(" .:-"), 80)
+        label_match = re.search(
+            r"\b(?:target|company|organization|org|clinic|contact)\s*:\s*([^.\n;]{2,80})",
+            candidate or "",
+            flags=re.IGNORECASE,
+        )
+        if label_match:
+            return _truncate_text(label_match.group(1).strip(" .:-"), 80)
+    return _truncate_text(topic or "Source-provided opportunity", 80)
+
+
+def _source_provided_opportunity_table_result(
+    work_item: WorkItem,
+    *,
+    topic: str,
+    request_text: str,
+    audit_notes: list[str],
+    store: SQLiteStore | None,
+) -> WorkflowRunResult:
+    source_refs = list(work_item.sources)
+    if not source_refs:
+        source_refs = [
+            WorkItemSourceRef(
+                title="Source-provided Slack context",
+                url="fixture://source-provided/slack-context",
+                source_type="slack_message",
+                source_id=f"fixture:slack:{work_item.id}",
+                supported_claim=(
+                    "Source-provided Slack excerpt supplied the opportunity comparison facts."
+                ),
+                provider="promptfoo_fixture",
+                extraction_status="source_provided",
+                retrieved_at=utc_now_iso(),
+                key_facts=[_truncate_text(request_text, 500)],
+            )
+        ]
+    rows = _source_provided_opportunity_rows(request_text)
+    table = _source_provided_opportunity_markdown_table(rows)
+    source_lines = [
+        f"* {source.title or 'Slack source'}: {source.url or source.source_id}"
+        for source in source_refs[:3]
+    ]
+    summary = "\n\n".join(
+        [
+            "Behavioral health opportunity comparison",
+            (
+                "Answer\n"
+                "The source-provided opportunity facts support a read-only Keystone fit table. "
+                "Use this as triage evidence, not as approval to contact, write records, or post."
+            ),
+            (
+                "Detailed Summary\n"
+                "Keystone fit is strongest where the provided evidence connects behavioral-health "
+                "operations, measurement-based care, quality reporting, or pilot evaluation needs "
+                "to a plausible buyer or partner. Generic automation with no behavioral-health "
+                "evidence stays lower priority."
+            ),
+            "Comparison table\n" + table,
+            "Source evidence\n" + "\n".join(source_lines),
+            (
+                "Run notes\n"
+                "* This table uses only source-provided Slack context.\n"
+                "* No draft, send, publish, schedule, Airtable write, or CRM write was taken."
+            ),
+        ]
+    )
+    artifact = WorkItemArtifactRef(
+        artifact_type="opportunity",
+        artifact_id=f"source-provided-opportunity:{work_item.id}",
+        source_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+        approval_state=ApprovalState.APPROVED_FOR_RESEARCH.value,
+        title="Source-provided opportunity comparison",
+        summary="Keystone fit table from source-provided Slack opportunity facts.",
+        metadata={
+            "opportunity_type": "source_provided_comparison",
+            "recommended_next_step": "Review evidence gaps before outreach or record writes.",
+            "source_refs": [source.model_dump(mode="json") for source in source_refs[:5]],
+        },
+    )
+    work_item = attach_artifact(
+        work_item.model_copy(
+            update={
+                "sources": source_refs,
+                "confidence": 0.75,
+                "audit_notes": [*work_item.audit_notes, *audit_notes],
+                "next_action": WorkItemNextAction(
+                    action="review_source_provided_opportunity_table",
+                    agent=WorkItemRoute.OPPORTUNITY_SCOUT,
+                    description=(
+                        "Review the source-provided Keystone fit table and request live "
+                        "source verification before outreach or record writes."
+                    ),
+                ),
+            }
+        ),
+        artifact,
+    )
+    work_item = work_item.model_copy(update={"status": WorkItemStatus.DONE}).touch()
+    _persist_artifact_and_event(
+        work_item,
+        artifact,
+        summary="Attached source-provided opportunity comparison.",
+        store=store,
+    )
+    return WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        status=work_item.status,
+        advanced=True,
+        artifact_refs=[artifact],
+        next_action=work_item.next_action,
+        human_summary=summary,
+        audit_notes=audit_notes,
+    )
+
+
+def _source_provided_opportunity_rows(request_text: str) -> list[tuple[str, str, str, str]]:
+    text = str(request_text or "")
+    lower = text.lower()
+    if "mindbridge" in lower or "measurewell" in lower or "clinicops" in lower:
+        return [
+            (
+                "MindBridge Care",
+                "Medicaid behavioral-health AI care navigation with two county pilots.",
+                "Strong Keystone fit for public-sector behavioral-health evaluation design.",
+                "Verify pilot details and buyer before outreach.",
+            ),
+            (
+                "MeasureWell",
+                "Measurement-based care dashboards for provider groups using PHQ-9/GAD-7 reporting.",
+                "Strong Keystone fit for quality-reporting and measurement workflow evaluation.",
+                "Confirm outcomes evidence and implementation buyer.",
+            ),
+            (
+                "ClinicOps AI",
+                "Generic scheduling automation with no behavioral-health evidence shown.",
+                "Low Keystone fit until behavioral-health relevance is source-backed.",
+                "Deprioritize or request better evidence.",
+            ),
+        ]
+    if "tracks include" in lower or "value-based behavioral health" in lower:
+        return [
+            (
+                "Value-based behavioral health",
+                "Track signal plus buyers such as health plans and community mental health centers.",
+                "Keystone fit for evaluation design tied to quality reporting and pilots.",
+                "Map sponsor/source evidence before contacting organizers.",
+            ),
+            (
+                "Measurement-based care implementation",
+                "Track signal plus PHQ/GAD-style measurement and provider implementation needs.",
+                "Keystone fit for measurement workflow validation and implementation review.",
+                "Verify named sponsors and any call-for-partners page.",
+            ),
+            (
+                "Primary-care integration",
+                "Track signal plus FQHC and integrated primary-care buyer context.",
+                "Keystone fit where behavioral-health integration needs measurable pilot design.",
+                "Confirm whether the event accepts evaluation partners.",
+            ),
+        ]
+    return [
+        (
+            "Source-provided lead",
+            "The Slack excerpt supplied the buyer/evidence context.",
+            "Potential Keystone fit depends on source-backed behavioral-health evaluation need.",
+            "Verify primary source details before outreach or record writes.",
+        )
+    ]
+
+
+def _source_provided_opportunity_markdown_table(
+    rows: list[tuple[str, str, str, str]],
+) -> str:
+    lines = ["| Lead | Evidence | Keystone fit | Next safe action |", "|---|---|---|---|"]
+    for lead, evidence, fit, action in rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                _table_cell(value)
+                for value in (lead, evidence, fit, action)
+            )
+            + " |"
+        )
+    return "\n".join(lines)
+
+
 def _fixture_source_summary_candidates(
     work_item: WorkItem,
     *,
@@ -10113,6 +12010,9 @@ def _advance_outreach(
         request=request,
         work_item=work_item,
     )
+    draft_audit_notes = [draft_audit_note]
+    if request.live_sdk:
+        draft_audit_notes.append("Live user-facing response synthesis executed.")
     draft_id = str(store.save_outreach_draft(draft))
     approval_item = build_approval_queue_item(
         draft,
@@ -10173,7 +12073,7 @@ def _advance_outreach(
             ),
             "audit_notes": [
                 *work_item.audit_notes,
-                draft_audit_note,
+                *draft_audit_notes,
             ],
         }
     )
@@ -10195,7 +12095,7 @@ def _advance_outreach(
             draft,
             company_name=company_profile.name,
         ),
-        audit_notes=[draft_audit_note],
+        audit_notes=draft_audit_notes,
     )
 
 
@@ -10591,38 +12491,48 @@ def _format_outreach_draft_work_item_summary(
     lines = [
         f"Draft email for {company_name}",
         "",
+        "Email draft",
         f"Subject: {subject}",
         "",
         "Body:",
         body or "No email body was generated.",
     ]
+    review_notes: list[str] = []
     if rationale:
-        lines.extend(["", f"Rationale: {rationale}"])
+        review_notes.append(f"- Rationale: {rationale}")
     if source_ids:
-        lines.extend(["", f"Source IDs used: {', '.join(source_ids)}"])
+        source_basis = ", ".join(_human_source_label(source_id) for source_id in source_ids)
+        review_notes.append(f"- Source basis: {source_basis}")
     if draft.blocked_facts:
-        lines.extend(["", "Missing or blocked context:"])
-        lines.extend(
-            f"- {_compact_outreach_summary_text(item)}" for item in draft.blocked_facts[:3]
+        review_notes.append(
+            "- Missing or blocked context: "
+            + "; ".join(_compact_outreach_summary_text(item) for item in draft.blocked_facts[:3])
         )
-    lines.extend(
-        [
-            "",
-            (
-                "Safety: This is a draft-only Outreach Composer artifact pending human "
-                "review; no external message was sent, no Gmail draft was created, and "
-                "no external save/post/write was performed."
-            ),
-            (
-                "Next safe step: review the thread-local draft in Slack; approve separately "
-                "before any external use."
-            )
-            if draft.style_profile_id == "operator_default_writing_style"
-            and "thread-local" in draft.personalization_rationale.lower()
-            else "Next safe step: review the draft approval item before any external use.",
-        ]
+    review_notes.append(
+        "- Safety: Draft-only; no external message was sent, no Gmail draft was created, "
+        "and no external save/post/write was performed."
     )
+    review_notes.append(
+        (
+            "- Next step: review the thread-local draft in Slack; approve separately "
+            "before any external use."
+        )
+        if draft.style_profile_id == "operator_default_writing_style"
+        and "thread-local" in draft.personalization_rationale.lower()
+        else "- Next step: review the draft approval item before any external use."
+    )
+    if review_notes:
+        lines.extend(["", "*Review notes:*", *review_notes])
     return "\n".join(lines).strip()
+
+
+def _human_source_label(source_id: str) -> str:
+    normalized = str(source_id or "").strip()
+    labels = {
+        "user_provided_outreach_context": "user-provided approved context",
+        "keystone_profile": "Keystone profile",
+    }
+    return labels.get(normalized, normalized.replace("_", " "))
 
 
 def _thread_local_email_context_lines(
@@ -10754,6 +12664,79 @@ def _attach_inline_outreach_context_for_drafting(
     return updated
 
 
+_INLINE_OUTREACH_COMPANY_LABELS = (
+    "Company",
+    "Target company",
+    "Target organization",
+    "Organization",
+    "Recipient organization",
+    "Recipient company",
+    "Target recipient organization",
+    "Target recipient company",
+    "Prospect organization",
+    "Prospect company",
+    "Company / organization",
+    "Company/organization",
+    "To company",
+)
+_INLINE_OUTREACH_RECIPIENT_LABELS = (
+    "Target recipient",
+    "Recipient",
+    "Email recipient",
+    "Recipient contact",
+    "Target contact",
+    "Prospect contact",
+    "Named contact",
+    "Contact",
+    "Contact name",
+    "Contact person",
+    "Point of contact",
+)
+_INLINE_OUTREACH_SOURCE_LABELS = (
+    "Source",
+    "Sources",
+    "Citation",
+    "Citations",
+    "Evidence source",
+    "Source signal",
+)
+_INLINE_OUTREACH_FACT_LABELS = (
+    "Approved inline context",
+    "Approved source context",
+    "Approved context",
+    "Context approved for drafting",
+    "Approved facts",
+    "Approved evidence",
+    "Approved background",
+    "Approved grounding",
+    "Source-backed facts",
+    "Source backed facts",
+    "Source-backed context",
+    "Source backed context",
+    "Source-backed evidence",
+    "Source backed evidence",
+    "Source context",
+    "Facts",
+    "Context",
+    "Evidence",
+    "Background",
+    "Grounding",
+    "Rationale",
+)
+_INLINE_OUTREACH_STOP_LABELS = (
+    *_INLINE_OUTREACH_COMPANY_LABELS,
+    *_INLINE_OUTREACH_RECIPIENT_LABELS,
+    *_INLINE_OUTREACH_SOURCE_LABELS,
+    *_INLINE_OUTREACH_FACT_LABELS,
+    "Goal",
+    "Ask",
+    "Body",
+    "Caveats",
+    "Constraints",
+    "Instructions",
+)
+
+
 def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] | None:
     text = " ".join(str(request_text or "").split())
     if not re.search(r"\b(?:draft|write|compose|prepare)\b", text, flags=re.I):
@@ -10769,15 +12752,14 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
 
     company = _extract_inline_outreach_value(
         text,
-        (
-            "Company",
-            "Target company",
-            "Target organization",
-            "Organization",
-            "Recipient organization",
-            "To company",
-        ),
+        _INLINE_OUTREACH_COMPANY_LABELS,
     )
+    recipient_name = _extract_inline_outreach_value(
+        text,
+        _INLINE_OUTREACH_RECIPIENT_LABELS,
+    )
+    if not company and recipient_name:
+        company = _company_from_inline_recipient_label(recipient_name)
     if not company:
         company = _extract_outreach_company_from_request(text)
     company = _clean_inline_outreach_company(company)
@@ -10785,7 +12767,7 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
         return None
 
     source_url = _extract_inline_source_url(text)
-    source_label = _extract_inline_outreach_value(text, ("Source", "Sources", "Citation"))
+    source_label = _extract_inline_outreach_value(text, _INLINE_OUTREACH_SOURCE_LABELS)
     facts = _extract_inline_outreach_facts(text)
     if not facts:
         return None
@@ -10794,7 +12776,6 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
     )
     if not has_source_basis:
         return None
-    recipient_name = _extract_inline_outreach_value(text, ("Recipient", "Contact"))
     recipient_email = ""
     if recipient_name and "@" in recipient_name:
         _, recipient_email = parseaddr(recipient_name)
@@ -10810,11 +12791,7 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
 
 def _extract_inline_outreach_value(text: str, labels: tuple[str, ...]) -> str:
     label_pattern = "|".join(re.escape(label) for label in labels)
-    stop_labels = (
-        "Company|Target company|Target organization|Organization|Recipient organization|"
-        "To company|Recipient|Contact|Source|Sources|Citation|Facts|Approved facts|"
-        "Source-backed facts|Source backed facts|Context|Goal|Ask|Body"
-    )
+    stop_labels = "|".join(re.escape(label) for label in _INLINE_OUTREACH_STOP_LABELS)
     pattern = re.compile(
         rf"\b(?:{label_pattern})\s*:\s*(?P<value>.*?)(?=\s+\b(?:{stop_labels})\s*:|$)",
         flags=re.I,
@@ -10846,6 +12823,22 @@ def _clean_inline_outreach_company(company: str) -> str:
     return cleaned[:120]
 
 
+def _company_from_inline_recipient_label(value: str) -> str:
+    text = " ".join(str(value or "").split()).strip(" .;,:")
+    if not text:
+        return ""
+    parts = [part.strip(" .;,:") for part in text.split(",") if part.strip(" .;,:")]
+    if len(parts) >= 2:
+        return parts[-1]
+    match = re.search(
+        r"\bat\s+(?P<company>[A-Z][A-Za-z0-9&.' -]{1,120})$",
+        text,
+    )
+    if match:
+        return match.group("company")
+    return ""
+
+
 def _extract_inline_source_url(text: str) -> str:
     match = re.search(r"\bhttps?://[^\s,;)]+", text)
     if match:
@@ -10856,23 +12849,12 @@ def _extract_inline_source_url(text: str) -> str:
 def _extract_inline_outreach_facts(text: str) -> list[str]:
     facts_block = _extract_inline_outreach_value(
         text,
-        (
-            "Approved facts",
-            "Source-backed facts",
-            "Source backed facts",
-            "Facts",
-            "Context",
-        ),
+        _INLINE_OUTREACH_FACT_LABELS,
     )
     if not facts_block:
         return []
-    facts_block = re.sub(
-        r"\b(?:Do not|Don't|Dont|Never)\s+[\s\S]*$",
-        "",
-        facts_block,
-        flags=re.I,
-    ).strip()
-    raw_facts = re.split(r"\s*(?:;|\n| \d+[\).] | - )\s*", facts_block)
+    facts_block = _strip_inline_outreach_instruction_tail(facts_block)
+    raw_facts = re.split(r"\s*(?:;|\n| \d+[\).] | - |(?<=[.!?])\s+)\s*", facts_block)
     facts = []
     for raw_fact in raw_facts:
         fact = raw_fact.strip(" .;")
@@ -10882,19 +12864,39 @@ def _extract_inline_outreach_facts(text: str) -> list[str]:
     return list(dict.fromkeys(facts))[:6]
 
 
+def _strip_inline_outreach_instruction_tail(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(
+        r"\bThe\s+desired\s+response\s+is\b[\s\S]*$",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(
+        r"\b(?:Return|Keep|Caveats?|Constraints?|Instructions?|Do not|Don't|Dont|Never)\b"
+        r"[\s\S]*$",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    return cleaned.strip(" .;")
+
+
 def _company_profile_from_inline_outreach_context(context: dict[str, Any]) -> CompanyProfile:
     company = str(context["company"])
     facts = [str(fact) for fact in context.get("facts") or []]
     source_url = str(context.get("source_url") or "user-provided://outreach-context")
+    description = _inline_outreach_company_description(company, facts)
     source = SourceRecord(
         source_id="user_provided_outreach_context",
         title=str(context.get("source_label") or "User-provided approved outreach context")[:160],
         url=source_url,
         source_type="user_provided",
-        supported_claims=facts,
+        supported_claims=list(dict.fromkeys([description, *facts])),
         confidence=0.7,
     )
-    description = facts[0] if facts else f"User-provided outreach context for {company}."
     fit_summary = next(
         (
             fact
@@ -10930,6 +12932,23 @@ def _company_profile_from_inline_outreach_context(context: dict[str, Any]) -> Co
             "No external-use approval has been granted.",
         ],
     )
+
+
+def _inline_outreach_company_description(company: str, facts: list[str]) -> str:
+    if not facts:
+        return f"User-provided outreach context for {company}."
+    first_fact = facts[0]
+    match = re.search(
+        r"\bwhether\s+Keystone\s+could\s+(?:help\s+)?review\s+"
+        r"(?P<object>.*?)(?:\s+before\b|$)",
+        first_fact,
+        flags=re.I,
+    )
+    if match:
+        subject = " ".join(match.group("object").split()).strip(" .;,:")
+        if subject:
+            return f"{company} is exploring review support for {subject}."
+    return first_fact
 
 
 def _compose_outreach_draft_for_work_item(
@@ -11004,6 +13023,10 @@ def _compose_outreach_draft_for_work_item(
             live=True,
             save=False,
             model_label="sdk-live",
+            trace_metadata=_work_item_sdk_trace_metadata(
+                work_item,
+                stage="work_item_outreach_composer",
+            ),
         )
         compact_payload = jsonable(outcome.final_output)
         if not isinstance(compact_payload, dict):
@@ -11183,6 +13206,14 @@ def _looks_like_outreach_request(text: str) -> bool:
     cleaned = str(text or "")
     if re.search(r"\boutreach\s+composer\b", cleaned, flags=re.I):
         return True
+    if re.search(
+        r"\b(?:do not|don't|dont|no|without)\b[\s\S]{0,120}"
+        r"\b(?:draft|write|compose|prepare|send)\b[\s\S]{0,120}"
+        r"\b(?:outreach|email|linkedin|message|note|reply|response)\b",
+        cleaned,
+        flags=re.I,
+    ):
+        return False
     return bool(
         re.search(
             r"\b(?:draft|write|compose|prepare)\b[\s\S]{0,120}"
@@ -11216,4 +13247,26 @@ def _outreach_goal(text: str) -> str:
     cleaned = " ".join(str(text or "").split())
     if not cleaned or cleaned.lower() in {"continue", "resume"}:
         return "compare notes on clinical AI evaluation and research operations"
+    facts = _extract_inline_outreach_facts(cleaned)
+    fact_text = " ".join(facts)
+    if fact_text:
+        match = re.search(
+            r"\bwhether\s+Keystone\s+could\s+(?:help\s+)?review\s+"
+            r"(?P<object>.*?)(?:\s+before\b|$)",
+            fact_text,
+            flags=re.I,
+        )
+        if match:
+            subject = " ".join(match.group("object").split()).strip(" .;,:")
+            if subject:
+                return f"discuss review scope and timing for {subject}"[:180]
+        if re.search(r"\bscope\s+and\s+timing\b", cleaned, flags=re.I):
+            return "discuss review scope and timing for the requested validation workflow"
+        return "compare notes on the potential review request"
+    cleaned = _strip_inline_outreach_instruction_tail(cleaned)
+    if (
+        re.search(r"\bdiagnostic\s+case\b", cleaned, flags=re.I)
+        or re.search(r"\buse\s+only\s+this\s+approved\b", cleaned, flags=re.I)
+    ):
+        return "compare notes on the potential review request"
     return cleaned[:180]

@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -878,12 +879,19 @@ def retrieve_company_profile_live(
                     query_client.telemetry(),
                 )
 
-            with ThreadPoolExecutor(max_workers=search_concurrency) as executor:
-                futures = {
-                    executor.submit(run_query, index, query): (index, query)
-                    for index, query in enumerate(queries)
-                }
-                for future in as_completed(futures):
+            executor = ThreadPoolExecutor(max_workers=search_concurrency)
+            futures = {
+                executor.submit(run_query, index, query): (index, query)
+                for index, query in enumerate(queries)
+            }
+            completed_futures: set[Any] = set()
+            timed_out = False
+            try:
+                for future in as_completed(
+                    futures,
+                    timeout=_company_search_total_timeout_seconds(),
+                ):
+                    completed_futures.add(future)
                     index, query, results, seconds, telemetry = future.result()
                     ordered_results[index] = results
                     telemetry_packets.append(telemetry)
@@ -894,6 +902,22 @@ def retrieve_company_profile_live(
                             "result_count": len(results),
                         }
                     )
+            except FuturesTimeoutError:
+                timed_out = True
+                for future, (_index, query) in futures.items():
+                    if future in completed_futures:
+                        continue
+                    future.cancel()
+                    query_timings.append(
+                        {
+                            "query": query,
+                            "seconds": _company_search_total_timeout_seconds(),
+                            "result_count": 0,
+                            "error": "company_search_total_timeout",
+                        }
+                    )
+            finally:
+                executor.shutdown(wait=not timed_out, cancel_futures=True)
             for results in ordered_results:
                 search_results.extend(results)
 
@@ -1059,7 +1083,17 @@ def _extract_company_website_inputs(
     errors: list[str] = []
     html_review_attempts = 0
     html_review_claim_count = 0
+    extraction_started_at = perf_counter()
+    extraction_timed_out = False
     for index, url in enumerate(urls, start=1):
+        if perf_counter() - extraction_started_at >= _website_extraction_total_timeout_seconds():
+            extraction_timed_out = True
+            errors.append(
+                "Website extraction stopped after "
+                f"{_website_extraction_total_timeout_seconds():.1f}s total budget; "
+                f"{max(0, len(urls) - index + 1)} page(s) were not extracted."
+            )
+            break
         try:
             result = extract_website_content(
                 url,
@@ -1157,6 +1191,8 @@ def _extract_company_website_inputs(
         "providers_used": providers_used,
         "agent_html_review_page_count": html_review_attempts,
         "agent_html_review_claim_count": html_review_claim_count,
+        "timed_out": extraction_timed_out,
+        "total_timeout_seconds": _website_extraction_total_timeout_seconds(),
     }
     return website_inputs, errors, stats
 
@@ -1326,6 +1362,24 @@ def _website_extraction_max_pages() -> int:
     except ValueError:
         value = 4
     return max(1, min(8, value))
+
+
+def _company_search_total_timeout_seconds() -> float:
+    raw = os.getenv("KEYSTONE_COMPANY_SEARCH_TOTAL_TIMEOUT_SECONDS", "60").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 60.0
+    return max(5.0, min(300.0, value))
+
+
+def _website_extraction_total_timeout_seconds() -> float:
+    raw = os.getenv("KEYSTONE_WEBSITE_EXTRACTION_TOTAL_TIMEOUT_SECONDS", "75").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 75.0
+    return max(5.0, min(300.0, value))
 
 
 def _looks_like_company_page(url: str, *, company: str) -> bool:

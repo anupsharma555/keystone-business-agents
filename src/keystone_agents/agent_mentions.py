@@ -88,6 +88,37 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "slack ops",
         ),
     ),
+    (
+        "airtable_context_agent",
+        "Airtable Context Agent",
+        (
+            "airtable context agent",
+            "airtable context",
+            "airtable agent",
+        ),
+    ),
+    (
+        "google_workspace_context_agent",
+        "Google Workspace Context Agent",
+        (
+            "google workspace context agent",
+            "google workspace context",
+            "workspace context agent",
+            "workspace context",
+            "google drive context",
+            "google docs context",
+            "google sheets context",
+        ),
+    ),
+    (
+        "zotero_context_agent",
+        "Zotero Context Agent",
+        (
+            "zotero context agent",
+            "zotero context",
+            "zotero agent",
+        ),
+    ),
 )
 
 

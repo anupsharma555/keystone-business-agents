@@ -46,6 +46,7 @@ from keystone_agents.schemas.email_triage import (
     managed_gmail_labels,
 )
 from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
+from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.tools.approval_tool import create_approval_queue_item
 from keystone_agents.tools.email_style_tool import load_email_style_profile
@@ -425,6 +426,7 @@ def run_gmail_triage_sdk(
     session: Any | None = None,
     context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
+    max_turns: int | None = None,
 ) -> TypedAgentRunResult[EmailTriageResult]:
     """Run Gmail triage through the typed SDK harness."""
 
@@ -437,6 +439,11 @@ def run_gmail_triage_sdk(
         context_flags=context_flags,
         tool_tier=resolved_tool_tier,
     )
+    turn_policy = resolve_sdk_turn_policy(
+        "gmail_triage",
+        request_text=skill_request_text(typed_input),
+        explicit_max_turns=max_turns,
+    )
     return run_typed_sdk_agent(
         agent=agent,
         typed_input=typed_input,
@@ -444,6 +451,7 @@ def run_gmail_triage_sdk(
         run_config=run_config,
         live=live,
         session=session,
+        max_turns=turn_policy.max_turns,
     )
 
 
@@ -454,6 +462,7 @@ def run_gmail_priority_grouping_sdk(
     live: bool = False,
     model: str | None = None,
     session: Any | None = None,
+    max_turns: int | None = None,
 ) -> TypedAgentRunResult[GmailPriorityGroupingResult]:
     """Run batch Gmail priority grouping through the typed SDK harness."""
 
@@ -463,6 +472,11 @@ def run_gmail_priority_grouping_sdk(
         model=model,
         request_text=skill_request_text(typed_input),
     )
+    turn_policy = resolve_sdk_turn_policy(
+        "gmail_priority_grouping",
+        request_text=skill_request_text(typed_input),
+        explicit_max_turns=max_turns,
+    )
     return run_typed_sdk_agent(
         agent=agent,
         typed_input=typed_input,
@@ -470,6 +484,7 @@ def run_gmail_priority_grouping_sdk(
         run_config=run_config,
         live=live,
         session=session,
+        max_turns=turn_policy.max_turns,
     )
 
 

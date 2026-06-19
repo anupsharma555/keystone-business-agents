@@ -3,6 +3,10 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from keystone_agents.source_layer_context import (
+    runtime_source_layer_policy_context,
+    runtime_source_layer_policy_text,
+)
 from keystone_agents.tool_availability import (
     local_kni_document_availability,
     mcp_availability_for_agent,
@@ -10,8 +14,6 @@ from keystone_agents.tool_availability import (
     search_web_availability_for_agent,
     tool_search_availability_for_agent,
 )
-from keystone_agents.source_layer_context import runtime_source_layer_policy_context
-from keystone_agents.source_layer_context import runtime_source_layer_policy_text
 from keystone_agents.tools.kni_document_tool import (
     KNI_DOC_AUTO_REFRESH_ENV,
     KNI_DOC_INDEX_PATH_ENV,

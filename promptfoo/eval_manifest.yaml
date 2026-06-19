@@ -26,14 +26,17 @@ slack_review_surface:
   eval_db_script: scripts/promptfoo_eval_db.py
 case_inventory:
   target_cases_per_agent: 15
-  total_seed_cases: 90
+  total_seed_cases: 100
   by_agent:
     opportunity_scout: 15
     business_research_analyst: 15
-    chief_of_staff: 15
+    chief_of_staff: 20
     gmail_triage: 15
     outreach_composer: 15
     orchestrator: 15
+    airtable_context_agent: 2
+    google_workspace_context_agent: 2
+    zotero_context_agent: 1
   by_dimension:
     retrieval: source relevance, source type, source count, recall boundaries
     synthesis: source-visible summaries, uncertainty, Keystone relevance

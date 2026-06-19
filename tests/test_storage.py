@@ -5,6 +5,10 @@ import sqlite3
 
 import pytest
 
+from keystone_agents.schemas.announcement_feed import (
+    AnnouncementFeedEvidence,
+    AnnouncementFeedItem,
+)
 from keystone_agents.schemas.approval import (
     ApprovalScope,
     ApprovalState,
@@ -74,6 +78,9 @@ EXPECTED_TABLES = {
     "automation_runs",
     "automation_channel_bindings",
     "automation_findings",
+    "announcement_feed_items",
+    "announcement_feed_evidence",
+    "announcement_feed_fts",
     "schema_migrations",
 }
 
@@ -310,6 +317,45 @@ def test_database_initializes_expected_tables(tmp_path) -> None:
     store = SQLiteStore(_database_url(tmp_path))
 
     assert EXPECTED_TABLES <= store.table_names()
+
+
+def test_announcement_feed_items_dedupe_by_publication_id_and_query(tmp_path) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+    item = AnnouncementFeedItem(
+        title="AI psychiatry preprint",
+        url="https://doi.org/10.1101/2026.01.01.123456?utm_source=newsletter",
+        source="bioRxiv",
+        feed="preprints",
+        doi="10.1101/2026.01.01.123456",
+        tags=["clinical_ai"],
+        selected=True,
+        selection_reason="Relevant to clinical AI evaluation.",
+        summary="Public preprint lead for clinical AI review.",
+        evidence=[
+            AnnouncementFeedEvidence(
+                kind="article",
+                title="AI psychiatry preprint",
+                url="https://example.org/article",
+                snippet="The article describes clinical AI review methods.",
+                source="trafilatura",
+                status="success",
+                char_count=1200,
+            )
+        ],
+    )
+
+    first_key = store.save_announcement_feed_item(item)
+    second_key = store.save_announcement_feed_item(item.model_copy(update={"summary": "Updated"}))
+    results = store.list_announcement_feed_items(query="psychiatry")
+    retrieved = store.retrieve_announcement_feed_items("clinical AI review")
+
+    assert first_key == second_key == "doi:10.1101/2026.01.01.123456"
+    assert len(results) == 1
+    assert [item.canonical_key for item in retrieved] == [first_key]
+    assert results[0].seen_count == 2
+    assert results[0].canonical_url == "https://doi.org/10.1101/2026.01.01.123456"
+    assert results[0].summary == "Updated"
+    assert results[0].evidence[0].kind == "article"
 
 
 def test_initialize_is_repeatable_and_records_schema_version(tmp_path) -> None:

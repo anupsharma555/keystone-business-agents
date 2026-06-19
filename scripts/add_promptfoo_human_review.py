@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from promptfoo.eval_database import resolve_human_review_target
 from promptfoo.human_review import (
     DEFAULT_REVIEW_DB,
     build_slack_review_template,
@@ -41,6 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print a Slack score template instead of saving a review.",
     )
+    parser.add_argument(
+        "--require-recorded-response",
+        action="store_true",
+        help="Require and resolve a matching Promptfoo or Slack response before saving.",
+    )
     return parser
 
 
@@ -67,7 +73,14 @@ def main() -> int:
         slack_channel_name=args.slack_channel_name,
         slack_thread_ts=args.slack_thread_ts,
     )
-    row_id = save_human_review(review, database_path=Path(args.database_path))
+    database_path = Path(args.database_path)
+    if args.require_recorded_response:
+        review = resolve_human_review_target(
+            review,
+            database_path=database_path,
+            require_recorded_response=True,
+        )
+    row_id = save_human_review(review, database_path=database_path)
     payload = review.to_dict()
     payload["id"] = row_id
     payload["database_path"] = args.database_path

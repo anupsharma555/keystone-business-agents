@@ -10,13 +10,17 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel
 
 from keystone_agents.config import default_database_url
 from keystone_agents.costing import compare_estimated_to_actual_cost
+from keystone_agents.schemas.announcement_feed import (
+    AnnouncementFeedEvidence,
+    AnnouncementFeedItem,
+)
 from keystone_agents.schemas.approval import (
     ApprovalDecisionRecord,
     ApprovalQueueItem,
@@ -55,7 +59,7 @@ from keystone_agents.schemas.work_item import (
 )
 
 DEFAULT_DATABASE_URL = "sqlite:///keystone_agents.db"
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
 EASTERN_TIME_ZONE = "America/New_York"
 EASTERN = ZoneInfo(EASTERN_TIME_ZONE)
 REDACTION_MARKER = "[REDACTED]"
@@ -78,6 +82,8 @@ NON_SECRET_USAGE_KEYS = {
     "reasoning_output_tokens",
     "total_token_count",
     "total_tokens",
+    "token_breakdown",
+    "token_components",
 }
 SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
@@ -143,6 +149,8 @@ TIMESTAMP_METADATA_TABLES = (
     "automation_runs",
     "automation_channel_bindings",
     "automation_findings",
+    "announcement_feed_items",
+    "announcement_feed_evidence",
 )
 
 OUTREACH_EMAIL_BODY_STORAGE_NOTE = (
@@ -656,6 +664,87 @@ CREATE INDEX IF NOT EXISTS idx_automation_findings_severity
 ON automation_findings(severity);
 """
 
+ANNOUNCEMENT_FEED_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS announcement_feed_items (
+    canonical_key TEXT PRIMARY KEY,
+    publication_id TEXT NOT NULL DEFAULT '',
+    publication_id_type TEXT NOT NULL DEFAULT '',
+    doi TEXT NOT NULL DEFAULT '',
+    arxiv_id TEXT NOT NULL DEFAULT '',
+    biorxiv_id TEXT NOT NULL DEFAULT '',
+    medrxiv_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    url TEXT NOT NULL DEFAULT '',
+    canonical_url TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    feed TEXT NOT NULL DEFAULT '',
+    authors_json TEXT NOT NULL DEFAULT '[]',
+    published_at TEXT NOT NULL DEFAULT '',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    relevance_status TEXT NOT NULL DEFAULT 'candidate',
+    selected INTEGER NOT NULL DEFAULT 0,
+    selection_reason TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    extraction_status TEXT NOT NULL DEFAULT 'not_attempted',
+    content_hash TEXT NOT NULL DEFAULT '',
+    automation_run_id TEXT NOT NULL DEFAULT '',
+    slack_link TEXT NOT NULL DEFAULT '',
+    review_metadata_json TEXT NOT NULL DEFAULT '{}',
+    item_json TEXT NOT NULL DEFAULT '{}',
+    first_seen_at_utc TEXT NOT NULL DEFAULT '',
+    last_seen_at_utc TEXT NOT NULL DEFAULT '',
+    seen_count INTEGER NOT NULL DEFAULT 1,
+    created_at_utc TEXT NOT NULL DEFAULT '',
+    created_at_et TEXT NOT NULL DEFAULT '',
+    created_date_et TEXT NOT NULL DEFAULT '',
+    updated_at_utc TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_announcement_feed_publication
+ON announcement_feed_items(publication_id_type, publication_id);
+
+CREATE INDEX IF NOT EXISTS idx_announcement_feed_canonical_url
+ON announcement_feed_items(canonical_url);
+
+CREATE INDEX IF NOT EXISTS idx_announcement_feed_source
+ON announcement_feed_items(source, feed);
+
+CREATE INDEX IF NOT EXISTS idx_announcement_feed_selected
+ON announcement_feed_items(selected);
+
+CREATE INDEX IF NOT EXISTS idx_announcement_feed_published
+ON announcement_feed_items(published_at);
+
+CREATE TABLE IF NOT EXISTS announcement_feed_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_key TEXT NOT NULL,
+    evidence_key TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'search',
+    title TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    snippet TEXT NOT NULL DEFAULT '',
+    char_count INTEGER NOT NULL DEFAULT 0,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at_utc TEXT NOT NULL DEFAULT '',
+    created_at_et TEXT NOT NULL DEFAULT '',
+    created_date_et TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(item_key, evidence_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_announcement_feed_evidence_item
+ON announcement_feed_evidence(item_key);
+
+CREATE INDEX IF NOT EXISTS idx_announcement_feed_evidence_kind
+ON announcement_feed_evidence(kind);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS announcement_feed_fts
+USING fts5(canonical_key UNINDEXED, retrieval_text);
+"""
+
 INITIAL_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS agent_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -787,6 +876,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (10, "outreach_examples", OUTREACH_EXAMPLES_TABLE_SQL),
     (11, "feedback_metadata_columns", "SELECT 1;"),
     (12, "work_items", WORK_ITEMS_TABLE_SQL),
+    (13, "announcement_feed_items", ANNOUNCEMENT_FEED_TABLE_SQL),
 )
 
 
@@ -1012,6 +1102,116 @@ def _json_dict(value: str | None) -> dict[str, Any]:
     return dict(loaded)
 
 
+def _canonicalize_url(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        return text
+    query_parts = []
+    for part in parsed.query.split("&"):
+        if not part:
+            continue
+        key = part.split("=", 1)[0].lower()
+        if key.startswith("utm_") or key in {"fbclid", "gclid", "mc_cid", "mc_eid"}:
+            continue
+        query_parts.append(part)
+    path = unquote(parsed.path or "").rstrip("/") or "/"
+    return urlunparse(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            path,
+            "",
+            "&".join(query_parts),
+            "",
+        )
+    )
+
+
+def _announcement_publication_identity(record: AnnouncementFeedItem) -> tuple[str, str]:
+    candidates = (
+        ("doi", record.doi),
+        ("arxiv", record.arxiv_id),
+        ("biorxiv", record.biorxiv_id),
+        ("medrxiv", record.medrxiv_id),
+        (record.publication_id_type, record.publication_id),
+    )
+    for kind, value in candidates:
+        cleaned_kind = str(kind or "").strip().lower()
+        cleaned_value = str(value or "").strip().lower()
+        if cleaned_kind and cleaned_value:
+            return cleaned_kind, cleaned_value
+    doi_from_url = _doi_from_url(record.url)
+    if doi_from_url:
+        return "doi", doi_from_url
+    return "", ""
+
+
+def _announcement_feed_canonical_key(record: AnnouncementFeedItem) -> str:
+    publication_id_type, publication_id = _announcement_publication_identity(record)
+    if publication_id_type and publication_id:
+        return f"{publication_id_type}:{publication_id}"
+    if record.canonical_url:
+        return f"url:{record.canonical_url.lower()}"
+    fingerprint = stable_hash(
+        "|".join(
+            [
+                record.title.strip().lower(),
+                record.source.strip().lower(),
+                record.feed.strip().lower(),
+                record.published_at.strip().lower(),
+            ]
+        )
+    )[:24]
+    return f"title:{fingerprint}"
+
+
+def _announcement_content_hash(record: AnnouncementFeedItem) -> str:
+    return stable_hash(
+        {
+            "title": record.title,
+            "url": record.url,
+            "summary": record.summary,
+            "evidence": [item.model_dump(mode="json") for item in record.evidence],
+        }
+    )
+
+
+def _announcement_evidence_key(evidence: AnnouncementFeedEvidence) -> str:
+    if evidence.url:
+        return f"{evidence.kind}:{_canonicalize_url(evidence.url)}"
+    fingerprint = stable_hash(
+        "|".join(
+            [
+                evidence.kind.strip().lower(),
+                evidence.title.strip().lower(),
+                evidence.source.strip().lower(),
+                evidence.snippet.strip().lower(),
+            ]
+        )
+    )[:24]
+    return f"{evidence.kind}:{fingerprint}"
+
+
+def _announcement_extraction_status(evidence: list[AnnouncementFeedEvidence]) -> str:
+    if any(item.kind == "article" and item.status == "success" for item in evidence):
+        return "article_read"
+    if any(item.kind == "article" for item in evidence):
+        return "article_attempted"
+    if any(item.kind == "search" for item in evidence):
+        return "search_only"
+    return "not_attempted"
+
+
+def _doi_from_url(value: str) -> str:
+    parsed = urlparse(str(value or ""))
+    if parsed.netloc.lower().endswith("doi.org"):
+        return unquote(parsed.path.lstrip("/")).lower()
+    return ""
+
+
 def _memory_query_tokens(query: str) -> list[str]:
     return [token for token in re.findall(r"[a-z0-9]+", str(query or "").lower()) if len(token) > 1]
 
@@ -1187,6 +1387,7 @@ class SQLiteStore:
         connection.executescript(OUTREACH_EXAMPLES_TABLE_SQL)
         connection.executescript(WORK_ITEMS_TABLE_SQL)
         connection.executescript(AUTOMATIONS_TABLE_SQL)
+        connection.executescript(ANNOUNCEMENT_FEED_TABLE_SQL)
 
         outreach_columns = self._column_names(connection, "outreach_drafts")
         if "approval_state" not in outreach_columns:
@@ -1428,6 +1629,8 @@ class SQLiteStore:
         event = WorkItemEvent.model_validate(_as_dict(event))
         created = _time_metadata()
         with self.connect() as connection:
+            if self._work_item_missing(connection, work_item_id):
+                raise ValueError(f"Cannot save WorkItem event for missing WorkItem: {work_item_id}")
             cursor = connection.execute(
                 """
                 INSERT INTO work_item_events
@@ -1480,6 +1683,10 @@ class SQLiteStore:
         metadata = {**artifact.metadata, "selected": artifact.selected}
         created = _time_metadata()
         with self.connect() as connection:
+            if self._work_item_missing(connection, work_item_id):
+                raise ValueError(
+                    f"Cannot save WorkItem artifact for missing WorkItem: {work_item_id}"
+                )
             cursor = connection.execute(
                 """
                 INSERT INTO work_item_artifacts
@@ -1505,6 +1712,13 @@ class SQLiteStore:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def _work_item_missing(self, connection: sqlite3.Connection, work_item_id: str) -> bool:
+        row = connection.execute(
+            "SELECT 1 FROM work_items WHERE id = ? LIMIT 1",
+            (work_item_id,),
+        ).fetchone()
+        return row is None
 
     def list_work_item_artifacts(self, work_item_id: str) -> list[WorkItemArtifactRef]:
         """Return artifact refs attached to a WorkItem."""
@@ -1825,6 +2039,325 @@ class SQLiteStore:
                 (*params, max(1, min(500, int(limit)))),
             ).fetchall()
         return [AutomationFinding.model_validate(_json_dict(row["finding_json"])) for row in rows]
+
+    def save_announcement_feed_item(self, item: Any) -> str:
+        """Upsert one RSS/preprint announcement item and replace its evidence rows."""
+
+        record = AnnouncementFeedItem.model_validate(_as_dict(item))
+        canonical_url = record.canonical_url or _canonicalize_url(record.url)
+        record = record.model_copy(update={"canonical_url": canonical_url})
+        canonical_key = record.canonical_key or _announcement_feed_canonical_key(record)
+        publication_id_type, publication_id = _announcement_publication_identity(record)
+        extraction_status = _announcement_extraction_status(record.evidence)
+        content_hash = record.content_hash or _announcement_content_hash(record)
+        now = _time_metadata()
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT first_seen_at_utc, seen_count, selected, selection_reason, summary "
+                "FROM announcement_feed_items WHERE canonical_key = ?",
+                (canonical_key,),
+            ).fetchone()
+            first_seen = (
+                str(existing["first_seen_at_utc"] or now["utc"]) if existing is not None else now["utc"]
+            )
+            seen_count = int(existing["seen_count"] or 0) + 1 if existing is not None else 1
+            stored = record.model_copy(
+                update={
+                    "canonical_key": canonical_key,
+                    "publication_id": publication_id,
+                    "publication_id_type": publication_id_type,
+                    "canonical_url": canonical_url,
+                    "extraction_status": extraction_status,
+                    "content_hash": content_hash,
+                    "first_seen_at": first_seen,
+                    "last_seen_at": now["utc"],
+                    "seen_count": seen_count,
+                }
+            )
+            if existing is not None and bool(existing["selected"]) and not stored.selected:
+                stored = stored.model_copy(
+                    update={
+                        "selected": True,
+                        "relevance_status": "selected",
+                        "selection_reason": stored.selection_reason
+                        or str(existing["selection_reason"] or ""),
+                        "summary": stored.summary or str(existing["summary"] or ""),
+                    }
+                )
+            connection.execute(
+                """
+                INSERT INTO announcement_feed_items
+                    (
+                        canonical_key, publication_id, publication_id_type, doi,
+                        arxiv_id, biorxiv_id, medrxiv_id, title, url, canonical_url,
+                        source, feed, authors_json, published_at, tags_json,
+                        relevance_status, selected, selection_reason, summary,
+                        extraction_status, content_hash, automation_run_id, slack_link,
+                        review_metadata_json, item_json, first_seen_at_utc,
+                        last_seen_at_utc, seen_count, created_at_utc, created_at_et,
+                        created_date_et, updated_at_utc
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(canonical_key) DO UPDATE SET
+                    publication_id = excluded.publication_id,
+                    publication_id_type = excluded.publication_id_type,
+                    doi = excluded.doi,
+                    arxiv_id = excluded.arxiv_id,
+                    biorxiv_id = excluded.biorxiv_id,
+                    medrxiv_id = excluded.medrxiv_id,
+                    title = excluded.title,
+                    url = excluded.url,
+                    canonical_url = excluded.canonical_url,
+                    source = excluded.source,
+                    feed = excluded.feed,
+                    authors_json = excluded.authors_json,
+                    published_at = excluded.published_at,
+                    tags_json = excluded.tags_json,
+                    relevance_status = excluded.relevance_status,
+                    selected = excluded.selected,
+                    selection_reason = excluded.selection_reason,
+                    summary = excluded.summary,
+                    extraction_status = excluded.extraction_status,
+                    content_hash = excluded.content_hash,
+                    automation_run_id = excluded.automation_run_id,
+                    slack_link = excluded.slack_link,
+                    review_metadata_json = excluded.review_metadata_json,
+                    item_json = excluded.item_json,
+                    last_seen_at_utc = excluded.last_seen_at_utc,
+                    seen_count = excluded.seen_count,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (
+                    canonical_key,
+                    _redact_string(publication_id),
+                    _redact_string(publication_id_type),
+                    _redact_string(stored.doi),
+                    _redact_string(stored.arxiv_id),
+                    _redact_string(stored.biorxiv_id),
+                    _redact_string(stored.medrxiv_id),
+                    _redact_string(stored.title),
+                    _redact_string(stored.url),
+                    _redact_string(stored.canonical_url),
+                    _redact_string(stored.source),
+                    _redact_string(stored.feed),
+                    stable_json(stored.authors),
+                    _redact_string(stored.published_at),
+                    stable_json(stored.tags),
+                    _redact_string(stored.relevance_status),
+                    1 if stored.selected else 0,
+                    _redact_string(stored.selection_reason),
+                    _redact_string(stored.summary),
+                    _redact_string(stored.extraction_status),
+                    _redact_string(stored.content_hash),
+                    _redact_string(stored.automation_run_id),
+                    _redact_string(stored.slack_link),
+                    stable_json(stored.review_metadata, summarize_email_content=True),
+                    stable_json(stored.model_dump(mode="json"), summarize_email_content=True),
+                    first_seen,
+                    now["utc"],
+                    seen_count,
+                    first_seen if existing is None else str(existing["first_seen_at_utc"] or now["utc"]),
+                    now["et"],
+                    now["date_et"],
+                    now["utc"],
+                ),
+            )
+            connection.execute(
+                "DELETE FROM announcement_feed_evidence WHERE item_key = ?",
+                (canonical_key,),
+            )
+            for evidence in stored.evidence:
+                self._save_announcement_feed_evidence(connection, canonical_key, evidence)
+            self._upsert_announcement_feed_index(connection, stored)
+        return canonical_key
+
+    def _upsert_announcement_feed_index(
+        self,
+        connection: sqlite3.Connection,
+        record: AnnouncementFeedItem,
+    ) -> None:
+        connection.execute(
+            "DELETE FROM announcement_feed_fts WHERE canonical_key = ?",
+            (record.canonical_key,),
+        )
+        connection.execute(
+            "INSERT INTO announcement_feed_fts (canonical_key, retrieval_text) VALUES (?, ?)",
+            (record.canonical_key, _redact_string(record.semantic_index_text())),
+        )
+
+    def _save_announcement_feed_evidence(
+        self,
+        connection: sqlite3.Connection,
+        item_key: str,
+        evidence: AnnouncementFeedEvidence,
+    ) -> None:
+        created = _time_metadata()
+        evidence_key = _announcement_evidence_key(evidence)
+        connection.execute(
+            """
+            INSERT INTO announcement_feed_evidence
+                (
+                    item_key, evidence_key, kind, title, url, source, status,
+                    snippet, char_count, evidence_json, created_at_utc,
+                    created_at_et, created_date_et
+                )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_key, evidence_key) DO UPDATE SET
+                kind = excluded.kind,
+                title = excluded.title,
+                url = excluded.url,
+                source = excluded.source,
+                status = excluded.status,
+                snippet = excluded.snippet,
+                char_count = excluded.char_count,
+                evidence_json = excluded.evidence_json
+            """,
+            (
+                item_key,
+                evidence_key,
+                _redact_string(evidence.kind),
+                _redact_string(evidence.title),
+                _redact_string(evidence.url),
+                _redact_string(evidence.source),
+                _redact_string(evidence.status),
+                _redact_string(evidence.snippet),
+                max(0, int(evidence.char_count or 0)),
+                stable_json(evidence.model_dump(mode="json"), summarize_email_content=True),
+                created["utc"],
+                created["et"],
+                created["date_et"],
+            ),
+        )
+
+    def list_announcement_feed_items(
+        self,
+        *,
+        query: str = "",
+        source: str | None = None,
+        selected_only: bool | None = None,
+        limit: int = 50,
+    ) -> list[AnnouncementFeedItem]:
+        """List durable RSS/preprint announcement records with evidence loaded."""
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if query:
+            like = f"%{_redact_string(query)}%"
+            clauses.append(
+                "(title LIKE ? OR summary LIKE ? OR tags_json LIKE ? OR canonical_url LIKE ?)"
+            )
+            params.extend([like, like, like, like])
+        if source:
+            clauses.append("(source = ? OR feed = ?)")
+            cleaned = _redact_string(source)
+            params.extend([cleaned, cleaned])
+        if selected_only is not None:
+            clauses.append("selected = ?")
+            params.append(1 if selected_only else 0)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        bounded_limit = max(1, min(500, int(limit or 50)))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM announcement_feed_items {where} "
+                "ORDER BY selected DESC, published_at DESC, last_seen_at_utc DESC, title "
+                "LIMIT ?",
+                (*params, bounded_limit),
+            ).fetchall()
+            items = [self._announcement_feed_item_from_row(connection, dict(row)) for row in rows]
+        return items
+
+    def get_announcement_feed_item(self, canonical_key: str) -> AnnouncementFeedItem | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM announcement_feed_items WHERE canonical_key = ?",
+                (canonical_key,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._announcement_feed_item_from_row(connection, dict(row))
+
+    def retrieve_announcement_feed_items(
+        self,
+        query: str,
+        *,
+        source: str | None = None,
+        selected_only: bool | None = None,
+        limit: int = 10,
+    ) -> list[AnnouncementFeedItem]:
+        """Retrieve prior RSS/preprint reviews from the local derived index."""
+
+        tokens = _fts_query_tokens(query)
+        if not tokens:
+            return self.list_announcement_feed_items(
+                source=source,
+                selected_only=selected_only,
+                limit=limit,
+            )
+        match_query = _fts_match_query(query)
+        clauses: list[str] = []
+        params: list[Any] = [match_query]
+        if source:
+            clauses.append("(i.source = ? OR i.feed = ?)")
+            cleaned = _redact_string(source)
+            params.extend([cleaned, cleaned])
+        if selected_only is not None:
+            clauses.append("i.selected = ?")
+            params.append(1 if selected_only else 0)
+        where = f" AND {' AND '.join(clauses)}" if clauses else ""
+        bounded_limit = max(1, min(100, int(limit or 10)))
+        with self.connect() as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT i.*, bm25(announcement_feed_fts) AS fts_rank
+                    FROM announcement_feed_fts
+                    JOIN announcement_feed_items i
+                      ON i.canonical_key = announcement_feed_fts.canonical_key
+                    WHERE announcement_feed_fts MATCH ?
+                    """
+                    + where
+                    + " ORDER BY fts_rank, i.selected DESC, i.last_seen_at_utc DESC LIMIT ?",
+                    (*params, bounded_limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return self.list_announcement_feed_items(
+                    query=query,
+                    source=source,
+                    selected_only=selected_only,
+                    limit=limit,
+                )
+            return [self._announcement_feed_item_from_row(connection, dict(row)) for row in rows]
+
+    def _announcement_feed_item_from_row(
+        self,
+        connection: sqlite3.Connection,
+        row: dict[str, Any],
+    ) -> AnnouncementFeedItem:
+        payload = _json_dict(row.get("item_json"))
+        evidence_rows = connection.execute(
+            "SELECT evidence_json FROM announcement_feed_evidence "
+            "WHERE item_key = ? ORDER BY id",
+            (row["canonical_key"],),
+        ).fetchall()
+        payload.update(
+            {
+                "canonical_key": row["canonical_key"],
+                "publication_id": row["publication_id"],
+                "publication_id_type": row["publication_id_type"],
+                "canonical_url": row["canonical_url"],
+                "selected": bool(row["selected"]),
+                "extraction_status": row["extraction_status"],
+                "content_hash": row["content_hash"],
+                "first_seen_at": row["first_seen_at_utc"],
+                "last_seen_at": row["last_seen_at_utc"],
+                "seen_count": int(row["seen_count"] or 1),
+                "evidence": [
+                    AnnouncementFeedEvidence.model_validate(_json_dict(evidence["evidence_json"]))
+                    for evidence in evidence_rows
+                ],
+            }
+        )
+        return AnnouncementFeedItem.model_validate(payload)
 
     def save(self, kind: str, payload: dict[str, Any]) -> int:
         """Backward-compatible generic save, stored as an agent run."""

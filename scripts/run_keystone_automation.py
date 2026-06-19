@@ -36,8 +36,10 @@ except ImportError:  # pragma: no cover - dependency is declared.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCK_DIR = PROJECT_ROOT / ".keystone" / "locks"
 WEEKLY_STAGES = {"dry-run", "live-research"}
+ANNOUNCEMENTS_STAGES = {"dry-run", "live-research"}
 GMAIL_STAGES = {"label-preview", "label-apply", "draft-create"}
 MAX_SCHEDULED_OPPORTUNITIES = 5
+MAX_SCHEDULED_ANNOUNCEMENTS = 5
 MAX_SCHEDULED_GMAIL_MESSAGES = 3
 MIN_LABEL_APPLY_PREVIEWS = 2
 FATAL_HEALTH_CODES = {
@@ -190,6 +192,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Operator confirmation for approved Gmail draft creation.",
     )
+
+    announcements = subparsers.add_parser(
+        "announcements-research",
+        help="Run the scheduled announcements/preprint research synthesis workflow.",
+    )
+    announcements.add_argument("--stage", choices=sorted(ANNOUNCEMENTS_STAGES), default="dry-run")
+    announcements.add_argument("--database-url", default=None)
+    announcements.add_argument("--input-json", default="", help="Inline JSON announcement payload.")
+    announcements.add_argument("--input-file", default="", help="Path to JSON announcement payload.")
+    announcements.add_argument("--min-items", type=int, default=3)
+    announcements.add_argument("--max-items", type=int, default=5)
+    announcements.add_argument("--live-sdk", action="store_true")
+    announcements.add_argument("--confirm-live", action="store_true")
+    announcements.add_argument("--failure-slack-channel", default=None)
     return parser
 
 
@@ -200,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
     env = _automation_env(args)
     if args.command == "weekly-opportunity":
         _validate_weekly_args(args)
+    elif args.command == "announcements-research":
+        _validate_announcements_args(args)
     elif args.command == "gmail-triage":
         _validate_gmail_args(args)
     else:  # pragma: no cover - argparse enforces choices.
@@ -210,6 +228,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "weekly-opportunity":
             _check_pending_approval_backlog(args)
             child = _run_child(_weekly_command(args), env=env, timeout_seconds=args.timeout_seconds)
+        elif args.command == "announcements-research":
+            child = _run_child(
+                _announcements_command(args),
+                env=env,
+                timeout_seconds=args.timeout_seconds,
+            )
         else:
             child = _run_child(_gmail_command(args), env=env, timeout_seconds=args.timeout_seconds)
 
@@ -239,14 +263,19 @@ def _load_env(env_file: str | None) -> None:
 def _lock_path(args: argparse.Namespace) -> Path:
     if args.lock_file:
         return Path(args.lock_file).expanduser()
-    suffix = "weekly-opportunity" if args.command == "weekly-opportunity" else "gmail-triage"
+    if args.command == "weekly-opportunity":
+        suffix = "weekly-opportunity"
+    elif args.command == "announcements-research":
+        suffix = "announcements-research"
+    else:
+        suffix = "gmail-triage"
     return DEFAULT_LOCK_DIR / f"{suffix}.lock"
 
 
 def _automation_env(args: argparse.Namespace) -> dict[str, str]:
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
-    if args.command == "weekly-opportunity" and args.stage == "dry-run":
+    if args.command in {"weekly-opportunity", "announcements-research"} and args.stage == "dry-run":
         env.update(
             {
                 "KEYSTONE_LIVE_MODE": "false",
@@ -256,7 +285,7 @@ def _automation_env(args: argparse.Namespace) -> dict[str, str]:
                 "KEYSTONE_ENABLE_LIVE_SLACK": "false",
             }
         )
-    elif args.command == "weekly-opportunity":
+    elif args.command in {"weekly-opportunity", "announcements-research"}:
         env.update(
             {
                 "KEYSTONE_LIVE_MODE": "true",
@@ -332,6 +361,21 @@ def _validate_gmail_args(args: argparse.Namespace) -> None:
             raise SystemExit("--stage draft-create requires a target --gmail-query.")
 
 
+def _validate_announcements_args(args: argparse.Namespace) -> None:
+    if args.min_items < 1 or args.min_items > MAX_SCHEDULED_ANNOUNCEMENTS:
+        raise SystemExit(
+            f"--min-items must be between 1 and {MAX_SCHEDULED_ANNOUNCEMENTS}."
+        )
+    if args.max_items < args.min_items or args.max_items > MAX_SCHEDULED_ANNOUNCEMENTS:
+        raise SystemExit(
+            f"--max-items must be between --min-items and {MAX_SCHEDULED_ANNOUNCEMENTS}."
+        )
+    if args.stage == "live-research" and not args.confirm_live:
+        raise SystemExit("--stage live-research requires --confirm-live.")
+    if args.stage == "dry-run" and args.live_sdk:
+        raise SystemExit("Dry-run announcements automation cannot enable --live-sdk.")
+
+
 def _check_pending_approval_backlog(args: argparse.Namespace) -> None:
     if args.command != "weekly-opportunity" or args.allow_pending_approvals:
         return
@@ -373,6 +417,33 @@ def _weekly_command(args: argparse.Namespace) -> list[str]:
         command.append("--request-approval")
     if args.live_slack:
         command.append("--live-slack")
+    return command
+
+
+def _announcements_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "run_multi_agent_automation.py"),
+        "--kind",
+        "announcements-research",
+        "--json",
+        "--min-items",
+        str(args.min_items),
+        "--max-items",
+        str(args.max_items),
+    ]
+    if args.database_url:
+        command.extend(["--database-url", args.database_url])
+    if args.input_json:
+        command.extend(["--input-json", args.input_json])
+    if args.input_file:
+        command.extend(["--input-file", args.input_file])
+    if args.stage == "dry-run":
+        command.append("--dry-run")
+    else:
+        command.extend(["--no-dry-run", "--live-search"])
+        if args.live_sdk:
+            command.append("--live-sdk")
     return command
 
 
@@ -541,6 +612,8 @@ def _next_safe_action_for_automation(args: argparse.Namespace, child: ChildRun) 
         return "Review the redacted child error, fix the blocker, then rerun dry-run first."
     if args.command == "weekly-opportunity":
         return "Review generated opportunities and pending approval queue items."
+    if args.command == "announcements-research":
+        return "Review announcement research summaries and persisted feed history."
     if args.command == "gmail-triage":
         return "Review Gmail triage output before enabling the next gated stage."
     return "Review automation output."

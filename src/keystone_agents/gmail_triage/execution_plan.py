@@ -22,6 +22,24 @@ def infer_gmail_execution_plan(
     if query_terms:
         query = f"{query} {query_terms}"
 
+    if _inline_context_request(lowered):
+        return GmailExecutionPlan(
+            source=source,
+            operation="single_message_triage",
+            lookback_days=lookback_days,
+            max_messages=1,
+            gmail_query="",
+            source_label="inline_context",
+            create_gmail_drafts=False,
+            draft_replies_in_output=False,
+            live_read_required=False,
+            candidate_helpers=["inline_email_context_triage", "gmail_triage_sdk"],
+            rationale=(
+                "Request provides inline email context and asks to use only that context; "
+                "do not read live Gmail."
+            ),
+        )
+
     if _priority_grouping_request(lowered):
         priority_query = f"newer_than:{lookback_days}d"
         return GmailExecutionPlan(
@@ -94,6 +112,22 @@ def infer_gmail_execution_plan(
 def _priority_grouping_request(lowered: str) -> bool:
     return any(marker in lowered for marker in ("top ", "top 3", "priority", "actionable")) or (
         "recent" in lowered and ("threads" in lowered or "messages" in lowered)
+    )
+
+
+def _inline_context_request(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "use only this inline",
+            "inline email context",
+            "inline, non-sensitive email context",
+            "sanitized inline email",
+            "provided email context",
+            "provided inline context",
+            "do not access gmail",
+            "do not access live gmail",
+        )
     )
 
 

@@ -10,9 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.context_env import context_env_path
 from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
 from keystone_agents.sdk import function_tool
 
+DEFAULT_LOCAL_ZOTERO_IMPORT_REPO = Path(
+    os.getenv("KEYSTONE_ZOTERO_IMPORT_REPO_DEFAULT", "../zotero-import")
+)
 DEFAULT_LOCAL_CONTEXT_SOURCE_ENV: dict[str, str] = {
     "keystone_neuroinformatics": "KEYSTONE_NEUROINFORMATICS_DIR",
     "zotero_active": "KEYSTONE_ZOTERO_ACTIVE_DIR",
@@ -89,6 +93,9 @@ def _configured_source_paths() -> dict[str, Path]:
         for source_id, env_var in DEFAULT_LOCAL_CONTEXT_SOURCE_ENV.items()
         if (raw_path := os.getenv(env_var, "").strip())
     }
+    default_zotero_cache = _default_zotero_import_cache_source()
+    if default_zotero_cache is not None:
+        sources.setdefault("zotero_import_cache", default_zotero_cache)
     raw_json = os.getenv("KEYSTONE_LOCAL_CONTEXT_SOURCES_JSON", "").strip()
     if raw_json:
         configured = json.loads(raw_json)
@@ -112,6 +119,26 @@ def _configured_source_paths() -> dict[str, Path]:
             if _valid_source_id(source_id):
                 sources[source_id] = Path(raw_path.strip()).expanduser()
     return sources
+
+
+def _default_zotero_import_cache_source() -> Path | None:
+    configured_cache = context_env_path("KEYSTONE_ZOTERO_IMPORT_CACHE", "")
+    if str(configured_cache) != "." and configured_cache.exists():
+        return configured_cache
+    collection_cache = context_env_path("ZOTERO_COLLECTION_CACHE", "")
+    if collection_cache.name == "zotero_collections.json" and collection_cache.parent.exists():
+        return collection_cache.parent
+    import_repo = context_env_path(
+        "KEYSTONE_ZOTERO_IMPORT_REPO",
+        str(DEFAULT_LOCAL_ZOTERO_IMPORT_REPO),
+    )
+    repo_cache = import_repo / ".cache"
+    if repo_cache.exists():
+        return repo_cache
+    default_cache = DEFAULT_LOCAL_ZOTERO_IMPORT_REPO / ".cache"
+    if default_cache.exists():
+        return default_cache
+    return None
 
 
 def local_context_sources() -> dict[str, LocalContextSource]:

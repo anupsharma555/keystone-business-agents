@@ -39,6 +39,26 @@ An ingestion script should:
 - fail closed on blocked filenames or patterns
 - print only file paths and ids, never file contents that might include secrets
 
+## RSS And Preprint Review History
+
+RSS, preprint, and announcement review history uses a two-layer model:
+
+- The local structured application database is canonical. It stores feed item
+  identifiers, canonical URLs, source/feed metadata, relevance decisions,
+  summaries, evidence status, automation run ids, Slack links, and review
+  metadata.
+- Local SQLite retrieval indexes are derived from canonical records. They may
+  contain only public/sanitized title, summary, tags, source, selection reason,
+  and bounded evidence snippets.
+- Hosted FileSearch/vector stores must not receive raw runtime RSS, Slack,
+  Gmail, or unreviewed article payloads. Upload is allowed only for
+  human-approved public/sanitized review chunks with explicit provenance,
+  sensitivity, retention, and approval metadata.
+
+Retrieval tools should return canonical feed item ids, publication ids, source
+URLs, dates, extraction status, and snippets. The index is advisory retrieval
+state; the structured database remains the source of truth.
+
 ## Never Upload
 
 - `.env`, `.env.*`, API keys, OAuth tokens, service account files, or credential

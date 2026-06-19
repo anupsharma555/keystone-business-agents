@@ -216,6 +216,17 @@ def test_build_context_pack_for_route_selects_specialist_pack() -> None:
 
     assert pack.pack_type == "opportunity"
     assert pack.route == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert pack.input_type == "keystone_agents.schemas.work_item.WorkItem"
+    assert pack.satisfies_input_type == (
+        "keystone_agents.schemas.context_pack.OpportunityContextPack"
+    )
+    assert pack.expected_output_type == (
+        "keystone_agents.schemas.opportunity.OpportunityScoutResult"
+    )
+    assert pack.next_input_type == "keystone_agents.schemas.context_pack.ResearchContextPack"
+    assert pack.type_compatibility_status == "compatible"
+    assert pack.handoff_type_contract.target_input_type == pack.satisfies_input_type
+    assert pack.handoff_type_contract.target_output_type == pack.expected_output_type
 
 
 def test_context_pack_payload_preserves_ordered_sources_for_followups() -> None:
@@ -238,6 +249,14 @@ def test_context_pack_payload_preserves_ordered_sources_for_followups() -> None:
 
     payload = build_research_context(item)
 
+    assert payload["satisfies_input_type"] == (
+        "keystone_agents.schemas.context_pack.ResearchContextPack"
+    )
+    assert payload["expected_output_type"] == "keystone_agents.schemas.research.ResearchBrief"
+    assert payload["next_input_type"] == (
+        "keystone_agents.schemas.context_pack.OutreachContextPack"
+    )
+    assert payload["handoff_type_contract"]["compatibility_status"] == "compatible"
     assert payload["ordered_sources"] == [
         {
             "index": 1,

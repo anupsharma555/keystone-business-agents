@@ -160,6 +160,14 @@ python3 scripts/switch_operator_mode.py live-test
 python3 scripts/switch_operator_mode.py full-live
 ```
 
+Optional read-only context agents for Airtable, Google Workspace, and Zotero
+can use a separately configured context repository for allowlisted environment
+values. Keep `KEYSTONE_CONTEXT_CONFIG_REPO` blank by default, set it to a local
+repo or config directory only on an operator workstation, and use
+`KEYSTONE_CONTEXT_CONFIG_OVERRIDE_KEYS` to allowlist specific read-context keys.
+This bridge does not grant write approval or enable sends, drafts, CRM writes,
+file writes, scheduling, or publishing.
+
 The intended retrieval ladder for live research is:
 
 - `SearXNG` for broad recall when no explicit provider override is set.
