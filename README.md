@@ -6,12 +6,22 @@ Nothing in this repository sends external email automatically.
 
 ## Agents
 
-The project centers on four business specialist agents:
+The project centers on four business workflow specialists plus read-only
+operational context specialists:
 
 - Gmail Inbound Triage Agent: classifies inbound email, recommends labels, flags safety issues, and creates draft-only response recommendations.
 - Business Research Analyst: builds source-attributed briefs for companies, institutes, conferences, labs, topics, Zotero collections, and article collections; legacy company-profile workflows still produce fit and confidence scores.
 - Opportunity Scout Agent: finds or updates opportunity records, scores priority, and preserves approval gates before outreach.
 - Outreach Composer Agent: drafts email or LinkedIn copy only from approved context and marks all output for human approval.
+- Airtable Context Agent: resolves configured Airtable bases, tables, fields,
+  and bounded records for read-only context handoffs; direct creates/updates
+  require explicit live flags and approval references.
+- Google Workspace Context Agent: reads scoped Drive, Docs, Sheets, and file
+  metadata for internal context handoffs; file creation, updates, sharing, and
+  deletion remain approval-gated.
+- Zotero Context Agent: reads local/API Zotero library, collection, item,
+  article, importer, and evidence context; library mutation is limited to
+  explicitly approved guarded importer paths.
 
 An Orchestrator Agent is the first model control plane for natural-language
 `@KNI`, Slack, WorkItem, scheduled-automation, and explicit named-agent
@@ -293,10 +303,12 @@ local SQLite WorkItem/artifact state plus the `ManualRequestPlan`; direct
 `live-test` / `full-live` mode, explicit named-agent calls through `--agent` or
 `@KNI <agent>` auto-enable live SDK model execution and still use
 Orchestrator-first interpretation before specialist execution unless
-`--no-live-sdk` is passed. Direct live manual calls use the reviewed
-script-backed paths for Business Research Analyst, Opportunity Scout, Gmail
-Triage, and Chief of Staff; Outreach Composer blocks until approved
-WorkItem/source context is available.
+`--no-live-sdk` is passed. Direct live manual calls use reviewed script-backed
+paths for Business Research Analyst, Opportunity Scout, Gmail Triage, Chief of
+Staff, and the three context agents. Outreach Composer blocks until approved
+WorkItem/source context is available, and context-agent writes remain disabled
+unless the selected adapter, live flags, and approval reference all allow the
+specific create/update action.
 
 WorkItem mode provides the stateful natural-language workflow path:
 
@@ -378,8 +390,9 @@ Outbound communication is draft-only. The codebase does not expose an implemente
 Implemented:
 
 - Shared OpenAI Agents SDK helper layer and model-provider configuration.
-- Four business specialist SDK agent builders, plus Orchestrator and KNI Chief
-  of Staff agent builders.
+- Four business workflow specialist SDK agent builders, three operational
+  context-agent builders, plus Orchestrator and KNI Chief of Staff agent
+  builders.
 - Repo-local `SKILL.md` bundles for reusable agent reasoning contracts,
   including source triage, evidence attribution, handoff packaging, output
   review, context permission gating, action boundaries, and specialist
@@ -396,6 +409,9 @@ Implemented:
 - Orchestrator Agent with intended handoff metadata and deterministic routing.
 - KNI Chief of Staff Agent for Slack operations routing, automation inventory
   review, and bounded internal operating-layer writes.
+- Airtable, Google Workspace, and Zotero context agents for scoped read
+  context, nested Chief-of-Staff handoffs, and explicit approval-gated
+  create/update planning where supported.
 - Deterministic dry-run fixture wrappers for triage, company research, opportunity scouting, and outreach drafting.
 - Typed WorkItem context packs and readiness gates for research, opportunity,
   outreach, and Gmail paths, with timeline metadata for pack selection and gate
@@ -443,7 +459,8 @@ Not implemented:
 - Live email sending.
 - Autonomous approval.
 - Live production pipeline execution outside the narrow explicit integrations above.
-- Live Apify, Browserless, Airtable, Google Sheets, CRM, or Google Docs writes
-  as automatic production side effects. Chief of Staff exposes dry-run/internal
-  review publishing surfaces; live providers must be added as reviewed adapters.
+- Live Apify, Browserless, CRM, or unapproved Airtable/Google Workspace/Zotero
+  writes as automatic production side effects. Chief of Staff and context
+  agents expose dry-run/internal review surfaces; live provider writes must stay
+  behind reviewed adapters, live flags, and explicit approval references.
 - Server-backed storage.
