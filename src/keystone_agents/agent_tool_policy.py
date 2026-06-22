@@ -170,6 +170,8 @@ CORE_READ_TOOL_NAMES = frozenset(
         "list_pending_automation_approvals",
         "inspect_active_work_items",
         "read_linked_article",
+        "retrieve_rss_announcement_history",
+        "retrieve_preprint_announcement_history",
         "get_gmail_message",
         "file_search",
         *ZOTERO_READ_CONTEXT_TOOL_NAMES,
@@ -450,6 +452,22 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
             "The Zotero context agent reads local/API Zotero metadata and may perform "
             "direct approved Google Workspace artifact writes; Zotero library mutation "
             "is limited to the guarded backend importer, and nested Chief calls remain advisory."
+        ),
+    ),
+    "rss_context_agent": AgentToolPolicy(
+        agent_name="rss_context_agent",
+        allowed_tool_names=frozenset({"retrieve_rss_announcement_history"}),
+        rationale=(
+            "The RSS context agent reads canonical local RSS/#announcements history "
+            "and returns advisory Chief of Staff context without writes."
+        ),
+    ),
+    "preprints_context_agent": AgentToolPolicy(
+        agent_name="preprints_context_agent",
+        allowed_tool_names=frozenset({"retrieve_preprint_announcement_history"}),
+        rationale=(
+            "The preprints context agent reads canonical local preprint/#knowledge-hub "
+            "history and returns advisory Chief of Staff context without writes."
         ),
     ),
     "orchestrator": AgentToolPolicy(

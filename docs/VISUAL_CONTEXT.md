@@ -3,16 +3,32 @@
 This folder collects repo-local visuals that explain Keystone architecture for operators,
 reviewers, and future agent context packs.
 
-## Orchestrator-First Model Architecture
+## Current Agent Architecture
+
+![Keystone Business Agents current architecture](assets/kba-current-agent-architecture.svg)
+
+This generated diagram is the current architecture visual. Regenerate it after
+agent registry, workflow, trace, or eval structure changes:
+
+```bash
+.venv/bin/python scripts/render_agent_architecture_diagram.py
+```
+
+The visual keeps Orchestrator above the execution plane as the first request
+control plane and output review layer. Chief of Staff sits below it as the
+cross-functional operating synthesis layer: broad Slack, workflow, automation,
+and KNI context requests can route there, and Chief of Staff may call workflow
+and context specialists as advisory tools. The edge colors distinguish
+routing/handoffs, deterministic gate/state flows, agents-as-tools calls, and
+trace/log/eval linkages.
+
+## Legacy Orchestrator-First Model Architecture
 
 ![KNI Orchestrator-first model architecture](assets/kni-agent-routing-architecture-orchestrator-first-20260525-181618.svg)
 
-The current model path keeps the Orchestrator close to the raw request while
-preserving deterministic gates for safety and exactness. Slack, CLI, and
-scheduled automation inputs pass raw request/context into Orchestrator
-preflight; specialists then receive both the original request and compact
-planner context. Output review and real-time feedback close the loop before
-Slack, CLI, or artifact renderers present the result.
+This older visual remains useful for the narrower Orchestrator-first routing
+model, but the generated current diagram above includes Chief of Staff,
+read-only context agents, traces, logs, and evals.
 
 ## Web Search And Extraction
 

@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
+from keystone_agents.config import load_settings
+
 try:  # pragma: no cover - platform dependent.
     import resource
 except ImportError:  # pragma: no cover - Windows fallback for local tooling.
@@ -40,9 +42,15 @@ from promptfoo.eval_database import (
 )
 from promptfoo.eval_urls import eval_dashboard_case_url, eval_dashboard_url, eval_review_case_url
 from promptfoo.human_review import (
+    REVIEW_KIND_HUMAN,
     SCORE_DIMENSIONS,
     HumanEvalReview,
     save_human_review,
+)
+from promptfoo.orchestrator_judge import (
+    JUDGE_ENV_FLAG,
+    eval_llm_judge_enabled,
+    score_eval_run_with_orchestrator_judge,
 )
 
 NO_STORE_CACHE_CONTROL = "no-store, max-age=0"
@@ -161,6 +169,7 @@ def save_human_review_payload(
         run_id=str(payload.get("run_id") or "").strip(),
         agent=str(payload.get("agent") or "").strip(),
         reviewer=str(payload.get("reviewer") or "anup").strip() or "anup",
+        review_kind=REVIEW_KIND_HUMAN,
         scores=scores,
         safety=safety,
         notes=str(payload.get("notes") or "").strip(),
@@ -229,6 +238,43 @@ def save_human_review_payload(
     return result
 
 
+def save_orchestrator_judge_payload(
+    payload: dict[str, Any],
+    *,
+    database_path: str | Path = DEFAULT_EVAL_DB,
+    live: bool | None = None,
+) -> dict[str, Any]:
+    """Run the Orchestrator judge for one saved #evals Slack response."""
+
+    if not eval_llm_judge_enabled():
+        raise ValueError(f"{JUDGE_ENV_FLAG}=true is required for Orchestrator judge scoring")
+    case_id = str(payload.get("case_id") or "").strip()
+    if not case_id:
+        raise ValueError("case_id is required")
+    result = score_eval_run_with_orchestrator_judge(
+        case_id=case_id,
+        run_id=str(payload.get("run_id") or "").strip(),
+        slack_thread_ts=str(payload.get("slack_thread_ts") or "").strip(),
+        database_path=database_path,
+        live=eval_llm_judge_enabled() if live is None else bool(live),
+        model=str(payload.get("model") or "").strip() or None,
+    )
+    row_id = int(result.get("id") or 0)
+    result.update(
+        {
+            "database_path": str(database_path),
+            "post_save_state": _human_review_post_save_state(
+                case_id,
+                row_id=row_id,
+                database_path=database_path,
+            ),
+            "refresh_endpoints": _refresh_endpoints(case_id),
+            "database_tables": database_table_summaries(database_path),
+        }
+    )
+    return result
+
+
 def _human_review_post_save_state(
     case_id: str,
     *,
@@ -292,8 +338,13 @@ def _human_review_post_save_state(
         if row_id
         else {}
     )
-    review_visible = case.get("human_average") is not None or bool(
-        case.get("human_created_at")
+    review_visible = any(
+        (
+            case.get("human_average") is not None,
+            bool(case.get("human_created_at")),
+            case.get("orchestrator_judge_average") is not None,
+            bool(case.get("orchestrator_judge_created_at")),
+        )
     )
     analysis_human_review_visible = bool(human_case_trend)
     return {
@@ -302,6 +353,9 @@ def _human_review_post_save_state(
             "human_average": case.get("human_average"),
             "human_safety": case.get("human_safety") or "",
             "human_created_at": case.get("human_created_at") or "",
+            "orchestrator_judge_average": case.get("orchestrator_judge_average"),
+            "orchestrator_judge_safety": case.get("orchestrator_judge_safety") or "",
+            "orchestrator_judge_created_at": case.get("orchestrator_judge_created_at") or "",
             "review_target": case.get("review_target") or {},
             "next_follow_up": case.get("next_follow_up") or "",
             "check_statuses": checks,
@@ -309,6 +363,8 @@ def _human_review_post_save_state(
         "summary": {
             "human_reviewed": summary.get("human_reviewed", 0),
             "human_average": summary.get("human_average"),
+            "orchestrator_judge_reviewed": summary.get("orchestrator_judge_reviewed", 0),
+            "orchestrator_judge_average": summary.get("orchestrator_judge_average"),
         },
         "analysis": {
             "human_review_trend_days": len(analysis.get("human_review_trends") or []),
@@ -577,6 +633,7 @@ def trace_diagnostics_response(
             "diagnostic_category_trends": trace_summary.get("diagnostic_category_trends") or [],
             "diagnostic_case_rollups": trace_summary.get("diagnostic_case_rollups") or [],
             "diagnostic_followups": trace_summary.get("diagnostic_followups") or [],
+            "latest_run_trace": trace_summary.get("latest_run_trace") or {},
             "dropped_fields": trace_summary.get("dropped_fields") or [],
             "effective_sensitive_capture": bool(trace_summary.get("effective_sensitive_capture")),
         },
@@ -702,6 +759,9 @@ def build_handler(
             if path == "/api/human-review":
                 self._save_human_review()
                 return
+            if path == "/api/orchestrator-judge-score":
+                self._save_orchestrator_judge_score()
+                return
             if path == "/api/analysis-exclusion":
                 self._save_analysis_exclusion()
                 return
@@ -719,6 +779,29 @@ def build_handler(
                     self._refresh_dashboard_cache()
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 self._send_json({"status": "error", "error": str(exc)}, status=400)
+                return
+            self._send_json({"status": "saved", **result})
+
+        def _save_orchestrator_judge_score(self) -> None:
+            try:
+                payload = self._read_json_body()
+                result = save_orchestrator_judge_payload(
+                    payload,
+                    database_path=database_path,
+                )
+                with render_lock:
+                    self._refresh_dashboard_cache()
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                self._send_json({"status": "error", "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json(
+                    {
+                        "status": "error",
+                        "error": f"Orchestrator judge scoring failed: {type(exc).__name__}: {exc}",
+                    },
+                    status=500,
+                )
                 return
             self._send_json({"status": "saved", **result})
 
@@ -1100,6 +1183,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     global _NOFILE_LIMIT_STATUS
     args = build_parser().parse_args()
+    load_settings(force_dotenv=True)
     _NOFILE_LIMIT_STATUS = _raise_nofile_limit()
     database_path = Path(args.database_path).expanduser().resolve()
     dashboard_path = Path(args.dashboard_path).expanduser().resolve()

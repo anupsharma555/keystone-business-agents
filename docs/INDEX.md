@@ -8,11 +8,14 @@ Start here when changing or operating the repository.
 - `docs/RUNBOOK.md`: operator checklist for local and live-test workflows.
 - `docs/DEPLOYMENT.md`: live integration setup, rollback, cost controls, and operations.
 - `docs/OPENAI_AGENT_PLATFORM_SETUP.md`: OpenAI dashboard, tracing, and eval setup.
-- `docs/SLACK_BUSINESS_AGENT_MODE.md`: `@KNI` Slack bridge flags, scopes, and
-  approval boundaries.
+- `docs/SLACK_BUSINESS_AGENT_MODE.md`: `@KNI` Slack bridge flags, scopes,
+  result rendering, and approval boundaries.
+- `docs/AI_AGENTS_WORKFLOW_TEST_STATUS.md`: current `#ai-agents-workflow`
+  named-agent testing status, gaps, and next low-cost probe plan.
 - `docs/VISUAL_CONTEXT.md`: repo-local architecture visuals for operator and agent context.
-- `docs/assets/kni-agent-routing-architecture-orchestrator-first-20260525-181618.svg`:
-  current Orchestrator-first model architecture visual.
+- `docs/assets/kba-current-agent-architecture.svg`: generated current architecture visual.
+- `scripts/render_agent_architecture_diagram.py`: regenerate the current architecture visual from
+  the agent registry, workflow, trace, and eval structure.
 
 ## Natural-Language Workflows
 

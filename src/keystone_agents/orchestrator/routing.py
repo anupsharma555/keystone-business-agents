@@ -43,8 +43,10 @@ SEND_RE = re.compile(
     re.I,
 )
 NO_SEND_RE = re.compile(
-    r"\b(?:do\s+not|don't|dont|never|no)\s+(?:auto-?send|send|deliver)\b"
-    r"|\b(?:do\s+not|don't|dont|never)\b[\s\S]{0,160}\b(?:auto-?send|send|deliver)\b"
+    r"\b(?:do\s+not|don't|dont|never|no)\s+"
+    r"(?:auto-?send|send|deliver|post|publish|share|schedule)\b"
+    r"|\b(?:do\s+not|don't|dont|never)\b[\s\S]{0,160}"
+    r"\b(?:auto-?send|send|deliver|post|publish|share|schedule)\b"
     r"|\bdraft[- ]only\b"
     r"|\bwithout\s+sending\b",
     re.I,

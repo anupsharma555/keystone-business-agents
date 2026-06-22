@@ -60,6 +60,43 @@ def test_parse_kni_context_agent_aliases() -> None:
     assert zotero.input_text == "map collection criteria"
 
 
+def test_parse_bare_context_agent_aliases_when_enabled() -> None:
+    rss = parse_agent_mention(
+        "business agents rss context agent: read recent announcement history",
+        allow_bare_context_agents=True,
+    )
+    preprints = parse_agent_mention(
+        "business agents preprints context agent: summarize recent preprints",
+        allow_bare_context_agents=True,
+    )
+
+    assert rss.explicit is True
+    assert rss.route == "rss_context_agent"
+    assert rss.input_text == "read recent announcement history"
+    assert preprints.explicit is True
+    assert preprints.route == "preprints_context_agent"
+    assert preprints.input_text == "summarize recent preprints"
+
+
+def test_bare_context_agent_aliases_require_opt_in() -> None:
+    mention = parse_agent_mention("rss context agent: read recent announcement history")
+
+    assert mention.explicit is False
+    assert mention.route is None
+    assert mention.input_text == "rss context agent: read recent announcement history"
+
+
+def test_bare_context_agent_opt_in_does_not_capture_non_context_agents() -> None:
+    mention = parse_agent_mention(
+        "business agents business research analyst: research Acme",
+        allow_bare_context_agents=True,
+    )
+
+    assert mention.explicit is False
+    assert mention.route is None
+    assert mention.input_text == "business research analyst: research Acme"
+
+
 def test_parse_without_mention_defaults_to_orchestrator_context() -> None:
     mention = parse_agent_mention("research Curebase")
 

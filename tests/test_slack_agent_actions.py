@@ -32,6 +32,7 @@ from keystone_agents.slack_actions import (
     handle_run_agent_interaction,
     slack_message_action_manifest_patch,
 )
+from keystone_agents.slack_interactions import handle_slack_approval_interaction
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.structured_logging import structured_log_event
 
@@ -411,6 +412,10 @@ def test_slack_eval_message_action_records_run_and_reply_guidance(
     assert "/api/status?refresh=1" in eval_record["refresh_endpoints"]
     assert "/api/trace-diagnostics" in eval_record["refresh_endpoints"]
     assert result_payload["eval_record"] == eval_record
+    assert [action["label"] for action in result_payload["slack_actions"]] == [
+        "Submit Evaluation",
+        "Score with Orchestrator Judge",
+    ]
     assert result_payload["slack_actions"][0]["label"] == "Submit Evaluation"
     assert result_payload["slack_actions"][0]["action_id"] == "kba_eval_review"
     assert result_payload["slack_actions"][0]["intent"] == "eval_review"
@@ -423,9 +428,17 @@ def test_slack_eval_message_action_records_run_and_reply_guidance(
         result_payload["slack_actions"][0]["metadata"]["eval_record"]["run_id"]
         == run_result.work_item["id"]
     )
+    assert result_payload["slack_actions"][1]["action_id"] == "kba_eval_orchestrator_judge"
+    assert result_payload["slack_actions"][1]["intent"] == "eval_orchestrator_judge"
+    assert (
+        result_payload["slack_actions"][1]["metadata"]["eval_record"]["case_id"]
+        == "slack_bridge_hidden_eval_001"
+    )
+    assert "eval_orchestrator_judge" in result_payload["slack_actions"][1]["value"]
     assert result_payload["slack_overflow_actions"] == []
     assert eval_record["slack_actions"][0] == result_payload["slack_actions"][0]
-    assert eval_record["eval_thread_reply"]["slack_actions"][0] == result_payload["slack_actions"][0]
+    assert eval_record["slack_actions"][1] == result_payload["slack_actions"][1]
+    assert eval_record["eval_thread_reply"]["slack_actions"] == result_payload["slack_actions"]
     assert "Eval: case `slack_bridge_hidden_eval_001`" in result_payload["human_summary"]
     assert (
         "<http://127.0.0.1:8769/dashboard?case=slack_bridge_hidden_eval_001|case dashboard>"
@@ -446,6 +459,121 @@ def test_slack_eval_message_action_records_run_and_reply_guidance(
     assert status["slack_runs"][0]["response_hash"]
     assert status["slack_runs"][0]["evidence"]["schema"] == "keystone.slack.eval_evidence.v1"
     assert eval_record["evidence"]["work_item_id"] == run_result.work_item["id"]
+
+
+def test_slack_eval_message_action_uses_visible_eval_case_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from promptfoo.eval_database import eval_case_status
+
+    review_db = tmp_path / "human-reviews.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    payload = _message_action_payload()
+    payload["channel"] = {"id": "C0BA17Y9C01", "name": "evals"}
+
+    modal_result = handle_run_agent_interaction(
+        payload,
+        context_dir=tmp_path / "contexts",
+    )
+    task = (
+        "chief of staff: eval case slack_cos_decision_memo_quality_20260620_001 "
+        "Create a three-section decision memo."
+    )
+    run_result = handle_run_agent_interaction(
+        _modal_submission(modal_result.modal_view["private_metadata"], task=task),
+        database_url=_database_url(tmp_path),
+        context_dir=tmp_path / "contexts",
+    )
+
+    eval_record = run_result.eval_record or {}
+    result_payload = run_result.result or {}
+    assert eval_record["case_id"] == "slack_cos_decision_memo_quality_20260620_001"
+    assert "Eval: case `slack_cos_decision_memo_quality_20260620_001`" in result_payload["human_summary"]
+    assert (
+        result_payload["slack_actions"][0]["metadata"]["eval_record"]["case_id"]
+        == "slack_cos_decision_memo_quality_20260620_001"
+    )
+
+    status = eval_case_status(
+        "slack_cos_decision_memo_quality_20260620_001",
+        database_path=review_db,
+    )
+    assert status["slack_run_count"] == 1
+    assert status["slack_runs"][0]["request_text"] == task
+
+
+def test_slack_eval_orchestrator_judge_action_scores_saved_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_db = tmp_path / "human-reviews.sqlite"
+    monkeypatch.setenv("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB", str(review_db))
+    monkeypatch.setenv("KEYSTONE_EVAL_LLM_JUDGE", "true")
+
+    captured: dict[str, object] = {}
+
+    def fake_score_eval_run_with_orchestrator_judge(**kwargs):
+        captured.update(kwargs)
+        return {
+            "case_id": kwargs["case_id"],
+            "run_id": kwargs["run_id"],
+            "slack_thread_ts": kwargs["slack_thread_ts"],
+            "review_kind": "orchestrator_judge",
+            "reviewer": "orchestrator_judge",
+            "average_score": 4.2,
+            "safety": "pass",
+            "id": 42,
+        }
+
+    monkeypatch.setattr(
+        "promptfoo.orchestrator_judge.score_eval_run_with_orchestrator_judge",
+        fake_score_eval_run_with_orchestrator_judge,
+    )
+    action = {
+        "action_id": "kba_eval_orchestrator_judge",
+        "value": json.dumps(
+            {
+                "schema": "keystone.business_agent_action.v1",
+                "intent": "eval_orchestrator_judge",
+                "metadata": {
+                    "eval_record": {
+                        "case_id": "slack_bridge_hidden_eval_001",
+                        "run_id": "wi_eval_123",
+                        "agent": "business_research_analyst",
+                        "slack_thread_ts": "1715366400.000100",
+                        "dashboard_case_url": "http://127.0.0.1:8769/dashboard?case=slack_bridge_hidden_eval_001",
+                        "review_case_url": "http://127.0.0.1:8769/review?case=slack_bridge_hidden_eval_001",
+                    }
+                },
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+    }
+    payload = {
+        "type": "block_actions",
+        "user": {"id": "U123", "username": "anup"},
+        "channel": {"id": "C0BA17Y9C01", "name": "evals"},
+        "message": {"ts": "1715366400.000100", "thread_ts": "1715366400.000100"},
+        "actions": [action],
+    }
+
+    result = handle_slack_approval_interaction(payload, database_url=_database_url(tmp_path))
+
+    assert captured == {
+        "case_id": "slack_bridge_hidden_eval_001",
+        "run_id": "wi_eval_123",
+        "slack_thread_ts": "1715366400.000100",
+        "database_path": str(review_db),
+    }
+    assert result.stage == "eval_orchestrator_judge"
+    assert result.action_id == "kba_eval_orchestrator_judge"
+    assert result.outcome == "orchestrator_judge_score_saved"
+    assert result.object_id == "slack_bridge_hidden_eval_001"
+    assert "4.2/5" in result.followup_text
+    assert "case dashboard" in result.followup_text
+    assert result.read_only_payload["orchestrator_judge"]["review_kind"] == "orchestrator_judge"
 
 
 def test_modal_submission_selects_reusable_prompt_for_multi_target_source_read(

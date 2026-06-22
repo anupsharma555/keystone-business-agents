@@ -7,14 +7,31 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
-from keystone_agents.structured_logging import structured_log_event
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+try:
+    from keystone_agents.structured_logging import structured_log_event
+except ImportError:
+
+    def structured_log_event(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "component": kwargs.get("component", "promptfoo_provider"),
+            "event": kwargs.get("event", "provider_error"),
+            "level": kwargs.get("level", "error"),
+            "status": kwargs.get("status", "error"),
+            "failure_kind": kwargs.get("failure_kind", ""),
+            "payload": kwargs.get("payload") or {},
+        }
+
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{12,}\b"),
@@ -141,8 +158,26 @@ def call_api(prompt: str, options: dict[str, Any], context: dict[str, Any]) -> d
         live_sdk=live_sdk,
         live_search=live_search,
     )
-    if context_file and not compact.get("slack_context_attached"):
-        compact["slack_context_attached"] = True
+    if context_file:
+        slack_context = (
+            vars_.get("slack_context") if isinstance(vars_.get("slack_context"), dict) else {}
+        )
+        if not compact.get("slack_context_attached"):
+            compact["slack_context_attached"] = True
+        compact["slack_channel_id"] = str(
+            compact.get("slack_channel_id") or slack_context.get("channel_id") or ""
+        )
+        compact["slack_channel_name"] = str(
+            compact.get("slack_channel_name") or slack_context.get("channel_name") or ""
+        )
+        compact["slack_thread_ts"] = str(
+            compact.get("slack_thread_ts") or slack_context.get("thread_ts") or ""
+        )
+        compact["slack_selected_message_ts"] = str(
+            compact.get("slack_selected_message_ts")
+            or slack_context.get("selected_message_ts")
+            or ""
+        )
     compact.update(
         {
             "provider_status": "ok",
@@ -262,8 +297,16 @@ def _compact_run_payload(payload: dict[str, Any]) -> dict[str, Any]:
         + _as_strings(route_result.get("audit_notes"))
         + _as_strings(work_item.get("audit_notes"))
     )
-    context_sources = _extract_context_sources(audit_notes)
-    nested_specialist_routes = _collect_nested_specialist_routes(payload)
+    human_summary = _human_summary(payload)
+    human_summary = _normalize_slack_display_summary(
+        human_summary,
+        source_urls=[source.get("url") for source in sources if source.get("url")],
+    )
+    context_sources = _extract_context_sources(audit_notes, human_summary=human_summary)
+    nested_specialist_routes = _collect_nested_specialist_routes(
+        payload,
+        human_summary=human_summary,
+    )
     manager_efficiency = _nested(work_item, "target", "metadata", "manager_loop_efficiency")
     next_action = payload.get("next_action") or work_item.get("next_action") or {}
     selected_agent = payload.get("selected_agent")
@@ -304,11 +347,14 @@ def _compact_run_payload(payload: dict[str, Any]) -> dict[str, Any]:
         audit_notes.append("Promptfoo dry-run provider used no live APIs.")
     side_effects = _side_effect_evidence(payload, route_result)
 
+    slack_context = _extract_slack_context(payload, work_item)
+
     return {
         "status": payload.get("status") or work_item.get("status") or "",
         "route": route,
+        "output_type": str(payload.get("output_type") or ""),
         "target_agent": route_result.get("target_agent") or "",
-        "human_summary": _human_summary(payload),
+        "human_summary": human_summary,
         "source_count": len(sources),
         "source_urls": [source.get("url") for source in sources if source.get("url")],
         "source_titles": [source.get("title") for source in sources if source.get("title")],
@@ -350,11 +396,27 @@ def _compact_run_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "external_write_performed": bool(side_effects.get("external_write_performed")),
         "side_effect_evidence_complete": bool(side_effects.get("evidence_complete")),
         "context_pack_type": context_pack_type,
-        "slack_context_attached": bool(
-            _nested(work_item, "target", "metadata", "slack_context")
-            or _nested(payload, "context_pack", "target", "metadata", "slack_context")
+        "slack_context_attached": bool(slack_context),
+        "slack_channel_id": str(slack_context.get("channel_id") or ""),
+        "slack_channel_name": str(slack_context.get("channel_name") or ""),
+        "slack_thread_ts": str(slack_context.get("thread_ts") or ""),
+        "slack_selected_message_ts": str(
+            slack_context.get("selected_message_ts")
+            or _nested(slack_context, "selected_message", "ts")
+            or ""
         ),
     }
+
+
+def _extract_slack_context(payload: dict[str, Any], work_item: dict[str, Any]) -> dict[str, Any]:
+    for candidate in (
+        _nested(work_item, "target", "metadata", "slack_context"),
+        _nested(payload, "context_pack", "target", "metadata", "slack_context"),
+        _nested(payload, "target", "metadata", "slack_context"),
+    ):
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    return {}
 
 
 def _attach_provider_invocation_mode(
@@ -664,8 +726,30 @@ def _eval_provenance(
 
 def _side_effect_evidence(payload: dict[str, Any], route_result: dict[str, Any]) -> dict[str, Any]:
     raw_present = isinstance(payload.get("side_effects"), dict)
+    route_side_effects_present = isinstance(route_result.get("side_effects"), dict)
     raw = payload.get("side_effects") if raw_present else {}
+    if not raw_present and route_side_effects_present:
+        raw = route_result.get("side_effects") or {}
+        raw_present = True
     approval_ref = str(raw.get("approval_ref") or route_result.get("approval_ref") or "").strip()
+    safe_route_evidence = (
+        not _truthy(route_result.get("can_send_email"))
+        and not _truthy(route_result.get("send_enabled"))
+        and "send_email" in {str(item) for item in route_result.get("forbidden_actions") or []}
+    )
+    if not raw_present and safe_route_evidence:
+        raw = {
+            "email_sent": False,
+            "gmail_draft_created": False,
+            "gmail_label_changed": False,
+            "slack_message_posted": False,
+            "crm_write_performed": False,
+            "calendar_write_performed": False,
+            "external_file_write_performed": False,
+            "blocked_write_attempts": [],
+            "evidence_complete": True,
+        }
+        raw_present = True
     flags = {
         "email_sent": _truthy(raw.get("email_sent")),
         "gmail_draft_created": _truthy(raw.get("gmail_draft_created")),
@@ -695,7 +779,29 @@ def _side_effect_evidence(payload: dict[str, Any], route_result: dict[str, Any])
     }
 
 
-def _extract_context_sources(audit_notes: list[str]) -> list[str]:
+_ADVISORY_SPECIALIST_ROUTE_MAP = {
+    "business research analyst": "business_research_analyst",
+    "opportunity scout": "opportunity_scout",
+    "airtable context agent": "airtable_context_agent",
+    "google workspace context agent": "google_workspace_context_agent",
+    "gmail triage": "gmail_triage",
+    "outreach composer": "outreach_composer",
+    "zotero context agent": "zotero_context_agent",
+}
+
+_ADVISORY_ROUTE_CONTEXT_SOURCES = {
+    "airtable_context_agent": ["airtable"],
+    "google_workspace_context_agent": ["google_docs", "google_drive", "google_sheets"],
+    "gmail_triage": ["gmail"],
+    "zotero_context_agent": ["zotero"],
+}
+
+
+def _extract_context_sources(
+    audit_notes: list[str],
+    *,
+    human_summary: str = "",
+) -> list[str]:
     seen: set[str] = set()
     sources: list[str] = []
     prefix = "Requested context sources tracked for specialist run:"
@@ -708,10 +814,19 @@ def _extract_context_sources(audit_notes: list[str]) -> list[str]:
             if source and source not in seen:
                 seen.add(source)
                 sources.append(source)
+    for route in _advisory_specialist_routes_from_text(human_summary):
+        for source in _ADVISORY_ROUTE_CONTEXT_SOURCES.get(route, []):
+            if source and source not in seen:
+                seen.add(source)
+                sources.append(source)
     return sources
 
 
-def _collect_nested_specialist_routes(payload: dict[str, Any]) -> list[str]:
+def _collect_nested_specialist_routes(
+    payload: dict[str, Any],
+    *,
+    human_summary: str = "",
+) -> list[str]:
     seen: set[str] = set()
     routes: list[str] = []
     candidates = []
@@ -734,7 +849,22 @@ def _collect_nested_specialist_routes(payload: dict[str, Any]) -> list[str]:
         if route and route not in seen:
             seen.add(route)
             routes.append(route)
+    for route in _advisory_specialist_routes_from_text(human_summary):
+        if route not in seen:
+            seen.add(route)
+            routes.append(route)
     return routes
+
+
+def _advisory_specialist_routes_from_text(text: str) -> list[str]:
+    lower = str(text or "").lower()
+    if "advisory specialists requested" not in lower:
+        return []
+    return [
+        route
+        for label, route in _ADVISORY_SPECIALIST_ROUTE_MAP.items()
+        if label in lower
+    ]
 
 
 def _cleanup_promptfoo_context_file(context_file: Path | None, *, keep: bool = False) -> None:
@@ -878,6 +1008,7 @@ def _human_summary(payload: dict[str, Any]) -> str:
     if (
         payload.get("mode") == "blocked"
         and str(payload.get("selected_agent") or "") == "outreach_composer"
+        and "*Answer:*" not in summary
     ):
         details = [
             "Approval is required before outreach drafting or external use."
@@ -889,7 +1020,11 @@ def _human_summary(payload: dict[str, Any]) -> str:
         for detail in details:
             if detail and detail not in summary:
                 summary = " ".join(part for part in (summary, detail) if part)
-    elif route_result.get("approval_required") and "approval" not in summary.lower():
+    elif (
+        route_result.get("approval_required")
+        and "approval" not in summary.lower()
+        and "*Answer:*" not in summary
+    ):
         summary = " ".join(
             part
             for part in (
@@ -899,6 +1034,41 @@ def _human_summary(payload: dict[str, Any]) -> str:
             if part
         )
     return summary
+
+
+def _normalize_slack_display_summary(
+    summary: str,
+    *,
+    source_urls: list[Any],
+) -> str:
+    text = str(summary or "").strip()
+    if not text:
+        text = "No user-facing summary was returned."
+    answer_match = re.search(r"(?im)^\s*\*{0,2}Answer\s*:\*{0,2}", text)
+    if answer_match:
+        text = text[answer_match.start() :].lstrip()
+    else:
+        parts = re.split(r"\n\s*\n", text, maxsplit=1)
+        answer = parts[0].strip()
+        details = parts[1].strip() if len(parts) > 1 else ""
+        if details:
+            text = f"*Answer:*\n{answer}\n\n*Detailed Summary:*\n{details}"
+        else:
+            text = f"*Answer:*\n{answer}"
+    if source_urls and not re.search(r"\b(?:https?://|fixture://)[^\s)>\]]+", text, re.I):
+        refs = []
+        seen: set[str] = set()
+        for raw_url in source_urls:
+            url = str(raw_url or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            refs.append(f"* {url}")
+            if len(refs) >= 4:
+                break
+        if refs:
+            text = text.rstrip() + "\n\n*Useful references:*\n" + "\n".join(refs)
+    return text
 
 
 def _nested(payload: dict[str, Any], *keys: str) -> Any:

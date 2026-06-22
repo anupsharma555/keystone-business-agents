@@ -17,19 +17,23 @@ from pydantic import BaseModel, ConfigDict, Field
 from keystone_agents.agents.orchestrator import run_orchestrator_preflight
 from keystone_agents.automation_inventory import build_automation_inventory_report
 from keystone_agents.eval_runtime_diagnostics import slack_eval_blocker_diagnostics
+from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
 )
 from keystone_agents.schemas.work_item import WorkflowRunRequest
 from keystone_agents.sdk_sessions import build_sdk_session, resolve_sdk_session_spec
 from keystone_agents.slack_action_contract import (
+    KBA_EVAL_ORCHESTRATOR_JUDGE,
     KBA_EVAL_REVIEW,
+    KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE,
     KBA_INTENT_EVAL_REVIEW,
     RUN_AGENT_MESSAGE_CALLBACK_ID,
     RUN_AGENT_TASK_ACTION_ID,
     RUN_AGENT_TASK_BLOCK_ID,
     RUN_AGENT_VIEW_CALLBACK_ID,
     SLACK_SELECTED_CONTEXT_SCHEMA,
+    business_agent_action_value,
     slack_agent_feedback_event,
 )
 from keystone_agents.slack_interactions import parse_slack_interaction_payload
@@ -48,6 +52,10 @@ _MAX_SLACK_CONTEXT_WINDOW_DAYS = 7
 _MAX_SLACK_CONTEXT_WINDOW_SECONDS = _MAX_SLACK_CONTEXT_WINDOW_DAYS * 24 * 60 * 60
 _MAX_PRIVATE_METADATA_CHARS = 2800
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_EVAL_CASE_ID_RE = re.compile(
+    r"\b(?:eval\s+case|case(?:_id)?)\s*(?:[:=]\s*|\s+)([A-Za-z0-9_.:-]+)",
+    re.IGNORECASE,
+)
 
 
 class SlackContextMessage(BaseModel):
@@ -534,8 +542,13 @@ def handle_run_agent_interaction(
             upstream_callback=feedback_callback,
         )
         preflight_session = _slack_context_sdk_session(selected_context, enabled=live_sdk)
+        deterministic_plan = infer_manual_request_plan(
+            submission.requested_task,
+            source="slack_modal_preflight_hint",
+        )
         orchestrator_preflight = run_orchestrator_preflight(
             submission.requested_task,
+            requested_agent=deterministic_plan.requested_agent,
             live_manual_plan=live_sdk,
             session=preflight_session,
             database_url=database_url,
@@ -630,9 +643,9 @@ def handle_run_agent_interaction(
             run_provenance=run_provenance,
         )
         if eval_record is not None:
-            eval_review_action = _eval_review_slack_action(eval_record)
+            eval_actions = _eval_slack_actions(eval_record)
             result_payload["eval_record"] = eval_record
-            result_payload["slack_actions"] = [eval_review_action]
+            result_payload["slack_actions"] = eval_actions
             result_payload["slack_overflow_actions"] = []
             result_payload["human_summary"] = _append_eval_thread_guidance(
                 str(result_payload.get("human_summary") or ""),
@@ -682,6 +695,8 @@ def _record_eval_run_for_slack_bridge(
     agent = str(getattr(getattr(result, "route", ""), "value", getattr(result, "route", "")))
     case_id = _clean_scalar(context.eval_metadata.get("case_id"))
     if not case_id:
+        case_id = _extract_eval_case_id_from_request(request_text)
+    if not case_id:
         try:
             case_id = resolve_slack_eval_case_id(
                 request_text=request_text,
@@ -725,8 +740,17 @@ def _record_eval_run_for_slack_bridge(
             visible_source_count=int(evidence.get("visible_source_count") or 0),
             sdk_estimated_cost_usd=evidence.get("sdk_estimated_cost_usd"),
             sdk_cache_hit_rate=evidence.get("sdk_cache_hit_rate"),
+            duration_ms=evidence.get("duration_ms"),
             response_hash=str(evidence.get("response_hash") or ""),
             evidence=evidence,
+            prompt_versions=[
+                item for item in evidence.get("prompt_versions") or [] if isinstance(item, dict)
+            ],
+            prompt_metadata=(
+                evidence.get("prompt_metadata")
+                if isinstance(evidence.get("prompt_metadata"), dict)
+                else {}
+            ),
             model_provider=str(evidence.get("model_provider") or ""),
             model_name=str(evidence.get("model_name") or ""),
             run_mode=str(evidence.get("run_mode") or ""),
@@ -752,7 +776,7 @@ def _record_eval_run_for_slack_bridge(
     dashboard = _render_eval_dashboard(database_path)
     dashboard_case_url = _eval_dashboard_case_url(case_id)
     review_case_url = _eval_review_case_url(case_id)
-    eval_review_action = _eval_review_slack_action(
+    eval_actions = _eval_slack_actions(
         {
             "case_id": case_id,
             "run_id": run_id,
@@ -779,19 +803,34 @@ def _record_eval_run_for_slack_bridge(
         "dashboard_visibility": post_save_state.get("dashboard_visibility", {}),
         "refresh_endpoints": post_save_state.get("refresh_endpoints", []),
         "scorecard_request": "@KNI can you give me a scorecard for this eval?",
+        "orchestrator_judge_action": "Score with Orchestrator Judge",
+        "orchestrator_judge_effect": (
+            "When enabled, fills the same backend review form for the saved #evals Slack output "
+            "and refreshes dashboard scoring/database/analysis."
+        ),
         "submit_evaluation_action": "Submit Evaluation",
-        "slack_actions": [eval_review_action],
+        "slack_actions": eval_actions,
         "eval_thread_reply": {
             "case_id": case_id,
             "run_id": run_id,
             "dashboard_case_url": dashboard_case_url,
             "review_case_url": review_case_url,
             "scorecard_request": "@KNI can you give me a scorecard for this eval?",
+            "orchestrator_judge_action": "Score with Orchestrator Judge",
             "submit_evaluation_action": "Submit Evaluation",
             "submit_evaluation_effect": "Writes scores and human notes to the local eval database, then refreshes dashboard views.",
-            "slack_actions": [eval_review_action],
+            "slack_actions": eval_actions,
         },
     }
+
+
+def _extract_eval_case_id_from_request(request_text: str) -> str:
+    compact = " ".join(str(request_text or "").split())
+    lowered = compact.lower()
+    if "eval" not in lowered and "case" not in lowered:
+        return ""
+    match = _EVAL_CASE_ID_RE.search(compact)
+    return _clean_scalar(match.group(1)) if match else ""
 
 
 def _slack_eval_evidence(
@@ -826,15 +865,36 @@ def _slack_eval_evidence(
         if isinstance(result_payload.get("retrieval"), dict)
         else {}
     )
+    duration_ms = _number_or_none(
+        result_payload.get("duration_ms")
+        or result_payload.get("elapsed_ms")
+        or result_payload.get("runtime_ms")
+    )
     thread_messages = slack_context.get("thread_messages") or context.thread_messages or []
     selected_message_count = 1 if (context.selected_message.ts or context.selected_message.text) else 0
     thread_message_count = len(thread_messages) if thread_messages else selected_message_count
+    source_channel_id = context.channel_id or str(run_provenance.get("source_channel_id") or "")
+    source_channel_name = context.channel_name or ""
+    source_thread_ts = (
+        context.thread_ts
+        or context.selected_message_ts
+        or str(run_provenance.get("source_thread_ts") or "")
+    )
     evidence = {
         "schema": "keystone.slack.eval_evidence.v1",
         "work_item_id": str(run_provenance.get("work_item_id") or work_item_payload.get("id") or ""),
         "route": str(run_provenance.get("route") or getattr(getattr(result, "route", ""), "value", "") or ""),
         "status": str(run_provenance.get("status") or getattr(getattr(result, "status", ""), "value", "") or ""),
         "permalink": context.permalink,
+        "slack_channel_id": source_channel_id,
+        "slack_channel_name": source_channel_name,
+        "slack_thread_ts": source_thread_ts,
+        "slack_context": {
+            "channel_id": source_channel_id,
+            "channel_name": source_channel_name,
+            "thread_ts": source_thread_ts,
+            "permalink_present": bool(context.permalink),
+        },
         "context_policy": str(
             slack_context.get("prompt_context_layout")
             or slack_context.get("channel_history_policy")
@@ -850,6 +910,12 @@ def _slack_eval_evidence(
         "visible_source_count": sum(1 for item in sources if isinstance(item, dict) and item.get("url")),
         "sdk_estimated_cost_usd": _number_or_none(sdk_cost.get("estimated_usd") or sdk_cost.get("amount_usd")),
         "sdk_cache_hit_rate": _number_or_none(sdk_usage.get("cache_hit_rate")),
+        "duration_ms": duration_ms,
+        "time_to_response_ms": duration_ms,
+        "execution": {
+            "duration_ms": duration_ms,
+            "time_to_response_ms": duration_ms,
+        },
         "response_hash": _hash_text(human_summary) if human_summary else "",
         "response_summary_chars": len(human_summary),
         "model_provider": str(model.get("provider") or ""),
@@ -859,7 +925,26 @@ def _slack_eval_evidence(
         "search_provider_sequence": [
             str(item) for item in retrieval.get("search_provider_sequence") or []
         ],
+        "prompt_versions": _trace_prompt_versions(result_payload),
+        "prompt_metadata": {
+            "source": "slack_action_eval_save",
+            "route": str(run_provenance.get("route") or ""),
+            "status": str(run_provenance.get("status") or ""),
+            "context_fingerprint": str(run_provenance.get("context_fingerprint") or ""),
+            "requested_task_hash": str(run_provenance.get("requested_task_hash") or ""),
+            "work_item_id": str(run_provenance.get("work_item_id") or work_item_payload.get("id") or ""),
+        },
     }
+    tool_summary = _trace_tool_summary_from_payload(result_payload)
+    if tool_summary:
+        evidence["tool_summary"] = tool_summary
+    orchestrator_summary = _trace_orchestrator_summary_from_payload(result_payload)
+    if orchestrator_summary.get("orchestrator"):
+        evidence["orchestrator"] = orchestrator_summary["orchestrator"]
+    if orchestrator_summary.get("orchestrator_preflight"):
+        evidence["orchestrator_preflight"] = orchestrator_summary["orchestrator_preflight"]
+    if orchestrator_summary.get("orchestrator_review"):
+        evidence["orchestrator_review"] = orchestrator_summary["orchestrator_review"]
     blocker_diagnostics = slack_eval_blocker_diagnostics(result_payload)
     if blocker_diagnostics:
         evidence["blocker_diagnostics"] = blocker_diagnostics
@@ -890,6 +975,129 @@ def _latest_sdk_cost_from_result(result: Any) -> dict[str, Any]:
         if cost:
             candidates.append(cost)
     return candidates[-1] if candidates else {}
+
+
+def _trace_prompt_versions(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("prompt_versions", "prompt_config_versions"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value[:20] if isinstance(item, dict)]
+    return []
+
+
+def _trace_tool_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    existing = payload.get("tool_summary") if isinstance(payload.get("tool_summary"), dict) else {}
+    if existing:
+        return existing
+    tooling = payload.get("tooling") if isinstance(payload.get("tooling"), dict) else {}
+    if tooling:
+        return tooling
+    counts: dict[str, int] = {}
+    failures: dict[str, int] = {}
+    statuses: dict[str, set[str]] = {}
+    for event in payload.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        event_type = str(event.get("event_type") or event.get("type") or "").lower()
+        name = _metadata_scalar(
+            metadata.get("tool_name")
+            or metadata.get("tool")
+            or metadata.get("function_name")
+            or event.get("tool_name")
+            or event.get("name")
+            or ("unknown_tool" if "tool" in event_type or "function" in event_type else "")
+        )
+        if not name:
+            continue
+        status = _metadata_scalar(metadata.get("status") or event.get("status") or "")
+        failed = bool(
+            metadata.get("error")
+            or metadata.get("error_type")
+            or status.lower() in {"error", "failed", "failure", "timeout"}
+        )
+        counts[name] = counts.get(name, 0) + 1
+        if status:
+            statuses.setdefault(name, set()).add(status.lower())
+        if failed:
+            failures[name] = failures.get(name, 0) + 1
+    if not counts:
+        return {}
+    return {
+        "tool_call_count": sum(counts.values()),
+        "failed_tool_call_count": sum(failures.values()),
+        "tool_names": sorted(counts)[:20],
+        "tool_call_summary": [
+            {
+                "name": name,
+                "count": counts[name],
+                "failed_count": failures.get(name, 0),
+                "status": "failed"
+                if failures.get(name, 0)
+                else (sorted(statuses.get(name, set()))[-1] if statuses.get(name) else "observed"),
+            }
+            for name in sorted(counts)[:20]
+        ],
+    }
+
+
+def _trace_orchestrator_summary_from_payload(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    preflight = (
+        payload.get("orchestrator_preflight")
+        if isinstance(payload.get("orchestrator_preflight"), dict)
+        else {}
+    )
+    review = (
+        payload.get("orchestrator_review")
+        if isinstance(payload.get("orchestrator_review"), dict)
+        else {}
+    )
+    blockers = payload.get("blockers") if isinstance(payload.get("blockers"), list) else []
+    feedback = payload.get("operator_feedback_requests")
+    if not isinstance(feedback, list):
+        feedback = []
+    preflight_blocker_count = _safe_count(
+        preflight.get("blocker_count") or preflight.get("preflight_blocker_count")
+    )
+    review_feedback_count = _safe_count(
+        review.get("feedback_count") or review.get("review_feedback_count")
+    )
+    result: dict[str, dict[str, Any]] = {}
+    orchestrator = {
+        "preflight": bool(preflight),
+        "review": bool(review),
+        "blocker_count": preflight_blocker_count or len(blockers),
+        "feedback_count": review_feedback_count or len(feedback),
+        "selected_route": _metadata_scalar(
+            preflight.get("selected_route")
+            or preflight.get("route")
+            or payload.get("route")
+            or ""
+        ),
+        "review_status": _metadata_scalar(review.get("status") or review.get("review_status") or ""),
+    }
+    if any(orchestrator.values()):
+        result["orchestrator"] = orchestrator
+    if preflight:
+        result["orchestrator_preflight"] = {
+            "blocker_count": orchestrator["blocker_count"],
+            "selected_route": orchestrator["selected_route"],
+            "has_preflight": True,
+        }
+    if review:
+        result["orchestrator_review"] = {
+            "feedback_count": orchestrator["feedback_count"],
+            "review_status": orchestrator["review_status"],
+            "has_review": True,
+        }
+    return result
+
+
+def _safe_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _number_or_none(value: Any) -> float | None:
@@ -965,9 +1173,18 @@ def _append_eval_thread_guidance(summary: str, *, eval_record: dict[str, Any]) -
         detail += f" Dashboard: <{dashboard_case_url}|case dashboard>."
     if review_case_url:
         detail += f" Review form: <{review_case_url}|score this case>."
-    detail += " Score from the linked form, then press `Submit Evaluation` in Slack to save scores and refresh the dashboard."
+    detail += " Score from the linked form, or use `Score with Orchestrator Judge` when enabled, then press `Submit Evaluation` in Slack to save scores and refresh the dashboard."
     parts.append(detail)
     return "\n\n".join(parts).strip()
+
+
+def _eval_slack_actions(eval_record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return renderer-ready Slack actions for one saved eval run."""
+
+    return [
+        _eval_review_slack_action(eval_record),
+        _eval_orchestrator_judge_slack_action(eval_record),
+    ]
 
 
 def _eval_review_slack_action(eval_record: dict[str, Any]) -> dict[str, Any]:
@@ -984,6 +1201,19 @@ def _eval_review_slack_action(eval_record: dict[str, Any]) -> dict[str, Any]:
         "action_id": KBA_EVAL_REVIEW,
         "intent": KBA_INTENT_EVAL_REVIEW,
         "style": "primary",
+        "value": business_agent_action_value(
+            intent=KBA_INTENT_EVAL_REVIEW,
+            metadata={
+                "eval_record": {
+                    "case_id": case_id,
+                    "run_id": run_id,
+                    "agent": agent,
+                    "slack_thread_ts": slack_thread_ts,
+                    "dashboard_case_url": dashboard_case_url,
+                    "review_case_url": review_case_url,
+                }
+            },
+        ),
         "metadata": {
             "eval_record": {
                 "case_id": case_id,
@@ -994,6 +1224,37 @@ def _eval_review_slack_action(eval_record: dict[str, Any]) -> dict[str, Any]:
                 "review_case_url": review_case_url,
             }
         },
+    }
+
+
+def _eval_orchestrator_judge_slack_action(eval_record: dict[str, Any]) -> dict[str, Any]:
+    """Return the Slack button descriptor that triggers Orchestrator judge scoring."""
+
+    case_id = _clean_scalar(eval_record.get("case_id"))
+    run_id = _clean_scalar(eval_record.get("run_id"))
+    agent = _clean_scalar(eval_record.get("agent"))
+    slack_thread_ts = _clean_scalar(eval_record.get("slack_thread_ts"))
+    dashboard_case_url = _clean_scalar(eval_record.get("dashboard_case_url"))
+    review_case_url = _clean_scalar(eval_record.get("review_case_url"))
+    eval_metadata = {
+        "eval_record": {
+            "case_id": case_id,
+            "run_id": run_id,
+            "agent": agent,
+            "slack_thread_ts": slack_thread_ts,
+            "dashboard_case_url": dashboard_case_url,
+            "review_case_url": review_case_url,
+        }
+    }
+    return {
+        "label": "Score with Orchestrator Judge",
+        "action_id": KBA_EVAL_ORCHESTRATOR_JUDGE,
+        "intent": KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE,
+        "value": business_agent_action_value(
+            intent=KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE,
+            metadata=eval_metadata,
+        ),
+        "metadata": eval_metadata,
     }
 
 

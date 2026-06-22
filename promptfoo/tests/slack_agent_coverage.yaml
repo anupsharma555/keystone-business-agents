@@ -179,7 +179,7 @@
     required_payload_terms: Requested context sources tracked for specialist run
     required_specialist_routes: business_research_analyst, opportunity_scout, gmail_triage, airtable_context_agent, google_workspace_context_agent, zotero_context_agent
     require_specialist_routes_strict: true
-    required_terms: next action, Source evidence
+    required_terms: next action, Useful references
     forbidden_terms: posted to Slack, sent email
     max_elapsed_seconds: 15
     slack_context:
@@ -211,7 +211,7 @@
     required_payload_terms: Requested context sources tracked for specialist run
     required_specialist_routes: airtable_context_agent, google_workspace_context_agent, gmail_triage
     require_specialist_routes_strict: true
-    required_terms: unresolved, Source evidence
+    required_terms: unresolved, Useful references
     forbidden_terms: posted to Slack, sent email
     max_elapsed_seconds: 15
     slack_context:
@@ -295,7 +295,7 @@
     required_payload_terms: Requested context sources tracked for specialist run
     required_specialist_routes: gmail_triage, google_workspace_context_agent, airtable_context_agent
     require_specialist_routes_strict: true
-    required_terms: No draft, Source evidence
+    required_terms: No draft, Useful references
     forbidden_terms: calendar event created, posted to Slack, sent email
     max_elapsed_seconds: 15
     slack_context:
@@ -759,7 +759,7 @@
     expected_pack_type: research
     min_source_count: 1
     required_source_types: slack_message
-    required_terms: Source evidence
+    required_terms: Useful references
     forbidden_terms: sent email, posted to Slack
     max_elapsed_seconds: 15
     slack_context:
@@ -854,7 +854,7 @@
     expected_pack_type: research
     min_source_count: 2
     min_artifact_count: 1
-    required_terms: Source evidence
+    required_terms: Useful references
     forbidden_terms: posted to Slack, sent email
     max_elapsed_seconds: 15
     slack_context:

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from keystone_agents.agents.chief_of_staff import (
 )
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
 from keystone_agents.agents.orchestrator import review_specialist_output, run_orchestrator_preflight
+from keystone_agents.agents.web_query_planner import resolve_web_query_plan
 from keystone_agents.cli_sdk import add_sdk_session_arguments, sdk_session_from_args
 from keystone_agents.config import load_settings
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
@@ -36,7 +38,11 @@ from keystone_agents.orchestrator.preflight_context import (
     load_orchestrator_preflight_from_env,
 )
 from keystone_agents.quality_budget import AgentQualityBudget, chief_of_staff_quality_budget
-from keystone_agents.schemas.chief_of_staff import ChiefOfStaffSourceRef
+from keystone_agents.schemas.chief_of_staff import (
+    ChiefOfStaffResult,
+    ChiefOfStaffRouteRecommendation,
+    ChiefOfStaffSourceRef,
+)
 from keystone_agents.source_layer_context import runtime_source_layer_policy_context
 from keystone_agents.visible_sources import append_visible_source_urls_to_output
 
@@ -102,6 +108,59 @@ def _live_side_effect_policy(input_text: str) -> str:
     return "read-only; no Slack post, Gmail send, calendar write, repo write, or external action"
 
 
+def _request_forbids_live_web_research(input_text: str) -> bool:
+    normalized = " ".join(str(input_text or "").lower().split())
+    if not normalized:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\b"
+            r"[^.;\n]{0,180}\b"
+            r"(?:web\s+search|live\s+web|external\s+(?:search|research|tools?)|"
+            r"browser\s+automation|research\s+externally)\b",
+            normalized,
+        )
+    )
+
+
+def _chief_web_query_plan_subject(input_text: str, manual_plan: object | None) -> str:
+    primary_target = str(getattr(manual_plan, "primary_target", "") or "").strip()
+    if primary_target:
+        return primary_target[:160]
+    objective = str(getattr(manual_plan, "objective", "") or "").strip()
+    if objective:
+        return objective[:160]
+    cleaned = " ".join(str(input_text or "").split())
+    return cleaned[:160] or "KNI Chief of Staff web research request"
+
+
+def _chief_fallback_web_queries(input_text: str, subject: str) -> list[str]:
+    topic = subject.strip() or "KNI business research"
+    request = " ".join(str(input_text or "").split())
+    focus = request[:140] if request and request.lower() != topic.lower() else topic
+    queries = [
+        f"{topic} official source",
+        f"{topic} recent news 2026",
+        f"{topic} independent coverage 2026",
+        f"{topic} partnership funding evidence",
+        f"{topic} customer case study validation",
+        f"{topic} leadership hiring product launch",
+    ]
+    if focus and focus.lower() not in topic.lower():
+        queries.insert(1, f"{topic} {focus}")
+        queries.insert(2, f"{focus} source backed brief")
+    return list(dict.fromkeys(query for query in queries if query.strip()))[:12]
+
+
+def _configure_live_web_research_env(*, enabled: bool) -> None:
+    if enabled:
+        os.environ["KEYSTONE_LIVE_MODE"] = "true"
+        os.environ["KEYSTONE_DRY_RUN"] = "false"
+        os.environ["KEYSTONE_ENABLE_LIVE_RESEARCH"] = "true"
+        return
+    os.environ["KEYSTONE_ENABLE_LIVE_RESEARCH"] = "false"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Plan KNI Slack operations routing.")
     parser.add_argument(
@@ -130,6 +189,22 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["fast", "balanced", "deep"],
         default=None,
         help="Chief of Staff quality budget for SDK planning.",
+    )
+    parser.add_argument(
+        "--live-search-plan",
+        action="store_true",
+        help=(
+            "Use the live SDK web-query planner to expand broad public web research "
+            "requests before Chief of Staff chooses search/read tools."
+        ),
+    )
+    parser.add_argument(
+        "--live-search",
+        action="store_true",
+        help=(
+            "Allow Chief of Staff to call the shared live `search_web` provider ladder "
+            "during live SDK execution. Requires --live-sdk and remains read-only."
+        ),
     )
     add_sdk_session_arguments(parser)
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
@@ -209,6 +284,8 @@ def _payload(
     usage: object | None = None,
     cost: object | None = None,
     request_cache: object | None = None,
+    web_query_plan: object | None = None,
+    delegated_work_item_result: object | None = None,
 ) -> dict[str, object]:
     dumped = output.model_dump(mode="json") if hasattr(output, "model_dump") else output
     payload: dict[str, object] = {
@@ -229,6 +306,18 @@ def _payload(
         payload["cost"] = cost
     if request_cache is not None:
         payload["request_cache"] = request_cache
+    if web_query_plan is not None:
+        payload["web_query_plan"] = (
+            web_query_plan.model_dump(mode="json")
+            if hasattr(web_query_plan, "model_dump")
+            else web_query_plan
+        )
+    if delegated_work_item_result is not None:
+        payload["delegated_work_item_result"] = (
+            delegated_work_item_result.model_dump(mode="json")
+            if hasattr(delegated_work_item_result, "model_dump")
+            else delegated_work_item_result
+        )
     if manual_request_plan is not None:
         payload["manual_request_plan"] = (
             manual_request_plan.model_dump(mode="json")
@@ -250,6 +339,122 @@ def _payload(
             else original_orchestrator_review
         )
     return payload
+
+
+def _maybe_execute_recommended_work_item_handoff(
+    output: object,
+    *,
+    input_text: str,
+    database_url: str | None,
+    live_sdk: bool,
+    manual_request_plan: object | None,
+    orchestrator_preflight: object | None,
+) -> tuple[object, object | None]:
+    if not isinstance(output, ChiefOfStaffResult):
+        return output, None
+    output_payload = output.model_dump(mode="json")
+    from keystone_agents.schemas.work_item import WorkflowRunRequest
+    from keystone_agents.workflow_runner import (
+        _chief_output_recommended_work_item_handoff_route,
+        advance_work_item_manager_loop,
+    )
+
+    delegated_route = _chief_output_recommended_work_item_handoff_route(
+        output_payload,
+        input_text,
+    )
+    if delegated_route is None:
+        return output, None
+    inline_only = _direct_handoff_should_use_inline_only(input_text)
+    delegated = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=input_text,
+            save=True,
+            database_url=database_url,
+            live_search=False,
+            live_sdk=bool(live_sdk and not inline_only),
+            max_results=3,
+            requested_route=delegated_route,
+            manual_request_plan=(
+                manual_request_plan.model_dump(mode="json")
+                if hasattr(manual_request_plan, "model_dump")
+                else manual_request_plan
+            ),
+            orchestrator_preflight=(
+                orchestrator_preflight
+                if isinstance(orchestrator_preflight, dict)
+                else (
+                    orchestrator_preflight.model_dump(mode="json")
+                    if hasattr(orchestrator_preflight, "model_dump")
+                    else None
+                )
+            ),
+            allow_manager_loop_repair=True,
+        ),
+        max_steps=2,
+    )
+    return _chief_result_from_delegated_work_item(output, delegated), delegated
+
+
+def _direct_handoff_should_use_inline_only(input_text: str) -> bool:
+    lowered = " ".join(str(input_text or "").lower().split())
+    return bool(
+        re.search(r"\buse\s+only\b.{0,80}\b(?:inline|sanitized|approved|provided)\b", lowered)
+        or re.search(r"\bdo\s+not\b.{0,80}\b(?:research|search|access|use)\b", lowered)
+        and re.search(r"\b(?:externally|external|web|browser|gmail|airtable|drive|zotero)\b", lowered)
+        or "no external action" in lowered
+        or "no external actions" in lowered
+    )
+
+
+def _chief_result_from_delegated_work_item(
+    output: ChiefOfStaffResult,
+    delegated: object,
+) -> ChiefOfStaffResult:
+    route_value = str(getattr(delegated, "route", "") or "").strip()
+    agent_label = _delegated_agent_label(route_value)
+    summary = str(getattr(delegated, "human_summary", "") or "").strip()
+    if not summary:
+        summary = f"{agent_label} completed the delegated WorkItem step."
+    work_item = getattr(delegated, "work_item", None)
+    work_item_id = str(getattr(work_item, "id", "") or "").strip()
+    status = str(getattr(delegated, "status", "") or "").strip()
+    audit_notes = list(getattr(output, "audit_notes", []) or [])
+    note = (
+        f"Chief of Staff executed a WorkItem handoff to {route_value or agent_label}"
+        + (f" ({work_item_id})." if work_item_id else ".")
+    )
+    if note not in audit_notes:
+        audit_notes.append(note)
+    return output.model_copy(
+        update={
+            "summary": f"Chief of Staff handed this to {agent_label}.\n\n{summary}",
+            "synthesis": "",
+            "recommended_route": ChiefOfStaffRouteRecommendation(
+                workflow_type="clarification",
+                rationale=(
+                    "Delegated through the WorkItem manager loop"
+                    + (f"; downstream status: {status}." if status else ".")
+                ),
+            ),
+            "recommended_actions": [
+                "Review the downstream WorkItem result before any external action."
+            ],
+            "nested_specialist_results": [],
+            "retrieval_diagnostics": {},
+            "audit_notes": audit_notes,
+        }
+    )
+
+
+def _delegated_agent_label(route_value: str) -> str:
+    labels = {
+        "business_research_analyst": "Business Research Agent",
+        "opportunity_scout": "Opportunity Scout Agent",
+        "gmail_triage": "Gmail Triage Agent",
+        "outreach_composer": "Outreach Composer Agent",
+    }
+    return labels.get(route_value, route_value.replace("_", " ").title() or "the next agent")
 
 
 def _chief_of_staff_output_review(
@@ -497,6 +702,10 @@ def main(argv: list[str] | None = None) -> int:
     local_kni_lookup = _looks_like_local_kni_evidence_lookup(input_text.lower())
     if args.live_sdk:
         load_settings(force_dotenv=True)
+        live_web_research_enabled = bool(
+            args.live_search and not _request_forbids_live_web_research(input_text)
+        )
+        _configure_live_web_research_env(enabled=live_web_research_enabled)
         model_config = get_runtime_agent_model_config("chief_of_staff", model_override=args.model)
         sdk_session = _chief_of_staff_session_from_args(args)
         if parent_manual_plan is not None:
@@ -526,6 +735,7 @@ def main(argv: list[str] | None = None) -> int:
         typed_result = None
         original_review = None
         local_kni_evidence = None
+        web_query_plan = None
         if local_kni_lookup:
             local_kni_evidence = _local_kni_evidence_packet_for_query(input_text)
             orchestrator_preflight = orchestrator_preflight or {
@@ -535,12 +745,28 @@ def main(argv: list[str] | None = None) -> int:
                     "the raw user query before live Chief of Staff synthesis."
                 ),
             }
+        elif args.live_search_plan and live_web_research_enabled:
+            web_query_plan_subject = _chief_web_query_plan_subject(input_text, manual_plan)
+            web_query_plan = resolve_web_query_plan(
+                subject=web_query_plan_subject,
+                request_text=input_text,
+                fallback_queries=_chief_fallback_web_queries(input_text, web_query_plan_subject),
+                max_queries=12 if budget.mode.value == "deep" else 8,
+                live=True,
+                model=args.model,
+                planner_context=json.dumps(
+                    orchestrator_preflight or {},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )[:4000],
+            )
         try:
             typed_input: dict[str, object] = {
                 "request": input_text,
                 "slack_repo_path": args.slack_repo_path,
                 "approval_reference": _approval_reference_for_request(input_text),
                 "side_effect_policy": _live_side_effect_policy(input_text),
+                "live_web_research_enabled": live_web_research_enabled,
                 "include_specialist_tools": chief_of_staff_should_use_specialist_tools(
                     input_text,
                     manual_plan,
@@ -554,6 +780,14 @@ def main(argv: list[str] | None = None) -> int:
             if local_kni_evidence is not None:
                 typed_input["local_kni_evidence_packet"] = local_kni_evidence
                 typed_input["local_kni_instruction"] = local_kni_live_instruction()
+            if web_query_plan is not None:
+                typed_input["web_query_plan"] = web_query_plan.model_dump(mode="json")
+                typed_input["web_query_plan_instruction"] = (
+                    "Use this bounded query plan for public web discovery when the "
+                    "request requires current source-backed research. Run the most "
+                    "relevant planned queries with search_web, then read/extract "
+                    "selected URLs before synthesis when tools and budget allow."
+                )
             typed_result = run_chief_of_staff_sdk(
                 typed_input,
                 live=True,
@@ -616,6 +850,20 @@ def main(argv: list[str] | None = None) -> int:
                 output=result,
                 run_type="deterministic_fallback_after_live_exception",
             )
+        result, delegated_result = _maybe_execute_recommended_work_item_handoff(
+            result,
+            input_text=input_text,
+            database_url=args.database_url,
+            live_sdk=args.live_sdk,
+            manual_request_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+        )
+        if delegated_result is not None:
+            review = _chief_of_staff_output_review(
+                input_text=input_text,
+                output=result,
+                run_type="live_sdk_delegated_work_item_handoff",
+            )
         payload = _payload(
             mode="live_sdk",
             live_sdk=True,
@@ -630,6 +878,8 @@ def main(argv: list[str] | None = None) -> int:
             usage=typed_result.usage if typed_result is not None else None,
             cost=typed_result.cost if typed_result is not None else None,
             request_cache=typed_result.request_cache if typed_result is not None else None,
+            web_query_plan=web_query_plan,
+            delegated_work_item_result=delegated_result,
         )
     else:
         if args.mode != RunMode.DRY_RUN.value:
@@ -662,6 +912,20 @@ def main(argv: list[str] | None = None) -> int:
             output=result,
             run_type="dry_run",
         )
+        result, delegated_result = _maybe_execute_recommended_work_item_handoff(
+            result,
+            input_text=input_text,
+            database_url=args.database_url,
+            live_sdk=False,
+            manual_request_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+        )
+        if delegated_result is not None:
+            review = _chief_of_staff_output_review(
+                input_text=input_text,
+                output=result,
+                run_type="dry_run_delegated_work_item_handoff",
+            )
         payload = _payload(
             mode="dry_run",
             live_sdk=False,
@@ -672,6 +936,7 @@ def main(argv: list[str] | None = None) -> int:
             manual_request_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             orchestrator_review=review,
+            delegated_work_item_result=delegated_result,
         )
 
     if args.json:

@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import keystone_agents.cli as cli
 from keystone_agents.cli import main
 from keystone_agents.manual_request import infer_manual_request_plan
@@ -362,6 +364,9 @@ notes: Useful and source-backed enough for a first pass."""
     assert payload["refresh_targets"] == ["overview", "database", "runs_scoring", "analysis"]
     assert payload["trace_event_type"] == "human_review_saved"
     assert payload["eval_thread_reply"]["submit_evaluation_action"] == "Submit Evaluation"
+    assert [
+        action["action_id"] for action in payload["eval_thread_reply"]["slack_actions"]
+    ] == ["kba_eval_review", "kba_eval_orchestrator_judge"]
     assert "human notes" in payload["eval_thread_reply"]["submit_evaluation_effect"]
     assert payload["eval_thread_reply"]["refresh_targets"] == [
         "overview",
@@ -757,6 +762,10 @@ def test_cli_ask_eval_case_with_slack_context_records_slack_eval_run(
     assert payload["_eval_record"]["eval_thread_reply"]["dashboard_case_url"].endswith(
         "?case=slack_behavioral_health_rfp_001"
     )
+    assert [
+        action["action_id"]
+        for action in payload["_eval_record"]["eval_thread_reply"]["slack_actions"]
+    ] == ["kba_eval_review", "kba_eval_orchestrator_judge"]
     assert payload["_eval_record"]["review_case_url"].endswith(
         "?case=slack_behavioral_health_rfp_001"
     )
@@ -1171,6 +1180,88 @@ def test_cli_work_items_advance_uses_orchestrator_preflight_and_manager_loop(
     assert review_events
     assert review_events[0].metadata["route"] == "business_research_analyst"
     assert review_events[0].metadata["review_decision"] in {"pass", "warn", "block"}
+
+
+def test_cli_ask_colon_named_business_research_does_not_auto_handoff_to_scout(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'work-items.db'}"
+
+    exit_code = main(
+        [
+            "ask",
+            "--no-live-sdk",
+            "--database-url",
+            database_url,
+            "@KNI",
+            "business",
+            "research",
+            "analyst:",
+            "diagnostic",
+            "case",
+            "diag_business_research_no_live_route_001",
+            "Research",
+            "Abridge",
+            "as",
+            "a",
+            "clinical",
+            "documentation",
+            "AI",
+            "company.",
+            "Return",
+            "a",
+            "concise",
+            "Answer,",
+            "Detailed",
+            "Summary,",
+            "and",
+            "Useful",
+            "references.",
+            "Focus",
+            "on",
+            "product/workflow,",
+            "healthcare",
+            "buyer",
+            "fit,",
+            "evidence",
+            "or",
+            "deployment",
+            "signals,",
+            "and",
+            "what",
+            "remains",
+            "unverified.",
+            "Do",
+            "not",
+            "draft",
+            "outreach,",
+            "send,",
+            "schedule,",
+            "write",
+            "files,",
+            "create",
+            "CRM",
+            "records,",
+            "publish,",
+            "or",
+            "post",
+            "elsewhere.",
+        ]
+    )
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Manual plan: business_research_analyst / company_research" in output
+    assert "Route: business_research_analyst" in output
+    assert "Research: Abridge" in output
+    assert "*Answer:*" in output
+    assert "Abridge has source-backed company context" in output
+    assert "Route: opportunity_scout" not in output
+    assert "step 2 opportunity_scout" not in output
+    stored_items = SQLiteStore(database_url).list_work_items(limit=1)
+    assert stored_items
+    assert stored_items[0].title == "Research: Abridge"
 
 
 def test_cli_work_items_advance_preflight_uses_existing_specialist_route(
@@ -1642,6 +1733,105 @@ def test_cli_ask_agent_override_auto_live_sdk_in_live_mode(
     assert calls
     assert "scripts/run_company_research.py" in calls[0]
     assert "--live-sdk" in calls[0]
+    assert "--live-search-plan" in calls[0]
+
+
+def test_cli_ask_agent_override_promotes_child_human_summary(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    summary = (
+        "*Answer:*\nCorti has a clean source-backed fit summary.\n\n"
+        "*Detailed Summary:*\n* Product/workflow: clinical AI.\n\n"
+        "*Useful references:*\n* Corti: https://www.corti.ai"
+    )
+
+    def fake_run_orchestrator_preflight(
+        request_text,
+        *,
+        requested_agent=None,
+        live_manual_plan=False,
+        **kwargs,
+    ):
+        assert live_manual_plan is True
+        return _fake_orchestrator_preflight(
+            request_text,
+            requested_agent=requested_agent,
+            live_manual_plan=live_manual_plan,
+            **kwargs,
+        )
+
+    def fake_run(_command, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "output_type": "CompanyResearchFocusedBrief",
+                    "send_enabled": False,
+                    "human_summary": summary,
+                    "output": {"company_name": "Corti", "send_enabled": False},
+                    "model": {"provider": "openai", "name": "gpt-5.4-mini"},
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_run_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "business_research_analyst",
+            "--json",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'runs.db'}",
+            "research",
+            "Corti",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["human_summary"] == summary
+    assert payload["slack_display_text"] == summary
+    assert payload["display_text"] == summary
+    assert payload["summary"] == summary
+    assert payload["script_payload"]["human_summary"] == summary
+    assert payload["output_type"] == "CompanyResearchFocusedBrief"
+
+
+def test_cli_live_payload_text_mode_prefers_human_summary_over_message(
+    capsys,
+) -> None:
+    summary = (
+        "*Answer:*\nSuki has a clean answer-first fit check.\n\n"
+        "*Detailed Summary:*\nDiagnostics should not render before this text."
+    )
+
+    assert (
+        cli._print_ask_live_payload(
+            {
+                "agent_name": "Business Research Analyst",
+                "output_type": "CompanyResearchFocusedBrief",
+                "send_enabled": False,
+                "message": "Business Agents Company Research Brief Ready",
+                "human_summary": summary,
+            },
+            json_output=False,
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "Business Agents Company Research Brief Ready" not in output
+    assert summary in output
+    if "Orchestrator review:" in output:
+        assert output.index("*Answer:*") < output.index("Orchestrator review:")
 
 
 def test_cli_live_outreach_inline_context_uses_work_item_runner(
@@ -1713,6 +1903,42 @@ def test_cli_live_opportunity_scout_no_external_context_uses_work_item_runner(
     assert captured["live_sdk"] is True
     assert captured["cost_tracking_requested"] is True
     assert "Cedar Grove Pediatrics" in str(captured["input_text"])
+
+
+def test_cli_live_business_research_no_external_context_uses_work_item_runner(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    database_url = f"sqlite:///{tmp_path / 'business-research-inline.db'}"
+
+    def fake_run_ask_work_item(input_text, **kwargs):
+        captured["input_text"] = input_text
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_run_ask_work_item)
+
+    exit_code = cli._run_ask_company_research_live(
+        "business research analyst agent: diagnostic case diag_bra. Use only this "
+        "sanitized inline context and do not research externally: Northstar Sleep Lab "
+        "is considering whether Keystone could review an internal sleep-study "
+        "operations dashboard before a November leadership review. Return a concise "
+        "internal research handoff.",
+        json_output=True,
+        manual_plan=None,
+        orchestrator_preflight=None,
+        sdk_session_spec=None,
+        cost_tracking_requested=True,
+        database_url=database_url,
+    )
+
+    assert exit_code == 0
+    assert captured["database_url"] == database_url
+    assert captured["live_search"] is False
+    assert captured["live_sdk"] is True
+    assert captured["cost_tracking_requested"] is True
+    assert "Northstar Sleep Lab" in str(captured["input_text"])
 
 
 def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
@@ -1814,6 +2040,187 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
     assert records[0]["model"] == "sdk-live:gpt-5.4-mini"
 
 
+@pytest.mark.parametrize(
+    ("agent_text", "expected_route", "expected_agent_name", "expected_output_type"),
+    [
+        ("rss context agent", "rss_context_agent", "rss_context_agent", "RssContextResult"),
+        (
+            "preprints context agent",
+            "preprints_context_agent",
+            "preprints_context_agent",
+            "PreprintsContextResult",
+        ),
+    ],
+)
+def test_cli_ask_feed_context_mentions_use_context_dry_run(
+    capsys,
+    tmp_path: Path,
+    agent_text: str,
+    expected_route: str,
+    expected_agent_name: str,
+    expected_output_type: str,
+) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "--no-live-sdk",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'feed-context.db'}",
+            "--json",
+            "--input",
+            (
+                f"@KNI {agent_text}: diagnostic case feed context. "
+                "Use available feed context, not browser automation or live web search. "
+                "Return a concise Answer and Detailed Summary."
+            ),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "dry_run"
+    assert payload["status"] == "done"
+    assert payload["route"] == expected_route
+    assert payload["selected_agent"] == expected_route
+    assert payload["output_type"] == expected_output_type
+    assert payload["output"]["agent_name"] == expected_agent_name
+    assert payload["human_summary"].startswith("*Answer:*\n")
+    assert "\n\n*Detailed Summary:*\n" in payload["human_summary"]
+    assert "work_item" not in payload
+
+
+@pytest.mark.parametrize(
+    ("agent_text", "expected_route", "expected_agent_name", "expected_output_type"),
+    [
+        ("rss context agent", "rss_context_agent", "rss_context_agent", "RssContextResult"),
+        (
+            "business agents rss context agent",
+            "rss_context_agent",
+            "rss_context_agent",
+            "RssContextResult",
+        ),
+        (
+            "preprints context agent",
+            "preprints_context_agent",
+            "preprints_context_agent",
+            "PreprintsContextResult",
+        ),
+        (
+            "business agents preprints context agent",
+            "preprints_context_agent",
+            "preprints_context_agent",
+            "PreprintsContextResult",
+        ),
+    ],
+)
+def test_cli_ask_bare_feed_context_aliases_use_context_dry_run(
+    capsys,
+    tmp_path: Path,
+    agent_text: str,
+    expected_route: str,
+    expected_agent_name: str,
+    expected_output_type: str,
+) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "--no-live-sdk",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'bare-feed-context.db'}",
+            "--json",
+            "--input",
+            (
+                f"{agent_text}: diagnostic case feed context. "
+                "Use available feed context, not browser automation or live web search. "
+                "Return a concise Answer and Detailed Summary."
+            ),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "dry_run"
+    assert payload["status"] == "done"
+    assert payload["route"] == expected_route
+    assert payload["selected_agent"] == expected_route
+    assert payload["output_type"] == expected_output_type
+    assert payload["output"]["agent_name"] == expected_agent_name
+    assert payload["human_summary"].startswith("*Answer:*\n")
+    assert "\n\n*Detailed Summary:*\n" in payload["human_summary"]
+
+
+def test_cli_ask_feed_context_text_mode_prints_human_summary(capsys, tmp_path: Path) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "--no-live-sdk",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'feed-context-text.db'}",
+            "--input",
+            (
+                "@KNI preprints context agent: diagnostic case feed context. "
+                "Use local dry-run preprints context, not external research. "
+                "Look for adolescent depression digital phenotyping or wearable-sensor monitoring."
+            ),
+        ]
+    )
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Agent: Preprints Context Agent" in output
+    assert "*Answer:*" in output
+    assert "*Detailed Summary:*" in output
+    assert "Dry-run selected the specialist" in output
+
+
+def test_feed_context_topic_terms_ignore_instruction_words() -> None:
+    terms = cli._feed_context_topic_terms(
+        "diagnostic case diag_preprints. Use only local/dry-run preprints context. "
+        "Do not research externally. Look for recent preprint context relevant to "
+        "adolescent depression digital phenotyping or wearable-sensor monitoring. "
+        "Do not create, update, export, write files, send, schedule, publish, create "
+        "CRM records, or post elsewhere."
+    )
+
+    assert "externally" not in terms
+    assert "recent" not in terms
+    assert "dry-run" not in terms
+    assert "export" not in terms
+    assert "research" not in terms
+    assert "relevant" not in terms
+    assert "concise" not in terms
+    assert "human-useful" not in terms
+    assert "handoff" not in terms
+    assert "whether" not in terms
+    assert "adolescent depression" in terms
+    assert "digital phenotyping" in terms
+    assert "wearable-sensor monitoring" in terms
+    assert terms[:3] == [
+        "adolescent depression",
+        "digital phenotyping",
+        "wearable-sensor monitoring",
+    ]
+
+
+def test_feed_context_topic_terms_prioritize_rss_domain_phrases() -> None:
+    terms = cli._feed_context_topic_terms(
+        "diagnostic case diag_rss. Use only local/dry-run announcements or RSS context. "
+        "Do not research externally. Look for recent announcement context relevant to "
+        "clinical AI validation, remote monitoring implementation, and operations "
+        "dashboard governance. Return a concise human-useful context handoff."
+    )
+
+    assert terms[:3] == [
+        "clinical AI validation",
+        "remote monitoring implementation",
+        "operations dashboard governance",
+    ]
+    assert "announcements" not in terms
+    assert "implementation" not in terms
+    assert "remote monitoring" not in terms
+    assert "externally" not in terms
+
+
 def test_cli_google_workspace_context_live_sdk_enables_live_read_default(
     monkeypatch,
     capsys,
@@ -1894,12 +2301,76 @@ def test_context_agent_human_summary_separates_answer_from_details() -> None:
     )
 
     assert summary == (
-        "Answer:\n"
+        "*Answer:*\n"
         "KNIOps Drive is accessible in read-only mode.\n\n"
-        "Detailed answer:\n"
+        "*Detailed Summary:*\n"
         "- Approval/write boundary: Live writes require explicit approval reference.\n"
         "- Needs attention: No Google Sheets were returned in the current folder listing."
     )
+
+
+def test_google_workspace_context_dry_run_tracks_onboarding_topic_without_eval_boilerplate() -> None:
+    output = cli._context_agent_dry_run_output(
+        "google_workspace_context_agent",
+        (
+            "@KNI google workspace context agent: Use only Google Workspace/Drive context "
+            "if available, read-only. I am looking for whether KNIOps has internal "
+            "onboarding or operations SOP docs for a new collaborator handoff. "
+            "Do not create, edit, share, export, or write."
+        ),
+        None,
+    )
+
+    assert output is not None
+    payload = output.model_dump(mode="json")
+    summary = cli._context_agent_human_summary(payload)
+
+    assert "internal onboarding" in payload["summary"]
+    assert "operations sop" in payload["summary"].lower()
+    assert "Slack eval review narrative" not in payload["summary"]
+    assert "Eval tracker" not in payload["summary"]
+    assert payload["recommended_target"] == "KNIOps Operations onboarding/SOP context"
+    assert "KNIOps/Operations" in payload["relevant_folders"]
+    assert "onboarding or operations SOP Doc" in payload["relevant_docs"]
+    assert "*Detailed Summary:*" in summary
+    assert "- Candidate target: KNIOps Operations onboarding/SOP context" in summary
+    assert "- Folder hints:" in summary
+    assert "- Doc hints:" in summary
+    assert "*Useful references:*" in summary
+    assert "Useful references require live Workspace reads" in summary
+
+
+def test_airtable_context_dry_run_tracks_finance_tax_topic_without_eval_boilerplate() -> None:
+    output = cli._context_agent_dry_run_output(
+        "airtable_context_agent",
+        (
+            "@KNI airtable context agent: Use Airtable context tools only, read-only. "
+            "I am looking for whether the 2026 Finance & Tax Tracker Tax Payments "
+            "table has Estimated Tax Period 2 payment records and the Q2 Rolling Taxes "
+            "Summary. Do not create, update, delete, attach files, export, or write."
+        ),
+        None,
+    )
+
+    assert output is not None
+    payload = output.model_dump(mode="json")
+    summary = cli._context_agent_human_summary(payload)
+
+    assert "2026 finance & tax tracker" in payload["summary"].lower()
+    assert "tax payments" in payload["summary"].lower()
+    assert "estimated tax period 2" in payload["summary"].lower()
+    assert "eval_tracker" not in payload["summary"]
+    assert "Promptfoo" not in payload["summary"]
+    assert payload["base_alias"] == "finance_tax_tracker"
+    assert payload["relevant_tables"] == ["Tax Payments"]
+    assert "Estimated Tax Periods" in payload["relevant_fields"]
+    assert "Q2 Rolling Taxes Summary" in payload["recommended_record_identity"]
+    assert "*Detailed Summary:*" in summary
+    assert "- Airtable target hints: finance_tax_tracker / Tax Payments" in summary
+    assert "- Field hints:" in summary
+    assert "- Record filter guidance:" in summary
+    assert "*Useful references:*" in summary
+    assert "Useful references require live Airtable schema/record reads" in summary
 
 
 def test_context_agent_human_summary_keeps_multiple_detail_items_readable() -> None:
@@ -1914,9 +2385,9 @@ def test_context_agent_human_summary_keeps_multiple_detail_items_readable() -> N
     )
 
     assert summary == (
-        "Answer:\n"
+        "*Answer:*\n"
         "Airtable records were read successfully.\n\n"
-        "Detailed answer:\n"
+        "*Detailed Summary:*\n"
         "- Needs attention:\n"
         "  - Sample records were arbitrary because no filter was provided\n"
         "  - One field label differs from the schema label"
@@ -1943,9 +2414,9 @@ def test_context_agent_human_summary_includes_airtable_record_summaries() -> Non
     )
 
     assert summary == (
-        "Answer:\n"
+        "*Answer:*\n"
         "Three matching Tax Payments records were visible.\n\n"
-        "Detailed answer:\n"
+        "*Detailed Summary:*\n"
         "- Records visible:\n"
         "  - IRS Estimated Taxes: Q2 2026 (pending): Tax Type: Federal; "
         "Amount: $4,705.00; Payment Date: 6/1/2026 (Period 2)\n"
@@ -1975,15 +2446,86 @@ def test_context_agent_human_summary_includes_zotero_reference_summaries() -> No
     )
 
     assert summary == (
-        "Answer:\n"
+        "*Answer:*\n"
         "The KNI foundational collection is available.\n\n"
-        "Detailed answer:\n"
-        "- Useful references:\n"
+        "*Detailed Summary:*\n"
+        "- Needs attention: No full-text extraction for some book records in the local cache.\n\n"
+        "*Useful references:*\n"
         "  - The growing field of digital psychiatry - Directly relevant to digital "
         "psychiatry background. (https://doi.org/10.1002/wps.20883)\n"
         "  - Toward the future of psychiatric diagnosis - Directly relevant to "
-        "psychiatric diagnosis background. (https://doi.org/10.1186/1741-7015-11-126)\n"
-        "- Needs attention: No full-text extraction for some book records in the local cache."
+        "psychiatric diagnosis background. (https://doi.org/10.1186/1741-7015-11-126)"
+    )
+
+
+def test_zotero_context_dry_run_tracks_requested_topic_without_generic_boilerplate() -> None:
+    output = cli._context_agent_dry_run_output(
+        "zotero_context_agent",
+        (
+            "@KNI zotero context agent: Use only local Zotero/cache context if available. "
+            "I am looking for foundational depression or psychiatric diagnosis review "
+            "material for an internal background scan. Do not import or write."
+        ),
+        None,
+    )
+
+    assert output is not None
+    payload = output.model_dump(mode="json")
+    summary = cli._context_agent_human_summary(payload)
+
+    assert "foundational depression" in payload["summary"]
+    assert "psychiatric diagnosis" in payload["summary"]
+    assert "import" not in payload["summary"]
+    assert "collections" not in payload["summary"]
+    assert "google" not in payload["summary"].lower()
+    assert "looking" not in payload["summary"].lower()
+    assert "behavioral-health AI validation" not in payload["summary"]
+    assert "foundational depression" in payload["collection_hints"]
+    assert "psychiatric diagnosis" in payload["collection_hints"]
+    assert "*Detailed Summary:*" in summary
+    assert "- Collection/context hints:" in summary
+    assert "- Evidence guidance:" in summary
+    assert "*Useful references:*" in summary
+    assert "Useful references require local item reads" in summary
+
+
+def test_context_agent_human_summary_includes_feed_item_summaries() -> None:
+    summary = cli._context_agent_human_summary(
+        {
+            "summary": "Two announcement feed items matched the request.",
+            "articles": [
+                {
+                    "title": "AI model validation guide",
+                    "url": "https://example.test/ai-validation",
+                    "published_at": "2026-06-18",
+                    "summary": "Practical validation guidance for clinical AI monitoring.",
+                },
+                {
+                    "title": "Remote monitoring pilot update",
+                    "source": "Internal RSS",
+                    "summary": "Pilot operations update relevant to dashboard review.",
+                },
+            ],
+            "recurring_themes": ["clinical AI validation", "remote monitoring operations"],
+            "evidence_gaps": ["No full article extraction was available for one item"],
+        }
+    )
+
+    assert summary == (
+        "*Answer:*\n"
+        "Two announcement feed items matched the request.\n\n"
+        "*Detailed Summary:*\n"
+        "- Items reviewed:\n"
+        "  - AI model validation guide: Practical validation guidance for clinical AI "
+        "monitoring. (2026-06-18)\n"
+        "  - Remote monitoring pilot update: Pilot operations update relevant to dashboard "
+        "review. (Internal RSS)\n"
+        "- Themes:\n"
+        "  - clinical AI validation\n"
+        "  - remote monitoring operations\n"
+        "- Needs attention: No full article extraction was available for one item.\n\n"
+        "*Useful references:*\n"
+        "  - AI model validation guide (https://example.test/ai-validation)"
     )
 
 
@@ -2384,6 +2926,8 @@ def test_cli_ask_explicit_chief_of_staff_runs_orchestrator_preflight_advise_only
     assert payload["orchestrator_preflight"]["route_result"]["route"] == "chief_of_staff"
     assert calls
     assert "scripts/run_chief_of_staff.py" in calls[0]
+    assert "--live-search" in calls[0]
+    assert "--live-search-plan" in calls[0]
     assert child_envs
     assert ORCHESTRATOR_PREFLIGHT_ENV in child_envs[0]
     assert MANUAL_REQUEST_PLAN_ENV in child_envs[0]

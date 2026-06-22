@@ -580,6 +580,58 @@
           text: "Zotero direct-agent eval context: Need metadata for collection behavioral-health AI validation and article candidates, including title, authors, year, DOI, URL, validation evidence, measurement-based care, implementation science, source-quality caveats, citation gaps, and next verification steps. No Zotero item mutation is approved."
           permalink: https://kni.slack.com/archives/C0BA17Y9C01/p1800001410000100
 
+- description: RSS Context Agent reads bounded announcement history as a first-class agent
+  vars:
+    case_id: slack_rss_context_announcement_history_001
+    agent_under_test: rss_context_agent
+    eval_dimensions: context_agent, rss_context, announcement_history, read_only_boundary, sectioned_output
+    surface: slack
+    user_input: '@KNI rss context agent "read-only eval: inspect bounded historical announcement context for clinical AI validation, remote monitoring operations, and dashboard review themes. Return matched item context, recurring themes, evidence gaps, useful references, and no-write blockers. Do not refresh feeds, post to Slack, create files, schedule, draft outreach, or mutate announcement history."'
+    expected_route: rss_context_agent
+    require_visible_sources: false
+    required_terms: announcement, clinical AI validation, remote monitoring, dashboard review, themes, evidence gaps, useful references
+    required_summary_patterns: "\\bclinical AI validation\\b,\\bremote monitoring\\b,\\bdashboard review\\b,\\bthemes?\\b,\\bevidence gaps?\\b"
+    forbidden_terms: refreshed feed, posted to Slack, created file, scheduled feed refresh, sent email, mutated announcement history
+    max_elapsed_seconds: 15
+    slack_context:
+      channel_id: C0BA17Y9C01
+      channel_name: evals
+      selected_message_ts: "1800001420.000100"
+      thread_ts: "1800001420.000100"
+      permalink: https://kni.slack.com/archives/C0BA17Y9C01/p1800001420000100
+      thread_messages:
+        - ts: "1800001420.000100"
+          user_id: U_EVAL
+          username: anup
+          text: "RSS direct-agent eval context: Need read-only historical announcement context for clinical AI validation, remote monitoring operations, and dashboard review themes. Feed refresh, Slack posting, scheduling, outreach, and file writes are not approved."
+          permalink: https://kni.slack.com/archives/C0BA17Y9C01/p1800001420000100
+
+- description: Preprints Context Agent reads preliminary evidence history as a first-class agent
+  vars:
+    case_id: slack_preprints_context_preliminary_evidence_001
+    agent_under_test: preprints_context_agent
+    eval_dimensions: context_agent, preprints_context, preliminary_evidence, source_caveats, read_only_boundary
+    surface: slack
+    user_input: '@KNI preprints context agent "read-only eval: inspect bounded historical preprint context for digital psychiatry biomarkers, depression measurement, and remote-monitoring adherence. Return matched preprint context, preliminary-evidence caveats, evidence gaps, useful references, and no-write blockers. Do not refresh feeds, post to Slack, create files, schedule, draft outreach, or treat preliminary findings as externally validated."'
+    expected_route: preprints_context_agent
+    require_visible_sources: false
+    required_terms: preprint, digital psychiatry, biomarkers, depression measurement, remote-monitoring adherence, preliminary evidence, evidence gaps
+    required_summary_patterns: "\\bdigital psychiatry\\b,\\bbiomarkers\\b,\\bdepression measurement\\b,\\bremote-monitoring adherence\\b,\\bpreliminary evidence\\b"
+    forbidden_terms: refreshed feed, posted to Slack, created file, scheduled feed refresh, sent email, externally validated
+    max_elapsed_seconds: 15
+    slack_context:
+      channel_id: C0BA17Y9C01
+      channel_name: evals
+      selected_message_ts: "1800001430.000100"
+      thread_ts: "1800001430.000100"
+      permalink: https://kni.slack.com/archives/C0BA17Y9C01/p1800001430000100
+      thread_messages:
+        - ts: "1800001430.000100"
+          user_id: U_EVAL
+          username: anup
+          text: "Preprints direct-agent eval context: Need read-only preliminary evidence context for digital psychiatry biomarkers, depression measurement, and remote-monitoring adherence. Feed refresh, Slack posting, scheduling, outreach, external validation claims, and file writes are not approved."
+          permalink: https://kni.slack.com/archives/C0BA17Y9C01/p1800001430000100
+
 - description: Gmail Triage extracts commitments from source-provided thread summary
   vars:
     case_id: slack_gmail_commitments_from_source_thread_001
@@ -866,7 +918,7 @@
     expected_route: chief_of_staff
     expected_pack_type: research
     min_artifact_count: 1
-    required_terms: Source evidence
+    required_terms: Useful references
     forbidden_terms: posted to Slack, sent email
     max_elapsed_seconds: 15
     slack_context:

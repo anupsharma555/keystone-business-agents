@@ -29,6 +29,10 @@ requests. It reads the raw request plus compact memory/context, produces route
 advice and blockers, then passes a memo to the selected specialist; explicit
 agent mentions are advisory and do not bypass safety gates. A KNI Chief of
 Staff Agent handles broad operational synthesis and Slack/workflow coordination.
+When Chief of Staff recommends a WorkItem-capable downstream agent, such as
+Business Research Analyst, Opportunity Scout, Gmail Triage, or Outreach
+Composer, the manager loop treats that recommendation as a handoff unless the
+request or Chief output explicitly keeps the result advisory-only.
 The first end-to-end dry-run workflow calls the specialists in sequence without
 replacing them. For the two search-heavy routes,
 `keystone_agents.workflows.run_orchestrated_search_handoff(...)` carries the
@@ -45,8 +49,18 @@ recipient, thread, or no-send gates. Each pack also exposes `can_synthesize`,
 `missing_requirements`, and `limitation_notes` so a blocked or partial run says
 which context was unavailable instead of filling gaps.
 
-Current architecture visual:
-`docs/assets/kni-agent-routing-architecture-orchestrator-first-20260525-181618.svg`.
+Current generated architecture visual:
+`docs/assets/kba-current-agent-architecture.svg`. Regenerate it after agent,
+workflow, trace, or eval structure changes with:
+
+```bash
+.venv/bin/python scripts/render_agent_architecture_diagram.py
+```
+
+The diagram positions Orchestrator as the first request control plane and output
+review layer, Chief of Staff as the cross-functional operating synthesis layer,
+and uses edge colors to distinguish routing/handoffs, deterministic gate/state
+flows, agents-as-tools calls, and trace/log/eval linkages.
 
 Search and extraction architecture visual:
 `docs/assets/web-search-agent-architecture.svg`, with a rendered PNG export at
@@ -136,6 +150,26 @@ For the local folder layout mapped to Agents SDK concepts, see
 For documentation navigation and extension guides, start with `docs/INDEX.md`.
 For the `@KNI` Slack bridge configuration, Slack scope requirements, and
 approval boundaries, see `docs/SLACK_BUSINESS_AGENT_MODE.md`.
+Slack bridge consumers should also honor the exported business-agent contract at
+`contracts/keystone_slack_business_agent_contract.v1.json`. Its
+`result_rendering` section identifies named-agent and context-agent output
+types whose Slack-visible text should come from `human_summary` before any
+legacy route metadata, provider diagnostics, or generic WorkItem status text is
+shown. For legacy fallback payloads, the contract also prefers
+`slack_display_text`, `display_text`, and `summary` before nested summaries or
+generic messages. Example bridge payloads and expected display text live in
+`contracts/keystone_slack_result_rendering_examples.v1.json`; validate them
+offline with `.venv/bin/python scripts/validate_slack_result_rendering_examples.py`.
+The same contract's `slack_response_routing` section requires replies to use
+the source channel/thread supplied by Slack instead of a fixed fallback channel.
+Before another live Slack probe, run
+`.venv/bin/python scripts/validate_slack_bridge_contract.py` to check contract
+freshness, rendering examples, and source-channel routing without API calls.
+For the focused no-live Slack agent expansion/readability gate across the
+36-case named-agent pack, run
+`.venv/bin/python scripts/run_slack_agent_expansion_gate.py --quiet`. The
+summary includes enforced route coverage counts so a passing run shows which
+agents were exercised without making live Slack/API/model/search calls.
 
 The default database is local SQLite:
 

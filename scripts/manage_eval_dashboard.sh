@@ -20,7 +20,13 @@ GUI_DOMAIN="gui/$(id -u)"
 mkdir -p "$LOG_DIR"
 
 is_healthy() {
-  curl -fsS "$HEALTH_URL" >/dev/null 2>&1
+  for _ in {1..5}; do
+    if curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
 }
 
 pid_is_running() {
@@ -111,6 +117,8 @@ render_launchd_plist() {
   <dict>
     <key>PYTHONPATH</key>
     <string>$REPO_ROOT</string>
+    <key>KEYSTONE_EVAL_LLM_JUDGE</key>
+    <string>${KEYSTONE_EVAL_LLM_JUDGE:-false}</string>
   </dict>
   <key>StandardOutPath</key>
   <string>$STDOUT_LOG</string>

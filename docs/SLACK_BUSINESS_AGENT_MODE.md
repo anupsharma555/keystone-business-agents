@@ -15,6 +15,13 @@ then receive the raw request plus the Orchestrator memo/context; deterministic
 Python gates still own approvals, exact record identity, source sufficiency,
 and side-effect blocking.
 
+Named-agent and context-agent replies should stay in the Slack channel/thread
+that produced the request. The exported KBA contract exposes
+`slack_response_routing.source_channel_id_field` and
+`slack_response_routing.source_thread_ts_field` so bridge consumers can preserve
+source-channel delivery across `ai-agents-workflow`, `evals`, and other
+workspace channels instead of funneling all replies into one default channel.
+
 ## Safe Operating Model
 
 - Dry-run is the default in this repo.
@@ -100,6 +107,79 @@ CLI renderers. It is safe to display because it contains provider names,
 reachability/fallback flags, result/source counts, extraction failures, and
 timing summaries only; it must not include credentials, raw headers, OAuth
 tokens, or verbose traces.
+
+## Result Rendering Contract
+
+Slack-visible agent answers should be rendered from KBA's exported
+business-agent contract before any bridge-local fallback formatting. The
+canonical contract artifact is:
+
+```text
+contracts/keystone_slack_business_agent_contract.v1.json
+```
+
+Bridge consumers should read the `result_rendering` section and apply this
+priority order:
+
+1. If a payload matches a listed `named_agents` or `context_agents` renderer by
+   `route`, `selected_agent`, or `output_type`, display its preferred text
+   field, currently `human_summary`.
+2. If no listed renderer matches, fall back to the contract's
+   `fallback_text_fields` order: `human_summary`, `slack_display_text`,
+   `display_text`, `summary`, `output.summary`, then `message`.
+3. Keep provider diagnostics, model names, retrieval counts, timing, WorkItem
+   ids, route/status fields, and other audit data out of the main Slack answer
+   unless the operator explicitly asks for debugging details.
+
+The side-effect-free helper
+`keystone_agents.slack_action_contract.business_agent_result_display_text()`
+implements this priority order for KBA payloads and accepts partial bridge
+payload identity, including route-only, selected-agent-only, or output-type-only
+payloads. The sibling Slack bridge may call that helper directly when KBA is
+installed, or mirror the same contract from the JSON artifact.
+KBA also publishes executable bridge fixture payloads in:
+
+```text
+contracts/keystone_slack_result_rendering_examples.v1.json
+```
+
+Validate those examples locally, without Slack or model calls, with:
+
+```bash
+.venv/bin/python scripts/validate_slack_result_rendering_examples.py
+```
+
+For the full no-live bridge gate, including exported contract freshness,
+result-rendering examples, and source-channel routing, run:
+
+```bash
+.venv/bin/python scripts/validate_slack_bridge_contract.py
+```
+
+For the focused no-live named-agent expansion/readability gate before a live
+Slack probe, run:
+
+```bash
+.venv/bin/python scripts/run_slack_agent_expansion_gate.py --quiet
+```
+
+The gate prints and enforces per-route coverage counts from the actual dry-run
+provider payloads, so the output is useful for confirming named-agent breadth
+before spending on live Slack/API probes.
+
+Before spending another live Slack/API probe on result formatting, verify the
+sibling bridge passes fixture tests for all of these cases:
+
+- direct named-agent result payload with `CompanyResearchFocusedBrief` and
+  top-level `human_summary`;
+- conversational named-agent app mention, such as "could the business research
+  analyst...", passed through to KBA instead of rejected as an unsupported KNI
+  command;
+- context-agent result payloads for `RssContextResult` and
+  `PreprintsContextResult`;
+- route-only, selected-agent-only, and output-type-only payload identities;
+- provider/model/timing/WorkItem metadata retained as audit data, not prepended
+  to the visible Slack answer.
 
 ## End-To-End Workflows
 

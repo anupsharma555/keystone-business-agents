@@ -9,6 +9,7 @@ REPO_PATH = "<repo>"
 EXPECTED_SKILLS = {
     "kba-agent-contract-change",
     "kba-eval-readiness-triage",
+    "kba-new-agent",
     "kba-search-provider-eval",
     "kba-workitem-orchestrator-ops",
     "kba-live-sdk-smoke-and-cost",

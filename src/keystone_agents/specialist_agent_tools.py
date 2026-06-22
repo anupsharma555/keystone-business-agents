@@ -59,6 +59,16 @@ SPECIALIST_CONTEXT_GUIDANCE: dict[str, str] = {
         "evidence-gap, and human work context plus a Chief-owned artifact plan. "
         "Do not mutate Zotero libraries, collections, notes, tags, attachments, or metadata."
     ),
+    "rss_context_agent": (
+        "Return historical RSS/#announcements articles, source IDs, recurring themes, "
+        "opportunity signals, future-direction guidance, and human work context. "
+        "Treat this as read-only historical context, not current source verification."
+    ),
+    "preprints_context_agent": (
+        "Return historical preprint/#knowledge-hub records, source IDs, recurring "
+        "psychiatry research themes, opportunity signals, future-direction guidance, "
+        "and human work context. Mark preprints as preliminary evidence."
+    ),
 }
 
 

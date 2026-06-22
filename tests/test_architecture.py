@@ -194,8 +194,15 @@ def test_context_source_catalog_declares_required_contracts() -> None:
         "google_workspace",
         "slack_posting",
         "openai_file_search",
+        "announcement_feed_history",
         "sandbox_workspace_review",
     } <= set(by_id)
+
+    announcement_history = by_id["announcement_feed_history"]
+    assert "rss_context_agent" in announcement_history.allowed_agents
+    assert "preprints_context_agent" in announcement_history.allowed_agents
+    assert "rss_context_agent" not in by_id["openai_file_search"].allowed_agents
+    assert "preprints_context_agent" not in by_id["openai_file_search"].allowed_agents
 
     known_agents = set(AGENT_REGISTRY)
     for source in catalog:

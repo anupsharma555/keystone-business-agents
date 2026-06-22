@@ -119,6 +119,26 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "zotero agent",
         ),
     ),
+    (
+        "rss_context_agent",
+        "RSS Context Agent",
+        (
+            "rss context agent",
+            "rss context",
+            "announcements context agent",
+            "announcements context",
+        ),
+    ),
+    (
+        "preprints_context_agent",
+        "Preprints Context Agent",
+        (
+            "preprints context agent",
+            "preprints context",
+            "preprint context agent",
+            "preprint context",
+        ),
+    ),
 )
 
 
@@ -130,23 +150,66 @@ def _strip_leading_separator(value: str) -> str:
     return value.lstrip(" \t:-,;")
 
 
-def parse_agent_mention(text: str) -> AgentMention:
-    """Parse an optional `@KNI <agent alias>` mention from user text."""
+def _strip_bare_business_agent_prefix(value: str) -> str:
+    normalized = " ".join(str(value or "").split())
+    lowered = normalized.lower()
+    for prefix in (
+        "keystone business agents",
+        "keystone business agent",
+        "business agents",
+        "business agent",
+    ):
+        if lowered == prefix:
+            return ""
+        if lowered.startswith(prefix + " "):
+            return normalized[len(prefix) :].strip()
+    return normalized
 
-    raw = text.strip()
-    match = KNI_MENTION_RE.match(raw)
-    if match is None:
-        return AgentMention(route=None, agent_name="Keystone Orchestrator Agent", input_text=raw)
 
-    after_mention = KEYSTONE_ASK_PREFIX_RE.sub("", raw[match.end() :].strip()).strip()
-    normalized = _normalize(after_mention)
+def _best_alias_match(text: str, *, context_agents_only: bool = False) -> tuple[
+    RouteName, str, str
+] | None:
+    normalized = _normalize(text)
     best: tuple[RouteName, str, str] | None = None
     for route, agent_name, aliases in AGENT_ALIASES:
+        if context_agents_only and not str(route).endswith("_context_agent"):
+            continue
         for alias in aliases:
             normalized_alias = _normalize(alias)
             if normalized == normalized_alias or normalized.startswith(f"{normalized_alias} "):
                 if best is None or len(normalized_alias) > len(best[2]):
                     best = (route, agent_name, normalized_alias)
+    return best
+
+
+def parse_agent_mention(
+    text: str,
+    *,
+    allow_bare_context_agents: bool = False,
+) -> AgentMention:
+    """Parse an optional `@KNI <agent alias>` mention from user text."""
+
+    raw = text.strip()
+    match = KNI_MENTION_RE.match(raw)
+    if match is None:
+        if allow_bare_context_agents:
+            raw = _strip_bare_business_agent_prefix(raw)
+            best = _best_alias_match(raw, context_agents_only=True)
+            if best is not None:
+                route, agent_name, normalized_alias = best
+                words_to_drop = len(normalized_alias.split())
+                original_words = raw.split()
+                input_text = " ".join(original_words[words_to_drop:])
+                return AgentMention(
+                    route=route,
+                    agent_name=agent_name,
+                    input_text=_strip_leading_separator(input_text),
+                    explicit=True,
+                )
+        return AgentMention(route=None, agent_name="Keystone Orchestrator Agent", input_text=raw)
+
+    after_mention = KEYSTONE_ASK_PREFIX_RE.sub("", raw[match.end() :].strip()).strip()
+    best = _best_alias_match(after_mention)
 
     if best is None:
         return AgentMention(

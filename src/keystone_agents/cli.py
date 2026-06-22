@@ -72,7 +72,10 @@ from keystone_agents.schemas.operational_context import (
     GoogleWorkspaceContextResult,
     HumanWorkContext,
     OperationalContextEntry,
+    OperationalContextSource,
     OperationalWritePlan,
+    PreprintsContextResult,
+    RssContextResult,
     ZoteroContextResult,
 )
 from keystone_agents.schemas.work_item import (
@@ -92,6 +95,13 @@ from keystone_agents.sdk_sessions import (
     default_cli_ask_session_components,
     resolve_sdk_session_spec,
     sdk_session_env,
+)
+from keystone_agents.slack_action_contract import (
+    KBA_EVAL_ORCHESTRATOR_JUDGE,
+    KBA_EVAL_REVIEW,
+    KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE,
+    KBA_INTENT_EVAL_REVIEW,
+    business_agent_action_value,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
 from keystone_agents.tools.internal_data_tools import (
@@ -120,6 +130,8 @@ from keystone_agents.workflows import (
 CONTEXT_AGENT_ROUTES = {
     "airtable_context_agent",
     "google_workspace_context_agent",
+    "preprints_context_agent",
+    "rss_context_agent",
     "zotero_context_agent",
 }
 
@@ -513,7 +525,7 @@ def _route_with_manual_plan_advice(route: str, manual_plan: ManualRequestPlan) -
 
 def _run_ask(args: argparse.Namespace) -> int:
     raw_input = _ask_input(args)
-    mention = parse_agent_mention(raw_input)
+    mention = parse_agent_mention(raw_input, allow_bare_context_agents=True)
     input_text = raw_input if args.agent else mention.input_text
     cost_directive = parse_cost_tracking_directive(input_text)
     input_text = (cost_directive.cleaned_text or input_text).strip()
@@ -811,6 +823,8 @@ def _eval_score_save_payload(
             "eval_thread_reply": _eval_thread_reply_guidance(
                 case_id=review.case_id,
                 run_id=review.run_id,
+                agent=review.agent,
+                slack_thread_ts=review.slack_thread_ts,
                 dashboard_case_url=case_dashboard.get("dashboard_case_url", ""),
             ),
             "send_enabled": False,
@@ -901,6 +915,7 @@ def _eval_score_template_payload(
         "eval_thread_reply": _eval_thread_reply_guidance(
             case_id=case_id,
             run_id=run_id,
+            agent=agent,
             dashboard_case_url=case_dashboard.get("dashboard_case_url", ""),
         ),
         "slack_channel_id": "C0BA17Y9C01",
@@ -1030,6 +1045,8 @@ def _eval_status_payload(
         "eval_thread_reply": _eval_thread_reply_guidance(
             case_id=case_id,
             run_id=str(latest_run.get("run_id") or ""),
+            agent=str(latest_run.get("agent") or ""),
+            slack_thread_ts=str(latest_run.get("slack_thread_ts") or ""),
             dashboard_case_url=case_dashboard.get("dashboard_case_url", ""),
             review_case_url=review_case.get("review_case_url", ""),
         ),
@@ -1165,22 +1182,92 @@ def _eval_thread_reply_guidance(
     *,
     case_id: str,
     run_id: str = "",
+    agent: str = "",
+    slack_thread_ts: str = "",
     dashboard_case_url: str = "",
     review_case_url: str = "",
 ) -> dict[str, object]:
     guidance = {
         "scorecard_request": "@KNI can you give me a scorecard for this eval?",
+        "orchestrator_judge_action": "Score with Orchestrator Judge",
+        "orchestrator_judge_effect": (
+            "When enabled, fills the same backend review form for the saved #evals Slack output "
+            "and refreshes dashboard scoring/database/analysis."
+        ),
         "submit_evaluation_action": "Submit Evaluation",
         "submit_evaluation_effect": "Writes scores and human notes to the local eval database, then refreshes dashboard views.",
         "refresh_targets": ["overview", "database", "runs_scoring", "analysis"],
         "case_id": case_id,
         "run_id": run_id,
+        "slack_actions": _eval_slack_actions_for_thread(
+            case_id=case_id,
+            run_id=run_id,
+            agent=agent,
+            slack_thread_ts=slack_thread_ts,
+            dashboard_case_url=dashboard_case_url,
+            review_case_url=review_case_url,
+        ),
     }
     if dashboard_case_url:
         guidance["dashboard_case_url"] = dashboard_case_url
     if review_case_url:
         guidance["review_case_url"] = review_case_url
     return {key: value for key, value in guidance.items() if value}
+
+
+def _eval_slack_actions_for_thread(
+    *,
+    case_id: str,
+    run_id: str = "",
+    agent: str = "",
+    slack_thread_ts: str = "",
+    dashboard_case_url: str = "",
+    review_case_url: str = "",
+) -> list[dict[str, Any]]:
+    case_id = " ".join(str(case_id or "").strip().split())
+    run_id = " ".join(str(run_id or "").strip().split())
+    agent = " ".join(str(agent or "").strip().split())
+    slack_thread_ts = " ".join(str(slack_thread_ts or "").strip().split())
+    dashboard_case_url = str(dashboard_case_url or "").strip()
+    review_case_url = str(review_case_url or "").strip()
+    if not case_id:
+        return []
+    eval_record = {
+        "case_id": case_id,
+        "run_id": run_id,
+        "agent": agent,
+        "slack_thread_ts": slack_thread_ts,
+        "dashboard_case_url": dashboard_case_url,
+        "review_case_url": review_case_url,
+    }
+    metadata = {"eval_record": eval_record}
+    actions = [
+        {
+            "label": "Submit Evaluation",
+            "action_id": KBA_EVAL_REVIEW,
+            "intent": KBA_INTENT_EVAL_REVIEW,
+            "style": "primary",
+            "value": business_agent_action_value(
+                intent=KBA_INTENT_EVAL_REVIEW,
+                metadata=metadata,
+            ),
+            "metadata": metadata,
+        }
+    ]
+    if run_id and slack_thread_ts:
+        actions.append(
+            {
+                "label": "Score with Orchestrator Judge",
+                "action_id": KBA_EVAL_ORCHESTRATOR_JUDGE,
+                "intent": KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE,
+                "value": business_agent_action_value(
+                    intent=KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE,
+                    metadata=metadata,
+                ),
+                "metadata": metadata,
+            }
+        )
+    return actions
 
 
 def _ask_live_sdk_enabled(args: argparse.Namespace) -> bool:
@@ -1721,8 +1808,17 @@ def _record_eval_slack_run_if_requested(
             visible_source_count=int(evidence.get("visible_source_count") or 0),
             sdk_estimated_cost_usd=evidence.get("sdk_estimated_cost_usd"),
             sdk_cache_hit_rate=evidence.get("sdk_cache_hit_rate"),
+            duration_ms=evidence.get("duration_ms"),
             response_hash=str(evidence.get("response_hash") or ""),
             evidence=evidence,
+            prompt_versions=[
+                item for item in evidence.get("prompt_versions") or [] if isinstance(item, dict)
+            ],
+            prompt_metadata=(
+                evidence.get("prompt_metadata")
+                if isinstance(evidence.get("prompt_metadata"), dict)
+                else {}
+            ),
             model_provider=str(evidence.get("model_provider") or ""),
             model_name=str(evidence.get("model_name") or ""),
             run_mode=str(evidence.get("run_mode") or ""),
@@ -1763,6 +1859,8 @@ def _record_eval_slack_run_if_requested(
         "eval_thread_reply": _eval_thread_reply_guidance(
             case_id=case_id,
             run_id=run_id,
+            agent=agent,
+            slack_thread_ts=slack_context.get("thread_ts", ""),
             dashboard_case_url=case_dashboard.get("dashboard_case_url", ""),
             review_case_url=review_case.get("review_case_url", ""),
         ),
@@ -1837,12 +1935,29 @@ def _cli_slack_eval_evidence(
         if isinstance(result_payload.get("retrieval"), dict)
         else {}
     )
+    duration_ms = _number_or_none(
+        result_payload.get("duration_ms")
+        or result_payload.get("elapsed_ms")
+        or result_payload.get("runtime_ms")
+    )
+    slack_channel_id = str(slack_context_payload.get("channel_id") or "")
+    slack_channel_name = str(slack_context_payload.get("channel_name") or "")
+    slack_thread_ts = str(slack_context_payload.get("thread_ts") or "")
     evidence = {
         "schema": "keystone.slack.eval_evidence.v1",
         "source": "cli_slack_context",
         "work_item_id": str(run_id or work_item.get("id") or ""),
         "route": str(result_payload.get("route") or ""),
         "status": str(result_payload.get("status") or ""),
+        "slack_channel_id": slack_channel_id,
+        "slack_channel_name": slack_channel_name,
+        "slack_thread_ts": slack_thread_ts,
+        "slack_context": {
+            "channel_id": slack_channel_id,
+            "channel_name": slack_channel_name,
+            "thread_ts": slack_thread_ts,
+            "permalink_present": bool(slack_context_payload.get("permalink")),
+        },
         "context_policy": str(
             slack_context.get("prompt_context_layout")
             or slack_context.get("channel_history_policy")
@@ -1866,6 +1981,12 @@ def _cli_slack_eval_evidence(
             sdk_cost.get("estimated_usd") or sdk_cost.get("amount_usd")
         ),
         "sdk_cache_hit_rate": _number_or_none(sdk_usage.get("cache_hit_rate")),
+        "duration_ms": duration_ms,
+        "time_to_response_ms": duration_ms,
+        "execution": {
+            "duration_ms": duration_ms,
+            "time_to_response_ms": duration_ms,
+        },
         "response_hash": _hash_text(summary) if summary else "",
         "response_summary_chars": len(summary),
         "model_provider": str(model.get("provider") or ""),
@@ -1875,7 +1996,24 @@ def _cli_slack_eval_evidence(
         "search_provider_sequence": [
             str(item) for item in retrieval.get("search_provider_sequence") or []
         ],
+        "prompt_versions": _trace_prompt_versions(result_payload),
+        "prompt_metadata": {
+            "source": "cli_slack_context_eval_save",
+            "route": str(result_payload.get("route") or ""),
+            "status": str(result_payload.get("status") or ""),
+            "work_item_id": str(run_id or work_item.get("id") or ""),
+        },
     }
+    tool_summary = _trace_tool_summary_from_payload(result_payload)
+    if tool_summary:
+        evidence["tool_summary"] = tool_summary
+    orchestrator_summary = _trace_orchestrator_summary_from_payload(result_payload)
+    if orchestrator_summary.get("orchestrator"):
+        evidence["orchestrator"] = orchestrator_summary["orchestrator"]
+    if orchestrator_summary.get("orchestrator_preflight"):
+        evidence["orchestrator_preflight"] = orchestrator_summary["orchestrator_preflight"]
+    if orchestrator_summary.get("orchestrator_review"):
+        evidence["orchestrator_review"] = orchestrator_summary["orchestrator_review"]
     blocker_diagnostics = slack_eval_blocker_diagnostics(result_payload)
     if blocker_diagnostics:
         evidence["blocker_diagnostics"] = blocker_diagnostics
@@ -1892,6 +2030,135 @@ def _latest_event_metadata(payload: dict[str, Any], key: str) -> dict[str, Any]:
         if value:
             candidates.append(value)
     return candidates[-1] if candidates else {}
+
+
+def _trace_prompt_versions(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("prompt_versions", "prompt_config_versions"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value[:20] if isinstance(item, dict)]
+    return []
+
+
+def _trace_tool_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    existing = payload.get("tool_summary") if isinstance(payload.get("tool_summary"), dict) else {}
+    if existing:
+        return existing
+    tooling = payload.get("tooling") if isinstance(payload.get("tooling"), dict) else {}
+    if tooling:
+        return tooling
+    counts: dict[str, int] = {}
+    failures: dict[str, int] = {}
+    statuses: dict[str, set[str]] = {}
+    for event in payload.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        event_type = str(event.get("event_type") or event.get("type") or "").lower()
+        name = _clean_eval_scalar(
+            metadata.get("tool_name")
+            or metadata.get("tool")
+            or metadata.get("function_name")
+            or event.get("tool_name")
+            or event.get("name")
+            or ("unknown_tool" if "tool" in event_type or "function" in event_type else "")
+        )
+        if not name:
+            continue
+        status = _clean_eval_scalar(metadata.get("status") or event.get("status") or "")
+        failed = bool(
+            metadata.get("error")
+            or metadata.get("error_type")
+            or status.lower() in {"error", "failed", "failure", "timeout"}
+        )
+        counts[name] = counts.get(name, 0) + 1
+        if status:
+            statuses.setdefault(name, set()).add(status.lower())
+        if failed:
+            failures[name] = failures.get(name, 0) + 1
+    if not counts:
+        return {}
+    return {
+        "tool_call_count": sum(counts.values()),
+        "failed_tool_call_count": sum(failures.values()),
+        "tool_names": sorted(counts)[:20],
+        "tool_call_summary": [
+            {
+                "name": name,
+                "count": counts[name],
+                "failed_count": failures.get(name, 0),
+                "status": "failed"
+                if failures.get(name, 0)
+                else (sorted(statuses.get(name, set()))[-1] if statuses.get(name) else "observed"),
+            }
+            for name in sorted(counts)[:20]
+        ],
+    }
+
+
+def _trace_orchestrator_summary_from_payload(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    preflight = (
+        payload.get("orchestrator_preflight")
+        if isinstance(payload.get("orchestrator_preflight"), dict)
+        else {}
+    )
+    review = (
+        payload.get("orchestrator_review")
+        if isinstance(payload.get("orchestrator_review"), dict)
+        else {}
+    )
+    blockers = payload.get("blockers") if isinstance(payload.get("blockers"), list) else []
+    feedback = payload.get("operator_feedback_requests")
+    if not isinstance(feedback, list):
+        feedback = []
+    preflight_blocker_count = _safe_count(
+        preflight.get("blocker_count") or preflight.get("preflight_blocker_count")
+    )
+    review_feedback_count = _safe_count(
+        review.get("feedback_count") or review.get("review_feedback_count")
+    )
+    result: dict[str, dict[str, Any]] = {}
+    orchestrator = {
+        "preflight": bool(preflight),
+        "review": bool(review),
+        "blocker_count": preflight_blocker_count or len(blockers),
+        "feedback_count": review_feedback_count or len(feedback),
+        "selected_route": _clean_eval_scalar(
+            preflight.get("selected_route")
+            or preflight.get("route")
+            or payload.get("route")
+            or ""
+        ),
+        "review_status": _clean_eval_scalar(review.get("status") or review.get("review_status") or ""),
+    }
+    if any(orchestrator.values()):
+        result["orchestrator"] = orchestrator
+    if preflight:
+        result["orchestrator_preflight"] = {
+            "blocker_count": orchestrator["blocker_count"],
+            "selected_route": orchestrator["selected_route"],
+            "has_preflight": True,
+        }
+    if review:
+        result["orchestrator_review"] = {
+            "feedback_count": orchestrator["feedback_count"],
+            "review_status": orchestrator["review_status"],
+            "has_review": True,
+        }
+    return result
+
+
+def _clean_eval_scalar(value: Any) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    return text if len(text) <= 96 else f"{text[:93].rstrip()}..."
+
+
+def _safe_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _number_or_none(value: Any) -> float | None:
@@ -2076,6 +2343,13 @@ def _print_ask_dry_run(
         if chief_of_staff_output
         else None
     )
+    output_type = (
+        type(context_agent_output).__name__
+        if context_agent_output is not None
+        else type(chief_of_staff_output).__name__
+        if chief_of_staff_output is not None
+        else ""
+    )
     status = (
         "blocked"
         if context_agent_output is not None and _context_agent_output_has_blockers(output_payload)
@@ -2092,6 +2366,7 @@ def _print_ask_dry_run(
         "send_enabled": False,
         "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
         "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+        "output_type": output_type,
         "output": output_payload,
         "human_summary": _context_agent_human_summary(output_payload)
         if context_agent_output is not None
@@ -2135,6 +2410,9 @@ def _print_ask_dry_run(
                 else "Target channel: clarify"
             )
             print(f"Slack post allowed: {chief_of_staff_output.slack_post_allowed}")
+        if context_agent_output is not None and payload["human_summary"]:
+            print()
+            print(payload["human_summary"])
         print("Mode: dry_run")
         print("Send enabled: False")
         print(payload["note"])
@@ -2145,7 +2423,14 @@ def _context_agent_dry_run_output(
     route: str,
     input_text: str,
     manual_plan: ManualRequestPlan | None,
-) -> AirtableContextResult | GoogleWorkspaceContextResult | ZoteroContextResult | None:
+) -> (
+    AirtableContextResult
+    | GoogleWorkspaceContextResult
+    | PreprintsContextResult
+    | RssContextResult
+    | ZoteroContextResult
+    | None
+):
     """Return deterministic no-API context-agent output for direct dry-run evals."""
 
     blocked = _context_agent_request_is_blocked(input_text)
@@ -2155,9 +2440,12 @@ def _context_agent_dry_run_output(
         else input_text.strip().strip('"')
     )
     if route == "airtable_context_agent":
+        topic_terms = _airtable_context_topic_terms(objective)
+        finance_tax_focus = _airtable_context_is_finance_tax_request(topic_terms, objective)
+        eval_tracker_focus = _airtable_context_is_eval_tracker_request(topic_terms, objective)
         blockers = (
             [
-                "Missing Airtable record id, field mapping, and approval reference for base alias eval_tracker and table Eval tracker."
+                "Missing Airtable record id, field mapping, and approval reference for the requested base/table."
             ]
             if blocked
             else []
@@ -2165,46 +2453,57 @@ def _context_agent_dry_run_output(
         return AirtableContextResult(
             mode="deterministic",
             summary=(
-                "Airtable read-only context: base alias eval_tracker and table Eval tracker "
-                "need metadata and schema mapping for Promptfoo case id, Slack run id, "
-                "human reviewer, missing evidence, and next follow-up. Record identity "
-                "must be confirmed before any Chief-owned write; approval needs and "
-                "no-write boundaries stay explicit."
+                _airtable_context_summary(topic_terms, objective)
             )
             if not blocked
             else (
-                "Airtable blocker: for base alias eval_tracker and table Eval tracker, record "
-                "id, field mapping, and approval reference are required before Chief of Staff "
-                "can approve any tracker write."
+                "Airtable blocker: record id, field mapping, and approval reference are "
+                "required before Chief of Staff can approve any Airtable write."
             ),
-            base_alias="eval_tracker",
-            relevant_tables=["Eval tracker"],
-            relevant_fields=[
-                "Promptfoo case id",
-                "Slack run id",
-                "human reviewer",
-                "missing evidence",
-                "next follow-up",
-            ],
-            recommended_record_identity=(
-                "Match on Promptfoo case id plus Slack run id; ask for record id when absent."
+            base_alias=(
+                "finance_tax_tracker"
+                if finance_tax_focus
+                else "eval_tracker"
+                if eval_tracker_focus
+                else "requested_airtable_base"
             ),
+            relevant_tables=[
+                "Tax Payments"
+            ] if finance_tax_focus else ["Eval tracker"] if eval_tracker_focus else ["requested table"],
+            relevant_fields=_airtable_context_field_hints(topic_terms, objective),
+            recommended_record_identity=_airtable_context_record_identity(topic_terms, objective),
             recommended_actions=[
                 "Read Airtable schema before records.",
-                "Return candidate record identity questions.",
+                "Use exact table and field names before interpreting records.",
                 "Keep all Airtable writes Chief-owned and approval gated.",
             ],
             write_plan=OperationalWritePlan(
                 target_system="airtable",
                 operation="chief_owned_update_after_approval",
-                target="Eval tracker record",
-                scope="case status, reviewer, evidence gap, next follow-up fields",
+                target="Airtable record selected after schema and record identity are confirmed",
+                scope="read-only context handoff unless a separate approved write is provided",
                 field_mapping=[
-                    OperationalContextEntry(key="case_id", value="Promptfoo case id"),
-                    OperationalContextEntry(key="run_id", value="Slack run id"),
-                    OperationalContextEntry(key="reviewer", value="human reviewer"),
-                    OperationalContextEntry(key="evidence_gap", value="missing evidence"),
-                    OperationalContextEntry(key="next_follow_up", value="next follow-up"),
+                    OperationalContextEntry(
+                        key="base_alias",
+                        value=(
+                            "finance_tax_tracker"
+                            if finance_tax_focus
+                            else "eval_tracker"
+                            if eval_tracker_focus
+                            else "requested base"
+                        ),
+                    ),
+                    OperationalContextEntry(
+                        key="table",
+                        value=(
+                            "Tax Payments"
+                            if finance_tax_focus
+                            else "Eval tracker"
+                            if eval_tracker_focus
+                            else "requested table"
+                        ),
+                    ),
+                    OperationalContextEntry(key="filter", value=_airtable_context_record_identity(topic_terms, objective)),
                 ],
                 rationale="Specialist is read-only; Chief of Staff owns any approved write.",
             ),
@@ -2214,20 +2513,37 @@ def _context_agent_dry_run_output(
                 "Confirmed base/table/record identity",
             ],
             human_work_context=HumanWorkContext(
-                work_functions=["eval tracking", "human review coordination"],
+                work_functions=_airtable_context_work_functions(topic_terms, objective),
                 human_owner_hint="Chief of Staff",
-                decision_needed="Confirm exact Airtable target before any write.",
-                handoff_ready_context=["schema mapping", "record identity questions"],
-                missing_context=blockers,
+                decision_needed="Confirm exact Airtable base, table, schema, and record identity before any write.",
+                handoff_ready_context=["schema mapping", "record identity questions", "read-only result limits"],
+                missing_context=[*blockers, "live Airtable schema and record reads"],
                 integration_surfaces=["Airtable"],
-                follow_up_actions=["request scoped approval", "confirm target record"],
+                follow_up_actions=["run live read if record values are needed", "confirm target record"],
             ),
+            sources=[
+                OperationalContextSource(
+                    source_id="dry_run_airtable_context",
+                    title="Dry-run Airtable context boundary",
+                    source_type="dry_run_context",
+                    location="local KBA CLI",
+                    note=(
+                        "Useful references require live Airtable schema/record reads; this "
+                        "dry-run proves route, topic focus, no-write boundaries, and output shape."
+                    ),
+                )
+            ],
             diagnostics=[
                 OperationalContextEntry(key="dry_run", value="true"),
                 OperationalContextEntry(key="objective", value=objective),
             ],
         )
     if route == "google_workspace_context_agent":
+        topic_terms = _workspace_context_topic_terms(objective)
+        eval_artifact_focus = _workspace_context_is_eval_artifact_request(topic_terms, objective)
+        topic_focus = (
+            ", ".join(topic_terms[:4]) if topic_terms else "the requested Workspace context"
+        )
         blockers = (
             [
                 "Missing Drive folder id, document id, Sheet tab, approval reference, and sharing scope."
@@ -2238,37 +2554,56 @@ def _context_agent_dry_run_output(
         return GoogleWorkspaceContextResult(
             mode="deterministic",
             summary=(
-                "Google Workspace read-only context: use Drive folder KNI Ops / Evals for "
-                "artifact placement, Doc Slack eval review narrative for review notes, and "
-                "Eval tracker Sheet for eval tracking metadata. Use a naming convention tied "
-                "to case id/run id. Approval and no-write blockers must be resolved before "
-                "creating, editing, sharing, or commenting."
+                (
+                    "Google Workspace read-only context dry-run recognized KNI Ops / Evals "
+                    "artifact placement for the Slack eval review narrative Doc and Eval "
+                    "tracker Sheet. It returns candidate folder, Doc purpose, Sheet tab "
+                    "purpose, naming convention, approval needs, and no-write blockers. "
+                )
+                if eval_artifact_focus
+                else (
+                    "Google Workspace read-only context dry-run recognized the requested focus on "
+                    f"{topic_focus}. "
+                )
+            )
+            + (
+                "Drive folders, Docs, Sheets, permissions, and file contents were not read "
+                "in this dry-run; use the live Workspace context path before naming specific "
+                "files or relying on document contents."
             )
             if not blocked
             else (
-                "Google Workspace blocker: for Drive folder KNI Ops / Evals, Slack eval review "
-                "narrative, and Eval tracker Sheet, folder id, document id, Sheet tab, sharing "
-                "scope, and approval reference are required before any Drive, Doc, or Sheet write."
+                (
+                    "Google Workspace blocker for KNI Ops / Evals, Slack eval review "
+                    "narrative, and Eval tracker Sheet: folder id, document id, Sheet tab, "
+                    "sharing scope, and approval reference are required before any Drive, "
+                    "Doc, or Sheet write."
+                )
+                if eval_artifact_focus
+                else (
+                    "Google Workspace blocker: folder id, document id, Sheet tab, sharing scope, "
+                    "and approval reference are required before any Drive, Doc, or Sheet write."
+                )
             ),
-            relevant_folders=["KNI Ops / Evals"],
-            relevant_docs=["Slack eval review narrative"],
-            relevant_sheets=["Eval tracker Sheet tab"],
-            recommended_target="KNI Ops / Evals / Slack eval review",
+            relevant_folders=_workspace_context_folder_hints(topic_terms),
+            relevant_docs=_workspace_context_doc_hints(topic_terms),
+            relevant_sheets=_workspace_context_sheet_hints(topic_terms),
+            recommended_target=_workspace_context_recommended_target(topic_terms),
             recommended_actions=[
-                "List scoped Drive folder before selecting an artifact home.",
-                "Read existing Doc or Sheet context before proposing changes.",
+                "List scoped Drive folder before selecting a handoff source.",
+                "Read existing Doc or Sheet context before naming specific files.",
                 "Keep all Workspace writes Chief-owned and approval gated.",
             ],
             write_plan=OperationalWritePlan(
                 target_system="google_workspace",
                 operation="chief_owned_artifact_update_after_approval",
-                target="Drive folder, review Doc, or tracker Sheet",
-                scope="artifact placement, narrative notes, tracker row, naming convention",
+                target="Drive folder, Doc, or Sheet selected after live read",
+                scope="internal handoff context, source notes, and optional tracker metadata",
                 field_mapping=[
                     OperationalContextEntry(key="folder", value="candidate Drive folder"),
-                    OperationalContextEntry(key="doc", value="review narrative Doc"),
-                    OperationalContextEntry(key="sheet_tab", value="eval tracker tab"),
-                    OperationalContextEntry(key="name", value="case id and run id naming convention"),
+                    OperationalContextEntry(key="doc", value="candidate handoff or SOP Doc"),
+                    OperationalContextEntry(key="sheet_tab", value="candidate tracker tab if relevant"),
+                    OperationalContextEntry(key="name", value="target-specific naming convention"),
                 ],
                 rationale="Specialist is read-only; Chief of Staff owns any approved Workspace write.",
             ),
@@ -2278,39 +2613,67 @@ def _context_agent_dry_run_output(
                 "Confirmed folder/file/tab identity and sharing scope",
             ],
             human_work_context=HumanWorkContext(
-                work_functions=["artifact governance", "eval reporting"],
+                work_functions=_workspace_context_work_functions(topic_terms),
                 human_owner_hint="Chief of Staff",
-                decision_needed="Confirm artifact home and sharing scope.",
-                handoff_ready_context=["Drive candidate", "Doc purpose", "Sheet tab purpose"],
-                missing_context=blockers,
+                decision_needed="Confirm source folder/file and sharing scope before using Workspace context.",
+                handoff_ready_context=["topic focus", "candidate folder/doc hints"],
+                missing_context=[*blockers, "live Workspace file listing and content reads"],
                 integration_surfaces=["Google Drive", "Google Docs", "Google Sheets"],
-                follow_up_actions=["request scoped approval", "confirm artifact target"],
+                follow_up_actions=["run live read if file evidence is needed", "confirm artifact target"],
             ),
+            sources=[
+                OperationalContextSource(
+                    source_id="dry_run_google_workspace_context",
+                    title="Dry-run Google Workspace context boundary",
+                    source_type="dry_run_context",
+                    location="local KBA CLI",
+                    note=(
+                        "Useful references require live Workspace reads; this dry-run proves "
+                        "route, topic focus, no-write boundaries, and output shape."
+                    ),
+                )
+            ],
             diagnostics=[
                 OperationalContextEntry(key="dry_run", value="true"),
                 OperationalContextEntry(key="objective", value=objective),
             ],
         )
     if route == "zotero_context_agent":
+        topic_terms = _zotero_context_topic_terms(objective)
+        validation_focus = _zotero_context_is_validation_collection_request(topic_terms, objective)
+        topic_focus = ", ".join(topic_terms[:4]) if topic_terms else "the requested Zotero topic"
         return ZoteroContextResult(
             mode="deterministic",
             summary=(
-                "Zotero read-only context: KNI collections for behavioral-health AI validation need "
-                "collection criteria and article metadata including title, authors, year, DOI, "
-                "URL, validation evidence, measurement-based care, implementation science, "
-                "source-quality caveats, citation gaps, and next verification steps for "
-                "behavioral-health AI eval prompts."
+                (
+                    "Zotero read-only context dry-run recognized the behavioral-health AI "
+                    "validation collection criteria, including title, authors, year, DOI, "
+                    "URL, validation evidence, measurement-based care, implementation "
+                    "science, source-quality caveats, citation gaps, and next verification "
+                    "steps. "
+                )
+                if validation_focus
+                else (
+                    "Zotero read-only context dry-run recognized the requested focus on "
+                    f"{topic_focus}. "
+                )
+            )
+            + (
+                "Local item-level titles, authors, years, DOIs, URLs, full text, and "
+                "collection membership were not read in this dry-run; use the live/local "
+                "Zotero context path before citing specific sources."
             ),
             library_context="KNI Zotero collections in the Keystone research library",
             collection_hints=[
-                "KNI collections",
-                "behavioral-health AI validation",
-                "measurement-based care",
-                "implementation science",
+                *(["behavioral-health AI validation"] if validation_focus else []),
+                *(topic_terms[:4] or ["requested Zotero topic"]),
+                "foundational reviews",
+                "psychiatry background literature",
             ],
             relevant_evidence=[
-                "Prioritize validation evidence over vendor claims.",
-                "Flag source-quality caveats and citation gaps.",
+                "Use collection metadata before citing individual items.",
+                "Treat item-level bibliographic facts as unverified until local Zotero records are read.",
+                "Flag missing full text, citation gaps, and source-quality caveats before external use.",
             ],
             recommended_artifact_plan=OperationalWritePlan(
                 target_system="google_workspace",
@@ -2321,8 +2684,8 @@ def _context_agent_dry_run_output(
             ),
             recommended_actions=[
                 "Search collection metadata before citing items.",
-                "Separate validation evidence from implementation context.",
-                "Return citation gaps and next verification steps.",
+                "Return collection and item identifiers only after local Zotero records are read.",
+                "Keep this pass read-only and preserve citation-gap caveats.",
             ],
             approval_needs=[
                 "Scoped approval before creating any Workspace artifact from Zotero context"
@@ -2332,9 +2695,156 @@ def _context_agent_dry_run_output(
                 human_owner_hint="Chief of Staff",
                 decision_needed="Confirm which evidence packet should use the Zotero criteria.",
                 handoff_ready_context=["collection criteria", "citation gaps"],
-                missing_context=[],
+                missing_context=["live/local item-level Zotero evidence"],
                 integration_surfaces=["Zotero", "Google Workspace"],
                 follow_up_actions=["verify citations", "request artifact approval if needed"],
+            ),
+            sources=[
+                OperationalContextSource(
+                    source_id="dry_run_zotero_context",
+                    title="Dry-run Zotero context boundary",
+                    source_type="dry_run_context",
+                    location="local KBA CLI",
+                    note=(
+                        "Useful references require local item reads; this dry-run proves "
+                        "route, topic focus, no-write boundaries, and output shape."
+                    ),
+                )
+            ],
+            diagnostics=[
+                OperationalContextEntry(key="dry_run", value="true"),
+                OperationalContextEntry(key="objective", value=objective),
+            ],
+        )
+    if route == "rss_context_agent":
+        topic_terms = _feed_context_topic_terms(objective)
+        topic_focus = (
+            ", ".join(topic_terms[:4]) if topic_terms else "the requested announcement topic"
+        )
+        return RssContextResult(
+            mode="deterministic",
+            summary=(
+                "RSS/#announcements read-only context: use recent announcement history to "
+                f"inspect {topic_focus}; identify recurring operational themes, partnership signals, clinical "
+                "validation hooks, and follow-up monitoring queries. No feed item is "
+                "published, posted, edited, or written externally in dry-run mode."
+            ),
+            query=objective,
+            frontier_summary=(
+                "Dry-run context is suitable for routing and handoff checks for "
+                f"{topic_focus}; use live SDK plus the announcement-history tool for "
+                "source-specific item summaries."
+            ),
+            recurring_themes=[
+                *topic_terms[:4],
+                "AI policy and operational readiness",
+                "payer/provider workflow signals",
+                "clinical validation and implementation evidence",
+            ],
+            evidence_gaps=[
+                "Evidence gaps remain because dry-run mode does not read item-level announcement titles, dates, URLs, or extracted page text."
+            ],
+            opportunity_signals=[
+                "Potential internal monitoring topics should be confirmed against retrieved feed items."
+            ],
+            future_directions=[
+                "Run the live RSS context agent when item-level titles, dates, and source URLs are needed."
+            ],
+            recommended_actions=[
+                "Keep the pass read-only.",
+                "Return Answer and Detailed Summary separately.",
+                "Escalate to Chief of Staff only after item-level evidence is available.",
+            ],
+            approval_needs=[
+                "Separate approval is required before creating Workspace artifacts or posting summaries."
+            ],
+            sources=[
+                OperationalContextSource(
+                    source_id="dry_run_rss_context",
+                    title="Dry-run RSS context boundary",
+                    source_type="dry_run_context",
+                    location="local KBA CLI",
+                    note=(
+                        "Useful references require live item reads; this dry-run proves "
+                        "route, topic focus, no-write boundaries, and output shape."
+                    ),
+                )
+            ],
+            human_work_context=HumanWorkContext(
+                work_functions=["announcement monitoring", "operations context"],
+                human_owner_hint="Chief of Staff",
+                decision_needed="Confirm whether item-level RSS evidence is needed.",
+                handoff_ready_context=["theme scan", "monitoring-query suggestions"],
+                missing_context=[],
+                integration_surfaces=["RSS", "Slack announcements"],
+                follow_up_actions=["run live context read if evidence is needed"],
+            ),
+            diagnostics=[
+                OperationalContextEntry(key="dry_run", value="true"),
+                OperationalContextEntry(key="objective", value=objective),
+            ],
+        )
+    if route == "preprints_context_agent":
+        topic_terms = _feed_context_topic_terms(objective)
+        topic_focus = ", ".join(topic_terms[:4]) if topic_terms else "the requested preprint topic"
+        return PreprintsContextResult(
+            mode="deterministic",
+            summary=(
+                "Preprints/#knowledge-hub read-only context: use recent preprint history "
+                f"to inspect {topic_focus}; identify research themes, psychiatry or clinical AI frontiers, evidence "
+                "gaps, and monitoring directions. Dry-run mode does not fetch, publish, "
+                "post, save, or modify any external artifact."
+            ),
+            query=objective,
+            frontier_summary=(
+                "Dry-run context is suitable for route validation for "
+                f"{topic_focus}; use live SDK plus the preprint-history tool for "
+                "item-level paper context."
+            ),
+            recurring_themes=[
+                *topic_terms[:4],
+                "clinical AI validation methods",
+                "psychiatry and behavioral-health evidence",
+                "measurement and implementation gaps",
+            ],
+            research_frontiers=[
+                "Source-backed preprint synthesis requires retrieved item titles, dates, and URLs."
+            ],
+            evidence_gaps=[
+                "Preliminary evidence remains unverified until item-level preprint titles, dates, URLs, and source text are read.",
+                "No item-level preprint evidence was read in dry-run mode."
+            ],
+            future_directions=[
+                "Run the live preprints context agent for bounded paper/item summaries."
+            ],
+            recommended_actions=[
+                "Keep the pass read-only.",
+                "Separate Answer, Detailed Summary, and Useful references in Slack output.",
+                "Ask for live item reads before using this externally.",
+            ],
+            approval_needs=[
+                "Separate approval is required before creating evidence packets or Workspace artifacts."
+            ],
+            sources=[
+                OperationalContextSource(
+                    source_id="dry_run_preprints_context",
+                    title="Dry-run preprints context boundary",
+                    source_type="dry_run_context",
+                    location="local KBA CLI",
+                    note=(
+                        "Useful references require live item reads; this dry-run proves "
+                        "route, topic focus, preliminary-evidence caveats, and output shape."
+                    ),
+                )
+            ],
+            human_work_context=HumanWorkContext(
+                work_functions=["research monitoring", "evidence triage"],
+                human_owner_hint="Chief of Staff",
+                decision_needed="Confirm whether item-level preprint evidence is needed.",
+                handoff_ready_context=["theme scan", "evidence-gap summary"],
+                missing_context=["live item-level preprint evidence"],
+                integration_surfaces=["preprint feeds", "knowledge hub"],
+                follow_up_actions=["run live context read if evidence is needed"],
             ),
             diagnostics=[
                 OperationalContextEntry(key="dry_run", value="true"),
@@ -2342,6 +2852,459 @@ def _context_agent_dry_run_output(
             ],
         )
     return None
+
+
+_FEED_CONTEXT_TOPIC_PHRASES = (
+    "adolescent depression",
+    "digital phenotyping",
+    "wearable-sensor monitoring",
+    "wearable sensor monitoring",
+    "clinical AI validation",
+    "remote monitoring implementation",
+    "operations dashboard governance",
+    "remote monitoring",
+    "remote-monitoring adherence",
+    "dashboard review",
+    "digital psychiatry",
+    "biomarkers",
+    "depression measurement",
+    "preliminary evidence",
+    "physical-therapy",
+    "exercise-adherence",
+)
+_ZOTERO_CONTEXT_TOPIC_PHRASES = (
+    "psychiatric diagnosis",
+    "foundational depression",
+    "depression review",
+    "depression reviews",
+    "digital psychiatry",
+    "psychiatry background",
+    "biomarkers",
+    "rdoc",
+    "measurement-based care",
+    "implementation science",
+    "clinical AI validation",
+)
+_WORKSPACE_CONTEXT_TOPIC_PHRASES = (
+    "internal onboarding",
+    "operations sop",
+    "operations sops",
+    "new collaborator",
+    "chief of staff handoff",
+    "lightweight handoff",
+    "artifact governance",
+    "eval tracking",
+    "review notes",
+    "drive context",
+)
+_AIRTABLE_CONTEXT_TOPIC_PHRASES = (
+    "2026 finance & tax tracker",
+    "finance & tax tracker",
+    "finance and tax tracker",
+    "tax payments",
+    "estimated tax period 2",
+    "estimated tax periods",
+    "period 2 payment records",
+    "period 2 payments",
+    "q2 rolling taxes summary",
+    "rolling taxes summary",
+    "payment evidence",
+    "payment date",
+)
+_FEED_CONTEXT_STOPWORDS = frozenset(
+    {
+        "agent",
+        "announcement",
+        "announcements",
+        "answer",
+        "available",
+        "bounded",
+        "brief",
+        "case",
+        "concise",
+        "context",
+        "create",
+        "detailed",
+        "elsewhere",
+        "diagnostic",
+        "dry-run",
+        "draft",
+        "externally",
+        "eval",
+        "evidence",
+        "external",
+        "export",
+        "feed",
+        "feeds",
+        "file",
+        "files",
+        "handoff",
+        "historical",
+        "history",
+        "human-useful",
+        "inspect",
+        "local",
+        "live",
+        "monitoring",
+        "mutate",
+        "publish",
+        "post",
+        "preprint",
+        "preprints",
+        "recent",
+        "read",
+        "read-only",
+        "refresh",
+        "relevant",
+        "research",
+        "records",
+        "return",
+        "rss",
+        "schedule",
+        "send",
+        "slack",
+        "summary",
+        "use",
+        "web",
+        "write",
+    }
+)
+
+
+def _workspace_context_topic_terms(request_text: str) -> list[str]:
+    lower = str(request_text or "").lower()
+    terms: list[str] = []
+    seen: set[str] = set()
+    for phrase in _WORKSPACE_CONTEXT_TOPIC_PHRASES:
+        phrase_lower = phrase.lower()
+        if phrase_lower in lower and phrase not in seen:
+            terms.append(phrase)
+            seen.add(phrase)
+    if len(terms) >= 2:
+        return terms[:8]
+    phrase_words = {
+        word
+        for phrase in terms
+        for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
+    }
+    workspace_stopwords = {
+        "google",
+        "workspace",
+        "drive",
+        "docs",
+        "sheets",
+        "browser",
+        "automation",
+        "records",
+        "available",
+        "lightweight",
+    }
+    for token in re.findall(r"[a-z][a-z0-9-]{5,}", lower):
+        if token in phrase_words:
+            continue
+        if token in _FEED_CONTEXT_STOPWORDS or token in workspace_stopwords or token in seen:
+            continue
+        if token.startswith("diag_") or token.startswith("2026"):
+            continue
+        terms.append(token)
+        seen.add(token)
+        if len(terms) >= 8:
+            break
+    return terms[:8]
+
+
+def _airtable_context_topic_terms(request_text: str) -> list[str]:
+    lower = str(request_text or "").lower()
+    terms: list[str] = []
+    seen: set[str] = set()
+    for phrase in _AIRTABLE_CONTEXT_TOPIC_PHRASES:
+        phrase_lower = phrase.lower()
+        if phrase_lower not in lower or phrase in seen:
+            continue
+        if any(phrase_lower in existing.lower() for existing in terms):
+            continue
+        terms = [existing for existing in terms if existing.lower() not in phrase_lower]
+        terms.append(phrase)
+        seen.add(phrase)
+    if len(terms) >= 3:
+        return terms[:8]
+    phrase_words = {
+        word
+        for phrase in terms
+        for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
+    }
+    airtable_stopwords = {
+        "airtable",
+        "browser",
+        "automation",
+        "context",
+        "diagnostic",
+        "schema",
+        "table",
+        "tools",
+        "available",
+        "records",
+        "record",
+        "read",
+        "read-only",
+        "return",
+        "concise",
+        "summary",
+        "references",
+        "blockers",
+        "caveats",
+        "create",
+        "update",
+        "delete",
+        "attach",
+        "export",
+        "write",
+        "send",
+        "schedule",
+        "publish",
+        "elsewhere",
+    }
+    for token in re.findall(r"[a-z][a-z0-9-]{4,}", lower):
+        if token in phrase_words:
+            continue
+        if token in _FEED_CONTEXT_STOPWORDS or token in airtable_stopwords or token in seen:
+            continue
+        if token.startswith("diag_") or token.startswith("2026"):
+            continue
+        terms.append(token)
+        seen.add(token)
+        if len(terms) >= 8:
+            break
+    return terms[:8]
+
+
+def _airtable_context_is_finance_tax_request(
+    topic_terms: list[str], request_text: str
+) -> bool:
+    haystack = " ".join([str(request_text or "").lower(), *[term.lower() for term in topic_terms]])
+    finance_markers = ("finance & tax", "finance and tax", "tax payments", "estimated tax")
+    return any(marker in haystack for marker in finance_markers)
+
+
+def _airtable_context_is_eval_tracker_request(
+    topic_terms: list[str], request_text: str
+) -> bool:
+    haystack = " ".join([str(request_text or "").lower(), *[term.lower() for term in topic_terms]])
+    return "eval_tracker" in haystack or "eval tracker" in haystack
+
+
+def _airtable_context_summary(topic_terms: list[str], request_text: str) -> str:
+    topic_focus = ", ".join(topic_terms[:4]) if topic_terms else "the requested Airtable context"
+    if _airtable_context_is_finance_tax_request(topic_terms, request_text):
+        return (
+            "Airtable read-only context dry-run recognized the requested focus on "
+            f"{topic_focus}. Airtable schema, records, attachments, and payment evidence "
+            "were not read in this dry-run; use the live Airtable context path before "
+            "confirming Period 2 payments, amounts, dates, or the Q2 Rolling Taxes Summary."
+        )
+    if _airtable_context_is_eval_tracker_request(topic_terms, request_text):
+        return (
+            "Airtable read-only context dry-run recognized base alias eval_tracker and "
+            "table Eval tracker. It returns schema mapping, record identity questions, "
+            "approval needs, and no-write blockers for Promptfoo case id, Slack run id, "
+            "human reviewer, missing evidence, and next follow-up. Schema, records, "
+            "attachments, and field values were not read in this dry-run; use the live "
+            "Airtable context path before relying on record data."
+        )
+    return (
+        "Airtable read-only context dry-run recognized the requested Airtable lookup focus "
+        f"on {topic_focus}. It returns schema mapping, record identity questions, approval "
+        "needs, and no-write blockers. Schema, records, attachments, and field values were "
+        "not read in this dry-run; use the live Airtable context path before relying on "
+        "record data."
+    )
+
+
+def _airtable_context_field_hints(topic_terms: list[str], request_text: str) -> list[str]:
+    if _airtable_context_is_finance_tax_request(topic_terms, request_text):
+        return [
+            "Payment Name",
+            "Estimated Tax Periods",
+            "Tax Type",
+            "Amount",
+            "Payment Date",
+            "Notes",
+            "Attachments",
+        ]
+    if _airtable_context_is_eval_tracker_request(topic_terms, request_text):
+        return [
+            "Promptfoo case id",
+            "Slack run id",
+            "human reviewer",
+            "missing evidence",
+            "next follow-up",
+            "analysis inclusion",
+            "record identifier",
+        ]
+    return ["requested schema fields", "record identifier", "status or note fields"]
+
+
+def _airtable_context_record_identity(topic_terms: list[str], request_text: str) -> str:
+    if _airtable_context_is_finance_tax_request(topic_terms, request_text):
+        return (
+            "Filter Tax Payments records where Estimated Tax Periods equals 2; include "
+            "IRS/PA Period 2 payment records and the Q2 Rolling Taxes Summary if present."
+        )
+    if _airtable_context_is_eval_tracker_request(topic_terms, request_text):
+        return (
+            "Confirm the Eval tracker record identity by Promptfoo case id plus Slack run id "
+            "before reading or proposing any Airtable update."
+        )
+    return "Confirm base, table, primary field, and record filter before reading records."
+
+
+def _airtable_context_work_functions(topic_terms: list[str], request_text: str) -> list[str]:
+    if _airtable_context_is_finance_tax_request(topic_terms, request_text):
+        return ["finance operations context", "tax payment record review"]
+    return ["structured record context", "Airtable schema review"]
+
+
+def _workspace_context_folder_hints(topic_terms: list[str]) -> list[str]:
+    if any("onboarding" in term or "sop" in term or "collaborator" in term for term in topic_terms):
+        return ["KNIOps", "KNIOps/Operations", "KNIOps/Communication"]
+    if any("eval" in term or "review" in term for term in topic_terms):
+        return ["KNI Ops / Evals", "KNIOps", "KNIOps/Artifacts"]
+    return ["KNIOps", "candidate scoped Drive folder"]
+
+
+def _workspace_context_doc_hints(topic_terms: list[str]) -> list[str]:
+    if any("onboarding" in term or "sop" in term or "collaborator" in term for term in topic_terms):
+        return ["onboarding or operations SOP Doc", "collaborator handoff Doc"]
+    if any("eval" in term or "review" in term for term in topic_terms):
+        return ["Slack eval review narrative", "artifact notes Doc"]
+    return ["candidate context Doc"]
+
+
+def _workspace_context_sheet_hints(topic_terms: list[str]) -> list[str]:
+    if any("eval" in term or "tracking" in term for term in topic_terms):
+        return ["Eval tracker Sheet", "Sheet tab"]
+    if any("onboarding" in term or "sop" in term or "collaborator" in term for term in topic_terms):
+        return ["collaborator tracker Sheet if available"]
+    return ["candidate tracker Sheet if relevant"]
+
+
+def _workspace_context_recommended_target(topic_terms: list[str]) -> str:
+    if any("onboarding" in term or "sop" in term or "collaborator" in term for term in topic_terms):
+        return "KNIOps Operations onboarding/SOP context"
+    if any("eval" in term or "review" in term for term in topic_terms):
+        return "KNI Ops / Evals artifact context"
+    return "scoped Google Workspace context"
+
+
+def _workspace_context_work_functions(topic_terms: list[str]) -> list[str]:
+    if any("onboarding" in term or "sop" in term or "collaborator" in term for term in topic_terms):
+        return ["collaborator onboarding", "operations handoff"]
+    if any("eval" in term or "review" in term for term in topic_terms):
+        return ["artifact governance", "eval reporting"]
+    return ["workspace context review", "internal handoff"]
+
+
+def _workspace_context_is_eval_artifact_request(
+    topic_terms: list[str], request_text: str
+) -> bool:
+    haystack = " ".join([str(request_text or "").lower(), *[term.lower() for term in topic_terms]])
+    return (
+        "kni ops / evals" in haystack
+        or "slack eval review narrative" in haystack
+        or "eval tracker sheet" in haystack
+        or ("eval" in haystack and "artifact" in haystack)
+    )
+
+
+def _zotero_context_topic_terms(request_text: str) -> list[str]:
+    lower = str(request_text or "").lower()
+    terms: list[str] = []
+    seen: set[str] = set()
+    for phrase in _ZOTERO_CONTEXT_TOPIC_PHRASES:
+        phrase_lower = phrase.lower()
+        if phrase_lower in lower and phrase not in seen:
+            terms.append(phrase)
+            seen.add(phrase)
+    if len(terms) >= 2:
+        return terms[:8]
+    phrase_words = {
+        word
+        for phrase in terms
+        for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
+    }
+    for token in re.findall(r"[a-z][a-z0-9-]{5,}", lower):
+        if token in phrase_words:
+            continue
+        if token in _FEED_CONTEXT_STOPWORDS or token in seen:
+            continue
+        if token in {
+            "zotero",
+            "library",
+            "material",
+            "support",
+            "background",
+            "import",
+            "collections",
+            "collection",
+            "download",
+            "downloads",
+            "pdfs",
+            "workspace",
+            "artifacts",
+        }:
+            continue
+        if token.startswith("diag_") or token.startswith("2026"):
+            continue
+        terms.append(token)
+        seen.add(token)
+        if len(terms) >= 8:
+            break
+    return terms[:8]
+
+
+def _zotero_context_is_validation_collection_request(
+    topic_terms: list[str], request_text: str
+) -> bool:
+    haystack = " ".join([str(request_text or "").lower(), *[term.lower() for term in topic_terms]])
+    return (
+        "behavioral-health ai validation" in haystack
+        or ("validation" in haystack and "collection" in haystack)
+        or ("title" in haystack and "doi" in haystack and "url" in haystack)
+    )
+
+
+def _feed_context_topic_terms(request_text: str) -> list[str]:
+    lower = str(request_text or "").lower()
+    terms: list[str] = []
+    seen: set[str] = set()
+    for phrase in _FEED_CONTEXT_TOPIC_PHRASES:
+        phrase_lower = phrase.lower()
+        if phrase_lower not in lower or phrase in seen:
+            continue
+        if any(phrase_lower in existing.lower() for existing in terms):
+            continue
+        if phrase.lower() in lower and phrase not in seen:
+            terms.append(phrase)
+            seen.add(phrase)
+    if len(terms) >= 3:
+        return terms[:8]
+    phrase_words = {
+        word
+        for phrase in terms
+        for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
+    }
+    for token in re.findall(r"[a-z][a-z0-9-]{5,}", lower):
+        if token in phrase_words:
+            continue
+        if token in _FEED_CONTEXT_STOPWORDS or token in seen:
+            continue
+        if token.startswith("diag_") or token.startswith("2026"):
+            continue
+        terms.append(token)
+        seen.add(token)
+        if len(terms) >= 8:
+            break
+    return terms[:8]
 
 
 def _context_agent_request_is_blocked(input_text: str) -> bool:
@@ -2389,55 +3352,92 @@ def _context_agent_human_summary(output: object) -> str:
         str(item).strip() for item in output.get("approval_needs") or [] if str(item).strip()
     ]
     blockers = [str(item).strip() for item in output.get("blockers") or [] if str(item).strip()]
+    blockers.extend(
+        str(item).strip() for item in output.get("evidence_gaps") or [] if str(item).strip()
+    )
     parts: list[str] = []
     if summary:
-        parts.append(f"Answer:\n{summary}")
+        parts.append(f"*Answer:*\n{summary}")
     detail_lines: list[str] = []
     record_lines = _context_agent_record_summary_lines(output)
     if record_lines:
         detail_lines.append("- Records visible:")
         detail_lines.extend(record_lines)
+    feed_item_lines = _context_agent_feed_item_summary_lines(output)
+    if feed_item_lines:
+        detail_lines.append("- Items reviewed:")
+        detail_lines.extend(feed_item_lines)
+    airtable_context_lines = _context_agent_airtable_context_lines(output)
+    if airtable_context_lines:
+        detail_lines.extend(airtable_context_lines)
+    workspace_context_lines = _context_agent_workspace_context_lines(output)
+    if workspace_context_lines:
+        detail_lines.extend(workspace_context_lines)
+    zotero_context_lines = _context_agent_zotero_context_lines(output)
+    if zotero_context_lines:
+        detail_lines.extend(zotero_context_lines)
+    theme_lines = _context_agent_theme_summary_lines(output)
+    if theme_lines:
+        detail_lines.append("- Themes:")
+        detail_lines.extend(theme_lines)
     reference_lines = _context_agent_reference_summary_lines(output)
-    if reference_lines:
-        detail_lines.append("- Useful references:")
-        detail_lines.extend(reference_lines)
     if approval_needs:
         if len(approval_needs) == 1:
-            detail_lines.append(f"- Approval/write boundary: {approval_needs[0]}.")
+            detail_lines.append(
+                f"- Approval/write boundary: {_ensure_terminal_punctuation(approval_needs[0])}"
+            )
         else:
             detail_lines.append("- Approval/write boundary:")
             detail_lines.extend(f"  - {item}" for item in approval_needs)
     if blockers:
         if len(blockers) == 1:
-            detail_lines.append(f"- Needs attention: {blockers[0]}.")
+            detail_lines.append(f"- Needs attention: {_ensure_terminal_punctuation(blockers[0])}")
         else:
             detail_lines.append("- Needs attention:")
             detail_lines.extend(f"  - {item}" for item in blockers)
     if detail_lines:
-        parts.append("Detailed answer:\n" + "\n".join(detail_lines))
+        parts.append("*Detailed Summary:*\n" + "\n".join(detail_lines))
+    if reference_lines:
+        parts.append("*Useful references:*\n" + "\n".join(reference_lines))
     return "\n\n".join(part for part in parts if part)
 
 
+def _ensure_terminal_punctuation(text: str) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return "."
+    if text[-1] in ".!?":
+        return text
+    return f"{text}."
+
+
 def _context_agent_reference_summary_lines(output: dict[str, object]) -> list[str]:
-    sources = output.get("sources")
-    if not isinstance(sources, list):
-        return []
     lines: list[str] = []
-    for source in sources[:5]:
-        if not isinstance(source, dict):
-            continue
-        title = str(source.get("title") or "").strip()
-        note = str(source.get("note") or "").strip()
-        location = str(source.get("location") or "").strip()
-        if not title:
-            continue
-        label = title
-        if note:
-            label = f"{label} - {note}"
-        if location:
-            label = f"{label} ({location})"
-        lines.append(f"  - {label}")
-    return lines
+    sources = output.get("sources")
+    if isinstance(sources, list):
+        for source in sources[:5]:
+            if not isinstance(source, dict):
+                continue
+            title = str(source.get("title") or "").strip()
+            note = str(source.get("note") or "").strip()
+            location = str(source.get("location") or "").strip()
+            if not title:
+                continue
+            label = title
+            if note:
+                label = f"{label} - {note}"
+            if location:
+                label = f"{label} ({location})"
+            lines.append(f"  - {label}")
+    article_refs = _context_agent_article_reference_lines(output)
+    existing = {line.lower() for line in lines}
+    for line in article_refs:
+        if line.lower() not in existing:
+            lines.append(line)
+            existing.add(line.lower())
+        if len(lines) >= 5:
+            break
+    return lines[:5]
 
 
 def _context_agent_record_summary_lines(output: dict[str, object]) -> list[str]:
@@ -2460,6 +3460,135 @@ def _context_agent_record_summary_lines(output: dict[str, object]) -> list[str]:
         if note:
             label = f"{label} ({note})"
         lines.append(f"  - {label}")
+    return lines
+
+
+def _context_agent_feed_item_summary_lines(output: dict[str, object]) -> list[str]:
+    articles = output.get("articles")
+    if not isinstance(articles, list):
+        return []
+    lines: list[str] = []
+    for article in articles[:5]:
+        if not isinstance(article, dict):
+            continue
+        title = str(article.get("title") or "").strip()
+        summary = str(
+            article.get("summary")
+            or article.get("detailed_summary")
+            or article.get("selection_reason")
+            or ""
+        ).strip()
+        source = str(article.get("published_at") or article.get("source") or "").strip()
+        if not title and not summary:
+            continue
+        label = f"{title}: {summary}" if title and summary else title or summary
+        if source:
+            label = f"{label} ({source})"
+        lines.append(f"  - {label}")
+    return lines
+
+
+def _context_agent_airtable_context_lines(output: dict[str, object]) -> list[str]:
+    base_alias = str(output.get("base_alias") or "").strip()
+    tables = [
+        str(item).strip()
+        for item in output.get("relevant_tables") or []
+        if str(item).strip()
+    ][:5]
+    fields = [
+        str(item).strip()
+        for item in output.get("relevant_fields") or []
+        if str(item).strip()
+    ][:8]
+    record_identity = str(output.get("recommended_record_identity") or "").strip()
+    lines: list[str] = []
+    if base_alias or tables:
+        target_parts: list[str] = []
+        if base_alias:
+            target_parts.append(base_alias)
+        if tables:
+            target_parts.append(", ".join(tables))
+        lines.append(f"- Airtable target hints: {' / '.join(target_parts)}")
+    if fields:
+        lines.append("- Field hints:")
+        lines.extend(f"  - {item}" for item in fields)
+    if record_identity:
+        lines.append(f"- Record filter guidance: {record_identity}")
+    return lines
+
+
+def _context_agent_workspace_context_lines(output: dict[str, object]) -> list[str]:
+    folders = [
+        str(item).strip()
+        for item in output.get("relevant_folders") or []
+        if str(item).strip()
+    ][:5]
+    docs = [
+        str(item).strip()
+        for item in output.get("relevant_docs") or []
+        if str(item).strip()
+    ][:5]
+    sheets = [
+        str(item).strip()
+        for item in output.get("relevant_sheets") or []
+        if str(item).strip()
+    ][:5]
+    target = str(output.get("recommended_target") or "").strip()
+    lines: list[str] = []
+    if target:
+        lines.append(f"- Candidate target: {target}")
+    if folders:
+        lines.append("- Folder hints:")
+        lines.extend(f"  - {item}" for item in folders)
+    if docs:
+        lines.append("- Doc hints:")
+        lines.extend(f"  - {item}" for item in docs)
+    if sheets:
+        lines.append("- Sheet hints:")
+        lines.extend(f"  - {item}" for item in sheets)
+    return lines
+
+
+def _context_agent_zotero_context_lines(output: dict[str, object]) -> list[str]:
+    hints = [
+        str(item).strip()
+        for item in output.get("collection_hints") or []
+        if str(item).strip()
+    ][:5]
+    evidence = [
+        str(item).strip()
+        for item in output.get("relevant_evidence") or []
+        if str(item).strip()
+    ][:5]
+    lines: list[str] = []
+    if hints:
+        lines.append("- Collection/context hints:")
+        lines.extend(f"  - {item}" for item in hints)
+    if evidence:
+        lines.append("- Evidence guidance:")
+        lines.extend(f"  - {item}" for item in evidence)
+    return lines
+
+
+def _context_agent_theme_summary_lines(output: dict[str, object]) -> list[str]:
+    themes = output.get("recurring_themes")
+    if not isinstance(themes, list):
+        return []
+    return [f"  - {str(theme).strip()}" for theme in themes[:5] if str(theme).strip()]
+
+
+def _context_agent_article_reference_lines(output: dict[str, object]) -> list[str]:
+    articles = output.get("articles")
+    if not isinstance(articles, list):
+        return []
+    lines: list[str] = []
+    for article in articles[:5]:
+        if not isinstance(article, dict):
+            continue
+        title = str(article.get("title") or "").strip()
+        url = str(article.get("url") or "").strip()
+        if title and url:
+            lines.append(f"  - {title} ({url})")
     return lines
 
 
@@ -2670,6 +3799,23 @@ def _run_ask_company_research_live(
     cost_tracking_requested: bool,
     database_url: str | None = None,
 ) -> int:
+    if _request_forbids_live_research(input_text):
+        return _run_ask_work_item(
+            input_text,
+            database_url=database_url,
+            live_search=False,
+            live_sdk=True,
+            max_results=max(1, min(10, manual_plan.desired_count if manual_plan else 5)),
+            json_output=json_output,
+            max_manager_steps=3,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
+            sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
+            sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
+            sdk_session_history_limit=sdk_session_spec.history_limit if sdk_session_spec else None,
+            cost_tracking_requested=cost_tracking_requested,
+        )
     target = (manual_plan.primary_target if manual_plan else "") or input_text[:120]
     if not target.strip():
         return _print_ask_clarification(
@@ -2692,6 +3838,7 @@ def _run_ask_company_research_live(
         "--max-results",
         "5",
         "--live-search",
+        "--live-search-plan",
         "--no-dry-run",
         "--live-sdk",
         "--focused-brief",
@@ -2741,6 +3888,8 @@ def _run_ask_chief_of_staff_live(
         "--input",
         input_text,
         "--live-sdk",
+        "--live-search",
+        "--live-search-plan",
         "--json",
     ]
     return _run_ask_script_live(
@@ -3203,6 +4352,12 @@ def _run_ask_script_live(
         "output": output if output is not None else script_payload,
         "script_payload": script_payload,
     }
+    human_summary = _payload_human_summary(script_payload)
+    if human_summary:
+        payload["human_summary"] = human_summary
+        payload["slack_display_text"] = human_summary
+        payload["display_text"] = human_summary
+        payload["summary"] = human_summary
     for key in ("usage", "cost", "request_cache", "model", "budget_guard"):
         value = script_payload.get(key) if isinstance(script_payload, dict) else None
         if value:
@@ -3282,6 +4437,20 @@ def _payload_missing_information(payload: object) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def _payload_human_summary(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    direct = payload.get("human_summary")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    output = payload.get("output")
+    if isinstance(output, dict):
+        nested = output.get("human_summary") or output.get("summary")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return ""
+
+
 def _payload_retrieval_diagnostics(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict):
         return {}
@@ -3358,7 +4527,9 @@ def _print_ask_live_payload(payload: dict[str, object], *, json_output: bool) ->
         if payload.get("output_type"):
             print(f"Output type: {payload['output_type']}")
         print(f"Send enabled: {payload.get('send_enabled', False)}")
-        if payload.get("message"):
+        if payload.get("human_summary"):
+            print(payload["human_summary"])
+        elif payload.get("message"):
             print(payload["message"])
         else:
             print(json.dumps(payload.get("output"), ensure_ascii=True, indent=2, sort_keys=True))
@@ -4019,7 +5190,7 @@ def _append_eval_thread_guidance_to_summary(
         detail += f" Dashboard: {_slack_link(dashboard_case_url, 'case dashboard')}."
     if review_case_url:
         detail += f" Review form: {_slack_link(review_case_url, 'score this case')}."
-    detail += " Score from the linked form, then press `Submit Evaluation` in Slack to save scores and refresh the dashboard."
+    detail += " Score from the linked form, or use `Score with Orchestrator Judge` when enabled, then press `Submit Evaluation` in Slack to save scores and refresh the dashboard."
     parts.append(detail)
     return "\n\n".join(parts).strip()
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "KBA New Agent"
+  short_description: "Create and integrate new Keystone Business Agents agents."
+  default_prompt: "Use $kba-new-agent to plan, implement, and validate a new Keystone Business Agents agent."

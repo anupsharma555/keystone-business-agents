@@ -147,6 +147,7 @@ def chief_of_staff_should_use_specialist_tools(
         "gmail_triage",
         "outreach_draft",
         "browser_diagnostics",
+        "context_lookup",
     }:
         return _chief_text_has_positive_specialist_marker(text)
     if plan is not None and plan.task_objective in {
@@ -157,6 +158,7 @@ def chief_of_staff_should_use_specialist_tools(
         "outreach_draft",
         "gmail_triage",
         "browser_diagnostics",
+        "context_lookup",
     }:
         return _chief_text_has_positive_specialist_marker(text)
     return _chief_text_has_positive_specialist_marker(text)
@@ -165,11 +167,11 @@ def chief_of_staff_should_use_specialist_tools(
 def _chief_positive_specialist_request_text(request_text: str) -> str:
     text = str(request_text or "").lower()
     text = re.sub(
-        r"\b(?:do not|don't|dont|never|without|no)\b[^.\n;]{0,220}"
+        r"\b(?:do not|don't|dont|never|without|no)\b[^.\n;:]{0,220}"
         r"\b(?:gmail|inbox|email|e-mail|thread|outreach|draft|reply|respond|"
         r"airtable|google drive|google doc|google sheet|workspace|zotero|live web|"
         r"research externally|external(?:ly)?|crm|publish|post|schedule|send)\b"
-        r"[^.\n;]*",
+        r"[^.\n;:]*",
         " ",
         text,
         flags=re.I,
@@ -234,6 +236,14 @@ def _chief_text_has_positive_specialist_marker(text: str) -> bool:
         "literature collection",
         "paper collection",
         "article collection",
+        "rss context",
+        "feed context",
+        "announcement history",
+        "announcements context",
+        "preprints context",
+        "preprint context",
+        "preprint",
+        "preprints",
         "compare agents",
         "across agents",
         "multiple agents",
@@ -3011,7 +3021,6 @@ def _looks_like_reference_capture_request(text: str) -> bool:
         "note this",
         "store this",
         "add this to memory",
-        "keep this",
     )
     if any(marker in lowered for marker in markers):
         return True
@@ -3377,6 +3386,34 @@ def _plan_natural_language_operating_intent(
     text: str, *, database_url: str | None = None
 ) -> ChiefOfStaffResult | None:
     lowered = text.lower()
+    if _looks_like_internal_handoff_request(lowered):
+        return _natural_language_intent_result(
+            text,
+            workflow_type="research-direction-review",
+            command_text=_internal_handoff_command_text(lowered),
+            target_channel=_extract_target_channel(text, "current-thread"),
+            summary=(
+                "Prepare an internal handoff that selects the next owner, explains why the "
+                "route fits, names the minimum context needed before committing, and keeps "
+                "external action blocked."
+            ),
+            rationale=(
+                "Internal review handoffs should route to the best next specialist without "
+                "drafting outreach or using live context sources unless explicitly approved."
+            ),
+            recommended_actions=[
+                "Name the next owner or specialist route using Chief of Staff -> Agent notation.",
+                "Ask for the dashboard schema, metric definitions, intended users, and review timeline.",
+                "Keep outreach, writes, live source access, and external commitments blocked.",
+            ],
+            context_sources=[
+                "operator_and_agent_policy",
+                "business_workflow_state",
+                "keystone_local_context",
+            ],
+            requires_live_connector=False,
+            database_url=database_url,
+        )
     if _looks_like_outreach_drafting_request(lowered):
         return _natural_language_intent_result(
             text,
@@ -3655,6 +3692,51 @@ def _looks_like_outreach_drafting_request(lowered: str) -> bool:
             "draft a reply",
         )
     )
+
+
+def _looks_like_internal_handoff_request(lowered: str) -> bool:
+    if not any(
+        marker in lowered
+        for marker in (
+            "internal handoff",
+            "best next owner",
+            "best next specialist",
+            "best next workitem-capable specialist",
+            "best next work item-capable specialist",
+            "next owner or agent",
+            "workitem-capable specialist",
+            "work item-capable specialist",
+            "hand off if appropriate",
+            "recommended next path",
+            "what remains blocked",
+            "information keystone should request",
+            "before committing",
+        )
+    ):
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "business research agent",
+            "airtable context agent",
+            "handoff",
+            "owner",
+            "agent",
+            "review",
+        )
+    )
+
+
+def _internal_handoff_command_text(lowered: str) -> str:
+    if "gmail triage agent" in lowered or "gmail inbound triage" in lowered:
+        return "Chief of Staff -> Gmail Triage Agent"
+    if "outreach composer agent" in lowered:
+        return "Chief of Staff -> Outreach Composer Agent"
+    if "opportunity scout agent" in lowered:
+        return "Chief of Staff -> Opportunity Scout Agent"
+    if "airtable context agent" in lowered and "business research agent" not in lowered:
+        return "Chief of Staff -> Airtable Context Agent"
+    return "Chief of Staff -> Business Research Agent"
 
 
 def _looks_like_budget_resource_request(lowered: str) -> bool:

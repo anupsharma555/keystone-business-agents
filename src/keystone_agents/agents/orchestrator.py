@@ -233,13 +233,44 @@ _CRM_WRITE_RE = re.compile(
     r"\b(?:save|write|add|sync|push|update|create|log)\b",
     re.I,
 )
-_NO_CRM_WRITE_RE = re.compile(
-    r"\b(?:do\s+not|don't|dont|never|no)\s+"
-    r"(?:save|write|add|sync|push|update|create|log)\b"
-    r"[\s\S]{0,80}\b(?:crm|airtable|salesforce|hubspot|external\s+systems?)\b"
+_NEGATED_CRM_WRITE_CLAUSE_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|avoid|skip)\b"
+    r"[^.;\n]{0,260}\b(?:crm|airtable|salesforce|hubspot|external\s+systems?)\b"
+    r"[^.;\n]*[.;]?"
     r"|\bwithout\s+(?:saving|writing|adding|syncing|pushing|updating|creating|logging)\b"
-    r"[\s\S]{0,80}\b(?:crm|airtable|salesforce|hubspot|external\s+systems?)\b",
+    r"[^.;\n]{0,160}\b(?:crm|airtable|salesforce|hubspot|external\s+systems?)\b"
+    r"[^.;\n]*[.;]?"
+    r"|\b(?:save|write|add|sync|push|update|create|log)\s+(?:no|zero|0)\s+"
+    r"(?:crm|airtable|salesforce|hubspot)\b[^.;\n]*[.;]?",
     re.I,
+)
+_NEGATED_OUTREACH_DRAFT_CLAUSE_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|avoid|skip|no)\b"
+    r"[^.;\n]{0,220}\b(?:draft|write|compose|prepare|outline)\b"
+    r"[^.;\n]{0,160}\b(?:outreach|email|reply|response|follow-up|followup|message|note)\b"
+    r"[^.;\n]*[.;]?"
+    r"|\b(?:do\s+not|don't|dont|never|avoid|skip|no)\b"
+    r"[^.;\n]{0,220}\b(?:outreach|email|reply|response|follow-up|followup|message|note)\b"
+    r"[^.;\n]{0,160}\b(?:draft|write|compose|prepare|outline)\b"
+    r"[^.;\n]*[.;]?",
+    re.I,
+)
+_NEGATED_CONTEXT_SEND_CLAUSE_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|avoid|skip|no)\b"
+    r"[^.;\n]{0,260}\b(?:send|post|publish|share|schedule|email|slack\s+post)\b"
+    r"[^.;\n]*[.;]?"
+    r"|\bwithout\s+(?:sending|posting|publishing|sharing|scheduling)\b"
+    r"[^.;\n]*[.;]?",
+    re.I,
+)
+_CONTEXT_AGENT_ROUTES = frozenset(
+    {
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+        "rss_context_agent",
+        "preprints_context_agent",
+    }
 )
 _DISCOVERY_OUTREACH_WORKFLOW_RE = re.compile(
     r"\b(?:find|identify|search|scout|source|discover|list)\b[\s\S]*?"
@@ -876,10 +907,16 @@ def _result(
 
 
 def _looks_like_crm_write_request(text: str) -> bool:
-    cleaned = str(text or "")
-    if _NO_CRM_WRITE_RE.search(cleaned):
-        return False
+    cleaned = _NEGATED_CRM_WRITE_CLAUSE_RE.sub(" ", str(text or ""))
     return bool(_CRM_WRITE_RE.search(cleaned))
+
+
+def _without_negated_outreach_draft_clauses(text: str) -> str:
+    return _NEGATED_OUTREACH_DRAFT_CLAUSE_RE.sub(" ", str(text or ""))
+
+
+def _without_negated_context_send_clauses(text: str) -> str:
+    return _NEGATED_CONTEXT_SEND_CLAUSE_RE.sub(" ", str(text or ""))
 
 
 def _with_crm_write_boundary(
@@ -1016,7 +1053,19 @@ def _hard_safety_refusal(
         refused=True,
         stop_reason=f"Blocked by Python safety gate: {reasons}.",
         clarification_request=(
-            "Remove PHI, security, legal, or professional-advice content before routing."
+            "Outreach blocked by safety gate\n\n"
+            "*Answer:*\n"
+            "I cannot route this to a specialist while the request includes possible PHI, "
+            "patient-specific content, or other protected material.\n\n"
+            "*Detailed Summary:*\n"
+            f"* Blocked reason: {reasons}.\n"
+            "* Remove PHI, named patient details, security-sensitive content, legal claims, "
+            "and professional-advice content before rerunning.\n"
+            "* No draft, send, post, CRM write, file write, schedule, publish, or external "
+            "action was taken.\n\n"
+            "*Next step:*\n"
+            "Resubmit with sanitized, non-patient-specific context and explicit approval "
+            "scope for any draft-only outreach."
         ),
         approved_context_present=approved_context_present,
         approval_scope=ApprovalScope.DRAFTING,
@@ -1103,7 +1152,7 @@ def _gmail_cross_agent_workflow(text: str) -> list[str]:
 
 
 def _requested_cross_agent_workflow(text: str, *, start_route: str) -> list[str]:
-    lower = str(text or "").lower()
+    lower = _without_negated_outreach_draft_clauses(text).lower()
     workflow: list[str] = []
     if re.search(r"\b(?:gmail|email)\s+context\b|\bcheck\s+recent\s+gmail\b", lower):
         workflow.append("gmail_triage")
@@ -1142,7 +1191,8 @@ def _mixed_outreach_request_requires_context_gate(
 ) -> bool:
     if approved_context_present:
         return False
-    lower = str(text or "").lower()
+    scrubbed = _without_negated_outreach_draft_clauses(text)
+    lower = scrubbed.lower()
     if re.search(r"\b(?:score\s+the\s+workflow|coordinate\s+the\s+agents)\b", lower):
         return False
     if re.search(r"\b(?:not|no)\s+outreach\b", lower):
@@ -1153,7 +1203,7 @@ def _mixed_outreach_request_requires_context_gate(
         lower,
     ):
         return False
-    return _requires_research_before_outreach(text)
+    return _requires_research_before_outreach(scrubbed)
 
 
 def _requires_research_before_outreach(text: str) -> bool:
@@ -1278,12 +1328,26 @@ def _missing_outreach_context_refusal(
             "context, is required before outreach."
         ),
         clarification_request=(
-            "Provide an approved CompanyProfile or OpportunityRecord plus recipient/contact "
-            "context before requesting an outreach draft."
+            "Outreach Composer needs approved drafting context\n\n"
+            "*Answer:*\n"
+            "I cannot create draft-only outreach until a source-backed company profile or "
+            "opportunity record is approved for drafting and recipient/contact context is present. "
+            "Approval is required before any external-use draft context, CRM action, send, post, "
+            "schedule, or file write.\n\n"
+            "*Detailed Summary:*\n"
+            "* Required: approved company profile or opportunity record.\n"
+            "* Required: recipient, target contact, or target organization.\n"
+            "* Approval boundary: no outreach draft or external action can proceed until the "
+            "approved context and recipient scope are explicit.\n"
+            "* Current status: draft-only outreach remains blocked; no email, LinkedIn note, "
+            "Slack post, CRM record, file write, send, schedule, publish, or external action was taken.\n\n"
+            "*Next step:*\n"
+            "Attach or approve source-backed company or opportunity context, then provide "
+            "the recipient or target organization before requesting a draft."
         ),
         approval_scope=ApprovalScope.DRAFTING,
         approval_rationale=(
-            "Outreach drafting is blocked until a human-approved drafting context is present."
+            "Draft-only outreach is blocked until a human-approved drafting context is present."
         ),
         workflow_state=workflow_state,
         audit_notes=["Hard Python approval-context gate blocked outreach routing."],
@@ -1608,7 +1672,20 @@ def _scout_no_result_explained(data: Mapping[str, Any]) -> bool:
         signal in note_text
         for signal in ("live search provider was used", "ran ", "source bundles were used")
     )
-    return _field_present(data, "topic", "audit_notes") and has_explanation and search_attempted
+    clarification_block = any(
+        phrase in note_text
+        for phrase in (
+            "blocked for clarification",
+            "missing buyer",
+            "missing buyer, geography",
+            "live-search approval",
+        )
+    )
+    return (
+        _field_present(data, "topic", "audit_notes")
+        and has_explanation
+        and (search_attempted or clarification_block)
+    )
 
 
 def _outreach_variant_drafts(data: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2835,6 +2912,18 @@ def _route_from_manual_plan(
             workflow_state=workflow_state,
             audit_notes=audit_notes,
         )
+    if route in _CONTEXT_AGENT_ROUTES:
+        return _result(
+            route=route,
+            rationale=plan.objective
+            or f"The manual request plan selected {route} for read-only context lookup.",
+            artifact=("input_type", plan.target_type),
+            routing_mode=plan.source
+            if plan.source in {"llm", "llm_unavailable"}
+            else "deterministic",
+            workflow_state=workflow_state,
+            audit_notes=audit_notes,
+        )
     if route in {
         "gmail_triage",
         "business_research_analyst",
@@ -2872,6 +2961,25 @@ def _route_from_manual_plan(
         )
         return _with_crm_write_boundary(result, request_text=request_text)
     return None
+
+
+def _manual_plan_is_read_only_context_lookup(
+    plan: ManualRequestPlan | None,
+    *,
+    request_text: str,
+) -> bool:
+    if plan is None:
+        return False
+    if not (plan.intent == "context_lookup" and plan.target_agent in {
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+        "rss_context_agent",
+        "preprints_context_agent",
+    }):
+        return False
+    cleaned = _without_negated_context_send_clauses(request_text)
+    return not _looks_like_send_side_effect(cleaned)
 
 
 def route_request(
@@ -2929,6 +3037,11 @@ def route_request(
         provided=manual_plan,
         enabled=use_manual_plan or manual_plan is not None,
     )
+    send_side_effect = _looks_like_send_side_effect(text)
+    read_only_context_lookup = _manual_plan_is_read_only_context_lookup(
+        resolved_manual_plan,
+        request_text=text,
+    )
 
     def finish(result: OrchestratorResult) -> OrchestratorResult:
         return _with_operator_feedback_request(
@@ -2936,7 +3049,11 @@ def route_request(
             include=include_operator_feedback_request,
         )
 
-    if _looks_like_send_side_effect(text) and _looks_like_discovery_outreach_workflow(text):
+    if (
+        send_side_effect
+        and not read_only_context_lookup
+        and _looks_like_discovery_outreach_workflow(text)
+    ):
         return finish(
             _safe_discovery_outreach_workflow_result(
                 request_text=text,
@@ -2945,7 +3062,7 @@ def route_request(
             )
         )
 
-    if _looks_like_send_side_effect(text):
+    if send_side_effect and not read_only_context_lookup:
         return finish(
             _send_refusal(
                 approved_context_present=approved_context_present,

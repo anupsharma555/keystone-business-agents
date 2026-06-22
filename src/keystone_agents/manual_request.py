@@ -63,6 +63,14 @@ _AGENT_ALIASES: dict[str, ManualTargetAgent] = {
     "zotero context agent": "zotero_context_agent",
     "zotero context": "zotero_context_agent",
     "zotero agent": "zotero_context_agent",
+    "rss context agent": "rss_context_agent",
+    "rss context": "rss_context_agent",
+    "announcements context agent": "rss_context_agent",
+    "announcements context": "rss_context_agent",
+    "preprints context agent": "preprints_context_agent",
+    "preprints context": "preprints_context_agent",
+    "preprint context agent": "preprints_context_agent",
+    "preprint context": "preprints_context_agent",
 }
 _ROUTE_INTENT: dict[ManualTargetAgent, ManualRequestIntent] = {
     "business_research_analyst": "company_research",
@@ -73,6 +81,8 @@ _ROUTE_INTENT: dict[ManualTargetAgent, ManualRequestIntent] = {
     "airtable_context_agent": "context_lookup",
     "google_workspace_context_agent": "context_lookup",
     "zotero_context_agent": "context_lookup",
+    "rss_context_agent": "context_lookup",
+    "preprints_context_agent": "context_lookup",
     "orchestrator": "route_request",
     "clarification": "clarification",
 }
@@ -85,9 +95,20 @@ _ROUTE_TARGET_TYPE: dict[ManualTargetAgent, ManualTargetType] = {
     "airtable_context_agent": "business_system_context",
     "google_workspace_context_agent": "business_system_context",
     "zotero_context_agent": "business_system_context",
+    "rss_context_agent": "article_collection",
+    "preprints_context_agent": "article_collection",
     "orchestrator": "unknown",
     "clarification": "unknown",
 }
+_CONTEXT_AGENT_TARGETS: frozenset[ManualTargetAgent] = frozenset(
+    {
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+        "rss_context_agent",
+        "preprints_context_agent",
+    }
+)
 _COUNT_RE = re.compile(
     r"\b(?:compare|discover|find|return|list|top|show|identify|source)\s+"
     r"(?:up\s+to\s+)?(?P<count>\d{1,2})\b"
@@ -163,6 +184,17 @@ _RESEARCH_ACTION_RE = re.compile(
     r"partnership|advisory|source-backed)\b",
     re.I,
 )
+_NO_EXTERNAL_RESEARCH_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\b"
+    r"[^.;\n]{0,180}\b"
+    r"(?:web\s+search|live\s+web|live\s+search|external\s+(?:search|research|tools?)|"
+    r"browser\s+automation|research\s+externally)\b"
+    r"|"
+    r"\buse\s+only\s+(?:this\s+)?(?:approved\s+|sanitized\s+|provided\s+|"
+    r"source-provided\s+|inline\s+)*"
+    r"(?:inline\s+)?context\b",
+    re.I,
+)
 _WORKFLOW_AGENT_MARKER_RE = re.compile(
     r"\b(?:coordinate|sequence|which\s+agents|agents?\s+should|routing\s+plan|"
     r"run\s+(?:the\s+)?workflow|multi[- ]agent|safe\s+parts\s+first|"
@@ -180,9 +212,15 @@ _WORKFLOW_RESEARCH_MARKER_RE = re.compile(
 )
 _TARGET_COMPANY_RE = re.compile(r"\btarget\s+company\s*:\s*(?P<name>[^\n.;]+)", re.I)
 _COMPANY_NAME_RE = re.compile(r"\bcompany\s+name\s*:\s*(?P<name>[^\n.;]+)", re.I)
+_COMPANY_LABEL_RE = re.compile(r"\bcompany\s*:\s*(?P<name>[^\n.;]+)", re.I)
 _RESEARCH_ON_COMPANY_RE = re.compile(
     r"\b(?:brief|research|profile|summary)\s+on\s+"
     r"(?P<name>(?:[A-Z][\w&.-]*|[A-Z]{2,})(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})\b"
+)
+_RESEARCH_COMPANY_ACTION_RE = re.compile(
+    r"\b(?i:research|profile|analyze|investigate|assess|summarize)\s+"
+    r"(?P<name>(?:[A-Z][\w&.-]*|[A-Z]{2,})(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})"
+    r"\s+(?i:as|for|with|and|before|using|from|about|to|,|\.)\b"
 )
 _COMPANY_COMPARISON_RE = re.compile(
     r"\b(?:compare|comparison\s+of)\s+"
@@ -194,6 +232,13 @@ _COMPANY_COMPARISON_RE = re.compile(
 _COMPANY_WORTH_RE = re.compile(
     r"\bwhether\s+(?P<name>(?:[A-Z][\w&.-]*|[A-Z]{2,})(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})\s+"
     r"(?:is|are)\s+worth\b"
+)
+_COMPANY_LOOK_RE = re.compile(
+    r"\b(?:take\s+(?:a\s+)?(?:quick\s+)?(?:read-only\s+)?look\s+at|"
+    r"(?:quick\s+)?(?:read-only\s+)?look\s+at|fit\s+check\s+on|"
+    r"check\s+on|review)\s+"
+    r"(?P<name>(?:[A-Z][\w&.-]*|[A-Z]{2,})(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})"
+    r"\s+(?i:as|for|with|and|before|using|from|about|to|,|\.)\b"
 )
 _FOR_COMPANY_RE = re.compile(
     r"\bfor\s+(?P<name>(?:[A-Z][\w&.-]*|[A-Z]{2,})(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})\b"
@@ -260,7 +305,7 @@ def infer_manual_request_plan(
         recipient=_recipient(text) if target_agent == "outreach_composer" else "",
         outreach_channel=_outreach_channel(text) if target_agent == "outreach_composer" else "",
         tone=_tone(text) if target_agent == "outreach_composer" else "",
-        requires_live_search=target_agent in {"business_research_analyst", "opportunity_scout"},
+        requires_live_search=_requires_live_search_for_plan(text, target_agent=target_agent),
         requires_approved_context=target_agent == "outreach_composer",
         side_effect_policy="draft_or_read_only",
         rationale="Local semantic planner inferred the manual request before agent execution.",
@@ -269,11 +314,17 @@ def infer_manual_request_plan(
         plan.planner_warnings.append(
             "Manual request did not contain enough information for a safe route."
         )
-    if looks_like_send_side_effect(text):
+    if _looks_like_blocked_side_effect_request(text):
         plan.planner_warnings.append(
-            "Send request blocked; Keystone manual agents are draft/read-only."
+            "Send request blocked; external send/write requests remain draft/read-only."
         )
     return plan
+
+
+def _requires_live_search_for_plan(text: str, *, target_agent: ManualTargetAgent) -> bool:
+    if target_agent not in {"business_research_analyst", "opportunity_scout"}:
+        return False
+    return not bool(_NO_EXTERNAL_RESEARCH_RE.search(str(text or "")))
 
 
 def merge_manual_request_plan(
@@ -353,6 +404,18 @@ def _semantic_target_agent(
     requested_agent: ManualTargetAgent | None,
 ) -> ManualTargetAgent:
     lower = text.lower()
+    explicit_text_agent = _direct_agent_prefix_agent(text)
+    conversational_agent = _conversational_named_agent(text)
+    if requested_agent in {None, "orchestrator"} and explicit_text_agent not in {
+        None,
+        "orchestrator",
+    }:
+        return explicit_text_agent
+    if requested_agent in {None, "orchestrator"} and conversational_agent not in {
+        None,
+        "orchestrator",
+    }:
+        return conversational_agent
     if _looks_like_browser_diagnostics_only_request(text):
         return (
             requested_agent
@@ -433,8 +496,12 @@ def _intent_for_target(
         and looks_like_opportunity_to_outreach_loop(text)
     ):
         return "opportunity_to_outreach_loop"
-    if looks_like_send_side_effect(text) and not _looks_like_discovery_outreach_workflow(text):
+    if _looks_like_blocked_side_effect_request(
+        text
+    ) and not _looks_like_discovery_outreach_workflow(text):
         return "blocked_send"
+    if target_agent in _CONTEXT_AGENT_TARGETS:
+        return "context_lookup"
     if target_agent == "business_research_analyst" and _company_comparison_target(text):
         return "company_research"
     if target_agent == "business_research_analyst" and _looks_like_research_table_synthesis(text):
@@ -574,7 +641,7 @@ def _looks_like_gmail_label_request(lower: str) -> bool:
 
 def _looks_like_gmail_followup_request(lower: str) -> bool:
     return bool(
-        re.search(r"\b(?:email|gmail|inbox|thread|messages?)\b", lower)
+        re.search(r"\b(?:email|gmail|inbox|messages?)\b", lower)
         and re.search(r"\b(?:follow\s+up|follow-up|reply|replies|draft\s+replies)\b", lower)
     )
 
@@ -606,6 +673,42 @@ def _looks_like_direct_outreach_send_request(lower: str) -> bool:
     )
 
 
+def _looks_like_blocked_side_effect_request(text: str) -> bool:
+    lower = " ".join(str(text or "").lower().split())
+    if (
+        re.search(r"\bdraft\b[\s\S]{0,120}\b(?:response|reply|email|message|outreach)\b", lower)
+        and re.search(r"\b(?:after|with|pending)\s+(?:human\s+)?approval\b", lower)
+        and not re.search(r"\b(?:send|post|publish|share|deliver)\s+(?:it|the|this)?\b", lower)
+    ):
+        return False
+    return looks_like_send_side_effect(text) or _looks_like_external_write_side_effect(text)
+
+
+def _looks_like_external_write_side_effect(text: str) -> bool:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return False
+    lower = cleaned.lower()
+    lower = re.sub(r"\bprior\s+post\b", "prior message", lower)
+    if re.search(
+        r"\b(?:do\s+not|don't|dont|never|no)\b[\s\S]{0,180}"
+        r"\b(?:create|update|delete|modify|write|save|attach|export|move|share|schedule|publish|post|send|deliver)\b",
+        lower,
+    ):
+        return False
+    write_verb = (
+        r"(?:create|update|delete|modify|write|save|attach|export|move|share|schedule|publish|post|send|deliver)"
+    )
+    target_object = (
+        r"(?:record|row|table|tracker|field|file|doc|document|sheet|folder|attachment|"
+        r"airtable|drive|workspace|gmail\s+draft|slack|crm|calendar|collection|item|library)"
+    )
+    return bool(
+        re.search(rf"\b{write_verb}\b[\s\S]{{0,100}}\b{target_object}\b", lower)
+        or re.search(rf"\b{target_object}\b[\s\S]{{0,100}}\b{write_verb}\b", lower)
+    )
+
+
 def _looks_like_reference_capture_request(lower: str) -> bool:
     markers = (
         "keep this for future reference",
@@ -617,7 +720,6 @@ def _looks_like_reference_capture_request(lower: str) -> bool:
         "note this",
         "store this",
         "add this to memory",
-        "keep this",
     )
     if any(marker in lower for marker in markers):
         return True
@@ -809,7 +911,7 @@ def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetT
             return "zotero_collection"
         if "article collection" in lower or "paper collection" in lower:
             return "article_collection"
-        if any(marker in lower for marker in ("institute", "center", "program", "lab")):
+        if _contains_word_or_phrase(lower, ("institute", "center", "program", "lab")):
             return "institute"
         if any(marker in lower for marker in ("conference", "meeting", "symposium", "summit")):
             return "conference"
@@ -835,12 +937,16 @@ def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetT
             return "conference"
         if any(marker in lower for marker in ("researcher", "principal investigator", "faculty")):
             return "person"
-        if any(marker in lower for marker in ("institute", "center", "program", "lab")):
+        if _contains_word_or_phrase(lower, ("institute", "center", "program", "lab")):
             return "institute"
         if any(marker in lower for marker in ("company", "companies", "startup", "vendor")):
             return "company"
         return "topic"
     return _ROUTE_TARGET_TYPE.get(target_agent, "unknown")
+
+
+def _contains_word_or_phrase(lower_text: str, markers: tuple[str, ...]) -> bool:
+    return any(re.search(rf"\b{re.escape(marker)}\b", lower_text) for marker in markers)
 
 
 def _reference_target(text: str) -> str:
@@ -909,7 +1015,11 @@ def _task_objective(
     if intent == "company_research":
         return (
             "source_research"
-            if _looks_like_source_summary_request(lower) or _looks_like_research_table_synthesis(lower)
+            if (
+                _looks_like_source_summary_request(lower)
+                or _looks_like_research_table_synthesis(lower)
+                or target_agent == "business_research_analyst"
+            )
             else "entity_research"
         )
     if intent == "research_brief":
@@ -933,6 +1043,15 @@ def _expected_artifact_type(
 ) -> ManualExpectedArtifactType:
     objective = _task_objective(text, target_agent=target_agent, intent=intent)
     if objective == "source_research":
+        lower = _strip_direct_agent_prefix(text).lower()
+        if _looks_like_source_summary_request(lower) or _looks_like_research_table_synthesis(lower):
+            return "source_summary"
+        if (
+            intent == "company_research"
+            and target_agent == "business_research_analyst"
+            and _target_type(text, target_agent=target_agent) == "company"
+        ):
+            return "research_brief"
         return "source_summary"
     if objective == "entity_research":
         return "research_brief"
@@ -1078,8 +1197,11 @@ def _workflow_company_target(text: str) -> str:
     for pattern in (
         _TARGET_COMPANY_RE,
         _COMPANY_NAME_RE,
+        _COMPANY_LABEL_RE,
         _RESEARCH_ON_COMPANY_RE,
+        _RESEARCH_COMPANY_ACTION_RE,
         _COMPANY_WORTH_RE,
+        _COMPANY_LOOK_RE,
         _FOR_COMPANY_RE,
     ):
         match = pattern.search(cleaned)
@@ -1208,7 +1330,7 @@ def _looks_like_discovery_outreach_workflow(text: str) -> bool:
 
 
 def _strip_direct_agent_prefix(text: str) -> str:
-    cleaned = " ".join(str(text or "").split()).strip()
+    cleaned = _strip_kni_direct_prefix(text)
     lowered = cleaned.lower()
     for alias in sorted(_AGENT_ALIASES, key=len, reverse=True):
         if lowered.startswith(alias + " "):
@@ -1226,11 +1348,43 @@ def _strip_wrapping_quotes(text: str) -> str:
 
 
 def _direct_agent_prefix_agent(text: str) -> ManualTargetAgent | None:
-    cleaned = " ".join(str(text or "").split()).strip().lower()
+    cleaned = _strip_kni_direct_prefix(text).lower()
     for alias in sorted(_AGENT_ALIASES, key=len, reverse=True):
-        if cleaned.startswith(alias + " "):
+        if cleaned == alias or re.match(rf"{re.escape(alias)}(?:\s|[:;,.-])", cleaned):
             return _AGENT_ALIASES[alias]
     return None
+
+
+def _conversational_named_agent(text: str) -> ManualTargetAgent | None:
+    """Detect polite natural-language asks that name a specific agent."""
+
+    cleaned = _strip_kni_direct_prefix(text).lower()
+    lead = cleaned[:160]
+    for alias in sorted(_AGENT_ALIASES, key=len, reverse=True):
+        if alias == "analyst":
+            continue
+        if re.search(
+            rf"\b(?:could|can|would|please|ask|have|get|let)\b"
+            rf".{{0,80}}\b(?:the\s+)?{re.escape(alias)}\b",
+            lead,
+        ):
+            return _AGENT_ALIASES[alias]
+    return None
+
+
+def _strip_kni_direct_prefix(text: str) -> str:
+    cleaned = " ".join(str(text or "").split()).strip()
+    for _ in range(2):
+        lowered = cleaned.lower()
+        for prefix in ("@kni", "kni", "business agents", "business agent"):
+            if lowered == prefix:
+                return ""
+            if lowered.startswith(prefix + " "):
+                cleaned = cleaned[len(prefix) :].strip(" :")
+                break
+        else:
+            break
+    return cleaned
 
 
 def _opportunity_to_outreach_topic(text: str) -> str:

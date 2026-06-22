@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -504,6 +505,19 @@ def test_chief_of_staff_still_enables_positive_cross_agent_planning() -> None:
         "chief of staff decide what we should do next across business research, "
         "opportunity scout, and outreach for this Slack thread"
     )
+
+
+def test_chief_of_staff_enables_advisory_agents_after_no_write_clause() -> None:
+    request = (
+        "chief of staff summarize these remaining eval gaps using agents-as-tools only "
+        "for advisory context, but do not mark anything complete or update records: "
+        "Business Research should explain the source-evidence gap, Opportunity Scout "
+        "should prioritize the next Slack test candidate, Airtable Context should identify "
+        "tracker fields, and Google Workspace Context should identify where an eval review "
+        "artifact would live."
+    )
+
+    assert chief_of_staff_module.chief_of_staff_should_use_specialist_tools(request)
 
 
 def test_chief_of_staff_local_kni_document_request_skips_hosted_file_search(
@@ -1118,6 +1132,270 @@ def test_run_script_live_sdk_runs_orchestrator_preflight_when_parent_absent(
     assert captured["sdk_args"][0]["include_specialist_tools"] is False
     assert payload["manual_request_plan"]["source"] == "llm"
     assert payload["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
+
+
+def test_run_script_live_sdk_passes_web_query_plan_to_chief(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from keystone_agents.agents.orchestrator import OrchestratorPreflight
+    from keystone_agents.schemas.orchestrator import OrchestratorResult
+    from keystone_agents.schemas.web_query_plan import WebQueryPlan
+
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="research_brief",
+        primary_target="ambient clinical AI partnerships",
+        target_type="topic",
+        objective="Prepare a source-backed public web brief.",
+        task_objective="source_research",
+        expected_artifact_type="research_brief",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_preflight(*args: object, **_kwargs: object) -> OrchestratorPreflight:
+        return OrchestratorPreflight(
+            request_text=str(args[0]),
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            manual_request_plan=plan,
+            route_result=OrchestratorResult(
+                route="chief_of_staff",
+                target_agent="chief_of_staff",
+                rationale="Use Chief of Staff with source-backed web research.",
+            ),
+        )
+
+    def fake_resolve_web_query_plan(**kwargs: object) -> WebQueryPlan:
+        captured["planner_kwargs"] = kwargs
+        return WebQueryPlan(
+            source="llm",
+            subject="ambient clinical AI partnerships",
+            request_text=str(kwargs["request_text"]),
+            queries=[
+                "ambient clinical AI partnerships 2026",
+                "ambient scribe health system partnership evidence",
+                "clinical documentation AI customer case study",
+            ],
+            rationale="Cover official, partnership, and evidence lanes.",
+        )
+
+    def fake_run_chief_of_staff_sdk(*args: object, **kwargs: object) -> TypedAgentRunResult:
+        captured["sdk_args"] = args
+        captured["sdk_kwargs"] = kwargs
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary="Source-backed web brief.",
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="budget-resource-review",
+                target_channel="current Slack thread",
+            ),
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.delenv(MANUAL_REQUEST_PLAN_ENV, raising=False)
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(script, "resolve_web_query_plan", fake_resolve_web_query_plan)
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--live-search",
+                "--live-search-plan",
+                "--json",
+                "--input",
+                (
+                    "chief of staff give me a source-backed brief on ambient "
+                    "clinical AI partnerships using broader related web queries"
+                ),
+            ]
+        )
+        == 0
+    )
+
+    typed_input = captured["sdk_args"][0]
+    payload = _payload(capsys.readouterr().out)
+    assert captured["planner_kwargs"]["live"] is True
+    assert captured["planner_kwargs"]["subject"] == "ambient clinical AI partnerships"
+    assert typed_input["live_web_research_enabled"] is True
+    assert typed_input["web_query_plan"]["source"] == "llm"
+    assert typed_input["web_query_plan"]["queries"] == [
+        "ambient clinical AI partnerships 2026",
+        "ambient scribe health system partnership evidence",
+        "clinical documentation AI customer case study",
+    ]
+    assert "web_query_plan_instruction" in typed_input
+    assert payload["web_query_plan"]["source"] == "llm"
+    assert os.environ["KEYSTONE_ENABLE_LIVE_RESEARCH"] == "true"
+
+
+def test_run_script_live_sdk_executes_recommended_work_item_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    import keystone_agents.workflow_runner as workflow_runner
+    from keystone_agents.schemas.work_item import (
+        WorkflowRunRequest,
+        WorkflowRunResult,
+        WorkItem,
+        WorkItemKind,
+        WorkItemRoute,
+        WorkItemStatus,
+    )
+
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="test",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="route_request",
+        primary_target="Cobalt Yard Operations",
+        target_type="company",
+        objective="Pick and execute the next specialist handoff.",
+        task_objective="route_or_continue",
+        expected_artifact_type="none",
+    )
+    captured: dict[str, WorkflowRunRequest] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_run_chief_of_staff_sdk(*_args: object, **_kwargs: object) -> TypedAgentRunResult:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary=(
+                    "Chief of Staff -> Business Research Agent is the best next owner "
+                    "for source-backed review before any external action."
+                ),
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="research-direction-review",
+                    target_channel="current thread",
+                ),
+                approval_required=True,
+                audit_notes=[],
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    def fake_advance_work_item_manager_loop(
+        request: WorkflowRunRequest,
+        **_kwargs: object,
+    ) -> WorkflowRunResult:
+        captured["request"] = request
+        work_item = WorkItem(
+            kind=WorkItemKind.COMPANY_RESEARCH,
+            title="Research: Cobalt Yard Operations",
+            request_text=request.request_text,
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=WorkItemStatus.DONE,
+            last_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        )
+        return WorkflowRunResult(
+            work_item=work_item,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=WorkItemStatus.DONE,
+            advanced=True,
+            human_summary=(
+                "Business Research Agent source-provided brief for Cobalt Yard Operations\n\n"
+                "Answer\nCobalt Yard Operations should be treated as a bounded internal "
+                "research handoff."
+            ),
+            audit_notes=["Business Research executed after Chief of Staff handoff."],
+        )
+
+    request_text = (
+        "chief of staff agent: diagnostic case diag_cos_direct_handoff Use only sanitized "
+        "inline context. Cobalt Yard Operations is considering whether Keystone could "
+        "help review a warehouse shift-handoff dashboard before a May internal pilot. "
+        "No PHI is included. If recommending another agent, use Chief of Staff -> "
+        "Business Research Agent notation. No external action is approved."
+    )
+
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "load_manual_request_plan_from_env", lambda: plan)
+    monkeypatch.setattr(script, "load_orchestrator_preflight_from_env", lambda: None)
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(script, "_chief_of_staff_output_review", lambda **_: {"status": "pass"})
+    monkeypatch.setattr(
+        workflow_runner,
+        "advance_work_item_manager_loop",
+        fake_advance_work_item_manager_loop,
+    )
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--json",
+                "--database-url",
+                f"sqlite:///{tmp_path / 'chief-direct.sqlite3'}",
+                "--input",
+                request_text,
+            ]
+        )
+        == 0
+    )
+
+    payload = _payload(capsys.readouterr().out)
+    output = payload["output"]
+    assert isinstance(output, dict)
+    delegated = payload["delegated_work_item_result"]
+    assert isinstance(delegated, dict)
+    assert captured["request"].requested_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert captured["request"].live_sdk is False
+    assert captured["request"].live_search is False
+    assert delegated["route"] == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert output["recommended_route"]["workflow_type"] == "clarification"
+    assert output["summary"].startswith("Chief of Staff handed this to Business Research Agent.")
+    assert "Business Research Agent source-provided brief" in output["summary"]
+    assert "Suggested route" not in output["summary"]
+
+
+def test_chief_deterministic_handoff_accepts_workitem_capable_specialist_wording() -> None:
+    result = plan_chief_of_staff_request(
+        "chief of staff agent: Use only sanitized inline context. Delta Harbor "
+        "Logistics is considering whether Keystone could help review an operations "
+        "dashboard for handoff delays before an August internal pilot. Recommend "
+        "the best next WorkItem-capable specialist and hand off if appropriate "
+        "using Chief of Staff -> Business Research Agent notation. Keep this "
+        "read-only and internal; no external action is approved."
+    )
+
+    assert result.recommended_route.workflow_type == "research-direction-review"
+    assert result.recommended_route.command_text == "Chief of Staff -> Business Research Agent"
+    assert "Saved reference" not in result.summary
 
 
 def test_run_script_falls_back_when_live_sdk_misroutes_search_to_reference_capture(
@@ -3465,6 +3743,40 @@ def test_outreach_request_routes_to_draft_only_owner() -> None:
     assert "outreach composer" in result.recommended_route.command_text.lower()
     assert "outreach_drafting" in result.operating_capabilities
     assert any("human approval" in action.lower() for action in result.recommended_actions)
+    assert result.send_enabled is False
+
+
+def test_internal_handoff_request_uses_agent_handoff_notation() -> None:
+    result = plan_chief_of_staff_request(
+        "chief of staff agent: Use only this sanitized inline context. Cedar Lane "
+        "Diagnostics is considering whether Keystone could help review an internal "
+        "lab-operations quality dashboard before an October management review. Return "
+        "a concise internal handoff with the best next owner or agent, why that path "
+        "fits, what information Keystone should request before committing, and what "
+        "remains blocked. If recommending another agent, use Chief of Staff -> "
+        "Business Research Agent notation. Do not draft outreach, send, schedule, "
+        "write files, create CRM records, publish, or post elsewhere."
+    )
+
+    assert result.recommended_route.workflow_type == "research-direction-review"
+    assert result.recommended_route.command_text == "Chief of Staff -> Business Research Agent"
+    assert "internal handoff" in result.summary
+    assert any("Chief of Staff -> Agent notation" in action for action in result.recommended_actions)
+    assert result.send_enabled is False
+
+
+def test_internal_handoff_request_preserves_named_downstream_agent() -> None:
+    result = plan_chief_of_staff_request(
+        "chief of staff agent: Use only sanitized inline context. Baylight Rehab is "
+        "considering whether Keystone could help review a physical-therapy "
+        "exercise-adherence dashboard before a January pilot. Return a concise "
+        "internal handoff with the best next owner or agent. If recommending another "
+        "agent, use Chief of Staff -> Opportunity Scout Agent notation. Do not draft "
+        "outreach, send, schedule, write files, create CRM records, publish, or post "
+        "elsewhere."
+    )
+
+    assert result.recommended_route.command_text == "Chief of Staff -> Opportunity Scout Agent"
     assert result.send_enabled is False
 
 

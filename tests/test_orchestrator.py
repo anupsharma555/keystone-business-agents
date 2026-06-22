@@ -17,6 +17,7 @@ from keystone_agents.agents.orchestrator import (
     load_workflow_state_context,
     review_specialist_output,
     route_request,
+    run_orchestrator_preflight,
 )
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import AgentRunRequest, RunMode, TypedAgentRunResult
@@ -669,6 +670,156 @@ def test_opportunity_crm_save_request_is_scout_with_no_write_boundary() -> None:
     assert any("CRM save/write request" in note for note in result.audit_notes)
 
 
+def test_negated_crm_record_creation_does_not_add_crm_boundary() -> None:
+    result = route_request(
+        "Opportunity scout agent: use only this sanitized inline context. "
+        "Baylight Rehab is considering whether Keystone could review an outcomes "
+        "dashboard before an internal pilot. Do not draft outreach, send, schedule, "
+        "write files, create CRM records, publish, or post elsewhere."
+    )
+
+    assert result.route == "opportunity_scout"
+    assert "crm_preflight" not in result.workflow
+    assert "save_to_crm" not in result.forbidden_actions
+    assert "crm_write" not in result.forbidden_actions
+    assert not any("CRM save/write request" in note for note in result.audit_notes)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Create no CRM records; summarize the provided context only.",
+        "Create zero CRM records and do not write to Airtable.",
+        "Research the company, but create no CRM records or opportunity records.",
+    ],
+)
+def test_zero_crm_record_constraints_do_not_add_crm_boundary(prompt: str) -> None:
+    result = route_request(prompt)
+
+    assert "crm_preflight" not in result.workflow
+    assert "save_to_crm" not in result.forbidden_actions
+    assert "crm_write" not in result.forbidden_actions
+
+
+def test_chief_of_staff_handoff_with_negated_outreach_does_not_trigger_draft_gate() -> None:
+    prompt = (
+        "chief of staff agent: diagnostic case diag_cos_20260620_003_diverse_ops_handoff "
+        "Use only this sanitized inline context. Cedar Lane Diagnostics is considering whether "
+        "Keystone could help review an internal lab-operations quality dashboard before an "
+        "October management review. No PHI is included. No external action is approved. "
+        "Return a concise internal handoff with the best next owner or agent, why that path "
+        "fits, what information Keystone should request before committing, and what remains "
+        "blocked. If recommending another agent, use Chief of Staff -> Business Research Agent "
+        "or Chief of Staff -> Airtable Context Agent notation as appropriate. Do not access "
+        "Gmail, Airtable, Drive, Zotero, Slack history, web search, browser automation, or "
+        "external tools. Do not draft outreach, send, schedule, write files, create CRM records, "
+        "publish, or post elsewhere."
+    )
+    manual_plan = infer_manual_request_plan(prompt, requested_agent="chief_of_staff")
+
+    result = route_request(prompt, manual_plan=manual_plan)
+
+    assert result.route == "chief_of_staff"
+    assert result.refused is False
+    assert result.workflow == ["chief_of_staff"]
+    assert "outreach_composer" not in result.workflow
+    assert result.stop_reason is None
+    assert not any("approval-context gate blocked outreach" in note for note in result.audit_notes)
+
+
+@pytest.mark.parametrize(
+    ("requested_agent", "expected_route"),
+    [
+        ("rss_context_agent", "rss_context_agent"),
+        ("preprints_context_agent", "preprints_context_agent"),
+    ],
+)
+def test_explicit_feed_context_agents_preserve_route(
+    requested_agent: str,
+    expected_route: str,
+) -> None:
+    prompt = (
+        "Read-only context test. Use available feed context, not browser automation "
+        "or live web search. Return a concise Answer and Detailed Summary."
+    )
+    manual_plan = infer_manual_request_plan(prompt, requested_agent=requested_agent)
+    result = route_request(prompt, manual_plan=manual_plan)
+
+    assert result.route == expected_route
+    assert result.workflow == [expected_route]
+    assert result.send_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_route"),
+    [
+        (
+            "@KNI rss context agent read-only eval: inspect announcement history. "
+            "Do not refresh feeds, post to Slack, create files, schedule, draft "
+            "outreach, or mutate announcement history.",
+            "rss_context_agent",
+        ),
+        (
+            "@KNI preprints context agent read-only eval: inspect preliminary "
+            "preprint evidence. Do not refresh feeds, post to Slack, create files, "
+            "schedule, draft outreach, or treat preliminary findings as validated.",
+            "preprints_context_agent",
+        ),
+    ],
+)
+def test_explicit_feed_context_agents_ignore_negated_post_side_effects(
+    prompt: str,
+    expected_route: str,
+) -> None:
+    manual_plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
+    result = route_request(prompt, manual_plan=manual_plan)
+
+    assert manual_plan.target_agent == expected_route
+    assert manual_plan.intent == "context_lookup"
+    assert result.route == expected_route
+    assert result.refused is False
+    assert result.workflow == [expected_route]
+    assert result.send_enabled is False
+
+
+def test_colon_named_business_research_mention_preserves_agent_reasoning_path() -> None:
+    prompt = (
+        "@KNI business research analyst: diagnostic case diag_business_research_abrdg_001 "
+        "Read-only source-backed business research test for Abridge. Use live search if "
+        "available. Identify up to 2 practical healthcare buyer-fit angles for Keystone, "
+        "explain why each might fit, and state key caveats. Keep answer concise and include "
+        "visible source URLs. Do not draft outreach, send, schedule, write files, create CRM "
+        "records, publish, or post elsewhere."
+    )
+    manual_plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
+    result = route_request(prompt, manual_plan=manual_plan)
+
+    assert manual_plan.target_agent == "business_research_analyst"
+    assert manual_plan.primary_target == "Abridge"
+    assert result.route == "business_research_analyst"
+    assert result.workflow == ["business_research_analyst"]
+    assert "opportunity_scout" not in result.workflow
+    assert "outreach_composer" not in result.workflow
+    assert result.send_enabled is False
+    assert result.retrieval_hint is not None
+
+
+def test_context_agent_affirmative_post_request_still_refuses_send_side_effect() -> None:
+    prompt = (
+        "@KNI rss context agent inspect announcement history and post this message "
+        "to Slack for the channel."
+    )
+    manual_plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
+    result = route_request(prompt, manual_plan=manual_plan)
+
+    assert manual_plan.target_agent == "rss_context_agent"
+    assert manual_plan.intent == "blocked_send"
+    assert result.route == "clarification"
+    assert result.refused is True
+    assert result.approval_required is True
+    assert result.send_enabled is False
+
+
 def test_find_and_send_outreach_preserves_draft_only_workflow() -> None:
     result = route_request("Find and send outreach to the best three companies.")
 
@@ -784,6 +935,43 @@ def test_outreach_request_without_approved_profile_refuses() -> None:
     assert result.send_enabled is False
     assert result.approval_scope == "drafting"
     assert "blocked" in result.approval_rationale
+
+
+def test_outreach_request_without_approved_profile_has_sectioned_operator_summary() -> None:
+    result = route_request("draft outreach to NeuroFlow")
+
+    assert result.clarification_request is not None
+    assert "Outreach Composer needs approved drafting context" in result.clarification_request
+    assert "*Answer:*" in result.clarification_request
+    assert "*Detailed Summary:*" in result.clarification_request
+    assert "*Next step:*" in result.clarification_request
+    assert "source-backed company profile or opportunity record" in result.clarification_request
+    assert "external action was taken" in result.clarification_request
+    assert "CompanyProfile" not in result.clarification_request
+    assert "OpportunityRecord" not in result.clarification_request
+    assert "WorkItem" not in result.clarification_request
+    assert result.route == "clarification"
+    assert result.refused is True
+
+
+def test_orchestrator_preflight_hard_safety_summary_preserves_execution_gate() -> None:
+    preflight = run_orchestrator_preflight(
+        (
+            "@KNI outreach composer draft a note using this named patient story: "
+            "Jane Doe improved after treatment."
+        ),
+        requested_agent="outreach_composer",
+    )
+
+    assert preflight.execution_allowed is False
+    assert preflight.block_kind == "safety"
+    assert preflight.route_result.route == "clarification"
+    assert preflight.route_result.clarification_request is not None
+    assert "Outreach blocked by safety gate" in preflight.route_result.clarification_request
+    assert "*Answer:*" in preflight.route_result.clarification_request
+    assert "*Detailed Summary:*" in preflight.route_result.clarification_request
+    assert "*Next step:*" in preflight.route_result.clarification_request
+    assert "No draft, send, post" in preflight.route_result.clarification_request
 
 
 def test_generic_outreach_to_this_company_blocks_for_missing_context() -> None:
@@ -1247,7 +1435,7 @@ def test_workflow_state_context_summarizes_storage_without_bodies(tmp_path) -> N
 def test_handoff_metadata_or_intended_handoff_list_exists() -> None:
     agent = build_orchestrator_agent()
 
-    assert len(INTENDED_HANDOFFS) == 7
+    assert len(INTENDED_HANDOFFS) == 9
     assert {handoff.agent_name for handoff in INTENDED_HANDOFFS} == {
         "Gmail Inbound Triage Agent",
         "Business Research Analyst",
@@ -1256,6 +1444,8 @@ def test_handoff_metadata_or_intended_handoff_list_exists() -> None:
         "Airtable Context Agent",
         "Google Workspace Context Agent",
         "Zotero Context Agent",
+        "RSS Context Agent",
+        "Preprints Context Agent",
     }
     assert getattr(agent, "handoffs", None)
     assert getattr(agent, "intended_handoffs", None) or getattr(agent, "handoff_contract", None)

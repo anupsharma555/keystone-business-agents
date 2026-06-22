@@ -48,6 +48,9 @@ from keystone_agents.agents.outreach_composer import (
     build_outreach_composer_agent,
     run_outreach_composer_sdk,
 )
+from keystone_agents.agents.preprints_context import build_preprints_context_agent
+from keystone_agents.agents.rss_context import build_rss_context_agent
+from keystone_agents.agents.web_query_planner import build_web_query_planner_agent
 
 __all__ = [
     "build_business_research_analyst_agent",
@@ -65,10 +68,13 @@ __all__ = [
     "build_gmail_priority_grouping_agent",
     "build_opportunity_scout_agent",
     "build_opportunity_search_planner_agent",
+    "build_web_query_planner_agent",
     "build_manual_request_planner_agent",
     "build_orchestrator_agent",
     "build_orchestrator_review_agent",
     "build_outreach_composer_agent",
+    "build_rss_context_agent",
+    "build_preprints_context_agent",
     "run_business_research_analyst_sdk",
     "run_business_research_analyst_focused_brief_sdk",
     "run_business_research_analyst_research_brief_sdk",

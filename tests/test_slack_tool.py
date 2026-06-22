@@ -21,6 +21,7 @@ from keystone_agents.slack_action_contract import (
     BUSINESS_AGENT_ACTION_SCHEMA,
     KBA_APPROVE_EXTERNAL_USE,
     KBA_COS_CONTINUE_WORK_ITEM,
+    KBA_COS_POST_SUMMARY,
     KBA_CREATE_GMAIL_DRAFT,
     KBA_FIND_CONTACT,
     KBA_INTENT_CONTINUE_WORK_ITEM,
@@ -170,6 +171,55 @@ def test_slack_tool_dry_run_posts_only_preview(monkeypatch: pytest.MonkeyPatch) 
     assert result["status"] == "dry-run"
     assert result["ts"] == "dry-run-slack-ts"
     assert result["channel"] == "dry-run-approvals"
+
+
+def test_chief_post_summary_action_uses_source_channel(tmp_path) -> None:
+    payload = {
+        "user": {"username": "anup"},
+        "channel": {"id": "CANNOUNCE", "name": "announcements"},
+        "message": {"ts": "1715366400.000100", "thread_ts": "1715366400.000100"},
+        "actions": [
+            {
+                "action_id": KBA_COS_POST_SUMMARY,
+                "value": business_agent_action_value(intent="post_internal_summary"),
+            }
+        ],
+    }
+
+    result = handle_slack_approval_interaction(
+        payload,
+        database_url=f"sqlite:///{tmp_path / 'slack.db'}",
+    )
+
+    publish_result = result.read_only_payload["publish_result"]
+    assert result.outcome == "slack_summary_ready"
+    assert result.slack_channel_id == "CANNOUNCE"
+    assert publish_result["slack_result"]["channel"] == "CANNOUNCE"
+    assert publish_result["status"] == "dry-run"
+
+
+def test_chief_post_summary_action_blocks_when_source_channel_missing(tmp_path) -> None:
+    payload = {
+        "user": {"username": "anup"},
+        "actions": [
+            {
+                "action_id": KBA_COS_POST_SUMMARY,
+                "value": business_agent_action_value(intent="post_internal_summary"),
+            }
+        ],
+    }
+
+    result = handle_slack_approval_interaction(
+        payload,
+        database_url=f"sqlite:///{tmp_path / 'slack.db'}",
+    )
+
+    publish_result = result.read_only_payload["publish_result"]
+    assert result.outcome == "channel_context_required"
+    assert result.slack_channel_id == ""
+    assert publish_result["status"] == "blocked"
+    assert publish_result["blocker"] == "missing_slack_source_channel"
+    assert publish_result["slack_result"]["channel"] == ""
 
 
 def test_slack_review_message_posts_thread_preview_in_dry_run() -> None:

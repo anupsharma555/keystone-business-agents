@@ -30,6 +30,29 @@ auditable, and dry-run-safe.
   scheduling, autonomous approval, CRM writes, LinkedIn publishing, or Slack
   posting except approval notifications behind explicit live flags.
 
+## Web Search Query Planning
+
+For live source-backed web research, agents should not default to a single broad
+query when the request needs breadth, recency, source diversity, or a decision
+brief. Chief of Staff, Business Research Analyst, and Opportunity Scout should
+first reason through a compact query plan, then call `search_web` for the
+strongest bounded queries within the available budget.
+
+Use multiple query angles when useful:
+
+- official source or named domain
+- independent press/news coverage
+- current-year or recent activity
+- funding, partnerships, customers, pilots, or deployments
+- clinical validation, trials, publications, regulatory, grants, RFPs, or
+  conference/journal calls
+- leadership, hiring, headcount, or operating signals
+- the operator's explicit decision criteria or exclusion terms
+
+After search, selected URLs must be extracted/read or explicitly marked
+snippet-only before final synthesis. Keep provider details in diagnostics or
+metadata unless the operator asks for them.
+
 ## Google Workspace Tools
 
 Registered Keystone business agents may use scoped Google Drive, Docs, and

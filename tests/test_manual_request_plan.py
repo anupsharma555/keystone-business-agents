@@ -33,6 +33,34 @@ def test_manual_plan_routes_conference_search_to_opportunity_scout() -> None:
     assert plan.requires_live_search is True
 
 
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "@KNI rss context agent: send the announcement summary to Slack",
+        "@KNI airtable context agent: update the tracker row for this case",
+    ],
+)
+def test_context_agent_affirmative_side_effect_requests_are_blocked(prompt: str) -> None:
+    plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
+
+    assert plan.intent == "blocked_send"
+    assert plan.target_agent in {"rss_context_agent", "airtable_context_agent"}
+    assert plan.task_objective == "blocked_side_effect"
+    assert plan.planner_warnings
+
+
+def test_context_agent_negated_side_effect_constraints_remain_read_only_context() -> None:
+    plan = infer_manual_request_plan(
+        "@KNI rss context agent: inspect announcement history. Do not post to Slack "
+        "or write files.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "rss_context_agent"
+    assert plan.intent == "context_lookup"
+    assert plan.planner_warnings == []
+
+
 @pytest.mark.parametrize("spec_id", ["BR-1", "BR-4"])
 def test_manual_plan_keeps_research_brief_prompts_with_outreach_mentions_on_research(
     spec_id: str,
@@ -407,9 +435,96 @@ def test_manual_plan_extracts_business_research_target_from_direct_call() -> Non
     assert plan.requested_agent == "business_research_analyst"
     assert plan.target_agent == "business_research_analyst"
     assert plan.primary_target == "NeuroFlow"
-    assert plan.task_objective == "entity_research"
+    assert plan.task_objective == "source_research"
     assert plan.expected_artifact_type == "research_brief"
     assert "NeuroFlow" in plan.objective
+
+
+def test_manual_plan_preserves_colon_named_business_research_mention() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "@KNI business research analyst: diagnostic case diag_business_research_abrdg_001 "
+            "Read-only source-backed business research test for Abridge. Use live search if "
+            "available. Identify up to 2 practical healthcare buyer-fit angles for Keystone, "
+            "explain why each might fit, and state key caveats. Keep answer concise and "
+            "include visible source URLs. Do not draft outreach, send, schedule, write files, "
+            "create CRM records, publish, or post elsewhere."
+        ),
+        requested_agent="orchestrator",
+    )
+
+    assert plan.requested_agent == "orchestrator"
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.primary_target == "Abridge"
+    assert plan.task_objective == "source_research"
+    assert plan.requires_live_search is True
+
+
+def test_manual_plan_routes_polite_business_research_agent_ask() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "@KNI could the business research analyst take a quick read-only look at "
+            "Nabla as a clinical AI documentation company? Please give the short answer "
+            "first, then a source-backed summary with visible URLs. No outreach, drafts, "
+            "scheduling, file creation, CRM records, publishing, or posting elsewhere."
+        ),
+        requested_agent="orchestrator",
+    )
+
+    assert plan.requested_agent == "orchestrator"
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.primary_target == "Nabla"
+    assert plan.target_type == "company"
+    assert plan.task_objective == "source_research"
+    assert plan.requires_live_search is True
+
+
+def test_manual_plan_extracts_fit_check_company_for_business_research() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "@KNI business research analyst: Could you do a concise read-only Keystone "
+            "fit check on Suki as a clinical AI assistant company? Focus on buyer fit "
+            "and evidence signals."
+        ),
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.primary_target == "Suki"
+    assert plan.target_type == "company"
+
+
+def test_manual_plan_extracts_company_after_diagnostic_prefix() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "diagnostic case diag_business_research_abrdg_001 Research Abridge as a "
+            "clinical documentation AI company. Return a concise Answer and Detailed Summary."
+        ),
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.primary_target == "Abridge"
+    assert plan.target_type == "company"
+
+
+def test_manual_plan_prefers_company_label_after_source_context_instruction() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "@KNI business research analyst: Use only this source-provided context. "
+            "Company: Northline Imaging. Context: Northline Imaging sells operational "
+            "analytics for outpatient imaging centers and is preparing an internal "
+            "capacity-planning pilot. No PHI is included. Return Answer and Detailed Summary."
+        ),
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.primary_target == "Northline Imaging"
+    assert plan.target_type == "company"
+    assert plan.requires_live_search is False
 
 
 def test_manual_plan_routes_unnamed_multi_company_business_research_to_scout() -> None:
@@ -984,7 +1099,7 @@ def test_cli_live_outreach_blocks_without_approved_context(capsys) -> None:
     assert output["status"] == "blocked"
     assert output["requires_approved_context"] is True
     assert output["send_enabled"] is False
-    assert "approved CompanyProfile or OpportunityRecord" in output["message"]
+    assert "source-backed company or opportunity context" in output["message"]
 
 
 def test_gmail_execution_plan_maps_recent_actionable_threads_to_priority_grouping() -> None:

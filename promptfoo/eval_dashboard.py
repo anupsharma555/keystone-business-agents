@@ -39,6 +39,7 @@ from promptfoo.eval_urls import (
     eval_review_case_url,
 )
 from promptfoo.human_review import SCORE_DIMENSIONS
+from promptfoo.orchestrator_judge import JUDGE_ENV_FLAG, eval_llm_judge_enabled
 
 DEFAULT_DASHBOARD_PATH = Path(".keystone/promptfoo/dashboard.html")
 DEFAULT_START_CASE_ID = "slack_company_research_001"
@@ -117,9 +118,11 @@ CASE_FOLLOW_UP_LABEL_PRIORITY = {
     "slack_retry_volume": 4,
     "machine_check": 5,
     "human_review": 6,
-    "source_visibility": 7,
-    "analysis_inclusion": 8,
-    "prompt_text": 9,
+    "orchestrator_judge": 7,
+    "orchestrator_review_detail": 8,
+    "source_visibility": 9,
+    "analysis_inclusion": 10,
+    "prompt_text": 11,
 }
 CASE_FOLLOW_UP_LABEL_DISPLAY = {
     "prompt_text": "Prompt text",
@@ -131,6 +134,8 @@ CASE_FOLLOW_UP_LABEL_DISPLAY = {
     "slack_warnings": "Slack warnings",
     "machine_check": "Machine check",
     "human_review": "Human review",
+    "orchestrator_judge": "Orchestrator Review",
+    "orchestrator_review_detail": "Orchestrator Review detail",
     "analysis_inclusion": "Analysis inclusion",
 }
 CORE_EVAL_AGENTS = (
@@ -215,13 +220,15 @@ def dashboard_payload(
         dashboard_health=dashboard_health,
         trace_summary=trace_summary,
     )
+    analysis = _promptfoo_analysis(db_path)
+    analysis["latest_run"] = _latest_case_run_summary(cases)
     return {
         "database_path": str(db_path),
         "database_tables": database_table_summaries(db_path),
         "eval_runs": eval_runs,
         "run_ledger": run_ledger,
         "follow_up_queue": _follow_up_queue(cases),
-        "analysis": _promptfoo_analysis(db_path),
+        "analysis": analysis,
         "cases": cases,
         "summary": summary,
         "dashboard_health": dashboard_health,
@@ -229,6 +236,10 @@ def dashboard_payload(
         "data_quality": data_quality,
         "workflow_readiness": _workflow_readiness(cases, summary),
         "score_dimensions": list(SCORE_DIMENSIONS),
+        "orchestrator_judge": {
+            "enabled": eval_llm_judge_enabled(),
+            "env_flag": JUDGE_ENV_FLAG,
+        },
     }
 
 
@@ -370,9 +381,17 @@ def dashboard_case_export_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         )
         slack_status = "tested" if int(case.get("slack_run_count") or 0) > 0 else "not_run"
         human_status = "reviewed" if case.get("human_average") is not None else "unreviewed"
+        judge_status = (
+            "scored" if case.get("orchestrator_judge_average") is not None else "unscored"
+        )
         human_scores = case.get("human_scores") or {}
+        judge_scores = case.get("orchestrator_judge_scores") or {}
         score_fields = {
             f"human_{dimension}": human_scores.get(dimension, "")
+            for dimension in SCORE_DIMENSIONS
+        }
+        judge_score_fields = {
+            f"orchestrator_judge_{dimension}": judge_scores.get(dimension, "")
             for dimension in SCORE_DIMENSIONS
         }
         rows.append(
@@ -381,6 +400,10 @@ def dashboard_case_export_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "case_id": case.get("case_id") or "",
                 "agent": case.get("agent") or "",
                 "dimensions": ", ".join(case.get("dimensions") or []),
+                "scoring_status": case.get("scoring_status") or "",
+                "scoring_status_label": case.get("scoring_status_label") or "",
+                "scoring_completed_at": case.get("scoring_completed_at") or "",
+                "scoring_review_kinds": ", ".join(case.get("scoring_review_kinds") or []),
                 "latest_run_at": case.get("latest_run_at") or "",
                 "latest_run_source": case.get("latest_run_source") or "",
                 "latest_run_id": case.get("latest_run_id") or "",
@@ -409,9 +432,25 @@ def dashboard_case_export_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "latest_slack_sdk_cache_hit_rate": case.get("latest_slack_sdk_cache_hit_rate") or "",
                 "human_status": human_status,
                 "human_average_5": _score_out_of_five(case.get("human_average")),
+                "human_total_score_5": _score_out_of_five(case.get("human_average")),
                 "human_safety": case.get("human_safety") or "",
                 **score_fields,
                 "human_notes": case.get("human_notes") or "",
+                "orchestrator_judge_status": judge_status,
+                "orchestrator_judge_average_5": _score_out_of_five(
+                    case.get("orchestrator_judge_average")
+                ),
+                "orchestrator_judge_total_score_5": _score_out_of_five(
+                    case.get("orchestrator_judge_average")
+                ),
+                "orchestrator_judge_safety": case.get("orchestrator_judge_safety") or "",
+                "orchestrator_judge_created_at": case.get("orchestrator_judge_created_at") or "",
+                **judge_score_fields,
+                "orchestrator_judge_notes": case.get("orchestrator_judge_notes") or "",
+                "orchestrator_judge_run_comment": case.get("orchestrator_judge_run_comment") or "",
+                "orchestrator_judge_recommended_next_action": (
+                    case.get("orchestrator_judge_recommended_next_action") or ""
+                ),
                 "analysis_excluded": "yes" if case.get("analysis_excluded") else "no",
                 "analysis_exclusion_reason": case.get("analysis_exclusion_reason") or "",
                 "updated_at": case.get("updated_at") or "",
@@ -429,6 +468,10 @@ def dashboard_case_export_csv(payload: dict[str, Any]) -> str:
         "case_id",
         "agent",
         "dimensions",
+        "scoring_status",
+        "scoring_status_label",
+        "scoring_completed_at",
+        "scoring_review_kinds",
         "latest_run_at",
         "latest_run_source",
         "latest_run_id",
@@ -452,9 +495,19 @@ def dashboard_case_export_csv(payload: dict[str, Any]) -> str:
         "latest_slack_sdk_cache_hit_rate",
         "human_status",
         "human_average_5",
+        "human_total_score_5",
         "human_safety",
         *[f"human_{dimension}" for dimension in SCORE_DIMENSIONS],
         "human_notes",
+        "orchestrator_judge_status",
+        "orchestrator_judge_average_5",
+        "orchestrator_judge_total_score_5",
+        "orchestrator_judge_safety",
+        "orchestrator_judge_created_at",
+        *[f"orchestrator_judge_{dimension}" for dimension in SCORE_DIMENSIONS],
+        "orchestrator_judge_notes",
+        "orchestrator_judge_run_comment",
+        "orchestrator_judge_recommended_next_action",
         "analysis_excluded",
         "analysis_exclusion_reason",
         "updated_at",
@@ -554,6 +607,24 @@ def dashboard_case_review_bundle(payload: dict[str, Any], case_id: str) -> dict[
             "created_at": case.get("human_created_at") or "",
             "notes": case.get("human_notes") or "",
             "scores": case.get("human_scores") or {},
+        },
+        "orchestrator_judge_review": {
+            "average_5": _score_out_of_five(case.get("orchestrator_judge_average")),
+            "safety": case.get("orchestrator_judge_safety") or "",
+            "created_at": case.get("orchestrator_judge_created_at") or "",
+            "notes": case.get("orchestrator_judge_notes") or "",
+            "run_comment": case.get("orchestrator_judge_run_comment") or "",
+            "recommended_next_action": (
+                case.get("orchestrator_judge_recommended_next_action") or ""
+            ),
+            "scores": case.get("orchestrator_judge_scores") or {},
+            "dimension_rationales": case.get("orchestrator_judge_dimension_rationales") or {},
+        },
+        "scoring": {
+            "status": case.get("scoring_status") or "",
+            "label": case.get("scoring_status_label") or "",
+            "completed_at": case.get("scoring_completed_at") or "",
+            "review_kinds": case.get("scoring_review_kinds") or [],
         },
         "review_target": case.get("review_target") or {},
         "analysis": {
@@ -685,6 +756,10 @@ def render_review_form(
         "database_path": str(db_path),
         "case": selected,
         "score_dimensions": list(SCORE_DIMENSIONS),
+        "orchestrator_judge": {
+            "enabled": eval_llm_judge_enabled(),
+            "env_flag": JUDGE_ENV_FLAG,
+        },
     }
     html_text = _review_html(payload)
     if output_path:
@@ -692,6 +767,38 @@ def render_review_form(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(html_text, encoding="utf-8")
     return html_text
+
+
+def _orchestrator_review_detail(review: dict[str, Any]) -> dict[str, Any]:
+    """Extract visible Orchestrator Review comments and metric rationales."""
+
+    raw: dict[str, Any] = {}
+    raw_text = str(review.get("raw_text") or "").strip()
+    if raw_text:
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            raw = parsed
+    rationales_raw = raw.get("dimension_rationales")
+    rationales = rationales_raw if isinstance(rationales_raw, dict) else {}
+    dimension_rationales = {
+        dimension: str(rationales.get(dimension) or "").strip()
+        for dimension in SCORE_DIMENSIONS
+        if str(rationales.get(dimension) or "").strip()
+    }
+    notes = str(raw.get("notes") or review.get("notes") or "").strip()
+    legacy_split = "\n\nDimension rationales:\n"
+    if legacy_split in notes:
+        notes = notes.split(legacy_split, 1)[0].strip()
+    recommended_next_action = str(raw.get("recommended_next_action") or "").strip()
+    return {
+        "run_comment": notes,
+        "dimension_rationales": dimension_rationales,
+        "recommended_next_action": recommended_next_action,
+        "confidence": raw.get("confidence"),
+    }
 
 
 def _case_dashboard_record(
@@ -710,6 +817,8 @@ def _case_dashboard_record(
     )
     latest_promptfoo = {} if prompt_changed_since_promptfoo else status.get("latest_promptfoo") or {}
     latest_human = status.get("latest_target_human_review") or {}
+    latest_judge = status.get("latest_target_orchestrator_judge_review") or {}
+    latest_judge_detail = _orchestrator_review_detail(latest_judge)
     latest_slack = (status.get("slack_runs") or [{}])[0] if status.get("slack_runs") else {}
     latest_slack_evidence = (
         latest_slack.get("evidence") if isinstance(latest_slack.get("evidence"), dict) else {}
@@ -718,11 +827,40 @@ def _case_dashboard_record(
     latest_machine_run_at = (
         "" if prompt_changed_since_promptfoo else latest_promptfoo.get("imported_at") or row.get("latest_promptfoo_imported_at") or ""
     )
+    latest_human_created_at = str(latest_human.get("created_at") or "")
+    latest_judge_created_at = str(latest_judge.get("created_at") or "")
+    latest_scorecard_created_at = max(
+        (latest_human_created_at, latest_judge_created_at),
+        key=_timestamp_sort_key,
+    )
+    scoring_review_kinds = [
+        label
+        for label, created_at in (
+            ("human", latest_human_created_at),
+            ("orchestrator_judge", latest_judge_created_at),
+        )
+        if created_at
+    ]
+    scoring_status = "complete" if latest_scorecard_created_at else "missing"
+    scoring_status_label = (
+        "Scoring complete"
+        if latest_scorecard_created_at
+        else "Review score missing"
+        if _case_has_recorded_response(
+            {
+                "scored_response_text": _case_response_text(latest_promptfoo, latest_slack),
+                "response_text": _case_response_text(latest_promptfoo, latest_slack),
+                "latest_slack_summary": latest_slack.get("result_summary") or "",
+            }
+        )
+        else "Review score pending"
+    )
     latest_run = _latest_run_summary(
         latest_slack=latest_slack,
         latest_machine_run_at=str(latest_machine_run_at or ""),
         promptfoo_eval_id="" if prompt_changed_since_promptfoo else str(row.get("latest_eval_id") or ""),
-        human_created_at=str(latest_human.get("created_at") or ""),
+        human_created_at=latest_human_created_at,
+        orchestrator_judge_created_at=latest_judge_created_at,
     )
     record = {
         "case_id": case_id,
@@ -751,6 +889,23 @@ def _case_dashboard_record(
         "human_created_at": latest_human.get("created_at") or "",
         "human_scores": latest_human.get("scores") or {},
         "human_notes": latest_human.get("notes") or "",
+        "review_kind": latest_human.get("review_kind") or "",
+        "reviewer": latest_human.get("reviewer") or "",
+        "orchestrator_judge_average": latest_judge.get("average_score"),
+        "orchestrator_judge_safety": latest_judge.get("safety") or "",
+        "orchestrator_judge_created_at": latest_judge.get("created_at") or "",
+        "orchestrator_judge_scores": latest_judge.get("scores") or {},
+        "orchestrator_judge_notes": latest_judge.get("notes") or "",
+        "orchestrator_judge_run_comment": latest_judge_detail["run_comment"],
+        "orchestrator_judge_dimension_rationales": latest_judge_detail["dimension_rationales"],
+        "orchestrator_judge_recommended_next_action": latest_judge_detail[
+            "recommended_next_action"
+        ],
+        "orchestrator_judge_confidence": latest_judge_detail["confidence"],
+        "scoring_status": scoring_status,
+        "scoring_status_label": scoring_status_label,
+        "scoring_completed_at": latest_scorecard_created_at,
+        "scoring_review_kinds": scoring_review_kinds,
         "slack_run_count": int(status.get("slack_run_count") or 0),
         "latest_slack_run_id": latest_slack.get("run_id") or "",
         "latest_slack_thread_ts": latest_slack.get("slack_thread_ts") or "",
@@ -807,7 +962,7 @@ def _case_review_checklist(case: dict[str, Any]) -> list[dict[str, str]]:
         or (visible_source_count > 0 and (not source_required or source_count > 0))
         or (not source_required and source_count == 0)
     )
-    return [
+    checks = [
         _ledger_check(
             "prompt_text",
             "complete" if has_prompt else "missing",
@@ -878,11 +1033,57 @@ def _case_review_checklist(case: dict[str, Any]) -> list[dict[str, str]]:
             (
                 "Human scorecard is saved."
                 if case.get("human_average") is not None
-                else "Submit the human scorecard for the saved response."
+                else "Submit a human scorecard for the saved response."
                 if has_response
-                else "Human review is waiting on a recorded response."
+                else "Scorecard review is waiting on a recorded response."
             ),
         ),
+    ]
+    has_orchestrator_review = case.get("orchestrator_judge_average") is not None
+    has_orchestrator_review_target = bool(slack_runs) or has_orchestrator_review
+    if has_orchestrator_review_target:
+        checks.append(
+            _ledger_check(
+                "orchestrator_judge",
+                "complete" if has_orchestrator_review else "pending",
+                (
+                    "Orchestrator Review scorecard is saved for this #evals output."
+                    if has_orchestrator_review
+                    else "Optional Orchestrator Review scoring is not saved for this #evals output; manual human scoring can satisfy the review gate until Orchestrator Review is explicitly enabled or selected."
+                    if has_response
+                    else "Orchestrator Review scoring is waiting on a recorded #evals response."
+                ),
+            )
+        )
+        if has_orchestrator_review:
+            has_judge_comment = bool(
+                str(
+                    case.get("orchestrator_judge_run_comment")
+                    or case.get("orchestrator_judge_notes")
+                    or ""
+                ).strip()
+            )
+            judge_rationales = case.get("orchestrator_judge_dimension_rationales") or {}
+            has_judge_rationales = any(
+                str(value or "").strip()
+                for value in (
+                    judge_rationales.values()
+                    if isinstance(judge_rationales, dict)
+                    else []
+                )
+            )
+            checks.append(
+                _ledger_check(
+                    "orchestrator_review_detail",
+                    "complete" if has_judge_comment and has_judge_rationales else "attention",
+                    (
+                        "Orchestrator Review run comment and per-metric rationales are visible."
+                        if has_judge_comment and has_judge_rationales
+                        else "Orchestrator Review score exists, but its run comment or per-metric rationales are not visible in the dashboard."
+                    ),
+                )
+            )
+    checks.append(
         _ledger_check(
             "analysis_inclusion",
             "attention" if case.get("analysis_excluded") else "complete" if case.get("promptfoo_eval_id") else "pending",
@@ -892,7 +1093,8 @@ def _case_review_checklist(case: dict[str, Any]) -> list[dict[str, str]]:
                 else "Included in analysis." if case.get("promptfoo_eval_id") else "Analysis inclusion starts after machine-check import."
             ),
         ),
-    ]
+    )
+    return checks
 
 
 def _case_next_follow_up(checks: list[dict[str, str]]) -> str:
@@ -903,6 +1105,8 @@ def _case_next_follow_up(checks: list[dict[str, str]]) -> str:
         "slack_thread_evidence",
         "machine_check",
         "human_review",
+        "orchestrator_judge",
+        "orchestrator_review_detail",
         "source_visibility",
         "slack_warnings",
         "slack_retry_volume",
@@ -913,7 +1117,7 @@ def _case_next_follow_up(checks: list[dict[str, str]]) -> str:
         check = by_label.get(label)
         if check and check.get("status") in {"missing", "attention"}:
             return str(check.get("detail") or f"Resolve {label}.")
-    return "Ready to compare prompt, response, machine score, human review, evidence, and analysis movement."
+    return "Ready to compare prompt, response, machine score, Orchestrator Review, human review, evidence, and analysis movement."
 
 
 def _case_open_follow_up_checks(case: dict[str, Any]) -> list[dict[str, str]]:
@@ -995,6 +1199,13 @@ def _case_action_queue_item(
         if preferred_label and preferred_detail
         else str(case.get("next_follow_up") or primary.get("detail") or reason or "")
     )
+    prompt_text = str(case.get("user_input") or "")
+    response_text = str(
+        case.get("scored_response_text")
+        or case.get("response_text")
+        or case.get("latest_slack_summary")
+        or ""
+    )
     return {
         "case_id": str(case.get("case_id") or ""),
         "case_label": str(case.get("case_id") or ""),
@@ -1017,6 +1228,29 @@ def _case_action_queue_item(
         "primary_label_display": _display_follow_up_label(str(primary.get("label") or "")),
         "detail": str(primary.get("detail") or case.get("next_follow_up") or reason or ""),
         "next_follow_up": next_follow_up,
+        "prompt_excerpt": _text_excerpt(prompt_text, 240),
+        "prompt_chars": len(prompt_text),
+        "response_excerpt": _text_excerpt(response_text, 360),
+        "response_chars": len(response_text),
+        "scoring_status": str(case.get("scoring_status") or ""),
+        "scoring_status_label": str(case.get("scoring_status_label") or ""),
+        "scoring_completed_at": str(case.get("scoring_completed_at") or ""),
+        "scoring_review_kinds": list(case.get("scoring_review_kinds") or []),
+        "human_average": case.get("human_average"),
+        "human_created_at": str(case.get("human_created_at") or ""),
+        "human_notes": str(case.get("human_notes") or ""),
+        "orchestrator_judge_average": case.get("orchestrator_judge_average"),
+        "orchestrator_judge_created_at": str(case.get("orchestrator_judge_created_at") or ""),
+        "orchestrator_judge_notes": str(case.get("orchestrator_judge_notes") or ""),
+        "orchestrator_judge_run_comment": str(
+            case.get("orchestrator_judge_run_comment") or ""
+        ),
+        "orchestrator_judge_dimension_rationales": (
+            case.get("orchestrator_judge_dimension_rationales") or {}
+        ),
+        "orchestrator_judge_recommended_next_action": str(
+            case.get("orchestrator_judge_recommended_next_action") or ""
+        ),
         "dashboard_url": str(case.get("dashboard_url") or ""),
         "review_url": str(case.get("review_url") or ""),
         "case_bundle_url": str(case.get("case_bundle_url") or ""),
@@ -1028,6 +1262,8 @@ def _follow_up_queue(cases: list[dict[str, Any]], *, limit: int = 24) -> list[di
 
     rows: list[dict[str, Any]] = []
     for case in cases:
+        if not _case_has_runtime_evidence(case):
+            continue
         checks = _case_open_follow_up_checks(case)
         if not checks:
             continue
@@ -1053,12 +1289,35 @@ def _follow_up_queue(cases: list[dict[str, Any]], *, limit: int = 24) -> list[di
     return rows[: max(1, int(limit))]
 
 
+def _case_has_runtime_evidence(case: dict[str, Any]) -> bool:
+    """Return whether this case has run/review/import state beyond prompt metadata."""
+
+    return bool(
+        str(
+            case.get("latest_run_at")
+            or case.get("latest_run_id")
+            or case.get("latest_slack_run_id")
+            or case.get("latest_slack_created_at")
+            or case.get("promptfoo_eval_id")
+            or case.get("human_created_at")
+            or case.get("orchestrator_judge_created_at")
+            or case.get("scoring_completed_at")
+            or ""
+        ).strip()
+        or int(case.get("slack_run_count") or 0) > 0
+        or case.get("promptfoo_success") is not None
+        or case.get("human_average") is not None
+        or case.get("orchestrator_judge_average") is not None
+    )
+
+
 def _latest_run_summary(
     *,
     latest_slack: dict[str, Any],
     latest_machine_run_at: str,
     promptfoo_eval_id: str,
     human_created_at: str,
+    orchestrator_judge_created_at: str = "",
 ) -> dict[str, str]:
     candidates = [
         (
@@ -1068,6 +1327,11 @@ def _latest_run_summary(
         ),
         ("machine", latest_machine_run_at, promptfoo_eval_id),
         ("human_review", human_created_at, "human review"),
+        (
+            "orchestrator_review",
+            orchestrator_judge_created_at,
+            "orchestrator review",
+        ),
     ]
     available = [
         {"source": source, "at": at, "id": run_id}
@@ -1089,6 +1353,66 @@ def _timestamp_sort_key(value: str) -> float:
         return 0
 
 
+def _latest_case_run_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return the newest run/review activity using the merged case model."""
+
+    candidates = [
+        case
+        for case in cases
+        if str(case.get("latest_run_at") or case.get("scoring_completed_at") or "").strip()
+    ]
+    if not candidates:
+        return {}
+    case = max(
+        candidates,
+        key=lambda item: max(
+            _timestamp_sort_key(str(item.get("latest_run_at") or "")),
+            _timestamp_sort_key(str(item.get("scoring_completed_at") or "")),
+        ),
+    )
+    response_text = str(
+        case.get("scored_response_text")
+        or case.get("response_text")
+        or case.get("latest_slack_summary")
+        or ""
+    )
+    prompt_text = str(case.get("user_input") or "")
+    return {
+        "case_id": case.get("case_id") or "",
+        "display_case_id": case.get("display_case_id") or case.get("case_id") or "",
+        "agent": case.get("agent") or "",
+        "run_id": case.get("latest_run_id") or case.get("latest_slack_run_id") or "",
+        "run_source": case.get("latest_run_source") or "",
+        "run_at": case.get("latest_run_at") or "",
+        "slack_run_id": case.get("latest_slack_run_id") or "",
+        "slack_thread_ts": case.get("latest_slack_thread_ts") or "",
+        "scoring_status": case.get("scoring_status") or "",
+        "scoring_status_label": case.get("scoring_status_label") or "",
+        "scoring_completed_at": case.get("scoring_completed_at") or "",
+        "human_average": case.get("human_average"),
+        "human_safety": case.get("human_safety") or "",
+        "human_notes": case.get("human_notes") or "",
+        "orchestrator_judge_average": case.get("orchestrator_judge_average"),
+        "orchestrator_judge_safety": case.get("orchestrator_judge_safety") or "",
+        "orchestrator_judge_notes": case.get("orchestrator_judge_notes") or "",
+        "orchestrator_judge_run_comment": case.get("orchestrator_judge_run_comment") or "",
+        "orchestrator_judge_dimension_rationales": (
+            case.get("orchestrator_judge_dimension_rationales") or {}
+        ),
+        "orchestrator_judge_recommended_next_action": (
+            case.get("orchestrator_judge_recommended_next_action") or ""
+        ),
+        "orchestrator_judge_created_at": case.get("orchestrator_judge_created_at") or "",
+        "prompt_excerpt": _text_excerpt(prompt_text, 280),
+        "prompt_chars": len(prompt_text),
+        "response_excerpt": _text_excerpt(response_text, 520),
+        "response_chars": len(response_text),
+        "dashboard_url": case.get("dashboard_url") or "",
+        "review_url": case.get("review_url") or "",
+        "case_bundle_url": case.get("case_bundle_url") or "",
+    }
+
+
 def _with_prompt_numbers(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     counts: Counter[str] = Counter()
     numbered: list[dict[str, Any]] = []
@@ -1100,7 +1424,11 @@ def _with_prompt_numbers(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
         prompt_number = f"_{counts[agent]:03d}"
         enriched["prompt_number"] = prompt_number
         enriched["display_prompt_number"] = _prompt_number_label(prompt_number)
-        enriched["display_case_id"] = _display_case_id(case_id, prompt_number)
+        enriched["display_case_id"] = _display_case_id(
+            case_id,
+            prompt_number,
+            source=str(case.get("source") or ""),
+        )
         numbered.append(enriched)
     return numbered
 
@@ -1109,7 +1437,9 @@ def _prompt_number_label(prompt_number: str) -> str:
     return prompt_number.lstrip("_") or prompt_number
 
 
-def _display_case_id(case_id: str, prompt_number: str) -> str:
+def _display_case_id(case_id: str, prompt_number: str, *, source: str = "") -> str:
+    if source == "slack":
+        return case_id
     suffix = prompt_number.lstrip("_")
     if not case_id or not suffix:
         return case_id
@@ -1297,6 +1627,9 @@ def _summary(
     promptfoo_failed = sum(1 for case in cases if case.get("promptfoo_success") is False)
     promptfoo_evaluated = promptfoo_passed + promptfoo_failed
     human_scored = [case for case in cases if case.get("human_average") is not None]
+    orchestrator_judge_scored = [
+        case for case in cases if case.get("orchestrator_judge_average") is not None
+    ]
     slack_linked = sum(1 for case in cases if int(case.get("slack_run_count") or 0) > 0)
     slack_run_rows = sum(int(case.get("slack_run_count") or 0) for case in cases)
     slack_retry_cases = sum(1 for case in cases if int(case.get("slack_run_count") or 0) > 3)
@@ -1330,6 +1663,14 @@ def _summary(
     machine_avg = _average_case_score(machine_scored, "promptfoo_score")
     machine_agent_scores = _agent_score_summary(machine_scored, "promptfoo_score")
     human_agent_scores = _agent_score_summary(human_scored, "human_average")
+    orchestrator_judge_avg = _average_case_score(
+        orchestrator_judge_scored,
+        "orchestrator_judge_average",
+    )
+    orchestrator_judge_agent_scores = _agent_score_summary(
+        orchestrator_judge_scored,
+        "orchestrator_judge_average",
+    )
     coverage = _coverage_summary(seed_agents)
     return {
         "total_cases": total,
@@ -1354,6 +1695,9 @@ def _summary(
         "human_reviewed": len(human_scored),
         "human_average": human_avg,
         "human_agent_scores": human_agent_scores,
+        "orchestrator_judge_reviewed": len(orchestrator_judge_scored),
+        "orchestrator_judge_average": orchestrator_judge_avg,
+        "orchestrator_judge_agent_scores": orchestrator_judge_agent_scores,
         "slack_linked": slack_linked,
         "slack_run_rows": slack_run_rows,
         "slack_retry_cases": slack_retry_cases,
@@ -1416,6 +1760,17 @@ def _workflow_readiness(
         for case in cases
         if case.get("human_average") is not None
     )
+    orchestrator_judge_scorecards = sum(
+        1
+        for case in cases
+        if case.get("orchestrator_judge_average") is not None
+    )
+    review_scorecards = sum(
+        1
+        for case in cases
+        if case.get("human_average") is not None
+        or case.get("orchestrator_judge_average") is not None
+    )
     analysis_included = sum(
         1
         for case in cases
@@ -1442,6 +1797,8 @@ def _workflow_readiness(
             "slack_thread_cases": slack_case_count,
             "recorded_responses": recorded_responses,
             "human_scorecards": human_scorecards,
+            "orchestrator_judge_scorecards": orchestrator_judge_scorecards,
+            "review_scorecards": review_scorecards,
             "analysis_included": analysis_included,
             "retrieval_source_cases": retrieval_source_cases,
         },
@@ -1488,12 +1845,26 @@ def _workflow_readiness(
             },
             {
                 "interaction": "Submit Evaluation",
-                "current_behavior": "Slack submission writes score fields and human notes to the local eval database",
-                "future_live_trigger": "Human presses Submit Evaluation after scoring in Slack",
-                "cost_guardrail": "No model call; no Slack post; writes one review row, then refreshes Database, Runs & Scoring, and Analysis from saved rows",
-                "stored_evidence": f"{human_scorecards} saved scorecards",
+                "current_behavior": "Manual submission and Orchestrator Review write score fields and notes to the local eval database as separate review kinds",
+                "future_live_trigger": "Human presses Submit Evaluation after scoring in Slack, or enabled Orchestrator Review scores the saved run",
+                "cost_guardrail": "Manual submit uses no model call and no Slack post; Orchestrator Review runs only when explicitly enabled, then refreshes Database, Runs & Scoring, and Analysis from saved rows",
+                "stored_evidence": f"{review_scorecards} saved review scorecards ({human_scorecards} manual, {orchestrator_judge_scorecards} Orchestrator Review)",
                 "live_api_call_now": False,
             },
+            *(
+                [
+                    {
+                        "interaction": "Orchestrator Review scoring",
+                        "current_behavior": "Explicitly enabled Orchestrator Review fills the same backend scorecard for saved #evals Slack runs",
+                        "future_live_trigger": "After a #evals review link is posted, the operator or enabled server action runs the Orchestrator Review scorer",
+                        "cost_guardrail": "Requires KEYSTONE_EVAL_LLM_JUDGE=true or explicit live SDK run_config; no Slack post, send, or external write",
+                        "stored_evidence": f"{orchestrator_judge_scorecards} saved Orchestrator Review scorecards",
+                        "live_api_call_now": False,
+                    }
+                ]
+                if eval_llm_judge_enabled() or orchestrator_judge_scorecards
+                else []
+            ),
             {
                 "interaction": "Analysis inclusion",
                 "current_behavior": "Included unless marked duplicate/problem run",
@@ -1519,6 +1890,12 @@ def _data_quality_gates(
     slack_cases = [case for case in cases if int(case.get("slack_run_count") or 0) > 0]
     completed_cases = [case for case in cases if str(case.get("latest_run_source") or "") != "pending"]
     recorded_response_cases = [case for case in cases if _case_has_recorded_response(case)]
+    review_scorecard_cases = [
+        case
+        for case in cases
+        if case.get("human_average") is not None
+        or case.get("orchestrator_judge_average") is not None
+    ]
     api_promptfoo_cases = [
         case
         for case in cases
@@ -1538,13 +1915,13 @@ def _data_quality_gates(
     checks = [
         _quality_check(
             "dashboard_runtime",
-            "Dashboard runtime",
+            "Scoring runtime",
             1
             if dashboard_health.get("dashboard_reachable") and dashboard_health.get("manager_exists")
             else 0,
             1,
-            "Local dashboard manager and HTTP endpoint are reachable.",
-            "Start or restart the eval dashboard manager before live eval review.",
+            "Local scoring manager and HTTP endpoint are reachable.",
+            "Start or restart the eval scoring manager before live eval review.",
             severity="blocker",
         ),
         _quality_check(
@@ -1579,7 +1956,7 @@ def _data_quality_gates(
             "Recorded responses",
             len(recorded_response_cases),
             total_cases,
-            "Cases need a saved response before human scoring.",
+            "Cases need a saved response before review scoring.",
             "Run the eval or import/save the response before opening review.",
             severity="warn",
         ),
@@ -1625,12 +2002,12 @@ def _data_quality_gates(
             severity="warn",
         ),
         _quality_check(
-            "human_scorecards",
-            "Human scorecards",
-            sum(1 for case in cases if case.get("human_average") is not None),
+            "review_scorecards",
+            "Review scorecards",
+            len(review_scorecard_cases),
             len(recorded_response_cases),
-            "Recorded responses should receive human review when they are candidates for fixes.",
-            "Use the scoring form after a response is saved.",
+            "Recorded responses should receive manual human or Orchestrator Review scoring when they are candidates for fixes.",
+            "Use the scoring form or Orchestrator Review after a response is saved.",
             severity="warn",
         ),
         _quality_check(
@@ -1762,7 +2139,10 @@ def _quality_check(
 def _trace_dashboard_summary(database_path: Path) -> dict[str, Any]:
     """Return local self-tracing readiness and recent safe events."""
 
-    events = list_eval_trace_events(database_path=database_path, limit=20)
+    events = [
+        _with_trace_agentic_summary(event)
+        for event in list_eval_trace_events(database_path=database_path, limit=20)
+    ]
     totals = summarize_eval_trace_events(database_path=database_path)
     configured_mode = os.environ.get("KEYSTONE_TRACE_PROCESSOR", "").strip().lower()
     trace_config = get_trace_config()
@@ -1773,6 +2153,7 @@ def _trace_dashboard_summary(database_path: Path) -> dict[str, Any]:
         **totals,
         "recent_event_count": len(events),
         "recent_events": events,
+        "latest_run_trace": _latest_trace_run_summary(events, database_path=database_path),
         "effective_sensitive_capture": bool(trace_config.trace_include_sensitive_data),
         "effective_tracing_disabled": bool(trace_config.tracing_disabled),
         "sensitive_data_env": os.environ.get("KEYSTONE_TRACE_INCLUDE_SENSITIVE_DATA", "").strip().lower() or "default_false",
@@ -1814,6 +2195,433 @@ def _trace_dashboard_summary(database_path: Path) -> dict[str, Any]:
             "Call flush_traces only after a unit of work closes when a worker needs immediate export guarantees.",
         ],
     }
+
+
+def _trace_metadata_object(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _trace_metadata_int(metadata: dict[str, Any], *paths: tuple[str, ...]) -> int:
+    for path in paths:
+        value: Any = metadata
+        for key in path:
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(key)
+        try:
+            number = int(value or 0)
+        except (TypeError, ValueError):
+            number = 0
+        if number:
+            return max(0, number)
+    return 0
+
+
+def _trace_metadata_string_list(value: Any, *, limit: int = 3) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    labels: list[str] = []
+    for item in value:
+        label = ""
+        if isinstance(item, dict):
+            label = str(item.get("name") or item.get("tool_name") or item.get("label") or item.get("key") or "")
+        else:
+            label = str(item or "")
+        label = label.strip()
+        if label:
+            labels.append(label[:80])
+        if len(labels) >= limit:
+            break
+    return labels
+
+
+def _trace_agentic_summary(event: dict[str, Any]) -> dict[str, Any]:
+    """Condense sanitized trace metadata into run-diagnostic fields."""
+
+    metadata = _trace_metadata_object(event.get("metadata"))
+    correlation = _trace_metadata_object(metadata.get("correlation"))
+    tooling = _trace_metadata_object(metadata.get("tooling"))
+    retrieval = _trace_metadata_object(metadata.get("retrieval"))
+    retrieval_provider = _trace_metadata_object(metadata.get("retrieval_provider_summary"))
+    model = _trace_metadata_object(metadata.get("model"))
+    orchestrator = _trace_metadata_object(metadata.get("orchestrator"))
+    approval = _trace_metadata_object(metadata.get("approval"))
+    diagnostics = _trace_metadata_object(metadata.get("diagnostic_summary"))
+    thread_evidence = _trace_metadata_object(metadata.get("thread_evidence"))
+    slack_context = _trace_metadata_object(metadata.get("slack_context"))
+    tool_count = _trace_metadata_int(metadata, ("tooling", "tool_call_count"), ("tool_call_count",))
+    failed_tool_count = _trace_metadata_int(metadata, ("tooling", "failed_tool_call_count"))
+    tool_names = _trace_metadata_string_list(tooling.get("tool_names"))
+    visible_sources = _trace_metadata_int(
+        metadata,
+        ("retrieval", "visible_source_count"),
+        ("source_visibility", "visible_source_count"),
+    )
+    source_count = _trace_metadata_int(
+        metadata,
+        ("retrieval", "source_count"),
+        ("source_visibility", "source_count"),
+    )
+    warning_count = _trace_metadata_int(
+        metadata,
+        ("error_retry", "warning_count"),
+        ("thread_evidence", "warning_count"),
+    )
+    retry_count = _trace_metadata_int(metadata, ("error_retry", "retry_count"))
+    route = str(
+        orchestrator.get("selected_route")
+        or metadata.get("route")
+        or metadata.get("agent")
+        or metadata.get("agent_name")
+        or correlation.get("route")
+        or ""
+    ).strip()
+    model_text = " ".join(
+        value
+        for value in (
+            str(model.get("provider") or metadata.get("model_provider") or "").strip(),
+            str(model.get("name") or metadata.get("model_name") or "").strip(),
+        )
+        if value
+    )
+    provider = str(
+        retrieval.get("search_provider")
+        or retrieval_provider.get("provider_summary")
+        or metadata.get("search_provider")
+        or ""
+    ).strip()
+    retrieval_text = (
+        f"{visible_sources}/{source_count} visible sources"
+        if source_count
+        else f"{visible_sources} visible sources"
+        if visible_sources
+        else ""
+    )
+    if provider:
+        retrieval_text = f"{retrieval_text} via {provider}".strip() if retrieval_text else f"provider {provider}"
+    tool_text = (
+        f"{tool_count} tool call{'s' if tool_count != 1 else ''}"
+        if tool_count
+        else ""
+    )
+    if failed_tool_count:
+        tool_text = (
+            f"{tool_text} · {failed_tool_count} failed"
+            if tool_text
+            else f"{failed_tool_count} failed tool call{'s' if failed_tool_count != 1 else ''}"
+        )
+    if tool_names:
+        tool_text = f"{tool_text} · {', '.join(tool_names)}" if tool_text else ", ".join(tool_names)
+    orchestrator_bits = [
+        "preflight" if orchestrator.get("has_preflight") else "",
+        "review" if orchestrator.get("has_review") else "",
+        f"{_trace_metadata_int(metadata, ('orchestrator', 'blocker_count'))} blockers"
+        if _trace_metadata_int(metadata, ("orchestrator", "blocker_count"))
+        else "",
+    ]
+    orchestrator_text = ", ".join(bit for bit in orchestrator_bits if bit)
+    errors_text = ", ".join(
+        bit
+        for bit in (
+            f"{warning_count} warnings" if warning_count else "",
+            f"{retry_count} retries" if retry_count else "",
+            "error/retry" if diagnostics.get("has_error_or_retry") else "",
+        )
+        if bit
+    )
+    if failed_tool_count:
+        signal = f"{failed_tool_count} failed tool call{'s' if failed_tool_count != 1 else ''}"
+    elif tool_count:
+        signal = f"{tool_count} tool call{'s' if tool_count != 1 else ''}"
+    elif visible_sources or source_count:
+        signal = retrieval_text
+    elif orchestrator_text:
+        signal = f"orchestrator {orchestrator_text}"
+    elif model_text:
+        signal = "model configured"
+    elif warning_count or retry_count:
+        signal = errors_text
+    else:
+        signal = "metadata only"
+    return {
+        "signal": signal,
+        "route": route,
+        "model": model_text or "model metadata pending",
+        "tools": tool_text or "tool metadata pending",
+        "retrieval": retrieval_text or "retrieval metadata pending",
+        "orchestrator": orchestrator_text or "orchestrator metadata pending",
+        "approval": str(approval.get("status") or "approval not required").strip(),
+        "errors": errors_text or "no warnings/retries recorded",
+        "slack_channel": str(
+            slack_context.get("channel_name")
+            or correlation.get("slack_channel_name")
+            or slack_context.get("channel_id")
+            or correlation.get("slack_channel_id")
+            or ""
+        ).strip(),
+        "thread": (
+            f"{int(thread_evidence.get('message_count') or 0)} messages"
+            if thread_evidence
+            else ""
+        ),
+    }
+
+
+def _trace_field_readiness(event: dict[str, Any]) -> dict[str, Any]:
+    """Summarize whether a sanitized trace event has the expected run diagnostics."""
+
+    metadata = _trace_metadata_object(event.get("metadata"))
+    diagnostics = _trace_metadata_object(metadata.get("diagnostic_summary"))
+    execution = _trace_metadata_object(metadata.get("execution"))
+    model = _trace_metadata_object(metadata.get("model"))
+    tooling = _trace_metadata_object(metadata.get("tooling"))
+    retrieval = _trace_metadata_object(metadata.get("retrieval"))
+    orchestrator = _trace_metadata_object(metadata.get("orchestrator"))
+    prompt_version = _trace_metadata_object(metadata.get("prompt_version"))
+    cost = _trace_metadata_object(metadata.get("cost"))
+    source_visibility = _trace_metadata_object(metadata.get("source_visibility"))
+    duration_ms = event.get("duration_ms")
+    if duration_ms in (None, ""):
+        duration_ms = execution.get("duration_ms")
+    checks = [
+        {
+            "key": "duration",
+            "label": "Duration",
+            "complete": duration_ms not in (None, ""),
+            "detail": "Trace has run/span duration." if duration_ms not in (None, "") else "Duration is not yet captured for this run.",
+        },
+        {
+            "key": "model",
+            "label": "Model",
+            "complete": bool(
+                diagnostics.get("has_model_metadata")
+                or model.get("provider")
+                or model.get("name")
+                or metadata.get("model_provider")
+                or metadata.get("model_name")
+            ),
+            "detail": "Model provider/name is present.",
+        },
+        {
+            "key": "tooling",
+            "label": "Tooling",
+            "complete": bool(
+                diagnostics.get("has_tool_metadata")
+                or _trace_metadata_int(metadata, ("tooling", "tool_call_count"))
+                or _trace_metadata_int(metadata, ("tooling", "failed_tool_call_count"))
+                or _trace_metadata_string_list(tooling.get("tool_names"))
+            ),
+            "detail": "Tool call count, names, or failure state is present.",
+        },
+        {
+            "key": "retrieval",
+            "label": "Retrieval",
+            "complete": bool(
+                diagnostics.get("has_retrieval_metadata")
+                or retrieval.get("search_provider")
+                or retrieval.get("source_count")
+                or source_visibility.get("source_count")
+            ),
+            "detail": "Retrieval provider or source visibility is present.",
+        },
+        {
+            "key": "orchestrator",
+            "label": "Orchestrator",
+            "complete": bool(
+                diagnostics.get("has_orchestrator_feedback")
+                or orchestrator.get("has_preflight")
+                or orchestrator.get("has_review")
+                or _trace_metadata_int(metadata, ("orchestrator", "feedback_count"))
+                or _trace_metadata_int(metadata, ("orchestrator", "blocker_count"))
+            ),
+            "detail": "Orchestrator preflight/review feedback is present.",
+        },
+        {
+            "key": "prompt_version",
+            "label": "Prompt/config version",
+            "complete": bool(
+                prompt_version.get("prompt_metadata_hash")
+                or prompt_version.get("request_text_hash")
+                or prompt_version.get("response_hash")
+                or prompt_version.get("static_prefix_sha256")
+                or prompt_version.get("dynamic_prompt_sha256")
+                or _trace_metadata_int(metadata, ("prompt_version", "prompt_version_count"))
+            ),
+            "detail": "Prompt/config fingerprint or response hash is present.",
+        },
+        {
+            "key": "cost",
+            "label": "Cost/cache",
+            "complete": bool(
+                cost.get("cost_profile")
+                or cost.get("sdk_estimated_cost_usd") is not None
+                or cost.get("sdk_cache_hit_rate") is not None
+                or _trace_metadata_object(metadata.get("cost_summary")).get("estimated_usd") is not None
+                or _trace_metadata_object(metadata.get("token_summary")).get("cache_hit_rate") is not None
+            ),
+            "detail": "Cost profile, estimate, or cache information is present.",
+        },
+        {
+            "key": "api_sdk_summary",
+            "label": "API SDK summary",
+            "complete": str(event.get("event_type") or "") == "sdk_run_summary",
+            "detail": "SDK run summary row is present for API-ready eval tracing.",
+        },
+    ]
+    normalized: list[dict[str, str]] = []
+    missing: list[str] = []
+    for check in checks:
+        complete = bool(check.get("complete"))
+        if not complete:
+            missing.append(str(check["label"]))
+        detail = str(check.get("detail") or "")
+        if not complete and detail.endswith(" is present."):
+            detail = detail.replace(" is present.", " is missing.")
+        normalized.append(
+            {
+                "key": str(check["key"]),
+                "label": str(check["label"]),
+                "status": "complete" if complete else "attention",
+                "detail": detail,
+            }
+        )
+    return {
+        "checks": normalized,
+        "missing": missing,
+        "complete_count": len(checks) - len(missing),
+        "attention_count": len(missing),
+        "summary": (
+            "All core run diagnostics populated."
+            if not missing
+            else "Missing: " + ", ".join(missing)
+        ),
+    }
+
+
+def _with_trace_agentic_summary(event: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(event)
+    payload["agentic_summary"] = _trace_agentic_summary(payload)
+    payload["field_readiness"] = _trace_field_readiness(payload)
+    return payload
+
+
+def _latest_trace_run_summary(
+    events: list[dict[str, Any]],
+    *,
+    database_path: Path | None = None,
+) -> dict[str, Any]:
+    """Return the newest trace event with useful run/case join metadata."""
+
+    if not events:
+        return {}
+    event = events[0]
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    correlation = metadata.get("correlation") if isinstance(metadata.get("correlation"), dict) else {}
+    diagnostics = metadata.get("diagnostic_summary")
+    categories: list[str] = []
+    if isinstance(diagnostics, dict):
+        raw_categories = diagnostics.get("categories") or diagnostics.get("category_counts") or []
+        if isinstance(raw_categories, list):
+            for item in raw_categories:
+                if isinstance(item, dict):
+                    label = str(item.get("label") or item.get("key") or "").strip()
+                    if label:
+                        categories.append(label)
+                else:
+                    label = str(item or "").strip()
+                    if label:
+                        categories.append(label)
+    summary = {
+        "event_type": event.get("event_type") or "",
+        "name": event.get("name") or "",
+        "trace_id": event.get("trace_id") or "",
+        "span_id": event.get("span_id") or "",
+        "case_id": (
+            event.get("group_id")
+            or metadata.get("case_id")
+            or correlation.get("case_id")
+            or ""
+        ),
+        "run_id": (
+            metadata.get("run_id")
+            or correlation.get("run_id")
+            or metadata.get("work_item_id")
+            or correlation.get("work_item_id")
+            or event.get("trace_id")
+            or ""
+        ),
+        "slack_thread_ts": (
+            metadata.get("slack_thread_ts")
+            or correlation.get("slack_thread_ts")
+            or metadata.get("thread_ts")
+            or correlation.get("thread_ts")
+            or ""
+        ),
+        "slack_channel_id": (
+            metadata.get("slack_channel_id")
+            or correlation.get("slack_channel_id")
+            or _trace_metadata_object(metadata.get("slack_context")).get("channel_id")
+            or ""
+        ),
+        "slack_channel_name": (
+            metadata.get("slack_channel_name")
+            or correlation.get("slack_channel_name")
+            or _trace_metadata_object(metadata.get("slack_context")).get("channel_name")
+            or ""
+        ),
+        "agent": metadata.get("agent") or metadata.get("agent_name") or metadata.get("route") or "",
+        "route": metadata.get("route") or "",
+        "created_at": event.get("created_at") or "",
+        "duration_ms": event.get("duration_ms")
+        if event.get("duration_ms") not in (None, "")
+        else _trace_metadata_object(metadata.get("execution")).get("duration_ms"),
+        "categories": categories[:8],
+        "scoring_status_label": "",
+        "scoring_completed_at": "",
+        "human_average": None,
+        "orchestrator_judge_average": None,
+        "orchestrator_judge_notes": "",
+        "orchestrator_judge_run_comment": "",
+        "agentic_summary": event.get("agentic_summary") or _trace_agentic_summary(event),
+        "field_readiness": event.get("field_readiness") or _trace_field_readiness(event),
+    }
+    if database_path is not None and summary["case_id"]:
+        try:
+            status = eval_case_status(str(summary["case_id"]), database_path=database_path)
+        except (OSError, ValueError, sqlite3.Error):
+            status = {}
+        case_status = (
+            _case_dashboard_record(
+                {"case_id": summary["case_id"]},
+                database_path=database_path,
+                status=status,
+            )
+            if status
+            else {}
+        )
+        if case_status:
+            summary["scoring_status_label"] = str(case_status.get("scoring_status_label") or "")
+            summary["scoring_completed_at"] = str(case_status.get("scoring_completed_at") or "")
+            summary["human_average"] = case_status.get("human_average")
+            summary["orchestrator_judge_average"] = case_status.get("orchestrator_judge_average")
+            summary["orchestrator_judge_notes"] = str(case_status.get("orchestrator_judge_notes") or "")
+            summary["orchestrator_judge_run_comment"] = str(
+                case_status.get("orchestrator_judge_run_comment") or ""
+            )
+        run_id = str(summary["run_id"] or "").strip()
+        if not summary["slack_thread_ts"]:
+            for slack_run in status.get("slack_runs") or []:
+                if not isinstance(slack_run, dict):
+                    continue
+                identifiers = {
+                    str(slack_run.get("run_id") or "").strip(),
+                    str(slack_run.get("work_item_id") or "").strip(),
+                }
+                if not run_id or run_id in identifiers:
+                    summary["slack_thread_ts"] = str(slack_run.get("slack_thread_ts") or "").strip()
+                    break
+    return summary
 
 
 def _trace_event_join_key(event: dict[str, Any]) -> str:
@@ -2117,6 +2925,7 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
                            SELECT COUNT(*)
                            FROM human_eval_reviews h
                            WHERE h.case_id = s.case_id
+                             AND COALESCE(h.review_kind, 'human') = 'human'
                              AND (
                                  (length(trim(COALESCE(s.run_id, ''))) > 0 AND h.run_id = s.run_id)
                                  OR (
@@ -2163,6 +2972,7 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
                     WHERE COALESCE(e.excluded, 0) = 1
                 )
                 SELECT h.case_id, run_id, agent, reviewer, average_score, safety,
+                       COALESCE(h.review_kind, 'human') AS review_kind,
                        CASE WHEN excluded.case_id IS NOT NULL THEN 1 ELSE 0 END AS excluded_from_scoring,
                        COALESCE(excluded.reason, '') AS analysis_exclusion_reason,
                        created_at
@@ -2212,6 +3022,7 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
         except sqlite3.OperationalError:
             trace_rows = []
 
+    trace_agentic_by_key = _trace_agentic_summary_index(trace_rows)
     for row in promptfoo_rows:
         item = dict(row)
         total = int(item.get("total") or 0)
@@ -2237,7 +3048,7 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
                 "next_follow_up": (
                     "Inspect failed/error cases before importing another run."
                     if failures or errors
-                    else "Compare with Slack and human-review rows for the same cases."
+                    else "Compare with Slack, Orchestrator Review, and human-review rows for the same cases."
                 ),
             }
         )
@@ -2248,6 +3059,13 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
         warning_count = int(item.get("warning_count") or 0)
         case_id = str(item.get("case_id") or "")
         run_id = str(item.get("run_id") or item.get("work_item_id") or item.get("slack_thread_ts") or "")
+        trace_agentic = _lookup_trace_agentic_summary(
+            trace_agentic_by_key,
+            case_id,
+            str(item.get("run_id") or ""),
+            str(item.get("work_item_id") or ""),
+            str(item.get("slack_thread_ts") or ""),
+        )
         details = [
             f"#{item.get('slack_channel_name') or 'evals'}",
             f"thread {item.get('thread_fetch_status') or 'tbd'}",
@@ -2259,6 +3077,8 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
             details.append(f"{warning_count} warnings")
         if item.get("cost_profile"):
             details.append(str(item["cost_profile"]))
+        if trace_agentic and trace_agentic.get("signal"):
+            details.append(f"trace {trace_agentic['signal']}")
         if item.get("excluded_from_scoring"):
             details.append(
                 f"excluded from scoring: {item.get('analysis_exclusion_reason') or 'manual exclusion'}"
@@ -2278,6 +3098,7 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
                 "case_bundle_url": eval_case_bundle_url(case_id) if case_id else "",
                 "excluded_from_scoring": bool(item.get("excluded_from_scoring")),
                 "analysis_exclusion_reason": item.get("analysis_exclusion_reason") or "",
+                "trace_agentic_summary": trace_agentic,
                 "review_checklist": _ledger_slack_review_checklist(item),
                 "next_follow_up": _ledger_slack_next_follow_up(item),
             }
@@ -2285,25 +3106,36 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
     for row in human_rows:
         item = dict(row)
         case_id = str(item.get("case_id") or "")
+        review_kind = str(item.get("review_kind") or "human").strip() or "human"
+        source = "orchestrator_judge" if review_kind == "orchestrator_judge" else "human"
+        reviewer = item.get("reviewer") or "unknown"
         rows.append(
             {
-                "source": "human",
+                "source": source,
                 "timestamp": item.get("created_at") or "",
                 "case_id": case_id,
                 "run_id": item.get("run_id") or "",
                 "agent": item.get("agent") or "",
                 "status": item.get("safety") or "reviewed",
                 "score": item.get("average_score"),
-                "details": f"reviewer {item.get('reviewer') or 'unknown'}",
+                "details": (
+                    f"Orchestrator Review complete; reviewer {reviewer}"
+                    if source == "orchestrator_judge"
+                    else f"reviewer {reviewer}"
+                ),
                 "dashboard_url": eval_dashboard_case_url(case_id) if case_id else "",
                 "review_url": eval_review_case_url(case_id) if case_id else "",
                 "case_bundle_url": eval_case_bundle_url(case_id) if case_id else "",
+                "review_kind": review_kind,
+                "scoring_completed_at": item.get("created_at") or "",
                 "excluded_from_scoring": bool(item.get("excluded_from_scoring")),
                 "analysis_exclusion_reason": item.get("analysis_exclusion_reason") or "",
                 "review_checklist": _ledger_human_review_checklist(item),
                 "next_follow_up": (
                     "Review failed safety or low dimension scores before analysis inclusion."
                     if str(item.get("safety") or "").strip() == "fail"
+                    else "Compare this Orchestrator Review score against machine score, human score, and evidence coverage."
+                    if source == "orchestrator_judge"
                     else "Compare this human score against machine score and evidence coverage."
                 ),
             }
@@ -2311,6 +3143,11 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
     for row in trace_rows:
         item = dict(row)
         metadata = _json_object(str(item.get("metadata_json") or "{}"))
+        event_payload = {
+            **item,
+            "metadata": metadata,
+        }
+        trace_agentic = _trace_agentic_summary(event_payload)
         case_id = str(item.get("group_id") or metadata.get("case_id") or "")
         rows.append(
             {
@@ -2318,7 +3155,7 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
                 "timestamp": item.get("created_at") or "",
                 "case_id": case_id,
                 "run_id": item.get("trace_id") or item.get("span_id") or "",
-                "agent": metadata.get("agent_name") or metadata.get("agent") or "",
+                "agent": trace_agentic.get("route") or metadata.get("agent_name") or metadata.get("agent") or "",
                 "status": item.get("event_type") or "",
                 "score": None,
                 "details": "; ".join(
@@ -2326,20 +3163,80 @@ def _eval_run_ledger(database_path: Path, limit: int = 80) -> list[dict[str, Any
                     for part in (
                         str(item.get("name") or ""),
                         f"{item.get('duration_ms')} ms" if item.get("duration_ms") is not None else "",
+                        str(trace_agentic.get("signal") or ""),
+                        str(trace_agentic.get("tools") or ""),
+                        str(trace_agentic.get("retrieval") or ""),
                     )
-                    if part
+                    if part and not str(part).endswith("metadata pending")
                 ),
                 "dashboard_url": eval_dashboard_case_url(case_id) if case_id else "",
                 "review_url": eval_review_case_url(case_id) if case_id else "",
                 "case_bundle_url": eval_case_bundle_url(case_id) if case_id else "",
                 "excluded_from_scoring": bool(item.get("excluded_from_scoring")),
                 "analysis_exclusion_reason": item.get("analysis_exclusion_reason") or "",
+                "trace_agentic_summary": trace_agentic,
                 "review_checklist": _ledger_trace_review_checklist(item, metadata),
                 "next_follow_up": "Confirm trace metadata is redacted and linked to the eval case/run.",
             }
         )
     rows.sort(key=lambda item: _timestamp_sort_key(str(item.get("timestamp") or "")), reverse=True)
     return rows[: max(1, int(limit))]
+
+
+def _trace_keys_for_ledger_event(item: dict[str, Any], metadata: dict[str, Any]) -> set[str]:
+    correlation = metadata.get("correlation") if isinstance(metadata.get("correlation"), dict) else {}
+    keys = {
+        str(item.get("group_id") or ""),
+        str(item.get("trace_id") or ""),
+        str(item.get("span_id") or ""),
+        str(metadata.get("case_id") or ""),
+        str(metadata.get("run_id") or ""),
+        str(metadata.get("work_item_id") or ""),
+        str(metadata.get("slack_thread_ts") or metadata.get("thread_ts") or ""),
+        str(correlation.get("case_id") or ""),
+        str(correlation.get("run_id") or ""),
+        str(correlation.get("work_item_id") or ""),
+        str(correlation.get("slack_thread_ts") or correlation.get("thread_ts") or ""),
+    }
+    return {key.strip() for key in keys if key and key.strip()}
+
+
+def _trace_agentic_summary_index(trace_rows: list[sqlite3.Row]) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    for row in trace_rows:
+        item = dict(row)
+        metadata = _json_object(str(item.get("metadata_json") or "{}"))
+        summary = _trace_agentic_summary({**item, "metadata": metadata})
+        for key in _trace_keys_for_ledger_event(item, metadata):
+            existing = index.get(key)
+            if existing is None or _trace_agentic_summary_rank(summary) > _trace_agentic_summary_rank(existing):
+                index[key] = summary
+    return index
+
+
+def _trace_agentic_summary_rank(summary: dict[str, Any]) -> int:
+    signal = str(summary.get("signal") or "")
+    rank = 0
+    if signal and signal != "metadata only":
+        rank += 4
+    for key in ("tools", "retrieval", "model", "orchestrator"):
+        value = str(summary.get(key) or "")
+        if value and not value.endswith("metadata pending"):
+            rank += 2
+    if str(summary.get("errors") or "") != "no warnings/retries recorded":
+        rank += 1
+    return rank
+
+
+def _lookup_trace_agentic_summary(
+    index: dict[str, dict[str, Any]],
+    *keys: str,
+) -> dict[str, Any]:
+    for key in keys:
+        normalized = str(key or "").strip()
+        if normalized and normalized in index:
+            return index[normalized]
+    return {}
 
 
 def _ledger_check(label: str, status: str, detail: str) -> dict[str, str]:
@@ -2419,7 +3316,7 @@ def _ledger_slack_next_follow_up(row: dict[str, Any]) -> str:
     checks = _ledger_slack_review_checklist(row)
     missing = [check["label"] for check in checks if check["status"] in {"missing", "attention"}]
     if not missing:
-        return "Ready to compare Slack output, machine score, and human review in Analysis."
+        return "Ready to compare Slack output, machine score, Orchestrator Review, and human review in Analysis."
     return "Resolve: " + ", ".join(missing) + "."
 
 
@@ -2462,8 +3359,11 @@ def _promptfoo_analysis(database_path: Path, limit: int = 12) -> dict[str, Any]:
     empty = {
         "run_trends": [],
         "human_review_trends": [],
+        "orchestrator_judge_review_trends": [],
         "agent_score_trends": {"agents": [], "series": {"all": []}},
         "case_trends": [],
+        "human_case_trends": [],
+        "orchestrator_judge_case_trends": [],
         "prompt_score_averages": [],
         "case_changes": [],
         "agent_stability": [],
@@ -2518,6 +3418,7 @@ def _promptfoo_analysis(database_path: Path, limit: int = 12) -> dict[str, Any]:
                     WHERE COALESCE(e.excluded, 0) = 1
                 )
                 SELECT h.id, h.case_id, h.run_id, h.agent, h.average_score, h.safety,
+                       COALESCE(h.review_kind, 'human') AS review_kind,
                        h.slack_thread_ts, h.created_at
                 FROM human_eval_reviews h
                 WHERE NOT EXISTS (
@@ -2531,12 +3432,21 @@ def _promptfoo_analysis(database_path: Path, limit: int = 12) -> dict[str, Any]:
             return empty
 
     run_order = {str(row["eval_id"]): index for index, row in enumerate(run_rows)}
+    review_rows = [dict(row) for row in human_rows]
     human_review_rows = _current_target_human_review_rows(
-        [dict(row) for row in human_rows],
+        review_rows,
         database_path=database_path,
+        review_kind="human",
+    )
+    orchestrator_judge_review_rows = _current_target_human_review_rows(
+        review_rows,
+        database_path=database_path,
+        review_kind="orchestrator_judge",
     )
     human_review_trends = _human_review_trends(human_review_rows)
+    orchestrator_judge_review_trends = _human_review_trends(orchestrator_judge_review_rows)
     human_case_trends = _human_case_review_trends(human_review_rows)
+    orchestrator_judge_case_trends = _human_case_review_trends(orchestrator_judge_review_rows)
     histories: dict[str, list[dict[str, Any]]] = {}
     agent_values: dict[str, list[dict[str, Any]]] = {}
     dimension_failures: Counter[str] = Counter()
@@ -2563,7 +3473,11 @@ def _promptfoo_analysis(database_path: Path, limit: int = 12) -> dict[str, Any]:
         for case_id, items in histories.items()
     }
     daily_items = [item for items in daily_histories.values() for item in items]
-    agent_score_trends = _agent_score_trends(daily_items, human_review_rows)
+    agent_score_trends = _agent_score_trends(
+        daily_items,
+        human_review_rows,
+        orchestrator_judge_review_rows,
+    )
     for items in daily_histories.values():
         for item in items:
             agent_values.setdefault(item["agent"], []).append(item)
@@ -2602,8 +3516,10 @@ def _promptfoo_analysis(database_path: Path, limit: int = 12) -> dict[str, Any]:
     return {
         "run_trends": run_trends,
         "human_review_trends": human_review_trends,
+        "orchestrator_judge_review_trends": orchestrator_judge_review_trends,
         "agent_score_trends": agent_score_trends,
         "human_case_trends": human_case_trends,
+        "orchestrator_judge_case_trends": orchestrator_judge_case_trends,
         "case_trends": case_trends,
         "prompt_score_averages": prompt_score_averages,
         "case_changes": case_changes[:40],
@@ -2617,20 +3533,35 @@ def _current_target_human_review_rows(
     rows: list[dict[str, Any]],
     *,
     database_path: Path,
+    review_kind: str = "human",
 ) -> list[dict[str, Any]]:
-    """Keep analysis human-review rows aligned with the current response target."""
+    """Keep analysis review rows aligned with the current response target."""
 
-    case_ids = [str(row.get("case_id") or "").strip() for row in rows if row.get("case_id")]
+    normalized_kind = str(review_kind or "human").strip() or "human"
+    case_ids = [
+        str(row.get("case_id") or "").strip()
+        for row in rows
+        if row.get("case_id")
+        and (str(row.get("review_kind") or "human").strip() or "human") == normalized_kind
+    ]
     if not case_ids:
         return []
     statuses = eval_case_statuses(case_ids, database_path=database_path)
     current_rows: list[dict[str, Any]] = []
     for row in rows:
+        row_kind = str(row.get("review_kind") or "human").strip() or "human"
+        if row_kind != normalized_kind:
+            continue
         row_id = row.get("id")
         if row_id is None:
             continue
         status = statuses.get(str(row.get("case_id") or "").strip()) or {}
-        review = status.get("latest_target_human_review")
+        review_key = (
+            "latest_target_orchestrator_judge_review"
+            if normalized_kind == "orchestrator_judge"
+            else "latest_target_human_review"
+        )
+        review = status.get(review_key)
         if not isinstance(review, dict) or review.get("id") is None:
             continue
         if int(row_id or 0) != int(review.get("id") or 0):
@@ -2687,10 +3618,12 @@ def _human_review_trends(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _agent_score_trends(
     machine_rows: list[dict[str, Any]],
     human_rows: list[dict[str, Any]],
+    orchestrator_judge_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     agents: set[str] = set()
     machine_scores: dict[str, dict[str, list[float]]] = {"all": {}}
     human_scores: dict[str, dict[str, list[float]]] = {"all": {}}
+    judge_scores: dict[str, dict[str, list[float]]] = {"all": {}}
 
     def add_score(
         buckets: dict[str, dict[str, list[float]]],
@@ -2721,12 +3654,27 @@ def _agent_score_trends(
         agents.add(agent)
         add_score(human_scores, agent, day, float(score))
 
+    for row in orchestrator_judge_rows:
+        created_at = str(row.get("created_at") or "")
+        score = row.get("average_score")
+        if score is None or not created_at:
+            continue
+        day = created_at[:10]
+        agent = str(row.get("agent") or "unknown").strip() or "unknown"
+        agents.add(agent)
+        add_score(judge_scores, agent, day, float(score))
+
     def build_series(key: str) -> list[dict[str, Any]]:
-        days = sorted(set(machine_scores.get(key, {})) | set(human_scores.get(key, {})))
+        days = sorted(
+            set(machine_scores.get(key, {}))
+            | set(human_scores.get(key, {}))
+            | set(judge_scores.get(key, {}))
+        )
         series: list[dict[str, Any]] = []
         for day in days:
             machine = machine_scores.get(key, {}).get(day, [])
             human = human_scores.get(key, {}).get(day, [])
+            judge = judge_scores.get(key, {}).get(day, [])
             series.append(
                 {
                     "date": day,
@@ -2734,6 +3682,8 @@ def _agent_score_trends(
                     "machine_count": len(machine),
                     "human_average": round(sum(human) / len(human), 3) if human else None,
                     "human_count": len(human),
+                    "orchestrator_judge_average": round(sum(judge) / len(judge), 3) if judge else None,
+                    "orchestrator_judge_count": len(judge),
                 }
             )
         return series
@@ -2800,6 +3750,7 @@ def _human_review_target_metadata(row: dict[str, Any]) -> dict[str, Any]:
         "created_at": str(row.get("created_at") or ""),
         "safety": str(row.get("safety") or ""),
         "average_score": row.get("average_score"),
+        "review_kind": str(row.get("review_kind") or "human"),
     }
 
 
@@ -3060,7 +4011,25 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
     data_quality_hint = (
         f'{data_quality.get("pending_count", data_quality.get("warning_count", 0))} pending before paid runs'
     )
-    title = "Keystone Eval Dashboard"
+    database_score_cols = "\n".join(
+        '<col class="dimension-score-col">'
+        for _dimension in SCORE_DIMENSIONS
+        for _source in ("human", "orchestrator")
+    )
+    database_score_headers = "\n".join(
+        "\n".join(
+            (
+                '<th><div class="metric-th">'
+                f'<div class="metric-th-title">Human {html.escape(dimension.replace("_", " "))}</div>'
+                '<div class="metric-th-detail">review form</div></div></th>',
+                '<th><div class="metric-th">'
+                f'<div class="metric-th-title">Orchestrator {html.escape(dimension.replace("_", " "))}</div>'
+                '<div class="metric-th-detail">review form</div></div></th>',
+            )
+        )
+        for dimension in SCORE_DIMENSIONS
+    )
+    title = "Keystone Eval Scoring"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -3086,7 +4055,9 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
     * {{ box-sizing: border-box; }}
     html {{
       max-width: 100%;
+      min-height: 100%;
       overflow-x: hidden;
+      overflow-y: auto;
     }}
     body {{
       margin: 0;
@@ -3094,7 +4065,9 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       color: var(--ink);
       font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       max-width: 100%;
+      min-height: 100%;
       overflow-x: hidden;
+      overflow-y: clip;
     }}
     header {{
       border-bottom: 1px solid var(--line);
@@ -3205,7 +4178,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
     }}
     .view {{ display: none; }}
     .view.active {{ display: block; }}
-    .grid > *, .panel {{ min-width: 0; }}
+    .grid > *, .workspace > *, .view, .panel {{ min-width: 0; }}
     .panel {{ padding: 14px; }}
     .section-head {{
       display: flex;
@@ -3482,6 +4455,214 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       min-width: 0;
     }}
     .analysis-card .label {{ color: var(--muted); font-size: 12px; font-weight: 650; }}
+    .trace-guide {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }}
+    .trace-guide-item {{
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fbfcfb;
+      padding: 8px 9px;
+      min-width: 0;
+    }}
+    .trace-guide-item strong {{
+      display: block;
+      margin-bottom: 3px;
+      font-size: 13px;
+    }}
+    .trace-guide-item span {{
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.3;
+    }}
+    .trace-contract {{
+      grid-template-columns: repeat(3, minmax(160px, 1fr));
+    }}
+    .trace-run-overview {{
+      margin-bottom: 12px;
+    }}
+    .trace-run-card {{
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #f8faf9;
+      padding: 12px;
+      min-width: 0;
+    }}
+    .trace-run-top {{
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 10px;
+    }}
+    .trace-run-title {{
+      font-size: 20px;
+      font-weight: 750;
+      line-height: 1.2;
+      overflow-wrap: anywhere;
+    }}
+    .trace-run-subtitle {{
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 3px;
+      overflow-wrap: anywhere;
+    }}
+    .trace-run-meta {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      gap: 8px;
+    }}
+    .trace-run-meta-item {{
+      border-top: 1px solid var(--line);
+      padding-top: 8px;
+      min-width: 0;
+    }}
+    .trace-run-meta-item .label {{
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }}
+    .trace-run-meta-item .value {{
+      font-weight: 700;
+      margin-top: 3px;
+      overflow-wrap: anywhere;
+    }}
+    .trace-timeline {{
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      overflow: hidden;
+      background: #fff;
+    }}
+    .trace-timeline-row {{
+      display: grid;
+      grid-template-columns: minmax(125px, 0.8fr) minmax(220px, 1.6fr) minmax(170px, 1fr) minmax(120px, 0.8fr) minmax(110px, 0.7fr);
+      gap: 10px;
+      align-items: start;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      min-width: 0;
+    }}
+    .trace-timeline-row:last-child {{
+      border-bottom: 0;
+    }}
+    .trace-timeline-row[data-trace-open] {{
+      cursor: pointer;
+    }}
+    .trace-timeline-row[data-trace-open]:hover {{
+      background: #f8faf9;
+    }}
+    .trace-timeline-row.selected {{
+      background: #f4f8f5;
+      box-shadow: inset 3px 0 0 var(--accent);
+    }}
+    .trace-timeline-head {{
+      background: #f3f5f4;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 750;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }}
+    .trace-step-name {{
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }}
+    .trace-step-detail {{
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 2px;
+      overflow-wrap: anywhere;
+    }}
+    .trace-signal {{
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      max-width: 100%;
+      border: 1px solid #cfd6dc;
+      border-radius: 999px;
+      background: #f8faf9;
+      padding: 2px 7px;
+      color: #4f5961;
+      font-size: 11px;
+      font-weight: 650;
+      overflow-wrap: anywhere;
+    }}
+    .trace-row-actions {{
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }}
+    .trace-detail-panel {{
+      display: grid;
+      gap: 12px;
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 12px;
+    }}
+    .trace-detail-head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .trace-detail-title {{
+      font-size: 16px;
+      font-weight: 750;
+      overflow-wrap: anywhere;
+    }}
+    .trace-detail-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+    }}
+    .trace-detail-cell {{
+      border-top: 1px solid var(--line);
+      padding-top: 7px;
+      min-width: 0;
+    }}
+    .trace-readiness-list {{
+      display: grid;
+      gap: 6px;
+    }}
+    .trace-readiness-item {{
+      display: grid;
+      grid-template-columns: minmax(130px, 0.8fr) minmax(0, 1fr);
+      gap: 8px;
+      align-items: start;
+      border-top: 1px solid var(--line);
+      padding-top: 6px;
+    }}
+    .trace-json {{
+      max-height: 360px;
+      overflow: auto;
+      white-space: pre-wrap;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #f6f8fa;
+      padding: 10px;
+      font-size: 11px;
+      line-height: 1.45;
+    }}
+    .trace-storage-stack {{
+      display: grid;
+      gap: 14px;
+      padding: 0 12px 12px;
+    }}
+    .compact-section-head {{
+      margin-bottom: 8px;
+    }}
+    .trace-detail-disclosure {{
+      margin-top: 12px;
+    }}
     .label-with-info {{
       display: inline-flex;
       align-items: center;
@@ -3591,6 +4772,25 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           color: #4b5563;
           border-color: #d1d5db;
           background: #f3f4f6;
+        }}
+        .score-legend {{
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px 14px;
+          margin: 6px 0 0;
+          color: var(--muted);
+          font-size: 12px;
+        }}
+        .score-legend-item {{
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+        }}
+        .score-swatch {{
+          width: 10px;
+          height: 10px;
+          border-radius: 2px;
+          flex: 0 0 auto;
         }}
     .analysis-scaffold-grid {{
       display: grid;
@@ -3747,6 +4947,42 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       color: var(--muted);
       font-size: 12px;
       overflow-wrap: anywhere;
+    }}
+    .run-score-strip {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 6px;
+    }}
+    .run-score-channel {{
+      display: grid;
+      gap: 2px;
+      min-width: 86px;
+      padding: 5px 7px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafb;
+    }}
+    .run-score-channel.pass {{
+      border-color: #b7dcc3;
+      background: #f3faf5;
+    }}
+    .run-score-channel.fail {{
+      border-color: #f0b8ad;
+      background: #fff4f2;
+    }}
+    .run-score-channel .label {{
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }}
+    .run-score-channel .value {{
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 750;
+      line-height: 1.2;
     }}
     .followup-actions {{
       display: flex;
@@ -3938,8 +5174,31 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           border-radius: 8px;
           padding: 12px;
         }}
+        .analysis-handoff {{
+          display: flex;
+          gap: 8px;
+          align-items: center;
+          flex-wrap: wrap;
+          margin-top: 10px;
+        }}
+        .secondary-action {{
+          display: inline-flex;
+          align-items: center;
+          min-height: 30px;
+          padding: 5px 9px;
+          border: 1px solid var(--line);
+          border-radius: 6px;
+          background: #fff;
+          color: var(--ink);
+          text-decoration: none;
+          font: inherit;
+          cursor: pointer;
+        }}
         .db-actions {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
         .db-table-wrap {{
+          width: 100%;
+          max-width: 100%;
+          min-width: 0;
           overflow-x: auto;
           border: 1px solid var(--line);
           border-radius: 8px;
@@ -3949,7 +5208,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         table.analysis-table {{ min-width: 0; }}
         table.eval-db-table {{
           table-layout: fixed;
-          min-width: 2520px;
+          min-width: 5260px;
         }}
         table.eval-db-table col.prompt-id {{ width: 68px; }}
         table.eval-db-table col.case-col {{ width: 240px; }}
@@ -3960,6 +5219,8 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         table.eval-db-table col.prompt-col {{ width: 440px; }}
         table.eval-db-table col.response-col {{ width: 500px; }}
         table.eval-db-table col.summary-col {{ width: 140px; }}
+        table.eval-db-table col.score-col {{ width: 230px; }}
+        table.eval-db-table col.dimension-score-col {{ width: 104px; }}
         table.eval-db-table col.evidence-col {{ width: 260px; }}
         table.eval-db-table col.notes-col {{ width: 220px; }}
         table.eval-db-table td.mono {{
@@ -3968,6 +5229,29 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           text-overflow: ellipsis;
           overflow-wrap: normal;
           word-break: normal;
+        }}
+        .score-metric-strip {{
+          display: flex;
+          flex-wrap: wrap;
+          gap: 4px;
+          max-height: 74px;
+          overflow: hidden;
+        }}
+        .score-chip {{
+          display: inline-flex;
+          align-items: center;
+          border: 1px solid var(--line);
+          border-radius: 999px;
+          background: #fbfcfb;
+          padding: 1px 6px;
+          color: var(--muted);
+          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+          font-size: 11px;
+          white-space: nowrap;
+        }}
+        table.eval-db-table td.score-dimension-cell {{
+          text-align: center;
+          white-space: nowrap;
         }}
         table.eval-db-table td:nth-child(2),
         table.eval-db-table td:nth-child(3) {{
@@ -4193,12 +5477,18 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       .score-controls {{ grid-template-columns: repeat(2, minmax(140px, 1fr)); }}
       .status-grid {{ grid-template-columns: 1fr; }}
       .analysis-grid {{ grid-template-columns: repeat(2, minmax(130px, 1fr)); }}
+      .trace-contract {{ grid-template-columns: 1fr; }}
+      .trace-run-meta {{ grid-template-columns: repeat(2, minmax(120px, 1fr)); }}
+      .trace-timeline-row {{ grid-template-columns: minmax(0, 1fr); gap: 4px; }}
+      .trace-timeline-head {{ display: none; }}
       .workflow-steps {{ grid-template-columns: repeat(2, minmax(140px, 1fr)); }}
       input, select {{ min-width: 0; width: 100%; }}
       .case-head {{ display: block; }}
     }}
     @media (max-width: 640px) {{
       .kpis {{ grid-template-columns: repeat(2, minmax(130px, 1fr)); }}
+      .trace-run-top {{ display: block; }}
+      .trace-run-meta {{ grid-template-columns: 1fr; }}
       .workflow-steps {{ grid-template-columns: 1fr; }}
     }}
   </style>
@@ -4211,8 +5501,8 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       <details class="intro-details">
         <summary>Scoring notes</summary>
         <div class="detail-content">
-          <span>Promptfoo scores are backend assertion checks; Slack human scores are separate quality reviews.</span>
-          <span>Human reviews create evidence for fixes and regression cases, but do not retrain agents automatically.</span>
+          <span>Promptfoo scores are backend assertion checks; manual human and Orchestrator Review scorecards are separate quality reviews.</span>
+          <span>Saved reviews create evidence for fixes and regression cases, but do not retrain agents automatically.</span>
           <span>Source database: {html.escape(str(payload["database_path"]))}</span>
         </div>
       </details>
@@ -4223,15 +5513,16 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           {_kpi("Agent Coverage", f'{summary["coverage_complete_agents"]}/{len(summary["coverage"])} agents ready', f'{summary["coverage_target_label"]}; {summary["coverage_gap_total"]} gaps')}
           {_kpi("Total Cases", summary["total_cases"], f'{summary["seed_case_total"]} committed; {summary["non_seed_cases"]} ad hoc')}
           {_kpi("Data Quality", data_quality_label, data_quality_hint)}
-          {_kpi("Dashboard Health", dashboard_health_label, dashboard_health_hint)}
+          {_kpi("Scoring Health", dashboard_health_label, dashboard_health_hint)}
               {_kpi("Machine Pass Rate", f'{summary["promptfoo_pass_rate"]}%', f'{summary["promptfoo_evaluated"]} checked; {summary["promptfoo_pending"]} pending')}
               {_kpi("Machine Avg / 5", _score_out_of_five(summary["machine_average"], machine=True), f'{summary["machine_scored"]} scored cases', "machine")}
           {_kpi("Slack Runs", summary["slack_run_rows"], f'{summary["slack_linked"]} linked cases; {summary["slack_retry_cases"]} retry-heavy')}
           {_kpi("Slack Evidence", summary["slack_evidence_ready"], f'{summary["slack_with_warnings"]} runs with warnings')}
-          {_kpi("Human Avg / 5", _score_out_of_five(summary["human_average"]), f'{summary["human_reviewed"]} reviewed', "human")}
+          {_kpi("Human Avg / 5", _score_out_of_five(summary["human_average"]), f'{summary["human_reviewed"]} manual review{"s" if summary["human_reviewed"] != 1 else ""}', "human")}
+          {_kpi("Orchestrator Review Avg / 5", _score_out_of_five(summary["orchestrator_judge_average"]), f'{summary["orchestrator_judge_reviewed"]} saved review forms', "human")}
         </section>
     <section class="workspace">
-          <nav class="side-nav" aria-label="Dashboard sections">
+          <nav class="side-nav" aria-label="Scoring sections">
             <button type="button" data-view="overview" class="active">Overview</button>
             <button type="button" data-view="prompts">Prompts</button>
             <button type="button" data-view="runs">Runs & scoring</button>
@@ -4254,6 +5545,15 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             <section class="subsection">
               <div class="section-head">
                 <div>
+                  <h2 class="subsection-title">{_label_with_info("Overview Latest Run")}</h2>
+                  <div class="subtle">Newest saved run or scoring event from the same merged case model used by Runs & Scoring.</div>
+                </div>
+              </div>
+              <div id="overview-latest-run"></div>
+            </section>
+            <section class="subsection">
+              <div class="section-head">
+                <div>
                   <h2 class="subsection-title">{_label_with_info("API Spend Readiness Gates")}</h2>
                   <div class="subtle">Local data checks that should pass before paid Slack/API eval runs are trusted.</div>
                 </div>
@@ -4264,11 +5564,12 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
               <div class="section-head" id="agent-score-drilldown" tabindex="-1">
                 <div>
                       <h2 class="subsection-title" id="agent-score-title">{_label_with_info("Agent Scores")}</h2>
-                      <div class="subtle" id="agent-score-note">Machine checks and human scorecards are tracked separately.</div>
+                      <div class="subtle" id="agent-score-note">Machine checks, manual human scorecards, and Orchestrator Review scorecards are tracked separately.</div>
                 </div>
                 <div class="segmented" aria-label="Agent score metric">
                   <button type="button" data-score-view="machine" class="active">Machine</button>
                   <button type="button" data-score-view="human">Human</button>
+                  <button type="button" data-score-view="orchestrator_judge">Orchestrator Review</button>
                 </div>
               </div>
               <div id="agent-score-table" class="score-table"></div>
@@ -4328,6 +5629,15 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
               <section class="subsection">
                 <div class="section-head">
                   <div>
+                    <h2 class="subsection-title">{_label_with_info("Latest Saved Runs")}</h2>
+                    <div class="subtle">Newest saved Slack, machine, human, and Orchestrator Review activity from the merged case model. This is read-only and does not run Slack or APIs.</div>
+                  </div>
+                </div>
+                <div id="latest-saved-runs"></div>
+              </section>
+              <section class="subsection">
+                <div class="section-head">
+                  <div>
                     <h2 class="subsection-title">{_label_with_info("Eval Follow-up Queue")}</h2>
                     <div class="subtle">Current cases needing the next manual step, ordered by oldest saved run first; pending no-run cases follow. Built from saved checklist gaps; no Slack or API call runs here.</div>
                   </div>
@@ -4358,8 +5668,8 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
                 <section class="subsection">
                   <div class="section-head">
                     <div>
-                      <h2 class="subsection-title">{_label_with_info("Average Score Over Time")}</h2>
-                      <div class="subtle">All agents by default; choose an agent to compare daily machine and human averages. Same-day prompt retries are averaged before rollup.</div>
+                      <h2 class="subsection-title">{_label_with_info("Average Score Across Time")}</h2>
+                      <div class="subtle">All agents by default; choose an agent to compare daily machine, human, and Orchestrator Review averages. Same-day prompt retries are averaged before rollup.</div>
                     </div>
                     <select id="analysis-agent-trend-filter"><option value="all">All agents</option></select>
                   </div>
@@ -4370,7 +5680,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
                   <div class="section-head">
                     <div>
                       <h2 class="subsection-title">{_label_with_info("Single Prompt Trend")}</h2>
-                      <div class="subtle">Daily machine and human lines for one prompt; duplicate same-day runs are averaged.</div>
+                      <div class="subtle">Daily machine, human, and Orchestrator Review lines for one prompt; duplicate same-day runs are averaged.</div>
                     </div>
                     <select id="analysis-case-filter"><option value="">Select prompt</option></select>
                   </div>
@@ -4418,41 +5728,72 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
               <div class="panel">
                 <div class="section-head">
                   <div>
-                    <h2>{_label_with_info("Trace Dashboard")}</h2>
-                    <div class="subtle">Trace-specific run diagnostics, joins, privacy state, and no-API/API readiness from saved local summaries. This view does not call OpenAI or Slack.</div>
+                    <h2>{_label_with_info("Trace Explorer")}</h2>
+                    <div class="subtle">OpenAI-style run timeline plus Keystone eval joins, review scores, diagnostics, and privacy state from sanitized local trace summaries. This view does not call OpenAI or Slack.</div>
                   </div>
                 </div>
-                <div id="trace-analytics" class="analysis-grid"></div>
                 <section class="subsection">
-                  <h2 class="subsection-title">{_label_with_info("Trace Processor Readiness")}</h2>
-                  <div class="subtle">Local self-tracing plan for future #evals API runs, including current processor mode and safe capture state.</div>
-                  <div id="trace-summary" class="analysis-grid"></div>
+                  <div class="section-head compact-section-head">
+                    <div>
+                      <h2 class="subsection-title">{_label_with_info("Trace Health")}</h2>
+                      <div class="subtle">Join coverage, manual/API split, diagnostic signal load, and privacy posture for the saved trace set.</div>
+                    </div>
+                  </div>
+                  <div id="trace-analytics" class="analysis-grid trace-health-grid"></div>
                 </section>
                 <section class="subsection">
-                  <h2 class="subsection-title">{_label_with_info("Local DB Freshness")}</h2>
-                  <div class="subtle">No-render ingestion counters for the local eval database. These should move when Slack runs, Promptfoo imports, trace rows, or human reviews are saved.</div>
-                  <div id="trace-db-freshness" class="analysis-grid"></div>
-                </section>
-                <section class="subsection">
-                  <h2 class="subsection-title">{_label_with_info("What We Store Locally")}</h2>
-                  <div id="trace-fields"></div>
-                </section>
-                <section class="subsection">
-                  <h2 class="subsection-title">{_label_with_info("Implementation Contract")}</h2>
-                  <div id="trace-implementation"></div>
-                </section>
-                <section class="subsection">
-                  <h2 class="subsection-title">{_label_with_info("Trace Diagnostic Categories")}</h2>
-                  <div class="subtle">Categorical run diagnostics from sanitized trace metadata. Older rows without the contract appear as instrumentation gaps, not model failures.</div>
+                  <h2 class="subsection-title">{_label_with_info("Trace Diagnostics")}</h2>
+                  <div class="subtle">Current cleanup signals from sanitized trace metadata. Missing model or retrieval metadata usually indicates instrumentation gaps, not automatic model failure.</div>
                   <div id="trace-diagnostic-categories"></div>
-                  <div id="trace-diagnostic-trend-chart" class="analysis-chart trace-diagnostic-chart"></div>
-                  <div id="trace-diagnostic-trends"></div>
-                  <div id="trace-diagnostic-followups"></div>
+                  <details class="dashboard-details trace-detail-disclosure">
+                    <summary>
+                      <span>Diagnostic trends and affected runs</span>
+                      <span class="subtle">chart, day table, and case rollups</span>
+                    </summary>
+                    <div id="trace-diagnostic-trend-chart" class="analysis-chart trace-diagnostic-chart"></div>
+                    <div id="trace-diagnostic-trends"></div>
+                    <div id="trace-diagnostic-followups"></div>
+                  </details>
                 </section>
                 <section class="subsection">
-                  <h2 class="subsection-title">{_label_with_info("Recent Trace Events")}</h2>
-                  <div id="trace-events"></div>
+                  <h2 class="subsection-title">{_label_with_info("Current Run Trace")}</h2>
+                  <div class="subtle">Newest run-level trace, joined to case/run identifiers and reduced to the review signals needed for debugging.</div>
+                  <div id="trace-reader-guide" class="trace-guide trace-contract"></div>
+                  <div id="trace-latest-run" class="trace-run-overview"></div>
+                  <div id="trace-current-timeline"></div>
                 </section>
+                <section class="subsection">
+                  <h2 class="subsection-title">{_label_with_info("Trace Event Log")}</h2>
+                  <div class="subtle">Recent sanitized workflow events as trace steps. Select a row to inspect the full capped trace packet in the dashboard; Copy keeps the same packet available for Codex review.</div>
+                  <div id="trace-events"></div>
+                  <div id="trace-event-detail"></div>
+                </section>
+                <details class="subsection dashboard-details trace-detail-disclosure">
+                  <summary>
+                    <span>{_label_with_info("Storage & Instrumentation")}</span>
+                    <span class="subtle">processor readiness, DB freshness, kept/dropped fields, and implementation notes</span>
+                  </summary>
+                  <div class="trace-storage-stack">
+                    <section>
+                      <h2 class="subsection-title">{_label_with_info("Trace Processor Readiness")}</h2>
+                      <div class="subtle">Local self-tracing plan for future #evals API runs, including current processor mode and safe capture state.</div>
+                      <div id="trace-summary" class="analysis-grid"></div>
+                    </section>
+                    <section>
+                      <h2 class="subsection-title">{_label_with_info("Local DB Freshness")}</h2>
+                      <div class="subtle">No-render ingestion counters for the local eval database.</div>
+                      <div id="trace-db-freshness" class="analysis-grid"></div>
+                    </section>
+                    <section>
+                      <h2 class="subsection-title">{_label_with_info("What We Store Locally")}</h2>
+                      <div id="trace-fields"></div>
+                    </section>
+                    <section>
+                      <h2 class="subsection-title">{_label_with_info("Implementation Contract")}</h2>
+                      <div id="trace-implementation"></div>
+                    </section>
+                  </div>
+                </details>
               </div>
             </section>
             <section id="view-database" class="view">
@@ -4491,6 +5832,8 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
                       <col class="response-col">
                       <col class="summary-col">
                       <col class="summary-col">
+                      {database_score_cols}
+                      <col class="summary-col">
                       <col class="evidence-col">
                       <col class="summary-col">
                       <col class="notes-col">
@@ -4502,14 +5845,16 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
                         <th><div class="metric-th"><div class="metric-th-title">Agent</div><div class="metric-th-detail">owner</div></div></th>
                         <th><div class="metric-th"><div class="metric-th-title">Latest run time</div><div class="metric-th-detail">Slack, machine, or review</div></div></th>
                         <th>Run source</th>
-                        <th>Run id / thread</th>
+                        <th>Run id / thread / score</th>
                         <th>Prompt</th>
                         <th>Latest response</th>
                         <th>Machine</th>
-                        <th>Human</th>
+                        <th>Human review</th>
+                        {database_score_headers}
+                        <th>Orchestrator Review</th>
                         <th>Evidence</th>
                         <th>Analysis</th>
-                        <th>Human notes</th>
+                        <th>Review notes</th>
                       </tr>
                     </thead>
                     <tbody id="database-rows"></tbody>
@@ -4525,6 +5870,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
     const data = JSON.parse(document.getElementById('eval-data').textContent);
     const cases = data.cases;
     const scoreDimensions = data.score_dimensions || [];
+    const orchestratorJudge = data.orchestrator_judge || {{}};
     const search = document.getElementById('search');
     const agentFilter = document.getElementById('agent-filter');
     const stateFilter = document.getElementById('state-filter');
@@ -4562,7 +5908,8 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       'Dashboard Health': 'Whether the local dashboard endpoint and launch manager are reachable from this machine.',
       'Data Quality': 'Preflight gates completed before paid evals: prompt text, run IDs, timestamps, responses, evidence, reviews, traces, and ledger rows.',
       'Slack Evidence': 'Saved Slack runs with thread evidence. Warnings mean the run is present but missing some audit metadata.',
-      'Human Avg / 5': 'Average score from submitted human scorecards. Unreviewed cases stay out of this number.',
+      'Human Avg / 5': 'Average score from submitted manual human scorecards. Orchestrator Review scorecards are tracked separately.',
+      'Orchestrator Review Avg / 5': 'Average score from saved Orchestrator Review forms, not the score for the latest imported machine run.',
       'Total Cases': 'Total local eval case rows: committed seed prompts plus any ad hoc cases created during Slack testing.',
       'Paid-run readiness': 'Count of local preflight gates still open before paid Slack/OpenAI eval runs should be trusted.',
       'Human review queue': 'Recorded responses that can be scored now because prompt, response, and run context are already saved.',
@@ -4571,7 +5918,6 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       'Saved events': 'Sanitized trace or workflow events already stored locally for dashboard joins and debugging.',
       'Sensitive capture': 'Effective trace privacy setting. This should stay disabled so raw prompts, outputs, and tool I/O are not stored.',
       'Primary use': 'What trace rows are for here: timing, routing, join keys, and refresh debugging without raw content.',
-      'Latest pass rate': 'Pass rate for the newest imported Promptfoo run, using only rows included in dashboard analysis.',
       'Pass-rate change': 'Newest Promptfoo pass rate minus the previous comparable imported run.',
       'Assertion avg change': 'Change in average imported machine-check score on the 0-5 scale between comparable runs.',
       'Case movement': 'Comparable cases that improved, regressed, or stayed flat between the latest two imported runs.',
@@ -4582,44 +5928,49 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       'Slack Eval Conversation Flow': 'End-to-end #evals workflow status from prompt library to saved Slack run, response, scorecard, and analysis row.',
       'Prompt library': 'Committed seed prompts available to start #evals threads. This is the denominator for most workflow counts.',
       'Slack runs': 'Cases with a saved #evals thread run. These should appear after the agent responds in Slack.',
-      'Responses': 'Cases with saved response text from Slack or Promptfoo. These are eligible for human scoring.',
-      'Scorecards': 'Human review submissions saved from the Slack Submit Evaluation flow, including scores, safety, and notes.',
+      'Responses': 'Cases with saved response text from Slack or Promptfoo. These are eligible for review scoring.',
+      'Scorecards': 'Manual human and Orchestrator Review scorecards saved from the review-form shape, including scores, safety, and notes.',
       'Analysis': 'Cases currently counted in analysis views after excluding duplicates or known problem runs.',
       'Source checks': 'Cases tagged for retrieval or evidence quality, useful for auditing source-backed answers.',
       'API Spend Readiness Gates': 'Local readiness checks that should pass before paying for live Slack/OpenAI eval runs.',
-      'Agent Scores': 'Per-agent score table. Machine mode uses Promptfoo imports; Human mode uses submitted scorecards.',
+      'Overview Latest Run': 'Newest saved run or score event from the merged dashboard case model, with machine, Orchestrator Review, and human score channels.',
+      'Agent Scores': 'Per-agent score table. Machine mode uses Promptfoo imports; review modes use manual human and Orchestrator Review scorecards.',
       'Promptfoo Assertion Avg / 5 by Agent': 'Average Promptfoo assertion score per agent. It is a machine-check signal, not a human quality judgment.',
       'Slack Human Review Avg / 5 by Agent': 'Average submitted human-review score per agent from Slack-linked scorecards.',
+      'Orchestrator Review Avg / 5 by Agent': 'Average Orchestrator Review score per agent from saved review-form scorecards.',
       'Evaluation Dimensions': 'Prompt tags showing which behaviors the eval set exercises, such as retrieval, safety, synthesis, and output format.',
       'Prompt Library': 'Searchable list of committed eval prompts that can be copied into #evals as root messages.',
-      'Runs & Scoring': 'Case-level workspace for latest run state, machine checks, human reviews, evidence, and analysis inclusion.',
-      'Eval Follow-up Queue': 'Prioritized current cases that need a run, evidence fix, machine import, human scorecard, or analysis decision.',
-      'Eval Run Ledger': 'Newest-first event feed across Slack runs, Promptfoo imports, human reviews, and trace events.',
-      'Promptfoo Run Analysis': 'Trend and comparison views built from imported Promptfoo rows and saved human scorecards.',
-      'Average Score Over Time': 'Daily average machine and human scores. Multiple same-day rows are averaged for trend readability.',
+      'Latest Saved Runs': 'Newest saved Slack, machine, human, and Orchestrator Review activity from the merged case model. No Slack or API calls run here.',
+      'Runs & Scoring': 'Case-level workspace for latest run state, machine checks, review scorecards, evidence, and analysis inclusion.',
+      'Eval Follow-up Queue': 'Prioritized current cases that need a run, evidence fix, machine import, review scorecard, or analysis decision.',
+      'Eval Run Ledger': 'Newest-first event feed across Slack runs, Promptfoo imports, review scorecards, and trace events.',
+      'Promptfoo Run Analysis': 'Trend and comparison views built from imported Promptfoo rows, manual human reviews, and Orchestrator Review scorecards.',
+      'Average Score Across Time': 'Daily average machine, manual human, and Orchestrator Review scores. Multiple same-day rows are averaged for trend readability.',
       'Single Prompt Trend': 'Score history for one selected prompt, useful for seeing whether a specific fix helped.',
       'Prompt Average Scores by Agent': 'Prompt-level machine averages grouped by agent so weak prompts are easier to target.',
       'Agent Stability': 'How consistent each agent is across scored cases: pass rate, average, range, and uneven results.',
       'Failure Clusters by Dimension': 'Failed machine checks grouped by prompt tags to show which behavior areas need fixes.',
           'Case Changes Across Runs': 'Latest score movement for each case compared with its previous imported run.',
-          'Trace Dashboard': 'Trace-specific diagnostics, joins, privacy state, and readiness analytics from saved local trace summaries.',
+          'Trace Explorer': 'OpenAI-style run timeline plus Keystone eval joins, review scores, diagnostics, and privacy state from sanitized local trace summaries.',
+          'Trace Health': 'Group-level trace coverage, source split, diagnostics, and privacy posture for saved run summaries.',
+          'Trace Diagnostics': 'Chartable run-diagnostic categories from sanitized trace metadata, such as missing model metadata, retrieval gaps, retries, extraction issues, approval gates, and tool failures.',
+          'Current Run Trace': 'Newest run-level trace reduced to case/run joins, route, review scores, step timeline, and cleanup signals.',
+          'Trace Event Log': 'Recent sanitized workflow events shown as trace steps. Copy exposes capped metadata for local review.',
+          'Storage & Instrumentation': 'Processor readiness, database freshness, retained fields, dropped sensitive fields, and implementation notes.',
           'Trace Processor Readiness': 'Sanitized trace-capture readiness for future API evals; disabled is normal for current no-API runs.',
           'Local DB Freshness': 'No-render row counts and latest timestamps from the local eval database tables that feed the dashboard.',
-          'Trace Analytics': 'Trace-specific run health, diagnostic load, manual/API split, and privacy state from sanitized local metadata.',
-          'Trace join health': 'How many saved run summaries can be joined back to a case, Slack run, or WorkItem.',
-          'Manual/API split': 'Whether trace rows came from local no-API manual summaries or future SDK/API run summaries.',
-          'Diagnostic load': 'How many chartable diagnostic categories are present across saved trace summaries.',
-          'Top diagnostic category': 'Largest current diagnostic bucket by saved event count.',
-          'Trace privacy': 'Whether raw prompt, response, Slack message, tool I/O, secrets, or PHI capture is disabled.',
+          'Join health': 'How many saved run summaries can be joined back to a case, Slack run, or WorkItem.',
+          'Run source split': 'Whether trace rows came from local no-API manual summaries or future SDK/API run summaries.',
+          'Diagnostic signals': 'How many chartable diagnostic categories are present across saved trace summaries.',
+          'Top cleanup signal': 'Largest current diagnostic bucket by saved event count.',
+          'Privacy guardrail': 'Whether raw prompt, response, Slack message, tool I/O, secrets, or PHI capture is disabled.',
           'Slack runs table': 'Rows saved from #evals Slack runs, including run ids, evidence, warnings, and response hashes.',
           'Trace events table': 'Sanitized trace and workflow events used for join checks and diagnostic rollups.',
           'Promptfoo cases table': 'Imported case-level Promptfoo assertion results used for machine scores and analysis.',
           'Promptfoo runs table': 'Imported Promptfoo run-level summaries used for run trends and machine averages.',
-          'Human reviews table': 'Submitted local human scorecards used for review trends and quality comparison.',
+          'Human reviews table': 'Submitted local human and Orchestrator Review scorecards used for review trends and quality comparison.',
           'What We Store Locally': 'Trace and workflow fields kept for joins/timing, plus sensitive fields intentionally dropped.',
           'Implementation Contract': 'Environment settings and integration rules needed before sanitized trace capture is enabled.',
-          'Trace Diagnostic Categories': 'Chartable run-diagnostic categories from sanitized trace metadata, such as missing model metadata, retrieval gaps, retries, extraction issues, approval gates, and tool failures.',
-          'Recent Trace Events': 'Recent sanitized workflow or trace events, including no-API Slack/review saves and future API spans.',
       'Eval Case Database': 'Searchable case table combining seed prompts, newest runs first, review status, evidence, and notes.',
     }};
     function infoDot(label, helpText) {{
@@ -4632,6 +5983,11 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
     function pill(text, cls) {{ return `<span class="pill ${{cls || ''}}">${{escapeHtml(text)}}</span>`; }}
     function escapeHtml(value) {{
       return String(value ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+    }}
+    function scoreValue(value) {{
+      if (value === null || value === undefined || value === '') return '-';
+      const number = Number(value);
+      return Number.isFinite(number) ? `${{number.toFixed(1)}}/5` : '-';
     }}
     function stateMatches(item) {{
       const state = stateFilter.value;
@@ -4655,8 +6011,22 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       if (state === 'pending') return !hasSlack && !hasMachine && !hasHuman;
       return true;
     }}
+    function caseHasRuntimeEvidence(item) {{
+      return Number(item.slack_run_count || 0) > 0
+        || item.promptfoo_success !== null
+        || item.human_average !== null
+        || item.orchestrator_judge_average !== null
+        || Boolean(item.latest_run_id || item.latest_slack_run_id || item.latest_slack_thread_ts)
+        || Boolean(item.scoring_completed_at || item.orchestrator_judge_created_at || item.human_created_at);
+    }}
     function latestRunMillis(item) {{
-      const value = item.latest_run_at || item.latest_slack_created_at || item.updated_at || item.human_created_at || '';
+      const value = item.latest_run_at
+        || item.scoring_completed_at
+        || item.orchestrator_judge_created_at
+        || item.latest_slack_created_at
+        || item.updated_at
+        || item.human_created_at
+        || '';
       const time = Date.parse(value);
       return Number.isFinite(time) ? time : 0;
     }}
@@ -4728,9 +6098,18 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       if (view === 'human') {{
         return {{
           title: 'Slack Human Review Avg / 5 by Agent',
-          note: 'Average 0-5 score from saved #evals human scorecards.',
+          note: 'Average 0-5 score from manual #evals human scorecards.',
           scores: data.summary.human_agent_scores || {{}},
-          empty: 'No Slack human-review scores have been saved yet.',
+          empty: 'No manual Slack human-review scores have been saved yet.',
+          machine: false,
+        }};
+      }}
+      if (view === 'orchestrator_judge') {{
+        return {{
+          title: 'Orchestrator Review Avg / 5 by Agent',
+          note: 'Average 0-5 score from Orchestrator Review scorecards.',
+          scores: data.summary.orchestrator_judge_agent_scores || {{}},
+          empty: 'No Orchestrator Review scores have been saved yet.',
           machine: false,
         }};
       }}
@@ -4789,6 +6168,41 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         .map(([label, value]) => pill(`${{label}} ${{value}}`, ''))
         .join('');
     }}
+    const scoreShortLabels = {{
+      accuracy: 'acc',
+      relevance: 'rel',
+      explainability: 'exp',
+      readability: 'read',
+      source_quality: 'src',
+      search_quality: 'search',
+      synthesis_quality: 'synth',
+      uniqueness: 'uniq',
+      format_quality: 'fmt',
+      instruction_following: 'instr',
+      usefulness: 'use',
+    }};
+    function scoreMetricStrip(scores) {{
+      const dimensions = data.score_dimensions || Object.keys(scores || {{}});
+      const chips = dimensions
+        .filter(dimension => scores && scores[dimension] !== null && scores[dimension] !== undefined && scores[dimension] !== '')
+        .map(dimension => {{
+          const label = scoreShortLabels[dimension] || dimension;
+          const number = Number(scores[dimension]);
+          const value = Number.isFinite(number) ? number.toFixed(1) : String(scores[dimension]);
+          return `<span class="score-chip" title="${{escapeHtml(dimension)}}">${{escapeHtml(label)}} ${{escapeHtml(value)}}</span>`;
+        }})
+        .join('');
+      return chips || '<span class="db-empty">no score columns</span>';
+    }}
+    function scoreDimensionCell(scores, dimension) {{
+      const value = scores ? scores[dimension] : undefined;
+      if (value === null || value === undefined || value === '') {{
+        return `<td class="mono score-dimension-cell"><span class="db-empty">tbd</span></td>`;
+      }}
+      const number = Number(value);
+      const text = Number.isFinite(number) ? number.toFixed(1) : String(value);
+      return `<td class="mono score-dimension-cell" title="${{escapeHtml(dimension)}}">${{escapeHtml(text)}}</td>`;
+    }}
     function formatDateTime(value) {{
       if (!value) return '';
       const parsed = new Date(value);
@@ -4811,6 +6225,9 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       chips.push(item.human_created_at
         ? pill(`Human ${{formatDateTime(item.human_created_at)}}`, item.human_safety === 'fail' ? 'fail' : 'pass')
         : pill('Human unreviewed', 'warn'));
+      chips.push(item.orchestrator_judge_created_at
+        ? pill(`Orchestrator Review ${{formatDateTime(item.orchestrator_judge_created_at)}}`, item.orchestrator_judge_safety === 'fail' ? 'fail' : 'pass')
+        : pill('Orchestrator Review unscored', 'warn'));
       return chips.join('');
     }}
     function statusBox(title, main, date, detail, cls = '') {{
@@ -4833,7 +6250,10 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             ? `${{item.slack_run_count}} saved run${{Number(item.slack_run_count || 0) === 1 ? '' : 's'}}`
             : 'Not tested in Slack';
           const slackDate = item.latest_slack_created_at ? formatDateTime(item.latest_slack_created_at) : '';
-          const slackDetail = item.latest_slack_run_id || item.latest_slack_thread_ts || '';
+          const slackDetail = [
+            item.latest_slack_run_id || '',
+            item.latest_slack_thread_ts ? `thread ${{item.latest_slack_thread_ts}}` : '',
+          ].filter(Boolean).join(' · ');
           const evidenceMain = Number(item.slack_run_count || 0) > 0
             ? `${{item.latest_slack_visible_source_count || 0}}/${{item.latest_slack_source_count || 0}} visible sources`
             : 'No Slack evidence';
@@ -4847,11 +6267,24 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             ? `${{scoreOutOfFive(item.human_average)}} ${{item.human_safety ? `· ${{item.human_safety}}` : ''}}`
             : 'Unreviewed';
       const humanDate = item.human_created_at ? formatDateTime(item.human_created_at) : '';
+      const judgeMain = item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined
+        ? `${{scoreOutOfFive(item.orchestrator_judge_average)}} ${{item.orchestrator_judge_safety ? `· ${{item.orchestrator_judge_safety}}` : ''}}`
+        : 'Unscored';
+      const judgeDate = item.orchestrator_judge_created_at ? formatDateTime(item.orchestrator_judge_created_at) : '';
+      const orchestratorComment = item.orchestrator_judge_run_comment || item.orchestrator_judge_notes || '';
+      const scoringMain = item.scoring_completed_at
+        ? `Review scoring complete · ${{formatDateTime(item.scoring_completed_at)}}`
+        : hasRecordedResponse(item) ? 'Missing scorecard' : 'Waiting on response';
+      const scoringDetail = Array.isArray(item.scoring_review_kinds) && item.scoring_review_kinds.length
+        ? item.scoring_review_kinds.join(' + ')
+        : '';
       return `<div class="status-grid">
             ${{statusBox('Promptfoo assertion', machineMain, machineDate, item.promptfoo_eval_id || '', item.promptfoo_success === false ? 'fail' : item.promptfoo_success === true ? 'pass' : 'warn')}}
             ${{statusBox('Slack test run', slackMain, slackDate, slackDetail, Number(item.slack_run_count || 0) > 0 ? 'pass' : 'warn')}}
             ${{statusBox('Slack evidence', evidenceMain, '', evidenceDetail, Number(item.slack_run_count || 0) > 0 ? (Number(item.latest_slack_warning_count || 0) > 0 ? 'warn' : 'pass') : 'warn')}}
+            ${{statusBox('Scoring status', scoringMain, '', scoringDetail, item.scoring_completed_at ? 'pass' : 'warn')}}
             ${{statusBox('Human review', humanMain, humanDate, item.human_notes || '', item.human_safety === 'fail' ? 'fail' : item.human_average !== null ? 'pass' : 'warn')}}
+            ${{statusBox('Orchestrator Review', judgeMain, judgeDate, orchestratorComment, item.orchestrator_judge_safety === 'fail' ? 'fail' : item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined ? 'pass' : 'warn')}}
           </div>`;
     }}
     function agentScorePills(agentScores) {{
@@ -4899,6 +6332,12 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       const source = String(row.source || '');
       if (row.score === null || row.score === undefined || row.score === '') return 'score tbd';
       return `score ${{scoreOutOfFive(row.score, source === 'promptfoo')}}`;
+    }}
+    function ledgerSourceLabel(row) {{
+      const source = String(row.source || '');
+      if (source === 'orchestrator_judge') return 'Orchestrator Review';
+      if (source === 'human') return 'human scoring';
+      return source || 'event';
     }}
     function ensureCopyFallback() {{
       let panel = document.getElementById('copy-fallback');
@@ -4980,6 +6419,72 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       }}
       setTimeout(() => {{ button.textContent = original; }}, 1200);
     }}
+    function filteredRunCases() {{
+      const query = search.value.trim().toLowerCase();
+      return latestFirstCases(cases.filter(item => {{
+        const haystack = [
+          item.case_id, item.display_case_id, item.agent, (item.dimensions || []).join(' '),
+          item.user_input, item.response_text, item.latest_slack_summary,
+          item.latest_run_id, item.latest_slack_run_id, item.latest_slack_thread_ts,
+          item.latest_slack_context_policy, item.latest_slack_thread_fetch_status,
+          item.latest_slack_cost_profile, item.human_notes,
+          item.orchestrator_judge_notes, item.orchestrator_judge_run_comment
+        ].join(' ').toLowerCase();
+        return (!query || haystack.includes(query))
+          && (!agentFilter.value || item.agent === agentFilter.value)
+          && stateMatches(item);
+      }}));
+    }}
+    function renderLatestSavedRuns() {{
+      const target = document.getElementById('latest-saved-runs');
+      if (!target) return;
+      const rows = filteredRunCases()
+        .filter(caseHasRuntimeEvidence)
+        .filter(item => latestRunMillis(item) > 0)
+        .slice(0, 8);
+      if (!rows.length) {{
+        target.innerHTML = '<div class="subtle">No saved runs or review events match the current filters.</div>';
+        return;
+      }}
+      target.innerHTML = `<div class="followup-list">${{rows.map(item => {{
+        const runAt = item.latest_run_at || item.scoring_completed_at || item.orchestrator_judge_created_at || item.latest_slack_created_at || item.updated_at || item.human_created_at || '';
+        const runContext = [
+          item.latest_run_source ? `source ${{item.latest_run_source}}` : '',
+          item.latest_run_id || item.latest_slack_run_id ? `run ${{item.latest_run_id || item.latest_slack_run_id}}` : '',
+          item.latest_slack_thread_ts ? `thread ${{item.latest_slack_thread_ts}}` : '',
+          runAt ? formatDateTime(runAt) || runAt : '',
+        ].filter(Boolean).join(' · ');
+        const evidenceContext = [
+          Number(item.slack_run_count || 0) > 0 ? `${{item.slack_run_count}} Slack run${{Number(item.slack_run_count || 0) === 1 ? '' : 's'}}` : '',
+          item.latest_slack_thread_fetch_status ? `thread ${{item.latest_slack_thread_fetch_status}}` : '',
+          Number(item.latest_slack_source_count || 0) || Number(item.latest_slack_visible_source_count || 0) ? `${{item.latest_slack_visible_source_count || 0}}/${{item.latest_slack_source_count || 0}} visible sources` : '',
+        ].filter(Boolean).join(' · ');
+        const orchestratorComment = item.orchestrator_judge_run_comment || item.orchestrator_judge_notes || '';
+        const statusLabel = item.scoring_status_label || (item.latest_run_source ? 'run saved' : 'saved activity');
+        const actions = [
+          item.dashboard_url ? `<a class="pill" href="${{escapeHtml(item.dashboard_url)}}">Scoring</a>` : '',
+          item.review_url ? `<a class="pill" href="${{escapeHtml(item.review_url)}}">Review form</a>` : '',
+          item.case_id ? `<button class="ledger-copy" type="button" data-copy-latest-case="${{escapeHtml(item.case_id)}}" title="Prompt, response, scores, evidence, and next review follow-up.">Copy eval review packet</button>` : '',
+        ].filter(Boolean).join('');
+        return `<article class="followup-item">
+          <div>
+            <div class="followup-title">
+              ${{pill(statusLabel, item.scoring_status === 'complete' ? 'pass' : 'warn')}}
+              <strong>${{escapeHtml(item.display_case_id || item.case_id || 'case tbd')}}</strong>
+              <span class="subtle">${{escapeHtml(item.agent || '')}}</span>
+            </div>
+            ${{runContext ? `<div class="followup-detail mono">${{escapeHtml(runContext)}}</div>` : ''}}
+            ${{runScoreStrip(item)}}
+            ${{evidenceContext ? `<div class="followup-detail">${{escapeHtml(evidenceContext)}}</div>` : ''}}
+            ${{orchestratorComment ? `<div class="followup-detail"><strong>Orchestrator Review:</strong> ${{escapeHtml(orchestratorComment)}}</div>` : ''}}
+          </div>
+          <div class="followup-actions">${{actions}}</div>
+        </article>`;
+      }}).join('')}}</div>`;
+      for (const button of target.querySelectorAll('[data-copy-latest-case]')) {{
+        button.addEventListener('click', () => copyCaseBundle(button));
+      }}
+    }}
     function renderFollowUpQueue() {{
       const target = document.getElementById('eval-follow-up-queue');
       if (!target) return;
@@ -5004,10 +6509,18 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         const runContext = [
           row.latest_run_source ? `source ${{row.latest_run_source}}` : '',
           row.latest_run_id ? `run ${{row.latest_run_id}}` : '',
+          row.latest_slack_thread_ts ? `thread ${{row.latest_slack_thread_ts}}` : '',
           row.latest_run_at ? formatDateTime(row.latest_run_at) || row.latest_run_at : '',
         ].filter(Boolean).join(' · ');
+        const orchestratorComment = row.orchestrator_judge_run_comment || row.orchestrator_judge_notes || '';
+        const reviewNotes = [
+          orchestratorComment ? `Orchestrator Review: ${{orchestratorComment}}` : '',
+          row.human_notes ? `Human review: ${{row.human_notes}}` : '',
+        ].filter(Boolean).join(' ');
+        const promptExcerpt = String(row.prompt_excerpt || '');
+        const responseExcerpt = String(row.response_excerpt || '');
         const actions = [
-          row.dashboard_url ? `<a class="pill" href="${{escapeHtml(row.dashboard_url)}}">Dashboard</a>` : '',
+          row.dashboard_url ? `<a class="pill" href="${{escapeHtml(row.dashboard_url)}}">Scoring</a>` : '',
           row.review_url ? `<a class="pill" href="${{escapeHtml(row.review_url)}}">Review form</a>` : '',
           row.case_id ? `<button class="ledger-copy" type="button" data-copy-followup-case="${{escapeHtml(row.case_id)}}" title="Prompt, response, scores, evidence, and next review follow-up.">Copy eval review packet</button>` : '',
         ].filter(Boolean).join('');
@@ -5024,6 +6537,10 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             ${{followUpSummary ? `<div class="followup-detail"><strong>${{escapeHtml(followUpSummary)}}</strong></div>` : ''}}
             <div class="followup-detail">Next: ${{escapeHtml(row.next_follow_up || row.detail || '')}}</div>
             ${{runContext ? `<div class="followup-detail mono">${{escapeHtml(runContext)}}</div>` : ''}}
+            ${{runScoreStrip(row)}}
+            ${{reviewNotes ? `<div class="followup-detail">${{escapeHtml(reviewNotes)}}</div>` : ''}}
+            ${{promptExcerpt ? `<div class="followup-detail"><strong>Prompt:</strong> ${{escapeHtml(promptExcerpt)}}${{Number(row.prompt_chars || 0) > promptExcerpt.length ? '...' : ''}}</div>` : ''}}
+            ${{responseExcerpt ? `<div class="followup-detail"><strong>Response:</strong> ${{escapeHtml(responseExcerpt)}}${{Number(row.response_chars || 0) > responseExcerpt.length ? '...' : ''}}</div>` : ''}}
           </div>
           <div class="followup-actions">${{actions}}</div>
         </article>`;
@@ -5062,12 +6579,20 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           row.run_id ? `run ${{row.run_id}}` : 'run tbd',
           score,
         ].filter(Boolean);
+        const traceSummary = row.trace_agentic_summary || {{}};
+        const traceParts = [
+          traceSummary.signal ? `signal ${{traceSummary.signal}}` : '',
+          traceSummary.route ? `route ${{traceSummary.route}}` : '',
+          traceSummary.tools && !String(traceSummary.tools).endsWith('metadata pending') ? `tools ${{traceSummary.tools}}` : '',
+          traceSummary.retrieval && !String(traceSummary.retrieval).endsWith('metadata pending') ? `retrieval ${{traceSummary.retrieval}}` : '',
+          traceSummary.model && !String(traceSummary.model).endsWith('metadata pending') ? `model ${{traceSummary.model}}` : '',
+        ].filter(Boolean);
         return `<article class="ledger-event">
           <div class="ledger-time">${{escapeHtml(formatDateTime(row.timestamp) || row.timestamp || 'time tbd')}}</div>
           <div class="ledger-main">
             <div class="ledger-title-row">
               <div class="ledger-title">
-                ${{pill(source || 'event', source === 'trace' ? 'warn' : 'pass')}}
+                ${{pill(ledgerSourceLabel(row), source === 'trace' ? 'warn' : 'pass')}}
                 ${{pill(status || 'saved', statusClass)}}
                 <strong>${{escapeHtml(titleParts)}}</strong>
               </div>
@@ -5075,6 +6600,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             </div>
             <div class="ledger-meta">${{metaParts.map(part => `<span>${{escapeHtml(part)}}</span>`).join('<span aria-hidden="true"> · </span>')}}</div>
             <div class="ledger-detail">${{escapeHtml(row.details || '')}}</div>
+            ${{traceParts.length ? `<div class="ledger-detail"><strong>Trace:</strong> ${{traceParts.map(part => escapeHtml(part)).join(' · ')}}</div>` : ''}}
           </div>
         </article>`;
       }}).join('')}}</div>`;
@@ -5122,6 +6648,29 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
     function scoreValue(value, machine = false) {{
       const formatted = scoreOutOfFive(value, machine);
       return formatted === '-' ? `<span class="db-empty">tbd</span>` : escapeHtml(formatted);
+    }}
+    function scoreValueText(value, machine = false) {{
+      const formatted = scoreOutOfFive(value, machine);
+      return formatted === '-' ? 'tbd' : formatted;
+    }}
+    function runScoreChannel(label, value, cls = 'warn', machine = false) {{
+      return `<div class="run-score-channel ${{cls}}">
+        <div class="label">${{escapeHtml(label)}}</div>
+        <div class="value">${{escapeHtml(scoreValueText(value, machine))}}</div>
+      </div>`;
+    }}
+    function runScoreStrip(item) {{
+      const hasMachine = item.promptfoo_success !== null && item.promptfoo_success !== undefined;
+      const hasOrchestrator = item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined;
+      const hasHuman = item.human_average !== null && item.human_average !== undefined;
+      const machineClass = item.promptfoo_success === false ? 'fail' : hasMachine ? 'pass' : 'warn';
+      const orchestratorClass = item.orchestrator_judge_safety === 'fail' ? 'fail' : hasOrchestrator ? 'pass' : 'warn';
+      const humanClass = item.human_safety === 'fail' ? 'fail' : hasHuman ? 'pass' : 'warn';
+      return `<div class="run-score-strip">
+        ${{runScoreChannel('Machine', hasMachine ? item.promptfoo_score : null, machineClass, true)}}
+        ${{runScoreChannel('Orchestrator', hasOrchestrator ? item.orchestrator_judge_average : null, orchestratorClass)}}
+        ${{runScoreChannel('Human', hasHuman ? item.human_average : null, humanClass)}}
+      </div>`;
     }}
     function analysisCard(label, value, detail = '') {{
       return `<div class="analysis-card">
@@ -5257,10 +6806,10 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             }},
             {{
               interaction: 'Submit Evaluation',
-              current_behavior: 'Slack submission writes score fields and human notes to the local eval database',
-              future_live_trigger: 'Human presses Submit Evaluation after scoring in Slack',
-              cost_guardrail: 'No model call; writes one review row, then refreshes Database, Runs & Scoring, and Analysis from saved rows',
-              stored_evidence: `${{fallbackCounts.humanReviews || 0}} saved scorecards`,
+              current_behavior: 'Manual submission and Orchestrator Review write score fields and notes to the local eval database as separate review kinds',
+              future_live_trigger: 'Human presses Submit Evaluation after scoring in Slack, or enabled Orchestrator Review scores the saved run',
+              cost_guardrail: 'Manual submit uses no model call and no Slack post; Orchestrator Review runs only when explicitly enabled, then refreshes Database, Runs & Scoring, and Analysis from saved rows',
+              stored_evidence: `${{fallbackCounts.reviewScorecards || fallbackCounts.humanReviews || 0}} saved scorecards`,
             }},
             {{
               interaction: 'Analysis inclusion',
@@ -5323,14 +6872,15 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             <div class="label">${{labelWithInfo('Start with')}}</div>
             <div class="mono">${{escapeHtml(caseLabel)}}</div>
             <div class="subtle">${{escapeHtml(agent)}}${{escapeHtml(promptNumber)}}</div>
-            ${{dashboardUrl ? `<div class="subtle">Case dashboard: <span class="mono">${{escapeHtml(dashboardUrl)}}</span></div>` : ''}}
+            ${{dashboardUrl ? `<div class="subtle">Case scoring: <span class="mono">${{escapeHtml(dashboardUrl)}}</span></div>` : ''}}
             ${{reviewUrl ? `<div class="subtle">Human review form: <span class="mono">${{escapeHtml(reviewUrl)}}</span></div>` : ''}}
             <ol class="run-plan-list">
               <li>Paste the prompt into <span class="mono">${{escapeHtml(plan.channel || '#evals')}}</span> as the root message.</li>
               <li>Keep all follow-ups in the same Slack thread.</li>
-              <li>Expect an in-thread eval footer with Promptfoo machine-check status, review form link, and dashboard link.</li>
+              <li>Expect an in-thread eval footer with Promptfoo machine-check status, review form link, and scoring link.</li>
               <li>Open the Slack-linked scoring form from the eval footer; no extra agent response is needed.</li>
-              <li>Press <strong>Submit Evaluation</strong> in Slack after scoring; the saved review updates Database, Runs & Scoring, and Analysis.</li>
+              <li>Use <strong>Score with Orchestrator Review</strong> when enabled to fill the same form-shaped scorecard for the saved #evals output.</li>
+              <li>Press <strong>Submit Evaluation</strong> in Slack after manual scoring; saved human and Orchestrator Review scorecards update Database, Runs & Scoring, and Analysis as separate review kinds.</li>
             </ol>
           </div>
           <div class="run-plan-box">
@@ -5358,6 +6908,12 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       const slackRuns = cases.filter(item => Number(item.slack_run_count || 0) > 0).length;
       const recordedResponses = cases.filter(item => hasRecordedResponse(item)).length;
       const humanReviews = cases.filter(item => item.human_average !== null && item.human_average !== undefined).length;
+      const orchestratorReviews = cases.filter(item => item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined).length;
+      const reviewScorecards = cases.filter(item => (
+        item.human_average !== null && item.human_average !== undefined
+      ) || (
+        item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined
+      )).length;
       const analysisReady = cases.filter(item => item.promptfoo_eval_id && !item.analysis_excluded).length;
       const retrievalTagged = cases.filter(item => (item.dimensions || []).some(dimension => [
         'retrieval',
@@ -5375,7 +6931,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           ${{workflowStep('Prompt library', `${{promptLibrary}} cases`, 'copy into #evals', promptLibrary, Math.max(total, promptLibrary))}}
           ${{workflowStep('Slack runs', `${{slackRuns}}/${{total}}`, 'saved thread run', slackRuns, total)}}
           ${{workflowStep('Responses', `${{recordedResponses}}/${{total}}`, 'unlock review', recordedResponses, total)}}
-          ${{workflowStep('Scorecards', `${{humanReviews}}/${{total}}`, 'human review saved', humanReviews, total)}}
+          ${{workflowStep('Scorecards', `${{reviewScorecards}}/${{total}}`, `${{humanReviews}} manual · ${{orchestratorReviews}} Orchestrator`, reviewScorecards, total)}}
           ${{workflowStep('Analysis', `${{analysisReady}}/${{total}}`, 'included rows', analysisReady, total)}}
           ${{workflowStep('Source checks', `${{retrievalTagged}}/${{promptLibrary}}`, 'retrieval/evidence tags', retrievalTagged, promptLibrary)}}
         </div>
@@ -5391,24 +6947,62 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             </div>
             <div class="chat-row">
               <div class="chat-speaker">KNI</div>
-              <div class="chat-bubble system">Reply once in-thread with the agent result, case id, run id, and dashboard link.</div>
+              <div class="chat-bubble system">Reply once in-thread with the agent result, case id, run id, and scoring link.</div>
             </div>
             <div class="chat-row">
               <div class="chat-speaker">Promptfoo</div>
-              <div class="chat-bubble system">Append imported machine-check status plus dashboard and review links; no Promptfoo rerun.</div>
+              <div class="chat-bubble system">Append imported machine-check status plus scoring and review links; no Promptfoo rerun.</div>
             </div>
             <div class="chat-row">
               <div class="chat-speaker">Review</div>
-              <div class="chat-bubble system">Score from the linked form using the saved prompt, response, and machine check.</div>
+              <div class="chat-bubble system">Score from the linked form, or run Orchestrator Review scoring when enabled, using the saved prompt, response, and machine check.</div>
             </div>
             <div class="chat-row">
-              <div class="chat-speaker">Dashboard</div>
+              <div class="chat-speaker">Scoring</div>
               <div class="chat-bubble system">Update runs, database, and analysis from saved rows without extra model calls.</div>
             </div>
           </div>
         </details>
         ${{workflowStarterRunPlan()}}
-        ${{workflowInteractionContract({{ total, slackRuns, recordedResponses, humanReviews, analysisReady, retrievalTagged }})}}`;
+        ${{workflowInteractionContract({{ total, slackRuns, recordedResponses, humanReviews, orchestratorReviews, reviewScorecards, analysisReady, retrievalTagged }})}}`;
+    }}
+    function renderOverviewLatestRun() {{
+      const target = document.getElementById('overview-latest-run');
+      if (!target) return;
+      const item = latestFirstCases(cases).find(row => latestRunMillis(row) > 0);
+      if (!item) {{
+        target.innerHTML = '<div class="subtle">No saved runs are available yet.</div>';
+        return;
+      }}
+      const latestAt = item.latest_run_at || item.scoring_completed_at || item.orchestrator_judge_created_at || item.latest_slack_created_at || item.updated_at || item.human_created_at || '';
+      const runContext = [
+        item.latest_run_source ? `source ${{item.latest_run_source}}` : '',
+        item.latest_run_id || item.latest_slack_run_id || item.promptfoo_eval_id ? `run ${{item.latest_run_id || item.latest_slack_run_id || item.promptfoo_eval_id}}` : '',
+        item.latest_slack_thread_ts ? `thread ${{item.latest_slack_thread_ts}}` : '',
+        latestAt ? formatDateTime(latestAt) || latestAt : '',
+      ].filter(Boolean).join(' · ');
+      const evidence = [
+        Number(item.slack_run_count || 0) > 0 ? `${{item.slack_run_count}} Slack run${{Number(item.slack_run_count || 0) === 1 ? '' : 's'}}` : 'Slack not run',
+        Number(item.latest_slack_source_count || 0) || Number(item.latest_slack_visible_source_count || 0) ? `${{item.latest_slack_visible_source_count || 0}}/${{item.latest_slack_source_count || 0}} visible sources` : '',
+        item.scoring_status_label || '',
+      ].filter(Boolean).join(' · ');
+      const actions = [
+        item.dashboard_url ? `<a class="pill" href="${{escapeHtml(item.dashboard_url)}}">Scoring</a>` : '',
+        item.review_url ? `<a class="pill" href="${{escapeHtml(item.review_url)}}">Review form</a>` : '',
+      ].filter(Boolean).join('');
+      target.innerHTML = `<article class="followup-item">
+        <div>
+          <div class="followup-title">
+            ${{pill(item.scoring_status_label || 'latest run', item.scoring_status === 'complete' ? 'pass' : 'warn')}}
+            <strong>${{escapeHtml(item.display_case_id || item.case_id || 'case tbd')}}</strong>
+            <span class="subtle">${{escapeHtml(item.agent || '')}}</span>
+          </div>
+          ${{runContext ? `<div class="followup-detail mono">${{escapeHtml(runContext)}}</div>` : ''}}
+          ${{runScoreStrip(item)}}
+          <div class="followup-detail">${{escapeHtml(evidence)}}</div>
+        </div>
+        <div class="followup-actions">${{actions}}</div>
+      </article>`;
     }}
     function renderDataQualityGates() {{
       const target = document.getElementById('data-quality-gates');
@@ -5465,6 +7059,12 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       const slackRuns = cases.filter(item => Number(item.slack_run_count || 0) > 0).length;
       const recordedResponses = cases.filter(item => hasRecordedResponse(item)).length;
       const humanReviews = cases.filter(item => item.human_average !== null && item.human_average !== undefined).length;
+      const orchestratorReviews = cases.filter(item => item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined).length;
+      const reviewScorecards = cases.filter(item => (
+        item.human_average !== null && item.human_average !== undefined
+      ) || (
+        item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined
+      )).length;
       const analysisIncluded = cases.filter(item => item.promptfoo_eval_id && !item.analysis_excluded).length;
       const excludedRuns = cases.filter(item => item.analysis_excluded).length;
       const retrievalTagged = cases.filter(item => (item.dimensions || []).some(dimension => [
@@ -5503,22 +7103,26 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       const humanTrendValues = (data.analysis?.human_review_trends || []).map(row => (
         row.average_score === null || row.average_score === undefined ? null : Number(row.average_score) / 5 * 100
       ));
+      const judgeTrendValues = (data.analysis?.orchestrator_judge_review_trends || []).map(row => (
+        row.average_score === null || row.average_score === undefined ? null : Number(row.average_score) / 5 * 100
+      ));
       target.innerHTML = [
         scaffoldCard(
           'Review completion funnel',
-          'Stage bars for committed cases, saved Slack responses, and completed human reviews.',
+          'Stage bars for committed cases, saved Slack responses, and completed review scorecards.',
           scaffoldBarRows([
             {{ label: 'Committed cases', value: total }},
             {{ label: 'Slack responses', value: recordedResponses }},
-            {{ label: 'Human reviews', value: humanReviews }},
+            {{ label: 'Review scorecards', value: reviewScorecards }},
           ])
         ),
         scaffoldCard(
-          'Machine vs human coverage',
-          'Grouped bars for Promptfoo machine checks beside saved human scorecards.',
+          'Machine vs review coverage',
+          'Grouped bars for Promptfoo machine checks beside saved human and Orchestrator Review scorecards.',
           scaffoldBarRows([
             {{ label: 'Machine checks', value: machineRows }},
             {{ label: 'Human reviews', value: humanReviews }},
+            {{ label: 'Orchestrator Reviews', value: orchestratorReviews }},
             {{ label: 'Included rows', value: analysisIncluded }},
           ])
         ),
@@ -5538,7 +7142,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         ),
         scaffoldCard(
           'Agent score comparison',
-          'Horizontal ranking scaffold for average machine score by agent, with human line added when reviews exist.',
+          'Horizontal ranking scaffold for average machine score by agent, with review lines added when scorecards exist.',
           scaffoldBarRows(agentRows)
         ),
         scaffoldCard(
@@ -5555,27 +7159,22 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           scaffoldLine(runTrendValues, 'Promptfoo pass-rate trend')
         ),
         scaffoldCard(
-          'Human review trend line',
-          'Line scaffold for daily human average score once reviews exist.',
-          humanTrendValues.some(value => value !== null && value !== undefined)
-            ? scaffoldLine(humanTrendValues, 'Human review trend')
-            : '<div class="subtle">Waiting for saved human reviews.</div><div class="scaffold-note">The line appears after at least one scorecard; the daily trend is best after 4+ reviews per day.</div>'
+          'Review trend line',
+          'Line scaffold for daily manual human and Orchestrator Review averages once reviews exist.',
+          humanTrendValues.some(value => value !== null && value !== undefined) || judgeTrendValues.some(value => value !== null && value !== undefined)
+            ? scaffoldLine(humanTrendValues.some(value => value !== null && value !== undefined) ? humanTrendValues : judgeTrendValues, 'Review trend')
+            : '<div class="subtle">Waiting for saved review forms.</div><div class="scaffold-note">The line appears after at least one human or Orchestrator Review scorecard; the daily trend is best after 4+ reviews per day.</div>'
         ),
       ].join('');
     }}
     function renderAnalysisSummary() {{
       const analysis = data.analysis || {{}};
       const trends = analysis.run_trends || [];
-      const latest = trends[trends.length - 1] || {{}};
       const fix = analysis.fix_signal || {{}};
-      const latestDetail = latest.eval_id
-        ? `${{latest.successes || 0}}/${{latest.total || 0}} passed · ${{formatDateTime(latest.created_at) || latest.created_at || ''}}`
-        : 'No imported Promptfoo runs yet';
       const avgDelta = fix.average_score_delta === null || fix.average_score_delta === undefined
         ? '-'
         : signedNumber(Number(fix.average_score_delta || 0) * 5, ' /5', 2);
       document.getElementById('analysis-summary').innerHTML = [
-        analysisCard('Latest pass rate', formatPercent(latest.pass_rate), latestDetail),
         analysisCard('Pass-rate change', signedNumber(fix.pass_rate_delta, ' pp'), fix.previous_eval_id ? `vs ${{fix.previous_eval_id}}` : 'needs two runs'),
         analysisCard('Assertion avg change', avgDelta, 'normalized to 0-5'),
         analysisCard('Case movement', `${{fix.improved_cases || 0}} improved · ${{fix.regressed_cases || 0}} regressed`, `${{fix.stable_cases || 0}} stable cases`),
@@ -5631,6 +7230,13 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         height,
         pad,
       );
+      const judgePoints = linePoints(
+        rows,
+        row => row.orchestrator_judge_average === null || row.orchestrator_judge_average === undefined ? null : Number(row.orchestrator_judge_average) / 5 * 100,
+        width,
+        height,
+        pad,
+      );
       const machineCircles = rows.map((row, index) => {{
         if (row.machine_average === null || row.machine_average === undefined) return '';
         const x = pad.left + (index / Math.max(1, rows.length - 1)) * (width - pad.left - pad.right);
@@ -5643,7 +7249,13 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         const y = pad.top + (1 - Number(row.human_average) / 5) * (height - pad.top - pad.bottom);
         return `<circle cx="${{x.toFixed(1)}}" cy="${{y.toFixed(1)}}" r="4" fill="#8a6f2a"><title>${{escapeHtml(row.date)}} · human ${{scoreValue(row.human_average)}} · ${{row.human_count || 0}} review${{Number(row.human_count || 0) === 1 ? '' : 's'}}</title></circle>`;
       }}).join('');
-      target.innerHTML = `<svg viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Average machine and human score over time">
+      const judgeCircles = rows.map((row, index) => {{
+        if (row.orchestrator_judge_average === null || row.orchestrator_judge_average === undefined) return '';
+        const x = pad.left + (index / Math.max(1, rows.length - 1)) * (width - pad.left - pad.right);
+        const y = pad.top + (1 - Number(row.orchestrator_judge_average) / 5) * (height - pad.top - pad.bottom);
+        return `<circle cx="${{x.toFixed(1)}}" cy="${{y.toFixed(1)}}" r="4" fill="#315f9b"><title>${{escapeHtml(row.date)}} · Orchestrator Review ${{scoreValue(row.orchestrator_judge_average)}} · ${{row.orchestrator_judge_count || 0}} review form${{Number(row.orchestrator_judge_count || 0) === 1 ? '' : 's'}}</title></circle>`;
+      }}).join('');
+      target.innerHTML = `<svg viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Average machine, human, and Orchestrator Review score across time">
         <line x1="${{pad.left}}" y1="${{pad.top}}" x2="${{pad.left}}" y2="${{height - pad.bottom}}" stroke="#d9dee3" />
         <line x1="${{pad.left}}" y1="${{height - pad.bottom}}" x2="${{width - pad.right}}" y2="${{height - pad.bottom}}" stroke="#d9dee3" />
         ${{[0, 2.5, 5].map(value => {{
@@ -5652,22 +7264,32 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         }}).join('')}}
         <polyline points="${{machinePoints}}" fill="none" stroke="#2f6f41" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />
         ${{humanPoints ? `<polyline points="${{humanPoints}}" fill="none" stroke="#8a6f2a" stroke-width="2.5" stroke-dasharray="2 4" stroke-linejoin="round" stroke-linecap="round" />` : ''}}
+        ${{judgePoints ? `<polyline points="${{judgePoints}}" fill="none" stroke="#315f9b" stroke-width="2.5" stroke-dasharray="6 3" stroke-linejoin="round" stroke-linecap="round" />` : ''}}
         ${{machineCircles}}
         ${{humanCircles}}
+        ${{judgeCircles}}
         <text x="${{pad.left}}" y="${{height - 8}}" fill="#687076" font-size="11">${{escapeHtml(rows[0].date || '')}}</text>
         <text x="${{width - pad.right}}" y="${{height - 8}}" fill="#687076" font-size="11" text-anchor="end">${{escapeHtml(rows[rows.length - 1].date || '')}}</text>
         <text x="${{width - 210}}" y="18" fill="#2f6f41" font-size="12">machine avg</text>
         ${{humanPoints ? `<text x="${{width - 105}}" y="18" fill="#8a6f2a" font-size="12">human avg</text>` : ''}}
+        ${{judgePoints ? `<text x="${{width - 15}}" y="18" fill="#315f9b" font-size="12" text-anchor="end">Orchestrator Review</text>` : ''}}
       </svg>
-      ${{humanPoints ? '' : '<div class="subtle">No saved human-review average trend yet for this selection.</div>'}}`;
+      <div class="score-legend" aria-label="Average score color legend">
+        <span class="score-legend-item"><span class="score-swatch" style="background:#2f6f41"></span>Machine average</span>
+        <span class="score-legend-item"><span class="score-swatch" style="background:#8a6f2a"></span>Human average</span>
+        <span class="score-legend-item"><span class="score-swatch" style="background:#315f9b"></span>Orchestrator Review average</span>
+      </div>
+      ${{humanPoints || judgePoints ? '' : '<div class="subtle">No saved human or Orchestrator Review average trend yet for this selection.</div>'}}`;
       table.innerHTML = `<table class="analysis-table">
-        <thead><tr><th>Date</th><th>Machine avg</th><th>Machine prompts</th><th>Human avg</th><th>Human reviews</th></tr></thead>
+        <thead><tr><th>Date</th><th>Machine avg</th><th>Machine prompts</th><th>Human avg</th><th>Human reviews</th><th>Orchestrator Review avg</th><th>Orchestrator Review forms</th></tr></thead>
         <tbody>${{rows.map(row => `<tr>
           <td class="mono">${{escapeHtml(row.date || '')}}</td>
           <td class="mono">${{scoreValue(row.machine_average)}}</td>
           <td class="mono">${{row.machine_count || '<span class="db-empty">tbd</span>'}}</td>
           <td class="mono">${{scoreValue(row.human_average)}}</td>
           <td class="mono">${{row.human_count || '<span class="db-empty">tbd</span>'}}</td>
+          <td class="mono">${{scoreValue(row.orchestrator_judge_average)}}</td>
+          <td class="mono">${{row.orchestrator_judge_count || '<span class="db-empty">tbd</span>'}}</td>
         </tr>`).join('')}}</tbody>
       </table>`;
     }}
@@ -5694,10 +7316,13 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       const runs = item.runs || [];
       const humanTrend = (data.analysis?.human_case_trends || []).find(row => row.case_id === selected);
       const humanDays = humanTrend?.days || [];
+      const judgeTrend = (data.analysis?.orchestrator_judge_case_trends || []).find(row => row.case_id === selected);
+      const judgeDays = judgeTrend?.days || [];
       const dateKey = value => String(value || '').slice(0, 10);
       const allDays = [...new Set([
         ...runs.map(row => dateKey(row.created_at)),
         ...humanDays.map(row => dateKey(row.date)),
+        ...judgeDays.map(row => dateKey(row.date)),
       ].filter(Boolean))].sort();
       const dayIndex = new Map(allDays.map((day, index) => [day, index]));
       const width = 760;
@@ -5719,6 +7344,14 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         height,
         pad,
       );
+      const judgePoints = indexedLinePoints(
+        judgeDays,
+        row => dayIndex.get(dateKey(row.date)) ?? 0,
+        row => row.average_score === null || row.average_score === undefined ? null : Number(row.average_score) / 5 * 100,
+        width,
+        height,
+        pad,
+      );
       const xForDay = day => {{
         const maxIndex = Math.max(1, allDays.length - 1);
         return pad.left + ((dayIndex.get(day) ?? 0) / maxIndex) * (width - pad.left - pad.right);
@@ -5734,7 +7367,12 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         const y = pad.top + (1 - Number(row.average_score || 0) / 5) * (height - pad.top - pad.bottom);
         return `<circle cx="${{x.toFixed(1)}}" cy="${{y.toFixed(1)}}" r="4" fill="#8a6f2a"><title>human avg ${{scoreOutOfFive(row.average_score)}} · ${{row.count || 1}} review${{Number(row.count || 1) === 1 ? '' : 's'}}</title></circle>`;
       }}).join('');
-      chart.innerHTML = `<svg viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Single prompt score over time">
+      const judgeCircles = judgeDays.map(row => {{
+        const x = xForDay(dateKey(row.date));
+        const y = pad.top + (1 - Number(row.average_score || 0) / 5) * (height - pad.top - pad.bottom);
+        return `<circle cx="${{x.toFixed(1)}}" cy="${{y.toFixed(1)}}" r="4" fill="#315f9b"><title>Orchestrator Review avg ${{scoreOutOfFive(row.average_score)}} · ${{row.count || 1}} form${{Number(row.count || 1) === 1 ? '' : 's'}}</title></circle>`;
+      }}).join('');
+      chart.innerHTML = `<svg viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Single prompt score across time">
         <line x1="${{pad.left}}" y1="${{pad.top}}" x2="${{pad.left}}" y2="${{height - pad.bottom}}" stroke="#d9dee3" />
         <line x1="${{pad.left}}" y1="${{height - pad.bottom}}" x2="${{width - pad.right}}" y2="${{height - pad.bottom}}" stroke="#d9dee3" />
         ${{[0, 2.5, 5].map(value => {{
@@ -5743,23 +7381,34 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         }}).join('')}}
         <polyline points="${{machinePoints}}" fill="none" stroke="#2f6f41" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />
         ${{humanPoints ? `<polyline points="${{humanPoints}}" fill="none" stroke="#8a6f2a" stroke-width="2.5" stroke-dasharray="4 4" stroke-linejoin="round" stroke-linecap="round" />` : ''}}
+        ${{judgePoints ? `<polyline points="${{judgePoints}}" fill="none" stroke="#315f9b" stroke-width="2.5" stroke-dasharray="6 3" stroke-linejoin="round" stroke-linecap="round" />` : ''}}
         ${{circles}}
         ${{humanCircles}}
+        ${{judgeCircles}}
         <text x="${{pad.left}}" y="${{height - 8}}" fill="#687076" font-size="11">${{escapeHtml(allDays[0] || runs[0].created_at || '')}}</text>
         <text x="${{width - pad.right}}" y="${{height - 8}}" fill="#687076" font-size="11" text-anchor="end">${{escapeHtml(allDays[allDays.length - 1] || runs[runs.length - 1].created_at || '')}}</text>
         <text x="${{width - 210}}" y="18" fill="#2f6f41" font-size="12">machine avg</text>
         ${{humanPoints ? `<text x="${{width - 105}}" y="18" fill="#8a6f2a" font-size="12">human avg</text>` : ''}}
+        ${{judgePoints ? `<text x="${{width - 15}}" y="18" fill="#315f9b" font-size="12" text-anchor="end">Orchestrator Review</text>` : ''}}
       </svg>
-      ${{humanPoints ? '' : '<div class="subtle">No saved human-review trend for this prompt yet.</div>'}}`;
+      <div class="score-legend" aria-label="Single prompt score color legend">
+        <span class="score-legend-item"><span class="score-swatch" style="background:#2f6f41"></span>Machine score</span>
+        <span class="score-legend-item"><span class="score-swatch" style="background:#8a6f2a"></span>Human average</span>
+        <span class="score-legend-item"><span class="score-swatch" style="background:#315f9b"></span>Orchestrator Review average</span>
+      </div>
+      ${{humanPoints || judgePoints ? '' : '<div class="subtle">No saved human or Orchestrator Review trend for this prompt yet.</div>'}}`;
       const machineByDay = new Map(runs.map(row => [dateKey(row.created_at), row]));
       const humanByDay = new Map(humanDays.map(row => [dateKey(row.date), row]));
+      const judgeByDay = new Map(judgeDays.map(row => [dateKey(row.date), row]));
       table.innerHTML = `<table class="analysis-table">
-        <thead><tr><th>Run date</th><th>Eval run instance</th><th>Machine runs</th><th>Machine check</th><th>Machine avg</th><th>Review target</th><th>Human reviews</th><th>Human avg</th></tr></thead>
+        <thead><tr><th>Run date</th><th>Eval run instance</th><th>Machine runs</th><th>Machine check</th><th>Machine avg</th><th>Review target</th><th>Human reviews</th><th>Human avg</th><th>Orchestrator Reviews</th><th>Orchestrator avg</th></tr></thead>
         <tbody>${{allDays.map(day => {{
           const machine = machineByDay.get(day) || {{}};
           const human = humanByDay.get(day) || {{}};
+          const judge = judgeByDay.get(day) || {{}};
           const reviewTargets = Array.isArray(human.reviews) ? human.reviews : [];
-          const reviewTarget = reviewTargets[0] || {{}};
+          const judgeTargets = Array.isArray(judge.reviews) ? judge.reviews : [];
+          const reviewTarget = reviewTargets[0] || judgeTargets[0] || {{}};
           const reviewTargetId = reviewTarget.run_id || reviewTarget.slack_thread_ts || reviewTarget.review_id || '';
           const reviewTargetLabel = reviewTarget.target_type
             ? `${{reviewTarget.target_type}}${{reviewTargetId ? ` · ${{reviewTargetId}}` : ''}}`
@@ -5773,6 +7422,8 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           <td class="mono">${{reviewTargetLabel ? escapeHtml(reviewTargetLabel) : '<span class="db-empty">tbd</span>'}}</td>
           <td class="mono">${{human.count || '<span class="db-empty">tbd</span>'}}</td>
           <td class="mono">${{scoreValue(human.average_score)}}</td>
+          <td class="mono">${{judge.count || '<span class="db-empty">tbd</span>'}}</td>
+          <td class="mono">${{scoreValue(judge.average_score)}}</td>
         </tr>`;
         }}).join('')}}</tbody>
       </table>`;
@@ -5983,11 +7634,11 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             ? 'Review before enabling broad eval runs.'
             : 'Prompts, responses, tool I/O, Slack text, secrets, and PHI stay out.';
           const cards = [
-            ['Trace join health', runSummaryCount ? `${{joinedRunSummaryCount}}/${{runSummaryCount}} joined` : 'no summaries', `${{joinPct}} join rate; ${{unjoinedRunSummaryCount}} unjoined`],
-            ['Manual/API split', `${{Number(trace.manual_run_summary_count || 0)}} manual / ${{Number(trace.sdk_run_summary_count || 0)}} SDK`, 'no-API backfill now; API summaries later'],
-            ['Diagnostic load', `${{diagnosticRows.length}} categories`, `${{diagnosticHits}} category hits across summaries`],
-            ['Top diagnostic category', topDiagnostic.label || topDiagnostic.key || 'none yet', topDiagnostic.count ? `${{Number(topDiagnostic.count)}} events` : 'no chartable diagnostic category yet'],
-            ['Trace privacy', privacyValue, privacyHint],
+            ['Join health', runSummaryCount ? `${{joinedRunSummaryCount}}/${{runSummaryCount}} joined` : 'no summaries', `${{joinPct}} join rate; ${{unjoinedRunSummaryCount}} unjoined`],
+            ['Run source split', `${{Number(trace.manual_run_summary_count || 0)}} manual / ${{Number(trace.sdk_run_summary_count || 0)}} SDK`, 'no-API backfill now; API summaries later'],
+            ['Diagnostic signals', `${{diagnosticRows.length}} categories`, `${{diagnosticHits}} category hits across summaries`],
+            ['Top cleanup signal', topDiagnostic.label || topDiagnostic.key || 'none yet', topDiagnostic.count ? `${{Number(topDiagnostic.count)}} events` : 'no chartable diagnostic category yet'],
+            ['Privacy guardrail', privacyValue, privacyHint],
           ];
           target.innerHTML = cards.map(([label, value, hint]) => `
             <div class="analysis-card">
@@ -6025,11 +7676,233 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             </div>`;
           }}).join('');
         }}
+        function traceStepLabel(event) {{
+          const type = String(event.event_type || '').toLowerCase();
+          const name = String(event.name || '');
+          const labels = {{
+            manual_run_summary: 'Manual run summary',
+            slack_run_saved: 'Slack run saved',
+            orchestrator_judge_review_saved: 'Orchestrator Review',
+            human_review_saved: 'Human scorecard',
+            sdk_run_summary: 'SDK run summary',
+            span_end: 'Span completed',
+            trace_end: 'Trace completed',
+          }};
+          if (labels[type]) return labels[type];
+          if (type.includes('review')) return 'Review saved';
+          if (type.includes('slack')) return 'Slack event';
+          if (type.includes('summary')) return 'Run summary';
+          return name || event.event_type || 'Trace event';
+        }}
+        function traceEventRoute(event) {{
+          const metadata = event.metadata || {{}};
+          const correlation = metadata.correlation || {{}};
+          return String(
+            event.agent ||
+            metadata.agent ||
+            correlation.agent ||
+            event.route ||
+            metadata.route ||
+            correlation.route ||
+            ''
+          );
+        }}
+        function traceEventSignal(event) {{
+          const agentic = event.agentic_summary || {{}};
+          if (agentic.signal) return String(agentic.signal);
+          const metadata = event.metadata || {{}};
+          const tooling = metadata.tooling || {{}};
+          const retrieval = metadata.retrieval || metadata.retrieval_provider_summary || {{}};
+          const model = metadata.model || {{}};
+          const orchestrator = metadata.orchestrator || {{}};
+          if (Number(tooling.failed_tool_call_count || 0) > 0) return `${{Number(tooling.failed_tool_call_count || 0)}} failed tools`;
+          if (Number(tooling.tool_call_count || metadata.tool_call_count || 0) > 0) return `${{Number(tooling.tool_call_count || metadata.tool_call_count || 0)}} tool calls`;
+          if (Number(retrieval.visible_source_count || retrieval.source_count || 0) > 0) return `${{Number(retrieval.visible_source_count || retrieval.source_count || 0)}} sources`;
+          if (orchestrator.selected_route) return `route ${{orchestrator.selected_route}}`;
+          if (model.provider || model.name || metadata.model_provider || metadata.model_name) return 'model configured';
+          const categories = event.categories || metadata.categories || metadata.diagnostic_categories || metadata.diagnostic_summary?.categories || [];
+          if (Array.isArray(categories) && categories.length) {{
+            return categories.map(category => typeof category === 'string' ? category : (category.label || category.key || 'diagnostic')).slice(0, 2).join(', ');
+          }}
+          const type = String(event.event_type || '').toLowerCase();
+          if (type.includes('review')) return 'scorecard';
+          if (type.includes('slack')) return 'run saved';
+          if (type.includes('summary')) return 'run summary';
+          return metadata.diagnostic_contract ? 'diagnostic contract' : 'metadata only';
+        }}
+        function traceEventDetail(event) {{
+          const duration = event.duration_ms === null || event.duration_ms === undefined ? '' : `${{event.duration_ms}} ms`;
+          const metadata = event.metadata || {{}};
+          const facts = traceAgenticFacts(event);
+          const signal = [facts.tools, facts.retrieval, facts.model].filter(value => value && !value.endsWith('pending')).slice(0, 2).join(' · ');
+          return [event.name, duration, signal].filter(Boolean).join(' · ') || 'sanitized trace metadata';
+        }}
+        function traceAgenticFacts(event) {{
+          const agentic = event.agentic_summary || {{}};
+          if (agentic.signal || agentic.tools || agentic.retrieval || agentic.model || agentic.route) {{
+            return {{
+              route: agentic.route || 'route tbd',
+              tools: agentic.tools || 'tool metadata pending',
+              retrieval: agentic.retrieval || 'retrieval metadata pending',
+              model: agentic.model || 'model metadata pending',
+            }};
+          }}
+          const metadata = event.metadata || {{}};
+          const tooling = metadata.tooling || {{}};
+          const retrieval = metadata.retrieval || metadata.retrieval_provider_summary || {{}};
+          const model = metadata.model || {{}};
+          const orchestrator = metadata.orchestrator || {{}};
+          const toolCount = Number(tooling.tool_call_count || metadata.tool_call_count || 0);
+          const failedToolCount = Number(tooling.failed_tool_call_count || 0);
+          const toolNames = Array.isArray(tooling.tool_names) ? tooling.tool_names.filter(Boolean).slice(0, 3) : [];
+          const sourceCount = Number(retrieval.visible_source_count || retrieval.source_count || 0);
+          const provider = retrieval.search_provider || retrieval.provider_summary || '';
+          const route = orchestrator.selected_route || metadata.route || metadata.agent || metadata.agent_name || '';
+          const modelText = [model.provider || metadata.model_provider, model.name || metadata.model_name].filter(Boolean).join(' ');
+          return {{
+            route: route || 'route tbd',
+            tools: toolCount
+              ? `${{toolCount}} tool call${{toolCount === 1 ? '' : 's'}}${{failedToolCount ? ` · ${{failedToolCount}} failed` : ''}}${{toolNames.length ? ` · ${{toolNames.join(', ')}}` : ''}}`
+              : failedToolCount
+                ? `${{failedToolCount}} failed tool call${{failedToolCount === 1 ? '' : 's'}}`
+                : 'tool metadata pending',
+            retrieval: sourceCount
+              ? `${{sourceCount}} source${{sourceCount === 1 ? '' : 's'}}${{provider ? ` · ${{provider}}` : ''}}`
+              : provider
+                ? `provider ${{provider}}`
+                : 'retrieval metadata pending',
+            model: modelText || 'model metadata pending',
+          }};
+        }}
+        function traceSameRun(event, latestTrace) {{
+          if (!latestTrace || !latestTrace.trace_id) return false;
+          const metadata = event.metadata || {{}};
+          const correlation = metadata.correlation || {{}};
+          const keys = [
+            event.trace_id,
+            event.span_id,
+            event.group_id,
+            metadata.case_id,
+            metadata.run_id,
+            correlation.case_id,
+            correlation.run_id,
+          ].map(value => String(value || '')).filter(Boolean);
+          const latestKeys = [
+            latestTrace.trace_id,
+            latestTrace.span_id,
+            latestTrace.case_id,
+            latestTrace.run_id,
+          ].map(value => String(value || '')).filter(Boolean);
+          return keys.some(key => latestKeys.includes(key));
+        }}
+        function traceTimelineMarkup(entries, options = {{}}) {{
+          const includeCopy = options.includeCopy === true;
+          const openable = options.openable === true;
+          const selectedIndex = options.selectedIndex === undefined ? null : Number(options.selectedIndex);
+          const rows = entries.map(entry => {{
+            const event = entry.event || entry;
+            const index = entry.index;
+            const joinKey = traceJoinKey(event) || event.trace_id || event.span_id || '';
+            const route = traceEventRoute(event) || 'route tbd';
+            const signal = traceEventSignal(event);
+            const openAttrs = openable
+              ? ` data-trace-open="${{index}}" role="button" tabindex="0" aria-label="Open full trace for ${{escapeHtml(traceStepLabel(event))}}"`
+              : '';
+            const selectedClass = openable && selectedIndex === Number(index) ? ' selected' : '';
+            return `<div class="trace-timeline-row${{selectedClass}}"${{openAttrs}}>
+              <div>
+                <div class="mono">${{escapeHtml(formatDateTime(event.created_at) || event.created_at || 'time tbd')}}</div>
+                <div class="trace-step-detail">${{escapeHtml(event.event_type || '')}}</div>
+              </div>
+              <div>
+                <div class="trace-step-name">${{escapeHtml(traceStepLabel(event))}}</div>
+                <div class="trace-step-detail">${{escapeHtml(traceEventDetail(event))}}</div>
+              </div>
+              <div>
+                <div class="mono">${{dbMetric(joinKey)}}</div>
+                <div class="trace-step-detail">case/run/work item join</div>
+              </div>
+              <div>
+                <div class="mono">${{escapeHtml(route)}}</div>
+                <div class="trace-step-detail">agent or route</div>
+              </div>
+              <div>
+                <span class="trace-signal">${{escapeHtml(signal)}}</span>
+                ${{includeCopy ? `<div class="trace-row-actions">
+                  <button class="ledger-copy" type="button" data-trace-detail-index="${{index}}" aria-label="Show full sanitized trace details">Details</button>
+                  <button class="ledger-copy" type="button" data-trace-index="${{index}}" data-copy-trace-event="${{escapeHtml(event.row_id || event.span_id || event.trace_id || index)}}" aria-label="Copy this trace event for Codex review">Copy</button>
+                </div>` : ''}}
+              </div>
+            </div>`;
+          }}).join('');
+          return `<div class="trace-timeline">
+            <div class="trace-timeline-row trace-timeline-head">
+              <div>Time</div>
+              <div>Step</div>
+              <div>Join key</div>
+              <div>Route</div>
+              <div>Signal</div>
+            </div>
+            ${{rows}}
+          </div>`;
+        }}
         function renderTraceSummary() {{
           const trace = data.trace_summary || {{}};
           const envRows = Object.entries(trace.recommended_env || {{}});
+          const latestTrace = trace.latest_run_trace || {{}};
+          const events = trace.recent_events || [];
+          const indexedEvents = events.map((event, index) => ({{ event, index }}));
+          const currentRunRows = indexedEvents.filter(entry => traceSameRun(entry.event, latestTrace)).slice(0, 6);
+          const latestEvent = currentRunRows[0]?.event || events[0] || {{}};
+          const latestFacts = traceAgenticFacts(latestEvent);
           renderTraceAnalytics(trace);
           renderTraceDatabaseFreshness();
+      document.getElementById('trace-reader-guide').innerHTML = [
+        ['Standard trace', 'ordered run steps with event type, time, route, and duration when available'],
+        ['Keystone joins', 'case id, Slack run id, WorkItem id, review score, and dashboard/review links'],
+        ['Privacy boundary', 'sanitized metadata only; no raw prompts, responses, Slack text, secrets, or PHI'],
+      ].map(([label, hint]) => `
+        <div class="trace-guide-item">
+          <strong>${{escapeHtml(label)}}</strong>
+          <span>${{escapeHtml(hint)}}</span>
+        </div>
+      `).join('');
+      if (latestTrace.trace_id) {{
+        const latestCategories = Array.isArray(latestTrace.categories) && latestTrace.categories.length
+          ? latestTrace.categories.join(', ')
+          : 'no event categories';
+        const readiness = latestTrace.field_readiness || latestEvent.field_readiness || {{}};
+        const readinessLabel = readiness.attention_count
+          ? `${{readiness.attention_count}} fields need attention`
+          : 'core fields populated';
+        const readinessHint = readiness.summary || '';
+        document.getElementById('trace-latest-run').innerHTML = `<div class="trace-run-card">
+          <div class="trace-run-top">
+            <div>
+              <div class="trace-run-title">${{escapeHtml(latestTrace.case_id || latestTrace.run_id || latestTrace.trace_id || 'Latest trace event')}}</div>
+              <div class="trace-run-subtitle">${{escapeHtml(formatDateTime(latestTrace.created_at) || latestTrace.created_at || 'time tbd')}} · ${{escapeHtml(latestTrace.agent || latestTrace.route || 'agent tbd')}}</div>
+            </div>
+            <span class="trace-signal">${{escapeHtml(latestCategories)}}</span>
+          </div>
+          <div class="trace-run-meta">
+            <div class="trace-run-meta-item"><div class="label">Run id</div><div class="value mono">${{dbMetric(latestTrace.run_id || 'run tbd')}}</div></div>
+            <div class="trace-run-meta-item"><div class="label">Route</div><div class="value mono">${{escapeHtml(latestFacts.route || latestTrace.agent || latestTrace.route || 'route tbd')}}</div></div>
+            <div class="trace-run-meta-item"><div class="label">Tools</div><div class="value">${{escapeHtml(latestFacts.tools)}}</div></div>
+            <div class="trace-run-meta-item"><div class="label">Retrieval</div><div class="value">${{escapeHtml(latestFacts.retrieval)}}</div></div>
+            <div class="trace-run-meta-item"><div class="label">Model</div><div class="value">${{escapeHtml(latestFacts.model)}}</div></div>
+            <div class="trace-run-meta-item"><div class="label">Field readiness</div><div class="value">${{escapeHtml(readinessLabel)}}</div><div class="subtle">${{escapeHtml(readinessHint)}}</div></div>
+            <div class="trace-run-meta-item"><div class="label">Joined case</div><div class="value">${{latestTrace.case_id ? `<a href="/dashboard?case=${{encodeURIComponent(latestTrace.case_id)}}">Open case</a>` : 'case tbd'}}</div></div>
+          </div>
+        </div>`;
+      }} else {{
+        document.getElementById('trace-latest-run').innerHTML = '<div class="subtle">No trace events are saved yet for the latest run.</div>';
+      }}
+      const timelineTarget = document.getElementById('trace-current-timeline');
+      if (timelineTarget) {{
+        timelineTarget.innerHTML = currentRunRows.length
+          ? traceTimelineMarkup(currentRunRows)
+          : '<div class="subtle">No multi-step timeline is available for this run yet. The saved trace still links by case/run id above.</div>';
+      }}
       document.getElementById('trace-summary').innerHTML = [
         ['Processor mode', trace.mode || 'disabled', trace.enabled ? 'Ready to persist safe trace summaries' : 'Set KEYSTONE_TRACE_PROCESSOR=eval_summary before future API evals'],
         ['Saved events', String(trace.event_count || 0), `local DB: ${{trace.database_path || data.database_path || ''}}`],
@@ -6114,7 +7987,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
               <col style="width: 18%">
               <col style="width: 36%">
             </colgroup>
-            <thead><tr><th>Latest</th><th>Join key</th><th>Events</th><th>Agent</th><th>Categories</th></tr></thead>
+            <thead><tr><th>Latest event</th><th>Join key / case</th><th>Events</th><th>Agent</th><th>Diagnostic categories</th></tr></thead>
             <tbody>${{followups.slice(0, 12).map(row => `<tr>
                   <td>${{escapeHtml(formatDateTime(row.latest_created_at || row.created_at) || row.latest_created_at || row.created_at || '')}}</td>
                   <td class="mono">${{dbMetric(row.join_key || row.group_id || row.trace_id || '')}}</td>
@@ -6125,38 +7998,30 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
               </table>
         </div>`;
       }}
-      const events = trace.recent_events || [];
       if (!events.length) {{
         document.getElementById('trace-events').innerHTML = '<div class="subtle">No local trace events are saved yet. That is expected before future API eval runs or dry local trace processor tests.</div>';
+        document.getElementById('trace-event-detail').innerHTML = '';
         return;
       }}
-          document.getElementById('trace-events').innerHTML = `<div class="trace-table-wrap">
-          <table class="analysis-table trace-table trace-events-table">
-            <colgroup>
-              <col style="width: 12%">
-              <col style="width: 12%">
-              <col style="width: 14%">
-              <col style="width: 14%">
-              <col style="width: 10%">
-              <col style="width: 8%">
-              <col style="width: 22%">
-              <col style="width: 8%">
-            </colgroup>
-            <thead><tr><th>Time</th><th>Event</th><th>Name</th><th>Trace</th><th>Span</th><th>Duration</th><th>Metadata preview</th><th>Copy</th></tr></thead>
-            <tbody>${{events.map((event, index) => `<tr>
-              <td>${{escapeHtml(formatDateTime(event.created_at) || event.created_at || '')}}</td>
-              <td>${{escapeHtml(event.event_type || '')}}</td>
-              <td>${{escapeHtml(event.name || '')}}</td>
-              <td class="mono">${{dbMetric(event.trace_id)}}</td>
-              <td class="mono">${{dbMetric(event.span_id)}}</td>
-              <td class="mono">${{event.duration_ms === null || event.duration_ms === undefined ? '<span class="db-empty">tbd</span>' : escapeHtml(String(event.duration_ms)) + ' ms'}}</td>
-              <td class="mono" title="${{escapeHtml(traceMetadataPreview(event, 220))}}">${{escapeHtml(traceMetadataPreview(event))}}</td>
-              <td><button class="ledger-copy" type="button" data-trace-index="${{index}}" data-copy-trace-event="${{escapeHtml(event.row_id || event.span_id || event.trace_id || index)}}" aria-label="Copy this trace event for Codex review">Copy</button></td>
-            </tr>`).join('')}}</tbody>
-          </table>
-          </div>`;
-          for (const button of document.getElementById('trace-events').querySelectorAll('[data-trace-index]')) {{
+          document.getElementById('trace-events').innerHTML = traceTimelineMarkup(indexedEvents.slice(0, 20), {{ includeCopy: true, openable: true }});
+          const traceEventsTarget = document.getElementById('trace-events');
+          for (const row of traceEventsTarget.querySelectorAll('[data-trace-open]')) {{
+            row.addEventListener('click', event => {{
+              if (event.target.closest('button')) return;
+              showTraceEventDetail(Number(row.getAttribute('data-trace-open') || -1));
+            }});
+            row.addEventListener('keydown', event => {{
+              if (event.key === 'Enter' || event.key === ' ') {{
+                event.preventDefault();
+                showTraceEventDetail(Number(row.getAttribute('data-trace-open') || -1));
+              }}
+            }});
+          }}
+          for (const button of traceEventsTarget.querySelectorAll('[data-trace-index]')) {{
             button.addEventListener('click', () => copyTraceReview(button));
+          }}
+          for (const button of traceEventsTarget.querySelectorAll('[data-trace-detail-index]')) {{
+            button.addEventListener('click', () => showTraceEventDetail(Number(button.getAttribute('data-trace-detail-index') || -1)));
           }}
         }}
         function traceJoinKey(event) {{
@@ -6178,22 +8043,44 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           if (!text || text === '{{}}') return 'no metadata';
           return text.length > limit ? `${{text.slice(0, limit)}}...` : text;
         }}
-        function traceReviewText(event) {{
-          const metadataText = JSON.stringify(event.metadata || {{}});
-          const metadata = event.metadata || {{}};
+        function traceJoinedCase(event) {{
           const joinKey = traceJoinKey(event);
-          const joinedCase = {{
+          return {{
             join_key: joinKey,
             dashboard_url: joinKey ? `/dashboard?case=${{encodeURIComponent(joinKey)}}` : '',
             review_url: joinKey ? `/review?case=${{encodeURIComponent(joinKey)}}` : '',
             case_bundle_url: joinKey ? `/api/eval-case-bundle?case=${{encodeURIComponent(joinKey)}}` : '',
           }};
-          const metadataLimit = 1200;
-          const payload = {{
-            schema: 'keystone.eval.trace_event_review.v1',
-            review_scope: 'single sanitized trace event',
-            cost_guardrail: 'No API or Slack call from dashboard copy',
-            copy_policy: 'Metadata is sanitized and capped for clipboard review; inspect local DB only if deeper trace detail is needed.',
+        }}
+        function traceFieldReadinessMarkup(readiness) {{
+          const checks = Array.isArray(readiness?.checks) ? readiness.checks : [];
+          if (!checks.length) {{
+            return '<div class="subtle">Field readiness is not available for this trace event.</div>';
+          }}
+          return `<div class="trace-readiness-list">
+            ${{checks.map(check => `<div class="trace-readiness-item">
+              <div>
+                <span class="trace-signal">${{escapeHtml(check.status || 'pending')}}</span>
+                <div class="trace-step-name">${{escapeHtml(check.label || check.key || '')}}</div>
+              </div>
+              <div class="subtle">${{escapeHtml(check.detail || '')}}</div>
+            </div>`).join('')}}
+          </div>`;
+        }}
+        function traceFullPacket(event) {{
+          const metadataText = JSON.stringify(event.metadata || {{}});
+          const metadata = event.metadata || {{}};
+          const correlation = metadata.correlation || {{}};
+          const execution = metadata.execution || {{}};
+          const slackContext = metadata.slack_context || {{}};
+          const durationMs = event.duration_ms ?? execution.duration_ms ?? execution.time_to_response_ms ?? null;
+          const joinedCase = traceJoinedCase(event);
+          const metadataLimit = 4000;
+          return {{
+            schema: 'keystone.eval.trace_event_detail.v1',
+            review_scope: 'single sanitized trace event detail',
+            cost_guardrail: 'No API or Slack call from dashboard trace inspection',
+            privacy_policy: 'Dashboard trace detail includes sanitized metadata only; raw prompts, responses, Slack text, tool I/O, secrets, and PHI are omitted.',
             timestamp: String(event.created_at || ''),
             display_time: formatDateTime(event.created_at) || String(event.created_at || ''),
             event_type: String(event.event_type || ''),
@@ -6202,13 +8089,129 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             span_id: String(event.span_id || ''),
             parent_id: String(event.parent_id || ''),
             group_id: String(event.group_id || ''),
-            join_key: joinKey,
+            join_key: joinedCase.join_key,
             joined_case: joinedCase,
-            duration_ms: event.duration_ms ?? null,
+            slack_channel: {{
+              id: String(event.slack_channel_id || metadata.slack_channel_id || correlation.slack_channel_id || slackContext.channel_id || ''),
+              name: String(event.slack_channel_name || metadata.slack_channel_name || correlation.slack_channel_name || slackContext.channel_name || ''),
+              thread_ts: String(event.slack_thread_ts || metadata.slack_thread_ts || correlation.slack_thread_ts || slackContext.thread_ts || ''),
+            }},
+            route: traceEventRoute(event),
+            signal: traceEventSignal(event),
+            duration_ms: durationMs,
+            time_to_response_ms: durationMs,
+            field_readiness: event.field_readiness || null,
+            agentic_summary: event.agentic_summary || null,
             diagnostic_summary: metadata.diagnostic_summary || null,
             diagnostic_contract: metadata.diagnostic_contract || null,
             metadata_excerpt: metadataText.slice(0, metadataLimit),
             metadata_truncated: metadataText.length > metadataLimit,
+          }};
+        }}
+        function showTraceEventDetail(index) {{
+          const events = ((data.trace_summary || {{}}).recent_events || []);
+          const event = events[index];
+          const target = document.getElementById('trace-event-detail');
+          if (!event || !target) return;
+          const metadata = event.metadata || {{}};
+          const correlation = metadata.correlation || {{}};
+          const execution = metadata.execution || {{}};
+          const durationMs = event.duration_ms ?? execution.duration_ms ?? execution.time_to_response_ms ?? null;
+          const slackContext = metadata.slack_context || {{}};
+          const slackChannel = event.slack_channel_name || metadata.slack_channel_name || correlation.slack_channel_name || slackContext.channel_name || event.slack_channel_id || metadata.slack_channel_id || correlation.slack_channel_id || slackContext.channel_id || '';
+          const joinedCase = traceJoinedCase(event);
+          const readiness = event.field_readiness || {{}};
+          const packet = traceFullPacket(event);
+          const selectedRun = {{
+            trace_id: event.trace_id,
+            span_id: event.span_id,
+            case_id: joinedCase.join_key,
+            run_id: metadata.run_id || correlation.run_id || event.group_id || '',
+          }};
+          const sameRunRows = events
+            .map((candidate, candidateIndex) => ({{ event: candidate, index: candidateIndex }}))
+            .filter(entry => traceSameRun(entry.event, selectedRun))
+            .slice(0, 8);
+          document.getElementById('trace-events').innerHTML = traceTimelineMarkup(
+            events.map((candidate, candidateIndex) => ({{ event: candidate, index: candidateIndex }})).slice(0, 20),
+            {{ includeCopy: true, openable: true, selectedIndex: index }}
+          );
+          const traceEventsTarget = document.getElementById('trace-events');
+          for (const row of traceEventsTarget.querySelectorAll('[data-trace-open]')) {{
+            row.addEventListener('click', clickEvent => {{
+              if (clickEvent.target.closest('button')) return;
+              showTraceEventDetail(Number(row.getAttribute('data-trace-open') || -1));
+            }});
+            row.addEventListener('keydown', keyEvent => {{
+              if (keyEvent.key === 'Enter' || keyEvent.key === ' ') {{
+                keyEvent.preventDefault();
+                showTraceEventDetail(Number(row.getAttribute('data-trace-open') || -1));
+              }}
+            }});
+          }}
+          for (const button of traceEventsTarget.querySelectorAll('[data-trace-index]')) {{
+            button.addEventListener('click', () => copyTraceReview(button));
+          }}
+          for (const button of traceEventsTarget.querySelectorAll('[data-trace-detail-index]')) {{
+            button.addEventListener('click', () => showTraceEventDetail(Number(button.getAttribute('data-trace-detail-index') || -1)));
+          }}
+          target.innerHTML = `<div class="trace-detail-panel">
+            <div class="trace-detail-head">
+              <div>
+                <div class="trace-detail-title">${{escapeHtml(traceStepLabel(event))}}</div>
+                <div class="trace-run-subtitle">${{escapeHtml(formatDateTime(event.created_at) || event.created_at || 'time tbd')}} · ${{escapeHtml(traceEventRoute(event) || 'route tbd')}}</div>
+              </div>
+              <span class="trace-signal">${{escapeHtml(traceEventSignal(event))}}</span>
+            </div>
+            <div class="trace-detail-grid">
+              <div class="trace-detail-cell"><div class="label">Join key</div><div class="value mono">${{dbMetric(joinedCase.join_key || 'join tbd')}}</div></div>
+              <div class="trace-detail-cell"><div class="label">Trace</div><div class="value mono">${{dbMetric(event.trace_id || 'trace tbd')}}</div></div>
+              <div class="trace-detail-cell"><div class="label">Span</div><div class="value mono">${{dbMetric(event.span_id || 'span tbd')}}</div></div>
+              <div class="trace-detail-cell"><div class="label">Time to response</div><div class="value">${{durationMs === null || durationMs === undefined ? 'tbd' : `${{Number(durationMs).toFixed(0)}} ms`}}</div></div>
+              <div class="trace-detail-cell"><div class="label">Slack channel</div><div class="value mono">${{dbMetric(slackChannel || 'channel tbd')}}</div></div>
+              <div class="trace-detail-cell"><div class="label">Thread</div><div class="value mono">${{dbMetric(event.slack_thread_ts || metadata.slack_thread_ts || correlation.slack_thread_ts || slackContext.thread_ts || 'thread tbd')}}</div></div>
+            </div>
+            <div class="analysis-handoff">
+              ${{joinedCase.dashboard_url ? `<a class="secondary-action" href="${{joinedCase.dashboard_url}}">Open Dashboard Case</a>` : ''}}
+              ${{joinedCase.review_url ? `<a class="secondary-action" href="${{joinedCase.review_url}}">Open Review</a>` : ''}}
+              ${{joinedCase.case_bundle_url ? `<a class="secondary-action" href="${{joinedCase.case_bundle_url}}">Open Case Bundle</a>` : ''}}
+            </div>
+            <div>
+              <div class="trace-step-name">Field readiness</div>
+              <div class="subtle">${{escapeHtml(readiness.summary || 'Trace readiness checks summarize which OpenAI-style and Keystone-specific fields are populated.')}}</div>
+              ${{traceFieldReadinessMarkup(readiness)}}
+            </div>
+            <div>
+              <div class="trace-step-name">Same-run timeline</div>
+              <div class="subtle">Events sharing case, run, WorkItem, trace, or span identifiers.</div>
+              ${{sameRunRows.length ? traceTimelineMarkup(sameRunRows) : '<div class="subtle">No same-run events were found for this trace event.</div>'}}
+            </div>
+            <div>
+              <div class="trace-step-name">Bounded sanitized trace packet</div>
+              <div class="subtle">Capped metadata for local inspection. Raw prompts, responses, Slack text, secrets, and PHI are not included; inspect the local DB row when deeper sanitized metadata is needed.</div>
+              <pre class="trace-json">${{escapeHtml(JSON.stringify(packet, null, 2))}}</pre>
+            </div>
+          </div>`;
+          target.scrollIntoView({{ block: 'nearest' }});
+        }}
+        function traceReviewText(event) {{
+          const metadataText = JSON.stringify(event.metadata || {{}});
+          const metadata = event.metadata || {{}};
+          const correlation = metadata.correlation || {{}};
+          const execution = metadata.execution || {{}};
+          const slackContext = metadata.slack_context || {{}};
+          const durationMs = event.duration_ms ?? execution.duration_ms ?? execution.time_to_response_ms ?? null;
+          const joinKey = traceJoinKey(event);
+          const fieldReadiness = event.field_readiness || {{}};
+          const missingFields = fieldReadiness.missing || [];
+          const diagnosticsComplete = metadata.diagnostic_contract && !Number(fieldReadiness.attention_count || 0);
+          const joinedCase = traceJoinedCase(event);
+          const metadataLimit = 1200;
+          const payload = {{
+            schema: 'keystone.eval.trace_event_review.v1',
+            review_scope: 'single sanitized trace event',
+            cost_guardrail: 'No API or Slack call from dashboard copy',
+            copy_policy: 'Metadata is sanitized and capped for clipboard review; inspect local DB only if deeper trace detail is needed.',
             review_checklist: [
               {{
                 label: 'join_key',
@@ -6222,9 +8225,11 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
               }},
               {{
                 label: 'run_diagnostics',
-                status: metadata.diagnostic_contract ? 'complete' : 'attention',
-                detail: metadata.diagnostic_contract
-                  ? 'Trace includes compact timing, model, tool, retrieval, approval, side-effect, and error/retry diagnostics.'
+                status: diagnosticsComplete ? 'complete' : 'attention',
+                detail: diagnosticsComplete
+                  ? 'Trace includes compact timing, model, tool, retrieval, approval, side-effect, prompt/config, cost/cache, and error/retry diagnostics.'
+                  : metadata.diagnostic_contract
+                  ? `Trace has the diagnostics contract but still needs populated fields: ${{missingFields.join(', ') || 'field readiness pending'}}.`
                   : 'Trace has join metadata but does not yet include the compact run diagnostics contract.',
               }},
               {{
@@ -6235,11 +8240,37 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
                       : event.event_type === 'manual_run_summary'
                       ? 'Manual no-API run summary verifies local join keys; future API evals still need sdk_run_summary events.'
                       : 'Future API evals should include a joined sdk_run_summary event for run-level diagnosis.',
-              }},
+                  }},
             ],
             next_follow_up: joinKey
-              ? 'Open joined_case links to compare this trace event with the case, ledger row, review row, case bundle, and dashboard data-quality gate.'
+              ? (missingFields.length
+                ? `Compare joined_case links, then populate missing trace fields: ${{missingFields.join(', ')}}.`
+                : 'Open joined_case links to compare this trace event with the case, ledger row, review row, case bundle, and dashboard data-quality gate.')
               : 'Add case_id, run_id, or work_item_id metadata before relying on this trace for API eval diagnosis.',
+            field_readiness: fieldReadiness,
+            missing_relevant_fields: missingFields,
+            agentic_summary: event.agentic_summary || null,
+            timestamp: String(event.created_at || ''),
+            display_time: formatDateTime(event.created_at) || String(event.created_at || ''),
+            event_type: String(event.event_type || ''),
+            name: String(event.name || ''),
+            trace_id: String(event.trace_id || ''),
+            span_id: String(event.span_id || ''),
+            parent_id: String(event.parent_id || ''),
+            group_id: String(event.group_id || ''),
+            join_key: joinKey,
+            joined_case: joinedCase,
+            slack_channel: {{
+              id: String(event.slack_channel_id || metadata.slack_channel_id || correlation.slack_channel_id || slackContext.channel_id || ''),
+              name: String(event.slack_channel_name || metadata.slack_channel_name || correlation.slack_channel_name || slackContext.channel_name || ''),
+              thread_ts: String(event.slack_thread_ts || metadata.slack_thread_ts || correlation.slack_thread_ts || slackContext.thread_ts || ''),
+            }},
+            duration_ms: durationMs,
+            time_to_response_ms: durationMs,
+            diagnostic_summary: metadata.diagnostic_summary || null,
+            diagnostic_contract: metadata.diagnostic_contract || null,
+            metadata_excerpt: metadataText.slice(0, metadataLimit),
+            metadata_truncated: metadataText.length > metadataLimit,
           }};
           return [
             'Please review this Keystone eval trace event and identify any trace join, data-quality, dashboard, or API-readiness follow-up needed. Use review_checklist and next_follow_up first.',
@@ -6277,12 +8308,26 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
     function hasRecordedResponse(item) {{
       return Boolean(String(item.scored_response_text || item.response_text || item.latest_slack_summary || '').trim());
     }}
+    function canJudgeScore(item) {{
+      const target = item.review_target || {{}};
+      return Boolean(
+        orchestratorJudge.enabled &&
+        target.target_type === 'slack' &&
+        String(item.latest_slack_summary || item.scored_response_text || '').trim()
+      );
+    }}
     function scoreForm(item) {{
       const reviewReady = hasRecordedResponse(item);
       const disabled = reviewReady ? '' : ' disabled';
       const disabledReason = reviewReady
         ? ''
         : '<div class="subtle">Score saving is disabled until this case has a recorded Promptfoo or Slack response.</div>';
+      const judgeReady = canJudgeScore(item);
+      const judgeReason = judgeReady
+        ? 'Scores this saved #evals Slack output with Orchestrator Review.'
+        : orchestratorJudge.enabled
+          ? 'Orchestrator Review scoring needs a saved #evals Slack response.'
+          : `Set ${{escapeHtml(orchestratorJudge.env_flag || 'KEYSTONE_EVAL_LLM_JUDGE')}}=true and restart the dashboard to enable Orchestrator Review scoring.`;
       const controls = scoreDimensions.map(dimension => `
         <div class="score-control">
           <label>${{escapeHtml(dimension)}}</label>
@@ -6308,8 +8353,10 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         <div class="subtle">Use this dashboard field to modify notes already submitted from the Slack eval thread.</div>
         <div class="form-actions">
           <button type="submit"${{disabled}}>Update review</button>
+          <button type="button" data-judge-score="${{escapeHtml(item.case_id)}}"${{judgeReady ? '' : ' disabled'}}>Score with Orchestrator Review</button>
           <span class="review-status" data-review-status></span>
         </div>
+        <div class="subtle">${{judgeReason}}</div>
       </form>`;
     }}
     function analysisToggle(item) {{
@@ -6373,6 +8420,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           source: String(item.latest_run_source || ''),
           at: String(item.latest_run_at || ''),
           id: String(item.latest_run_id || ''),
+          thread_ts: String(item.latest_slack_thread_ts || ''),
         }},
         prompt: promptText.slice(0, promptLimit),
         prompt_chars: promptText.length,
@@ -6506,7 +8554,8 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         return (!query || haystack.includes(query))
           && (!promptAgentFilter.value || item.agent === promptAgentFilter.value);
       }});
-      document.getElementById('prompt-rows').innerHTML = rows.map(item => `
+      document.getElementById('prompt-rows').innerHTML = rows.map(item => {{
+        return `
         <article class="prompt-card">
           <div class="case-head" style="border-bottom:0; padding-bottom:0; margin-bottom:8px">
             <div>
@@ -6521,24 +8570,13 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           <textarea class="copy-source" data-copy-source readonly>${{escapeHtml(item.user_input || '')}}</textarea>
           <div class="text-block">${{escapeHtml(item.user_input || 'No prompt recorded.')}}</div>
         </article>
-      `).join('');
+      `}}).join('');
       for (const button of document.querySelectorAll('#prompt-rows [data-copy-prompt]')) {{
         button.addEventListener('click', () => copyPrompt(button));
       }}
     }}
         function renderRows() {{
-      const query = search.value.trim().toLowerCase();
-      const rows = latestFirstCases(cases.filter(item => {{
-            const haystack = [
-              item.case_id, item.display_case_id, item.agent, (item.dimensions || []).join(' '),
-              item.user_input, item.response_text, item.latest_slack_run_id,
-              item.latest_slack_context_policy, item.latest_slack_thread_fetch_status,
-              item.latest_slack_cost_profile, item.human_notes
-            ].join(' ').toLowerCase();
-        return (!query || haystack.includes(query))
-          && (!agentFilter.value || item.agent === agentFilter.value)
-          && stateMatches(item);
-      }}));
+      const rows = filteredRunCases();
       document.getElementById('case-rows').innerHTML = rows.map(item => {{
         return `<article class="case-card">
           <div class="case-head">
@@ -6582,6 +8620,9 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       for (const form of document.querySelectorAll('.review-form')) {{
         form.addEventListener('submit', event => saveReview(event, form));
         }}
+          for (const button of document.querySelectorAll('[data-judge-score]')) {{
+            button.addEventListener('click', () => scoreWithOrchestratorJudge(button));
+          }}
           for (const button of document.querySelectorAll('[data-copy-prompt]')) {{
             button.addEventListener('click', () => copyPrompt(button));
           }}
@@ -6610,7 +8651,16 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
           document.getElementById('database-rows').innerHTML = rows.map(item => {{
             const latestRunAt = item.latest_run_at ? formatDateTime(item.latest_run_at) : '';
             const latestRunSource = item.latest_run_source || 'pending';
-            const latestRunId = item.latest_run_id || item.latest_slack_run_id || item.latest_slack_thread_ts || item.promptfoo_eval_id || '';
+            const latestRunId = [
+              item.latest_run_id || item.latest_slack_run_id || item.promptfoo_eval_id || '',
+              item.latest_slack_thread_ts ? `thread ${{item.latest_slack_thread_ts}}` : '',
+            ].filter(Boolean).join(' · ');
+            const runScoreParts = [
+              item.human_average !== null && item.human_average !== undefined ? `human review ${{scoreValue(item.human_average)}}` : '',
+              item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined ? `Orchestrator Review ${{scoreValue(item.orchestrator_judge_average)}}` : '',
+              item.scoring_completed_at ? `scored ${{formatDateTime(item.scoring_completed_at)}}` : '',
+            ].filter(Boolean);
+            const latestRunInfo = [latestRunId, ...runScoreParts].filter(Boolean).join(' · ');
             const machineSummary = item.promptfoo_success === true
               ? `${{pill('pass', 'pass')}}<div class="mono subtle">${{scoreValue(item.promptfoo_score, true)}}</div>`
               : item.promptfoo_success === false
@@ -6619,11 +8669,21 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             const analysisState = item.promptfoo_eval_id
               ? `${{item.analysis_excluded ? 'excluded' : 'included'}}${{item.analysis_exclusion_reason ? `: ${{item.analysis_exclusion_reason}}` : ''}}`
               : '';
-            const humanStatus = item.human_average !== null ? 'reviewed' : 'unreviewed';
+            const hasHumanScore = item.human_average !== null && item.human_average !== undefined;
+            const hasOrchestratorScore = item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined;
+            const humanStatus = hasHumanScore ? 'reviewed' : 'unreviewed';
             const databaseResponse = item.scored_response_text || item.response_text || item.latest_slack_summary || '';
-            const humanSummary = item.human_average !== null
+            const humanSummary = hasHumanScore
               ? `${{pill(humanStatus, item.human_safety === 'fail' ? 'fail' : 'pass')}}<div class="mono subtle">${{scoreValue(item.human_average)}}</div>${{item.human_safety ? `<div class="subtle">${{escapeHtml(item.human_safety)}}</div>` : ''}}`
               : '<span class="db-empty">unreviewed</span>';
+            const orchestratorComment = item.orchestrator_judge_run_comment || item.orchestrator_judge_notes || '';
+            const scoringSummary = hasOrchestratorScore
+              ? `${{pill('Orchestrator Review complete', 'pass')}}<div class="mono subtle">${{item.orchestrator_judge_created_at ? formatDateTime(item.orchestrator_judge_created_at) : ''}}</div><div class="subtle">${{scoreValue(item.orchestrator_judge_average)}}</div>${{orchestratorComment ? `<div class="subtle">${{escapeHtml(orchestratorComment)}}</div>` : ''}}`
+              : '<span class="db-empty">orchestrator review missing</span>';
+            const scoreDimensionColumns = scoreDimensions.map(dimension => [
+              scoreDimensionCell(item.human_scores || {{}}, dimension),
+              scoreDimensionCell(item.orchestrator_judge_scores || {{}}, dimension),
+            ].join('')).join('');
             const sourceCount = Number(item.latest_slack_source_count || 0);
             const visibleSourceCount = Number(item.latest_slack_visible_source_count || 0);
             const evidenceParts = [];
@@ -6640,14 +8700,16 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
               <td>${{escapeHtml(item.agent || '')}}</td>
               <td class="mono">${{dbMetric(latestRunAt || item.latest_run_at)}}</td>
               <td>${{pill(latestRunSource, latestRunSource === 'pending' ? 'warn' : 'pass')}}</td>
-              <td class="mono">${{dbMetric(latestRunId)}}</td>
+              <td class="mono">${{dbMetric(latestRunInfo)}}</td>
               <td class="prompt-cell" title="${{escapeHtml(item.user_input || '')}}"><div class="db-cell-text">${{escapeHtml(item.user_input || '')}}</div></td>
               <td class="response-cell" title="${{escapeHtml(databaseResponse)}}"><div class="db-cell-text subtle">${{escapeHtml(databaseResponse)}}</div></td>
               <td>${{machineSummary}}</td>
               <td>${{humanSummary}}</td>
+              ${{scoreDimensionColumns}}
+              <td>${{scoringSummary}}</td>
               <td title="${{escapeHtml(evidenceSummary)}}"><div class="db-cell-text">${{dbMetric(evidenceSummary)}}</div></td>
               <td title="${{escapeHtml(analysisState || (item.promptfoo_eval_id ? 'included' : 'tbd'))}}"><div class="db-cell-text">${{dbMetric(analysisState, item.promptfoo_eval_id ? 'included' : 'tbd')}}</div></td>
-              <td title="${{escapeHtml(item.human_notes || '')}}"><div class="db-cell-text">${{dbMetric(item.human_notes)}}</div></td>
+              <td title="${{escapeHtml(item.human_notes || orchestratorComment || '')}}"><div class="db-cell-text">${{dbMetric(item.human_notes || orchestratorComment)}}</div></td>
             </tr>`;
           }}).join('');
         }}
@@ -6762,12 +8824,51 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         status.textContent = `Update failed: ${{error.message}}. Start the dashboard server to save scores.`;
       }}
     }}
+    async function scoreWithOrchestratorJudge(button) {{
+      const caseId = button.getAttribute('data-judge-score') || '';
+      const item = cases.find(candidate => candidate.case_id === caseId) || {{}};
+      const status = button.closest('form')?.querySelector('[data-review-status]');
+      const original = button.textContent;
+      if (!canJudgeScore(item)) {{
+        if (status) status.textContent = orchestratorJudge.enabled
+          ? 'Orchestrator Review needs a saved #evals Slack response.'
+          : `Orchestrator Review disabled; set ${{orchestratorJudge.env_flag || 'KEYSTONE_EVAL_LLM_JUDGE'}}=true and restart.`;
+        return;
+      }}
+      const reviewTarget = item.review_target || {{}};
+      button.disabled = true;
+      button.textContent = 'Scoring...';
+      if (status) status.textContent = 'Orchestrator Review scoring this #evals output...';
+      try {{
+        const response = await fetch('/api/orchestrator-judge-score', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{
+            case_id: caseId,
+            run_id: reviewTarget.run_id || item.latest_slack_run_id || '',
+            slack_thread_ts: reviewTarget.slack_thread_ts || item.latest_slack_thread_ts || '',
+          }}),
+        }});
+        const result = await response.json().catch(() => ({{}}));
+        if (!response.ok) throw new Error(result.error || `HTTP ${{response.status}}`);
+        const refreshed = await verifyLocalRefreshEndpoints(result);
+        const dbHint = databaseFreshnessHint(result);
+        if (status) status.textContent = `Orchestrator Review saved ${{scoreValue(result.average_score)}}/5. Verified ${{refreshed.length}} local views.${{dbHint}} Reloading dashboard...`;
+        setTimeout(() => window.location.reload(), 500);
+      }} catch (error) {{
+        button.disabled = false;
+        button.textContent = original;
+        if (status) status.textContent = `Orchestrator Review failed: ${{error.message}}`;
+      }}
+    }}
     renderAgentScoreTable('machine');
     renderWorkflowVisualization();
+    renderOverviewLatestRun();
     renderDataQualityGates();
     renderCoverageBars();
     renderBars('dimension-bars', data.summary.dimensions, 8);
     renderEvalRuns();
+    renderLatestSavedRuns();
     renderFollowUpQueue();
     renderRunLedger();
     renderAnalysis();
@@ -6793,9 +8894,18 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             }}
           }});
         }}
-    search.addEventListener('input', renderRows);
-    agentFilter.addEventListener('change', renderRows);
-    stateFilter.addEventListener('change', renderRows);
+    search.addEventListener('input', () => {{
+      renderLatestSavedRuns();
+      renderRows();
+    }});
+    agentFilter.addEventListener('change', () => {{
+      renderLatestSavedRuns();
+      renderRows();
+    }});
+    stateFilter.addEventListener('change', () => {{
+      renderLatestSavedRuns();
+      renderRows();
+    }});
         promptSearch.addEventListener('input', renderPromptRows);
         promptAgentFilter.addEventListener('change', renderPromptRows);
         databaseSearch.addEventListener('input', renderDatabaseRows);
@@ -6807,6 +8917,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
       setActiveView('runs');
     }}
         renderPromptRows();
+        renderLatestSavedRuns();
         renderRows();
         renderDatabaseRows();
   </script>
@@ -6821,11 +8932,49 @@ def _review_html(payload: dict[str, Any]) -> str:
     title = "Keystone Eval Review"
     review_ready = _case_has_recorded_response(case)
     disabled = "" if review_ready else " disabled"
-    disabled_note = (
-        ""
-        if review_ready
-        else '<div class="subtle">Score saving is disabled until this case has a recorded Promptfoo or Slack response.</div>'
+    prompt_recorded = bool(str(case.get("user_input") or "").strip())
+    response_recorded = bool(
+        str(
+            case.get("scored_response_text")
+            or case.get("response_text")
+            or case.get("latest_slack_summary")
+            or ""
+        ).strip()
     )
+    judge_ready = (
+        bool((payload.get("orchestrator_judge") or {}).get("enabled"))
+        and str((case.get("review_target") or {}).get("target_type") or "") == "slack"
+        and bool(str(case.get("latest_slack_summary") or case.get("scored_response_text") or "").strip())
+    )
+    judge_disabled = "" if judge_ready else " disabled"
+    if judge_ready:
+        judge_note = "Scores this saved #evals Slack output with Orchestrator Review."
+    elif not response_recorded:
+        judge_note = "Orchestrator Review is disabled until this case has a saved #evals Slack response."
+    elif str((case.get("review_target") or {}).get("target_type") or "") != "slack":
+        judge_note = "Orchestrator Review is available only for saved #evals Slack runs."
+    elif not bool((payload.get("orchestrator_judge") or {}).get("enabled")):
+        judge_note = f"Orchestrator Review is disabled; set {JUDGE_ENV_FLAG}=true and restart the dashboard."
+    else:
+        judge_note = "Orchestrator Review is disabled for this case."
+    missing_items: list[str] = []
+    if not prompt_recorded:
+        missing_items.append("No prompt is recorded for this case ID.")
+    if not response_recorded:
+        missing_items.append("No Promptfoo result or saved #evals Slack response is recorded.")
+    missing_html = "".join(
+        f"<li>{html.escape(item)}</li>"
+        for item in missing_items
+    )
+    disabled_note = ""
+    if not review_ready:
+        disabled_note = (
+            '<div class="disabled-banner" role="status">'
+            "<strong>Review controls are disabled.</strong> "
+            "This page can score only a case with a recorded Promptfoo result or a saved #evals Slack response."
+            f"{'<ul>' + missing_html + '</ul>' if missing_html else ''}"
+            "</div>"
+        )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -6907,9 +9056,52 @@ def _review_html(payload: dict[str, Any]) -> str:
       font: inherit;
       cursor: pointer;
     }}
+    select:disabled,
+    textarea:disabled,
+    button:disabled {{
+      opacity: 1;
+      cursor: not-allowed;
+      background: #eef2f5;
+      color: #8a949e;
+      border-color: #cfd7df;
+    }}
+    .disabled-banner {{
+      border: 1px solid #d6d9dc;
+      background: #f2f4f5;
+      color: #4d5660;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin: 10px 0 12px;
+    }}
+    .disabled-banner ul {{
+      margin: 6px 0 0 18px;
+      padding: 0;
+    }}
+    .review-summary {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      background: #fbfcfd;
+      margin: 10px 0 14px;
+    }}
+    .review-summary-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }}
+    .score-chip-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(130px, 1fr));
+      gap: 6px;
+      margin-top: 8px;
+    }}
     .form-actions {{ display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }}
     @media (max-width: 760px) {{
       .score-controls {{ grid-template-columns: 1fr; }}
+      .score-chip-grid {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -6928,9 +9120,11 @@ def _review_html(payload: dict[str, Any]) -> str:
       <div class="text-block">{html.escape(str(case.get("user_input") or "No prompt recorded."))}</div>
       <h2>Latest Response / Result</h2>
       <div class="text-block">{html.escape(str(case.get("scored_response_text") or case.get("response_text") or "No response recorded."))}</div>
+      <h2>Orchestrator Review</h2>
+      <div id="orchestrator-review-summary" class="review-summary"></div>
       <h2>Human Review</h2>
-      <div class="subtle">Primary eval submission should happen from the Slack thread. Use this page to review or modify a saved scorecard.</div>
-      <form id="review-form">
+      <div class="subtle">Manual human review stays separate from Orchestrator Review. Use this form to edit, override, and save a human scorecard.</div>
+      <form id="review-form" aria-disabled="{str(not review_ready).lower()}">
         {disabled_note}
         <div id="score-controls" class="score-controls"></div>
         <label for="notes">Human notes</label>
@@ -6938,8 +9132,10 @@ def _review_html(payload: dict[str, Any]) -> str:
         <div class="subtle">Saved to the database Human notes column with this scorecard.</div>
         <div class="form-actions">
           <button type="submit"{disabled}>Update review</button>
+          <button type="button" id="judge-score"{judge_disabled}>Score with Orchestrator Review</button>
           <span id="status" class="subtle"></span>
         </div>
+        <div class="subtle">{html.escape(judge_note)}</div>
       </form>
     </div>
   </main>
@@ -6948,10 +9144,22 @@ def _review_html(payload: dict[str, Any]) -> str:
     const data = JSON.parse(document.getElementById('eval-data').textContent);
     const item = data.case || {{}};
     const scoreDimensions = data.score_dimensions || [];
+    const orchestratorJudge = data.orchestrator_judge || {{}};
     const reviewReady = Boolean(String(item.scored_response_text || item.response_text || item.latest_slack_summary || '').trim());
+    const judgeReady = Boolean(
+      orchestratorJudge.enabled &&
+      (item.review_target || {{}}).target_type === 'slack' &&
+      String(item.latest_slack_summary || item.scored_response_text || '').trim()
+    );
     const controls = document.getElementById('score-controls');
     function escapeHtml(value) {{
       return String(value ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+    }}
+    function scoreValue(value) {{
+      if (value === null || value === undefined || value === '') return 'tbd';
+      const number = Number(value);
+      if (Number.isNaN(number)) return 'tbd';
+      return `${{number.toFixed(1).replace(/\\.0$/, '')}}/5`;
     }}
         function scoreOptions(selected) {{
           if (!reviewReady || selected === null || selected === undefined || selected === '') {{
@@ -6977,6 +9185,53 @@ def _review_html(payload: dict[str, Any]) -> str:
             </select>
           </div>
         `;
+        function renderOrchestratorReviewSummary() {{
+          const target = document.getElementById('orchestrator-review-summary');
+          const hasScore = item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined;
+          if (!target) return;
+          if (!hasScore) {{
+            target.innerHTML = '<div class="subtle">No Orchestrator Review scorecard is saved for this case/run yet.</div>';
+            return;
+          }}
+          const scores = item.orchestrator_judge_scores || {{}};
+          const rationales = item.orchestrator_judge_dimension_rationales || {{}};
+          const chips = scoreDimensions.map(dimension => `
+            <div class="text-block">
+              <strong>${{escapeHtml(dimension)}} ${{scores[dimension] ?? 'tbd'}}</strong>
+              <div class="subtle">${{escapeHtml(rationales[dimension] || 'No metric rationale saved.')}}</div>
+            </div>
+          `).join('');
+          target.innerHTML = `
+            <div class="review-summary-head">
+              <div>
+                <strong>Orchestrator Review ${{scoreValue(item.orchestrator_judge_average)}}</strong>
+                <span class="subtle">${{item.orchestrator_judge_safety ? ` · safety ${{escapeHtml(item.orchestrator_judge_safety)}}` : ''}}${{item.orchestrator_judge_created_at ? ` · ${{escapeHtml(item.orchestrator_judge_created_at)}}` : ''}}</span>
+              </div>
+              <button type="button" id="copy-orchestrator-review">Use as human draft</button>
+            </div>
+            <div class="score-chip-grid">${{chips}}</div>
+            <div class="text-block" style="margin-top:8px">${{escapeHtml(item.orchestrator_judge_run_comment || item.orchestrator_judge_notes || 'No Orchestrator Review comment saved.')}}</div>
+          `;
+          const copyButton = document.getElementById('copy-orchestrator-review');
+          if (copyButton) {{
+            copyButton.addEventListener('click', () => {{
+              for (const select of document.querySelectorAll('[data-score]')) {{
+                const dimension = select.getAttribute('data-score');
+                if (scores[dimension] !== null && scores[dimension] !== undefined) {{
+                  select.value = String(scores[dimension]);
+                }}
+              }}
+              const safety = document.querySelector('[data-safety]');
+              if (safety && item.orchestrator_judge_safety) safety.value = item.orchestrator_judge_safety;
+              const notes = document.getElementById('notes');
+              const orchestratorComment = item.orchestrator_judge_run_comment || item.orchestrator_judge_notes || '';
+              if (notes && orchestratorComment) notes.value = orchestratorComment;
+              const status = document.getElementById('status');
+              if (status) status.textContent = 'Copied Orchestrator Review into the human form. Save manually to create a human scorecard.';
+            }});
+          }}
+        }}
+        renderOrchestratorReviewSummary();
         async function verifyLocalRefreshEndpoints(result) {{
           const endpoints = Array.isArray(result.refresh_endpoints) ? result.refresh_endpoints : [];
           const localEndpoints = endpoints.filter(endpoint => String(endpoint || '').startsWith('/api/'));
@@ -7049,6 +9304,41 @@ def _review_html(payload: dict[str, Any]) -> str:
         status.textContent = `Update failed: ${{error.message}}`;
       }}
     }});
+    document.getElementById('judge-score').addEventListener('click', async () => {{
+      const status = document.getElementById('status');
+      const button = document.getElementById('judge-score');
+      if (!judgeReady) {{
+        status.textContent = orchestratorJudge.enabled
+          ? 'Orchestrator Review needs a saved #evals Slack response.'
+          : `Orchestrator Review disabled; set ${{orchestratorJudge.env_flag || 'KEYSTONE_EVAL_LLM_JUDGE'}}=true and restart.`;
+        return;
+      }}
+      const reviewTarget = item.review_target || {{}};
+      button.disabled = true;
+      button.textContent = 'Scoring...';
+      status.textContent = 'Orchestrator Review scoring this #evals output...';
+      try {{
+        const response = await fetch('/api/orchestrator-judge-score', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{
+            case_id: item.case_id || '',
+            run_id: reviewTarget.run_id || item.latest_slack_run_id || '',
+            slack_thread_ts: reviewTarget.slack_thread_ts || item.latest_slack_thread_ts || '',
+          }}),
+        }});
+        const result = await response.json().catch(() => ({{}}));
+        if (!response.ok) throw new Error(result.error || `HTTP ${{response.status}}`);
+        const refreshed = await verifyLocalRefreshEndpoints(result);
+        const dbHint = databaseFreshnessHint(result);
+        status.textContent = `Orchestrator Review saved ${{result.average_score}}/5. Verified ${{refreshed.length}} local dashboard views.${{dbHint}} Reloading review page...`;
+        setTimeout(() => window.location.reload(), 500);
+      }} catch (error) {{
+        button.disabled = false;
+        button.textContent = 'Score with Orchestrator Review';
+        status.textContent = `Orchestrator Review failed: ${{error.message}}`;
+      }}
+    }});
   </script>
 </body>
 </html>
@@ -7093,39 +9383,44 @@ def _label_help_text(label: str) -> str:
         "Machine Pass Rate": "Share of imported Promptfoo checks that passed. Pending cases are not counted until a machine-check row exists.",
         "Machine Avg / 5": "Average Promptfoo assertion score for scored cases only, normalized to the dashboard 0-5 scale.",
         "Slack Runs": "Saved #evals run rows. The hint shows distinct linked cases and retry-heavy cases separately.",
-        "Dashboard Health": "Whether the local dashboard endpoint and launch manager are reachable from this machine.",
+        "Scoring Health": "Whether the local scoring endpoint and launch manager are reachable from this machine.",
         "Data Quality": "Preflight gates completed before paid evals: prompt text, run IDs, timestamps, responses, evidence, reviews, traces, and ledger rows.",
         "Slack Evidence": "Saved Slack runs with thread evidence. Warnings mean the run is present but missing some audit metadata.",
-        "Human Avg / 5": "Average score from submitted human scorecards. Unreviewed cases stay out of this number.",
+        "Human Avg / 5": "Average score from submitted human scorecards. Orchestrator Review scorecards are tracked separately.",
+        "Orchestrator Review Avg / 5": "Average score from saved Orchestrator Review scorecards, not the score for the latest imported machine run.",
         "Total Cases": "Total local eval case rows: committed seed prompts plus any ad hoc cases created during Slack testing.",
         "Slack Eval Conversation Flow": "End-to-end #evals workflow status from prompt library to saved Slack run, response, scorecard, and analysis row.",
         "Prompt library": "Committed seed prompts available to start #evals threads. This is the denominator for most workflow counts.",
         "Slack runs": "Cases with a saved #evals thread run. These should appear after the agent responds in Slack.",
-        "Responses": "Cases with saved response text from Slack or Promptfoo. These are eligible for human scoring.",
-        "Scorecards": "Human review submissions saved from the Slack Submit Evaluation flow, including scores, safety, and notes.",
+        "Responses": "Cases with saved response text from Slack or Promptfoo. These are eligible for review scoring.",
+        "Scorecards": "Manual human and Orchestrator Review scorecards saved from the review flow, including scores, safety, and notes.",
         "Analysis": "Cases currently counted in analysis views after excluding duplicates or known problem runs.",
         "Source checks": "Cases tagged for retrieval or evidence quality, useful for auditing source-backed answers.",
         "API Spend Readiness Gates": "Local readiness checks that should pass before paying for live Slack/OpenAI eval runs.",
-        "Agent Scores": "Per-agent score table. Machine mode uses Promptfoo imports; Human mode uses submitted scorecards.",
+        "Agent Scores": "Per-agent score table. Machine mode uses Promptfoo imports; review modes use submitted human and Orchestrator Review scorecards.",
         "Promptfoo Assertion Avg / 5 by Agent": "Average Promptfoo assertion score per agent. It is a machine-check signal, not a human quality judgment.",
         "Slack Human Review Avg / 5 by Agent": "Average submitted human-review score per agent from Slack-linked scorecards.",
         "Evaluation Dimensions": "Prompt tags showing which behaviors the eval set exercises, such as retrieval, safety, synthesis, and output format.",
         "Prompt Library": "Searchable list of committed eval prompts that can be copied into #evals as root messages.",
-        "Runs & Scoring": "Case-level workspace for latest run state, machine checks, human reviews, evidence, and analysis inclusion.",
-        "Eval Follow-up Queue": "Prioritized current cases that need a run, evidence fix, machine import, human scorecard, or analysis decision.",
-        "Eval Run Ledger": "Newest-first event feed across Slack runs, Promptfoo imports, human reviews, and trace events.",
-        "Promptfoo Run Analysis": "Trend and comparison views built from imported Promptfoo rows and saved human scorecards.",
-        "Average Score Over Time": "Daily average machine and human scores. Multiple same-day rows are averaged for trend readability.",
+        "Runs & Scoring": "Case-level workspace for latest run state, machine checks, review scorecards, evidence, and analysis inclusion.",
+        "Eval Follow-up Queue": "Prioritized current cases that need a run, evidence fix, machine import, review scorecard, or analysis decision.",
+        "Eval Run Ledger": "Newest-first event feed across Slack runs, Promptfoo imports, review scorecards, and trace events.",
+        "Promptfoo Run Analysis": "Trend and comparison views built from imported Promptfoo rows, manual human reviews, and Orchestrator Review scorecards.",
+        "Average Score Across Time": "Daily average machine, manual human, and Orchestrator Review scores. Multiple same-day rows are averaged for trend readability.",
         "Single Prompt Trend": "Score history for one selected prompt, useful for seeing whether a specific fix helped.",
         "Prompt Average Scores by Agent": "Prompt-level machine averages grouped by agent so weak prompts are easier to target.",
         "Agent Stability": "How consistent each agent is across scored cases: pass rate, average, range, and uneven results.",
         "Failure Clusters by Dimension": "Failed machine checks grouped by prompt tags to show which behavior areas need fixes.",
         "Case Changes Across Runs": "Latest score movement for each case compared with its previous imported run.",
-        "Trace Dashboard": "Trace-specific diagnostics, joins, privacy state, and readiness analytics from saved local trace summaries.",
+        "Trace Explorer": "OpenAI-style run timeline plus Keystone eval joins, review scores, diagnostics, and privacy state from sanitized local trace summaries.",
+        "Trace Health": "Group-level trace coverage, source split, diagnostics, and privacy posture for saved run summaries.",
+        "Trace Diagnostics": "Chartable run-diagnostic categories from sanitized trace metadata, such as missing model metadata, retrieval gaps, retries, extraction issues, approval gates, and tool failures.",
+        "Current Run Trace": "Newest run-level trace reduced to case/run joins, route, review scores, step timeline, and cleanup signals.",
+        "Trace Event Log": "Recent sanitized workflow events shown as trace steps. Copy exposes capped metadata for local review.",
+        "Storage & Instrumentation": "Processor readiness, database freshness, retained fields, dropped sensitive fields, and implementation notes.",
         "Trace Processor Readiness": "Sanitized trace-capture readiness for future API evals; disabled is normal for current no-API runs.",
         "What We Store Locally": "Trace and workflow fields kept for joins/timing, plus sensitive fields intentionally dropped.",
         "Implementation Contract": "Environment settings and integration rules needed before sanitized trace capture is enabled.",
-        "Recent Trace Events": "Recent sanitized workflow or trace events, including no-API Slack/review saves and future API spans.",
         "Eval Case Database": "Searchable case table combining seed prompts, newest runs first, review status, evidence, and notes.",
     }.get(label, "")
 

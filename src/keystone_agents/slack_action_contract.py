@@ -16,6 +16,9 @@ BUSINESS_AGENT_SLACK_CONTRACT_CAPABILITIES = (
     "selected_context_prior_agent_runs",
     "selected_context_embedded_fallback",
     "write_gate_no_send",
+    "context_agent_result_rendering",
+    "named_agent_result_rendering",
+    "source_channel_response_routing",
 )
 SLACK_SELECTED_CONTEXT_SCHEMA = "keystone.slack.selected_message_context.v1"
 SLACK_AGENT_FEEDBACK_EVENT_SCHEMA = "keystone.slack.agent_feedback_event.v1"
@@ -27,6 +30,7 @@ KBA_REVISE_DRAFT = "kba_revise_draft"
 KBA_MORE_RESEARCH = "kba_more_research"
 KBA_FIND_CONTACT = "kba_find_contact"
 KBA_EVAL_REVIEW = "kba_eval_review"
+KBA_EVAL_ORCHESTRATOR_JUDGE = "kba_eval_orchestrator_judge"
 KBA_OVERFLOW = "kba_overflow"
 KBA_COS_AUDIT_AUTOMATIONS = "kba_cos_audit_automations"
 KBA_COS_GENERATE_DOC = "kba_cos_generate_doc"
@@ -55,6 +59,7 @@ KBA_ACTION_IDS = frozenset(
         KBA_MORE_RESEARCH,
         KBA_FIND_CONTACT,
         KBA_EVAL_REVIEW,
+        KBA_EVAL_ORCHESTRATOR_JUDGE,
         KBA_OVERFLOW,
         KBA_COS_AUDIT_AUTOMATIONS,
         KBA_COS_GENERATE_DOC,
@@ -72,6 +77,7 @@ KBA_INTENT_MORE_RESEARCH = "more_research"
 KBA_INTENT_RESEARCH_ALL_CANDIDATES = "research_all_candidates"
 KBA_INTENT_FIND_CONTACT = "find_contact"
 KBA_INTENT_EVAL_REVIEW = "eval_review"
+KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE = "eval_orchestrator_judge"
 KBA_INTENT_SHOW_SOURCES = "show_sources"
 KBA_INTENT_OPEN_WORK_ITEM = "open_work_item"
 KBA_INTENT_RUN_AGAIN = "run_again"
@@ -91,6 +97,7 @@ KBA_INTENTS = frozenset(
         KBA_INTENT_RESEARCH_ALL_CANDIDATES,
         KBA_INTENT_FIND_CONTACT,
         KBA_INTENT_EVAL_REVIEW,
+        KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE,
         KBA_INTENT_SHOW_SOURCES,
         KBA_INTENT_OPEN_WORK_ITEM,
         KBA_INTENT_RUN_AGAIN,
@@ -119,6 +126,63 @@ BUSINESS_AGENT_WRITE_GATE_NO_SEND_TEXT = (
     "This approval only lets the AI agent run this request. It does not allow sending email, "
     "posting externally, publishing, scheduling, or creating live drafts unless a later "
     "specific gate allows it."
+)
+
+CONTEXT_AGENT_RESULT_RENDERERS: tuple[dict[str, str], ...] = (
+    {
+        "route": "airtable_context_agent",
+        "output_type": "AirtableContextResult",
+        "preferred_text_field": "human_summary",
+    },
+    {
+        "route": "google_workspace_context_agent",
+        "output_type": "GoogleWorkspaceContextResult",
+        "preferred_text_field": "human_summary",
+    },
+    {
+        "route": "zotero_context_agent",
+        "output_type": "ZoteroContextResult",
+        "preferred_text_field": "human_summary",
+    },
+    {
+        "route": "rss_context_agent",
+        "output_type": "RssContextResult",
+        "preferred_text_field": "human_summary",
+    },
+    {
+        "route": "preprints_context_agent",
+        "output_type": "PreprintsContextResult",
+        "preferred_text_field": "human_summary",
+    },
+)
+
+
+NAMED_AGENT_RESULT_RENDERERS: tuple[dict[str, str], ...] = (
+    {
+        "route": "business_research_analyst",
+        "output_type": "CompanyResearchFocusedBrief",
+        "preferred_text_field": "human_summary",
+    },
+    {
+        "route": "chief_of_staff",
+        "output_type": "ChiefOfStaffResult",
+        "preferred_text_field": "human_summary",
+    },
+    {
+        "route": "opportunity_scout",
+        "output_type": "OpportunityScoutResult",
+        "preferred_text_field": "human_summary",
+    },
+    {
+        "route": "gmail_triage",
+        "output_type": "EmailTriageResult",
+        "preferred_text_field": "human_summary",
+    },
+    {
+        "route": "outreach_composer",
+        "output_type": "OutreachDraft",
+        "preferred_text_field": "human_summary",
+    },
 )
 
 
@@ -425,6 +489,30 @@ def business_agent_slack_contract() -> dict[str, Any]:
             "selected_message_context": selected_message_context_json_schema(),
             "write_gate": BusinessAgentWriteGatePayload.model_json_schema(),
         },
+        "result_rendering": {
+            "context_agents": [dict(item) for item in CONTEXT_AGENT_RESULT_RENDERERS],
+            "named_agents": [dict(item) for item in NAMED_AGENT_RESULT_RENDERERS],
+            "required_sections": ["Answer", "Detailed Summary"],
+            "optional_sections": ["Useful references"],
+            "fallback_text_fields": [
+                "human_summary",
+                "slack_display_text",
+                "display_text",
+                "summary",
+                "output.summary",
+                "message",
+            ],
+        },
+        "slack_response_routing": {
+            "source_channel_id_field": "source_channel_id",
+            "source_message_ts_field": "source_message_ts",
+            "source_thread_ts_field": "source_thread_ts",
+            "policy": (
+                "Reply in the source Slack channel/thread supplied by the event or "
+                "action payload; do not funnel named-agent or context-agent replies "
+                "to ai-agents-workflow or evals unless that was the source channel."
+            ),
+        },
         "notes": [
             "Legacy approval action IDs are supported for compatibility only.",
             (
@@ -433,3 +521,39 @@ def business_agent_slack_contract() -> dict[str, Any]:
             ),
         ],
     }
+
+
+def business_agent_result_display_text(payload: dict[str, Any]) -> str:
+    """Resolve the operator-facing result text from a business-agent payload.
+
+    Sibling Slack bridge consumers can use this side-effect-free resolver to
+    avoid falling back to generic WorkItem status or route metadata when a
+    context or named agent has already returned a sectioned ``human_summary``.
+    """
+
+    if not isinstance(payload, dict):
+        return ""
+    route = str(payload.get("route") or payload.get("selected_agent") or "").strip()
+    output_type = str(payload.get("output_type") or "").strip()
+    for renderer in (*CONTEXT_AGENT_RESULT_RENDERERS, *NAMED_AGENT_RESULT_RENDERERS):
+        if route != renderer["route"] and output_type != renderer["output_type"]:
+            continue
+        text = _payload_text_at_path(payload, renderer["preferred_text_field"])
+        if text:
+            return text
+    for field_path in business_agent_slack_contract()["result_rendering"]["fallback_text_fields"]:
+        text = _payload_text_at_path(payload, field_path)
+        if text:
+            return text
+    return ""
+
+
+def _payload_text_at_path(payload: dict[str, Any], field_path: str) -> str:
+    current: Any = payload
+    for part in str(field_path or "").split("."):
+        if not isinstance(current, dict):
+            return ""
+        current = current.get(part)
+    if isinstance(current, str):
+        return current.strip()
+    return ""

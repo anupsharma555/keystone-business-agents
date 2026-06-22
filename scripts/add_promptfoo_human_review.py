@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Add a human Promptfoo eval review from a Slack thread score block."""
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from promptfoo.human_review import (
     parse_human_review,
     save_human_review,
 )
+from promptfoo.orchestrator_judge import score_eval_run_with_orchestrator_judge
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Require and resolve a matching Promptfoo or Slack response before saving.",
     )
+    parser.add_argument(
+        "--orchestrator-judge-score",
+        action="store_true",
+        help="Score the saved #evals Slack run with the Orchestrator LLM judge instead of reading human text.",
+    )
+    parser.add_argument("--live-sdk", action="store_true", help="Enable live SDK model execution for judge scoring.")
+    parser.add_argument("--model", default="", help="Optional model override for judge scoring.")
     return parser
 
 
@@ -62,6 +71,20 @@ def main() -> int:
         )
         return 0
 
+    database_path = Path(args.database_path)
+    if args.orchestrator_judge_score:
+        result = score_eval_run_with_orchestrator_judge(
+            case_id=args.case_id,
+            run_id=args.run_id,
+            slack_thread_ts=args.slack_thread_ts,
+            database_path=database_path,
+            live=args.live_sdk,
+            model=args.model or None,
+        )
+        result["database_path"] = args.database_path
+        print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
+        return 0
+
     text = args.text or sys.stdin.read()
     review = parse_human_review(
         text,
@@ -73,7 +96,6 @@ def main() -> int:
         slack_channel_name=args.slack_channel_name,
         slack_thread_ts=args.slack_thread_ts,
     )
-    database_path = Path(args.database_path)
     if args.require_recorded_response:
         review = resolve_human_review_target(
             review,

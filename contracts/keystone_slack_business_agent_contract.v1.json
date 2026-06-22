@@ -8,6 +8,7 @@
     "kba_cos_show_blockers",
     "kba_cos_sync_airtable",
     "kba_create_gmail_draft",
+    "kba_eval_orchestrator_judge",
     "kba_eval_review",
     "kba_find_contact",
     "kba_more_research",
@@ -28,7 +29,10 @@
     "operator_failure_payload",
     "selected_context_prior_agent_runs",
     "selected_context_embedded_fallback",
-    "write_gate_no_send"
+    "write_gate_no_send",
+    "context_agent_result_rendering",
+    "named_agent_result_rendering",
+    "source_channel_response_routing"
   ],
   "input_action_ids": {
     "revision_feedback": "kba_revision_feedback",
@@ -40,6 +44,7 @@
     "audit_automations",
     "continue_work_item",
     "create_gmail_draft",
+    "eval_orchestrator_judge",
     "eval_review",
     "find_contact",
     "generate_doc",
@@ -378,6 +383,77 @@
       "type": "object"
     }
   },
+  "result_rendering": {
+    "context_agents": [
+      {
+        "output_type": "AirtableContextResult",
+        "preferred_text_field": "human_summary",
+        "route": "airtable_context_agent"
+      },
+      {
+        "output_type": "GoogleWorkspaceContextResult",
+        "preferred_text_field": "human_summary",
+        "route": "google_workspace_context_agent"
+      },
+      {
+        "output_type": "ZoteroContextResult",
+        "preferred_text_field": "human_summary",
+        "route": "zotero_context_agent"
+      },
+      {
+        "output_type": "RssContextResult",
+        "preferred_text_field": "human_summary",
+        "route": "rss_context_agent"
+      },
+      {
+        "output_type": "PreprintsContextResult",
+        "preferred_text_field": "human_summary",
+        "route": "preprints_context_agent"
+      }
+    ],
+    "fallback_text_fields": [
+      "human_summary",
+      "slack_display_text",
+      "display_text",
+      "summary",
+      "output.summary",
+      "message"
+    ],
+    "named_agents": [
+      {
+        "output_type": "CompanyResearchFocusedBrief",
+        "preferred_text_field": "human_summary",
+        "route": "business_research_analyst"
+      },
+      {
+        "output_type": "ChiefOfStaffResult",
+        "preferred_text_field": "human_summary",
+        "route": "chief_of_staff"
+      },
+      {
+        "output_type": "OpportunityScoutResult",
+        "preferred_text_field": "human_summary",
+        "route": "opportunity_scout"
+      },
+      {
+        "output_type": "EmailTriageResult",
+        "preferred_text_field": "human_summary",
+        "route": "gmail_triage"
+      },
+      {
+        "output_type": "OutreachDraft",
+        "preferred_text_field": "human_summary",
+        "route": "outreach_composer"
+      }
+    ],
+    "optional_sections": [
+      "Useful references"
+    ],
+    "required_sections": [
+      "Answer",
+      "Detailed Summary"
+    ]
+  },
   "schema": "keystone.business_agent_slack_contract.v1",
   "schemas": {
     "agent_feedback_event": "keystone.slack.agent_feedback_event.v1",
@@ -385,6 +461,12 @@
     "operator_failure": "keystone.operator_failure.v1",
     "selected_message_context": "keystone.slack.selected_message_context.v1",
     "write_gate": "keystone.business_agent_write_request.v1"
+  },
+  "slack_response_routing": {
+    "policy": "Reply in the source Slack channel/thread supplied by the event or action payload; do not funnel named-agent or context-agent replies to ai-agents-workflow or evals unless that was the source channel.",
+    "source_channel_id_field": "source_channel_id",
+    "source_message_ts_field": "source_message_ts",
+    "source_thread_ts_field": "source_thread_ts"
   },
   "version": "1",
   "write_gate": {

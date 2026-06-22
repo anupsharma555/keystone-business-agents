@@ -87,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     slack_parser.add_argument("--visible-source-count", type=int, default=0)
     slack_parser.add_argument("--sdk-estimated-cost-usd", type=float, default=None)
     slack_parser.add_argument("--sdk-cache-hit-rate", type=float, default=None)
+    slack_parser.add_argument("--duration-ms", type=float, default=None)
     slack_parser.add_argument("--response-hash", default="")
     slack_parser.add_argument("--model-provider", default="")
     slack_parser.add_argument("--model-name", default="")
@@ -193,6 +194,7 @@ def main() -> int:
             visible_source_count=args.visible_source_count,
             sdk_estimated_cost_usd=args.sdk_estimated_cost_usd,
             sdk_cache_hit_rate=args.sdk_cache_hit_rate,
+            duration_ms=args.duration_ms,
             response_hash=args.response_hash,
             evidence=evidence,
             model_provider=args.model_provider,

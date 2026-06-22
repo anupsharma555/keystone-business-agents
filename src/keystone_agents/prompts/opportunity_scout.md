@@ -39,6 +39,10 @@ Use the Lead Intelligence Platform pattern: Scout discovers candidates, Analyst 
 - Look for funding, hiring, partnerships, validation work, clinical trials, outcomes activity, payer partnerships, conference activity, publications, procurement signals, and research operations growth.
 - Search across time windows on purpose: immediate/recent signals, current-year
   activity, and slower evergreen collaboration surfaces.
+- Before broad live search, reason through multiple related query angles rather
+  than relying on one generic query. Use the structured search plan, requested
+  entity type, objectives, required terms, and source-lane gaps to shape 3-8
+  targeted query lanes before selecting URLs for extraction or scoring.
 - For broad requests, treat lane terms such as funding, partnerships, grants,
   trials, conferences, journal calls, contracts/RFPs, and advisory roles as options rather than mandatory
   constraints on every result. Deterministic retrieval may run bounded adaptive

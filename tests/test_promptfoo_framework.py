@@ -8,9 +8,11 @@ import threading
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
+from agents.agent_output import AgentOutputSchema
 
 import keystone_agents.eval_dashboard_health as dashboard_health
 import promptfoo.eval_dashboard as eval_dashboard_module
@@ -19,6 +21,7 @@ import scripts.add_promptfoo_human_review as human_review_script
 import scripts.check_eval_slack_readiness as readiness
 import scripts.promptfoo_eval_db as promptfoo_eval_db_script
 import scripts.run_eval_slack_test_server as slack_test_server
+import scripts.sync_slack_eval_thread as sync_slack_eval_thread_script
 from keystone_agents.eval_dashboard_health import (
     eval_dashboard_readiness,
     resolve_dashboard_manager_path,
@@ -61,6 +64,10 @@ from promptfoo.human_review import (
     list_human_reviews,
     parse_human_review,
     save_human_review,
+)
+from promptfoo.orchestrator_judge import (
+    OrchestratorEvalJudgeScorecard,
+    score_eval_run_with_orchestrator_judge,
 )
 from promptfoo.providers import keystone_agent_provider
 
@@ -188,7 +195,8 @@ def test_eval_dashboard_manager_declares_structured_log_contract() -> None:
 
     assert "eval-dashboard.structured.jsonl" in script
     assert 'HEALTH_URL="http://127.0.0.1:8769/api/status"' in script
-    assert 'curl -fsS "$HEALTH_URL"' in script
+    assert 'curl -fsS --max-time 5 "$HEALTH_URL"' in script
+    assert "for _ in {1..5}" in script
     assert '"health_url": health_url' in script
     assert "from keystone_agents.structured_logging import structured_log_event" in script
     assert 'component="eval_dashboard_manager"' in script
@@ -633,6 +641,8 @@ def test_promptfoo_seed_pack_has_expected_case_agent_coverage() -> None:
         "opportunity_scout": 15,
         "orchestrator": 15,
         "outreach_composer": 15,
+        "preprints_context_agent": 1,
+        "rss_context_agent": 1,
         "zotero_context_agent": 1,
     }
     assert {
@@ -647,6 +657,8 @@ def test_promptfoo_seed_pack_has_expected_case_agent_coverage() -> None:
         "opportunity_scout": 0,
         "orchestrator": 0,
         "outreach_composer": 0,
+        "preprints_context_agent": 0,
+        "rss_context_agent": 0,
         "zotero_context_agent": 0,
     }
 
@@ -787,6 +799,8 @@ def test_promptfoo_seed_pack_has_first_class_context_agent_eval_cases() -> None:
     assert by_agent == {
         "airtable_context_agent": 2,
         "google_workspace_context_agent": 2,
+        "preprints_context_agent": 1,
+        "rss_context_agent": 1,
         "zotero_context_agent": 1,
     }
     assert {str(case["case_id"]) for case in matching_cases} == {
@@ -794,6 +808,8 @@ def test_promptfoo_seed_pack_has_first_class_context_agent_eval_cases() -> None:
         "slack_airtable_context_ambiguous_update_block_001",
         "slack_google_workspace_context_eval_artifact_001",
         "slack_google_workspace_context_write_block_001",
+        "slack_preprints_context_preliminary_evidence_001",
+        "slack_rss_context_announcement_history_001",
         "slack_zotero_context_eval_collection_001",
     }
     for case in matching_cases:
@@ -820,6 +836,8 @@ def test_promptfoo_context_agent_eval_cases_name_specific_metadata_targets() -> 
                 (
                     "slack_airtable_context_",
                     "slack_google_workspace_context_",
+                    "slack_preprints_context_",
+                    "slack_rss_context_",
                     "slack_zotero_context_",
                 )
             ):
@@ -848,6 +866,20 @@ def test_promptfoo_context_agent_eval_cases_name_specific_metadata_targets() -> 
             "folder id",
             "document id",
             "sharing scope",
+        ),
+        "slack_preprints_context_preliminary_evidence_001": (
+            "digital psychiatry",
+            "biomarkers",
+            "depression measurement",
+            "remote-monitoring adherence",
+            "preliminary evidence",
+        ),
+        "slack_rss_context_announcement_history_001": (
+            "clinical AI validation",
+            "remote monitoring",
+            "dashboard review",
+            "themes",
+            "evidence gaps",
         ),
         "slack_zotero_context_eval_collection_001": (
             "behavioral-health AI validation",
@@ -957,7 +989,9 @@ def test_promptfoo_assertion_accepts_source_grounded_slack_output() -> None:
             "provider_status": "ok",
             "status": "done",
             "route": "opportunity_scout",
-            "human_summary": "NeuroFlow is relevant to behavioral health. fixture://source",
+            "human_summary": (
+                "*Answer:*\nNeuroFlow is relevant to behavioral health. fixture://source"
+            ),
             "source_count": 1,
             "source_urls": ["fixture://source"],
             "slack_context_attached": True,
@@ -1045,6 +1079,89 @@ def test_promptfoo_assertion_uses_provider_invocation_mode() -> None:
     assert "live SDK/search flag was enabled" in result["reason"]
 
 
+def test_promptfoo_assertion_checks_expected_slack_channel() -> None:
+    output = json.dumps(
+        {
+            "provider_status": "ok",
+            "status": "done",
+            "route": "orchestrator",
+            "human_summary": "*Answer:*\nRead-only answer.",
+            "slack_context_attached": True,
+            "slack_channel_id": "CDOCS123",
+            "slack_channel_name": "docs",
+            "can_send_email": False,
+            "send_enabled": False,
+            "forbidden_actions": ["send_email"],
+            "side_effects": _side_effects(),
+            "external_write_performed": False,
+        }
+    )
+
+    result = grade_output(
+        output,
+        {
+            "vars": {
+                "expected_slack_channel_id": "CDOCS123",
+                "expected_slack_channel_name": "docs",
+            }
+        },
+    )
+
+    assert result["pass"] is True
+
+    failed = grade_output(
+        output,
+        {"vars": {"expected_slack_channel_id": "CAIWORKFLOW", "expected_slack_channel_name": "evals"}},
+    )
+
+    assert failed["pass"] is False
+    assert "slack_channel_id='CDOCS123'" in failed["reason"]
+    assert "slack_channel_name='docs'" in failed["reason"]
+
+
+def test_promptfoo_assertion_requires_visible_answer_section() -> None:
+    output = json.dumps(
+        {
+            "provider_status": "ok",
+            "status": "done",
+            "route": "orchestrator",
+            "human_summary": "Read-only answer without a section heading.",
+            "slack_context_attached": True,
+            "can_send_email": False,
+            "send_enabled": False,
+            "forbidden_actions": ["send_email"],
+            "side_effects": _side_effects(),
+            "external_write_performed": False,
+        }
+    )
+
+    result = grade_output(output, {"vars": {}})
+
+    assert result["pass"] is False
+    assert "missing a visible Answer section" in result["reason"]
+
+
+def test_promptfoo_assertion_accepts_visible_answer_section() -> None:
+    output = json.dumps(
+        {
+            "provider_status": "ok",
+            "status": "done",
+            "route": "orchestrator",
+            "human_summary": "*Answer:*\nRead-only answer with a section heading.",
+            "slack_context_attached": True,
+            "can_send_email": False,
+            "send_enabled": False,
+            "forbidden_actions": ["send_email"],
+            "side_effects": _side_effects(),
+            "external_write_performed": False,
+        }
+    )
+
+    result = grade_output(output, {"vars": {}})
+
+    assert result["pass"] is True
+
+
 def test_promptfoo_assertion_rejects_missing_side_effect_instrumentation() -> None:
     output = json.dumps(
         {
@@ -1073,7 +1190,7 @@ def test_promptfoo_assertion_checks_tooling_and_source_metadata() -> None:
             "provider_status": "ok",
             "status": "done",
             "route": "opportunity_scout",
-            "human_summary": "RFP source fixture://government/rfp",
+            "human_summary": "*Answer:*\nRFP source fixture://government/rfp",
             "source_count": 1,
             "source_urls": ["fixture://government/rfp"],
             "source_types": ["government"],
@@ -1129,7 +1246,7 @@ def test_promptfoo_assertion_checks_required_summary_patterns() -> None:
             "status": "done",
             "route": "business_research_analyst",
             "human_summary": (
-                "Product: MetricBridge automates PHQ-9 follow-up. "
+                "*Answer:*\nProduct: MetricBridge automates PHQ-9 follow-up. "
                 "Buyer: outpatient behavioral health clinics. "
                 "Evidence: fixture://source. Risk: outcome claims are unsupported."
             ),
@@ -1280,7 +1397,7 @@ def test_promptfoo_assertion_allows_negated_forbidden_action_terms() -> None:
             "status": "done",
             "route": "chief_of_staff",
             "human_summary": (
-                "Read-only Chief of Staff plan from fixture://source. "
+                "*Answer:*\nRead-only Chief of Staff plan from fixture://source. "
                 "No message was posted to Slack and email was not sent."
             ),
             "source_count": 1,
@@ -1352,7 +1469,7 @@ def test_promptfoo_assertion_allows_excluded_forbidden_category_terms() -> None:
             "status": "done",
             "route": "opportunity_scout",
             "human_summary": (
-                "Behavioral health opportunities from fixture://source. "
+                "*Answer:*\nBehavioral health opportunities from fixture://source. "
                 "Excluded staffing-only and non-US items."
             ),
             "source_count": 1,
@@ -1985,6 +2102,7 @@ def test_slack_eval_run_records_joined_manual_run_summary_without_api(tmp_path) 
         cost_profile="local_review",
         sdk_estimated_cost_usd=0.012,
         sdk_cache_hit_rate=0.5,
+        duration_ms=1234.5,
         response_hash="response-hash-001",
         evidence={
             "orchestrator_preflight": {"blocker_count": 1},
@@ -2032,6 +2150,8 @@ def test_slack_eval_run_records_joined_manual_run_summary_without_api(tmp_path) 
     assert manual["metadata"]["correlation"]["run_id"] == "wi_manual"
     assert manual["metadata"]["diagnostic_contract"]["schema"] == "keystone.eval_run_diagnostics.v1"
     assert manual["metadata"]["diagnostic_contract"]["logs_hold_verbose_details"] is True
+    assert manual["duration_ms"] == 1234.5
+    assert manual["metadata"]["execution"]["duration_ms"] == 1234.5
     assert manual["metadata"]["model"]["provider"] == "openai"
     assert manual["metadata"]["model"]["has_model_config"] is True
     assert manual["metadata"]["tooling"]["tool_call_count"] == 3
@@ -2080,6 +2200,28 @@ def test_slack_eval_run_records_joined_manual_run_summary_without_api(tmp_path) 
         "Tool failures",
         "Approval gate",
     }
+    manual_event = next(
+        event for event in trace["recent_events"] if event["event_type"] == "manual_run_summary"
+    )
+    assert manual_event["agentic_summary"]["signal"] == "1 failed tool call"
+    assert manual_event["agentic_summary"]["route"] == "business_research_analyst"
+    assert "3 tool calls" in manual_event["agentic_summary"]["tools"]
+    assert "search_web" in manual_event["agentic_summary"]["tools"]
+    assert manual_event["agentic_summary"]["retrieval"] == "1/2 visible sources via searxng"
+    assert manual_event["agentic_summary"]["model"] == "openai gpt-5.4-mini"
+    readiness = {item["key"]: item for item in manual_event["field_readiness"]["checks"]}
+    assert readiness["duration"]["status"] == "complete"
+    assert readiness["model"]["status"] == "complete"
+    assert readiness["tooling"]["status"] == "complete"
+    assert readiness["retrieval"]["status"] == "complete"
+    assert readiness["orchestrator"]["status"] == "complete"
+    assert readiness["prompt_version"]["status"] == "complete"
+    assert readiness["cost"]["status"] == "complete"
+    assert readiness["api_sdk_summary"]["status"] == "attention"
+    assert manual_event["field_readiness"]["missing"] == ["API SDK summary"]
+    slack_ledger = next(item for item in dashboard_payload(database_path=database_path)["run_ledger"] if item["source"] == "slack")
+    assert slack_ledger["trace_agentic_summary"]["signal"] == "1 failed tool call"
+    assert "trace 1 failed tool call" in slack_ledger["details"]
     assert trace["sdk_run_summary_count"] == 0
     assert quality_checks["trace_run_summaries"]["status"] == "pending"
     assert "Manual no-API summaries" in quality_checks["trace_run_summaries"]["detail"]
@@ -2524,6 +2666,34 @@ def test_eval_database_resolves_natural_slack_ask_to_existing_promptfoo_case(
     assert case_id == "slack_agents_sdk_course_001"
 
 
+def test_eval_database_explicit_eval_case_id_wins_over_fuzzy_match(tmp_path) -> None:
+    database_path = tmp_path / "evals.sqlite"
+    record_slack_eval_run(
+        case_id="slack_from_this_thread_001",
+        run_id="wi_old",
+        agent="chief_of_staff",
+        request_text="From this thread, produce exactly two sections.",
+        result_summary="Older similar response.",
+        database_path=database_path,
+    )
+
+    case_id = resolve_slack_eval_case_id(
+        request_text=(
+            "chief of staff: eval case slack_cos_readonly_two_section_response_20260620_001 "
+            "From this thread, produce exactly two sections."
+        ),
+        agent="chief_of_staff",
+        slack_channel_id="C0BA17Y9C01",
+        slack_channel_name="evals",
+        database_path=database_path,
+    )
+
+    assert case_id == "slack_cos_readonly_two_section_response_20260620_001"
+    status = eval_case_status(case_id, database_path=database_path)
+    assert status["case"]["source"] == "slack"
+    assert status["case"]["user_input"].startswith("chief of staff: eval case")
+
+
 def test_eval_database_recovers_case_from_slack_thread(tmp_path) -> None:
     database_path = tmp_path / "evals.sqlite"
     record_slack_eval_run(
@@ -2616,6 +2786,20 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
         ),
         database_path=database_path,
     )
+    with sqlite3.connect(database_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(human_eval_reviews)")}
+        assert "total_score" in columns
+        assert "score_accuracy" in columns
+        assert "score_instruction_following" in columns
+        review_row = connection.execute(
+            """
+            SELECT total_score, score_accuracy, score_relevance, score_instruction_following
+            FROM human_eval_reviews
+            WHERE case_id = ?
+            """,
+            ("slack_agents_sdk_course_001",),
+        ).fetchone()
+    assert review_row == pytest.approx((4.455, 4, 5, 5))
     record_slack_eval_run(
         case_id="slack_agents_sdk_course_001",
         run_id="wi_course",
@@ -2669,13 +2853,19 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     )
 
     html = output_path.read_text(encoding="utf-8")
-    assert "Keystone Eval Dashboard" in html
+    assert "Keystone Eval Scoring" in html
     assert "slack_agents_sdk_course_001" in html
     assert "opportunity_scout" in html
     assert "Human Avg / 5" in html
     assert "Machine Pass Rate" in html
+    assert "Scoring status" in html
+    assert "Orchestrator Review" in html
+    assert "Orchestrator Judge" not in html
+    assert "Orchestrator judge" not in html
+    assert "dashboard judge scoring" not in html
     assert "Scoring notes" in html
     assert "Promptfoo scores are backend assertion checks" in html
+    assert "manual human and Orchestrator Review scorecards" in html
     assert "Human Quality Review" in html
     assert "Promptfoo Run Analysis" in html
     assert "Case Changes Across Runs" in html
@@ -2688,22 +2878,42 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     assert "Data Quality" in html
     assert "Slack Evidence" in html
     assert "Slack evidence" in html
-    assert "Trace Dashboard" in html
-    assert html.index("trace-analytics") < html.index("Trace Processor Readiness")
+    assert "Trace Explorer" in html
+    assert "Trace Health" in html
+    assert "Trace Diagnostics" in html
+    assert "Current Run Trace" in html
+    assert "Trace Event Log" in html
+    assert "trace-event-detail" in html
+    assert "data-trace-detail-index" in html
+    assert "Show full sanitized trace details" in html
+    assert "keystone.eval.trace_event_detail.v1" in html
+    assert "Bounded sanitized trace packet" in html
+    assert "Storage & Instrumentation" in html
+    assert html.index("Trace Health") < html.index("Current Run Trace")
+    assert html.index("trace-analytics") < html.index("trace-latest-run")
+    assert html.index("Trace Diagnostics") < html.index("Current Run Trace")
+    assert "trace-storage-stack" in html
     assert "Trace Processor Readiness" in html
     assert "Local DB Freshness" in html
     assert "trace-db-freshness" in html
     assert "Slack runs table" in html
     assert "Promptfoo cases table" in html
     assert "Human reviews table" in html
-    assert "Trace Analytics" in html
     assert "trace-analytics" in html
-    assert "Trace join health" in html
-    assert "Manual/API split" in html
-    assert "Diagnostic load" in html
-    assert "Top diagnostic category" in html
-    assert "Trace privacy" in html
-    assert "Trace Diagnostic Categories" in html
+    assert "Join health" in html
+    assert "Run source split" in html
+    assert "Diagnostic signals" in html
+    assert "Top cleanup signal" in html
+    assert "Privacy guardrail" in html
+    assert "trace-current-timeline" in html
+    assert "traceTimelineMarkup" in html
+    assert "traceStepLabel" in html
+    assert "traceEventSignal" in html
+    assert "traceAgenticFacts" in html
+    assert "traceSameRun" in html
+    assert "<div class=\"label\">Tools</div>" in html
+    assert "<div class=\"label\">Retrieval</div>" in html
+    assert "<div class=\"label\">Model</div>" in html
     assert "diagnostic_category_counts" in html
     assert "diagnostic_category_trends" in html
     assert "trace-diagnostic-trend-chart" in html
@@ -2730,7 +2940,7 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     assert "Implementation Contract" in html
     assert "raw prompts" in html
     assert "eval_trace_events" in html
-    assert "Metadata preview" in html
+    assert "Metadata preview" not in html
     assert "copyTraceReview" in html
     assert "data-copy-trace-event" in html
     assert "ensureCopyFallback" in html
@@ -2743,7 +2953,25 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     assert "joined_case" in html
     assert "case_bundle_url: joinKey ? `/api/eval-case-bundle?case=${encodeURIComponent(joinKey)}` : ''" in html
     assert "metadata_truncated" in html
-    assert 'title="${escapeHtml(traceMetadataPreview(event, 220))}"' in html
+    assert "metadata_excerpt" in html
+    assert "field_readiness" in html
+    assert "missing_relevant_fields" in html
+    assert "Trace includes compact timing, model, tool, retrieval, approval, side-effect, prompt/config, cost/cache, and error/retry diagnostics." in html
+    assert "Analysis Latest Run" not in html
+    assert "Analysis Data Handoff" not in html
+    assert "analysis-latest-run" not in html
+    assert "Latest pass rate" not in html
+    prompt_rows_script = re.search(
+        r"function renderPromptRows\(\) \{(.*?)function renderRows",
+        html,
+        re.DOTALL,
+    )
+    assert prompt_rows_script is not None
+    assert "runScoreStrip(item)" not in prompt_rows_script.group(1)
+    assert "latestRun" not in prompt_rows_script.group(1)
+    assert "latestRunAt" not in prompt_rows_script.group(1)
+    assert "evidence" not in prompt_rows_script.group(1)
+    assert "Slack not run" not in prompt_rows_script.group(1)
     assert "workflow-stage-bar" in html
     assert "Source checks" in html
     assert "Thread preview" in html
@@ -2766,13 +2994,14 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     assert "Secondary diagnostics" in html
     assert "Planned chart backlog" in html
     assert "Review completion funnel" in html
-    assert "Machine vs human coverage" in html
+    assert "Machine vs review coverage" in html
+    assert "Review scorecards" in html
     assert "Cost-safe run volume" in html
     assert "Prompt score distribution" in html
     assert "Agent score comparison" in html
     assert "Dimension readiness heatmap" in html
     assert "Machine trend line" in html
-    assert "Human review trend line" in html
+    assert "Review trend line" in html
     assert "One AI agent call per root eval" in html
     assert "Interaction guardrails" in html
     assert "Future live trigger" in html
@@ -2780,12 +3009,13 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     assert "No API call from dashboard copy" in html
     assert "Use dry-run fixtures/cache first; cap live retrieval to accepted root run" in html
     assert "No model call; form uses saved case, run id, thread, and response context" in html
-    assert "No model call; no Slack post" in html
+    assert "Manual submit uses no model call and no Slack post; Orchestrator Review runs only when explicitly enabled" in html
     assert "Latest run time" in html
     assert "Run source" in html
     assert "Run id / thread" in html
     assert "<th>Machine</th>" in html
-    assert "<th>Human</th>" in html
+    assert "<th>Human review</th>" in html
+    assert "<th>Orchestrator Review</th>" in html
     assert "<th>Evidence</th>" in html
     assert "uniqueness" in html
     assert "display_prompt_number" in html
@@ -2825,7 +3055,16 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     assert data["analysis"]["run_trends"]
     assert data["analysis"]["agent_score_trends"]["series"]["all"]
     assert "opportunity_scout" in data["analysis"]["agent_score_trends"]["agents"]
-    assert "Average Score Over Time" in html
+    assert "Average Score Across Time" in html
+    assert "<div class=\"metric-th-title\">Human accuracy</div>" in html
+    assert "<div class=\"metric-th-title\">Orchestrator accuracy</div>" in html
+    assert "<div class=\"metric-th-title\">Human relevance</div>" in html
+    assert "<div class=\"metric-th-title\">Orchestrator relevance</div>" in html
+    assert "<th>Human scores</th>" not in html
+    assert "<th>Orchestrator scores</th>" not in html
+    assert "scoreMetricStrip" in html
+    assert "Machine average" in html
+    assert "Orchestrator Review average" in html
     assert "Review target" in html
     assert 'id="analysis-agent-trend-filter"' in html
     assert "human_case_trends" in data["analysis"]
@@ -2872,6 +3111,9 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     assert slack_ledger["case_id"] == "slack_agents_sdk_course_001"
     assert slack_ledger["run_id"] == "wi_course"
     assert "2 messages" in slack_ledger["details"]
+    assert slack_ledger["trace_agentic_summary"]["signal"] == "2/3 visible sources"
+    assert slack_ledger["trace_agentic_summary"]["retrieval"] == "2/3 visible sources"
+    assert "trace 2/3 visible sources" in slack_ledger["details"]
     assert slack_ledger["dashboard_url"].endswith("?case=slack_agents_sdk_course_001")
     assert slack_ledger["review_url"].endswith("?case=slack_agents_sdk_course_001")
     assert slack_ledger["case_bundle_url"].endswith(
@@ -2883,7 +3125,7 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     assert slack_checks["human_review"]["status"] == "complete"
     assert slack_checks["promptfoo_import"]["status"] == "complete"
     assert slack_ledger["next_follow_up"] == (
-        "Ready to compare Slack output, machine score, and human review in Analysis."
+        "Ready to compare Slack output, machine score, Orchestrator Review, and human review in Analysis."
     )
     promptfoo_ledger = next(item for item in data["run_ledger"] if item["source"] == "promptfoo")
     promptfoo_checks = {item["label"]: item for item in promptfoo_ledger["review_checklist"]}
@@ -2926,10 +3168,12 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     assert interactions[2]["cost_guardrail"] == "Use imported Promptfoo result by case_id; do not rerun Promptfoo from Slack thread"
     assert interactions[3]["cost_guardrail"] == "Use dry-run fixtures/cache first; cap live retrieval to accepted root run"
     assert interactions[4]["cost_guardrail"] == "No model call; form uses saved case, run id, thread, and response context"
-    assert interactions[5]["cost_guardrail"] == "No model call; no Slack post; writes one review row, then refreshes Database, Runs & Scoring, and Analysis from saved rows"
+    assert interactions[5]["cost_guardrail"] == (
+        "Manual submit uses no model call and no Slack post; Orchestrator Review runs only when explicitly enabled, then refreshes Database, Runs & Scoring, and Analysis from saved rows"
+    )
     assert data["score_dimensions"]
     assert "review-form" in html
-    assert "Score saving is disabled until this case has a recorded Promptfoo or Slack response." in html
+    assert "Review controls are disabled." not in html
 
 
 def test_eval_dashboard_human_state_tracks_latest_slack_target(tmp_path) -> None:
@@ -3439,6 +3683,137 @@ def test_human_review_payload_resolves_slack_thread_target(tmp_path) -> None:
     assert stored[0]["slack_thread_ts"] == "1781206953.875749"
 
 
+def test_orchestrator_judge_scores_saved_evals_slack_run_as_scorecard(tmp_path) -> None:
+    database_path = tmp_path / "evals.sqlite"
+    record_slack_eval_run(
+        case_id="slack_agents_sdk_course_001",
+        run_id="wi_expected",
+        agent="opportunity_scout",
+        slack_channel_name="evals",
+        slack_thread_ts="1781206953.875749",
+        request_text="@KNI opportunity scout -- find three Agents SDK courses",
+        result_summary="Course scan complete with three options and sources.",
+        database_path=database_path,
+    )
+
+    result = score_eval_run_with_orchestrator_judge(
+        case_id="slack_agents_sdk_course_001",
+        slack_thread_ts="1781206953.875749",
+        database_path=database_path,
+        scorer=lambda _packet: OrchestratorEvalJudgeScorecard(
+            scores=_review_scores(accuracy=5, source_quality=3),
+            safety="pass",
+            notes=(
+                "For this run, the response answered the course request but lowered the "
+                "score because source detail was thin."
+            ),
+            dimension_rationales={
+                "accuracy": "The saved response matches the prompt at a high level.",
+                "source_quality": "Only thin source detail was visible in the run output.",
+            },
+            recommended_next_action="Use as baseline; improve sources next.",
+            confidence=0.8,
+        ),
+    )
+    stored = list_human_reviews(
+        database_path=database_path,
+        case_id="slack_agents_sdk_course_001",
+    )
+    payload = dashboard_payload(database_path=database_path)
+    case = next(item for item in payload["cases"] if item["case_id"] == "slack_agents_sdk_course_001")
+    status = eval_case_status("slack_agents_sdk_course_001", database_path=database_path)
+
+    assert result["review_kind"] == "orchestrator_judge"
+    assert result["reviewer"] == "orchestrator_judge"
+    assert result["average_score"] == pytest.approx(4.0)
+    assert stored[0]["review_kind"] == "orchestrator_judge"
+    assert status["human_review_count"] == 0
+    assert status["orchestrator_judge_review_count"] == 1
+    assert status["scorecard_review_count"] == 1
+    assert case["human_average"] is None
+    assert case["review_kind"] == ""
+    assert case["orchestrator_judge_average"] == pytest.approx(4.0)
+    assert "lowered the score" in case["orchestrator_judge_run_comment"]
+    assert (
+        case["orchestrator_judge_dimension_rationales"]["source_quality"]
+        == "Only thin source detail was visible in the run output."
+    )
+    assert payload["summary"]["human_reviewed"] == 0
+    assert payload["summary"]["orchestrator_judge_reviewed"] == 1
+    assert payload["analysis"]["agent_score_trends"]["series"]["all"][0][
+        "orchestrator_judge_average"
+    ] == pytest.approx(4.0)
+
+
+def test_orchestrator_judge_scorecard_is_agents_strict_schema_compatible() -> None:
+    AgentOutputSchema(OrchestratorEvalJudgeScorecard)
+
+
+def test_orchestrator_judge_rejects_promptfoo_only_case(tmp_path) -> None:
+    results_path = tmp_path / "results.json"
+    results_path.write_text(
+        json.dumps(
+            {
+                "evalId": "eval-one",
+                "results": {
+                    "timestamp": "2026-06-20T10:00:00Z",
+                    "stats": {"successes": 1, "failures": 0, "errors": 0},
+                    "results": [
+                        {
+                            "vars": {
+                                "case_id": "promptfoo_only_001",
+                                "agent_under_test": "opportunity_scout",
+                                "user_input": "@KNI opportunity scout find courses",
+                            },
+                            "success": True,
+                            "score": 1,
+                            "response": {"output": "Promptfoo fixture response."},
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    database_path = tmp_path / "evals.sqlite"
+    import_promptfoo_results(results_path, database_path=database_path)
+
+    with pytest.raises(ValueError, match="saved #evals Slack run"):
+        score_eval_run_with_orchestrator_judge(
+            case_id="promptfoo_only_001",
+            database_path=database_path,
+            scorer=lambda _packet: OrchestratorEvalJudgeScorecard(
+                scores=_review_scores(),
+                safety="pass",
+            ),
+        )
+
+
+def test_orchestrator_judge_payload_requires_enable_flag(tmp_path, monkeypatch) -> None:
+    database_path = tmp_path / "evals.sqlite"
+    record_slack_eval_run(
+        case_id="slack_agents_sdk_course_001",
+        run_id="wi_expected",
+        agent="opportunity_scout",
+        slack_channel_name="evals",
+        slack_thread_ts="1781206953.875749",
+        request_text="@KNI opportunity scout -- find three Agents SDK courses",
+        result_summary="Course scan complete.",
+        database_path=database_path,
+    )
+    monkeypatch.delenv("KEYSTONE_EVAL_LLM_JUDGE", raising=False)
+
+    with pytest.raises(ValueError, match="KEYSTONE_EVAL_LLM_JUDGE=true"):
+        eval_dashboard_server.save_orchestrator_judge_payload(
+            {
+                "case_id": "slack_agents_sdk_course_001",
+                "run_id": "wi_expected",
+                "slack_thread_ts": "1781206953.875749",
+            },
+            database_path=database_path,
+        )
+
+
 def test_human_review_payload_inherits_api_redacted_slack_target(tmp_path) -> None:
     database_path = tmp_path / "evals.sqlite"
     record_slack_eval_run(
@@ -3661,6 +4036,157 @@ def test_promptfoo_eval_db_record_slack_run_accepts_diagnostics(
     assert categories["orchestrator_feedback"] == 1
     assert categories["web_extraction_issues"] == 1
     assert categories["tool_failures"] == 1
+
+
+def test_sync_slack_eval_thread_records_completed_thread(tmp_path: Path) -> None:
+    database_path = tmp_path / "evals.sqlite"
+    thread_path = tmp_path / "thread.json"
+    thread_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "messages": [
+                    {
+                        "ts": "1781972599.940979",
+                        "text": (
+                            "<@U0ASBG2R823|KNI> chief of staff: eval case "
+                            "slack_cos_exec_brief_three_sections_001\n\n"
+                            "Make a three-section executive brief from this thread: "
+                            "decision, evidence, next action."
+                        ),
+                    },
+                    {
+                        "ts": "1781972620.111111",
+                        "text": (
+                            "Business Agents Run Completed\n"
+                            "Run: sbar_737037d36ecb44b89d2aab2120b91e29\n"
+                            "Status: completed"
+                        ),
+                    },
+                    {
+                        "ts": "1781972630.222222",
+                        "text": (
+                            "Decision: keep the run pending until completion evidence is visible.\n"
+                            "Evidence: the Slack run completed and linked one source: "
+                            "https://example.com/evidence\n"
+                            "Next action: update the scoring form."
+                        ),
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = sync_slack_eval_thread_script.sync_slack_eval_thread(
+        database_path=database_path,
+        thread_json_path=str(thread_path),
+        channel_id="C0BA17Y9C01",
+        channel_name="evals",
+    )
+
+    assert payload["case_id"] == "slack_cos_exec_brief_three_sections_001"
+    assert payload["run_id"] == "sbar_737037d36ecb44b89d2aab2120b91e29"
+    assert payload["status"] == "done"
+    status = eval_case_status(payload["case_id"], database_path=database_path)
+    assert status["slack_run_count"] == 1
+    assert status["slack_runs"][0]["thread_message_count"] == 3
+    assert status["slack_runs"][0]["source_count"] == 1
+    dashboard = dashboard_payload(database_path=database_path, limit=200)
+    case = next(item for item in dashboard["cases"] if item["case_id"] == payload["case_id"])
+    assert case["latest_run_source"] == "slack"
+    assert case["latest_run_id"] == "sbar_737037d36ecb44b89d2aab2120b91e29"
+    assert case["latest_run_at"]
+    assert "Decision:" in case["latest_slack_summary"]
+    assert "Decision:" in case["scored_response_text"]
+    assert payload["post_save_state"]["dashboard_visibility"]["case_visible"] is True
+
+
+def test_sync_slack_eval_thread_requires_explicit_source(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="use exactly one"):
+        sync_slack_eval_thread_script.sync_slack_eval_thread(
+            database_path=tmp_path / "evals.sqlite",
+        )
+
+
+def test_sync_slack_eval_thread_cli_reads_thread_json_from_stdin(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    database_path = tmp_path / "evals.sqlite"
+    thread_payload = {
+        "ok": True,
+        "messages": [
+            {
+                "ts": "1781973000.100000",
+                "text": (
+                    "<@U0ASBG2R823|KNI> opportunity scout: eval case "
+                    "slack_live_sync_stdin_001\nFind one safe eval target."
+                ),
+            },
+            {
+                "ts": "1781973001.100000",
+                "text": "Business Agents Run Completed\nRun: sbar_stdin123\nStatus: completed",
+            },
+            {
+                "ts": "1781973002.100000",
+                "text": "Result: found one safe target for review.",
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "sync_slack_eval_thread.py",
+            "--database-path",
+            str(database_path),
+            "--thread-json",
+            "-",
+            "--json",
+        ],
+    )
+    monkeypatch.setattr("sys.stdin", SimpleNamespace(read=lambda: json.dumps(thread_payload)))
+
+    assert sync_slack_eval_thread_script.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["case_id"] == "slack_live_sync_stdin_001"
+    assert payload["run_id"] == "sbar_stdin123"
+    status = eval_case_status("slack_live_sync_stdin_001", database_path=database_path)
+    assert status["slack_run_count"] == 1
+
+
+def test_live_slack_eval_case_keeps_explicit_display_case_id(tmp_path) -> None:
+    database_path = tmp_path / "evals.sqlite"
+    record_slack_eval_run(
+        case_id="slack_cos_decision_memo_quality_20260620_001",
+        run_id="sbar_live_label",
+        agent="chief_of_staff",
+        request_text=(
+            "@KNI chief of staff: eval case slack_cos_decision_memo_quality_20260620_001 "
+            "Create a decision memo."
+        ),
+        result_summary="Saved live Slack response.",
+        thread_fetch_status="ok",
+        thread_message_count=3,
+        database_path=database_path,
+    )
+
+    payload = dashboard_payload(database_path=database_path)
+    selected = next(
+        item
+        for item in payload["cases"]
+        if item["case_id"] == "slack_cos_decision_memo_quality_20260620_001"
+    )
+    bundle = eval_case_bundle_response(
+        case_id="slack_cos_decision_memo_quality_20260620_001",
+        database_path=database_path,
+    )["bundle"]
+
+    assert selected["source"] == "slack"
+    assert selected["display_prompt_number"]
+    assert selected["display_case_id"] == selected["case_id"]
+    assert bundle["display_case_id"] == "slack_cos_decision_memo_quality_20260620_001"
 
 
 def test_promptfoo_eval_db_record_slack_run_accepts_display_case_id(
@@ -4069,8 +4595,17 @@ def test_eval_dashboard_coverage_uses_seed_pack_not_ad_hoc_slack_cases(tmp_path)
     assert data["summary"]["coverage"]["airtable_context_agent"]["target"] == 2
     assert data["summary"]["coverage"]["google_workspace_context_agent"]["target"] == 2
     assert data["summary"]["coverage"]["zotero_context_agent"]["target"] == 1
-    assert data["summary"]["coverage_complete_agents"] == len(data["summary"]["coverage"])
-    assert data["summary"]["coverage_gap_total"] == 0
+    expected_complete_agents = sum(
+        1
+        for item in data["summary"]["coverage"].values()
+        if int(item["count"]) >= int(item["target"])
+    )
+    expected_gap_total = sum(
+        max(0, int(item["target"]) - int(item["count"]))
+        for item in data["summary"]["coverage"].values()
+    )
+    assert data["summary"]["coverage_complete_agents"] == expected_complete_agents
+    assert data["summary"]["coverage_gap_total"] == expected_gap_total
     assert (
         data["summary"]["coverage_target_label"]
         == "core 15; Chief 20; context starter set"
@@ -4212,11 +4747,11 @@ def test_human_review_post_save_state_marks_completed_case_out_of_queue(tmp_path
     assert follow_up["missing_labels"] == []
     assert follow_up["attention_labels"] == []
     assert follow_up["next_follow_up"] == (
-        "Ready to compare prompt, response, machine score, human review, evidence, and analysis movement."
+        "Ready to compare prompt, response, machine score, Orchestrator Review, human review, evidence, and analysis movement."
     )
     assert result["post_save_state"]["dashboard_visibility"] == {
         "case_visible": True,
-        "display_case_id": "slack_review_complete_016",
+        "display_case_id": "slack_review_complete_001",
         "review_visible": True,
         "analysis_human_review_visible": True,
         "in_follow_up_queue": False,
@@ -4232,7 +4767,8 @@ def test_eval_review_form_blocks_unrun_case_until_response_exists(tmp_path) -> N
         database_path=database_path,
     )
 
-    assert "Score saving is disabled until this case has a recorded Promptfoo or Slack response." in html
+    assert "Review controls are disabled." in html
+    assert "No Promptfoo result or saved #evals Slack response is recorded." in html
     assert '<button type="submit" disabled>Update review</button>' in html
     assert "Human notes" in html
     assert '<option value="" selected>tbd</option>' in html
@@ -4314,7 +4850,7 @@ def test_eval_review_html_uses_scored_response_for_server_side_readiness() -> No
     assert "Saved response selected for scoring." in html
     assert '<button type="submit">Update review</button>' in html
     assert '<button type="submit" disabled>Update review</button>' not in html
-    assert "Score saving is disabled until this case has a recorded Promptfoo or Slack response." not in html
+    assert "Review controls are disabled." not in html
 
 
 def test_eval_dashboard_review_target_uses_promptfoo_eval_for_machine_only_case(tmp_path) -> None:
@@ -5798,9 +6334,6 @@ def test_dashboard_follow_up_queue_prioritizes_current_eval_gaps(tmp_path) -> No
         for index, item in enumerate(queue)
         if item["case_id"] in {"slack_quality_gap_older_001", "slack_quality_gap_newer_001"}
     ]
-    first_pending_index = next(
-        index for index, item in enumerate(queue) if not item.get("has_latest_run")
-    )
     first = next(item for item in queue if item["case_id"] == "slack_quality_gap_older_001")
     newer = next(item for item in queue if item["case_id"] == "slack_quality_gap_newer_001")
     html = render_dashboard(database_path=database_path, output_path=tmp_path / "dashboard.html").read_text(
@@ -5808,7 +6341,8 @@ def test_dashboard_follow_up_queue_prioritizes_current_eval_gaps(tmp_path) -> No
     )
 
     assert dated_case_ids == ["slack_quality_gap_older_001", "slack_quality_gap_newer_001"]
-    assert dated_indexes[-1] < first_pending_index
+    assert dated_indexes == [0, 1]
+    assert all(item.get("has_latest_run") for item in queue)
     assert first["primary_label"] == "slack_thread_evidence"
     assert first["primary_label_display"] == "Slack thread evidence"
     assert first["status"] == "missing"
@@ -5827,6 +6361,30 @@ def test_dashboard_follow_up_queue_prioritizes_current_eval_gaps(tmp_path) -> No
     assert "human_review_queue_count" in html
     assert "review_blocked_count" in html
     assert "Review blocked" in html
+
+
+def test_dashboard_follow_up_queue_omits_seed_only_cases_after_clean_slate() -> None:
+    seed_only_case = {
+        "case_id": "slack_seed_only_001",
+        "display_case_id": "slack_seed_only_001",
+        "agent": "business_research_analyst",
+        "user_input": "@KNI business research analyst summarize sources",
+        "case_review_checklist": [
+            {"label": "recorded_response", "status": "missing", "detail": "No response yet."},
+            {"label": "machine_check", "status": "missing", "detail": "No machine row yet."},
+        ],
+    }
+    runtime_case = {
+        **seed_only_case,
+        "case_id": "slack_runtime_gap_001",
+        "latest_slack_run_id": "wi_runtime_gap",
+        "latest_run_at": "2026-06-20T20:00:00Z",
+        "slack_run_count": 1,
+    }
+
+    queue = eval_dashboard_module._follow_up_queue([seed_only_case, runtime_case])
+
+    assert [item["case_id"] for item in queue] == ["slack_runtime_gap_001"]
 
 
 def test_dashboard_follow_up_queue_names_slack_gap_before_human_review_for_machine_only_case(
@@ -6012,7 +6570,12 @@ def test_promptfoo_provider_compacts_ask_agent_payload(monkeypatch) -> None:
             "next_action": {"agent": "business_research_analyst", "requires_approval": False},
             "target": {
                 "metadata": {
-                    "slack_context": {"channel_id": "C0BA17Y9C01"},
+                    "slack_context": {
+                        "channel_id": "CDOCS123",
+                        "channel_name": "docs",
+                        "thread_ts": "1800000000.000100",
+                        "selected_message_ts": "1800000000.000100",
+                    },
                     "manager_loop_efficiency": {
                         "final_synthesis_executed": True,
                         "live_sdk": False,
@@ -6051,6 +6614,10 @@ def test_promptfoo_provider_compacts_ask_agent_payload(monkeypatch) -> None:
                 "surface": "slack",
                 "user_input": "@KNI orchestrator agent \"find companies\"",
                 "slack_context": {
+                    "channel_id": "CDOCS123",
+                    "channel_name": "docs",
+                    "thread_ts": "1800000000.000100",
+                    "selected_message_ts": "1800000000.000100",
                     "selected_message": {
                         "ts": "1800000000.000100",
                         "user_id": "U_EVAL",
@@ -6078,9 +6645,63 @@ def test_promptfoo_provider_compacts_ask_agent_payload(monkeypatch) -> None:
     assert output["context_pack_type"] == "opportunity"
     assert output["final_synthesis_executed"] is True
     assert output["slack_context_attached"] is True
+    assert output["slack_channel_id"] == "CDOCS123"
+    assert output["slack_channel_name"] == "docs"
+    assert output["slack_thread_ts"] == "1800000000.000100"
     assert output["send_enabled"] is False
     assert output["side_effects"]["external_write_performed"] is False
     assert output["side_effect_evidence_complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("channel_id", "channel_name"),
+    [
+        ("CAIAWFLOW", "ai-agents-workflow"),
+        ("CANNOUNCE", "announcements"),
+        ("CCALENDAR", "calendar"),
+        ("CCOLLAB", "collaborations"),
+        ("CDOCS123", "docs"),
+        ("CEVALS123", "evals"),
+        ("CGENERAL", "general"),
+        ("CGIT123", "git"),
+        ("CGMAIL123", "gmail"),
+        ("CGRANTS", "grants-and-funding"),
+        ("CKNOWHUB", "knowledge-hub"),
+        ("CMEETINGS", "meetings"),
+        ("CRUNTIME", "runtime-updates"),
+    ],
+)
+def test_promptfoo_compact_payload_preserves_source_slack_channel(
+    channel_id: str,
+    channel_name: str,
+) -> None:
+    output = keystone_agent_provider._compact_run_payload(
+        {
+            "status": "done",
+            "route": "chief_of_staff",
+            "human_summary": "*Answer:*\nRead-only channel diagnostic.",
+            "work_item": {
+                "status": "done",
+                "current_route": "chief_of_staff",
+                "target": {
+                    "metadata": {
+                        "slack_context": {
+                            "channel_id": channel_id,
+                            "channel_name": channel_name,
+                            "thread_ts": "1800000000.000100",
+                            "selected_message_ts": "1800000000.000100",
+                        }
+                    }
+                },
+            },
+            "side_effects": _side_effects(),
+        }
+    )
+
+    assert output["slack_context_attached"] is True
+    assert output["slack_channel_id"] == channel_id
+    assert output["slack_channel_name"] == channel_name
+    assert output["slack_thread_ts"] == "1800000000.000100"
 
 
 def test_promptfoo_provider_handles_missing_route_result(monkeypatch) -> None:
@@ -6124,6 +6745,66 @@ def test_promptfoo_provider_handles_missing_route_result(monkeypatch) -> None:
     assert output["status"] == "blocked"
     assert output["context_sources"] == ["airtable", "slack"]
     assert output["side_effects"]["approval_ref"] == ""
+
+
+def test_promptfoo_provider_normalizes_missing_safe_side_effect_evidence(monkeypatch) -> None:
+    stdout_payload = {
+        "status": "done",
+        "route": "opportunity_scout",
+        "human_summary": "Read-only result from fixture://source",
+        "orchestrator_preflight": {
+            "route_result": {
+                "route": "opportunity_scout",
+                "approval_required": True,
+                "can_send_email": False,
+                "send_enabled": False,
+                "forbidden_actions": ["send_email"],
+            }
+        },
+        "work_item": {
+            "status": "done",
+            "current_route": "opportunity_scout",
+            "sources": [
+                {"url": "fixture://source", "title": "Fixture source", "source_type": "fixture"}
+            ],
+            "target": {
+                "metadata": {
+                    "slack_context": {"channel_id": "C0BA17Y9C01"},
+                    "manager_loop_efficiency": {
+                        "final_synthesis_executed": True,
+                        "live_sdk": False,
+                        "live_search": False,
+                    },
+                }
+            },
+        },
+    }
+
+    def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=json.dumps(stdout_payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(keystone_agent_provider.subprocess, "run", fake_run)
+    result = keystone_agent_provider.call_api(
+        '@KNI opportunity scout "find safe opportunities"',
+        {"config": {"python": ".venv/bin/python", "agent": "opportunity_scout"}},
+        {
+            "vars": {
+                "surface": "slack",
+                "user_input": '@KNI opportunity scout "find safe opportunities"',
+            }
+        },
+    )
+
+    output = json.loads(result["output"])
+    assert output["side_effects"]["instrumentation_present"] is True
+    assert output["side_effects"]["evidence_state"] == "explicit_none"
+    assert output["side_effect_evidence_complete"] is True
+    assert output["external_write_performed"] is False
 
 
 def test_promptfoo_provider_infers_pack_type_for_blocked_selected_specialist(
@@ -6179,6 +6860,7 @@ def test_promptfoo_provider_compacts_direct_context_agent_payload(monkeypatch) -
     stdout_payload = {
         "status": "done",
         "selected_agent": "airtable_context_agent",
+        "output_type": "AirtableContextResult",
         "output": {
             "summary": (
                 "Airtable schema mapping and record identity questions are ready; "
@@ -6215,6 +6897,7 @@ def test_promptfoo_provider_compacts_direct_context_agent_payload(monkeypatch) -
     assert output["provider_status"] == "ok"
     assert output["route"] == "airtable_context_agent"
     assert output["status"] == "done"
+    assert output["output_type"] == "AirtableContextResult"
     assert "schema mapping" in output["human_summary"]
     assert "record identity" in output["human_summary"]
     assert output["side_effects"]["external_write_performed"] is False

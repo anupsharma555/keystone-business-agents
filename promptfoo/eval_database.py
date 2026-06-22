@@ -15,6 +15,8 @@ from typing import Any
 
 from promptfoo.human_review import (
     DEFAULT_REVIEW_DB,
+    REVIEW_KIND_HUMAN,
+    REVIEW_KIND_ORCHESTRATOR_JUDGE,
     HumanEvalReview,
     ensure_human_review_schema,
 )
@@ -66,7 +68,10 @@ DATABASE_TABLE_LATEST_COLUMNS: dict[str, tuple[str, ...]] = {
         "case_id",
         "run_id",
         "agent",
+        "reviewer",
+        "review_kind",
         "average_score",
+        "total_score",
         "safety",
         "slack_thread_ts",
         "created_at",
@@ -313,6 +318,7 @@ def record_slack_eval_run(
     visible_source_count: int = 0,
     sdk_estimated_cost_usd: float | None = None,
     sdk_cache_hit_rate: float | None = None,
+    duration_ms: float | None = None,
     response_hash: str = "",
     evidence: dict[str, Any] | None = None,
     prompt_versions: list[Any] | None = None,
@@ -391,6 +397,7 @@ def record_slack_eval_run(
             "visible_source_count": max(0, int(visible_source_count or 0)),
             "sdk_estimated_cost_usd": sdk_estimated_cost_usd,
             "sdk_cache_hit_rate": sdk_cache_hit_rate,
+            "duration_ms": _float_or_none(duration_ms),
             "response_hash": str(response_hash or "").strip(),
             "evidence_json": json.dumps(normalized_evidence, ensure_ascii=True, sort_keys=True),
             "prompt_versions_json": json.dumps(prompt_versions or [], ensure_ascii=True, sort_keys=True),
@@ -487,6 +494,7 @@ def record_slack_eval_run(
                 "source_count": max(0, int(source_count or 0)),
                 "visible_source_count": max(0, int(visible_source_count or 0)),
                 "cost_profile": str(cost_profile or "").strip(),
+                "duration_ms": _float_or_none(duration_ms),
                 "model_provider": str(model_provider or "").strip(),
                 "model_name": str(model_name or "").strip(),
                 "run_mode": str(run_mode or "").strip(),
@@ -612,14 +620,25 @@ def resolve_slack_eval_case_id(
         slack_channel_name=slack_channel_name,
     ):
         return ""
+    explicit_case_id = _extract_explicit_slack_eval_case_id(request_text)
     normalized_request = _normalize_eval_request_text(request_text)
-    if not normalized_request:
+    if not normalized_request and not explicit_case_id:
         return ""
     db_path = Path(database_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(db_path)) as connection:
         connection.row_factory = sqlite3.Row
         _ensure_eval_schema(connection)
+        if explicit_case_id:
+            _upsert_eval_case(
+                connection,
+                case_id=explicit_case_id,
+                agent_under_test=agent,
+                user_input=request_text,
+                source="slack",
+            )
+            connection.commit()
+            return explicit_case_id
         matched = _matching_eval_case(
             connection,
             normalized_request=normalized_request,
@@ -642,6 +661,18 @@ def resolve_slack_eval_case_id(
         )
         connection.commit()
         return case_id
+
+
+def _extract_explicit_slack_eval_case_id(request_text: str) -> str:
+    text = " ".join(str(request_text or "").split())
+    if "eval" not in text.lower() and "case" not in text.lower():
+        return ""
+    match = re.search(
+        r"\b(?:eval\s+case|case(?:_id)?)\s*(?:[:=]\s*|\s+)([A-Za-z0-9_.:-]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return str(match.group(1)).strip() if match else ""
 
 
 def eval_context_from_slack_thread(
@@ -798,10 +829,14 @@ def eval_case_statuses(
             payload = _human_review_row(dict(row))
             case_id = str(payload.get("case_id") or "")
             if case_id in statuses:
-                statuses[case_id]["human_reviews"].append(payload)
+                if payload.get("review_kind") == REVIEW_KIND_ORCHESTRATOR_JUDGE:
+                    statuses[case_id]["orchestrator_judge_reviews"].append(payload)
+                else:
+                    statuses[case_id]["human_reviews"].append(payload)
     for status in statuses.values():
         promptfoo_results = status["promptfoo_results"]
         human_reviews = status["human_reviews"]
+        orchestrator_judge_reviews = status["orchestrator_judge_reviews"]
         slack_runs = status["slack_runs"]
         status["latest_promptfoo"] = promptfoo_results[0] if promptfoo_results else None
         status["latest_human_review"] = human_reviews[-1] if human_reviews else None
@@ -810,8 +845,24 @@ def eval_case_statuses(
             latest_slack=slack_runs[0] if slack_runs else None,
             human_rows=human_reviews,
         )
+        status["latest_orchestrator_judge_review"] = (
+            orchestrator_judge_reviews[-1] if orchestrator_judge_reviews else None
+        )
+        status["latest_target_orchestrator_judge_review"] = (
+            _matching_human_review_for_current_target(
+                latest_promptfoo=status["latest_promptfoo"],
+                latest_slack=slack_runs[0] if slack_runs else None,
+                human_rows=orchestrator_judge_reviews,
+            )
+        )
+        status["latest_target_scorecard_review"] = (
+            status["latest_target_human_review"]
+            or status["latest_target_orchestrator_judge_review"]
+        )
         status["promptfoo_result_count"] = len(promptfoo_results)
         status["human_review_count"] = len(human_reviews)
+        status["orchestrator_judge_review_count"] = len(orchestrator_judge_reviews)
+        status["scorecard_review_count"] = len(human_reviews) + len(orchestrator_judge_reviews)
         status["slack_run_count"] = len(slack_runs)
     return statuses
 
@@ -824,11 +875,17 @@ def _empty_eval_case_status(case_id: str, db_path: Path) -> dict[str, Any]:
         "latest_promptfoo": None,
         "latest_human_review": None,
         "latest_target_human_review": None,
+        "latest_orchestrator_judge_review": None,
+        "latest_target_orchestrator_judge_review": None,
+        "latest_target_scorecard_review": None,
         "promptfoo_result_count": 0,
         "human_review_count": 0,
+        "orchestrator_judge_review_count": 0,
+        "scorecard_review_count": 0,
         "slack_run_count": 0,
         "promptfoo_results": [],
         "human_reviews": [],
+        "orchestrator_judge_reviews": [],
         "slack_runs": [],
     }
 
@@ -849,6 +906,7 @@ def _human_review_row(row: dict[str, Any]) -> dict[str, Any]:
         payload["scores"] = normalized_scores
     else:
         payload["scores"] = {}
+    payload["review_kind"] = str(payload.get("review_kind") or REVIEW_KIND_HUMAN).strip() or REVIEW_KIND_HUMAN
     return payload
 
 
@@ -1694,6 +1752,7 @@ def list_eval_cases(
             LEFT JOIN human_eval_reviews h ON h.id = (
                 SELECT id FROM human_eval_reviews
                 WHERE case_id = c.case_id
+                  AND COALESCE(review_kind, 'human') = 'human'
                 ORDER BY id DESC
                 LIMIT 1
             )
@@ -1709,7 +1768,7 @@ def list_eval_cases(
     )
     for row in case_rows:
         status = statuses.get(str(row.get("case_id") or "")) or {}
-        target_review = status.get("latest_target_human_review")
+        target_review = status.get("latest_target_scorecard_review")
         if isinstance(target_review, dict):
             row["latest_human_average"] = target_review.get("average_score")
             row["latest_human_safety"] = target_review.get("safety") or ""
@@ -1778,7 +1837,8 @@ def record_promptfoo_eval_to_benchmark(
                 dict(row)
                 for row in connection.execute(
                     f"""
-                    SELECT case_id, run_id, slack_thread_ts, average_score, safety, scores_json
+                    SELECT case_id, run_id, slack_thread_ts, average_score, safety, scores_json,
+                           COALESCE(review_kind, 'human') AS review_kind
                     FROM human_eval_reviews
                     WHERE case_id IN ({placeholders})
                     ORDER BY id DESC
@@ -2658,6 +2718,7 @@ def _ensure_eval_schema(connection: sqlite3.Connection) -> None:
             visible_source_count INTEGER NOT NULL DEFAULT 0,
             sdk_estimated_cost_usd REAL,
             sdk_cache_hit_rate REAL,
+            duration_ms REAL,
             response_hash TEXT NOT NULL DEFAULT '',
             evidence_json TEXT NOT NULL DEFAULT '{}',
             prompt_versions_json TEXT NOT NULL DEFAULT '[]',
@@ -2695,6 +2756,7 @@ def _ensure_eval_schema(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(connection, "slack_eval_runs", "visible_source_count", "INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing(connection, "slack_eval_runs", "sdk_estimated_cost_usd", "REAL")
     _add_column_if_missing(connection, "slack_eval_runs", "sdk_cache_hit_rate", "REAL")
+    _add_column_if_missing(connection, "slack_eval_runs", "duration_ms", "REAL")
     _add_column_if_missing(connection, "slack_eval_runs", "response_hash", "TEXT NOT NULL DEFAULT ''")
     _add_column_if_missing(connection, "slack_eval_runs", "evidence_json", "TEXT NOT NULL DEFAULT '{}'")
     for column_name, column_definition in (
@@ -2709,6 +2771,7 @@ def _ensure_eval_schema(connection: sqlite3.Connection) -> None:
         ("git_revision", "TEXT NOT NULL DEFAULT ''"),
         ("run_label", "TEXT NOT NULL DEFAULT ''"),
         ("storage_mode", "TEXT NOT NULL DEFAULT 'local_review'"),
+        ("duration_ms", "REAL"),
         ("request_text_hash", "TEXT NOT NULL DEFAULT ''"),
         ("result_summary_hash", "TEXT NOT NULL DEFAULT ''"),
         ("attempt_group_id", "TEXT NOT NULL DEFAULT ''"),
@@ -2950,6 +3013,17 @@ def _manual_trace_diagnostics_from_row(row: dict[str, Any]) -> dict[str, Any]:
     retry_state = evidence.get("retry_state") if isinstance(evidence.get("retry_state"), dict) else {}
     if not retry_state and isinstance(evidence.get("retry"), dict):
         retry_state = evidence["retry"]
+    execution = evidence.get("execution") if isinstance(evidence.get("execution"), dict) else {}
+    timing = evidence.get("timing") if isinstance(evidence.get("timing"), dict) else {}
+    duration_ms = _float_or_none(
+        row.get("duration_ms")
+        or execution.get("duration_ms")
+        or execution.get("time_to_response_ms")
+        or timing.get("duration_ms")
+        or timing.get("time_to_response_ms")
+        or evidence.get("duration_ms")
+        or evidence.get("time_to_response_ms")
+    )
 
     warning_count = _safe_int(row.get("warning_count"))
     retry_count = _safe_int(retry_state.get("retry_count") or retry_state.get("attempt_count"))
@@ -3017,7 +3091,14 @@ def _manual_trace_diagnostics_from_row(row: dict[str, Any]) -> dict[str, Any]:
             "run_mode": str(row.get("run_mode") or "").strip(),
             "run_label": str(row.get("run_label") or "").strip(),
             "git_revision": str(row.get("git_revision") or "").strip(),
-            "duration_ms": None,
+            "duration_ms": duration_ms,
+            "time_to_response_ms": duration_ms,
+        },
+        "slack_context": {
+            "channel_id": str(row.get("slack_channel_id") or "").strip(),
+            "channel_name": str(row.get("slack_channel_name") or "").strip(),
+            "thread_ts": str(row.get("slack_thread_ts") or "").strip(),
+            "permalink_present": bool(str(row.get("permalink") or "").strip()),
         },
         "model": {
             "provider": model_provider,
@@ -3106,6 +3187,8 @@ def _manual_slack_run_summary_from_row(row: dict[str, Any]) -> dict[str, Any]:
                 "case_id": case_id,
                 "run_id": run_id,
                 "work_item_id": work_item_id,
+                "slack_channel_id": str(row.get("slack_channel_id") or "").strip(),
+                "slack_channel_name": str(row.get("slack_channel_name") or "").strip(),
                 "slack_thread_ts": str(row.get("slack_thread_ts") or "").strip(),
             },
             "thread_evidence": {
@@ -3135,6 +3218,8 @@ def _insert_manual_slack_run_summary_event(
     connection: sqlite3.Connection,
     summary: dict[str, Any],
 ) -> int:
+    metadata = summary.get("metadata") if isinstance(summary.get("metadata"), dict) else {}
+    execution = metadata.get("execution") if isinstance(metadata.get("execution"), dict) else {}
     return _insert_eval_trace_event(
         connection,
         event_type="manual_run_summary",
@@ -3142,7 +3227,8 @@ def _insert_manual_slack_run_summary_event(
         span_id=str(summary.get("span_id") or ""),
         name=str(summary.get("name") or ""),
         group_id=str(summary.get("group_id") or ""),
-        metadata=summary.get("metadata") if isinstance(summary.get("metadata"), dict) else {},
+        metadata=metadata,
+        duration_ms=_float_or_none(execution.get("duration_ms")),
     )
 
 
@@ -3159,6 +3245,8 @@ def _update_manual_slack_run_summary_event(
     existing: dict[str, Any],
     summary: dict[str, Any],
 ) -> None:
+    metadata = summary.get("metadata") if isinstance(summary.get("metadata"), dict) else {}
+    execution = metadata.get("execution") if isinstance(metadata.get("execution"), dict) else {}
     connection.execute(
         """
         UPDATE eval_trace_events
@@ -3168,7 +3256,7 @@ def _update_manual_slack_run_summary_event(
             name = ?,
             group_id = ?,
             metadata_json = ?,
-            duration_ms = NULL
+            duration_ms = ?
         WHERE id = ?
         """,
         (
@@ -3176,11 +3264,8 @@ def _update_manual_slack_run_summary_event(
             str(summary.get("span_id") or ""),
             str(summary.get("name") or ""),
             str(summary.get("group_id") or ""),
-            json.dumps(
-                summary.get("metadata") if isinstance(summary.get("metadata"), dict) else {},
-                ensure_ascii=True,
-                sort_keys=True,
-            ),
+            json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+            _float_or_none(execution.get("duration_ms")),
             int(existing.get("id") or 0),
         ),
     )

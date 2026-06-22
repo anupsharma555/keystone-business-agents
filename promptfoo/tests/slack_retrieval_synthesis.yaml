@@ -223,7 +223,7 @@
     required_artifact_types: chief_of_staff_plan
     required_source_types: slack_docs
     required_source_url_prefixes: https://docs.slack.dev/
-    required_terms: Slack, Source evidence
+    required_terms: Slack, Useful references
     forbidden_terms: posted to Slack, sent email
     max_elapsed_seconds: 15
     slack_context:
@@ -245,7 +245,7 @@
     min_source_count: 2
     min_artifact_count: 1
     required_artifact_types: chief_of_staff_plan
-    required_terms: Source evidence, No draft
+    required_terms: Useful references, No draft
     forbidden_terms: posted to Slack, sent email
     max_elapsed_seconds: 15
     slack_context:

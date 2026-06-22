@@ -46,47 +46,57 @@ SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "5c14ccf60fe817f25bac8f60d6f291b9f981a73de10448b230682ce1af09eb06",
+        "instructions_sha256": "74aa585ef3fae49791c7e1622b848ae7159ef13d332b38017b263c598d3b8158",
         "tool_names_sha256": "5666cdbfcc42bfd14f3dcd75c544302d6fa9aa7f76697b1d24fdb87a5880dd76",
         "output_schema_sha256": "519be6127e040ff904066e7dd8efe671ce88a3c4c527bdcb730a6e5f131d3345",
     },
     "business_research_analyst": {
-        "instructions_sha256": "6d5d3f656bc6b974aef819ad911f10d915131ca6bf409006cc37cffe20e4dc47",
+        "instructions_sha256": "a55f0a8ca20b52703b810e0db67ad3de385c687ab4969d88b2874b7f3e5d69e8",
         "tool_names_sha256": "8c128ab9eee684363954e52c9b1b8a29e27df6b1509647f4b39479f37ddf1bc1",
         "output_schema_sha256": "b8218a333d85d2f3850203f5ee48b7ec535a6f924a8851c513f1f2b2afeef6e0",
     },
     "opportunity_scout": {
-        "instructions_sha256": "7ae98a1a9bdb6fc0a1a41f06ef42374d4910c4e1975eba01e2505b29acab50b5",
+        "instructions_sha256": "f27df85efb5098da256e510b42c4003b9b74e84a94c48dadf0aa045c62867345",
         "tool_names_sha256": "38c690f9feef3bcb9699511283538d4448fe33a4e1f82d68acab135f51e4d51b",
         "output_schema_sha256": "2e91674be427e59361cfb5a9c275a048bf4166fbcd9f88f6e06405a235ab59e8",
     },
     "outreach_composer": {
-        "instructions_sha256": "14405e5a2ac419dad2c18c8277d04bf81d0021ee07e06c68baa543d6ec6dd1d2",
+        "instructions_sha256": "a7e8c116bd463f725ed2c739f1b10fa0e7c55d9efcf5c359a045c94c5ada1a5f",
         "tool_names_sha256": "b86270338a35685eb23e446ca5ec82e4ff7849e71356129b7920ca33c454de68",
         "output_schema_sha256": "167da45f0bb07c0a255c4115b52e9510272a22cc1c479abe9e97c88693d44b34",
     },
     "airtable_context_agent": {
-        "instructions_sha256": "f4cb19d488cf50cb5e56335125d9585ccf673ca28b96c3d92e9786352572b77a",
+        "instructions_sha256": "1cd163cd0093193bf1360c72c1e00737896989a99856ba5d0dea7e5d46b85908",
         "tool_names_sha256": "8dbe88d3c4789ad1579d96c16bdd4136d16b69801d0b0402e92cbd83c2eb2f23",
         "output_schema_sha256": "e472babb0c090889cbd7a6afa92dce58e4006e6895754c48d0fe2b5e661e1442",
     },
     "google_workspace_context_agent": {
-        "instructions_sha256": "b3c6b1bd9913553f7c0657b50d15cc861ddd1ebd8ba62f16444ddc8e728bdf53",
+        "instructions_sha256": "475d35529d78af5019232bca5739ca7c5bc20e23b80309c1e02069339bac3c46",
         "tool_names_sha256": "a20b54ebe4e23acf72fbab3fcba4d67150a81fefc03d00d16c5b94ce9f56c760",
         "output_schema_sha256": "28dc3fc15522eeaf4693d4e5787f1927f9913a180a958ca1f3228d0fd6741731",
     },
     "zotero_context_agent": {
-        "instructions_sha256": "80f3dfd83bbd552fbc1eb2eb93dc9d274c502729292c33decba0433e4289c05b",
+        "instructions_sha256": "af7e79e408839622a87c4de63b4409db0c97ff9b238a8bd3da36af36299df50c",
         "tool_names_sha256": "4b5242fa381337a43a5dbb560a8c99a956ebe2540d011369aa5238236f402b96",
         "output_schema_sha256": "948058c91335bafdbc38116beb87fc71b8b874ce8c7d2a1b6626bf07893f9426",
     },
+    "rss_context_agent": {
+        "instructions_sha256": "f6f446f9775866b4104d7fc00d80633393b9ccb8fe10fb83f88c2949b54fa305",
+        "tool_names_sha256": "f31fcf99ce67500ab85ceb6130f6c81c8fdeea9668c82ffd10eaf4862b47a55f",
+        "output_schema_sha256": "c81421b84589b67baca97d6ae5bc0a8468adbe9bd3b10d1c13639a3148d68936",
+    },
+    "preprints_context_agent": {
+        "instructions_sha256": "4ffd2f7df41b1fd19ca51352c8dfeeb4791235a44c9f2eae9b1688bece155087",
+        "tool_names_sha256": "985bb3e5f395ac4fdab0e2243e450e60eaeab20c34646431415a94dbbb9bef08",
+        "output_schema_sha256": "0c360ba87ef900bd5c658029374a445b6c14c22b9067207d8b7ad083c4b1d702",
+    },
     "orchestrator": {
-        "instructions_sha256": "4419b0f64167bcd129e407ed0288bfa577bf578ab3d4099e8e48a58af09f2902",
+        "instructions_sha256": "d570b258c2ce14ddd2678ca8e2a294c925f8921ac0550ae47ef1043ae58d6a22",
         "tool_names_sha256": "65a79825b11ddc73b9418be488895e8ba03e4c3d9e9b5a68bc0dd9eb8775cb72",
-        "output_schema_sha256": "f2b89a6fe10345179f00847ec38056860c89a58bd2b1da5b6686a40cc6de649f",
+        "output_schema_sha256": "98f0e154658a465df86c498fbf9b1a6c84028fbd02eedef97d1549ef5b5887e7",
     },
     "chief_of_staff": {
-        "instructions_sha256": "cca0078ebca3c06005c3f12b4f9f8a733fc15fde2dcd16ddc46bed1eddb19f68",
+        "instructions_sha256": "21359599661bd362310c81ec69b1a67ce0a5897f647e553c2cc1a85ef9425f3f",
         "tool_names_sha256": "b1deac379e2121c7c1d4e6c69471845228ce3b6f3accf8e85754ca089b0ce18d",
         "output_schema_sha256": "c8b0252319afa129becdea43ebbb25b262fbf10f4cda9f4284cf09ad5d0a1cd7",
     },
@@ -132,6 +142,8 @@ def test_registry_has_canonical_agents() -> None:
         "airtable_context_agent",
         "google_workspace_context_agent",
         "zotero_context_agent",
+        "rss_context_agent",
+        "preprints_context_agent",
         "orchestrator",
         "chief_of_staff",
     }
@@ -143,6 +155,8 @@ def test_registry_has_canonical_agents() -> None:
         "airtable_context_agent",
         "google_workspace_context_agent",
         "zotero_context_agent",
+        "rss_context_agent",
+        "preprints_context_agent",
         "orchestrator",
         "chief_of_staff",
     ]
@@ -229,6 +243,8 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
         "airtable_context_agent",
         "google_workspace_context_agent",
         "zotero_context_agent",
+        "rss_context_agent",
+        "preprints_context_agent",
     ):
         spec = AGENT_REGISTRY[route_name]
         assert spec.eval_datasets == ("promptfoo/tests/slack_agent_expansion_15.yaml",)
@@ -237,9 +253,13 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     airtable = AGENT_REGISTRY["airtable_context_agent"].build_agent()
     workspace = AGENT_REGISTRY["google_workspace_context_agent"].build_agent()
     zotero = AGENT_REGISTRY["zotero_context_agent"].build_agent()
+    rss = AGENT_REGISTRY["rss_context_agent"].build_agent()
+    preprints = AGENT_REGISTRY["preprints_context_agent"].build_agent()
     airtable_tool_names = _tool_names(airtable)
     workspace_tool_names = _tool_names(workspace)
     zotero_tool_names = _tool_names(zotero)
+    rss_tool_names = _tool_names(rss)
+    preprints_tool_names = _tool_names(preprints)
 
     assert {"airtable_get_base_schema", "airtable_read_records"} <= airtable_tool_names
     assert "airtable_write_record" in airtable_tool_names
@@ -289,9 +309,15 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
         sorted(workspace_tool_names),
     ) == []
     assert disallowed_tool_names("zotero_context_agent", sorted(zotero_tool_names)) == []
+    assert rss_tool_names == {"retrieve_rss_announcement_history"}
+    assert preprints_tool_names == {"retrieve_preprint_announcement_history"}
+    assert disallowed_tool_names("rss_context_agent", sorted(rss_tool_names)) == []
+    assert disallowed_tool_names("preprints_context_agent", sorted(preprints_tool_names)) == []
     assert tool_tier_for_name("airtable_write_record") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("google_doc_write") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("zotero_import_article_with_backend") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("retrieve_rss_announcement_history") == ToolTier.CORE_READ
+    assert tool_tier_for_name("retrieve_preprint_announcement_history") == ToolTier.CORE_READ
 
     nested_airtable = AGENT_REGISTRY["airtable_context_agent"].build_agent(
         tool_tier=ToolTier.DIAGNOSTIC
@@ -302,14 +328,26 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     nested_zotero = AGENT_REGISTRY["zotero_context_agent"].build_agent(
         tool_tier=ToolTier.DIAGNOSTIC
     )
+    nested_rss = AGENT_REGISTRY["rss_context_agent"].build_agent(
+        tool_tier=ToolTier.DIAGNOSTIC
+    )
+    nested_preprints = AGENT_REGISTRY["preprints_context_agent"].build_agent(
+        tool_tier=ToolTier.DIAGNOSTIC
+    )
     nested_tool_names = (
-        _tool_names(nested_airtable) | _tool_names(nested_workspace) | _tool_names(nested_zotero)
+        _tool_names(nested_airtable)
+        | _tool_names(nested_workspace)
+        | _tool_names(nested_zotero)
+        | _tool_names(nested_rss)
+        | _tool_names(nested_preprints)
     )
     assert "airtable_write_record" not in nested_tool_names
     assert "google_drive_get_file_metadata" in nested_tool_names
     assert "google_doc_write" not in nested_tool_names
     assert "google_sheet_append_rows" not in nested_tool_names
     assert "zotero_import_article_with_backend" not in nested_tool_names
+    assert "retrieve_rss_announcement_history" in nested_tool_names
+    assert "retrieve_preprint_announcement_history" in nested_tool_names
 
 
 def test_build_model_settings_defaults_to_usage_and_prompt_cache(monkeypatch) -> None:
@@ -559,6 +597,8 @@ def test_orchestrator_handoffs_derive_from_specialist_registry() -> None:
     assert "airtable_context_agent" in [handoff.name for handoff in agent.handoffs]
     assert "google_workspace_context_agent" in [handoff.name for handoff in agent.handoffs]
     assert "zotero_context_agent" in [handoff.name for handoff in agent.handoffs]
+    assert "rss_context_agent" in [handoff.name for handoff in agent.handoffs]
+    assert "preprints_context_agent" in [handoff.name for handoff in agent.handoffs]
 
 
 def test_orchestrator_handoff_specs_expose_typed_contracts() -> None:
@@ -587,6 +627,10 @@ def test_orchestrator_handoff_specs_expose_typed_contracts() -> None:
     )
     assert handoffs["zotero_context_agent"].type_contract.target_output_type.endswith(
         ".ZoteroContextResult"
+    )
+    assert handoffs["rss_context_agent"].output_schema.endswith(".RssContextResult")
+    assert handoffs["preprints_context_agent"].output_schema.endswith(
+        ".PreprintsContextResult"
     )
 
 

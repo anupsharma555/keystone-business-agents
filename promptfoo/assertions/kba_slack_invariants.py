@@ -8,6 +8,7 @@ import sys
 from typing import Any
 
 SOURCE_PATTERN = re.compile(r"\b(?:https?://|fixture://)[^\s)>\]]+", re.IGNORECASE)
+ANSWER_HEADING_PATTERN = re.compile(r"(?im)^\s*\*{0,2}Answer\s*:\*{0,2}")
 METADATA_SUMMARY_TERMS = (
     "provider_status",
     "orchestrator_preflight",
@@ -19,6 +20,10 @@ METADATA_SUMMARY_TERMS = (
     "final_synthesis_executed",
     "work_item",
     "decision_trace",
+)
+DIAGNOSTIC_HEADING_PATTERN = re.compile(
+    r"(?im)^\s*(?:Agent|Search|Live search|Retrieval diagnostics|Timing|"
+    r"Profile links|Model|Synthesis|Route|WorkItem|Status)\s*:"
 )
 
 
@@ -44,6 +49,23 @@ def grade_output(output: str, context: dict[str, Any]) -> dict[str, Any]:
 
     if vars_.get("expect_slack_context", True) and not payload.get("slack_context_attached"):
         failures.append("Slack context was not attached to the WorkItem payload")
+
+    expected_slack_channel_id = str(vars_.get("expected_slack_channel_id") or "").strip()
+    if expected_slack_channel_id and payload.get("slack_channel_id") != expected_slack_channel_id:
+        failures.append(
+            f"slack_channel_id={payload.get('slack_channel_id')!r}, "
+            f"expected {expected_slack_channel_id!r}"
+        )
+
+    expected_slack_channel_name = str(vars_.get("expected_slack_channel_name") or "").strip()
+    if (
+        expected_slack_channel_name
+        and payload.get("slack_channel_name") != expected_slack_channel_name
+    ):
+        failures.append(
+            f"slack_channel_name={payload.get('slack_channel_name')!r}, "
+            f"expected {expected_slack_channel_name!r}"
+        )
 
     min_sources = int(vars_.get("min_source_count") or 0)
     if int(payload.get("source_count") or 0) < min_sources:
@@ -95,6 +117,8 @@ def grade_output(output: str, context: dict[str, Any]) -> dict[str, Any]:
     human_summary = str(payload.get("human_summary") or "")
     if vars_.get("require_readable_summary", True):
         _check_readable_summary(human_summary, failures)
+    if vars_.get("require_answer_first_summary", True):
+        _check_answer_first_summary(human_summary, failures)
 
     if vars_.get("require_visible_sources", min_sources > 0):
         visible_source_count = len(SOURCE_PATTERN.findall(human_summary))
@@ -292,6 +316,8 @@ def _score(failures: list[str], warnings: list[str]) -> float:
 
 def _check_readable_summary(human_summary: str, failures: list[str]) -> None:
     lowered = human_summary.lower()
+    if not ANSWER_HEADING_PATTERN.search(human_summary):
+        failures.append("human_summary is missing a visible Answer section")
     for term in METADATA_SUMMARY_TERMS:
         if term.lower() in lowered:
             failures.append(f"human_summary exposes metadata term: {term}")
@@ -299,6 +325,31 @@ def _check_readable_summary(human_summary: str, failures: list[str]) -> None:
         failures.append("human_summary looks like raw JSON instead of an operator summary")
     if re.search(r"\b[a-z]+_[a-z_]+\s*[:=]", human_summary):
         failures.append("human_summary contains raw snake_case metadata fields")
+
+
+def _check_answer_first_summary(human_summary: str, failures: list[str]) -> None:
+    stripped = human_summary.lstrip()
+    answer_match = ANSWER_HEADING_PATTERN.search(stripped)
+    if not answer_match:
+        return
+    diagnostic_match = DIAGNOSTIC_HEADING_PATTERN.search(stripped)
+    if diagnostic_match and diagnostic_match.start() < answer_match.start():
+        failures.append(
+            "human_summary puts diagnostic metadata before the visible Answer section"
+        )
+    prefix = stripped[: answer_match.start()].strip()
+    if prefix and not _allowed_answer_prefix(prefix):
+        failures.append("human_summary has non-answer text before the visible Answer section")
+
+
+def _allowed_answer_prefix(prefix: str) -> bool:
+    lines = [line.strip() for line in prefix.splitlines() if line.strip()]
+    if len(lines) > 1:
+        return False
+    if not lines:
+        return True
+    line = lines[0].strip("* ")
+    return bool(re.fullmatch(r"[A-Z][A-Za-z0-9 '&/().,-]{0,96}", line))
 
 
 def _forbidden_term_found(human_summary: str, term: str) -> bool:

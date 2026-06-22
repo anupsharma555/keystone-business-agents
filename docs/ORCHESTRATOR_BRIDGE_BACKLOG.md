@@ -43,6 +43,299 @@ again.
 
 ## Open Findings
 
+### P1 - EVAL-TRACE-DETAIL-001: Eval traces need child-step/tool-call metadata, not only summarized events
+
+- Found: 2026-06-21 01:00 EDT
+- Fixed: pending
+- Status: open
+- Area: eval trace capture, OpenAI-style trace explorer, SDK run summaries,
+  WorkItem trace metadata, `promptfoo/eval_database.py`,
+  `promptfoo/eval_dashboard.py`, Slack/CLI eval run recording.
+- Issue: The dashboard can now expand sanitized trace rows, but many manual
+  Slack/CLI runs still produce only coarse `manual_run_summary` and
+  `slack_run_saved` events. That supports joins and cleanup diagnostics, but it
+  does not yet expose a true OpenAI-style internal trace with child tool calls,
+  model usage, approval gates, cache/cost state, retries, and step durations at
+  the right granularity.
+- Evidence: Current trace rows often report missing model/tool/retrieval
+  metadata even when the underlying WorkItem or SDK run may have richer
+  runtime context. The UI has a Details panel and field-readiness indicators,
+  but the source packets still depend on what Slack/CLI recording passes into
+  `record_slack_eval_run()` and `eval_trace_events`.
+- Impact: Operators can click into a trace, but a real debugging session may
+  still require inspecting local run payloads or WorkItem state outside the
+  dashboard. This also makes diagnostic categories look like failures when the
+  actual gap is instrumentation coverage.
+- Expected fix: Add bounded child-step trace rows or a structured
+  `tool_call_summary`/`model_usage_summary` packet to saved eval runs. Include
+  stable join fields (`case_id`, `run_id`, `work_item_id`, route, Slack thread,
+  trace/span ids), child tool name/status/duration/error kind, approval
+  checkpoints, retrieval/source counts, and model/cost/cache metadata when
+  available. Keep raw prompts, raw responses, Slack message text, secrets, PHI,
+  and tool I/O out of trace storage.
+- Validation: Add fixture coverage for a saved Slack/CLI eval run with multiple
+  child events and verify the Trace Explorer Details panel shows same-run
+  timeline, duration, model/tool/retrieval readiness, and bounded sanitized
+  packet data without exposing raw content.
+
+### P2 - EVAL-DATABASE-UX-001: Database tab needs a stable inventory contract distinct from scoring workspace
+
+- Found: 2026-06-21 01:00 EDT
+- Fixed: pending
+- Status: open
+- Area: Eval Case Database UX, review item-level score visibility,
+  CSV/JSON export, `promptfoo/eval_dashboard.py`,
+  `tests/test_promptfoo_framework.py`.
+- Issue: The Database tab is useful as an audit/export table, but it can become
+  too wide or duplicate Runs & Scoring when it tries to show every run, review,
+  scorecard, evidence, analysis, prompt, and response field at once.
+- Evidence: The current implementation now exposes item-level review form
+  dimensions as explicit human and Orchestrator Review columns so scores like
+  `accuracy`, `relevance`, and `source_quality` are database-visible. Subagent
+  review still flagged that notes, rationales, run identity, score status, and
+  prompt/response text need a clearer long-term ownership boundary.
+- Impact: Operators need separate score columns for audit/export work, but the
+  screen can become hard to scan if Database also behaves like the editable
+  case-review workspace. Runs & Scoring should remain the place for full review
+  forms, follow-up queues, case packets, and detailed score rationales.
+- Expected fix: Keep CSV/JSON and case bundles as the complete detail surfaces;
+  keep the visible Database table read-only with stable inventory columns,
+  explicit review-dimension score columns, compact statuses, and links to
+  Review form / case bundle for full comments and rationales. Avoid putting
+  editable review controls or full rationales in Database.
+- Validation: Add UI tests that assert item-level review dimensions remain
+  visible as columns, while review editing and detailed comments stay in Runs &
+  Scoring/review-detail surfaces.
+
+### P1 - CONTEXT-EVAL-001: RSS and preprint context agents lack Slack eval cases
+
+- Found: 2026-06-20 00:00 EDT
+- Fixed: 2026-06-20
+- Status: fixed
+- Area: RSS/preprint context agents, Promptfoo Slack expansion coverage,
+  `src/keystone_agents/agent_registry.py`,
+  `promptfoo/tests/slack_agent_expansion_15.yaml`,
+  `tests/test_agent_registry.py`, `tests/test_announcement_context_tools.py`.
+- Issue: The new `rss_context_agent` and `preprints_context_agent` were
+  registered as named specialists and each `AgentSpec` points at
+  `promptfoo/tests/slack_agent_expansion_15.yaml`, but that eval file did not
+  include direct Slack-style cases for either named agent.
+- Evidence: Registry and context-source tests pass for both agents, and
+  `tests/test_announcement_context_tools.py` covers the local read tools and
+  schemas. The Slack expansion seed pack now includes
+  `slack_rss_context_announcement_history_001` and
+  `slack_preprints_context_preliminary_evidence_001`, each using direct
+  `@KNI <context agent>` wording, read-only constraints, side-effect
+  prohibitions, and sectioned-output expectations.
+- Impact: The repo can claim registry-level coverage while missing the actual
+  Slack/named-agent behavior that matters operationally: mention parsing,
+  Orchestrator preflight, WorkItem route, read-only local data retrieval,
+  source/preprint caveats, and Slack output shape for these two new agents.
+- Fix: Added one Slack expansion eval case for each agent. The RSS case reads
+  bounded historical announcement context and the preprint case verifies
+  preliminary-evidence language. Both assert no Slack posting, no feed
+  mutation, visible source/reference handling, and concise Answer/Detailed
+  Summary output.
+- Validation: `.venv/bin/python -m pytest
+  tests/test_promptfoo_framework.py::test_promptfoo_seed_pack_has_expected_case_agent_coverage
+  tests/test_promptfoo_framework.py::test_promptfoo_seed_pack_has_first_class_context_agent_eval_cases
+  tests/test_promptfoo_framework.py::test_promptfoo_context_agent_eval_cases_name_specific_metadata_targets`
+  and `.venv/bin/python -m pytest tests/test_agent_registry.py -k
+  "context or handoff" tests/test_announcement_context_tools.py` passed on
+  2026-06-20. Focused Orchestrator/CLI checks also verify that direct RSS
+  context asks with negated "do not post to Slack" constraints route to
+  `RssContextResult`, while an affirmative "post this message to Slack" ask
+  remains blocked by the send gate. Direct promptfoo-provider execution of the
+  two new seed-pack cases returns `route`, `status`, `output_type`, and dry-run
+  invocation metadata for `RssContextResult` and `PreprintsContextResult`.
+  `npm run eval:promptfoo:json` completed with 0 provider errors and both new
+  cases passing in the saved JSON output.
+
+### P1 - SLACK-BRIDGE-RSS-001: RSS/preprints context results are routed but not rendered by Slack bridge
+
+- Found: 2026-06-20 13:15 EDT
+- Fixed: pending
+- Status: open
+- Area: sibling `keystone-slack` app-mention bridge, context-agent direct
+  prefixes, context result rendering, KBA RSS/preprints context agents,
+  `src/keystone_agents/agent_mentions.py`, `src/keystone_agents/cli.py`.
+- Issue: RSS and preprints context agents can run from KBA, but the current
+  Slack bridge does not fully support them as first-class context-agent Slack
+  routes. Direct `@KNI rss context agent ...` is rejected before KBA runs, and
+  a bridge-prefix fallback can reach KBA but the bridge renders only generic
+  `Business Agents WorkItem Ready / WorkItem command completed` instead of the
+  context-agent answer.
+- Evidence: KBA dry-run now resolves `@KNI rss context agent ...`,
+  `rss context agent ...`, and `business agents rss context agent ...` to
+  `rss_context_agent`, with equivalent preprints coverage. A live Slack probe
+  in `#ai-agents-workflow` at
+  `https://as-xkn6329.slack.com/archives/C0ASJ6QU1FX/p1781975195668639`
+  completed as route `rss_context_agent` with run
+  `sbar_a3a1280584f14922b3a2d5cce0295966`, but Slack posted only
+  `WorkItem command completed`. The local `agent_runs` row `576` contains
+  `output_type='RssContextResult'` and a usable `human_summary` with
+  `*Answer:*`, `*Detailed Summary:*`, and `*Useful references:*`. Read-only
+  inspection of sibling
+  `keystone-slack/kni_integrations/business_agents_bridge.py` shows
+  `BUSINESS_AGENT_DIRECT_PREFIXES` and `CONTEXT_AGENT_DIRECT_PREFIX_ROUTES`
+  include Airtable, Google Workspace, and Zotero context aliases, but not RSS
+  or preprints; `_context_agent_success_from_ask()` accepts only
+  `AirtableContextResult`, `GoogleWorkspaceContextResult`, and
+  `ZoteroContextResult`.
+- Impact: Operators see a completed Slack run without the answer, which makes
+  the RSS/preprints agents look broken even when KBA produced a valid result.
+  It also blocks reliable one-agent-at-a-time Slack testing for these two
+  context agents.
+- Expected fix: In sibling `keystone-slack`, add RSS/preprints direct prefixes
+  and context-route mappings, then render `RssContextResult` and
+  `PreprintsContextResult` through the same context-agent summary path. Preserve
+  the KBA section contract and keep Slack output low-metadata.
+- Validation: Add sibling bridge tests for direct `@KNI rss context agent` and
+  `@KNI preprints context agent` app mentions, plus generic
+  `@KNI business agents ...` fallback cases. Verify Slack displays the KBA
+  `human_summary` instead of the generic WorkItem completion text.
+
+### P1 - SLACK-BRIDGE-NAMED-001: Named-agent Slack results ignore the KBA human-summary contract
+
+- Found: 2026-06-20 20:45 EDT
+- Fixed: pending
+- Status: open
+- Area: sibling `keystone-slack` app-mention bridge, named-agent result
+  rendering, conversational app mentions, KBA Slack business-agent contract,
+  `src/keystone_agents/slack_action_contract.py`,
+  `contracts/keystone_slack_business_agent_contract.v1.json`.
+- Issue: KBA now produces and exports clean named-agent result summaries, but
+  the sibling Slack bridge can still render named-agent runs through a legacy
+  metadata-heavy formatter or reject conversational named-agent requests before
+  they reach KBA. This makes successful live Business Research runs look noisy
+  or unsupported even when the KBA child process completed and exposed a clean
+  `human_summary`.
+- Evidence: Four bounded live Slack probes were run in `#ai-agents-workflow`
+  before pausing for cost control. The direct Business Research/Abridge run
+  completed but Slack showed provider, model, retrieval, and timing metadata
+  ahead of the answer. A conversational Nabla prompt using "could the business
+  research analyst..." was rejected by the sibling bridge as an unsupported KNI
+  command before KBA ran. KBA now has no-live planner and WorkItem coverage for
+  that polite named-agent wording: it routes to `business_research_analyst`,
+  extracts `Nabla` as the company target, and avoids the Opportunity Scout
+  clarification path. Corti completed locally but initially exposed only
+  `script_payload.human_summary`; KBA now promotes child `human_summary` to the
+  top-level CLI envelope. Suki completed locally with both top-level and child
+  `human_summary`, and KBA now also exposes the answer-first Business Research
+  summary under `slack_display_text`, `display_text`, and `summary`; the
+  exported rendering examples include a Suki-shaped legacy fallback fixture.
+  The sibling Slack bridge still needs to consume that contract instead of
+  rendering the metadata-heavy Company Research block.
+- Impact: Operators cannot trust visible Slack output shape as proof of agent
+  quality. The live model and WorkItem path can be correct while Slack still
+  displays audit details as the main answer, and natural operator phrasing can
+  fail at the sibling bridge rather than exercising KBA's Orchestrator-first
+  routing.
+- Expected fix: In sibling `keystone-slack`, consume the KBA
+  `result_rendering.named_agents` contract or call the side-effect-free KBA
+  display helper before route-specific legacy formatting. Preserve the
+  `*Answer:*`, `*Detailed Summary:*`, and `*Useful references:*` sections, and
+  keep provider/model/timing diagnostics out of the main Slack answer unless
+  explicitly requested. Also pass conversational app-mention text that includes
+  a known named-agent alias through to KBA instead of treating it as an
+  unsupported slash-command-style command.
+- Validation: Add sibling bridge fixture tests for direct and conversational
+  Business Research app mentions. Verify the bridge displays the KBA
+  `human_summary` for `CompanyResearchFocusedBrief`, does not prepend provider
+  metadata, and does not reject conversational named-agent wording before KBA
+  planning.
+
+### P2 - CONTEXT-UX-001: Direct context-agent summaries use a different section contract than Slack synthesis
+
+- Found: 2026-06-20 00:00 EDT
+- Fixed: 2026-06-20
+- Status: fixed
+- Area: context-agent CLI/Slack summaries, `src/keystone_agents/cli.py`,
+  `src/keystone_agents/response_synthesis.py`, `tests/test_cli.py`,
+  `tests/test_response_synthesis.py`.
+- Issue: Direct context-agent fallback summaries used plain `Answer:` and
+  `Detailed answer:` headings, while the shared Slack/user-facing synthesis
+  renderer used bold `*Answer:*` and `*Detailed Summary:*` sections with
+  metadata placed after the main narrative. That left context-agent outputs
+  less consistent and could make references, blockers, and approval notes read
+  like part of the answer.
+- Evidence: `_context_agent_human_summary()` now renders bold `*Answer:*`,
+  `*Detailed Summary:*`, and `*Useful references:*` sections with blank-line
+  separation. The focused CLI tests assert the section contract for Drive,
+  Airtable records, Zotero references, and feed/preprint-style item summaries.
+- Impact: Operators reviewing Slack results have to distinguish content,
+  references, blockers, and workflow notes by convention instead of by a stable
+  renderer-owned contract. This is especially noisy for Airtable, Google
+  Workspace, Zotero, RSS, and preprint context handoffs where "what was found"
+  should stay separate from "what needs attention" and audit details.
+- Fix: Updated `_context_agent_human_summary()` to match the Slack synthesis
+  contract: bold `Answer`, bold `Detailed Summary`, a visually separate
+  `Useful references` section, and only minimal blockers/approval notes after
+  the main answer.
+- Validation: `.venv/bin/python -m pytest tests/test_cli.py -k
+  "context_agent_human_summary"` passed on 2026-06-20.
+
+### P2 - DOC-ASSET-001: Generated architecture visual is referenced before the release surface is complete
+
+- Found: 2026-06-20 00:00 EDT
+- Fixed: pending
+- Status: open
+- Area: README/docs release surface, generated visual assets,
+  `README.md`, `docs/INDEX.md`, `docs/VISUAL_CONTEXT.md`,
+  `docs/assets/kba-current-agent-architecture.svg`,
+  `scripts/render_agent_architecture_diagram.py`.
+- Issue: README and visual-context docs now point to the generated current
+  architecture visual and regeneration script, but the asset and generator are
+  still untracked in the current worktree.
+- Evidence: `git status --short --branch` shows tracked modifications to
+  `README.md`, `docs/INDEX.md`, and `docs/VISUAL_CONTEXT.md`, while
+  `docs/assets/kba-current-agent-architecture.svg` and
+  `scripts/render_agent_architecture_diagram.py` are untracked. The README and
+  docs refer directly to `docs/assets/kba-current-agent-architecture.svg` and
+  the generator command.
+- Impact: A partial publish could merge docs that reference a missing SVG or a
+  regeneration command that does not exist in GitHub. That would break the
+  documentation path operators use for architecture review and future agent
+  context.
+- Expected fix: Before publishing, either include the generated SVG and script
+  together with their tests, or revert the docs to the previous committed
+  visual reference. Add a lightweight doc asset/link check if this visual is
+  expected to remain a generated release artifact.
+- Validation: Run `git status --short`, `git diff --check`, and the architecture
+  diagram generator/test path after the release-surface decision.
+
+### P2 - TEST-HYGIENE-001: Focused tests pass while surfacing serializer and SQLite resource warnings
+
+- Found: 2026-06-20 00:00 EDT
+- Fixed: pending
+- Status: open
+- Area: test hygiene, Pydantic serialization, SQLite connection lifecycle,
+  `src/keystone_agents/automation_inventory.py`,
+  `src/keystone_agents/schemas/orchestrator.py`,
+  `src/keystone_agents/storage/sqlite_store.py`, `tests/test_cli.py`,
+  `tests/test_automation_control.py`.
+- Issue: Focused tests still pass while emitting Pydantic serializer warnings
+  and repeated unclosed SQLite connection `ResourceWarning`s.
+- Evidence: `.venv/bin/python -m pytest -q
+  tests/test_automation_control.py::test_weekly_dry_run_uses_save_without_live_flags
+  tests/test_cli.py::test_cli_ask_preflight_blocked_omits_raw_workflow_state
+  -W always` passed, but warned that `AutomationSpec.metadata` expected `str`
+  while receiving `{"last_stage": "dry-run"}`, warned that
+  `workflow_state_summary` expected `OrchestratorWorkflowStateSummary` while
+  receiving a dict, and emitted repeated unclosed `sqlite3.Connection`
+  resource warnings from the CLI preflight-blocked path.
+- Impact: The warning stream can hide real schema drift and connection leaks,
+  and a future `-W error` or stricter CI profile would fail on tests that
+  currently look green. The serializer warnings also mean JSON/persistence
+  output may not match the intended Pydantic contract.
+- Expected fix: Align the affected schema fields with the actual payload shapes
+  or coerce inputs before serialization, and close or context-manage SQLite
+  connections opened during CLI preflight/blocked-path tests. Keep the fix
+  focused on type/resource correctness rather than suppressing warnings.
+- Validation: Re-run the focused command above with `-W error::UserWarning
+  -W error::ResourceWarning`, then run the relevant CLI and automation test
+  modules.
+
 ### P1 - EVAL-RUNTIME-001: Slack eval run IDs are not reconstructable from canonical WorkItem state
 
 - Found: 2026-06-18 15:34 EDT

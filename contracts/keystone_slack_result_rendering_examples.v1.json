@@ -1,0 +1,96 @@
+{
+  "schema": "keystone.slack_result_rendering_examples.v1",
+  "description": "Fixture payloads for Slack bridge consumers. Render expected_display_text from each payload before legacy route metadata or generic WorkItem status text.",
+  "examples": [
+    {
+      "name": "business_research_named_agent_human_summary",
+      "expected_display_text": "*Answer:*\nSamsara has a source-backed operations technology brief.\n\n*Detailed Summary:*\nRender this summary before provider diagnostics or WorkItem metadata.",
+      "payload": {
+        "human_summary": "*Answer:*\nSamsara has a source-backed operations technology brief.\n\n*Detailed Summary:*\nRender this summary before provider diagnostics or WorkItem metadata.",
+        "message": "Business Agents Company Research Brief Ready",
+        "model": {
+          "name": "gpt-5.4-mini",
+          "provider": "openai"
+        },
+        "output": {
+          "summary": "Nested fallback should not be rendered first.",
+          "title": "Metadata-shaped title"
+        },
+        "output_type": "CompanyResearchFocusedBrief",
+        "retrieval_diagnostics": {
+          "provider_summary": "searxng+agents-web-search"
+        },
+        "route": "business_research_analyst",
+        "status": "done"
+      }
+    },
+    {
+      "name": "conversational_named_agent_selected_agent_only",
+      "expected_display_text": "*Answer:*\nThe conversational named-agent ask reached KBA.\n\n*Detailed Summary:*\nA selected-agent-only payload still has enough identity to render the clean summary.",
+      "payload": {
+        "human_summary": "*Answer:*\nThe conversational named-agent ask reached KBA.\n\n*Detailed Summary:*\nA selected-agent-only payload still has enough identity to render the clean summary.",
+        "message": "Business Agents WorkItem completed.",
+        "output": {
+          "summary": "Generic nested fallback."
+        },
+        "selected_agent": "business_research_analyst"
+      }
+    },
+    {
+      "name": "business_research_legacy_display_text_fallback",
+      "expected_display_text": "*Answer:*\nSuki has an answer-first clinical AI assistant fit check ready.\n\n*Detailed Summary:*\nDisplay this summary before model, search, retrieval, timing, profile-link, or route metadata.\n\n*Useful references:*\n* Suki funding and partnership signal: https://www.businesswire.com/news/home/20241010687252/en/Suki-Secures-%2470M-Series-D-Funding-as-Demand-Surges-Expands-Strategic-Partnership-with-MedStar-Health",
+      "payload": {
+        "display_text": "*Answer:*\nDisplay-text fallback should lose to slack_display_text.",
+        "message": "Business Agents Company Research Brief Ready",
+        "model": {
+          "name": "gpt-5.4-mini",
+          "provider": "openai"
+        },
+        "output": {
+          "summary": "Nested output summary should not render before slack_display_text.",
+          "title": "Company Research Brief Ready"
+        },
+        "output_type": "CompanyResearchFocusedBrief",
+        "profile_links": [
+          {
+            "label": "Website",
+            "url": "https://www.businesswire.com"
+          }
+        ],
+        "retrieval_diagnostics": {
+          "fallback_used": true,
+          "provider_summary": "searxng+exa+agents-web-search"
+        },
+        "route": "business_research_analyst",
+        "sdk_synthesis_seconds": 78.0,
+        "slack_display_text": "*Answer:*\nSuki has an answer-first clinical AI assistant fit check ready.\n\n*Detailed Summary:*\nDisplay this summary before model, search, retrieval, timing, profile-link, or route metadata.\n\n*Useful references:*\n* Suki funding and partnership signal: https://www.businesswire.com/news/home/20241010687252/en/Suki-Secures-%2470M-Series-D-Funding-as-Demand-Surges-Expands-Strategic-Partnership-with-MedStar-Health",
+        "status": "done",
+        "summary": "*Answer:*\nTop-level summary fallback should lose to slack_display_text."
+      }
+    },
+    {
+      "name": "rss_context_output_type_only",
+      "expected_display_text": "*Answer:*\nRSS context results are available.\n\n*Detailed Summary:*\nAn output-type-only context payload should render the sectioned summary.",
+      "payload": {
+        "human_summary": "*Answer:*\nRSS context results are available.\n\n*Detailed Summary:*\nAn output-type-only context payload should render the sectioned summary.",
+        "message": "Business Agents WorkItem command completed.",
+        "output": {
+          "summary": "Generic context fallback."
+        },
+        "output_type": "RssContextResult"
+      }
+    },
+    {
+      "name": "preprints_context_route_only",
+      "expected_display_text": "*Answer:*\nPreprints context is ready for review.\n\n*Detailed Summary:*\nA route-only context payload should render human_summary instead of generic status.",
+      "payload": {
+        "human_summary": "*Answer:*\nPreprints context is ready for review.\n\n*Detailed Summary:*\nA route-only context payload should render human_summary instead of generic status.",
+        "message": "Business Agents WorkItem Ready",
+        "output": {
+          "summary": "Generic context fallback."
+        },
+        "route": "preprints_context_agent"
+      }
+    }
+  ]
+}

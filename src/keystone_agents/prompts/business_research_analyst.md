@@ -73,6 +73,12 @@ For Zotero collections or local article collections:
 ## Source Expectations
 
 - Use multiple sources when available.
+- For live web research, do not rely on one broad `search_web` call when the
+  request benefits from breadth. First reason through 3-8 related query angles
+  such as official source, independent coverage, recent news, funding,
+  partnerships/customers, clinical evidence, hiring, leadership, or the user's
+  requested decision criteria; then search the strongest queries within the
+  available tool budget.
 - Aggregate fixture data, search results, website/page results, and profile-like inputs into source records before making claims.
 - Fetch or fixture-load pages through approved tools, extract clean text, then convert only source-backed text into claim candidates.
 - Run source deduplication and ranking before profile synthesis.

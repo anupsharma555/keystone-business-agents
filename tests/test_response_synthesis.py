@@ -249,6 +249,7 @@ def test_format_user_response_synthesis_can_suppress_metadata_sections() -> None
 def test_low_metadata_requested_detects_operator_instruction() -> None:
     assert low_metadata_requested("Keep the main answer concise and low-metadata.")
     assert low_metadata_requested("Use minimal metadata in the Slack reply.")
+    assert low_metadata_requested("Return a concise internal handoff with the next owner.")
     assert not low_metadata_requested("Use compact source metadata for research.")
 
 

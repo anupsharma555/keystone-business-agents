@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 from __future__ import annotations
 
 import json
@@ -149,6 +150,57 @@ def test_early_run_smoke_business_research_analyst_cli_curebase_sources_and_mark
     assert "Source-Backed Facts" in markdown
     assert "Missing Information" in markdown
     assert "fixture://sample_company_curebase.json" in markdown
+
+
+def test_company_research_focused_brief_payload_exposes_clean_slack_summary() -> None:
+    import scripts.run_company_research as run_company_research
+    from keystone_agents.slack_action_contract import business_agent_result_display_text
+
+    payload = {
+        "output_type": "CompanyResearchFocusedBrief",
+        "output": {
+            "company_name": "Abridge",
+            "product": "A clinical documentation AI workflow integrated into EHR review.",
+            "customers": "Health systems and clinicians are the visible buyer fit.",
+            "traction_signals": "The source-backed context reports enterprise deployments.",
+            "why_it_matters": "This is relevant to Keystone because it sits in clinical AI workflow evaluation.",
+            "facts": [
+                {
+                    "text": "Abridge describes a clinical conversation documentation platform.",
+                    "source_ids": ["source:product"],
+                    "confidence": 0.9,
+                }
+            ],
+            "unknowns": ["Exact buyer titles remain unverified."],
+            "sources": [
+                {
+                    "source_id": "source:product",
+                    "title": "Abridge product",
+                    "url": "https://www.abridge.com/product",
+                    "source_type": "company_site",
+                }
+            ],
+        },
+        "model": {"provider": "openai", "name": "gpt-5.4-mini"},
+        "message": "Business Agents Company Research Brief Ready",
+        "retrieval_diagnostics": {"provider_summary": "searxng+exa"},
+        "sdk_synthesis_seconds": 12.3,
+    }
+
+    summary = run_company_research._company_research_sdk_human_summary(payload)
+    run_company_research._attach_company_research_display_text(payload, summary)
+
+    assert summary.startswith("*Answer:*\n")
+    assert "\n\n*Detailed Summary:*\n" in summary
+    assert "\n\n*Useful references:*\n" in summary
+    assert "https://www.abridge.com/product" in summary
+    assert "Model:" not in summary
+    assert "Retrieval diagnostics" not in summary
+    assert "Timing:" not in summary
+    assert payload["slack_display_text"] == summary
+    assert payload["display_text"] == summary
+    assert payload["summary"] == summary
+    assert business_agent_result_display_text(payload) == summary
 
 
 def test_early_run_smoke_opportunity_scout_cli_high_confidence_and_weak_stale() -> None:

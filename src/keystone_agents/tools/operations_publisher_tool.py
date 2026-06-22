@@ -265,6 +265,7 @@ def publish_slack_summary_impl(
     """Publish a short internal Slack summary through the existing Slack boundary."""
 
     report = report_from_json(report_json)
+    target_channel = str(channel or "").strip()
     text = "\n".join(
         [
             f"{report.title}",
@@ -274,13 +275,24 @@ def publish_slack_summary_impl(
             "Writes are internal-review only; public posts and external actions remain gated.",
         ]
     )
-    result = SlackTool(live=live).post_message(channel or "#ai-agents-workflow", text)
+    if not target_channel:
+        return {
+            "status": "blocked",
+            "send_enabled": False,
+            "blocker": "missing_slack_source_channel",
+            "slack_result": {
+                "status": "blocked",
+                "channel": "",
+                "error": "missing_slack_source_channel",
+            },
+        }
+    result = SlackTool(live=live).post_message(target_channel, text)
     artifact = AutomationArtifactRef(
         artifact_type="automation_slack_summary",
         title=f"{report.title} Slack Summary",
         provider="slack",
         dry_run=not live,
-        url=f"slack://{result.get('channel', channel)}/{result.get('ts', '')}",
+        url=f"slack://{result.get('channel', target_channel)}/{result.get('ts', '')}",
         metadata={
             "report_id": report.report_id,
             "slack_result": result,

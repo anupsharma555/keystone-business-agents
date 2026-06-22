@@ -23,6 +23,8 @@ RouteName = Literal[
     "airtable_context_agent",
     "google_workspace_context_agent",
     "zotero_context_agent",
+    "rss_context_agent",
+    "preprints_context_agent",
     "clarification",
 ]
 RoutingMode = Literal["deterministic", "llm", "llm_unavailable"]

@@ -44,11 +44,15 @@ from keystone_agents.slack_action_contract import (
     KBA_COS_SHOW_BLOCKERS,
     KBA_COS_SYNC_AIRTABLE,
     KBA_CREATE_GMAIL_DRAFT,
+    KBA_EVAL_ORCHESTRATOR_JUDGE,
+    KBA_EVAL_REVIEW,
     KBA_FIND_CONTACT,
     KBA_INTENT_APPROVE_EXTERNAL_USE,
     KBA_INTENT_AUDIT_AUTOMATIONS,
     KBA_INTENT_CONTINUE_WORK_ITEM,
     KBA_INTENT_CREATE_GMAIL_DRAFT,
+    KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE,
+    KBA_INTENT_EVAL_REVIEW,
     KBA_INTENT_FIND_CONTACT,
     KBA_INTENT_GENERATE_DOC,
     KBA_INTENT_MORE_RESEARCH,
@@ -428,6 +432,139 @@ def _handle_kba_action(
     )
 
 
+def _handle_eval_orchestrator_judge_action(
+    payload: dict[str, Any],
+    action_payload: BusinessAgentActionPayload,
+    *,
+    action_id: str,
+    reviewer: str,
+) -> SlackApprovalInteractionResult:
+    """Run the local Orchestrator judge for a saved #evals Slack run."""
+
+    eval_record = action_payload.metadata.get("eval_record")
+    if not isinstance(eval_record, dict):
+        raise ValueError("Orchestrator judge action is missing eval_record metadata.")
+    case_id = _eval_action_scalar(eval_record.get("case_id"))
+    run_id = _eval_action_scalar(eval_record.get("run_id"))
+    slack_thread_ts = _eval_action_scalar(
+        eval_record.get("slack_thread_ts") or action_payload.source_thread_ts
+    )
+    if not case_id or not run_id or not slack_thread_ts:
+        raise ValueError("Orchestrator judge action requires case_id, run_id, and slack_thread_ts.")
+
+    try:
+        from promptfoo.eval_database import DEFAULT_EVAL_DB
+        from promptfoo.eval_urls import eval_dashboard_case_url, eval_review_case_url
+        from promptfoo.orchestrator_judge import score_eval_run_with_orchestrator_judge
+    except ImportError as exc:
+        raise ValueError("Orchestrator judge scoring is unavailable in this runtime.") from exc
+
+    database_path = os.environ.get("KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB") or str(DEFAULT_EVAL_DB)
+    result = score_eval_run_with_orchestrator_judge(
+        case_id=case_id,
+        run_id=run_id,
+        slack_thread_ts=slack_thread_ts,
+        database_path=database_path,
+    )
+    dashboard_case_url = _eval_action_scalar(
+        result.get("dashboard_case_url")
+        or eval_record.get("dashboard_case_url")
+        or eval_dashboard_case_url(case_id)
+    )
+    review_case_url = _eval_action_scalar(
+        result.get("review_case_url")
+        or eval_record.get("review_case_url")
+        or eval_review_case_url(case_id)
+    )
+    average = result.get("average_score")
+    safety = _eval_action_scalar(result.get("safety"))
+    score_text = f"{float(average):.1f}/5" if isinstance(average, (int, float)) else "saved"
+    followup_text = (
+        f"Orchestrator judge saved scorecard for `{case_id}`: {score_text}"
+        f"{f' (safety {safety})' if safety else ''}. "
+        f"Dashboard: <{dashboard_case_url}|case dashboard>. "
+        f"Review form: <{review_case_url}|scorecard>."
+    )
+    slack_context = _slack_context(payload)
+    return SlackApprovalInteractionResult(
+        approval_id="",
+        action_id=action_id,
+        approval_status=ApprovalQueueStatus.PENDING,
+        stage="eval_orchestrator_judge",
+        object_type="eval_case",
+        object_id=case_id,
+        source_agent="orchestrator",
+        reviewer=reviewer,
+        outcome="orchestrator_judge_score_saved",
+        followup_text=followup_text,
+        read_only_payload={
+            "orchestrator_judge": result,
+            "dashboard_case_url": dashboard_case_url,
+            "review_case_url": review_case_url,
+        },
+        slack_channel_id=action_payload.source_channel_id or slack_context.get("channel_id", ""),
+        slack_message_ts=action_payload.source_message_ts or slack_context.get("message_ts", ""),
+    )
+
+
+def _handle_eval_review_action(
+    payload: dict[str, Any],
+    action_payload: BusinessAgentActionPayload,
+    *,
+    action_id: str,
+    reviewer: str,
+) -> SlackApprovalInteractionResult:
+    """Return the saved review-form link for a #evals Slack run."""
+
+    eval_record = action_payload.metadata.get("eval_record")
+    if not isinstance(eval_record, dict):
+        raise ValueError("Eval review action is missing eval_record metadata.")
+    case_id = _eval_action_scalar(eval_record.get("case_id"))
+    run_id = _eval_action_scalar(eval_record.get("run_id"))
+    if not case_id:
+        raise ValueError("Eval review action requires case_id.")
+    try:
+        from promptfoo.eval_urls import eval_dashboard_case_url, eval_review_case_url
+    except ImportError as exc:
+        raise ValueError("Eval review URLs are unavailable in this runtime.") from exc
+    dashboard_case_url = _eval_action_scalar(
+        eval_record.get("dashboard_case_url") or eval_dashboard_case_url(case_id)
+    )
+    review_case_url = _eval_action_scalar(
+        eval_record.get("review_case_url") or eval_review_case_url(case_id)
+    )
+    followup_text = (
+        f"Review form for `{case_id}`"
+        f"{f', run `{run_id}`' if run_id else ''}: <{review_case_url}|score this case>. "
+        f"Dashboard: <{dashboard_case_url}|case dashboard>."
+    )
+    slack_context = _slack_context(payload)
+    return SlackApprovalInteractionResult(
+        approval_id="",
+        action_id=action_id,
+        approval_status=ApprovalQueueStatus.PENDING,
+        stage="eval_review",
+        object_type="eval_case",
+        object_id=case_id,
+        source_agent=_eval_action_scalar(eval_record.get("agent")),
+        reviewer=reviewer,
+        outcome="eval_review_link_ready",
+        followup_text=followup_text,
+        read_only_payload={
+            "case_id": case_id,
+            "run_id": run_id,
+            "dashboard_case_url": dashboard_case_url,
+            "review_case_url": review_case_url,
+        },
+        slack_channel_id=action_payload.source_channel_id or slack_context.get("channel_id", ""),
+        slack_message_ts=action_payload.source_message_ts or slack_context.get("message_ts", ""),
+    )
+
+
+def _eval_action_scalar(value: Any, *, max_chars: int = 500) -> str:
+    return " ".join(str(value or "").strip().split())[:max_chars]
+
+
 def _handle_kba_revision_modal_submission(
     payload: dict[str, Any],
     *,
@@ -544,6 +681,20 @@ def _handle_kba_steering_action(
             action_id=action_id,
             reviewer=reviewer,
             database_url=database_url,
+        )
+    if intent == KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE:
+        return _handle_eval_orchestrator_judge_action(
+            payload,
+            action_payload,
+            action_id=action_id,
+            reviewer=reviewer,
+        )
+    if intent == KBA_INTENT_EVAL_REVIEW:
+        return _handle_eval_review_action(
+            payload,
+            action_payload,
+            action_id=action_id,
+            reviewer=reviewer,
         )
     if intent == KBA_INTENT_SHOW_SOURCES:
         work_item = _optional_work_item_for_action(store, action_payload, item)
@@ -1042,11 +1193,15 @@ def _handle_chief_of_staff_action(
     elif intent == KBA_INTENT_POST_INTERNAL_SUMMARY:
         read_only_payload["publish_result"] = publish_slack_summary_impl(
             report.model_dump_json(),
-            channel=channel or "#ai-agents-workflow",
+            channel=channel,
             live=False,
         )
         outcome = "slack_summary_ready"
-        followup = "Dry-run internal Slack summary prepared."
+        if read_only_payload["publish_result"].get("status") == "blocked":
+            outcome = "channel_context_required"
+            followup = "No source Slack channel was available for the internal summary dry-run."
+        else:
+            followup = "Dry-run internal Slack summary prepared."
     elif intent == KBA_INTENT_SHOW_BLOCKERS:
         blockers = [
             finding.model_dump(mode="json")
@@ -1092,6 +1247,8 @@ def _kba_action_payload(
         KBA_REVISE_DRAFT: KBA_INTENT_REVISE_DRAFT,
         KBA_MORE_RESEARCH: KBA_INTENT_MORE_RESEARCH,
         KBA_FIND_CONTACT: KBA_INTENT_FIND_CONTACT,
+        KBA_EVAL_REVIEW: KBA_INTENT_EVAL_REVIEW,
+        KBA_EVAL_ORCHESTRATOR_JUDGE: KBA_INTENT_EVAL_ORCHESTRATOR_JUDGE,
         KBA_COS_AUDIT_AUTOMATIONS: KBA_INTENT_AUDIT_AUTOMATIONS,
         KBA_COS_GENERATE_DOC: KBA_INTENT_GENERATE_DOC,
         KBA_COS_SYNC_AIRTABLE: KBA_INTENT_SYNC_AIRTABLE,

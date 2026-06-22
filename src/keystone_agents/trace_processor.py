@@ -170,6 +170,7 @@ def record_sdk_run_summary_trace_event(
         failure_kind=failure_kind,
         retry_count=retry_count,
         repair_loop_count=repair_loop_count,
+        duration_ms=duration_ms,
     )
     try:
         return record_eval_trace_event(
@@ -216,6 +217,7 @@ def _sdk_run_summary_metadata(
     failure_kind: str,
     retry_count: int,
     repair_loop_count: int,
+    duration_ms: float | None,
 ) -> dict[str, Any]:
     observed = _observed_sdk_activity(raw_result)
     turns_used, turns_source = _turns_used(raw_result, usage)
@@ -235,7 +237,10 @@ def _sdk_run_summary_metadata(
         or search_diagnostics.get("extraction_issues")
         or []
     )
-    failed_tool_count = _safe_int(search_diagnostics.get("failed_tool_call_count"))
+    failed_tool_count = max(
+        _safe_int(search_diagnostics.get("failed_tool_call_count")),
+        observed["failed_tool_call_count"],
+    )
     tool_names = sorted(observed["tool_call_counts"].keys())[:20]
     has_retrieval_metadata = bool(
         search_diagnostics.get("provider_summary")
@@ -295,6 +300,7 @@ def _sdk_run_summary_metadata(
         "configured_tool_count": _safe_int(request_cache.get("tool_count")),
         "tool_call_count": observed["tool_call_count"],
         "tool_call_counts": observed["tool_call_counts"],
+        "tool_call_summary": observed["tool_call_summary"],
         "handoff_count": observed["handoff_count"],
         "retry_count": retry_total,
         "repair_loop_count": repair_total,
@@ -352,7 +358,6 @@ def _sdk_run_summary_metadata(
                 "raw_payloads_included": False,
                 "logs_hold_verbose_details": True,
                 "future_api_expected": [
-                    "tool_call_summary",
                     "orchestrator_review",
                     "web_extraction_summary",
                 ],
@@ -360,7 +365,7 @@ def _sdk_run_summary_metadata(
             "execution": {
                 "run_mode": _clean_scalar(run_mode),
                 "stage": _clean_scalar(stage),
-                "duration_ms": None,
+                "duration_ms": _safe_float(duration_ms),
                 "live": bool(live),
             },
             "model": {
@@ -372,6 +377,7 @@ def _sdk_run_summary_metadata(
                 "tool_call_count": observed["tool_call_count"],
                 "failed_tool_call_count": failed_tool_count,
                 "tool_names": tool_names,
+                "tool_call_summary": observed["tool_call_summary"],
                 "handoff_count": observed["handoff_count"],
                 "has_tool_metadata": bool(observed["tool_call_count"] or failed_tool_count or tool_names),
             },
@@ -489,6 +495,7 @@ def _safe_correlation(trace_metadata: dict[str, Any]) -> dict[str, str]:
         "eval_id",
         "run_id",
         "slack_channel_id",
+        "slack_channel_name",
         "slack_thread_ts",
         "stage",
         "status",
@@ -506,6 +513,8 @@ def _safe_correlation(trace_metadata: dict[str, Any]) -> dict[str, str]:
 
 def _observed_sdk_activity(raw_result: Any) -> dict[str, Any]:
     tool_counts: dict[str, int] = {}
+    tool_failed_counts: dict[str, int] = {}
+    tool_statuses: dict[str, set[str]] = {}
     handoff_count = 0
     for item in _result_items(raw_result):
         kind = _clean_scalar(
@@ -521,9 +530,34 @@ def _observed_sdk_activity(raw_result: Any) -> dict[str, Any]:
             safe_name = _clean_scalar(name or "unknown_tool")
             if safe_name:
                 tool_counts[safe_name] = tool_counts.get(safe_name, 0) + 1
+                status = _activity_status(item)
+                if status:
+                    tool_statuses.setdefault(safe_name, set()).add(status)
+                if status in {"error", "failed", "failure", "timeout"} or _activity_error_kind(item):
+                    tool_failed_counts[safe_name] = tool_failed_counts.get(safe_name, 0) + 1
+    tool_call_summary = []
+    for name, count in sorted(tool_counts.items()):
+        failed_count = tool_failed_counts.get(name, 0)
+        statuses = sorted(tool_statuses.get(name, set()))
+        if failed_count:
+            status = "failed"
+        elif statuses:
+            status = statuses[-1]
+        else:
+            status = "observed"
+        tool_call_summary.append(
+            {
+                "name": name,
+                "count": count,
+                "failed_count": failed_count,
+                "status": status,
+            }
+        )
     return {
         "tool_call_count": sum(tool_counts.values()),
         "tool_call_counts": dict(sorted(tool_counts.items())),
+        "failed_tool_call_count": sum(tool_failed_counts.values()),
+        "tool_call_summary": tool_call_summary[:20],
         "handoff_count": handoff_count,
     }
 
@@ -558,6 +592,53 @@ def _activity_name(item: Any) -> str:
         raw = item.get("raw_item")
         if isinstance(raw, dict):
             return str(raw.get("name") or raw.get("tool_name") or "")
+    return ""
+
+
+def _activity_status(item: Any) -> str:
+    for candidate in (
+        getattr(item, "status", ""),
+        getattr(item, "state", ""),
+        getattr(item, "outcome", ""),
+        getattr(getattr(item, "raw_item", None), "status", ""),
+        getattr(getattr(item, "item", None), "status", ""),
+    ):
+        cleaned = _clean_scalar(candidate)
+        if cleaned:
+            return cleaned.lower()
+    if isinstance(item, dict):
+        for key in ("status", "state", "outcome"):
+            cleaned = _clean_scalar(item.get(key))
+            if cleaned:
+                return cleaned.lower()
+        raw = item.get("raw_item")
+        if isinstance(raw, dict):
+            cleaned = _clean_scalar(raw.get("status") or raw.get("state") or raw.get("outcome"))
+            if cleaned:
+                return cleaned.lower()
+    return ""
+
+
+def _activity_error_kind(item: Any) -> str:
+    for candidate in (
+        getattr(item, "error_type", ""),
+        getattr(item, "error_kind", ""),
+        getattr(item, "exception_type", ""),
+        getattr(getattr(item, "raw_item", None), "error_type", ""),
+        getattr(getattr(item, "item", None), "error_type", ""),
+    ):
+        cleaned = _clean_scalar(candidate)
+        if cleaned:
+            return cleaned
+    if isinstance(item, dict):
+        for key in ("error_type", "error_kind", "exception_type", "error"):
+            if item.get(key):
+                return _clean_scalar(key if key == "error" else item.get(key))
+        raw = item.get("raw_item")
+        if isinstance(raw, dict):
+            for key in ("error_type", "error_kind", "exception_type", "error"):
+                if raw.get(key):
+                    return _clean_scalar(key if key == "error" else raw.get(key))
     return ""
 
 

@@ -451,6 +451,11 @@ matching `SKILL.md` before touching repo files.
 - `codex-skills/kba-agent-contract-change/SKILL.md`: use when changing SDK
   agents, prompts, schemas, tools, context packs, handoffs, runtime skills,
   `AgentSpec` metadata, or related tests.
+- `codex-skills/kba-new-agent/SKILL.md`: use when creating, shaping, or
+  integrating a novel Keystone agent, including workflow specialists, context
+  specialists, Chief-of-Staff callable specialists, workflow-specific registry
+  metadata, runtime skill bundles, tool policies, handoff contracts, LLM
+  reasoning preservation, and eval coverage.
 - `codex-skills/kba-eval-readiness-triage/SKILL.md`: use when diagnosing or
   changing Promptfoo evals, Slack eval readiness, eval dashboards, route
   compaction, or trace summary behavior.

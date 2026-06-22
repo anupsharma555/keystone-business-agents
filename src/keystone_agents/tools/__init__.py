@@ -6,6 +6,12 @@ approval, and audit handling.
 
 from importlib import import_module
 
+from keystone_agents.tools.announcement_context_tools import (
+    retrieve_preprint_announcement_history,
+    retrieve_preprint_announcement_history_impl,
+    retrieve_rss_announcement_history,
+    retrieve_rss_announcement_history_impl,
+)
 from keystone_agents.tools.apify_tool import ApifyTool
 from keystone_agents.tools.approval_tool import ApprovalTool, post_approval_request
 from keystone_agents.tools.browserless_tool import BrowserlessTool
@@ -91,6 +97,10 @@ __all__ = [
     "list_threads_by_label_filter",
     "HtmlReviewResult",
     "extract_research_claims_from_html",
+    "retrieve_rss_announcement_history",
+    "retrieve_rss_announcement_history_impl",
+    "retrieve_preprint_announcement_history",
+    "retrieve_preprint_announcement_history_impl",
     "google_drive_get_file_metadata",
     "google_drive_get_file_metadata_impl",
     "google_drive_search_files",

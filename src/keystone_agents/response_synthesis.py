@@ -1144,6 +1144,10 @@ def low_metadata_requested(text: str) -> bool:
             r"\b(?:low[- ]metadata|minimal\s+metadata|no\s+metadata|metadata[- ]light)\b",
             normalized,
         )
+        or re.search(
+            r"\b(?:concise|compact|short)\s+internal\s+handoff\b",
+            normalized,
+        )
     )
 
 

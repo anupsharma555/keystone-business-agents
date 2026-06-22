@@ -14,6 +14,8 @@ ALL_AGENT_ROUTES = (
     "airtable_context_agent",
     "google_workspace_context_agent",
     "zotero_context_agent",
+    "rss_context_agent",
+    "preprints_context_agent",
 )
 
 
@@ -217,7 +219,13 @@ CONTEXT_SOURCE_CATALOG: tuple[ContextSourceSpec, ...] = (
             "src/keystone_agents/multi_agent_automations.py",
             "docs/corpus/resources/file_search_corpus_policy.md",
         ),
-        allowed_agents=("chief_of_staff", "business_research_analyst", "orchestrator"),
+        allowed_agents=(
+            "chief_of_staff",
+            "business_research_analyst",
+            "orchestrator",
+            "rss_context_agent",
+            "preprints_context_agent",
+        ),
         contract=(
             "Local canonical RSS/preprint announcement records with derived SQLite "
             "retrieval index; hosted vector stores are not canonical state."

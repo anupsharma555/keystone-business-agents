@@ -37,6 +37,8 @@ DEFAULT_AGENT_INPUT_SCHEMAS: dict[str, str] = {
         "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput"
     ),
     "zotero_context_agent": "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput",
+    "rss_context_agent": "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput",
+    "preprints_context_agent": "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput",
     "orchestrator": "keystone_agents.schemas.manual_request_plan.ManualRequestPlan",
     "chief_of_staff": "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput",
 }
@@ -500,6 +502,64 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "No Zotero library mutation except through the guarded backend importer",
             "Chief of Staff owns writes when this agent is nested as a specialist tool",
             "Return blockers when library, collection, article, or item identity is ambiguous",
+        ),
+        handoff_enabled=True,
+    ),
+    AgentSpec(
+        route_name="rss_context_agent",
+        agent_name="RSS Context Agent",
+        builder="keystone_agents.agents.rss_context:build_rss_context_agent",
+        output_schema="keystone_agents.schemas.operational_context.RssContextResult",
+        prompt_files=(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "rss_context.md",
+        ),
+        skills=AGENT_SKILL_NAMES["rss_context_agent"],
+        tools=("retrieve_rss_announcement_history",),
+        live_flags_required=("--live-sdk",),
+        eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
+        validation_paths=("tests/test_agent_registry.py", "tests/test_announcement_context_tools.py"),
+        handoff_description=(
+            "Read historical RSS/#announcements article context from canonical local "
+            "application data and return advisory themes, opportunity signals, and "
+            "future-direction guidance."
+        ),
+        safety_notes=(
+            "Read-only historical context",
+            "No Slack scraping or posting",
+            "No local feed mutation",
+            "Current external claims still require current source verification",
+        ),
+        handoff_enabled=True,
+    ),
+    AgentSpec(
+        route_name="preprints_context_agent",
+        agent_name="Preprints Context Agent",
+        builder="keystone_agents.agents.preprints_context:build_preprints_context_agent",
+        output_schema="keystone_agents.schemas.operational_context.PreprintsContextResult",
+        prompt_files=(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "preprints_context.md",
+        ),
+        skills=AGENT_SKILL_NAMES["preprints_context_agent"],
+        tools=("retrieve_preprint_announcement_history",),
+        live_flags_required=("--live-sdk",),
+        eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
+        validation_paths=("tests/test_agent_registry.py", "tests/test_announcement_context_tools.py"),
+        handoff_description=(
+            "Read historical preprint/#knowledge-hub context from canonical local "
+            "application data and return advisory psychiatry-field themes, opportunity "
+            "signals, and future-direction guidance."
+        ),
+        safety_notes=(
+            "Read-only historical context",
+            "No Slack scraping or posting",
+            "No local feed mutation",
+            "Preprints are preliminary and current claims require source verification",
         ),
         handoff_enabled=True,
     ),

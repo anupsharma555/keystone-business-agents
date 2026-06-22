@@ -773,7 +773,7 @@ def _dashboard_workflow_readiness_check(*, tmp_dir: Path, eval_db: Path) -> dict
         "Promptfoo machine summary": "Use imported Promptfoo result by case_id; do not rerun Promptfoo from Slack thread",
         "Retrieval/source evidence": "Use dry-run fixtures/cache first; cap live retrieval to accepted root run",
         "Slack review form open": "No model call; form uses saved case, run id, thread, and response context",
-        "Submit Evaluation": "No model call; no Slack post; writes one review row, then refreshes Database, Runs & Scoring, and Analysis from saved rows",
+        "Submit Evaluation": "Manual submit uses no model call and no Slack post; Orchestrator Review runs only when explicitly enabled, then refreshes Database, Runs & Scoring, and Analysis from saved rows",
         "Analysis inclusion": "No rerun; recalculates from database rows",
     }
     if readiness.get("mode") != "local_preview":
@@ -874,7 +874,7 @@ def _dashboard_human_review_check(*, tmp_dir: Path, eval_db: Path, case_id: str)
     html = output_path.read_text(encoding="utf-8")
     required = [
         "Human Avg / 5",
-        "1 reviewed",
+        "1 manual review",
         "4.54",
         case_id,
     ]

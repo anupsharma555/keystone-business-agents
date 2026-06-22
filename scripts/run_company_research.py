@@ -19,6 +19,7 @@ from keystone_agents.agents.business_research_analyst import (
     research_account_from_search_results,
 )
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
+from keystone_agents.agents.web_query_planner import resolve_web_query_plan
 from keystone_agents.cli_orchestrator_review import (
     add_orchestrator_review_arguments,
     build_cli_orchestrator_review,
@@ -186,6 +187,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Use live search through the configured provider. Supported in both "
             "standard company-profile mode and SDK BR-1 focused-brief mode. "
             "Requires --no-dry-run."
+        ),
+    )
+    parser.add_argument(
+        "--live-search-plan",
+        action="store_true",
+        help=(
+            "Use a credential-gated LLM query-planning pass before live company "
+            "retrieval. Falls back to deterministic queries if unavailable."
         ),
     )
     parser.add_argument(
@@ -398,6 +407,25 @@ def _company_query_builder_for_args(
         queries = build_company_research_queries(company, company_url)
         if args.improvement_case == CR1_IMPROVEMENT_CASE_ID:
             return queries[:4]
+        if getattr(args, "live_search_plan", False):
+            request_text = " ".join(
+                part
+                for part in (
+                    getattr(args, "request_text", ""),
+                    getattr(args, "research_goal", ""),
+                    getattr(args, "notes", ""),
+                )
+                if str(part or "").strip()
+            )
+            plan = resolve_web_query_plan(
+                subject=company,
+                request_text=request_text,
+                fallback_queries=queries,
+                max_queries=12,
+                live=True,
+                planner_context=orchestrator_preflight_context_text(args),
+            )
+            return plan.queries
         return queries
 
     return build_queries
@@ -700,6 +728,8 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         retrieval_mode="live_search" if args.live_search else "fixture",
     )
     payload["retrieval_diagnostics"] = payload["retrieval"].get("retrieval_diagnostics")
+    human_summary = _company_research_sdk_human_summary(payload)
+    _attach_company_research_display_text(payload, human_summary)
     if getattr(args, "manual_request_plan", None):
         payload["manual_request_plan"] = args.manual_request_plan
     attach_orchestrator_preflight_payload(payload, args)
@@ -733,6 +763,127 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         payload["test_pack_prompt"] = CR1_IMPROVEMENT_PROMPT
         payload["acceptance_criteria"] = list(CR1_ACCEPTANCE_CRITERIA)
     return payload
+
+
+def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
+    """Build a Slack-safe reader summary from structured SDK company output."""
+
+    if payload.get("output_type") != "CompanyResearchFocusedBrief":
+        return ""
+    output = payload.get("output")
+    if not isinstance(output, dict):
+        return ""
+    company = _summary_text(output.get("company_name")) or "The company"
+    product = _summary_text(output.get("product"))
+    customers = _summary_text(output.get("customers"))
+    traction = _summary_text(output.get("traction_signals"))
+    why_it_matters = _summary_text(output.get("why_it_matters"))
+    unknowns = _summary_list(output.get("unknowns"), limit=4)
+    facts = _summary_facts(output.get("facts"), limit=4)
+    sources = _summary_sources(output.get("sources"), limit=5)
+
+    answer_parts = []
+    if why_it_matters:
+        answer_parts.append(_truncate_summary(why_it_matters, 360))
+    elif product:
+        answer_parts.append(f"{company} appears relevant based on its product/workflow context.")
+    else:
+        answer_parts.append(f"{company} has source-backed context available for review.")
+    if traction:
+        answer_parts.append(f"Key signal: {_truncate_summary(traction, 220)}")
+
+    detail_lines: list[str] = []
+    if product:
+        detail_lines.append(f"* Product/workflow: {_truncate_summary(product, 420)}")
+    if customers:
+        detail_lines.append(f"* Healthcare buyer fit: {_truncate_summary(customers, 420)}")
+    if traction:
+        detail_lines.append(f"* Evidence or deployment signals: {_truncate_summary(traction, 420)}")
+    if facts:
+        detail_lines.append("* Source-backed facts:")
+        detail_lines.extend(f"  * {fact}" for fact in facts)
+    if unknowns:
+        detail_lines.append("* What remains unverified:")
+        detail_lines.extend(f"  * {_truncate_summary(item, 240)}" for item in unknowns)
+    if not detail_lines:
+        detail_lines.append(
+            "* No detailed source-backed fields were returned by the focused brief."
+        )
+
+    sections = [
+        "*Answer:*\n" + " ".join(answer_parts).strip(),
+        "*Detailed Summary:*\n" + "\n".join(detail_lines).strip(),
+    ]
+    if sources:
+        sections.append("*Useful references:*\n" + "\n".join(sources))
+    return "\n\n".join(section for section in sections if section.strip())
+
+
+def _attach_company_research_display_text(payload: dict[str, Any], human_summary: str) -> None:
+    """Expose answer-first display text for Slack bridge compatibility."""
+
+    display_text = str(human_summary or "").strip()
+    if not display_text:
+        return
+    payload["human_summary"] = display_text
+    payload["slack_display_text"] = display_text
+    payload["display_text"] = display_text
+    payload["summary"] = display_text
+
+
+def _summary_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _summary_list(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_summary_text(item) for item in value if _summary_text(item)][:limit]
+
+
+def _summary_facts(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    facts: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            text = _summary_text(item.get("text"))
+            source_ids = _summary_list(item.get("source_ids"), limit=3)
+            if text and source_ids:
+                facts.append(f"{_truncate_summary(text, 260)} (sources: {', '.join(source_ids)})")
+            elif text:
+                facts.append(_truncate_summary(text, 260))
+        else:
+            text = _summary_text(item)
+            if text:
+                facts.append(_truncate_summary(text, 260))
+        if len(facts) >= limit:
+            break
+    return facts
+
+
+def _summary_sources(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    lines: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        url = _summary_text(item.get("url"))
+        if not url:
+            continue
+        title = _summary_text(item.get("title")) or url
+        lines.append(f"* {title}: {url}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _truncate_summary(text: str, limit: int) -> str:
+    clean = " ".join(str(text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(limit - 1, 0)].rstrip() + "..."
 
 
 def _save_retrieval_tool_performance_memory(

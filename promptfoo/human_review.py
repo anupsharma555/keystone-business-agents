@@ -15,6 +15,10 @@ from typing import Any
 UTC = UTC
 
 DEFAULT_REVIEW_DB = Path(".keystone/promptfoo/human-reviews.sqlite")
+REVIEW_KIND_HUMAN = "human"
+REVIEW_KIND_ORCHESTRATOR_JUDGE = "orchestrator_judge"
+REVIEW_KINDS = (REVIEW_KIND_HUMAN, REVIEW_KIND_ORCHESTRATOR_JUDGE)
+SCORE_COLUMN_PREFIX = "score_"
 
 SCORE_DIMENSIONS = (
     "accuracy",
@@ -107,6 +111,7 @@ class HumanEvalReview:
     run_id: str = ""
     agent: str = ""
     reviewer: str = "anup"
+    review_kind: str = REVIEW_KIND_HUMAN
     scores: dict[str, float] = field(default_factory=dict)
     safety: str = ""
     notes: str = ""
@@ -146,6 +151,7 @@ def parse_human_review(
     slack_channel_name: str = "evals",
     slack_thread_ts: str = "",
     storage_mode: str = "local_review",
+    review_kind: str = REVIEW_KIND_HUMAN,
 ) -> HumanEvalReview:
     """Parse a Slack-thread score reply into a normalized review record."""
 
@@ -200,6 +206,7 @@ def parse_human_review(
         run_id=parsed_run_id,
         agent=parsed_agent,
         reviewer=parsed_reviewer,
+        review_kind=_normalize_review_kind(review_kind),
         scores=dict(sorted(scores.items())),
         safety=safety,
         notes=parsed_notes,
@@ -231,22 +238,45 @@ def save_human_review(
         if storage_mode == "api_redacted":
             stored_notes = _redact_review_text(review.notes, max_chars=500)
             stored_raw_text = _redact_review_text(review.raw_text, max_chars=1200)
+        score_columns = [f"{SCORE_COLUMN_PREFIX}{dimension}" for dimension in SCORE_DIMENSIONS]
+        column_names = [
+            "case_id",
+            "run_id",
+            "agent",
+            "reviewer",
+            "review_kind",
+            "scores_json",
+            "average_score",
+            "total_score",
+            *score_columns,
+            "safety",
+            "notes",
+            "slack_channel_id",
+            "slack_channel_name",
+            "slack_thread_ts",
+            "raw_text",
+            "storage_mode",
+            "raw_text_hash",
+            "notes_hash",
+            "created_at",
+        ]
+        placeholders = ", ".join("?" for _ in column_names)
         cursor = connection.execute(
-            """
+            f"""
             INSERT INTO human_eval_reviews (
-                case_id, run_id, agent, reviewer, scores_json, average_score,
-                safety, notes, slack_channel_id, slack_channel_name,
-                slack_thread_ts, raw_text, storage_mode, raw_text_hash,
-                notes_hash, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                {", ".join(column_names)}
+            ) VALUES ({placeholders})
             """,
             (
                 review.case_id,
                 review.run_id,
                 review.agent,
                 review.reviewer,
+                _normalize_review_kind(review.review_kind),
                 json.dumps(review.scores, ensure_ascii=True, sort_keys=True),
                 review.average_score,
+                review.average_score,
+                *[review.scores.get(dimension) for dimension in SCORE_DIMENSIONS],
                 review.safety,
                 stored_notes,
                 review.slack_channel_id,
@@ -336,8 +366,21 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             run_id TEXT NOT NULL DEFAULT '',
             agent TEXT NOT NULL DEFAULT '',
             reviewer TEXT NOT NULL DEFAULT '',
+            review_kind TEXT NOT NULL DEFAULT 'human',
             scores_json TEXT NOT NULL DEFAULT '{}',
             average_score REAL,
+            total_score REAL,
+            score_accuracy REAL,
+            score_relevance REAL,
+            score_explainability REAL,
+            score_readability REAL,
+            score_source_quality REAL,
+            score_search_quality REAL,
+            score_synthesis_quality REAL,
+            score_uniqueness REAL,
+            score_format_quality REAL,
+            score_instruction_following REAL,
+            score_usefulness REAL,
             safety TEXT NOT NULL DEFAULT '',
             notes TEXT NOT NULL DEFAULT '',
             slack_channel_id TEXT NOT NULL DEFAULT '',
@@ -351,9 +394,30 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    _add_column_if_missing(connection, "human_eval_reviews", "run_id", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "human_eval_reviews", "agent", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "human_eval_reviews", "reviewer", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "human_eval_reviews", "review_kind", "TEXT NOT NULL DEFAULT 'human'")
+    _add_column_if_missing(connection, "human_eval_reviews", "scores_json", "TEXT NOT NULL DEFAULT '{}'")
+    _add_column_if_missing(connection, "human_eval_reviews", "average_score", "REAL")
+    _add_column_if_missing(connection, "human_eval_reviews", "total_score", "REAL")
+    for dimension in SCORE_DIMENSIONS:
+        _add_column_if_missing(
+            connection,
+            "human_eval_reviews",
+            f"{SCORE_COLUMN_PREFIX}{dimension}",
+            "REAL",
+        )
+    _add_column_if_missing(connection, "human_eval_reviews", "safety", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "human_eval_reviews", "notes", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "human_eval_reviews", "slack_channel_id", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "human_eval_reviews", "slack_channel_name", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "human_eval_reviews", "slack_thread_ts", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "human_eval_reviews", "raw_text", "TEXT NOT NULL DEFAULT ''")
     _add_column_if_missing(connection, "human_eval_reviews", "storage_mode", "TEXT NOT NULL DEFAULT 'local_review'")
     _add_column_if_missing(connection, "human_eval_reviews", "raw_text_hash", "TEXT NOT NULL DEFAULT ''")
     _add_column_if_missing(connection, "human_eval_reviews", "notes_hash", "TEXT NOT NULL DEFAULT ''")
+    _backfill_score_columns(connection)
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_human_eval_reviews_case ON human_eval_reviews(case_id)"
     )
@@ -408,6 +472,16 @@ def _validate_review_for_storage(review: HumanEvalReview) -> None:
         raise ValueError("scores must be numeric values between 0 and 5")
     if str(review.safety or "").strip() not in {"pass", "fail"}:
         raise ValueError("safety is required and must be pass or fail")
+    _normalize_review_kind(review.review_kind)
+
+
+def _normalize_review_kind(value: str) -> str:
+    normalized = str(value or REVIEW_KIND_HUMAN).strip().lower()
+    if normalized not in REVIEW_KINDS:
+        raise ValueError(
+            "review_kind must be one of: " + ", ".join(REVIEW_KINDS)
+        )
+    return normalized
 
 
 def _normalize_key(value: str) -> str:
@@ -435,8 +509,51 @@ def _parse_safety(value: str) -> str:
 
 def _row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
     payload = dict(row)
-    payload["scores"] = _normalize_scores(json.loads(str(payload.pop("scores_json") or "{}")))
+    try:
+        scores = _normalize_scores(json.loads(str(payload.pop("scores_json") or "{}")))
+    except (TypeError, json.JSONDecodeError, ValueError):
+        scores = {}
+    for dimension in SCORE_DIMENSIONS:
+        column_value = payload.get(f"{SCORE_COLUMN_PREFIX}{dimension}")
+        if dimension not in scores and column_value is not None:
+            scores[dimension] = float(column_value)
+    payload["scores"] = scores
     return payload
+
+
+def _backfill_score_columns(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(human_eval_reviews)").fetchall()
+    }
+    required = {"id", "scores_json", "average_score", "total_score"}
+    required.update(f"{SCORE_COLUMN_PREFIX}{dimension}" for dimension in SCORE_DIMENSIONS)
+    if not required.issubset(columns):
+        return
+    rows = connection.execute(
+        """
+        SELECT id, scores_json, average_score, total_score
+        FROM human_eval_reviews
+        WHERE total_score IS NULL
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            scores = _normalize_scores(json.loads(str(row[1] or "{}")))
+        except (TypeError, json.JSONDecodeError, ValueError):
+            scores = {}
+        average = row[2]
+        if average is None and scores:
+            average = round(sum(float(value) for value in scores.values()) / len(scores), 3)
+        assignments = ["total_score = ?"] + [
+            f"{SCORE_COLUMN_PREFIX}{dimension} = ?"
+            for dimension in SCORE_DIMENSIONS
+        ]
+        values = [average, *[scores.get(dimension) for dimension in SCORE_DIMENSIONS], row[0]]
+        connection.execute(
+            f"UPDATE human_eval_reviews SET {', '.join(assignments)} WHERE id = ?",
+            values,
+        )
 
 
 def _add_column_if_missing(

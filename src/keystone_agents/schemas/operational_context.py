@@ -362,3 +362,163 @@ class ZoteroContextResult(BaseModel):
         self.recommended_artifact_plan.target_system = "google_workspace"
         self.recommended_artifact_plan.live_write_allowed_for_specialist = False
         return self
+
+
+class HistoricalFeedContextItem(BaseModel):
+    """One bounded RSS/preprint history item returned by a context specialist."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    feed_item_id: str = ""
+    title: str = ""
+    url: str = ""
+    source: str = ""
+    feed: str = ""
+    published_at: str = ""
+    tags: list[str] = Field(default_factory=list)
+    selected: bool = False
+    relevance_status: str = ""
+    selection_reason: str = ""
+    summary: str = ""
+    detailed_summary: str = ""
+    source_basis: str = ""
+    key_findings: list[str] = Field(default_factory=list)
+    methods_or_design: str = ""
+    limitations: list[str] = Field(default_factory=list)
+    relevance_to_psychiatry: str = ""
+    relevance_to_keystone: str = ""
+    frontier_signal: str = ""
+    evidence_status: str = ""
+    publication_ids: list[str] = Field(default_factory=list)
+    evidence_notes: list[str] = Field(default_factory=list)
+    slack_link: str = ""
+
+    @field_validator(
+        "feed_item_id",
+        "title",
+        "url",
+        "source",
+        "feed",
+        "published_at",
+        "relevance_status",
+        "selection_reason",
+        "summary",
+        "detailed_summary",
+        "source_basis",
+        "methods_or_design",
+        "relevance_to_psychiatry",
+        "relevance_to_keystone",
+        "frontier_signal",
+        "evidence_status",
+        "slack_link",
+        mode="before",
+    )
+    @classmethod
+    def _clean_fields(cls, value: object) -> str:
+        return _clean_text(value, max_chars=900)
+
+    @field_validator(
+        "tags",
+        "key_findings",
+        "limitations",
+        "publication_ids",
+        "evidence_notes",
+        mode="before",
+    )
+    @classmethod
+    def _clean_lists(cls, value: object) -> list[str]:
+        return _clean_list(value)
+
+
+class HistoricalFeedContextResult(BaseModel):
+    """Historical RSS/preprint context and Chief of Staff handoff guidance."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str = "historical_feed_context_agent"
+    mode: Literal["llm", "deterministic", "llm_unavailable"] = "llm"
+    summary: str = ""
+    query: str = ""
+    source_focus: str = ""
+    retrieved_item_ids: list[str] = Field(default_factory=list)
+    articles: list[HistoricalFeedContextItem] = Field(default_factory=list)
+    frontier_summary: str = ""
+    recurring_themes: list[str] = Field(default_factory=list)
+    research_frontiers: list[str] = Field(default_factory=list)
+    clinical_translation_signals: list[str] = Field(default_factory=list)
+    market_or_partnership_signals: list[str] = Field(default_factory=list)
+    evidence_gaps: list[str] = Field(default_factory=list)
+    opportunity_signals: list[str] = Field(default_factory=list)
+    future_directions: list[str] = Field(default_factory=list)
+    monitoring_queries: list[str] = Field(default_factory=list)
+    recommended_actions: list[str] = Field(default_factory=list)
+    blockers: list[str] = Field(default_factory=list)
+    approval_needs: list[str] = Field(default_factory=list)
+    human_work_context: HumanWorkContext = Field(default_factory=HumanWorkContext)
+    sources: list[OperationalContextSource] = Field(default_factory=list)
+    diagnostics: list[OperationalContextEntry] = Field(default_factory=list)
+
+    @field_validator(
+        "agent_name",
+        "mode",
+        "summary",
+        "query",
+        "source_focus",
+        "frontier_summary",
+        mode="before",
+    )
+    @classmethod
+    def _clean_fields(cls, value: object) -> str:
+        return _clean_text(value)
+
+    @field_validator(
+        "retrieved_item_ids",
+        "recurring_themes",
+        "research_frontiers",
+        "clinical_translation_signals",
+        "market_or_partnership_signals",
+        "evidence_gaps",
+        "opportunity_signals",
+        "future_directions",
+        "monitoring_queries",
+        "recommended_actions",
+        "blockers",
+        "approval_needs",
+        mode="before",
+    )
+    @classmethod
+    def _clean_lists(cls, value: object) -> list[str]:
+        return _clean_list(value)
+
+    @field_validator("diagnostics", mode="before")
+    @classmethod
+    def _clean_diagnostics(cls, value: object) -> list[OperationalContextEntry]:
+        return _clean_entries(value)
+
+
+class RssContextResult(HistoricalFeedContextResult):
+    """RSS/#announcements history context for Chief of Staff."""
+
+    agent_name: str = "rss_context_agent"
+    source_focus: str = "rss_announcements"
+
+    @model_validator(mode="after")
+    def _force_agent_name(self) -> RssContextResult:
+        self.agent_name = "rss_context_agent"
+        if not self.source_focus:
+            self.source_focus = "rss_announcements"
+        return self
+
+
+class PreprintsContextResult(HistoricalFeedContextResult):
+    """Preprint/#knowledge-hub history context for Chief of Staff."""
+
+    agent_name: str = "preprints_context_agent"
+    source_focus: str = "preprints"
+
+    @model_validator(mode="after")
+    def _force_agent_name(self) -> PreprintsContextResult:
+        self.agent_name = "preprints_context_agent"
+        if not self.source_focus:
+            self.source_focus = "preprints"
+        return self

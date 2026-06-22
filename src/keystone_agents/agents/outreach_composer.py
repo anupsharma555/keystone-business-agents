@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -1084,11 +1085,7 @@ def compose_outreach_draft_fixture(
     signal = signal_claim.claim_text if signal_claim else ""
 
     if signal:
-        signal_fragment = _sentence_fragment(signal)
-        if "exploring review support" in signal_fragment:
-            opening = f"I saw that {signal_fragment}."
-        else:
-            opening = f"I noticed {company_name}'s work around {signal_fragment}."
+        opening = _fixture_outreach_opening(company_name, signal)
     else:
         opening = f"I came across {company_name} and wanted to reach out."
 
@@ -1255,6 +1252,35 @@ def compose_outreach_draft_fixture(
         )
     create_approval_request_placeholder(draft.model_dump())
     return draft
+
+
+def _fixture_outreach_opening(company_name: str, signal: str) -> str:
+    signal_clean = _clean_copy(signal)
+    review_subject = _fixture_review_subject(signal_clean)
+    if review_subject:
+        return f"I saw that {company_name} is considering review support for {review_subject}."
+    signal_fragment = _sentence_fragment(signal_clean)
+    if "exploring review support" in signal_fragment:
+        return f"I saw that {signal_fragment}."
+    return f"I noticed {company_name}'s work around {signal_fragment}."
+
+
+def _fixture_review_subject(signal: str) -> str:
+    for pattern in (
+        r"\bwhether\s+Keystone\s+could\s+(?:help\s+)?review\s+"
+        r"(?P<object>.*?)(?:\s+before\b|$)",
+        r"\b(?:is|are)\s+(?:considering|exploring|evaluating)\s+(?:a\s+)?review\s+of\s+"
+        r"(?P<object>.*?)(?:\s+before\b|$)",
+        r"\b(?:is|are)\s+(?:considering|exploring|evaluating)\s+review\s+support\s+for\s+"
+        r"(?P<object>.*?)(?:\s+before\b|$)",
+    ):
+        match = re.search(pattern, signal, flags=re.I)
+        if not match:
+            continue
+        subject = " ".join(match.group("object").split()).strip(" .;,:")
+        if subject:
+            return subject[:160]
+    return ""
 
 
 @_with_tool_name
