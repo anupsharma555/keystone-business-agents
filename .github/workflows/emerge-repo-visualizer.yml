@@ -1,0 +1,80 @@
+name: Emerge Repo Visualizer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-emerge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare output directory
+        run: |
+          rm -rf images/emerge
+          mkdir -p images/emerge
+
+      - name: Run Emerge
+        run: |
+          set +e
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/tmp/emerge" \
+            achtelik/emerge:2.0.0 \
+            /tmp/emerge/.github/emerge.yml
+          emerge_status=$?
+          set -e
+
+          if [ "$emerge_status" -ne 0 ] && [ ! -f images/emerge/html/emerge.html ]; then
+            exit "$emerge_status"
+          fi
+
+          if [ "$emerge_status" -ne 0 ]; then
+            echo "::warning::Emerge exited with status $emerge_status after generating output. Continuing because images/emerge/html/emerge.html exists."
+          fi
+
+      - name: Verify Emerge output
+        run: |
+          test -f images/emerge/html/emerge.html
+          test -f images/emerge/emerge-statistics-metrics.txt
+
+      - name: Add local entry point
+        run: |
+          cat > images/emerge/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta http-equiv="refresh" content="0; url=html/emerge.html">
+              <title>Emerge Visualization</title>
+            </head>
+            <body>
+              <p><a href="html/emerge.html">Open the Emerge visualization</a>.</p>
+            </body>
+          </html>
+          HTML
+
+      - name: Upload Emerge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emerge-repo-visualization
+          path: images/emerge
+          if-no-files-found: error
+
+      - name: Commit Emerge visualization
+        run: |
+          git config user.name "repo-visualizer"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add images/emerge
+          if git diff --cached --quiet; then
+            echo "No Emerge visualization changes to commit."
+          else
+            git commit -m "Update Emerge repo visualization [skip ci]"
+            git push
+          fi
