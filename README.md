@@ -49,6 +49,16 @@ recipient, thread, or no-send gates. Each pack also exposes `can_synthesize`,
 `missing_requirements`, and `limitation_notes` so a blocked or partial run says
 which context was unavailable instead of filling gaps.
 
+LangGraph is now part of the WorkItem orchestration architecture as an optional
+graph runtime, not a replacement for the SDK agents. Backend selection can route
+multi-step WorkItem runs, resumes, approval checkpoints, context-agent handoffs,
+Gmail-to-research/reply paths, and Chief-of-Staff coordination asks through
+explicit graph nodes while preserving the same `WorkflowRunRequest`,
+`WorkflowRunResult`, WorkItems/SQLite state, context packs, Python gates, and
+approval/no-send boundaries. Single-specialist runs can still use the simple
+runner. See `docs/LANGGRAPH_OPTION.md` for the graph-node contract, backend
+selection rules, diagnostics, and optional `orchestration` extra.
+
 Current generated architecture visual:
 `docs/assets/kba-current-agent-architecture.svg`. Regenerate it after agent,
 workflow, trace, or eval structure changes with:
