@@ -11,7 +11,7 @@ from keystone_agents.schemas.approval import ApprovalQueueObjectType, ApprovalQu
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.gmail_tool import GmailTool
 
-DEFAULT_GMAIL_DRAFT_ACCOUNT = "wisegrow05@gmail.com"
+DEFAULT_GMAIL_DRAFT_ACCOUNT = "operator@example.com"
 GMAIL_DRAFT_ACCOUNT_ENV_KEYS = (
     "KEYSTONE_GMAIL_DRAFT_ACCOUNT",
     "KNI_BUSINESS_AGENTS_GMAIL_DRAFT_ACCOUNT",

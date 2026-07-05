@@ -298,9 +298,9 @@ Approve the selected company profile, then continue:
   --json
 ```
 
-`--langgraph` routes the same WorkItem advancement through the optional graph
-wrapper. If the `orchestration` extra is not installed, local dry-run execution
-uses the dependency-free node contract and still records a
+`--langgraph` routes WorkItem advancement through the optional graph-native
+node path. If the `orchestration` extra is not installed, local dry-run execution
+uses the dependency-free graph-node contract and still records a
 `langgraph_orchestration` timeline event. With LangGraph installed, the same
 entrypoint can use graph thread IDs and future checkpointers for resumable
 approval workflows.
@@ -314,7 +314,7 @@ For Slack parity, new `@KNI workitem "..."` starts should route through
 `continue`, `show`, `timeline`, `select`, and `approve-context` remain direct
 `work-items` subcommands. Set `KNI_BUSINESS_AGENTS_LANGGRAPH=true` in the
 `keystone-slack` environment to route Slack WorkItem advancement through the
-same optional graph wrapper. Slack button actions such as continue, run again,
+same optional graph-native node path. Slack button actions such as continue, run again,
 more research, find contact, and revise draft now attach Orchestrator preflight
 context before advancing the WorkItem and record `orchestrator_action_review`
 metadata after execution. When the Slack bridge invokes
@@ -995,6 +995,7 @@ Finance/tax tracker setup for `2026 Finance & Tax Tracker`:
 # AIRTABLE_ACCESS_TOKEN=pat...
 # AIRTABLE_ALLOWED_TABLES="Business Income,Business Expenses,Personal Income,Personal Expenses,Tax Payments"
 # AIRTABLE_WRITE_DRY_RUN=true
+# AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=false
 
 .venv/bin/python scripts/run_chief_of_staff.py \
   "chief of staff inspect the 2026 Finance & Tax Tracker Airtable schema and save a bounded context note"
@@ -1004,9 +1005,12 @@ The first pass should run with `AIRTABLE_WRITE_DRY_RUN=true`: fetch schema,
 read 1-3 records from each allowed table, prepare a dry-run write, and save
 schema/rule summaries only. After validating one test create/update, set
 `AIRTABLE_ALLOW_WRITES=true` and `AIRTABLE_WRITE_DRY_RUN=false` only for the
-approved command window. Google Drive running-update notes should be written as
-scoped internal artifacts under `KNIOps/Finance Tax Tracker Updates`; do not use
-them as final tax advice. Tracker semantics should be captured in
+approved command window. Receipt/invoice attachment uploads are a separate
+opt-in gate; set `AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true` only for the approved
+expense-record command window after confirming the target table exposes an
+Airtable attachment field. Google Drive running-update notes should be written
+as scoped internal artifacts under `KNIOps/Finance Tax Tracker Updates`; do not
+use them as final tax advice. Tracker semantics should be captured in
 `documents/finance_tax_tracker_context.md`: `Estimated Tax Periods` (formerly
 `Quarter`) is the authoritative estimated-tax period field, `Total Expenses` is
 the preferred expense amount, `Tax Payments` are excluded from expense totals

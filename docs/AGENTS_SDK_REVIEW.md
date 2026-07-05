@@ -398,7 +398,7 @@ High-value additions:
 Lower-value or premature additions:
 
 - A new framework layer around LangGraph, CrewAI, or LangChain. The repo already
-  has an optional LangGraph wrapper for WorkItems; specialists should remain SDK
+  has optional LangGraph WorkItem graph execution; specialists should remain SDK
   agents.
 - Broad dynamic tool loading before there is a measurable tool-schema token or
   routing problem.

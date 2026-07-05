@@ -9,11 +9,19 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from keystone_agents.automation_inventory import build_automation_inventory_report
+from keystone_agents.config import parse_bool
 from keystone_agents.file_search import append_configured_file_search_tools
+from keystone_agents.finance_expense_receipts import (
+    extract_finance_receipt_evidence,
+    finance_expense_receipt_provider_context,
+    infer_finance_expense_receipt_target,
+    match_receipt_evidence_to_airtable_fields,
+)
 from keystone_agents.guardrails import keystone_guardrails
 from keystone_agents.local_kni_evidence import build_local_kni_evidence_packet_for_query
 from keystone_agents.manual_request import infer_manual_request_plan
@@ -35,6 +43,10 @@ from keystone_agents.schemas.automation import (
     ChiefOfStaffWriteRequest,
 )
 from keystone_agents.schemas.chief_of_staff import (
+    ChiefContextHandoff,
+    ChiefContextHandoffAgent,
+    ChiefDurableHandoff,
+    ChiefDurableHandoffAgent,
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
     ChiefOfStaffSourceRef,
@@ -76,13 +88,21 @@ from keystone_agents.tools.chief_of_staff_tool import (
 )
 from keystone_agents.tools.html_review_tool import extract_research_claims_from_html
 from keystone_agents.tools.internal_data_tools import (
+    airtable_create_expense_from_receipt,
     airtable_get_base_schema,
     airtable_get_base_schema_impl,
     airtable_read_records,
     airtable_read_records_impl,
+    airtable_upload_attachment,
     airtable_write_record,
     airtable_write_record_impl,
     explicit_full_article_read_requested,
+    google_doc_read,
+    google_drive_get_file_metadata,
+    google_drive_list_folder,
+    google_drive_search_files,
+    google_sheet_list,
+    google_sheet_read_table,
     google_workspace_tools,
     read_linked_article,
 )
@@ -296,7 +316,15 @@ def _chief_of_staff_tools(
         airtable_get_base_schema,
         airtable_read_records,
         airtable_write_record,
+        airtable_upload_attachment,
+        airtable_create_expense_from_receipt,
         *(specialist_tools or []),
+        google_doc_read,
+        google_drive_list_folder,
+        google_drive_search_files,
+        google_drive_get_file_metadata,
+        google_sheet_list,
+        google_sheet_read_table,
         *google_workspace_tools(),
     ]
     if explicit_full_article_read_requested(request_text):
@@ -601,7 +629,7 @@ def _chief_of_staff_sdk_input_for_request(
 
     latest_request = _latest_slack_followup_request(raw_request_text)
     if not latest_request:
-        return typed_input
+        return _with_finance_expense_receipt_context(typed_input, str(raw_request_text or ""))
 
     data: dict[str, Any]
     if isinstance(typed_input, Mapping):
@@ -624,7 +652,101 @@ def _chief_of_staff_sdk_input_for_request(
             "sentence and put the checklist items in recommended_actions in the "
             "requested order. Each action should be specific enough to run or verify."
         )
+    return _with_finance_expense_receipt_context(data, latest_request)
+
+
+def _with_finance_expense_receipt_context(
+    typed_input: str | Mapping[str, Any],
+    request_text: str,
+) -> str | dict[str, Any]:
+    target = infer_finance_expense_receipt_target(request_text)
+    context = finance_expense_receipt_provider_context(target) if target is not None else []
+    if not context:
+        return typed_input
+    data: dict[str, Any] = (
+        dict(typed_input) if isinstance(typed_input, Mapping) else {"request": str(typed_input)}
+    )
+    existing_context = list(data.get("provider_call_context") or [])
+    existing_context.extend(context)
+    data["provider_call_context"] = existing_context
+    data["finance_expense_receipt_instruction"] = (
+        "For this explicit finance_tax_tracker expense receipt request, use "
+        'base_alias="finance_tax_tracker" and the target table from '
+        "provider_call_context. First call airtable_get_base_schema to resolve exact "
+        "field names and attachment-field availability. Read and reason over the "
+        "attached receipt PDF/image for vendor, date, amount, total, and estimated-tax "
+        "period; do not infer receipt values from the filename alone. Then stage a "
+        "reviewable Airtable create-and-attach plan and route approved execution to "
+        "Airtable Context or the approved Airtable action handler. Chief of Staff "
+        "does not execute Airtable record writes or attachment uploads directly."
+    )
+    approval_reference = str(data.get("approval_reference") or "").strip()
+    data["finance_expense_receipt_tool_plan"] = {
+        "handoff_tool_name": "airtable_create_expense_from_receipt",
+        "arguments": {
+            "local_file_path": target.receipt_local_path if target is not None else "",
+            "table": target.table if target is not None else "",
+            "base_alias": target.base_alias if target is not None else "finance_tax_tracker",
+            "receipt_fields_json": "{}",
+            "field_values_json": "{}",
+            "approval_reference": approval_reference,
+            "live": True,
+        },
+        "llm_reasoning_required": [
+            "Read the receipt content before finalizing values.",
+            "Inspect Airtable schema before creating the record.",
+            "Pass receipt_fields_json from model-read artifact facts when deterministic parsing is weak.",
+            "Pass field_values_json only for exact Airtable field names verified in schema.",
+            "Choose optional category/payment_method only when supported by schema and evidence.",
+            "Explain any unmapped or review-required fields.",
+        ],
+        "side_effect_boundary": (
+            "Do not execute the create/upload in Chief of Staff. Persist this as a "
+            "reviewable handoff plan for Airtable Context or the approved Airtable "
+            "action handler; execution still requires live write/upload gates and a "
+            "scoped approval_reference."
+        ),
+    }
     return data
+
+
+def _finance_expense_receipt_provider_context(request_text: str) -> list[dict[str, str]]:
+    target = infer_finance_expense_receipt_target(request_text)
+    return finance_expense_receipt_provider_context(target) if target is not None else []
+
+
+def _finance_expense_receipt_live_preflight_blocker(
+    request_text: str,
+) -> ChiefOfStaffResult | None:
+    if not _finance_expense_receipt_provider_context(request_text):
+        return None
+    if parse_bool(os.getenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS")):
+        return None
+    result = _plan_finance_expense_receipt_create_request(
+        request_text,
+        live=parse_bool(os.getenv("KEYSTONE_AIRTABLE_LIVE_READS")),
+    )
+    return result.model_copy(
+        update={
+            "summary": (
+                result.summary
+                + " Live execution is blocked before the model/tool call because "
+                "`AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true` is not set; this avoids "
+                "creating an expense record without attaching the receipt."
+            ),
+            "recommended_actions": [
+                (
+                    "Enable `AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true` for the approved "
+                    "command window if the receipt should be attached."
+                ),
+                *result.recommended_actions,
+            ],
+            "audit_notes": [
+                "Live SDK preflight blocked a receipt expense create to avoid a partial Airtable write.",
+                *result.audit_notes,
+            ],
+        }
+    )
 
 
 def _manual_plan_allows_finance_tracker_shortcut(
@@ -723,6 +845,12 @@ def _looks_like_finance_tracker_mutation_request(text: str) -> bool:
     return any(
         re.search(rf"\b{marker}\b", normalized)
         for marker in (
+            "add",
+            "attach",
+            "create",
+            "fill",
+            "insert",
+            "upload",
             "update",
             "change",
             "correct",
@@ -818,23 +946,6 @@ def _looks_like_expense_total_sync_request(normalized: str) -> bool:
     )
 
 
-def _expense_total_live_write_requested(normalized: str) -> bool:
-    if any(marker in normalized for marker in ("dry-run", "dry run", "preview only")):
-        return False
-    return any(
-        marker in normalized
-        for marker in (
-            "approved",
-            "go ahead",
-            "live write",
-            "write them",
-            "update them",
-            "fill them",
-            "fill in",
-        )
-    )
-
-
 def _finance_tracker_route(command: str) -> ChiefOfStaffRouteRecommendation:
     return ChiefOfStaffRouteRecommendation(
         workflow_type="budget-resource-review",
@@ -899,6 +1010,141 @@ def _finance_tracker_result(
             "No raw credentials were read into the response.",
             *(audit_notes or []),
         ],
+    )
+
+
+def _plan_finance_expense_receipt_create_request(
+    text: str,
+    *,
+    live: bool,
+) -> ChiefOfStaffResult:
+    context = {item["key"]: item["value"] for item in _finance_expense_receipt_provider_context(text)}
+    table = context.get("airtable_target_table") or _finance_tracker_table_from_text(text)
+    receipt_path = context.get("receipt_local_path", "")
+    receipt_name = Path(receipt_path).name if receipt_path else "operator-supplied receipt"
+    file_status = "present" if receipt_path and Path(receipt_path).expanduser().is_file() else "unverified"
+    receipt_evidence = extract_finance_receipt_evidence(receipt_path) if receipt_path else None
+    evidence_preview = receipt_evidence.supported_field_preview() if receipt_evidence else {}
+    evidence_summary = (
+        receipt_evidence.summary_fragment()
+        if receipt_evidence is not None
+        else "Receipt evidence was not read because no local receipt path was detected."
+    )
+    evidence_read = bool(receipt_evidence and receipt_evidence.content_read)
+    schema_mapping: dict[str, Any] = {}
+    schema_mapping_status = "not_run"
+    if evidence_read:
+        try:
+            schema = airtable_get_base_schema_impl(base_alias="finance_tax_tracker", live=live)
+            schema_mapping_status = str(schema.get("status") or "unknown")
+            schema_fields = _schema_fields_for_named_table(schema, table)
+            if schema_fields:
+                schema_mapping = match_receipt_evidence_to_airtable_fields(
+                    receipt_evidence,
+                    schema_fields,
+                )
+            elif live:
+                schema_mapping_status = "blocked_schema_table_not_found"
+        except Exception as exc:  # pragma: no cover - defensive live metadata boundary
+            schema_mapping_status = f"blocked_{type(exc).__name__}: {exc}"
+    schema_summary = _finance_receipt_schema_mapping_summary(schema_mapping, schema_mapping_status)
+    summary = (
+        f"Prepare an Airtable expense-create plan for `finance_tax_tracker` / `{table}` "
+        f"from `{receipt_name}`. {evidence_summary}{schema_summary} "
+        "The live Chief of Staff SDK path should attach the local PDF/image as model "
+        "evidence, inspect Airtable schema, map receipt-backed fields, set `Estimated Tax "
+        "Periods` from the receipt date, and prefer `airtable_create_expense_from_receipt` "
+        "for the approved create-and-attach operation. If extraction was unavailable "
+        "or uncertain, do not invent vendor, date, amount, tax period, or attachment "
+        "field values."
+    )
+    write_request = ChiefOfStaffWriteRequest(
+        destination=AutomationWriteDestination.AIRTABLE,
+        title=f"Create {table} receipt expense",
+        summary=(
+            "Create one finance_tax_tracker expense record from the operator-supplied "
+            "receipt PDF/image, then attach the receipt after record identity is known."
+        ),
+        approval_required=True,
+        live_required=True,
+        allowed=False,
+        status="planned",
+        blocked_reason=(
+            "Live execution must use the Chief of Staff SDK/tool path with "
+            "AIRTABLE_ALLOW_WRITES=true, AIRTABLE_WRITE_DRY_RUN=false, "
+            "AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true for receipt upload, exact schema "
+            "field mapping, and a command approval reference."
+        ),
+        metadata=json.dumps(
+            {
+                "base_alias": "finance_tax_tracker",
+                "table": table,
+                "receipt_local_path": receipt_path,
+                "receipt_file_status": file_status,
+                "receipt_evidence_read": evidence_read,
+                "receipt_evidence_method": (
+                    receipt_evidence.extraction_method if receipt_evidence else ""
+                ),
+                "receipt_evidence_blocker": receipt_evidence.blocker if receipt_evidence else "",
+                "receipt_field_preview": evidence_preview,
+                "schema_mapping_status": schema_mapping_status,
+                "schema_field_mapping": schema_mapping,
+                "operation": "create",
+                "requires_model_receipt_read": True,
+                "requires_schema_field_mapping": True,
+                "estimated_tax_period_source": "receipt_date",
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+    )
+    return _finance_tracker_result(
+        text=text,
+        summary=summary,
+        command=f"Prepare {table} receipt expense create plan",
+        actions=[
+            (
+                "Review the extracted receipt-backed field preview before live write."
+                if evidence_read
+                else "Run the live Chief of Staff SDK path so the model can read the attached receipt content."
+            ),
+            "Use `airtable_get_base_schema` before writing and map only exact schema fields.",
+            "Set `Estimated Tax Periods` from the receipt date and the tracker period rules.",
+            (
+                "Create and attach through `airtable_create_expense_from_receipt`; use "
+                "lower-level write/upload tools only if the bounded tool cannot express "
+                "the approved operation."
+            ),
+        ],
+        audit_notes=[
+            "Explicit finance_tax_tracker receipt-create request bypassed generic context-agent advisory.",
+            (
+                "Local receipt extraction produced a receipt-backed preview."
+                if evidence_read
+                else "Deterministic fallback did not infer receipt values from filename or current date."
+            ),
+            f"Receipt file status: {file_status}.",
+            (
+                f"Receipt extraction method: {receipt_evidence.extraction_method}."
+                if evidence_read and receipt_evidence is not None
+                else ""
+            ),
+        ],
+    ).model_copy(
+        update={
+            "write_requests": [write_request],
+            "recommended_route": ChiefOfStaffRouteRecommendation(
+                workflow_type="artifact-write-plan",
+                command_text=f"Create {table} receipt expense from attached receipt",
+                target_channel="docs",
+                rationale=(
+                    "The request asks Chief of Staff to create a finance tracker expense "
+                    "record from local receipt evidence through Airtable tools."
+                ),
+                requires_live_connector=True,
+                requires_human_approval_before_post=True,
+            ),
+        }
     )
 
 
@@ -1639,6 +1885,54 @@ def _plan_expense_total_sync_request(
             f"Write statuses: {', '.join(write_statuses) or 'none'}.",
         ],
     )
+
+
+def _schema_fields_for_named_table(
+    schema_result: Mapping[str, Any],
+    table_name: str,
+) -> list[Mapping[str, Any]]:
+    tables = schema_result.get("schema", {}).get("tables", [])
+    if not isinstance(tables, list):
+        return []
+    for table in tables:
+        if not isinstance(table, Mapping) or table.get("name") != table_name:
+            continue
+        fields = table.get("fields", [])
+        return [field for field in fields if isinstance(field, Mapping)] if isinstance(fields, list) else []
+    return []
+
+
+def _finance_receipt_schema_mapping_summary(
+    schema_mapping: Mapping[str, Any],
+    schema_mapping_status: str,
+) -> str:
+    if not schema_mapping:
+        return ""
+    fields = schema_mapping.get("fields")
+    attachment = schema_mapping.get("attachment_field")
+    select_candidates = schema_mapping.get("select_candidates")
+    field_names = ", ".join(sorted(fields)) if isinstance(fields, Mapping) else ""
+    attachment_name = (
+        str(attachment.get("name") or "")
+        if isinstance(attachment, Mapping)
+        else ""
+    )
+    select_names = (
+        ", ".join(sorted(select_candidates))
+        if isinstance(select_candidates, Mapping) and select_candidates
+        else ""
+    )
+    parts = []
+    if field_names:
+        parts.append(f"schema-backed fields: {field_names}")
+    if attachment_name:
+        parts.append(f"attachment field: {attachment_name}")
+    if select_names:
+        parts.append(f"review select candidates for: {select_names}")
+    if not parts:
+        return ""
+    status = f" ({schema_mapping_status})" if schema_mapping_status else ""
+    return " Schema mapping resolved" + status + ": " + "; ".join(parts) + "."
 
 
 def _plural_count(count: int, singular: str, plural: str | None = None) -> str:
@@ -2447,13 +2741,16 @@ def _plan_finance_tracker_request(text: str, *, live: bool) -> ChiefOfStaffResul
     normalized = _normalized_text(active_text)
     command = active_text[:240]
     try:
+        if _finance_expense_receipt_provider_context(active_text):
+            return _plan_finance_expense_receipt_create_request(active_text, live=live)
+
         if _looks_like_expense_total_sync_request(normalized):
             schema = airtable_get_base_schema_impl(base_alias="finance_tax_tracker", live=live)
             return _plan_expense_total_sync_request(
                 active_text,
                 schema=schema,
                 live=live,
-                live_write=_expense_total_live_write_requested(normalized),
+                live_write=False,
             )
 
         if "dry-run" in normalized or "dry run" in normalized or "write plan" in normalized:
@@ -2625,9 +2922,11 @@ def _plan_finance_tracker_request(text: str, *, live: bool) -> ChiefOfStaffResul
                 "the schema-resolved tax table. It can create/update records only through "
                 "typed Airtable tools, "
                 "allowed tables, explicit live flags, exact fields, and an approval reference. "
-                "It cannot delete, change schema, upload attachments, file returns, make "
-                "payments, or give final tax/legal advice. Federal, Pennsylvania, and "
-                "Philadelphia tax outputs are operational support notes; uncertain deductions, "
+                "It can upload one receipt/invoice attachment only for an approved expense "
+                "record after schema and record identity are known. It cannot delete, change "
+                "schema, file returns, make payments, or give final tax/legal advice. Federal, "
+                "Pennsylvania, and Philadelphia tax outputs are operational support notes; "
+                "uncertain deductions, "
                 "mixed-use expenses, entity-structure questions, estimated payments, "
                 "and Philadelphia BIRT/NPT issues need human tax review."
             )
@@ -3387,10 +3686,12 @@ def _plan_natural_language_operating_intent(
 ) -> ChiefOfStaffResult | None:
     lowered = text.lower()
     if _looks_like_internal_handoff_request(lowered):
+        command_text = _internal_handoff_command_text(lowered)
+        durable_handoff = _internal_handoff_durable_handoff(command_text)
         return _natural_language_intent_result(
             text,
             workflow_type="research-direction-review",
-            command_text=_internal_handoff_command_text(lowered),
+            command_text=command_text,
             target_channel=_extract_target_channel(text, "current-thread"),
             summary=(
                 "Prepare an internal handoff that selects the next owner, explains why the "
@@ -3413,6 +3714,11 @@ def _plan_natural_language_operating_intent(
             ],
             requires_live_connector=False,
             database_url=database_url,
+            durable_handoff=durable_handoff,
+            context_handoffs=_internal_context_handoffs(
+                lowered,
+                durable_handoff=durable_handoff,
+            ),
         )
     if _looks_like_outreach_drafting_request(lowered):
         return _natural_language_intent_result(
@@ -3626,6 +3932,8 @@ def _natural_language_intent_result(
     context_sources: list[str],
     requires_live_connector: bool,
     database_url: str | None = None,
+    durable_handoff: ChiefDurableHandoff | None = None,
+    context_handoffs: list[ChiefContextHandoff] | None = None,
 ) -> ChiefOfStaffResult:
     memory_context = build_chief_of_staff_memory_context(
         query=text,
@@ -3654,6 +3962,8 @@ def _natural_language_intent_result(
             requires_live_connector=requires_live_connector,
             requires_human_approval_before_post=True,
         ),
+        durable_handoff=durable_handoff,
+        context_handoffs=context_handoffs or [],
         recommended_actions=[
             *recommended_actions,
             *memory_actions,
@@ -3734,9 +4044,95 @@ def _internal_handoff_command_text(lowered: str) -> str:
         return "Chief of Staff -> Outreach Composer Agent"
     if "opportunity scout agent" in lowered:
         return "Chief of Staff -> Opportunity Scout Agent"
+    if (
+        "google workspace context agent" in lowered
+        or "google drive context agent" in lowered
+    ):
+        return "Chief of Staff -> Google Workspace Context Agent"
     if "airtable context agent" in lowered and "business research agent" not in lowered:
         return "Chief of Staff -> Airtable Context Agent"
     return "Chief of Staff -> Business Research Agent"
+
+
+def _internal_handoff_durable_handoff(command_text: str) -> ChiefDurableHandoff | None:
+    handoff_by_command: dict[str, ChiefDurableHandoffAgent] = {
+        "Chief of Staff -> Gmail Triage Agent": "gmail_triage",
+        "Chief of Staff -> Outreach Composer Agent": "outreach_composer",
+        "Chief of Staff -> Opportunity Scout Agent": "opportunity_scout",
+        "Chief of Staff -> Business Research Agent": "business_research_analyst",
+    }
+    agent = handoff_by_command.get(command_text)
+    if agent is None:
+        return None
+    return ChiefDurableHandoff(
+        agent=agent,
+        rationale=(
+            "Deterministic Chief of Staff selected this WorkItem-capable specialist "
+            "as the durable next owner for the internal handoff."
+        ),
+    )
+
+
+def _internal_context_handoffs(
+    lowered: str,
+    *,
+    durable_handoff: ChiefDurableHandoff | None,
+) -> list[ChiefContextHandoff]:
+    handoffs: list[ChiefContextHandoff] = []
+    if "rss context agent" in lowered or "announcements context agent" in lowered:
+        handoffs.append(
+            _internal_context_handoff(
+                "rss_context_agent",
+                durable_handoff=durable_handoff,
+            )
+        )
+    if "preprints context agent" in lowered or "preprint context agent" in lowered:
+        handoffs.append(
+            _internal_context_handoff(
+                "preprints_context_agent",
+                durable_handoff=durable_handoff,
+            )
+        )
+    if "zotero context agent" in lowered:
+        handoffs.append(
+            _internal_context_handoff(
+                "zotero_context_agent",
+                durable_handoff=durable_handoff,
+            )
+        )
+    if "airtable context agent" in lowered:
+        handoffs.append(
+            _internal_context_handoff(
+                "airtable_context_agent",
+                durable_handoff=durable_handoff,
+            )
+        )
+    if (
+        "google workspace context agent" in lowered
+        or "google drive context agent" in lowered
+    ):
+        handoffs.append(
+            _internal_context_handoff(
+                "google_workspace_context_agent",
+                durable_handoff=durable_handoff,
+            )
+        )
+    return handoffs
+
+
+def _internal_context_handoff(
+    agent: ChiefContextHandoffAgent,
+    *,
+    durable_handoff: ChiefDurableHandoff | None,
+) -> ChiefContextHandoff:
+    return ChiefContextHandoff(
+        agent=agent,
+        before_agent=durable_handoff.agent if durable_handoff is not None else None,
+        rationale=(
+            "Deterministic Chief of Staff selected this context agent for read-only "
+            "staging before any durable specialist or provider write."
+        ),
+    )
 
 
 def _looks_like_budget_resource_request(lowered: str) -> bool:
@@ -4036,6 +4432,11 @@ def plan_chief_of_staff_request(
         return planned(
             _plan_slack_history_digest_request(text),
             action="allowed_slack_history_digest_shortcut",
+        )
+    if _finance_expense_receipt_provider_context(active_text):
+        return planned(
+            _plan_finance_tracker_request(active_text, live=False),
+            action="allowed_finance_receipt_create_plan",
         )
     if _looks_like_finance_tracker_artifact_workflow_request(
         active_text
@@ -4879,6 +5280,21 @@ def run_chief_of_staff_sdk(
     finance_artifact_workflow = _looks_like_finance_tracker_artifact_workflow_request(
         active_request_text
     )
+    if (
+        _finance_expense_receipt_provider_context(active_request_text)
+        and not live
+        and not force_sdk_interpretation
+    ):
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=_with_manual_plan_audit(
+                _plan_finance_tracker_request(active_request_text, live=False),
+                request_plan,
+                action="allowed_finance_receipt_create_plan",
+            ),
+            raw_result={"deterministic": "finance_tax_tracker_receipt_create_plan"},
+            live=live,
+        )
     if finance_artifact_workflow and not live:
         return TypedAgentRunResult(
             agent_name="chief_of_staff",
@@ -4894,7 +5310,14 @@ def run_chief_of_staff_sdk(
         _looks_like_finance_tracker_request(active_request_text)
         and not finance_artifact_workflow
         and not force_sdk_interpretation
-        and not (live and _looks_like_finance_tracker_mutation_request(active_request_text))
+        and not (live and _finance_expense_receipt_provider_context(active_request_text))
+        and not (
+            live
+            and _looks_like_finance_tracker_mutation_request(active_request_text)
+            and not _looks_like_expense_total_sync_request(
+                _normalized_text(active_request_text)
+            )
+        )
         and _manual_plan_allows_finance_tracker_shortcut(request_plan, active_request_text)
     ):
         return TypedAgentRunResult(
@@ -4907,6 +5330,24 @@ def run_chief_of_staff_sdk(
             raw_result={"deterministic": "finance_tax_tracker"},
             live=live,
         )
+    if live:
+        live_preflight_blocker = _finance_expense_receipt_live_preflight_blocker(
+            active_request_text
+        )
+        if live_preflight_blocker is not None:
+            return TypedAgentRunResult(
+                agent_name="chief_of_staff",
+                output=_with_manual_plan_audit(
+                    live_preflight_blocker,
+                    request_plan,
+                    action="blocked_receipt_attachment_upload_gate",
+                ),
+                raw_result={
+                    "blocked": "airtable_receipt_attachment_upload_gate",
+                    "missing_env": "AIRTABLE_ALLOW_ATTACHMENT_UPLOADS",
+                },
+                live=False,
+            )
 
     budget = quality_budget or chief_of_staff_quality_budget(
         quality_mode,

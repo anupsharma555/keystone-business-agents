@@ -143,6 +143,11 @@ def test_business_agent_slack_contract_exports_action_and_context_metadata() -> 
         "OutreachDraft",
     } <= named_output_types
     assert contract["result_rendering"]["fallback_text_fields"][0] == "human_summary"
+    assert contract["result_rendering"]["canonical_status_field"] == "status"
+    assert contract["result_rendering"]["operator_status_field"] == "operator_status"
+    assert contract["result_rendering"]["operator_title_field"] == "slack_display_title"
+    assert contract["result_rendering"]["operator_text_field"] == "slack_display_text"
+    assert "needs_input" in contract["result_rendering"]["status_display_policy"]
     routing = contract["slack_response_routing"]
     assert routing["source_channel_id_field"] == "source_channel_id"
     assert routing["source_thread_ts_field"] == "source_thread_ts"

@@ -40,10 +40,18 @@ def test_architecture_diagram_generator_renders_current_registry_and_edge_legend
         "Deterministic gate or state",
         "Agents as tools",
         "Traces / logs / evals",
+        "Backend graph selector",
+        "LangGraph WorkItem graph",
+        "not a parallel router",
+        "Stages review plans, approvals, and blockers",
+        "Provider writes use owning specialists or approved handlers",
+        "Chief/Gmail/context -> Research -> Opportunity/Outreach checkpoints",
+        "WorkItems / SQLite canonical state",
         "keystone.sdk_run_summary.v1",
         "keystone.structured_log.v1",
     ):
         assert expected in svg
 
+    assert "Owns Chief-level write plans" not in svg
     assert "Outreach Composer</text>" not in svg
     assert "Business Research</text>" not in svg

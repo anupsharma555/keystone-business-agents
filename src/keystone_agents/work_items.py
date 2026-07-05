@@ -345,12 +345,23 @@ def apply_slack_approval_to_work_item_gate(
         for gate in work_item.approval_gates
     ]
     updated = work_item.model_copy(update={"approval_gates": updated_gates}).touch()
+    if resolved_status == ApprovalQueueStatus.APPROVED:
+        updated = _apply_approved_gate_to_artifacts(
+            updated,
+            matching_gate,
+            approval_id=cleaned_approval_id,
+            new_state=new_state,
+        )
     blocker_code = _gate_blocker_code(cleaned_approval_id)
     if resolved_status == ApprovalQueueStatus.APPROVED:
         updated = resolve_blocker(updated, blocker_code)
+        next_action = _approved_gate_next_action(
+            matching_gate,
+            approval_id=cleaned_approval_id,
+        )
         updated = set_next_action(
             updated,
-            _approved_gate_next_action(matching_gate, approval_id=cleaned_approval_id),
+            None if matching_gate.scope == "external_use" else next_action,
         )
     else:
         updated = add_blocker(
@@ -396,6 +407,36 @@ def apply_slack_approval_to_work_item_gate(
         changed=True,
         event_recorded=True,
     )
+
+
+def _apply_approved_gate_to_artifacts(
+    work_item: WorkItem,
+    gate: WorkItemApprovalGate,
+    *,
+    approval_id: str,
+    new_state: str,
+) -> WorkItem:
+    if gate.scope != "external_use":
+        return work_item
+    artifacts: list[WorkItemArtifactRef] = []
+    changed = False
+    for artifact in work_item.artifact_refs:
+        if str(artifact.metadata.get("approval_queue_id") or "") == approval_id:
+            changed = True
+            artifacts.append(
+                artifact.model_copy(
+                    update={
+                        "approval_state": new_state,
+                        "selected": True,
+                        "metadata": {**artifact.metadata, "selected": True},
+                    }
+                )
+            )
+        else:
+            artifacts.append(artifact)
+    if not changed:
+        return work_item
+    return work_item.model_copy(update={"artifact_refs": artifacts}).touch()
 
 
 def record_event(

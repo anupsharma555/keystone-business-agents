@@ -426,7 +426,7 @@ def test_slack_review_message_for_gmail_draft_save_names_button_scope(
                 "recipient_email": "andy@example.com",
                 "email_subject": "Test subject",
                 "slack_approval_allows_gmail_draft_creation": True,
-                "gmail_draft_account": "wisegrow05@gmail.com",
+                "gmail_draft_account": "operator@example.com",
             },
         )
     )
@@ -445,7 +445,7 @@ def test_slack_review_message_for_gmail_draft_save_names_button_scope(
     action_ids = [element["action_id"] for element in button_elements]
 
     assert result["status"] == "posted"
-    assert "Create Gmail draft in wisegrow05@gmail.com" in message.root_text
+    assert "Create Gmail draft in operator@example.com" in message.root_text
     assert action_texts == [
         "Create Gmail draft",
         "Revise draft",
@@ -553,7 +553,7 @@ def test_slack_interactive_yes_creates_gmail_draft_when_explicitly_allowed(
                 "recipient_email": "andy@example.com",
                 "email_subject": "Test subject",
                 "slack_approval_allows_gmail_draft_creation": True,
-                "gmail_draft_account": "wisegrow05@gmail.com",
+                "gmail_draft_account": "operator@example.com",
             },
         )
     )
@@ -578,10 +578,10 @@ def test_slack_interactive_yes_creates_gmail_draft_when_explicitly_allowed(
     assert result.gmail_draft_result is not None
     assert result.gmail_draft_result["status"] == "dry-run"
     assert result.gmail_draft_result["to"] == "andy@example.com"
-    assert result.gmail_draft_result["gmail_account"] == "wisegrow05@gmail.com"
-    assert "Gmail draft creation in `wisegrow05@gmail.com`" in result.followup_text
+    assert result.gmail_draft_result["gmail_account"] == "operator@example.com"
+    assert "Gmail draft creation in `operator@example.com`" in result.followup_text
     assert item is not None
-    assert item.metadata["gmail_draft_result"]["gmail_account"] == "wisegrow05@gmail.com"
+    assert item.metadata["gmail_draft_result"]["gmail_account"] == "operator@example.com"
 
 
 def test_kba_create_gmail_draft_creates_dry_run_when_explicitly_allowed(
@@ -602,7 +602,7 @@ def test_kba_create_gmail_draft_creates_dry_run_when_explicitly_allowed(
                 "recipient_email": "andy@example.com",
                 "email_subject": "Test subject",
                 "slack_approval_allows_gmail_draft_creation": True,
-                "gmail_draft_account": "wisegrow05@gmail.com",
+                "gmail_draft_account": "operator@example.com",
             },
         )
     )
@@ -621,7 +621,7 @@ def test_kba_create_gmail_draft_creates_dry_run_when_explicitly_allowed(
     assert result.approval_status == "approved"
     assert result.gmail_draft_result is not None
     assert result.gmail_draft_result["status"] == "dry-run"
-    assert result.gmail_draft_result["gmail_account"] == "wisegrow05@gmail.com"
+    assert result.gmail_draft_result["gmail_account"] == "operator@example.com"
     assert result.email_sent is False
 
 
@@ -643,7 +643,7 @@ def test_slack_interactive_duplicate_gmail_draft_approval_is_idempotent(
                 "recipient_email": "andy@example.com",
                 "email_subject": "Test subject",
                 "slack_approval_allows_gmail_draft_creation": True,
-                "gmail_draft_account": "wisegrow05@gmail.com",
+                "gmail_draft_account": "operator@example.com",
             },
         )
     )
@@ -1463,12 +1463,19 @@ def test_kba_more_research_uses_langgraph_when_enabled(
     assert review_event.metadata["route"] == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
     assert graph_event.metadata["checkpoint_key"] == f"work-item:{item.id}"
     assert graph_event.metadata["runtime"] in {"langgraph", "dependency_free_fallback"}
-    assert graph_event.metadata["node_path"][0] == "advance_work_item"
+    assert graph_event.metadata["node_path"][:3] == [
+        "normalize_request",
+        "orchestrator_preflight",
+        "state_followup",
+    ]
+    assert "prepare_work_item" in graph_event.metadata["node_path"]
+    assert "run_business_research" in graph_event.metadata["node_path"]
+    assert "finalize_step" in graph_event.metadata["node_path"]
     if graph_event.metadata.get("checkpoint_required"):
         assert "approval_checkpoint" in graph_event.metadata["node_path"]
         assert graph_event.metadata.get("checkpoint_reason")
     else:
-        assert graph_event.metadata["node_path"] == ["advance_work_item"]
+        assert "approval_checkpoint" not in graph_event.metadata["node_path"]
 
 
 def test_kba_continue_work_item_uses_langgraph_thread_when_enabled(

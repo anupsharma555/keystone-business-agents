@@ -1312,6 +1312,7 @@ def test_cli_work_items_advance_preflight_uses_existing_specialist_route(
         )
 
     monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_run_orchestrator_preflight)
+    monkeypatch.setenv("KNI_BUSINESS_AGENTS_LANGGRAPH", "false")
     monkeypatch.setattr(
         cli,
         "advance_work_item_manager_loop",
@@ -1535,6 +1536,170 @@ def test_cli_ask_context_agent_mention_uses_first_class_dry_run(
     assert payload["side_effects"]["external_write_performed"] is False
 
 
+def test_cli_ask_kni_multistep_uses_backend_selected_langgraph(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'kni_multistep_graph.db'}"
+    monkeypatch.delenv("KNI_BUSINESS_AGENTS_LANGGRAPH", raising=False)
+    monkeypatch.delenv("KEYSTONE_WORKITEM_LANGGRAPH", raising=False)
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "--database-url",
+            database_url,
+            "@KNI",
+            "research",
+            "NeuroFlow",
+            "and",
+            "find",
+            "matching",
+            "opportunities",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    events = SQLiteStore(database_url).list_work_item_events(payload["work_item"]["id"])
+    graph_event = next(event for event in events if event.event_type == "langgraph_orchestration")
+
+    assert exit_code == 0
+    assert payload["route"] in {
+        WorkItemRoute.OPPORTUNITY_SCOUT.value,
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+    }
+    assert any(event.event_type == "langgraph_orchestration" for event in events)
+    assert any(event.event_type == "langgraph_manager_loop_completed" for event in events)
+    assert {
+        "run_opportunity_scout",
+        "run_business_research",
+    } <= set(graph_event.metadata["node_path"])
+
+
+def test_cli_airtable_context_infers_finance_expense_receipt_target(
+    capsys,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "airtable_context_agent",
+            "--json",
+            "add a business expense to the airtable business expenses based on the receipt "
+            "details which are: /tmp/example-business-cards-receipt.pdf",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    output = payload["output"]
+    assert output["base_alias"] == "finance_tax_tracker"
+    assert output["relevant_tables"] == ["Business Expenses"]
+    assert "Total Expenses" in output["relevant_fields"]
+    assert output["write_plan"]["operation"] == (
+        "airtable_specialist_create_from_receipt_after_schema_and_approval"
+    )
+    assert output["write_plan"]["target"] == "finance_tax_tracker / Business Expenses"
+    assert "receipt_local_path" in {
+        item["key"] for item in output["write_plan"]["field_mapping"]
+    }
+    assert "Confirmed base/table/record identity" not in output["approval_needs"]
+    assert "Confirmed expense-table schema field mapping" in output["approval_needs"]
+    assert "not ask the operator to restate the base or table" in output["summary"]
+    assert "Tax Payments" not in output["relevant_tables"]
+    assert payload["send_enabled"] is False
+    assert payload["side_effects"]["external_write_performed"] is False
+
+
+def test_cli_no_live_chief_receipt_command_returns_bounded_write_plan(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    receipt_path = tmp_path / "example-business-cards-receipt.pdf"
+    receipt_path.write_bytes(b"%PDF-1.4\nreceipt fixture")
+
+    def fake_extract(path: str) -> FinanceReceiptEvidence:
+        return FinanceReceiptEvidence(
+            source_path=str(path),
+            filename=Path(path).name,
+            content_read=True,
+            extraction_method="fixture",
+            vendor="Example Print Inc.",
+            receipt_date="2026-06-28",
+            order_number="1002003",
+            description="Business Cards",
+            quantity="50",
+            subtotal="31.00",
+            shipping="45.80",
+            total="76.80",
+            currency="USD",
+            payment_summary="credit card ending in 0000",
+            estimated_tax_periods="Q3",
+        )
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.extract_finance_receipt_evidence",
+        fake_extract,
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--no-live-sdk",
+            "--json",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'ask.db'}",
+            "@KNI",
+            "chief",
+            "of",
+            "staff",
+            "add",
+            "a",
+            "business",
+            "expense",
+            "to",
+            "the",
+            "airtable",
+            "business",
+            "expenses",
+            "based",
+            "on",
+            "the",
+            "receipt",
+            "details",
+            "which",
+            "are:",
+            str(receipt_path),
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    human_summary = payload["human_summary"]
+    assert exit_code == 0
+    assert payload["status"] == "done"
+    assert payload["route"] == "chief_of_staff"
+    assert payload["manual_request_plan"]["intent"] == "business_system_write"
+    assert payload["manual_request_plan"]["target_type"] == "business_system_context"
+    assert "Read-only only" not in human_summary
+    assert "finance_tax_tracker" in human_summary
+    assert "Business Expenses" in human_summary
+    assert "Example Print Inc." in human_summary
+    assert "Q3" in human_summary
+    assert "76.80" in human_summary
+    assert "airtable_create_expense_from_receipt" in human_summary
+    assert payload["next_action"]["requires_approval"] is True
+    assert payload["artifact_refs"][0]["metadata"]["send_enabled"] is False
+    assert payload["artifact_refs"][0]["metadata"]["slack_post_allowed"] is False
+
+
 def test_cli_ask_chief_of_staff_outputs_deterministic_plan(capsys) -> None:
     exit_code = main(
         [
@@ -1648,6 +1813,129 @@ def test_cli_ask_kni_chief_of_staff_uses_chief_work_item(tmp_path: Path, capsys)
     assert "Artifacts: chief_of_staff_plan:" in output
 
 
+def test_cli_ask_kni_chief_natural_research_outreach_uses_graph_workflow(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'ask-chief-research-outreach.db'}"
+    monkeypatch.delenv("KNI_BUSINESS_AGENTS_LANGGRAPH", raising=False)
+    monkeypatch.delenv("KEYSTONE_WORKITEM_LANGGRAPH", raising=False)
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "--no-live-sdk",
+            "--database-url",
+            database_url,
+            "--max-manager-steps",
+            "4",
+            "@KNI",
+            "chief",
+            "of",
+            "staff",
+            "NeuroFlow",
+            "has",
+            "been",
+            "coming",
+            "up",
+            "as",
+            "a",
+            "behavioral-health",
+            "AI",
+            "company",
+            "with",
+            "payer",
+            "partnership",
+            "and",
+            "outcomes-evidence",
+            "signals.",
+            "Do",
+            "research,",
+            "assess",
+            "whether",
+            "this",
+            "is",
+            "a",
+            "real",
+            "KNI",
+            "advisory/research",
+            "opportunity,",
+            "identify",
+            "what",
+            "source-backed",
+            "evidence",
+            "is",
+            "still",
+            "missing,",
+            "and",
+            "decide",
+            "whether",
+            "it",
+            "should",
+            "stop",
+            "at",
+            "an",
+            "approval",
+            "checkpoint",
+            "before",
+            "any",
+            "outreach.",
+            "If",
+            "the",
+            "evidence",
+            "supports",
+            "pursuing",
+            "it,",
+            "include",
+            "a",
+            "draft-only",
+            "Slack-thread",
+            "sample",
+            "outreach",
+            "for",
+            "review.",
+            "Do",
+            "not",
+            "send",
+            "email,",
+            "create",
+            "Gmail",
+            "drafts,",
+            "post",
+            "outside",
+            "this",
+            "thread,",
+            "schedule,",
+            "publish,",
+            "or",
+            "write",
+            "external",
+            "systems.",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    artifact_types = {
+        artifact["artifact_type"] for artifact in payload["work_item"]["artifact_refs"]
+    }
+    blocker_codes = {blocker["code"] for blocker in payload["blockers"]}
+    events = SQLiteStore(database_url).list_work_item_events(payload["work_item"]["id"])
+    graph_event = next(event for event in events if event.event_type == "langgraph_orchestration")
+
+    assert payload["route"] == "outreach_composer"
+    assert payload["status"] == "blocked"
+    assert {"company_profile", "opportunity"} <= artifact_types
+    assert "outreach_draft" not in artifact_types
+    assert "outreach_draft_needs_model_reasoning" in blocker_codes
+    assert graph_event.metadata["checkpoint_required"] is False
+    assert "run_business_research" in graph_event.metadata["node_path"]
+    assert "run_opportunity_scout" in graph_event.metadata["node_path"]
+    assert "run_outreach_composer" in graph_event.metadata["node_path"]
+
+
 def test_cli_ask_chief_of_staff_reference_capture_persists_memory(
     tmp_path: Path,
     capsys,
@@ -1734,6 +2022,153 @@ def test_cli_ask_agent_override_auto_live_sdk_in_live_mode(
     assert "scripts/run_company_research.py" in calls[0]
     assert "--live-sdk" in calls[0]
     assert "--live-search-plan" in calls[0]
+
+
+def test_cli_live_finance_receipt_write_skips_live_manual_planner(
+    monkeypatch,
+    capsys,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_orchestrator_preflight(
+        request_text,
+        *,
+        requested_agent=None,
+        live_manual_plan=False,
+        **kwargs,
+    ):
+        captured["live_manual_plan"] = live_manual_plan
+        return _fake_orchestrator_preflight(
+            request_text,
+            requested_agent=requested_agent,
+            live_manual_plan=live_manual_plan,
+            **kwargs,
+        )
+
+    def fake_run(command, **_kwargs):
+        captured["command"] = command
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "output_type": "ChiefOfStaffResult",
+                    "send_enabled": False,
+                    "human_summary": "blocked before model/tool call",
+                    "output": {
+                        "summary": "blocked before model/tool call",
+                        "send_enabled": False,
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_run_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--json",
+            "@KNI",
+            "chief",
+            "of",
+            "staff",
+            "add",
+            "a",
+            "business",
+            "expense",
+            "to",
+            "the",
+            "airtable",
+            "business",
+            "expenses",
+            "based",
+            "on",
+            "the",
+            "receipt",
+            "details",
+            "which",
+            "are:",
+            "/tmp/example-business-cards-receipt.pdf",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert captured["live_manual_plan"] is False
+    assert "scripts/run_chief_of_staff.py" in captured["command"]
+    assert "--live-sdk" in captured["command"]
+    assert payload["manual_request_plan"]["intent"] == "business_system_write"
+    assert payload["manual_request_plan"]["target_type"] == "business_system_context"
+
+
+def test_cli_bounded_smoke_suppresses_live_manual_planner_and_live_search(
+    monkeypatch,
+    capsys,
+) -> None:
+    prompt = (
+        "Research smoke: research NeuroFlow for a short internal read-only company note. "
+        "Stay on Business Research only; do not scout opportunities or draft outreach. "
+        "Live SDK is approved only for this bounded read-only smoke if the backend would "
+        "normally use it; live web search is not approved. Use local/dry-run retrieval "
+        "where possible. Do not send email, create drafts, post elsewhere, publish, "
+        "schedule, or write external systems."
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_orchestrator_preflight(
+        request_text,
+        *,
+        requested_agent=None,
+        live_manual_plan=False,
+        **kwargs,
+    ):
+        captured["live_manual_plan"] = live_manual_plan
+        return _fake_orchestrator_preflight(
+            request_text,
+            requested_agent=requested_agent,
+            live_manual_plan=live_manual_plan,
+            **kwargs,
+        )
+
+    def fake_advance_work_item_manager_loop(request, **_kwargs):
+        captured["request"] = request
+        item = WorkItem(
+            kind=WorkItemKind.COMPANY_RESEARCH,
+            title="Research: NeuroFlow",
+            request_text=request.request_text,
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=WorkItemStatus.DONE,
+        )
+        return WorkflowRunResult(
+            work_item=item,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=WorkItemStatus.DONE,
+            advanced=True,
+            human_summary="Business Research completed.",
+            manual_request_plan=request.manual_request_plan,
+            orchestrator_preflight=request.orchestrator_preflight,
+        )
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_run_orchestrator_preflight)
+    monkeypatch.setattr(
+        "keystone_agents.langgraph_workflow.advance_work_item_manager_loop_with_optional_langgraph",
+        fake_advance_work_item_manager_loop,
+    )
+
+    exit_code = main(["ask", "--live-search", "--live-sdk", "--json", prompt])
+
+    payload = json.loads(capsys.readouterr().out)
+    request = captured["request"]
+    assert exit_code == 0
+    assert captured["live_manual_plan"] is False
+    assert request.live_search is False
+    assert request.live_sdk is True
+    assert request.manual_request_plan["target_agent"] == "business_research_analyst"
+    assert request.manual_request_plan["requires_live_search"] is False
+    assert payload["route"] == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
 
 
 def test_cli_ask_agent_override_promotes_child_human_summary(
@@ -3044,8 +3479,100 @@ def test_cli_ask_gmail_reply_without_thread_context_is_blocked(
     assert payload["requires_gmail_context"] is True
     assert payload["send_enabled"] is False
     assert payload["agent_execution_plan"]["operation"] == "draft_reply"
-    assert "No synthetic email was created" in payload["message"]
+    assert "usable email context" in payload["message"]
+    assert "pasted sanitized email" in payload["message"]
     assert calls == []
+
+
+def test_cli_ask_gmail_triage_live_promotes_inline_email_workflow_to_work_item(
+    monkeypatch,
+    capsys,
+) -> None:
+    work_item_calls: list[dict[str, object]] = []
+
+    def fake_work_item(input_text, **kwargs):
+        work_item_calls.append({"input_text": input_text, **kwargs})
+        return 0
+
+    prompt = (
+        "gmail triage this sanitized inbound email from Mindful Care, research "
+        "Mindful Care, and prepare a draft-only Slack-thread sample outreach for "
+        "review. Email: From: Jordan Lee, Operations at Mindful Care. Subject: "
+        "Follow-up on measurement support. Body: Hi Jordan, our team is reviewing "
+        "measurement-based care workflows and may need advisory help on evaluation "
+        "design. Could you let me know if this is relevant for Keystone? Do not "
+        "send, create Gmail drafts, post outside this thread, schedule, publish, "
+        "create files, update Airtable/CRM/Drive/Sheets, or write external systems."
+    )
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_work_item)
+
+    exit_code = main(["ask", "--agent", "gmail_triage", "--live-sdk", "--json", prompt])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == ""
+    assert len(work_item_calls) == 1
+    call = work_item_calls[0]
+    assert call["input_text"] == prompt
+    assert call["live_search"] is False
+    assert call["live_sdk"] is True
+    assert call["json_output"] is True
+    assert call["max_manager_steps"] == 3
+    assert call["manual_plan"] is not None
+    assert call["orchestrator_preflight"] is not None
+
+
+def test_cli_ask_gmail_triage_live_accepts_simple_inline_sanitized_email_fixture(
+    monkeypatch,
+    capsys,
+) -> None:
+    calls: list[list[str]] = []
+    fixture_texts: list[str] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        fixture_path = Path(command[command.index("--fixture") + 1])
+        fixture_texts.append(fixture_path.read_text(encoding="utf-8"))
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    prompt = (
+        "gmail triage this sanitized inbound email and prepare a draft reply for review. "
+        "Email: From: Jordan Lee, Operations at Mindful Care. Subject: Follow-up on "
+        "measurement support. Body: Hi Jordan, our team is reviewing measurement-based "
+        "care workflows and may need advisory help on evaluation design. Could you let "
+        "me know if this is relevant for Keystone? Do not send or create Gmail drafts."
+    )
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+
+    exit_code = main(["ask", "--agent", "gmail_triage", "--live-sdk", "--json", prompt])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_agent"] == "gmail_triage"
+    assert calls
+    command = calls[0]
+    assert "--fixture" in command
+    assert "--no-live-gmail" in command
+    assert "--no-allow-inbox" in command
+    assert "--sender-name" in command
+    assert command[command.index("--sender-name") + 1] == (
+        "Jordan Lee, Operations at Mindful Care"
+    )
+    assert fixture_texts == [
+        (
+            "Subject: Follow-up on measurement support\n\n"
+            "Hi Jordan, our team is reviewing measurement-based care workflows and "
+            "may need advisory help on evaluation design. Could you let me know if "
+            "this is relevant for Keystone?"
+        )
+    ]
 
 
 def test_cli_ask_live_child_timeout_returns_structured_payload(
@@ -3191,7 +3718,10 @@ def test_cli_ask_work_item_failure_returns_clear_json_and_stderr(
         raise ToolGuardrailViolation("blocked by safety guardrail")
 
     monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
-    monkeypatch.setattr(cli, "advance_work_item_manager_loop", failed_work_item)
+    monkeypatch.setattr(
+        "keystone_agents.langgraph_workflow.advance_work_item_manager_loop_with_optional_langgraph",
+        failed_work_item,
+    )
 
     exit_code = main(
         [

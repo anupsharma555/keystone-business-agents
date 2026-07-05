@@ -43,11 +43,11 @@ def test_gmail_create_draft_dry_run_records_target_account() -> None:
         to="andy@example.com",
         subject="Draft subject",
         body="Draft body for approval only.",
-        expected_account="wisegrow05@gmail.com",
+        expected_account="operator@example.com",
     )
 
     assert draft["status"] == "dry-run"
-    assert draft["gmail_account"] == "wisegrow05@gmail.com"
+    assert draft["gmail_account"] == "operator@example.com"
     assert draft["sent"] is False
     assert draft["approval_required"] is True
 
@@ -58,12 +58,12 @@ def test_gmail_create_draft_live_requires_expected_account(
     tool = GmailTool(live=True, access_token="fake-token")
     monkeypatch.setattr(tool, "current_account_email", lambda: "other@example.com")
 
-    with pytest.raises(GmailConfigurationError, match="wisegrow05@gmail.com"):
+    with pytest.raises(GmailConfigurationError, match="operator@example.com"):
         tool.create_draft(
             to="andy@example.com",
             subject="Draft subject",
             body="Draft body for approval only.",
-            expected_account="wisegrow05@gmail.com",
+            expected_account="operator@example.com",
         )
 
 

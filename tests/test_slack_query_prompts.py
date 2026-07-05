@@ -143,10 +143,9 @@ def test_slack_query_prompt_keeps_deterministic_route_authoritative() -> None:
     )
 
     assert selection is not None
-    assert selection.kind == SlackQueryPromptKind.OPPORTUNITY_SEARCH
+    assert selection.kind == SlackQueryPromptKind.RESEARCH_SUMMARY
     assert selection.target_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
-    assert selection.route_mismatch["detected_route"] == WorkItemRoute.OPPORTUNITY_SCOUT.value
-    assert selection.route_mismatch["resolution"] == "deterministic_route_wins"
+    assert selection.route_mismatch == {}
 
 
 def test_slack_query_prompt_context_flags_select_reusable_agent_skill_contracts() -> None:

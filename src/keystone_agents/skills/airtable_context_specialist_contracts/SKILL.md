@@ -26,12 +26,21 @@ and write-plan recommendations only.
 
 - Resolve base, table, field, and candidate record identity from schema and
   capped reads.
+- Infer obvious finance tracker expense receipt targets from the ask before
+  asking for clarification: Airtable business expenses -> `finance_tax_tracker`
+  / `Business Expenses`; Airtable personal expenses -> `finance_tax_tracker` /
+  `Personal Expenses`.
 - Return useful operational context, not raw tool output.
 - State mapping assumptions and missing identifiers.
 - Put proposed create/update details in `write_plan`.
 - Keep `write_plan.live_write_allowed_for_specialist=false`.
+- Use `airtable_create_expense_from_receipt` for direct selected-agent or
+  approved action-handler expense receipt/invoice creates when the target table,
+  approval reference, and live-write flags are exact.
 - Use `airtable_write_record` only for direct selected-agent runs with exact
   target identity, approval reference, and live-write flags.
+- Use `airtable_upload_attachment` only when the bounded receipt-create tool is
+  not sufficient and record identity plus an Airtable attachment field are known.
 
 ## Flexible Behavior
 
@@ -47,7 +56,8 @@ and write-plan recommendations only.
 
 - Do not execute live writes when nested inside Chief of Staff.
 - Do not approve writes.
-- Do not delete records, alter schema, upload attachments, or bulk overwrite.
+- Do not delete records, alter schema, perform generic attachment uploads, or
+  bulk overwrite.
 - Must not infer approval from route advice, a desired outcome, or a draft plan.
 
 ## Output Contract
@@ -56,6 +66,9 @@ and write-plan recommendations only.
 - Include `write_plan` only for scoped create/update candidates.
 - Include evidence notes for fields read and candidate matching logic.
 - Include blockers and next safe actions when the tool cannot resolve identity.
+  For receipt-backed expense creates, base/table should be resolved from the
+  business object; blockers should focus on missing schema fields, missing
+  receipt evidence, missing attachment support, or missing approval/live gates.
 
 ## Failure Modes
 
@@ -70,15 +83,18 @@ and write-plan recommendations only.
 
 - Correctly separates read context, write plans, and approved direct writes.
 - Preserves exact field names and record IDs when available.
-- Blocks deletes, schema changes, attachment uploads, and unapproved bulk edits.
+- Blocks deletes, schema changes, generic attachment uploads, and unapproved
+  bulk edits.
 - Produces a Chief of Staff handoff that is organized enough for downstream
-  writing without performing the write.
+  specialist/action-handler execution without performing the nested write.
 
 ## Reasoning Questions
 
 - Which base, table, view, fields, and records were actually inspected?
 - Is the requested operation a read, advisory handoff, or approved direct write?
 - What record identity evidence supports the selected candidate?
+- If this is a receipt-backed create, what base/table did the ask imply and what
+  field/attachment evidence still needs schema verification?
 - What approval reference and live-write gate would be required before mutation?
 
 ## Decision Rubric

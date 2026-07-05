@@ -270,8 +270,6 @@ def should_run_multi_target_research(
         return True
     if "target is a product category" in text:
         return True
-    if "identify three current public products" in text:
-        return True
     return False
 
 
@@ -1337,13 +1335,30 @@ def _desired_count(plan: dict[str, Any], request_text: str) -> int:
 def _explicit_desired_count(plan: dict[str, Any], request_text: str) -> int | None:
     raw = plan.get("desired_count")
     if isinstance(raw, int):
+        if raw <= 1:
+            return None
         return max(2, min(6, raw))
-    match = re.search(r"\b(?:compare|find|identify|return|list)\s+(\d{1,2})\b", request_text, re.I)
+    match = re.search(
+        r"\b(?:compare|find|identify|return|list)\s+(?:how\s+)?(\d{1,2})\b",
+        request_text,
+        re.I,
+    )
     if match:
         return max(2, min(6, int(match.group(1))))
-    word_match = re.search(r"\b(compare|find|identify|return|list)\s+three\b", request_text, re.I)
+    word_match = re.search(
+        r"\b(?:compare|find|identify|return|list)\s+(?:how\s+)?"
+        r"(two|three|four|five|six)\b",
+        request_text,
+        re.I,
+    )
     if word_match:
-        return 3
+        return {
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+        }[word_match.group(1).lower()]
     return None
 
 

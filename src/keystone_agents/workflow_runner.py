@@ -7,6 +7,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from email.utils import parseaddr
 from pathlib import Path
 from time import perf_counter
@@ -40,6 +41,10 @@ from keystone_agents.company_research import research_company_fixture
 from keystone_agents.config import cli_default_live_gmail
 from keystone_agents.contact_enrichment import build_contact_enrichment_artifact
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
+from keystone_agents.finance_expense_receipts import (
+    extract_finance_receipt_evidence,
+    infer_finance_expense_receipt_target,
+)
 from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.live_retrieval import (
     retrieve_company_profile_live,
@@ -51,6 +56,7 @@ from keystone_agents.local_kni_evidence import (
     local_kni_live_instruction,
     looks_like_local_kni_evidence_lookup,
 )
+from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.memory import (
     MANAGER_LOOP_EFFICIENCY_METRIC_NAME,
     MANAGER_LOOP_EFFICIENCY_METRIC_VERSION,
@@ -74,6 +80,7 @@ from keystone_agents.quality_budget import (
     AgentQualityBudget,
     business_research_quality_budget,
     opportunity_scout_quality_budget,
+    quality_mode_from_cost_profile,
 )
 from keystone_agents.response_synthesis import (
     format_user_response_synthesis,
@@ -86,7 +93,11 @@ from keystone_agents.response_synthesis import (
 from keystone_agents.run import run_retrieved_sdk_synthesis
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffSourceRef
-from keystone_agents.schemas.company_profile import CompanyProfile, SourceRecord
+from keystone_agents.schemas.company_profile import (
+    ClaimEvidenceRecord,
+    CompanyProfile,
+    SourceRecord,
+)
 from keystone_agents.schemas.email_triage import (
     GmailThreadSummaryMessage,
     GmailThreadSummaryResult,
@@ -100,11 +111,12 @@ from keystone_agents.schemas.opportunity import (
     OpportunityRecord as ScoutOpportunityRecord,
 )
 from keystone_agents.schemas.outreach import (
-    OpportunityRecord as OutreachOpportunityRecord,
-)
-from keystone_agents.schemas.outreach import (
+    ApprovedOutreachDraftingContext,
     OutreachDraft,
     OutreachLLMDraftPayload,
+)
+from keystone_agents.schemas.outreach import (
+    OpportunityRecord as OutreachOpportunityRecord,
 )
 from keystone_agents.schemas.research import ResearchBrief
 from keystone_agents.schemas.retrieval import RetrievalHint
@@ -216,6 +228,17 @@ _FORMAL_OPPORTUNITY_TIMING_RE = re.compile(
     r"dec(?:ember)?)\s+\d{1,2}(?:,\s*20\d{2})?\b",
     flags=re.I,
 )
+
+
+@dataclass(frozen=True)
+class PreparedWorkItemStep:
+    """Prepared WorkItem state for graph-native orchestration nodes."""
+
+    request: WorkflowRunRequest
+    work_item: WorkItem
+    route: WorkItemRoute
+    input_text: str
+    context_pack: dict[str, Any]
 _KEYSTONE_APPLICABILITY_RE = re.compile(
     r"\b(?:small\s+business|for[- ]profit|commercial|company|companies|startup|vendor|"
     r"contractor|subcontract(?:or|ing)?|partner(?:ship|s)?|collaborat(?:or|ion|e)|"
@@ -269,12 +292,22 @@ def _normalize_workflow_request_for_context(
 ) -> WorkflowRunRequest:
     """Apply conservative defaults when a request is known to come from Slack context."""
 
-    if _is_slack_conservative_cost_profile(request):
-        return request
     context_work_item = work_item
     if context_work_item is None and request.work_item_id and store is not None:
         context_work_item = store.get_work_item(request.work_item_id)
     if not _request_has_slack_context(request, store=store, work_item=context_work_item):
+        return request
+    if _request_is_bounded_live_sdk_smoke(request, work_item=context_work_item):
+        return request.model_copy(
+            update={
+                "cost_profile": "slack_smoke_limited",
+                "allow_manager_loop_repair": False,
+                "include_contact_enrichment": False,
+                "hosted_web_search_max_calls": 0,
+                "reuse_existing_research": True,
+            }
+        )
+    if _is_slack_conservative_cost_profile(request):
         return request
     route = _request_route_for_slack_cost_profile(request, work_item=context_work_item)
     formal_opportunity = (
@@ -389,6 +422,24 @@ def _manual_request_plan_dict(value: Any) -> dict[str, Any] | None:
         payload = value.model_dump(mode="json")
         return payload if isinstance(payload, dict) else None
     return value if isinstance(value, dict) else None
+
+
+def _attach_inferred_manual_request_plan(
+    request: WorkflowRunRequest,
+    input_text: str,
+) -> WorkflowRunRequest:
+    """Attach the local semantic plan for entrypoints that skipped CLI/Slack preflight."""
+
+    if request.manual_request_plan is not None:
+        return request
+    if request.work_item_id:
+        return request
+    normalized = " ".join(str(input_text or "").lower().split())
+    if not normalized or normalized in {"continue", "resume"}:
+        return request
+    requested_agent = request.requested_route.value if request.requested_route is not None else None
+    plan = infer_manual_request_plan(input_text, requested_agent=requested_agent)
+    return request.model_copy(update={"manual_request_plan": plan.model_dump(mode="json")})
 
 
 def _slack_context_from_work_item(work_item: WorkItem | None) -> dict[str, Any]:
@@ -563,6 +614,8 @@ def _request_stops_after_opportunity_packet(text: str) -> bool:
     normalized = " ".join(str(text or "").lower().split())
     if not normalized:
         return False
+    if _manager_loop_requests_outreach_draft(normalized):
+        return False
     return bool(
         re.search(
             r"\bstop\s+after\b[\s\S]{0,80}\b(?:opportunit(?:y|ies)|review packet|packet)\b"
@@ -639,6 +692,27 @@ def _slack_cost_defaults_for_route(
     }
 
 
+def _request_is_bounded_live_sdk_smoke(
+    request: WorkflowRunRequest,
+    *,
+    work_item: WorkItem | None = None,
+) -> bool:
+    text = " ".join(
+        str(part or "")
+        for part in (
+            request.request_text,
+            work_item.request_text if work_item is not None else "",
+            request.manual_request_plan or {},
+            request.orchestrator_preflight or {},
+        )
+    ).lower()
+    if "smoke" not in text:
+        return False
+    return bool(
+        re.search(r"\bbounded\b|\bread[- ]only\b|\blive sdk is approved only\b", text)
+    )
+
+
 def _slack_request_needs_deep_research_profile(
     route: str,
     *,
@@ -705,11 +779,39 @@ def _advance_work_item_one_step(
 ) -> WorkflowRunResult:
     """Advance one WorkItem step, optionally deferring final response synthesis."""
 
+    prepared = prepare_work_item_step(request)
+    result = run_prepared_work_item_specialist(prepared)
+    return finalize_prepared_work_item_step(
+        prepared,
+        result,
+        synthesize_user_response=synthesize_user_response,
+    )
+
+
+def normalize_workflow_request_for_graph(request: WorkflowRunRequest) -> WorkflowRunRequest:
+    """Return the normalized request shape used before graph-native execution."""
+
+    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    return _normalize_workflow_request_for_context(request, store=store)
+
+
+def answer_work_item_state_followup(request: WorkflowRunRequest) -> WorkflowRunResult | None:
+    """Answer same-thread WorkItem state questions before specialist graph execution."""
+
+    request = normalize_workflow_request_for_graph(request)
+    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    return _maybe_answer_manager_loop_state_followup(request, store=store)
+
+
+def prepare_work_item_step(request: WorkflowRunRequest) -> PreparedWorkItemStep:
+    """Prepare WorkItem state, context, and audit records for one specialist step."""
+
     store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
     cost_directive = parse_cost_tracking_directive(request.request_text)
     cost_tracking_requested = bool(request.cost_tracking_requested or cost_directive.requested)
     input_text = (cost_directive.cleaned_text or request.request_text).strip()
     request = request.model_copy(update={"request_text": input_text})
+    request = _attach_inferred_manual_request_plan(request, input_text)
     route = _select_route(request, input_text, store)
     work_item = create_or_load_work_item(
         store=store,
@@ -803,6 +905,23 @@ def _advance_work_item_one_step(
     )
     _record_preflight_sdk_cost_events(work_item, request=request, store=store)
 
+    return PreparedWorkItemStep(
+        request=request,
+        work_item=work_item,
+        route=route,
+        input_text=input_text,
+        context_pack=context_pack.model_dump(mode="json"),
+    )
+
+
+def run_prepared_work_item_specialist(prepared: PreparedWorkItemStep) -> WorkflowRunResult:
+    """Run the specialist node selected during WorkItem preparation."""
+
+    request = prepared.request
+    work_item = prepared.work_item
+    route = prepared.route
+    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    sdk_session_spec = _sdk_session_spec_for_work_item(request, work_item)
     sdk_session = build_sdk_session(sdk_session_spec) if request.live_sdk else None
 
     source_link_followup = (
@@ -842,9 +961,24 @@ def _advance_work_item_one_step(
 
     _record_skill_contract_gates_event(
         result,
-        request_text=work_item.request_text or input_text,
+        request_text=work_item.request_text or prepared.input_text,
         store=store,
     )
+    return result
+
+
+def finalize_prepared_work_item_step(
+    prepared: PreparedWorkItemStep,
+    result: WorkflowRunResult,
+    *,
+    synthesize_user_response: bool,
+) -> WorkflowRunResult:
+    """Attach final context, synthesize user response, and persist one graph step."""
+
+    request = prepared.request
+    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    sdk_session_spec = _sdk_session_spec_for_work_item(request, result.work_item)
+    sdk_session = build_sdk_session(sdk_session_spec) if request.live_sdk else None
     final_context_pack = build_context_pack_for_route(result.work_item, result.route, store=store)
     result = result.model_copy(
         update={
@@ -1080,12 +1214,29 @@ def advance_work_item_manager_loop(
         if request.live_sdk
         else None
     )
-    final_result = _maybe_synthesize_user_facing_response(
-        final_result,
-        request=request,
-        sdk_session=final_sdk_session,
-        store=store,
-    )
+    if _manager_loop_should_synthesize_final_response(request):
+        final_result = _maybe_synthesize_user_facing_response(
+            final_result,
+            request=request,
+            sdk_session=final_sdk_session,
+            store=store,
+        )
+    else:
+        final_result = final_result.model_copy(
+            update={
+                "audit_notes": list(
+                    dict.fromkeys(
+                        [
+                            *final_result.audit_notes,
+                            (
+                                "Skipped live user-facing response synthesis because "
+                                "the manager-loop cost profile is smoke-limited."
+                            ),
+                        ]
+                    )
+                )
+            }
+        )
     final_result = _record_manager_loop_efficiency_metrics(
         final_result,
         original_request=request,
@@ -1102,6 +1253,15 @@ def advance_work_item_manager_loop(
     return final_result
 
 
+def _manager_loop_should_synthesize_final_response(request: WorkflowRunRequest) -> bool:
+    if not request.live_sdk:
+        return True
+    profile = str(request.cost_profile or "").strip().lower()
+    if profile == "slack_smoke_limited":
+        return False
+    return True
+
+
 def _maybe_answer_manager_loop_state_followup(
     request: WorkflowRunRequest,
     *,
@@ -1111,12 +1271,15 @@ def _maybe_answer_manager_loop_state_followup(
         return None
     full_request = str(request.request_text or "").strip()
     latest_request = latest_user_request(full_request).strip()
-    if not latest_request or latest_request == full_request:
-        return None
-    if not _looks_like_existing_state_followup(latest_request):
+    if not latest_request:
         return None
     work_item = store.get_work_item(request.work_item_id)
     if work_item is None:
+        return None
+    if latest_request == full_request:
+        if not _looks_like_external_use_approval_continue(latest_request, work_item):
+            return None
+    elif not _looks_like_existing_state_followup(latest_request):
         return None
 
     cost_directive = parse_cost_tracking_directive(latest_request)
@@ -1168,6 +1331,27 @@ def _maybe_answer_manager_loop_state_followup(
         sdk_session=sdk_session,
         store=store,
     )
+
+
+def _looks_like_external_use_approval_continue(text: str, work_item: WorkItem) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if normalized not in {"continue", "resume"}:
+        return False
+    has_approved_external_gate = any(
+        gate.scope == ApprovalScope.EXTERNAL_USE.value
+        and gate.state == ApprovalState.APPROVED_FOR_EXTERNAL_USE.value
+        for gate in work_item.approval_gates
+    )
+    has_approved_outreach_draft = any(
+        artifact.artifact_type == "outreach_draft"
+        and artifact.approval_state == ApprovalState.APPROVED_FOR_EXTERNAL_USE.value
+        for artifact in work_item.artifact_refs
+    )
+    has_pending_gate = any(
+        gate.required and gate.state == ApprovalState.PENDING.value
+        for gate in work_item.approval_gates
+    )
+    return has_approved_external_gate and has_approved_outreach_draft and not has_pending_gate
 
 
 def _looks_like_existing_state_followup(text: str) -> bool:
@@ -2174,13 +2358,14 @@ def _attach_route_specific_review_fields(
                     "category": "context_required",
                     "priority": "blocked",
                     "recommended_action": (
-                        "Select the Gmail thread/message or approve an explicit read-only "
-                        "Gmail retrieval scope before requesting triage, labels, or reply guidance."
+                        "Provide usable email context by pasting a sanitized email, selecting "
+                        "a Gmail message/thread, or approving an explicit read-only Gmail "
+                        "retrieval scope before requesting triage, labels, or reply guidance."
                     ),
                     "risk_flags": ["missing_gmail_context"],
                     "missing_information": [
-                        "selected Gmail thread or message",
-                        "recipient/thread identity for reply guidance",
+                        "pasted sanitized email, selected Gmail message/thread, or approved read-only retrieval scope",
+                        "recipient and relationship context for reply guidance",
                         "approval reference before any Gmail draft, label, archive, send, or schedule action",
                     ],
                     "write_actions_performed": False,
@@ -2650,6 +2835,10 @@ def _manager_loop_mentions_next_agent(
             (
                 r"\bresearch\s+(?:it|them|that|the\s+company|the\s+candidate|"
                 r"candidate|company|top|best|selected|shortlist)",
+                r"\bresearch\s+"
+                r"(?!externally\b|plan\b|workflow\b|question\b|questions\b|notes?\b|"
+                r"consulting\b|advisory\b|work\b|opportunit)"
+                r"[a-z0-9&._'-]+(?:\s+[a-z0-9&._'-]+){0,4}\b",
                 r"\b(?:company|candidate|target)\s+(?:research|profile)\b",
                 r"\bprofile\s+(?:it|them|that|the\s+company|the\s+candidate|"
                 r"candidate|company|top|best|selected|shortlist)",
@@ -3268,6 +3457,38 @@ def _manager_loop_needs_orchestrator_plan_summary(
     return len(routes) > 1 and "orchestrator" in text
 
 
+def _manager_loop_request_is_planning_only(
+    request_text: str,
+    *,
+    manual_request_plan: dict[str, Any] | None,
+) -> bool:
+    manual = _manual_plan_event_payload(manual_request_plan)
+    requested_agent = str(manual.get("requested_agent") or "").strip()
+    text = str(request_text or "").lower()
+    planning_pattern = (
+        r"\b(?:plan|state|list|describe|decide)\b[^.\n]{0,120}"
+        r"\b(?:workflow|route|handoff|blockers?|evidence|agents?)\b"
+    )
+    if re.search(r"\bplan\s+the\s+safest\s+workflow\b", text):
+        return True
+    if requested_agent == WorkItemRoute.ORCHESTRATOR.value:
+        return bool(re.search(planning_pattern, text))
+    if _manager_loop_requests_outreach_draft(text):
+        return False
+    if re.search(planning_pattern, text) and not re.search(
+        r"\b(?:run|execute|continue|advance)\b[^.\n]{0,80}\b(?:workflow|agents?|specialists?)\b",
+        text,
+    ):
+        return True
+    return bool(
+        "orchestrator" in text
+        and re.search(
+            planning_pattern,
+            text,
+        )
+    )
+
+
 def _render_orchestrator_plan_summary(summary: dict[str, Any]) -> str:
     def lines_for(key: str) -> list[str]:
         values = summary.get(key) or []
@@ -3602,7 +3823,10 @@ def _manager_loop_missing_stage_blockers(
             )
         )
     if (
-        _manager_loop_requests_opportunity_record(text)
+        (
+            _manager_loop_requests_opportunity_record(text)
+            or _manager_loop_requests_opportunity_assessment(text)
+        )
         and WorkItemRoute.OPPORTUNITY_SCOUT.value not in routes
         and "opportunity_record" not in artifact_types
     ):
@@ -3699,10 +3923,25 @@ def _manager_loop_requests_research(normalized_text: str) -> bool:
         normalized_text,
         flags=re.I,
     )
+    context_reference = re.sub(
+        r"\b(?:do not|don't|dont|never|no|without|avoid|skip)\b[^.\n]{0,120}"
+        r"\bresearch\s+externally\b",
+        " ",
+        context_reference,
+        flags=re.I,
+    )
     return bool(
         re.search(
             r"\b(?:research\s+(?:the\s+)?company|research\s+it|company\s+research|"
             r"company\s+brief|company\s+profile|source-backed|source\s+backed)\b",
+            context_reference,
+            flags=re.I,
+        )
+        or re.search(
+            r"\bresearch\s+"
+            r"(?!externally\b|plan\b|workflow\b|question\b|questions\b|notes?\b|"
+            r"consulting\b|advisory\b|work\b|opportunit)"
+            r"[a-z0-9&._'-]+(?:\s+[a-z0-9&._'-]+){0,4}\b",
             context_reference,
             flags=re.I,
         )
@@ -3735,40 +3974,80 @@ def _manager_loop_requests_opportunity_record(normalized_text: str) -> bool:
     ) or bool(re.search(r"\bopportunity record\b", scrubbed, flags=re.I))
 
 
+def _manager_loop_requests_opportunity_assessment(normalized_text: str) -> bool:
+    scrubbed = re.sub(
+        r"\b(?:do not|don't|dont|never|no|without)\b[^.\n]{0,120}"
+        r"\b(?:assess|evaluate|decide|determine)\b[^.\n]{0,160}\bopportunit",
+        " ",
+        normalized_text,
+        flags=re.I,
+    )
+    return bool(
+        re.search(
+            r"\b(?:assess|evaluate|decide|determine|rank|prioriti[sz]e)\b"
+            r"[^.\n]{0,160}\bopportunit(?:y|ies)\b",
+            scrubbed,
+            flags=re.I,
+        )
+        or re.search(
+            r"\bopportunit(?:y|ies)\b[^.\n]{0,180}"
+            r"\b(?:approval checkpoint|before any outreach|pursu(?:e|ing)|"
+            r"source-backed evidence|real kni)\b",
+            scrubbed,
+            flags=re.I,
+        )
+    )
+
+
 def _manager_loop_requests_outreach_draft(normalized_text: str) -> bool:
     if re.search(
-        r"\b(?:do not|don't|no|without)\b[^.\n]{0,80}\b(?:draft|write|compose|prepare|send)\b"
+        r"\b(?:do not|don't|no|without)\b[^.\n]{0,80}\b(?:draft|write|compose|prepare)\b"
         r"[^.\n]{0,80}\b(?:outreach|email|linkedin|message|note|reply|response)\b",
         normalized_text,
         flags=re.I,
     ):
         return False
+    scrubbed_text = re.sub(
+        r"\b(?:do not|don't|dont|never|no|without)\b[^.\n]{0,80}\bsend\b"
+        r"[^.\n]{0,80}\b(?:outreach|email|linkedin|message|note|reply|response)\b",
+        " ",
+        normalized_text,
+        flags=re.I,
+    )
     if re.search(
         r"\b(?:write|prepare|compose)\b[^.\n]{0,80}"
         r"\b(?:diligence|research|market|source[- ]provided)\s+note\b",
-        normalized_text,
+        scrubbed_text,
         flags=re.I,
     ):
         return False
     return (
-        bool(re.search(r"\boutreach draft\b(?!ing)", normalized_text, flags=re.I))
+        bool(re.search(r"\boutreach draft\b(?!ing)", scrubbed_text, flags=re.I))
         or bool(
             re.search(
                 r"\b(?:draft|write|compose|prepare|send)\b[^.\n]{0,160}"
                 r"\b(?:outreach|email|linkedin|message|note|reply|response)\b",
-                normalized_text,
+                scrubbed_text,
+                flags=re.I,
+            )
+        )
+        or bool(
+            re.search(
+                r"\bdraft[- ]only\b[^.\n]{0,160}"
+                r"\b(?:slack[- ]thread\s+)?sample\s+outreach\b",
+                scrubbed_text,
                 flags=re.I,
             )
         )
         or (
             (
-                _manager_loop_requests_research(normalized_text)
-                or _manager_loop_requests_opportunity_record(normalized_text)
+                _manager_loop_requests_research(scrubbed_text)
+                or _manager_loop_requests_opportunity_record(scrubbed_text)
             )
             and bool(
                 re.search(
                     r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,160}\b(?:response|reply)\b",
-                    normalized_text,
+                    scrubbed_text,
                     flags=re.I,
                 )
             )
@@ -3777,6 +4056,20 @@ def _manager_loop_requests_outreach_draft(normalized_text: str) -> bool:
 
 
 def _manager_loop_requests_crm_write(normalized_text: str) -> bool:
+    lowered = " ".join(str(normalized_text or "").lower().split())
+    if "airtable" in lowered and any(
+        marker in lowered
+        for marker in (
+            "finance_tax_tracker",
+            "finance tax tracker",
+            "tax tracker",
+            "business expense",
+            "business expenses",
+            "personal expense",
+            "personal expenses",
+        )
+    ):
+        return False
     if re.search(
         r"\b(?:do\s+not|don't|without|no)\b[^.\n]{0,120}"
         r"\b(?:crm|airtable|salesforce|hubspot|external\s+systems?)\b",
@@ -3831,7 +4124,13 @@ def _select_route(
         if continued is not None:
             return continued
         return existing.current_route
-    planned_route = _route_from_manual_plan(request.manual_request_plan)
+    if existing is not None and _use_deterministic_source_link_followup(request):
+        return existing.current_route
+    planned_route = _route_from_manual_plan(
+        request.manual_request_plan,
+        request_text=input_text,
+        live_sdk=request.live_sdk,
+    )
     if planned_route is not None:
         return planned_route
     if re.match(r"^\s*@?KNI\s+chief\s+of\s+staff\b|^\s*chief\s+of\s+staff\b", input_text, re.I):
@@ -3845,7 +4144,12 @@ def _select_route(
         return WorkItemRoute.CLARIFICATION
 
 
-def _route_from_manual_plan(plan: dict | None) -> WorkItemRoute | None:
+def _route_from_manual_plan(
+    plan: dict | None,
+    *,
+    request_text: str = "",
+    live_sdk: bool = False,
+) -> WorkItemRoute | None:
     if not isinstance(plan, dict):
         return None
     target_agent = str(plan.get("target_agent") or "").strip()
@@ -3856,6 +4160,19 @@ def _route_from_manual_plan(plan: dict | None) -> WorkItemRoute | None:
         return WorkItemRoute.CLARIFICATION
     if target_agent in {"", WorkItemRoute.ORCHESTRATOR.value, WorkItemRoute.CLARIFICATION.value}:
         return None
+    if (
+        target_agent == WorkItemRoute.CHIEF_OF_STAFF.value
+        and not live_sdk
+        and _chief_request_needs_manager_loop(request_text)
+        and not _chief_request_should_start_with_chief(request_text)
+    ):
+        normalized_text = " ".join(str(request_text or "").lower().split())
+        mentions_opportunity_scout = "opportunity scout" in normalized_text
+        if _manager_loop_requests_opportunity_assessment(
+            normalized_text
+        ) and (mentions_opportunity_scout or not _manager_loop_requests_research(normalized_text)):
+            return WorkItemRoute.OPPORTUNITY_SCOUT
+        return WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     if target_agent in _MANUAL_CONTEXT_AGENT_TARGETS:
         return WorkItemRoute.CHIEF_OF_STAFF
     try:
@@ -3941,6 +4258,59 @@ def _manual_primary_target(work_item: WorkItem) -> str:
     if not isinstance(plan, dict):
         return ""
     return " ".join(str(plan.get("primary_target") or "").strip().split())
+
+
+def _chief_request_needs_manager_loop(request_text: str) -> bool:
+    normalized = " ".join(str(request_text or "").lower().split())
+    if not normalized:
+        return False
+    return (
+        (
+            _manager_loop_requests_research(normalized)
+            and (
+                _manager_loop_requests_outreach_draft(normalized)
+                or _manager_loop_requests_opportunity_assessment(normalized)
+                or _manager_loop_requests_opportunity_record(normalized)
+            )
+        )
+        or _manager_loop_requests_opportunity_assessment(normalized)
+        or _manager_loop_mentions_next_agent(
+            f" {normalized} ",
+            WorkItemRoute.OPPORTUNITY_SCOUT,
+        )
+    )
+
+
+def _chief_request_should_start_with_chief(request_text: str) -> bool:
+    normalized = " ".join(str(request_text or "").lower().split())
+    if not normalized:
+        return False
+    return bool(
+        "agents-as-tools only" in normalized
+        or "advisory specialist" in normalized
+        or "advisory context" in normalized
+        or "use only sanitized inline context" in normalized
+        or re.search(r"\bcontext\s+as\s+an?\s+advisory\b", normalized)
+    )
+
+
+def _gmail_research_target(work_item: WorkItem) -> str:
+    return " ".join(str(work_item.target.metadata.get("gmail_research_target") or "").split())
+
+
+def _metadata_with_manual_primary_target(
+    metadata: dict[str, Any],
+    primary_target: str,
+) -> dict[str, Any]:
+    target = " ".join(str(primary_target or "").split())
+    if not target:
+        return metadata
+    updated = dict(metadata)
+    plan = updated.get("manual_request_plan")
+    if isinstance(plan, dict):
+        updated["manual_request_plan"] = {**plan, "primary_target": target}
+    updated["gmail_research_target"] = target
+    return updated
 
 
 def _title_without_route_prefix(title: str) -> str:
@@ -4723,6 +5093,9 @@ def _chief_of_staff_artifact_user_facing_summary(
     )
     if operational_summary:
         return operational_summary
+    finance_receipt_write_summary = _chief_finance_tracker_receipt_write_summary(request_text)
+    if finance_receipt_write_summary:
+        return finance_receipt_write_summary
     context_agent_summary = _chief_context_agent_advisory_summary(request_text)
     if context_agent_summary:
         return context_agent_summary
@@ -5343,6 +5716,8 @@ def _chief_agents_as_tools_requested_review_lines(request_text: str) -> list[str
 
 
 def _chief_context_agent_advisory_summary(request_text: str) -> str:
+    if _chief_workflow_requests_finance_tracker_airtable_write(request_text):
+        return ""
     routes = _chief_requested_specialist_routes(request_text)
     context_routes = {
         "airtable_context_agent",
@@ -5382,6 +5757,70 @@ def _chief_context_agent_advisory_summary(request_text: str) -> str:
                 "*Review notes:*\n"
                 "* This is an advisory wrapper around requested context-agent work.\n"
                 "* It should not be read as source evidence or as approval for external action."
+            ),
+        ]
+    )
+
+
+def _chief_finance_tracker_receipt_write_summary(request_text: str) -> str:
+    if not _chief_workflow_requests_finance_tracker_airtable_write(request_text):
+        return ""
+    lowered = " ".join(str(request_text or "").lower().split())
+    if "receipt" not in lowered and "invoice" not in lowered:
+        return ""
+    table = "Business Expenses" if "business expense" in lowered else "Personal Expenses"
+    target = infer_finance_expense_receipt_target(request_text)
+    evidence = (
+        extract_finance_receipt_evidence(target.receipt_local_path)
+        if target and target.receipt_local_path
+        else None
+    )
+    evidence_lines = ""
+    if evidence and evidence.content_read:
+        preview = evidence.supported_field_preview()
+        evidence_lines = "\n".join(
+            f"* {key}: {value}" for key, value in preview.items() if key != "Receipt or Attachments"
+        )
+    elif evidence:
+        evidence_lines = f"* Receipt extraction blocker: {evidence.blocker or 'not available'}"
+    else:
+        evidence_lines = "* Receipt extraction blocker: no local receipt path was detected."
+    return "\n\n".join(
+        [
+            "Chief of Staff finance tracker receipt write plan",
+            (
+                "*Answer:*\n"
+                f"Prepare an Airtable create plan for `finance_tax_tracker` / `{table}` "
+                "from the operator-supplied receipt. Use the receipt-backed preview below "
+                "when local extraction succeeds; otherwise do not invent vendor, date, "
+                "amount, tax period, or attachment field values."
+            ),
+            (
+                "*Detailed Summary:*\n"
+                f"* Target table: `{table}`.\n"
+                "* Evidence source: local receipt/invoice PDF or image supplied by path.\n"
+                f"{evidence_lines}\n"
+                "* Live path: Chief of Staff SDK attaches the local file as model evidence, "
+                "then reads Airtable schema before mapping fields.\n"
+                "* Period logic: set `Estimated Tax Periods` from the receipt date and the "
+                "tracker period rules, not from the current date.\n"
+                "* Write path: prefer `airtable_create_expense_from_receipt` for the "
+                "approved create-and-attach operation; use lower-level write/upload tools "
+                "only if the bounded tool cannot express the approved operation."
+            ),
+            (
+                "*Next step:*\n"
+                "Run the approved live Chief of Staff SDK/tool path with "
+                "`AIRTABLE_ALLOW_WRITES=true`, `AIRTABLE_WRITE_DRY_RUN=false`, and "
+                "`AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true` if receipt upload is approved. "
+                "No Slack test or live Airtable write was performed by this no-live plan."
+            ),
+            (
+                "*Review notes:*\n"
+                "* This is a scoped finance-tracker write plan, not a generic Airtable "
+                "context-agent advisory.\n"
+                "* Deletes, schema changes, tax filing/payment, Gmail sends, and calendar "
+                "writes remain blocked."
             ),
         ]
     )
@@ -6608,10 +7047,16 @@ _CONTEXT_SOURCE_TOOL_GUIDANCE: dict[str, dict[str, Any]] = {
     "airtable": {
         "label": "Airtable records",
         "patterns": (r"\bairtable\b", r"\b(?:crm|tracker)\s+(?:record|table|row|field)s?\b"),
-        "tools": ("airtable_get_base_schema", "airtable_read_records"),
+        "tools": (
+            "airtable_get_base_schema",
+            "airtable_read_records",
+            "airtable_write_record",
+            "airtable_upload_attachment",
+        ),
         "instruction": (
             "Inspect Airtable schema before reading records; writes require explicit "
-            "approval and live-write flags."
+            "approval and live-write flags. Receipt/invoice attachment uploads require "
+            "record identity and an attachment field."
         ),
     },
     "google_docs": {
@@ -7551,6 +7996,47 @@ def _advance_gmail_triage(
     )
     if inline_fixture is not None and _gmail_plan_allows_inline_read_only_triage(gmail_plan):
         triage = triage_email_fixture(inline_fixture)
+        research_requested = _manager_loop_requests_research(effective_request_text)
+        gmail_research_target = (
+            _gmail_sender_organization(triage.sender_name, triage.sender_email)
+            if research_requested
+            else ""
+        )
+        target = (
+            work_item.target.model_copy(
+                update={
+                    "name": gmail_research_target,
+                    "object_type": "company",
+                    "metadata": _metadata_with_manual_primary_target(
+                        work_item.target.metadata,
+                        gmail_research_target,
+                    ),
+                }
+            )
+            if gmail_research_target
+            else work_item.target
+        )
+        next_action = (
+            WorkItemNextAction(
+                action="research_company_from_gmail_context",
+                agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+                description=(
+                    "Use the read-only Gmail triage context to research the sender "
+                    "organization before any reply or outreach draft."
+                ),
+                requires_approval=False,
+            )
+            if research_requested and gmail_research_target
+            else WorkItemNextAction(
+                action="review_gmail_triage",
+                agent=WorkItemRoute.GMAIL_TRIAGE,
+                description=(
+                    "Review the read-only triage. Select the Gmail thread/message only "
+                    "if a Gmail draft, label, send, or thread-specific action is needed."
+                ),
+                requires_approval=False,
+            )
+        )
         limitations = [
             *triage.triage_limitations,
             (
@@ -7603,6 +8089,7 @@ def _advance_gmail_triage(
                 "labels_modified": False,
                 "send_enabled": False,
                 "inline_context": True,
+                "gmail_research_target": gmail_research_target,
                 "message_id": triage.message_id,
                 "thread_id": triage.thread_id,
                 "risk_flags": list(triage.risk_flags),
@@ -7612,7 +8099,10 @@ def _advance_gmail_triage(
         updated = attach_artifact(
             work_item.model_copy(
                 update={
-                    "status": WorkItemStatus.DONE,
+                    "status": WorkItemStatus.IN_PROGRESS
+                    if next_action.agent != WorkItemRoute.GMAIL_TRIAGE
+                    else WorkItemStatus.DONE,
+                    "target": target,
                     "confidence": max(work_item.confidence, triage.confidence),
                     "audit_notes": [
                         *work_item.audit_notes,
@@ -7621,15 +8111,7 @@ def _advance_gmail_triage(
                             "Gmail writes remain blocked without selected Gmail context and approval."
                         ),
                     ],
-                    "next_action": WorkItemNextAction(
-                        action="review_gmail_triage",
-                        agent=WorkItemRoute.GMAIL_TRIAGE,
-                        description=(
-                            "Review the read-only triage. Select the Gmail thread/message only "
-                            "if a Gmail draft, label, send, or thread-specific action is needed."
-                        ),
-                        requires_approval=False,
-                    ),
+                    "next_action": next_action,
                 }
             ).touch(),
             artifact,
@@ -7686,17 +8168,49 @@ def _advance_gmail_triage(
     )
 
 
+def _gmail_sender_organization(sender_name: str, sender_email: str = "") -> str:
+    text = " ".join(str(sender_name or "").split()).strip(" .,:;")
+    if text:
+        match = re.search(r"\b(?:at|from)\s+([A-Z][A-Za-z0-9&.,' -]{1,80})\b", text)
+        if match:
+            return _clean_gmail_organization_name(match.group(1))
+        if "," in text:
+            tail = text.rsplit(",", maxsplit=1)[1]
+            org = _clean_gmail_organization_name(re.sub(r"^\s*(?:at|from)\s+", "", tail))
+            if org:
+                return org
+    domain = parseaddr(str(sender_email or ""))[1].split("@")[-1].lower()
+    if domain and "." in domain and not domain.endswith(
+        ("gmail.com", "outlook.com", "icloud.com", "yahoo.com", "hotmail.com")
+    ):
+        stem = domain.split(".")[0].replace("-", " ").replace("_", " ")
+        return " ".join(part.capitalize() for part in stem.split() if part)
+    return ""
+
+
+def _clean_gmail_organization_name(value: str) -> str:
+    cleaned = " ".join(str(value or "").split()).strip(" .,:;-")
+    cleaned = re.sub(
+        r"\b(?:team|ops|operations|clinical|business|development)$",
+        "",
+        cleaned,
+        flags=re.I,
+    ).strip(" .,:;-")
+    return cleaned[:120]
+
+
 def _gmail_context_gate_message(request_text: str) -> str:
     lower = str(request_text or "").lower()
     details = [
         (
-            "Gmail Triage requires selected Gmail thread/message context or explicit live "
-            "Gmail retrieval before it can summarize, triage, or draft a reply."
+            "Gmail Triage needs usable email context before it can summarize, triage, "
+            "or draft reply guidance: pasted sanitized email text, selected Gmail "
+            "message/thread context, or explicit read-only Gmail retrieval scope."
         )
     ]
     if "recipient" in lower or re.search(r"\b(?:draft|reply)\b", lower):
         details.append(
-            "Recipient identity and thread context are required before any reply guidance."
+            "Recipient identity and enough message context are required before reply guidance."
         )
     if re.search(r"\b(?:schedule|calendar|send|draft|label|archive|modify)\b", lower):
         details.append(
@@ -7708,7 +8222,9 @@ def _gmail_context_gate_message(request_text: str) -> str:
             "Legal, contract, attachment, or clause interpretation requires human review "
             "and selected source context."
         )
-    details.append("No Gmail draft, label, archive, schedule, calendar change, or send action was performed.")
+    details.append(
+        "No Gmail draft, label, archive, schedule, calendar change, or send action was performed."
+    )
     return " ".join(details)
 
 
@@ -7770,6 +8286,10 @@ def _try_live_gmail_thread_retrieval(
     )
     selected = summaries[0]
     draft_requested = _manager_loop_requests_outreach_draft(request.request_text)
+    research_requested = _manager_loop_requests_research(request.request_text)
+    gmail_research_target = (
+        _gmail_thread_research_target(selected) if research_requested else ""
+    )
     output_payload = {
         "mode": "live-gmail-thread-summary",
         "query": query,
@@ -7815,6 +8335,7 @@ def _try_live_gmail_thread_retrieval(
             "message_count": selected.message_count,
             "latest_received_at": selected.latest_received_at,
             "thread_summary": selected.summary,
+            "gmail_research_target": gmail_research_target,
             "send_enabled": False,
             "draft_created": False,
             "labels_modified": False,
@@ -7822,6 +8343,17 @@ def _try_live_gmail_thread_retrieval(
         },
     )
     next_action = (
+        WorkItemNextAction(
+            action="research_company_from_gmail_context",
+            agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            description=(
+                "Use the selected read-only Gmail thread summary to research the sender "
+                "organization before any reply or outreach draft."
+            ),
+            requires_approval=False,
+        )
+        if research_requested and gmail_research_target
+        else
         WorkItemNextAction(
             action="draft_thread_local_reply",
             agent=WorkItemRoute.OUTREACH_COMPOSER,
@@ -7843,7 +8375,23 @@ def _try_live_gmail_thread_retrieval(
         work_item.model_copy(
             update={
                 "last_agent": WorkItemRoute.GMAIL_TRIAGE.value,
-                "status": WorkItemStatus.IN_PROGRESS if draft_requested else WorkItemStatus.DONE,
+                "status": WorkItemStatus.IN_PROGRESS
+                if next_action.agent != WorkItemRoute.GMAIL_TRIAGE
+                else WorkItemStatus.DONE,
+                "target": (
+                    work_item.target.model_copy(
+                        update={
+                            "name": gmail_research_target,
+                            "object_type": "company",
+                            "metadata": _metadata_with_manual_primary_target(
+                                work_item.target.metadata,
+                                gmail_research_target,
+                            ),
+                        }
+                    )
+                    if gmail_research_target
+                    else work_item.target
+                ),
                 "confidence": max(work_item.confidence, 0.74),
                 "audit_notes": [
                     *work_item.audit_notes,
@@ -7874,6 +8422,22 @@ def _try_live_gmail_thread_retrieval(
         human_summary=_format_gmail_thread_summary_work_item_summary(selected, query=query),
         audit_notes=updated.audit_notes[-1:],
     )
+
+
+def _gmail_thread_research_target(summary: GmailThreadSummaryResult) -> str:
+    for message in summary.messages:
+        if _is_operator_identity(message.sender_email) or _is_operator_identity(
+            message.sender_name
+        ):
+            continue
+        org = _gmail_sender_organization(message.sender_name, message.sender_email)
+        if org:
+            return org
+    for participant in summary.participants:
+        org = _gmail_sender_organization(participant)
+        if org and not _is_operator_identity(org):
+            return org
+    return ""
 
 
 def _effective_work_item_request_text(request: WorkflowRunRequest, work_item: WorkItem) -> str:
@@ -7976,7 +8540,6 @@ def _gmail_search_terms_from_request(text: str) -> list[str]:
 
 
 _GMAIL_QUERY_STOPWORDS = {
-    "anup",
     "chief",
     "current",
     "draft",
@@ -7988,8 +8551,30 @@ _GMAIL_QUERY_STOPWORDS = {
     "reply",
     "staff",
     "thread",
-    "wisegrow05",
+    "operator",
 }
+
+_OPERATOR_IDENTITY_MARKERS_ENV = "KEYSTONE_OPERATOR_IDENTITY_MARKERS"
+_DEFAULT_OPERATOR_IDENTITY_MARKERS = ("operator@example.com", "operator")
+
+
+def _operator_identity_markers() -> tuple[str, ...]:
+    configured = os.environ.get(_OPERATOR_IDENTITY_MARKERS_ENV, "")
+    values = [
+        item.strip().lower()
+        for item in re.split(r"[,;\n]+", configured)
+        if item.strip()
+    ]
+    if not values:
+        values = list(_DEFAULT_OPERATOR_IDENTITY_MARKERS)
+    return tuple(dict.fromkeys(values))
+
+
+def _is_operator_identity(value: object) -> bool:
+    lowered = str(value or "").lower()
+    return bool(lowered) and any(
+        marker and marker in lowered for marker in _operator_identity_markers()
+    )
 
 
 def _quote_gmail_query_term(term: str) -> str:
@@ -8215,6 +8800,9 @@ def _gmail_triage_human_summary(triage: Any) -> str:
     ]
     if body_context:
         lines.append(f"- Context reviewed: {body_context}")
+    draft_reply = _gmail_summary_text(getattr(triage, "draft_reply", ""))
+    if draft_reply:
+        lines.extend(["", "*Draft reply:*", draft_reply])
     lines.extend(
         [
             "",
@@ -8244,6 +8832,8 @@ def _gmail_triage_review_limitations(values: Any) -> list[str]:
         if "no gmail draft" in lowered and "external write" in lowered:
             continue
         if "draft reply text is local guidance only" in lowered:
+            continue
+        if "fixture mode uses deterministic" in lowered:
             continue
         if item not in limitations:
             limitations.append(item)
@@ -8350,6 +8940,61 @@ def _with_chief_local_kni_evidence_path_note(
     )
 
 
+def _chief_workflow_approval_reference(request_text: str) -> str:
+    digest = hashlib.sha256(str(request_text or "").encode("utf-8")).hexdigest()[:12]
+    return f"chief-of-staff-workitem:{digest}"
+
+
+def _chief_workflow_requests_finance_tracker_airtable_write(request_text: str) -> bool:
+    lowered = " ".join(str(request_text or "").lower().split())
+    has_airtable_tracker = "airtable" in lowered and any(
+        marker in lowered
+        for marker in (
+            "finance_tax_tracker",
+            "finance tax tracker",
+            "tax tracker",
+            "personal expenses",
+            "personal expense",
+            "business expenses",
+            "business expense",
+        )
+    )
+    has_write_intent = any(
+        marker in lowered
+        for marker in (
+            "add ",
+            "create ",
+            "insert ",
+            "record ",
+            "update ",
+            "change ",
+            "set ",
+            "fill ",
+        )
+    )
+    return has_airtable_tracker and has_write_intent
+
+
+def _chief_workflow_side_effect_policy(request_text: str) -> str:
+    if _chief_workflow_requests_finance_tracker_airtable_write(request_text):
+        return (
+            "Live internal Airtable schema reads, capped record reads, and the explicitly "
+            "requested finance_tax_tracker Airtable create/update are allowed only through "
+            "typed Airtable tools, using the supplied approval_reference and exact allowed "
+            "table/field mapping. If the operator supplied a receipt/invoice PDF or image "
+            "and Airtable schema exposes an attachment field on the target expense record, "
+            "one receipt attachment upload is allowed through typed Airtable tools after "
+            "record identity is known. The Airtable tool's dry-run/live-write/upload gates "
+            "remain authoritative. Do not delete records, change schema, file tax returns, "
+            "make tax payments, post to Slack beyond the normal result, send Gmail, create "
+            "calendar events, write the repo, or mutate any other system."
+        )
+    return (
+        "read-only interpretation; no Slack post, Gmail send, calendar write, "
+        "Airtable write, or repo write without explicit approval gates"
+    )
+
+
 def _advance_chief_of_staff(
     work_item: WorkItem,
     *,
@@ -8399,10 +9044,8 @@ def _advance_chief_of_staff(
         "runtime_source_layer_policy": runtime_source_layer_policy_context(
             WorkItemRoute.CHIEF_OF_STAFF.value
         ),
-        "side_effect_policy": (
-            "read-only interpretation; no Slack post, Gmail send, calendar write, "
-            "Airtable write, or repo write without explicit approval gates"
-        ),
+        "approval_reference": _chief_workflow_approval_reference(request_text),
+        "side_effect_policy": _chief_workflow_side_effect_policy(request_text),
     }
     include_specialist_tools = chief_of_staff_should_use_specialist_tools(
         request_text,
@@ -8423,6 +9066,7 @@ def _advance_chief_of_staff(
                 sdk_input,
                 live=True,
                 session=sdk_session,
+                quality_mode=quality_mode_from_cost_profile(request.cost_profile),
                 force_sdk_interpretation=True,
                 context_flags=_slack_query_context_flags(request),
                 include_specialist_tools=include_specialist_tools,
@@ -8522,6 +9166,14 @@ def _advance_chief_of_staff(
             "target_channel": output.recommended_route.target_channel,
             "slack_post_allowed": output.slack_post_allowed,
             "send_enabled": output.send_enabled,
+            "durable_handoff": (
+                output.durable_handoff.model_dump(mode="json")
+                if output.durable_handoff is not None
+                else {}
+            ),
+            "context_handoffs": [
+                handoff.model_dump(mode="json") for handoff in output.context_handoffs
+            ],
             "retrieval_diagnostics": output.retrieval_diagnostics,
             "source_refs": [ref.model_dump(mode="json") for ref in source_refs],
             "source_context_status": _source_context_status(source_refs),
@@ -9524,6 +10176,15 @@ def _chief_of_staff_delegated_next_agent(
     output_payload: dict[str, Any],
     request_text: str,
 ) -> WorkItemRoute | None:
+    output_text = _chief_output_payload_text(output_payload)
+    if _chief_advisory_only_handoff_blocked(output_text, request_text):
+        return None
+    structured_handoff = _chief_structured_durable_handoff_route(
+        output_payload,
+        request_text,
+    )
+    if structured_handoff is not None:
+        return structured_handoff
     route = output_payload.get("recommended_route")
     workflow_type = ""
     if isinstance(route, dict):
@@ -9542,6 +10203,35 @@ def _chief_of_staff_delegated_next_agent(
     if _chief_positive_business_research_intent(lower, request_text=request_text):
         return WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     return None
+
+
+def _chief_structured_durable_handoff_route(
+    output_payload: dict[str, Any],
+    request_text: str,
+) -> WorkItemRoute | None:
+    if _chief_advisory_only_handoff_blocked(
+        _chief_output_payload_text(output_payload),
+        request_text,
+    ):
+        return None
+    handoff = output_payload.get("durable_handoff")
+    if not isinstance(handoff, dict):
+        return None
+    agent = str(handoff.get("agent") or "").strip()
+    if not agent:
+        return None
+    route_by_agent = {
+        WorkItemRoute.GMAIL_TRIAGE.value: WorkItemRoute.GMAIL_TRIAGE,
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value: WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        WorkItemRoute.OPPORTUNITY_SCOUT.value: WorkItemRoute.OPPORTUNITY_SCOUT,
+        WorkItemRoute.OUTREACH_COMPOSER.value: WorkItemRoute.OUTREACH_COMPOSER,
+    }
+    route = route_by_agent.get(agent)
+    if route is None:
+        return None
+    if _chief_handoff_blocked_for_route(route, request_text):
+        return None
+    return route
 
 
 def _chief_positive_gmail_intent(lower: str) -> bool:
@@ -9749,7 +10439,8 @@ def _advance_research(
         target = selected_opportunity[0].title
     target = (
         target
-        or _manual_primary_target(work_item)
+        or _gmail_research_target(work_item)
+        or _manual_primary_research_target(work_item)
         or work_item.target.name
         or normalize_target_text(
             request.request_text or work_item.request_text,
@@ -9846,14 +10537,6 @@ def _advance_research(
     if not ready.ready:
         return _blocked_result(work_item, ready.blockers, ready.next_action, store=store)
 
-    if _is_source_provided_business_research_request(work_item, request_text):
-        return _source_provided_business_research_result(
-            work_item,
-            request=request,
-            target=target,
-            store=store,
-        )
-
     comparison_names = _comparison_company_names(request.request_text or work_item.request_text)
     if comparison_names is not None:
         return _advance_company_comparison_research(
@@ -9879,6 +10562,14 @@ def _advance_research(
             request=request,
             target=target,
             manual_plan=manual_plan,
+            store=store,
+        )
+
+    if _is_source_provided_business_research_request(work_item, request_text):
+        return _source_provided_business_research_result(
+            work_item,
+            request=request,
+            target=target,
             store=store,
         )
 
@@ -10033,16 +10724,44 @@ def _advance_research(
         if contact_artifact is not None
         else work_item_with_profile
     )
+    combined_request_text = f"{request.request_text} {work_item.request_text}"
+    planning_only = _manager_loop_request_is_planning_only(
+        combined_request_text,
+        manual_request_plan=request.manual_request_plan,
+    )
+    outreach_requested = (
+        _manager_loop_requests_outreach_draft(combined_request_text) and not planning_only
+    )
+    padded_request_text = f" {' '.join(combined_request_text.lower().split())} "
+    opportunity_requested = (
+        _manager_loop_requests_opportunity_record(combined_request_text)
+        or _manager_loop_requests_opportunity_assessment(combined_request_text)
+        or _manager_loop_mentions_next_agent(
+            padded_request_text,
+            WorkItemRoute.OPPORTUNITY_SCOUT,
+        )
+    )
+    next_agent = (
+        WorkItemRoute.OUTREACH_COMPOSER
+        if outreach_requested and not opportunity_requested
+        else WorkItemRoute.OPPORTUNITY_SCOUT
+    )
+    next_description = (
+        (
+            "Review the source-backed company profile, then run Outreach Composer only "
+            "after approved drafting context is available."
+        )
+        if next_agent == WorkItemRoute.OUTREACH_COMPOSER
+        else "Review the source-backed profile, then scout matching opportunities if useful."
+    )
     work_item = work_item.model_copy(
         update={
             "confidence": float(profile.confidence_score or 0),
             "audit_notes": [*work_item.audit_notes, *audit_notes],
             "next_action": WorkItemNextAction(
                 action="review_company_profile",
-                agent=WorkItemRoute.OPPORTUNITY_SCOUT,
-                description=(
-                    "Review the source-backed profile, then scout matching opportunities if useful."
-                ),
+                agent=next_agent,
+                description=next_description,
                 command_hint=f"keystone work-items advance {work_item.id}",
             ),
         }
@@ -10157,6 +10876,11 @@ def _request_forbids_live_research(text: str) -> bool:
             r"[^.;\n]{0,180}\b"
             r"(?:web\s+search|live\s+web|external\s+(?:search|research|tools?)|"
             r"browser\s+automation|research\s+externally)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:web\s+search|live\s+web|live\s+search|external\s+(?:search|research|tools?))"
+            r"\b[^.;\n]{0,80}\b(?:not\s+approved|not\s+allowed|disabled|off)\b",
             normalized,
         )
         or re.search(
@@ -11801,7 +12525,14 @@ def _advance_opportunity(
 
     metadata: dict[str, object] = {}
     live_research_allowed = request.live_search and not source_provided_only
-    if source_provided_only:
+    repair_context = _request_manager_loop_repair_context(request)
+    needs_source_context = _opportunity_prompt_needs_sources_or_live_search(
+        combined_request_text
+    )
+    has_work_item_source_context = _work_item_has_opportunity_source_context(work_item)
+    if source_provided_only or (
+        needs_source_context and has_work_item_source_context and not repair_context
+    ):
         scout_result, metadata = _source_provided_opportunity_scout_result(
             work_item,
             topic=topic,
@@ -11811,8 +12542,13 @@ def _advance_opportunity(
         audit_notes = [
             (
                 "Live opportunity retrieval suppressed because the request forbids external research."
-                if request.live_search
-                else "Opportunity Scout used source-provided context because the request forbids external research."
+                if source_provided_only and request.live_search
+                else (
+                    "Opportunity Scout used prior WorkItem source context because the graph "
+                    "handoff supplied source-backed evidence."
+                    if has_work_item_source_context and not source_provided_only
+                    else "Opportunity Scout used source-provided context because the request forbids external research."
+                )
             ),
             "Source-provided opportunity scout executed; no live APIs were called.",
         ]
@@ -11903,6 +12639,36 @@ def _advance_opportunity(
                 agent_name=WorkItemRoute.OPPORTUNITY_SCOUT.value,
             )
     else:
+        if needs_source_context:
+            blocker = WorkItemBlocker(
+                code="opportunity_requires_source_or_live_search",
+                message=(
+                    "Opportunity Scout needs source-provided evidence or approved live "
+                    "search before assessing a specific inbound note or opportunity fit."
+                ),
+            )
+            return _blocked_result(
+                work_item,
+                (blocker,),
+                WorkItemNextAction(
+                    action="provide_source_context_or_approve_live_search",
+                    agent=WorkItemRoute.OPPORTUNITY_SCOUT,
+                    description=(
+                        "Provide the source excerpt/evidence to use, or approve bounded "
+                        "live search for this opportunity assessment."
+                    ),
+                    requires_approval=False,
+                ),
+                store=store,
+                route=WorkItemRoute.OPPORTUNITY_SCOUT,
+                audit_notes=[
+                    (
+                        "Opportunity Scout stopped instead of using generic fixture "
+                        "records because this specific assessment needs source context "
+                        "or approved live search."
+                    )
+                ],
+            )
         if _is_strict_role_recency_search(topic):
             audit_notes = [
                 "Fixture opportunity scout executed; no live APIs were called.",
@@ -12136,6 +12902,48 @@ def _advance_opportunity(
             ],
         )
 
+    planning_only = _manager_loop_request_is_planning_only(
+        combined_request_text,
+        manual_request_plan=request.manual_request_plan,
+    )
+    outreach_requested = (
+        _manager_loop_requests_outreach_draft(combined_request_text) and not planning_only
+    )
+    padded_request_text = f" {' '.join(combined_request_text.lower().split())} "
+    company_research_already_attached = any(
+        artifact.artifact_type == "company_profile" for artifact in work_item.artifact_refs
+    )
+    research_requested = (not company_research_already_attached) and (
+        _manager_loop_requests_research(combined_request_text)
+        or _manager_loop_mentions_next_agent(
+            padded_request_text,
+            WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        )
+    )
+    next_agent = (
+        WorkItemRoute.OPPORTUNITY_SCOUT
+        if stop_after_opportunity_packet
+        else WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+        if research_requested
+        else WorkItemRoute.OUTREACH_COMPOSER
+        if outreach_requested
+        else WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    )
+    next_description = (
+        (
+            "Review the opportunity packet, then run Business Research before any "
+            "draft-only outreach handoff."
+        )
+        if research_requested and not stop_after_opportunity_packet
+        else (
+            "Review the opportunity packet, then run Outreach Composer only after "
+            "approved source-backed company/opportunity context is available."
+        )
+        if outreach_requested
+        else "Review the opportunity packet without downstream specialist handoff."
+        if stop_after_opportunity_packet
+        else "Review the opportunity records and run company research for any priority target."
+    )
     work_item = work_item.model_copy(
         update={
             "confidence": max(record.priority_score for record in scout_result.records) / 100,
@@ -12143,22 +12951,11 @@ def _advance_opportunity(
             "audit_notes": [*work_item.audit_notes, *audit_notes],
             "next_action": WorkItemNextAction(
                 action="review_opportunities",
-                agent=(
-                    WorkItemRoute.OPPORTUNITY_SCOUT
-                    if stop_after_opportunity_packet
-                    else WorkItemRoute.BUSINESS_RESEARCH_ANALYST
-                ),
-                description=(
-                    "Review the opportunity packet without downstream specialist handoff."
-                    if stop_after_opportunity_packet
-                    else (
-                        "Review the opportunity records and run company research for any "
-                        "priority target."
-                    )
-                ),
+                agent=next_agent,
+                description=next_description,
                 command_hint=(
                     ""
-                    if stop_after_opportunity_packet
+                    if stop_after_opportunity_packet and not outreach_requested
                     else f"keystone work-items advance {work_item.id}"
                 ),
             ),
@@ -12500,9 +13297,18 @@ def _is_strict_partnership_signal_search(topic: str) -> bool:
 
 
 def _is_source_summary_opportunity_request(work_item: WorkItem) -> bool:
+    plan = work_item.target.metadata.get("manual_request_plan")
+    target_agent = (
+        str(plan.get("target_agent") or "").strip()
+        if isinstance(plan, dict)
+        else ""
+    )
     return (
         _manual_expected_artifact_type(work_item) == "source_summary"
-        or _manual_task_objective(work_item) == "source_research"
+        or (
+            _manual_task_objective(work_item) == "source_research"
+            and target_agent == WorkItemRoute.OPPORTUNITY_SCOUT.value
+        )
     )
 
 
@@ -12657,6 +13463,45 @@ def _is_source_provided_opportunity_table_request(text: str) -> bool:
     )
 
 
+def _opportunity_prompt_needs_sources_or_live_search(text: str) -> bool:
+    lower = " ".join(str(text or "").lower().split())
+    if not lower:
+        return False
+    if not re.search(r"\b(?:inbound|specific|source-backed|evidence)\b", lower):
+        return False
+    if not re.search(r"\b(?:assess|evaluate|review|qualify|worth\s+pursuing)\b", lower):
+        return False
+    return bool(re.search(r"\b(?:opportunit(?:y|ies)|advisory|fit|lead)\b", lower))
+
+
+def _work_item_has_opportunity_source_context(work_item: WorkItem) -> bool:
+    if any(
+        _compact_outreach_summary_text(
+            source.supported_claim
+            or source.evidence_excerpt
+            or " ".join(source.key_facts[:2])
+        )
+        for source in work_item.sources
+    ):
+        return True
+    source_artifact_types = {
+        "company_profile",
+        "research_brief",
+        "gmail_triage_report",
+        "rss_context_summary",
+        "preprints_context_summary",
+        "zotero_context_summary",
+    }
+    for artifact in work_item.artifact_refs:
+        if artifact.artifact_type not in source_artifact_types:
+            continue
+        if _artifact_source_refs(artifact):
+            return True
+        if _compact_outreach_summary_text(artifact.summary):
+            return True
+    return False
+
+
 def _source_provided_opportunity_scout_result(
     work_item: WorkItem,
     *,
@@ -12801,21 +13646,42 @@ def _source_provided_opportunity_context_signal(request_text: str) -> str:
 def _source_provided_opportunity_target(topic: str, request_text: str) -> str:
     for candidate in (request_text, topic):
         candidate_text = _source_provided_opportunity_target_text(candidate or "")
+        possessive_match = re.search(
+            r"\b(?P<name>[A-Z][A-Za-z0-9&.' -]{2,80}?)['\u2019]s\s+"
+            r"(?:inbound|email|note|message|request|team)\b",
+            candidate_text,
+        )
+        if possessive_match:
+            return _clean_source_provided_opportunity_target_name(
+                possessive_match.group("name")
+            )
         match = re.search(
             r"\b([A-Z][A-Za-z0-9&.' -]{2,80}?)\s+"
             r"(?:is|asked|wants|needs|could|has|plans|considering)\b",
             candidate_text,
         )
         if match:
-            return _truncate_text(match.group(1).strip(" .:-"), 80)
+            return _clean_source_provided_opportunity_target_name(match.group(1))
         label_match = re.search(
             r"\b(?:target|company|organization|org|clinic|contact)\s*:\s*([^.\n;]{2,80})",
             candidate_text,
             flags=re.IGNORECASE,
         )
         if label_match:
-            return _truncate_text(label_match.group(1).strip(" .:-"), 80)
+            return _clean_source_provided_opportunity_target_name(label_match.group(1))
     return _truncate_text(topic or "Source-provided opportunity", 80)
+
+
+def _clean_source_provided_opportunity_target_name(value: str) -> str:
+    cleaned = str(value or "").strip(" .:-")
+    cleaned = re.sub(
+        r"^(?:assess|evaluate|review|qualify|decide|determine)\s+whether\s+",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"^whether\s+", "", cleaned, flags=re.I)
+    return _truncate_text(cleaned or "Source-provided opportunity", 80)
 
 
 def _source_provided_opportunity_target_text(text: str) -> str:
@@ -13464,18 +14330,80 @@ def _advance_outreach(
         store=store,
     )
     gmail_thread_context = _latest_gmail_thread_summary_for_outreach(work_item, store=store)
-    if (
-        looks_like_thread_local_draft_request(request.request_text)
-        or gmail_thread_context is not None
-    ) and not selected_artifacts(work_item, "company_profile"):
+    thread_local_request = _request_allows_thread_local_outreach_draft(
+        request,
+        work_item=work_item,
+        store=store,
+    )
+    if thread_local_request or (
+        gmail_thread_context is not None
+        and not selected_artifacts(work_item, "company_profile")
+    ):
+        if not _thread_local_request_has_draft_context(
+            request,
+            work_item=work_item,
+            gmail_thread_context=gmail_thread_context,
+        ):
+            blocker = WorkItemBlocker(
+                code="outreach_requires_approved_context",
+                message=(
+                    "Thread-local draft help needs pasted context, selected Gmail/thread "
+                    "context, source refs, or a clear focus and target before writing copy."
+                ),
+            )
+            return _blocked_result(
+                work_item,
+                (blocker,),
+                WorkItemNextAction(
+                    action="provide_thread_local_draft_context",
+                    agent=WorkItemRoute.OUTREACH_COMPOSER,
+                    description=(
+                        "Provide the focus, target, and source-backed context to use for "
+                        "the Slack-thread-local draft."
+                    ),
+                    requires_approval=False,
+                ),
+                store=store,
+                route=WorkItemRoute.OUTREACH_COMPOSER,
+            )
         return _advance_thread_local_outreach_draft(
             work_item,
             request=request,
             store=store,
             gmail_thread_context=gmail_thread_context,
+            target_name=work_item.target.name if thread_local_request else "",
         )
     ready = drafting_ready(work_item)
     if not ready.ready:
+        researchable_target = _outreach_missing_context_research_target(work_item, request)
+        if researchable_target and _outreach_missing_context_should_run_research(
+            work_item,
+            request,
+            researchable_target=researchable_target,
+        ):
+            research_item = work_item.model_copy(
+                update={
+                    "current_route": WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+                    "target": work_item.target.model_copy(
+                        update={
+                            "name": researchable_target,
+                            "object_type": "company",
+                        }
+                    ),
+                    "audit_notes": [
+                        *work_item.audit_notes,
+                        (
+                            "Outreach Composer deferred drafting and routed to Business "
+                            "Research because source-backed drafting context was missing."
+                        ),
+                    ],
+                }
+            )
+            return _advance_research(
+                research_item,
+                request=request,
+                store=store,
+            )
         return _blocked_result(
             work_item,
             ready.blockers,
@@ -13645,12 +14573,158 @@ def _latest_gmail_thread_summary_for_outreach(
             if isinstance(threads, list) and threads and isinstance(threads[0], dict):
                 summary_payload = threads[0]
         if not isinstance(summary_payload, dict):
+            inline_summary = _gmail_thread_summary_from_inline_triage_payload(payload)
+            if inline_summary is not None:
+                return inline_summary
             continue
         try:
             return GmailThreadSummaryResult.model_validate(summary_payload)
         except ValueError:
-            continue
+            pass
+        inline_summary = _gmail_thread_summary_from_inline_triage_payload(payload)
+        if inline_summary is not None:
+            return inline_summary
     return None
+
+
+def _gmail_thread_summary_from_inline_triage_payload(
+    payload: dict[str, Any],
+) -> GmailThreadSummaryResult | None:
+    subject = _compact_outreach_summary_text(payload.get("subject"))
+    sender_name = _compact_outreach_summary_text(payload.get("sender_name"))
+    sender_email = _compact_outreach_summary_text(payload.get("sender_email"))
+    summary = _compact_outreach_summary_text(payload.get("thread_summary")) or (
+        _compact_outreach_summary_text(payload.get("summary"))
+    )
+    thread_body = (
+        _compact_outreach_summary_text(payload.get("normalized_body"))
+        or _compact_outreach_summary_text(payload.get("normalized_body_summary"))
+        or _compact_outreach_summary_text(payload.get("thread_context"))
+        or _compact_outreach_summary_text(payload.get("snippet"))
+        or summary
+    )
+    if not any([subject, sender_name, sender_email, thread_body, summary]):
+        return None
+    message_id = _compact_outreach_summary_text(payload.get("message_id")) or "inline-email"
+    received_at = _compact_outreach_summary_text(payload.get("received_at"))
+    participant = _gmail_thread_participant_label(sender_name, sender_email)
+    message = GmailThreadSummaryMessage(
+        message_id=message_id,
+        received_at=received_at,
+        sender_name=sender_name,
+        sender_email=sender_email,
+        subject=subject,
+        snippet=thread_body[:500],
+        prior_labels=_context_string_list(payload.get("prior_labels"), max_items=8, max_chars=80),
+        summary=summary or thread_body[:240],
+    )
+    recommended_action = _compact_outreach_summary_text(payload.get("recommended_action"))
+    try:
+        return GmailThreadSummaryResult(
+            thread_id=_compact_outreach_summary_text(payload.get("thread_id")) or message_id,
+            source_label="inline_email_context",
+            subject=subject,
+            summary=summary or thread_body[:240],
+            thread_context=_compact_outreach_summary_text(payload.get("thread_context"))
+            or thread_body,
+            message_count=1,
+            latest_received_at=received_at,
+            participants=[participant] if participant else [],
+            action_items=[recommended_action] if recommended_action else [],
+            open_questions=_question_fragments_from_inline_email(thread_body),
+            triage_limitations=_context_string_list(
+                payload.get("triage_limitations"),
+                max_items=8,
+                max_chars=200,
+            ),
+            messages=[message],
+        )
+    except ValueError:
+        return None
+
+
+def _gmail_thread_participant_label(sender_name: str, sender_email: str) -> str:
+    name = _compact_outreach_summary_text(sender_name)
+    email = _clean_recipient_email_address(sender_email)
+    if name and email:
+        return f"{name} <{email}>"
+    return name or email
+
+
+def _question_fragments_from_inline_email(text: str) -> list[str]:
+    questions: list[str] = []
+    for sentence in re.split(r"(?<=[.!])\s+", str(text or "")):
+        if "?" not in sentence:
+            continue
+        question = sentence.split("?", maxsplit=1)[0] + "?"
+        question = _compact_outreach_summary_text(question)
+        if question and question not in questions:
+            questions.append(question[:220])
+    return questions[:3]
+
+
+def _request_allows_thread_local_outreach_draft(
+    request: WorkflowRunRequest,
+    *,
+    work_item: WorkItem,
+    store: SQLiteStore,
+) -> bool:
+    """Allow local Slack-thread draft artifacts without external-use approval."""
+
+    text = str(request.request_text or "")
+    if looks_like_thread_local_draft_request(text):
+        return True
+    if not _request_has_slack_context(request, store=store, work_item=work_item):
+        return False
+    normalized = " ".join(text.lower().split())
+    if not re.search(
+        r"\b(?:draft|draft-only|compose|write|prepare|reply|respond)\b"
+        r"[^.\n]{0,120}\b(?:outreach|email|reply|message|response)\b",
+        normalized,
+    ):
+        return False
+    if not re.search(
+        r"\b(?:draft-only|draft only|for review|no send|do not send|don't send|"
+        r"without external|no external|write external systems)\b",
+        normalized,
+    ):
+        return False
+    if _request_demands_external_outreach_side_effect(normalized):
+        return False
+    return True
+
+
+def _request_demands_external_outreach_side_effect(normalized: str) -> bool:
+    direct_side_effect = re.search(
+        r"\b(?:send|post|publish|schedule|create\s+gmail\s+drafts?|"
+        r"create\s+drafts?|write\s+external\s+systems?|update\s+(?:airtable|crm|drive|sheets))\b",
+        normalized,
+    )
+    if not direct_side_effect:
+        return False
+    negated_side_effect = re.search(
+        r"\b(?:do\s+not|don't|no|never|without)\b[^.\n]{0,120}"
+        r"\b(?:send|post|publish|schedule|create\s+gmail\s+drafts?|"
+        r"create\s+drafts?|write\s+external\s+systems?|"
+        r"update\s+(?:airtable|crm|drive|sheets))\b",
+        normalized,
+    )
+    return not bool(negated_side_effect)
+
+
+def _thread_local_request_has_draft_context(
+    request: WorkflowRunRequest,
+    *,
+    work_item: WorkItem,
+    gmail_thread_context: GmailThreadSummaryResult | None,
+) -> bool:
+    if gmail_thread_context is not None:
+        return True
+    if _thread_local_inline_context(request.request_text):
+        return True
+    if _thread_local_source_context(work_item):
+        return True
+    return False
 
 
 def _advance_thread_local_outreach_draft(
@@ -13659,10 +14733,43 @@ def _advance_thread_local_outreach_draft(
     request: WorkflowRunRequest,
     store: SQLiteStore,
     gmail_thread_context: GmailThreadSummaryResult | None = None,
+    target_name: str = "",
 ) -> WorkflowRunResult:
-    draft = _thread_local_outreach_draft(
-        request.request_text,
+    if not request.live_sdk:
+        blocker = WorkItemBlocker(
+            code="outreach_draft_needs_model_reasoning",
+            message=(
+                "Draft copy should be model-synthesized from the provided context. "
+                "No deterministic placeholder draft was created."
+            ),
+        )
+        return _blocked_result(
+            work_item,
+            (blocker,),
+            WorkItemNextAction(
+                action="run_model_backed_draft_or_provide_exact_copy",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+                description=(
+                    "Run Outreach Composer with live SDK/model reasoning, or provide "
+                    "the exact copy to store as a thread-local draft."
+                ),
+                requires_approval=False,
+            ),
+            store=store,
+            route=WorkItemRoute.OUTREACH_COMPOSER,
+            audit_notes=[
+                (
+                    "Thread-local Outreach Composer did not create deterministic "
+                    "fallback copy; it returned a request for model-backed drafting "
+                    "or exact operator-provided copy."
+                )
+            ],
+        )
+    draft, draft_audit_note, sdk_usage_event = _compose_thread_local_outreach_draft_for_work_item(
+        request=request,
+        work_item=work_item,
         gmail_thread_context=gmail_thread_context,
+        target_name=target_name,
     )
     thread_context_lines = _thread_local_email_context_lines(gmail_thread_context)
     boundary_summary = "Slack-thread-only draft; no Gmail draft created and no send performed."
@@ -13690,6 +14797,9 @@ def _advance_thread_local_outreach_draft(
             "external_write_performed": False,
             "approval_queue_created": False,
             "style_profile_id": draft.style_profile_id,
+            "drafting_mode": draft.drafting_mode,
+            "sdk_synthesis_attempted": bool(request.live_sdk),
+            "sdk_synthesis_used": request.live_sdk and draft.drafting_mode == "llm_constrained",
         },
     )
     work_item = attach_artifact(work_item, artifact)
@@ -13704,6 +14814,7 @@ def _advance_thread_local_outreach_draft(
                     "CompanyProfile because no external delivery, Gmail draft, or provider "
                     "write was requested."
                 ),
+                draft_audit_note,
             ],
         }
     )
@@ -13714,6 +14825,18 @@ def _advance_thread_local_outreach_draft(
         summary="Attached thread-local Outreach Composer draft.",
         store=store,
     )
+    if sdk_usage_event is not None:
+        _record_workflow_sdk_cost_event(
+            work_item,
+            event_type="workflow_sdk_usage",
+            summary="Recorded thread-local Outreach Composer SDK usage.",
+            agent_name=WorkItemRoute.OUTREACH_COMPOSER.value,
+            usage=sdk_usage_event.get("usage"),
+            cost=sdk_usage_event.get("cost"),
+            request_cache=sdk_usage_event.get("request_cache"),
+            store=store,
+            run_stage="thread_local_outreach_composer",
+        )
     summary = _format_outreach_draft_work_item_summary(
         draft,
         company_name=draft.company_name,
@@ -13729,52 +14852,436 @@ def _advance_thread_local_outreach_draft(
         artifact_refs=[artifact],
         next_action=work_item.next_action,
         human_summary=summary,
-        audit_notes=work_item.audit_notes[-1:],
+        audit_notes=work_item.audit_notes[-2:],
     )
+
+
+def _compose_thread_local_outreach_draft_for_work_item(
+    *,
+    request: WorkflowRunRequest,
+    work_item: WorkItem,
+    gmail_thread_context: GmailThreadSummaryResult | None = None,
+    target_name: str = "",
+) -> tuple[OutreachDraft, str, dict[str, Any] | None]:
+    fallback = _thread_local_outreach_draft(
+        request.request_text,
+        gmail_thread_context=gmail_thread_context,
+        target_name=target_name,
+        source_context=_thread_local_source_context(work_item),
+    )
+    if not request.live_sdk:
+        return (
+            fallback,
+            "Thread-local Outreach Composer draft used deterministic fallback.",
+            None,
+        )
+
+    try:
+        approved_context = _thread_local_outreach_sdk_context(
+            request=request,
+            work_item=work_item,
+            fallback=fallback,
+            gmail_thread_context=gmail_thread_context,
+        )
+
+        def retrieve() -> dict[str, Any]:
+            return {
+                "approved_context": approved_context,
+                "thread_local_policy": {
+                    "gmail_draft_created": False,
+                    "send_enabled": False,
+                    "external_write_performed": False,
+                    "approval_queue_created": False,
+                    "allowed_copy": "Slack-thread-local sample outreach only.",
+                },
+                "orchestrator_context": _specialist_orchestrator_context_payload(
+                    request,
+                    work_item,
+                ),
+            }
+
+        def normalize(context: dict[str, Any]) -> OutreachComposerSDKInput:
+            return OutreachComposerSDKInput(
+                company_name=approved_context.company_profile.name,
+                recent_signal="",
+                outreach_goal=approved_context.objective,
+                approved_context=(
+                    _specialist_orchestrator_context_text(request, work_item)
+                    + "\n\nThread-local Slack sample outreach context:\n"
+                    + json.dumps(jsonable(context), ensure_ascii=True, sort_keys=True)
+                    + "\n\nConstraints: write draft-only Slack-thread sample copy for review. "
+                    "Do not claim that an email draft was created. Do not send, schedule, "
+                    "publish, create Gmail drafts, or write external systems. Use only the "
+                    "listed source_ids_used."
+                ),
+                email_style_profile="operator_default_writing_style",
+            )
+
+        outcome = run_retrieved_sdk_synthesis(
+            agent=build_outreach_composer_compact_synthesis_agent(
+                request_text=request.request_text,
+            ),
+            output_type=OutreachLLMDraftPayload,
+            retrieve=retrieve,
+            normalize=normalize,
+            input_summary=(
+                "Thread-local Outreach Composer SDK synthesis for "
+                f"{approved_context.company_profile.name}"
+            ),
+            input_audit_payload={
+                "company": approved_context.company_profile.name,
+                "sdk_synthesis": True,
+                "workflow": "thread_local_outreach_composer",
+            },
+            live=True,
+            save=False,
+            model_label="sdk-live",
+            trace_metadata=_work_item_sdk_trace_metadata(
+                work_item,
+                stage="thread_local_outreach_composer",
+            ),
+        )
+        compact_payload = jsonable(outcome.final_output)
+        if not isinstance(compact_payload, dict):
+            raise RuntimeError("Thread-local outreach SDK synthesis did not return JSON.")
+        compact_payload["source_ids_used"] = _normalize_thread_local_outreach_source_ids(
+            compact_payload.get("source_ids_used"),
+            approved_context=approved_context,
+        )
+        draft = compose_outreach_draft_llm_constrained(
+            approved_context=approved_context,
+            llm_draft_payload=compact_payload,
+            fallback_to_fixture=False,
+        )
+        return (
+            draft.model_copy(
+                update={
+                    "drafting_mode": "llm_constrained",
+                    "style_profile_used": True,
+                    "style_profile_id": "operator_default_writing_style",
+                    "revision_request": request.request_text,
+                    "approved_context_used": True,
+                    "send_enabled": False,
+                    "sent": False,
+                    "can_send_email": False,
+                    "external_use_allowed": False,
+                }
+            ),
+            (
+                "Thread-local Outreach Composer live SDK draft created; no send, "
+                "Gmail draft, approval queue item, or external write occurred."
+            ),
+            {
+                "usage": dict(getattr(outcome, "usage", None) or {}),
+                "cost": dict(getattr(outcome, "cost", None) or {}),
+                "request_cache": dict(getattr(outcome, "request_cache", None) or {}),
+            },
+        )
+    except Exception as exc:
+        error_detail = _compact_outreach_summary_text(str(exc))[:240]
+        detail_suffix = f": {error_detail}" if error_detail else ""
+        return (
+            fallback,
+            (
+                "Thread-local Outreach Composer live SDK drafting failed with "
+                f"{type(exc).__name__}{detail_suffix}; deterministic draft-only fallback created."
+            ),
+            None,
+        )
+
+
+def _thread_local_outreach_sdk_context(
+    *,
+    request: WorkflowRunRequest,
+    work_item: WorkItem,
+    fallback: OutreachDraft,
+    gmail_thread_context: GmailThreadSummaryResult | None,
+) -> ApprovedOutreachDraftingContext:
+    target = (
+        _compact_outreach_summary_text(fallback.company_name)
+        or _compact_outreach_summary_text(work_item.target.name)
+        or "Thread-local outreach"
+    )
+    source_id = (
+        f"gmail_thread:{gmail_thread_context.thread_id}"
+        if gmail_thread_context is not None and gmail_thread_context.thread_id
+        else "user_provided:thread_local_request"
+    )
+    source_url = (
+        f"gmail-thread://{gmail_thread_context.thread_id}"
+        if gmail_thread_context is not None and gmail_thread_context.thread_id
+        else "user-provided://thread-local-request"
+    )
+    claim = _thread_local_outreach_source_claim(
+        request=request,
+        work_item=work_item,
+        target=target,
+        gmail_thread_context=gmail_thread_context,
+    )
+    source = SourceRecord(
+        source_id=source_id,
+        title="Thread-local outreach request context",
+        url=source_url,
+        source_type="user_provided",
+        supported_claims=[claim],
+        evidence_excerpt=claim,
+        confidence=0.7,
+    )
+    sources = _thread_local_outreach_context_sources(work_item, base_source=source)
+    allowed_facts = _thread_local_outreach_allowed_facts(sources)
+    company_profile = CompanyProfile(
+        name=target,
+        description=f"Thread-local draft context for {target}.",
+        fit_summary="Draft-only Slack-thread sample outreach requested for review.",
+        confidence_score=0.7,
+        confidence_explanation=(
+            "Context is limited to operator-provided thread-local drafting instructions."
+        ),
+        sources=sources,
+        claims=allowed_facts,
+        missing_information=[
+            "No external-use approval has been granted.",
+            "No Gmail draft or send action was authorized.",
+        ],
+    )
+    return ApprovedOutreachDraftingContext(
+        company_profile=company_profile,
+        allowed_facts=allowed_facts,
+        blocked_facts=list(fallback.blocked_facts),
+        objective=_compact_outreach_summary_text(request.request_text)[:500],
+        revision_request=request.request_text,
+        approval_state=ApprovalState.PENDING,
+        approved_context_used=True,
+        allowed_source_ids=list(dict.fromkeys(fact.source_id for fact in allowed_facts)),
+    )
+
+
+def _thread_local_outreach_context_sources(
+    work_item: WorkItem,
+    *,
+    base_source: SourceRecord,
+) -> list[SourceRecord]:
+    sources = [base_source]
+    for source in work_item.sources:
+        parsed = _source_record_from_work_item_source(source)
+        if parsed is not None:
+            sources.append(parsed)
+    for artifact in work_item.artifact_refs:
+        metadata_sources = artifact.metadata.get("source_refs")
+        if not isinstance(metadata_sources, list):
+            continue
+        for raw_source in metadata_sources:
+            parsed = _source_record_from_mapping(raw_source)
+            if parsed is not None:
+                sources.append(parsed)
+    deduped: dict[str, SourceRecord] = {}
+    for source in sources:
+        deduped.setdefault(source.source_id, source)
+    return list(deduped.values())
+
+
+def _source_record_from_work_item_source(source: WorkItemSourceRef) -> SourceRecord | None:
+    return _source_record_from_mapping(source.model_dump(mode="json"))
+
+
+def _source_record_from_mapping(raw_source: Any) -> SourceRecord | None:
+    if not isinstance(raw_source, dict):
+        return None
+    source_id = _compact_outreach_summary_text(raw_source.get("source_id"))[:160]
+    if not source_id:
+        return None
+    title = _compact_outreach_summary_text(raw_source.get("title"))[:180] or source_id
+    url = _compact_outreach_summary_text(raw_source.get("url"))[:500] or f"source-ref://{source_id}"
+    source_type = _thread_local_outreach_source_type(raw_source.get("source_type"))
+    supported_claims = [
+        _compact_outreach_summary_text(value)[:500]
+        for value in raw_source.get("supported_claims") or raw_source.get("key_facts") or []
+        if _compact_outreach_summary_text(value)
+    ]
+    fallback_claim = _compact_outreach_summary_text(
+        raw_source.get("supported_claim") or raw_source.get("evidence_excerpt")
+    )[:500]
+    if fallback_claim and fallback_claim not in supported_claims:
+        supported_claims.append(fallback_claim)
+    if not supported_claims:
+        supported_claims.append(f"Source context was available from {title}.")
+    confidence = raw_source.get("confidence")
+    try:
+        confidence_value = float(confidence)
+    except (TypeError, ValueError):
+        confidence_value = 0.7
+    confidence_value = max(0.1, min(1.0, confidence_value))
+    return SourceRecord(
+        source_id=source_id,
+        title=title,
+        url=url,
+        source_type=source_type,
+        supported_claims=supported_claims,
+        evidence_excerpt=_compact_outreach_summary_text(raw_source.get("evidence_excerpt"))[:500],
+        confidence=confidence_value,
+    )
+
+
+def _thread_local_outreach_source_type(value: Any) -> str:
+    source_type = _compact_outreach_summary_text(value).lower()
+    allowed = {
+        "fixture",
+        "academic",
+        "company_site",
+        "funding_database",
+        "government",
+        "website",
+        "linkedin",
+        "google_search",
+        "news",
+        "database",
+        "social",
+        "unknown",
+        "user_provided",
+    }
+    if source_type in allowed:
+        return source_type
+    if source_type in {"slack_message", "slack", "gmail_thread"}:
+        return "user_provided"
+    return "unknown"
+
+
+def _thread_local_outreach_allowed_facts(
+    sources: Sequence[SourceRecord],
+) -> list[ClaimEvidenceRecord]:
+    facts: list[ClaimEvidenceRecord] = []
+    for source in sources:
+        for claim in source.supported_claims or [source.evidence_excerpt]:
+            cleaned = _compact_outreach_summary_text(claim)[:500]
+            if not cleaned:
+                continue
+            facts.append(
+                ClaimEvidenceRecord(
+                    claim_text=cleaned,
+                    source_id=source.source_id,
+                    confidence=max(0.1, min(1.0, source.confidence)),
+                    claim_type="user_provided"
+                    if source.source_type == "user_provided"
+                    else "outreach_fact",
+                    approved=True,
+                )
+            )
+            break
+    return facts
+
+
+def _normalize_thread_local_outreach_source_ids(
+    raw_source_ids: Any,
+    *,
+    approved_context: ApprovedOutreachDraftingContext,
+) -> list[str]:
+    allowed = list(dict.fromkeys(approved_context.allowed_source_ids))
+    if not allowed:
+        return []
+    aliases: dict[str, str] = {source_id: source_id for source_id in allowed}
+    for source in approved_context.company_profile.sources:
+        aliases[source.source_id] = source.source_id
+        if source.url:
+            aliases[source.url] = source.source_id
+    normalized: list[str] = []
+    if isinstance(raw_source_ids, list):
+        for raw_source_id in raw_source_ids:
+            source_id = aliases.get(str(raw_source_id).strip())
+            if source_id and source_id in allowed and source_id not in normalized:
+                normalized.append(source_id)
+    return normalized or [allowed[0]]
+
+
+def _thread_local_outreach_source_claim(
+    *,
+    request: WorkflowRunRequest,
+    work_item: WorkItem,
+    target: str,
+    gmail_thread_context: GmailThreadSummaryResult | None,
+) -> str:
+    if gmail_thread_context is not None:
+        subject = _compact_outreach_summary_text(gmail_thread_context.subject)
+        if subject:
+            return f"Operator requested a thread-local draft reply for Gmail subject: {subject}."
+        return "Operator requested a thread-local draft reply for a selected Gmail thread."
+    requested = _compact_outreach_summary_text(request.request_text or work_item.request_text)
+    if requested:
+        return (
+            f"Operator requested draft-only Slack-thread sample outreach for {target}: "
+            f"{requested[:260]}"
+        )
+    return f"Operator requested draft-only Slack-thread sample outreach for {target}."
 
 
 def _thread_local_outreach_draft(
     request_text: str,
     *,
     gmail_thread_context: GmailThreadSummaryResult | None = None,
+    target_name: str = "",
+    source_context: str = "",
 ) -> OutreachDraft:
+    inline_context = (
+        _thread_local_inline_context(request_text) if gmail_thread_context is None else ""
+    )
+    source_context = _compact_outreach_summary_text(source_context)[:700]
     target = (
         _thread_local_draft_target_from_gmail(gmail_thread_context)
         if gmail_thread_context is not None
+        else _thread_local_draft_target_from_inline_context(inline_context)
+        if inline_context
+        else (_compact_outreach_summary_text(target_name)[:80] or _thread_local_draft_target(request_text))
+        if target_name
         else _thread_local_draft_target(request_text)
     )
     subject = f"Re: {target}" if target else "Re: your note"
     if gmail_thread_context is not None and gmail_thread_context.subject:
         subject = _reply_subject(gmail_thread_context.subject)
-    body = _thread_local_draft_body(gmail_thread_context)
+    body = _thread_local_draft_body(
+        gmail_thread_context,
+        inline_context=inline_context,
+        source_context=source_context,
+        target=target,
+    )
     rationale = (
         "Thread-local reply drafted from a read-only Gmail Triage thread summary "
         "using the operator default writing style. No Gmail draft or external send "
         "was performed."
         if gmail_thread_context is not None
         else (
-            "Thread-local placeholder reply in the operator default style. Gmail "
-            "thread content or approved source-backed context was not available to "
-            "the Outreach Composer, so no recipient-specific factual claims were used."
+            "Thread-local reply drafted from operator-provided Slack/inline context. "
+            "No Gmail draft or external send was performed."
+        )
+        if inline_context
+        else (
+            "Thread-local reply drafted from available WorkItem source context. "
+            "No Gmail draft or external send was performed."
+        )
+        if source_context
+        else (
+            "Thread-local draft context was not available, so no recipient-specific "
+            "copy should be generated."
         )
     )
     blocked_facts = (
         []
-        if gmail_thread_context is not None
+        if gmail_thread_context is not None or inline_context or source_context
         else [
-            "Gmail thread body was not available to the Outreach Composer.",
-            "Recipient-specific claims require thread context or approved source-backed context.",
+            "Pasted context, Gmail/thread context, or source refs are required before drafting.",
         ]
     )
     source_ids = (
         [f"gmail_thread:{gmail_thread_context.thread_id}"]
         if gmail_thread_context is not None and gmail_thread_context.thread_id
+        else ["user_provided:thread_local_request"]
+        if inline_context
+        else ["work_item:source_context"]
+        if source_context
         else []
     )
     unsupported = (
         []
-        if gmail_thread_context is not None
-        else ["No recipient-specific facts were used because source context was unavailable."]
+        if gmail_thread_context is not None or inline_context or source_context
+        else ["No draft copy was generated because source context was unavailable."]
     )
     return OutreachDraft(
         company_name=target or "Gmail thread",
@@ -13787,30 +15294,78 @@ def _thread_local_outreach_draft(
         style_profile_used=True,
         style_profile_id="operator_default_writing_style",
         revision_request=request_text,
-        approved_context_used=False,
+        approved_context_used=bool(inline_context),
         unsupported_claims_flagged=unsupported,
     )
 
 
-def _thread_local_draft_body(gmail_thread_context: GmailThreadSummaryResult | None) -> str:
+def _thread_local_draft_body(
+    gmail_thread_context: GmailThreadSummaryResult | None,
+    *,
+    inline_context: str = "",
+    source_context: str = "",
+    target: str = "",
+) -> str:
+    if inline_context:
+        focus = _thread_local_inline_context_focus(inline_context)
+        focus_text = f" around {focus}" if focus else ""
+        target_text = target if target and target != "Gmail thread" else "your team"
+        return "\n\n".join(
+            [
+                "Hi,",
+                (
+                    f"Thanks for reaching out. Keystone can review whether there is "
+                    f"a practical fit to support {target_text}{focus_text}."
+                ),
+                (
+                    "Please send any non-sensitive context on the current workflow, "
+                    "goals, evidence you have already collected, and timing, and I can "
+                    "suggest a focused next step."
+                ),
+                "Sincerely,\nKeystone",
+            ]
+        )
+    if source_context:
+        focus = _thread_local_inline_context_focus(source_context)
+        focus_text = f" around {focus}" if focus else ""
+        target_text = target if target and target != "Gmail thread" else "this"
+        return "\n\n".join(
+            [
+                "Hi,",
+                (
+                    f"Thanks for reaching out. Based on the available context, "
+                    f"{target_text} looks potentially relevant to discuss{focus_text}."
+                ),
+                (
+                    "The next useful step would be to share non-sensitive details on "
+                    "the current workflow, evidence base, stakeholders, and timing so "
+                    "Keystone can assess whether a focused advisory review makes sense."
+                ),
+                "Sincerely,\nKeystone",
+            ]
+        )
     if gmail_thread_context is None:
         return "\n\n".join(
             [
-                "Hi [Name],",
-                (
-                    "Thanks for reaching out. This sounds useful. I can take a look "
-                    "and follow up with any relevant context."
-                ),
-                "Sincerely,\nAnup",
+                "I need the focus, target, and source-backed context before writing "
+                "draft copy.",
+                "Please provide the relevant email/thread excerpt or approved facts to use.",
             ]
         )
     greeting_name = _gmail_thread_recipient_first_name(gmail_thread_context)
     ask = _gmail_thread_reply_focus(gmail_thread_context)
     if ask:
-        middle = (
-            f"Thanks for reaching out. I saw your note about {ask}. "
-            "I can take a look and follow up."
-        )
+        detail = _gmail_thread_acknowledgement_detail(gmail_thread_context)
+        if detail:
+            middle = (
+                f"Thanks for reaching out{detail}, including {ask}. "
+                "I can take a look and follow up."
+            )
+        else:
+            middle = (
+                f"Thanks for reaching out. I saw your note about {ask}. "
+                "I can take a look and follow up."
+            )
     else:
         detail = _gmail_thread_acknowledgement_detail(gmail_thread_context)
         middle = (
@@ -13821,16 +15376,108 @@ def _thread_local_draft_body(gmail_thread_context: GmailThreadSummaryResult | No
         [
             f"Hi {greeting_name}," if greeting_name else "Hi,",
             middle,
-            "Sincerely,\nAnup",
+            "Sincerely,\nKeystone",
         ]
     )
     return body
 
 
+def _thread_local_inline_context(request_text: str) -> str:
+    text = " ".join(str(request_text or "").split()).strip()
+    if not text:
+        return ""
+    match = re.search(
+        r"\b(?:using\s+this\s+context|use\s+this\s+context|provided\s+context|"
+        r"approved\s+context|context)\s*:\s*(.+?)(?:\b(?:write|draft|compose|"
+        r"prepare|return)\b.{0,120}\b(?:slack[- ]thread|sample|reply|response|"
+        r"outreach|email|message)|$)",
+        text,
+        flags=re.I,
+    )
+    if match:
+        return _compact_outreach_summary_text(match.group(1)).strip(" .:-")[:500]
+    return ""
+
+
+def _thread_local_source_context(work_item: WorkItem) -> str:
+    snippets: list[str] = []
+    for source in work_item.sources[:5]:
+        for value in (
+            source.supported_claim,
+            source.evidence_excerpt,
+            " ".join(source.key_facts[:2]),
+        ):
+            cleaned = _compact_outreach_summary_text(value)
+            if cleaned:
+                snippets.append(cleaned)
+                break
+    for artifact in work_item.artifact_refs[:5]:
+        if artifact.artifact_type not in {"company_profile", "opportunity"}:
+            continue
+        if artifact.summary:
+            snippets.append(_compact_outreach_summary_text(artifact.summary))
+        source_refs = artifact.metadata.get("source_refs")
+        if isinstance(source_refs, list):
+            for ref in source_refs[:3]:
+                if not isinstance(ref, dict):
+                    continue
+                cleaned = _compact_outreach_summary_text(
+                    ref.get("supported_claim")
+                    or ref.get("evidence_excerpt")
+                    or " ".join(str(item) for item in (ref.get("key_facts") or [])[:2])
+                )
+                if cleaned:
+                    snippets.append(cleaned)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for snippet in snippets:
+        normalized = snippet.lower()
+        if not snippet or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(snippet)
+        if len(deduped) >= 5:
+            break
+    return _compact_outreach_summary_text("; ".join(deduped))[:900]
+
+
+def _thread_local_draft_target_from_inline_context(inline_context: str) -> str:
+    context = str(inline_context or "")
+    for pattern in (
+        r"\b([A-Z][A-Za-z0-9&.' -]{2,80}?)['\u2019]s\s+"
+        r"(?:inbound|email|note|message|request|team)\b",
+        r"\b([A-Z][A-Za-z0-9&.' -]{2,80}?)\s+"
+        r"(?:is|asked|asks|wants|needs|could|has|plans|considering)\b",
+        r"\b(?:at|from)\s+([A-Z][A-Za-z0-9&.' -]{2,80})\b",
+    ):
+        match = re.search(pattern, context)
+        if not match:
+            continue
+        candidate = re.sub(r"^(?:whether|if)\s+", "", match.group(1).strip(" .:-"), flags=re.I)
+        if candidate:
+            return _truncate_text(candidate, 80)
+    return "Gmail thread"
+
+
+def _thread_local_inline_context_focus(inline_context: str) -> str:
+    context = _compact_outreach_summary_text(inline_context)
+    for pattern in (
+        r"\bhelp\s+with\s+(.+?)(?:[.?!]|$)",
+        r"\babout\s+(.+?)(?:[.?!]|$)",
+        r"\breview(?:ing)?\s+(.+?)(?:[.?!]|$)",
+    ):
+        match = re.search(pattern, context, flags=re.I)
+        if match:
+            value = _compact_outreach_summary_text(match.group(1)).strip(" .")
+            if value:
+                return value[:140]
+    return ""
+
+
 def _gmail_thread_acknowledgement_detail(
     gmail_thread_context: GmailThreadSummaryResult,
 ) -> str:
-    context = " ".join(
+    raw_context = " ".join(
         [
             gmail_thread_context.subject,
             gmail_thread_context.summary,
@@ -13838,7 +15485,8 @@ def _gmail_thread_acknowledgement_detail(
             " ".join(message.summary for message in gmail_thread_context.messages),
             " ".join(message.snippet for message in gmail_thread_context.messages),
         ]
-    ).lower()
+    )
+    context = raw_context.lower()
     if "halo" in context and (
         "partner listing" in context
         or "partnering request" in context
@@ -13847,6 +15495,17 @@ def _gmail_thread_acknowledgement_detail(
         return " and for the overview of Halo's partner listings and active requests"
     if "halo" in context:
         return " and for the overview of Halo"
+    advisory_match = re.search(
+        r"\b(?:we|our team|i)\s+(?:are|am|is)\s+reviewing\s+(.{8,120}?)\s+"
+        r"and\s+may\s+need\s+advisory\s+help\s+on\s+(.{4,80}?)(?:[.?!]|$)",
+        raw_context,
+        flags=re.I,
+    )
+    if advisory_match:
+        topic = _compact_outreach_summary_text(advisory_match.group(1)).rstrip(" .")
+        focus = _compact_outreach_summary_text(advisory_match.group(2)).rstrip(" .")
+        if topic and focus:
+            return f" about {topic} and {focus}"
     if "profile" in context and ("guide" in context or "quick-start" in context):
         return " and for the profile guidance"
     return ""
@@ -13865,14 +15524,27 @@ def _gmail_thread_reply_focus(gmail_thread_context: GmailThreadSummaryResult) ->
         if value and _usable_reply_focus(value):
             value = value[:120].rstrip(" .")
             if value.endswith("?"):
-                question = value[:-1].strip()
-                can_match = re.match(r"can\s+(.+?)\s+(.+)", question, flags=re.I)
-                if can_match:
-                    value = f"whether {can_match.group(1)} can {can_match.group(2)}"
-                else:
-                    value = "whether " + question[:1].lower() + question[1:]
+                value = _normalize_gmail_reply_question_focus(value)
             return value
     return ""
+
+
+def _normalize_gmail_reply_question_focus(value: str) -> str:
+    question = _compact_outreach_summary_text(value).rstrip("?").strip()
+    if not question:
+        return ""
+    for pattern in (
+        r"^(?:could|can)\s+you\s+let\s+me\s+know\s+if\s+(.+)$",
+        r"^let\s+me\s+know\s+if\s+(.+)$",
+        r"^(?:could|can)\s+you\s+confirm\s+if\s+(.+)$",
+    ):
+        match = re.match(pattern, question, flags=re.I)
+        if match:
+            return "whether " + match.group(1)[:1].lower() + match.group(1)[1:]
+    can_match = re.match(r"can\s+(.+?)\s+(.+)", question, flags=re.I)
+    if can_match:
+        return f"whether {can_match.group(1)} can {can_match.group(2)}"
+    return "whether " + question[:1].lower() + question[1:]
 
 
 def _usable_reply_focus(value: str) -> bool:
@@ -13893,7 +15565,7 @@ def _usable_reply_focus(value: str) -> bool:
 
 def _gmail_thread_recipient_first_name(gmail_thread_context: GmailThreadSummaryResult) -> str:
     for participant in gmail_thread_context.participants:
-        if "wisegrow05" in participant.lower() or "anup" in participant.lower():
+        if _is_operator_identity(participant):
             continue
         name = re.sub(r"<[^>]+>", "", participant).strip().strip('"')
         name = name.split()[0] if name else ""
@@ -13901,7 +15573,9 @@ def _gmail_thread_recipient_first_name(gmail_thread_context: GmailThreadSummaryR
         if name:
             return name[:40]
     for message in gmail_thread_context.messages:
-        if "wisegrow05" in message.sender_email.lower() or "anup" in message.sender_name.lower():
+        if _is_operator_identity(message.sender_email) or _is_operator_identity(
+            message.sender_name
+        ):
             continue
         name = (
             re.sub(r"[^A-Za-z'-]", "", message.sender_name.split()[0])
@@ -13936,7 +15610,7 @@ def _clean_recipient_email_address(value: str) -> str:
     if not email or "@" not in email:
         return ""
     lowered = email.lower()
-    if "wisegrow05" in lowered or lowered.startswith("anup@"):
+    if _is_operator_identity(lowered):
         return ""
     return email[:160]
 
@@ -13948,7 +15622,7 @@ def _thread_local_draft_target_from_gmail(
         return "Gmail thread"
     participants = [item for item in gmail_thread_context.participants if item.strip()]
     for participant in participants:
-        if "wisegrow05" not in participant.lower() and "anup" not in participant.lower():
+        if not _is_operator_identity(participant):
             return _compact_outreach_summary_text(participant)[:80]
     return _compact_outreach_summary_text(gmail_thread_context.subject)[:80] or "Gmail thread"
 
@@ -13994,6 +15668,11 @@ def _format_outreach_draft_work_item_summary(
             "",
             "Body:",
             body or "No email body was generated.",
+            "",
+            (
+                "Safety: Draft-only; no external message was sent, no Gmail draft was "
+                "created, and no external save/post/write was performed."
+            ),
         ]
         return "\n".join(lines).strip()
     rationale = _compact_outreach_summary_text(draft.personalization_rationale)
@@ -14535,7 +16214,9 @@ def _compose_outreach_draft_for_work_item(
             )
 
         outcome = run_retrieved_sdk_synthesis(
-            agent=build_outreach_composer_compact_synthesis_agent(),
+            agent=build_outreach_composer_compact_synthesis_agent(
+                request_text=request.request_text,
+            ),
             output_type=OutreachLLMDraftPayload,
             retrieve=retrieve,
             normalize=normalize,
@@ -14617,6 +16298,117 @@ def _block_unsupported_route(
         store=store,
         route=route,
     )
+
+
+def _outreach_missing_context_research_target(
+    work_item: WorkItem,
+    request: WorkflowRunRequest,
+) -> str:
+    if selected_artifacts(work_item, "company_profile") or selected_artifacts(
+        work_item,
+        "opportunity",
+    ):
+        return ""
+    if _request_demands_external_outreach_side_effect(
+        " ".join(str(request.request_text or work_item.request_text or "").lower().split())
+    ):
+        return ""
+    metadata = work_item.target.metadata if isinstance(work_item.target.metadata, dict) else {}
+    candidates = [
+        metadata.get("manual_recipient"),
+        _outreach_target_from_request_text(request.request_text or work_item.request_text),
+        _manual_primary_target(work_item),
+        _compact_outreach_summary_text(work_item.target.name),
+        normalize_target_text(
+            request.request_text or work_item.request_text,
+            WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        ),
+    ]
+    target = ""
+    for candidate in candidates:
+        cleaned = _compact_outreach_summary_text(candidate).strip(" .,:;-")
+        if cleaned and not _is_generic_outreach_research_target(cleaned):
+            target = cleaned
+            break
+    if not target:
+        return ""
+    return target[:120]
+
+
+def _outreach_missing_context_should_run_research(
+    work_item: WorkItem,
+    request: WorkflowRunRequest,
+    *,
+    researchable_target: str,
+) -> bool:
+    """Return whether Outreach may gather context before blocking on approval."""
+
+    if not researchable_target:
+        return False
+    text = " ".join(str(request.request_text or work_item.request_text or "").lower().split())
+    if not text or looks_like_thread_local_draft_request(text):
+        return False
+    if re.search(r"\b(?:research|profile|look\s+into|evaluate|assess)\b", text) and re.search(
+        r"\b(?:draft|outreach|email|linkedin|message|reply)\b",
+        text,
+    ):
+        return True
+    plan = _manual_request_plan_dict(request.manual_request_plan) or (
+        work_item.target.metadata.get("manual_request_plan")
+        if isinstance(work_item.target.metadata.get("manual_request_plan"), dict)
+        else {}
+    )
+    requested_agent = str(plan.get("requested_agent") or "").strip()
+    recipient = str(plan.get("recipient") or "").strip()
+    return bool(
+        requested_agent == WorkItemRoute.OUTREACH_COMPOSER.value
+        and recipient
+        and re.search(r"\b(?:draft|prepare|compose|write)\b", text)
+        and re.search(r"\b(?:outreach|email|linkedin|message|reply)\b", text)
+    )
+
+
+def _is_generic_outreach_research_target(target: str) -> bool:
+    return target.lower() in {
+        "gmail thread",
+        "outreach",
+        "draft outreach",
+        "email",
+        "message",
+        "reply",
+        "thread",
+    }
+
+
+def _outreach_target_from_request_text(text: str) -> str:
+    normalized = " ".join(str(text or "").split())
+    for pattern in (
+        r"\b(?:outreach|email|message|reply|draft)\s+(?:for|to|about)\s+([A-Z][A-Za-z0-9&.' -]{1,80})\b",
+        r"\b(?:for|to|about)\s+([A-Z][A-Za-z0-9&.' -]{1,80})\b",
+    ):
+        match = re.search(pattern, normalized)
+        if not match:
+            continue
+        candidate = re.split(
+            r"\b(?:using|with|before|after|from|and|that|who|which)\b",
+            match.group(1),
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" .,:;-")
+        if candidate:
+            return candidate[:120]
+    return ""
+
+
+def _manual_primary_research_target(work_item: WorkItem) -> str:
+    primary = _compact_outreach_summary_text(_manual_primary_target(work_item)).strip(" .,:;-")
+    if primary and not _is_generic_outreach_research_target(primary):
+        return primary
+    metadata = work_item.target.metadata if isinstance(work_item.target.metadata, dict) else {}
+    recipient = _compact_outreach_summary_text(metadata.get("manual_recipient")).strip(" .,:;-")
+    if recipient and not _is_generic_outreach_research_target(recipient):
+        return recipient
+    return ""
 
 
 def _blocked_result(
@@ -14706,26 +16498,26 @@ def _blocked_human_summary(
     ):
         return "\n\n".join(
             [
-                "Outreach Composer needs approved drafting context",
+                "What should this outreach focus on?",
                 (
                     "*Answer:*\n"
-                    "I cannot create draft-only outreach until approved source-backed "
-                    "context and recipient/contact context are both present. Approval is "
-                    "required before any external-use draft context, CRM action, send, post, "
-                    "schedule, or file write."
+                    "I can keep this as draft-only thread help, but I need the intended "
+                    "focus and either the recipient or target organization before writing "
+                    "copy that could be used externally."
                 ),
                 (
-                    "*Detailed Summary:*\n"
-                    "* Required: selected company profile or opportunity record approved "
-                    "for drafting.\n"
-                    "* Required: recipient, target contact, or target organization.\n"
-                    "* Current status: no email, LinkedIn note, Slack post, CRM record, file "
-                    "write, send, schedule, publish, or external action was taken."
+                    "*What I need:*\n"
+                    "* Focus: what the email or message should accomplish.\n"
+                    "* Target: recipient, target contact, or target organization.\n"
+                    "* Evidence: approved source-backed company or opportunity context, "
+                    "or permission to use the context already in this thread.\n"
+                    "* Boundary: no email, Gmail draft, Slack post outside this thread, "
+                    "CRM record, file write, send, schedule, publish, or external action "
+                    "has been taken."
                 ),
                 (
-                    "*Next step:*\n"
-                    "Attach or approve source-backed company or opportunity context, then "
-                    "provide the recipient or target organization before requesting a draft."
+                    "*Reply with:*\n"
+                    "\"Focus: ...; target: ...; use these source-backed facts: ...\""
                 ),
             ]
         )
@@ -14734,45 +16526,41 @@ def _blocked_human_summary(
             re.search(r"\b(?:legal|contract|attachment|indemnity|agree|clause)\b", message, re.I)
             for message in requirements
         )
-        needs_reply_context = any(
-            "Recipient identity and thread context" in message for message in requirements
-        )
+        needs_reply_context = any("Recipient identity" in message for message in requirements)
         return "\n\n".join(
             [
-                "Gmail Triage needs selected message context",
+                "What email should I use?",
                 (
                     "*Answer:*\n"
-                    "Gmail Triage cannot summarize, label-plan, or draft reply guidance until "
-                    "the required context is available: a selected Gmail thread/message, pasted "
-                    "sanitized thread context, or an explicitly approved read-only Gmail "
-                    "retrieval scope."
+                    "I can triage, summarize, label-plan, or prepare reply guidance once I have "
+                    "the email context to work from."
                 ),
                 (
-                    "*Detailed Summary:*\n"
-                    "* Required: selected Gmail thread/message context or a bounded live Gmail "
-                    "retrieval scope.\n"
+                    "*What I need:*\n"
+                    "* Email context: paste a sanitized email, select a Gmail message/thread, "
+                    "or approve a bounded read-only Gmail retrieval scope.\n"
                     + (
-                        "* Required for reply guidance: recipient identity and thread context.\n"
+                        "* Reply guidance: include recipient identity and enough message context "
+                        "to understand the relationship and ask.\n"
                         if needs_reply_context
                         else ""
                     )
                     + (
-                        "* Human review required: legal, contract, attachment, or clause "
-                        "interpretation needs selected source context.\n"
+                        "* Human review: legal, contract, attachment, or clause interpretation "
+                        "needs selected source context.\n"
                         if legal_or_contract
                         else ""
                     )
-                    + "* Approval boundary: live Gmail retrieval, draft creation, labels, "
+                    + "* Boundary: live Gmail retrieval, draft creation, labels, "
                     "archiving, scheduling, sending, or other mailbox changes require explicit "
                     "approval and an exact selected scope.\n"
-                    + "* Current status: no Gmail draft, label, archive, schedule, calendar "
-                    "change, send, Slack post, CRM write, file write, or external action was taken."
+                    + "* Current status: no Gmail draft, label, archive, schedule, send, Slack "
+                    "post, CRM write, file write, or external action was taken."
                 ),
                 (
-                    "*Next step:*\n"
-                    "Select the Gmail thread/message, paste sanitized thread context, or rerun "
-                    "with an explicit read-only Gmail retrieval scope before requesting triage "
-                    "or reply guidance."
+                    "*Reply with:*\n"
+                    "\"Email: From: ... Subject: ... Body: ...\" or select the Gmail message/thread "
+                    "and approve read-only retrieval."
                 ),
             ]
         )
@@ -14804,8 +16592,21 @@ def _blocked_human_summary(
                 ),
             ]
         )
-    return f"{agent_name} did not have the required context to complete synthesis: " + "; ".join(
-        dict.fromkeys(requirements)
+    return "\n\n".join(
+        [
+            f"{agent_name} needs one more input",
+            (
+                "*Answer:*\n"
+                "I can keep this moving, but the current run is missing context that the "
+                "backend could not safely infer."
+            ),
+            "*What I need:*\n" + "\n".join(f"* {item}" for item in dict.fromkeys(requirements)),
+            (
+                "*Next step:*\n"
+                "Provide the missing context, or approve the relevant bounded retrieval/search "
+                "scope if the system should gather it."
+            ),
+        ]
     )
 
 

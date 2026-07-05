@@ -140,8 +140,13 @@ returned records with `raw_body_included=false`.
 
 ## Approval Gate
 
-- All drafts approval-gated.
-- Draft-only behavior is mandatory.
+- Slack-thread-local draft text for human review is allowed when no provider-side
+  Gmail draft, send, post outside the current thread, schedule, publish, or
+  external write is performed.
+- Provider-side Gmail draft creation, external-use copy, sending, posting
+  outside the current thread, scheduling, publishing, CRM writes, and other
+  external writes require the relevant backend setting plus scoped approval.
+- Draft-only behavior is mandatory for outbound communication.
 - Never send automatically.
 - Output must be ready for human review, not external delivery.
 - Provider-side Gmail draft creation is a separate setting-backed action, not

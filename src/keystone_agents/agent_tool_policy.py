@@ -28,7 +28,13 @@ GOOGLE_WORKSPACE_READ_TOOLS = frozenset(
 )
 GOOGLE_WORKSPACE_WRITE_TOOLS = GOOGLE_WORKSPACE_ALLOWED_TOOLS - GOOGLE_WORKSPACE_READ_TOOLS
 AIRTABLE_READ_ALLOWED_TOOLS = frozenset({"airtable_get_base_schema", "airtable_read_records"})
-AIRTABLE_WRITE_ALLOWED_TOOLS = frozenset({"airtable_write_record"})
+AIRTABLE_WRITE_ALLOWED_TOOLS = frozenset(
+    {
+        "airtable_write_record",
+        "airtable_upload_attachment",
+        "airtable_create_expense_from_receipt",
+    }
+)
 WEB_STRUCTURING_ALLOWED_TOOLS = frozenset({"structure_web_data_for_schema"})
 PLAYWRIGHT_RESEARCH_ALLOWED_TOOLS = frozenset({"render_page"})
 BROWSER_DIAGNOSTIC_ALLOWED_TOOLS = frozenset(
@@ -534,10 +540,10 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "search_web",
                 "airtable_get_base_schema",
                 "airtable_read_records",
-                "airtable_write_record",
             }
         )
         | GOOGLE_WORKSPACE_ALLOWED_TOOLS
+        | AIRTABLE_WRITE_ALLOWED_TOOLS
         | WEB_STRUCTURING_ALLOWED_TOOLS
         | PLAYWRIGHT_RESEARCH_ALLOWED_TOOLS
         | BROWSER_DIAGNOSTIC_ALLOWED_TOOLS,

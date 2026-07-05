@@ -150,7 +150,7 @@ Stop and ask or document a validation plan when:
 For this skill itself, run:
 
 ```bash
-python3 /Users/anup/.codex/skills/.system/skill-creator/scripts/quick_validate.py codex-skills/kba-new-agent
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py codex-skills/kba-new-agent
 ```
 
 For future agent implementations, prefer:

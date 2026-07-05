@@ -519,6 +519,13 @@
       "secret": false
     },
     {
+      "category": "orchestration",
+      "default_notes": "Slack parent flag is scrubbed for child runs so KBA backend policy or explicit KEYSTONE_WORKITEM_LANGGRAPH test overrides own graph selection.",
+      "display_safety": "safe",
+      "name": "KNI_BUSINESS_AGENTS_LANGGRAPH",
+      "secret": false
+    },
+    {
       "category": "model",
       "default_notes": "",
       "display_safety": "url",
@@ -713,6 +720,7 @@
       "KEYSTONE_TRACE_WORKFLOW_NAME",
       "KEYSTONE_WEBSITE_EXTRACTOR",
       "KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK",
+      "KNI_BUSINESS_AGENTS_LANGGRAPH",
       "LITELLM_BASE_URL",
       "MODEL_PROVIDER",
       "OPENAI_API_KEY",

@@ -630,6 +630,43 @@ def test_find_behavioral_health_ai_companies_routes_to_opportunity_scout() -> No
     assert result.retrieval_hint.source == "request_heuristic"
 
 
+def test_explicit_business_research_smoke_request_does_not_route_to_scout() -> None:
+    result = route_request(
+        "LangGraph smoke 1: use preprints context agent history and Zotero context "
+        "agent handoff, then run Business Research for NeuroFlow as an internal "
+        "evidence-packet planning note. Live SDK is approved only for this bounded "
+        "read-only smoke if the backend would normally use it; live web search is "
+        "not approved. Use local/dry-run retrieval where possible. Do not send "
+        "email, create drafts, post elsewhere, publish, schedule, or write external "
+        "systems."
+    )
+
+    assert result.route == "business_research_analyst"
+    assert result.target_agent == "Business Research Analyst"
+    assert result.retrieval_hint is not None
+
+
+def test_business_research_only_smoke_ignores_negated_scouting_and_outreach() -> None:
+    prompt = (
+        "Research smoke: research NeuroFlow for a short internal read-only company note. "
+        "Stay on Business Research only; do not scout opportunities or draft outreach. "
+        "Live SDK is approved only for this bounded read-only smoke if the backend would "
+        "normally use it; live web search is not approved. Use local/dry-run retrieval "
+        "where possible. Do not send email, create drafts, post elsewhere, publish, "
+        "schedule, or write external systems."
+    )
+    manual_plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
+    result = route_request(prompt, manual_plan=manual_plan)
+
+    assert manual_plan.target_agent == "business_research_analyst"
+    assert result.route == "business_research_analyst"
+    assert result.target_agent == "Business Research Analyst"
+    assert result.workflow == ["business_research_analyst"]
+    assert "opportunity_scout" not in result.workflow
+    assert "outreach_composer" not in result.workflow
+    assert result.send_enabled is False
+
+
 def test_recent_remote_role_search_routes_to_opportunity_scout() -> None:
     result = route_request(
         "Find up to 5 active U.S.-based remote roles posted in the last 7 days "
@@ -668,6 +705,20 @@ def test_opportunity_crm_save_request_is_scout_with_no_write_boundary() -> None:
     assert result.send_enabled is False
     assert fields["outreach_status"] == "draft_only_blocked_pending_approval"
     assert any("CRM save/write request" in note for note in result.audit_notes)
+
+
+def test_finance_tracker_airtable_expense_write_does_not_trigger_crm_boundary() -> None:
+    result = route_request(
+        "chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: "
+        "/tmp/example-business-cards-receipt.pdf"
+    )
+
+    assert result.route == "chief_of_staff"
+    assert "crm_preflight" not in result.workflow
+    assert "save_to_crm" not in result.forbidden_actions
+    assert "crm_write" not in result.forbidden_actions
+    assert not any("CRM save/write request" in note for note in result.audit_notes)
 
 
 def test_negated_crm_record_creation_does_not_add_crm_boundary() -> None:
@@ -941,12 +992,17 @@ def test_outreach_request_without_approved_profile_has_sectioned_operator_summar
     result = route_request("draft outreach to NeuroFlow")
 
     assert result.clarification_request is not None
-    assert "Outreach Composer needs approved drafting context" in result.clarification_request
+    assert "What should this outreach focus on?" in result.clarification_request
     assert "*Answer:*" in result.clarification_request
-    assert "*Detailed Summary:*" in result.clarification_request
-    assert "*Next step:*" in result.clarification_request
-    assert "source-backed company profile or opportunity record" in result.clarification_request
-    assert "external action was taken" in result.clarification_request
+    assert "*What I need:*" in result.clarification_request
+    assert "*Reply with:*" in result.clarification_request
+    assert "Focus: what the email or message should accomplish." in result.clarification_request
+    assert "recipient, target contact, or target organization" in result.clarification_request
+    assert "permission to use the context already in this thread" in result.clarification_request
+    assert "external action has been taken" in result.clarification_request
+    assert "Outreach Composer needs approved drafting context" not in result.clarification_request
+    assert "cannot create draft-only outreach" not in result.clarification_request
+    assert "blocked" not in result.clarification_request.lower()
     assert "CompanyProfile" not in result.clarification_request
     assert "OpportunityRecord" not in result.clarification_request
     assert "WorkItem" not in result.clarification_request

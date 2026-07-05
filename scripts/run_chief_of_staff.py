@@ -22,6 +22,7 @@ from keystone_agents.agents.web_query_planner import resolve_web_query_plan
 from keystone_agents.cli_sdk import add_sdk_session_arguments, sdk_session_from_args
 from keystone_agents.config import load_settings
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
+from keystone_agents.finance_expense_receipts import infer_finance_expense_receipt_target
 from keystone_agents.local_kni_evidence import (
     build_local_kni_evidence_packet,
     build_local_kni_evidence_packet_for_query,
@@ -95,6 +96,36 @@ def _requests_google_workspace_artifact(input_text: str) -> bool:
     )
 
 
+def _requests_finance_tracker_airtable_write(input_text: str) -> bool:
+    lowered = " ".join(str(input_text or "").lower().split())
+    has_airtable_tracker = "airtable" in lowered and any(
+        marker in lowered
+        for marker in (
+            "finance_tax_tracker",
+            "finance tax tracker",
+            "tax tracker",
+            "personal expenses",
+            "personal expense",
+            "business expenses",
+            "business expense",
+        )
+    )
+    has_write_intent = any(
+        marker in lowered
+        for marker in (
+            "add ",
+            "create ",
+            "insert ",
+            "record ",
+            "update ",
+            "change ",
+            "set ",
+            "fill ",
+        )
+    )
+    return has_airtable_tracker and has_write_intent
+
+
 def _live_side_effect_policy(input_text: str) -> str:
     if _requests_google_workspace_artifact(input_text):
         return (
@@ -104,6 +135,19 @@ def _live_side_effect_policy(input_text: str) -> str:
             "Google Workspace tools. Do not post to Slack beyond the normal result, send "
             "Gmail, create calendar events, write the repo, file tax returns, make tax "
             "payments, or mutate Airtable unless separately requested."
+        )
+    if _requests_finance_tracker_airtable_write(input_text):
+        return (
+            "Live internal Airtable schema reads, capped record reads, and the explicitly "
+            "requested finance_tax_tracker Airtable create/update are allowed only through "
+            "typed Airtable tools, using the supplied approval_reference and exact allowed "
+            "table/field mapping. If the operator supplied a receipt/invoice PDF or image "
+            "and Airtable schema exposes an attachment field on the target expense record, "
+            "one receipt attachment upload is allowed through typed Airtable tools after "
+            "record identity is known. The Airtable tool's dry-run/live-write/upload gates "
+            "remain authoritative. Do not delete records, change schema, file tax returns, "
+            "make tax payments, post to Slack beyond the normal result, send Gmail, create "
+            "calendar events, write the repo, or mutate any other system."
         )
     return "read-only; no Slack post, Gmail send, calendar write, repo write, or external action"
 
@@ -132,6 +176,21 @@ def _chief_web_query_plan_subject(input_text: str, manual_plan: object | None) -
         return objective[:160]
     cleaned = " ".join(str(input_text or "").split())
     return cleaned[:160] or "KNI Chief of Staff web research request"
+
+
+def _chief_should_build_web_query_plan(input_text: str, manual_plan: object | None) -> bool:
+    if infer_finance_expense_receipt_target(input_text) is not None:
+        return False
+    blocked_plan_values = {
+        "business_system_write",
+        "business_system_write_plan",
+        "business_system_context",
+    }
+    for attr in ("intent", "task_objective", "expected_artifact_type", "target_type"):
+        value = str(getattr(manual_plan, attr, "") or "").strip()
+        if value in blocked_plan_values:
+            return False
+    return True
 
 
 def _chief_fallback_web_queries(input_text: str, subject: str) -> list[str]:
@@ -353,10 +412,12 @@ def _maybe_execute_recommended_work_item_handoff(
     if not isinstance(output, ChiefOfStaffResult):
         return output, None
     output_payload = output.model_dump(mode="json")
+    from keystone_agents.langgraph_workflow import (
+        advance_work_item_manager_loop_with_optional_langgraph,
+    )
     from keystone_agents.schemas.work_item import WorkflowRunRequest
     from keystone_agents.workflow_runner import (
         _chief_output_recommended_work_item_handoff_route,
-        advance_work_item_manager_loop,
     )
 
     delegated_route = _chief_output_recommended_work_item_handoff_route(
@@ -366,7 +427,7 @@ def _maybe_execute_recommended_work_item_handoff(
     if delegated_route is None:
         return output, None
     inline_only = _direct_handoff_should_use_inline_only(input_text)
-    delegated = advance_work_item_manager_loop(
+    delegated = advance_work_item_manager_loop_with_optional_langgraph(
         WorkflowRunRequest(
             request_text=input_text,
             save=True,
@@ -745,7 +806,11 @@ def main(argv: list[str] | None = None) -> int:
                     "the raw user query before live Chief of Staff synthesis."
                 ),
             }
-        elif args.live_search_plan and live_web_research_enabled:
+        elif (
+            args.live_search_plan
+            and live_web_research_enabled
+            and _chief_should_build_web_query_plan(input_text, manual_plan)
+        ):
             web_query_plan_subject = _chief_web_query_plan_subject(input_text, manual_plan)
             web_query_plan = resolve_web_query_plan(
                 subject=web_query_plan_subject,

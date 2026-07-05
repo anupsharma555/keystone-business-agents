@@ -634,7 +634,7 @@ def _airtable_context_payload(**overrides: Any) -> dict[str, Any]:
             "approval_required": True,
             "approval_reference_needed": True,
             "live_write_allowed_for_specialist": False,
-            "rationale": "Chief-owned write only.",
+            "rationale": "Review-only plan; Airtable execution remains downstream.",
         },
         "blockers": ["Approval reference missing."],
         "approval_needs": ["Scoped Airtable approval required."],
@@ -674,7 +674,7 @@ def _google_workspace_context_payload(**overrides: Any) -> dict[str, Any]:
             "approval_required": True,
             "approval_reference_needed": True,
             "live_write_allowed_for_specialist": False,
-            "rationale": "Chief-owned Workspace write only.",
+            "rationale": "Review-only plan; Workspace execution remains downstream.",
         },
         "blockers": ["Workspace approval reference missing."],
         "approval_needs": ["Scoped Google Workspace approval required."],
@@ -714,7 +714,7 @@ def _zotero_context_payload(**overrides: Any) -> dict[str, Any]:
             "approval_required": True,
             "approval_reference_needed": True,
             "live_write_allowed_for_specialist": False,
-            "rationale": "Chief-owned artifact write only.",
+            "rationale": "Review-only artifact plan; execution remains downstream.",
         },
         "zotero_write_supported": False,
         "recommended_actions": ["Use these citations in the Chief synthesis."],
@@ -819,7 +819,7 @@ def test_chief_specialist_agent_tools_invoke_nested_agents_with_fake_model(
         specialist_task=f"Resolve {route_name} context and return blockers.",
         decision_context={
             "intent_family": "eval readiness",
-            "desired_deliverable": "Chief-owned work plan",
+            "desired_deliverable": "reviewable work plan",
             "success_criteria": "Friday Slack eval pilot is ready or blockers are explicit",
         },
         target_context={
@@ -1032,6 +1032,61 @@ def test_run_typed_sdk_agent_retries_live_rate_limit_once(
     assert sleeps == [2.0]
     assert result.output.summary == "Recovered after retry."
     assert result.request_cache["rate_limit_retries"] == 1
+
+
+def test_run_typed_sdk_agent_preserves_explicit_local_pdf_and_image_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "receipt.pdf"
+    image_path = tmp_path / "receipt.png"
+    pdf_path.write_bytes(b"%PDF-1.4\nreceipt fixture")
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+    captured: dict[str, Any] = {}
+
+    class FakeAgent:
+        name = "chief_of_staff"
+        model = "gpt-test"
+
+    def fake_run_typed_sdk_sync(
+        _agent: Any,
+        prompt: Any,
+        _output_type: Any,
+        **_kwargs: Any,
+    ) -> tuple[dict[str, Any], ChiefOfStaffResult]:
+        captured["prompt"] = prompt
+        return (
+            {"fake": True},
+            ChiefOfStaffResult(mode="llm", summary="Read attached files."),
+        )
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(
+        "keystone_agents.run.enforce_agent_run_budget",
+        lambda **_kwargs: {"enforced": False},
+    )
+
+    result = run_typed_sdk_agent(
+        agent=FakeAgent(),
+        typed_input={"request": f"read {pdf_path} and {image_path}"},
+        output_type=ChiefOfStaffResult,
+        live=True,
+        config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+    )
+
+    prompt = captured["prompt"]
+    assert result.output.summary == "Read attached files."
+    assert isinstance(prompt, list)
+    content = prompt[0]["content"]
+    assert any(part.get("type") == "input_file" for part in content)
+    assert any(part.get("type") == "input_image" for part in content)
+    assert "data:application/pdf;base64," in next(
+        part["file_data"] for part in content if part.get("type") == "input_file"
+    )
+    assert "data:image/png;base64," in next(
+        part["image_url"] for part in content if part.get("type") == "input_image"
+    )
+    assert result.request_cache["dynamic_prompt_chars"] > 0
 
 
 def test_run_typed_sdk_agent_records_sdk_run_summary_trace(
@@ -2711,6 +2766,119 @@ def test_fake_model_tool_call_executes_fixture_tool(monkeypatch: pytest.MonkeyPa
     tool_outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
     assert tool_outputs
     assert "dry-run" in str(tool_outputs[0].output)
+
+
+def test_chief_fake_model_cannot_call_receipt_create_tool_directly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS", "true")
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    receipt = tmp_path / "receipt.pdf"
+    receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="receipt.pdf",
+            content_read=False,
+            extraction_method="fixture_unreadable",
+            blocker="fixture extraction unavailable",
+        ),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Business Expenses",
+                        "fields": [
+                            {"name": "Merchant", "field_type": "multilineText"},
+                            {"name": "Expense Date", "field_type": "date"},
+                            {
+                                "name": "Period",
+                                "field_type": "singleSelect",
+                                "select_choices": ["Q1", "Q2", "Q3", "Q4"],
+                            },
+                            {"name": "Grand Total", "field_type": "currency"},
+                            {
+                                "name": "Receipt File",
+                                "field_type": "multipleAttachments",
+                                "field_id": "fldReceipt",
+                            },
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    tool_args = {
+        "local_file_path": str(receipt),
+        "table": "Business Expenses",
+        "base_alias": "finance_tax_tracker",
+        "receipt_fields_json": json.dumps(
+            {
+                "vendor": "Acme Labs",
+                "receipt_date": "2026-09-15",
+                "description": "Lab supplies",
+                "total": "199.25",
+                "currency": "USD",
+            },
+            sort_keys=True,
+        ),
+        "field_values_json": json.dumps(
+            {
+                "Merchant": "Acme Labs",
+                "Expense Date": "2026-09-15",
+                "Period": "Q4",
+                "Grand Total": "199.25",
+            },
+            sort_keys=True,
+        ),
+        "approval_reference": "slack-test-approved",
+        "live": False,
+    }
+    model = FakeModel(
+        outputs=[
+            [_tool_call("airtable_create_expense_from_receipt", tool_args)],
+            [
+                _structured_message(
+                    _chief_of_staff_payload(
+                        summary=(
+                            "Created a dry-run Airtable expense plan from model-read "
+                            "receipt evidence."
+                        ),
+                        audit_notes=["Fake model called bounded receipt create tool."],
+                    )
+                )
+            ],
+        ]
+    )
+    request = (
+        "chief of staff add a business expense to the airtable business expenses "
+        f"based on the receipt details which are: {receipt}"
+    )
+
+    result = run_chief_of_staff_sdk(
+        request,
+        live=True,
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    assert result.output.summary == (
+        "Created a dry-run Airtable expense plan from model-read receipt evidence."
+    )
+    assert len(model.calls) == 2
+    assert "airtable_create_expense_from_receipt" in model.calls[0]["tool_names"]
+    assert "airtable_get_base_schema" in model.calls[0]["tool_names"]
 
 
 def test_fake_model_input_guardrail_tripwire(monkeypatch: pytest.MonkeyPatch) -> None:

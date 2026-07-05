@@ -153,8 +153,75 @@ def test_cli_work_items_langgraph_json_exposes_graph_metadata(tmp_path: Path, ca
     assert exit_code == 0
     assert payload["route"] == "business_research_analyst"
     assert payload["_langgraph"]["runtime"] in {"langgraph", "dependency_free_fallback"}
-    assert payload["_langgraph"]["node_path"] == ["advance_work_item"]
+    assert payload["_langgraph"]["node_path"] == [
+        "normalize_request",
+        "orchestrator_preflight",
+        "state_followup",
+        "prepare_work_item",
+        "run_business_research",
+        "finalize_step",
+    ]
     assert payload["_langgraph"]["checkpoint_required"] is False
+
+
+def test_cli_work_items_backend_selects_langgraph_for_graph_worthy_request(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    monkeypatch.delenv("KNI_BUSINESS_AGENTS_LANGGRAPH", raising=False)
+    monkeypatch.delenv("KEYSTONE_WORKITEM_LANGGRAPH", raising=False)
+
+    exit_code = main(
+        [
+            "work-items",
+            "advance",
+            "--input",
+            (
+                "research NeuroFlow, find matching opportunities, and prepare "
+                "draft-only outreach. Do not send, post, schedule, or write externally."
+            ),
+            "--database-url",
+            database_url,
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    node_path = payload["_langgraph"]["node_path"]
+
+    assert exit_code == 0
+    assert payload["_langgraph"]["runtime"] in {"langgraph", "dependency_free_fallback"}
+    assert "prepare_work_item" in node_path
+    assert any(node.startswith("run_") for node in node_path)
+
+
+def test_cli_work_items_false_langgraph_env_disables_backend_selection(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    monkeypatch.setenv("KNI_BUSINESS_AGENTS_LANGGRAPH", "false")
+
+    exit_code = main(
+        [
+            "work-items",
+            "advance",
+            "--input",
+            (
+                "research NeuroFlow, find matching opportunities, and prepare "
+                "draft-only outreach. Do not send, post, schedule, or write externally."
+            ),
+            "--database-url",
+            database_url,
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert "_langgraph" not in payload
 
 
 def test_cli_work_items_langgraph_env_enables_graph_metadata(
@@ -181,7 +248,9 @@ def test_cli_work_items_langgraph_env_enables_graph_metadata(
     assert exit_code == 0
     assert payload["route"] == "business_research_analyst"
     assert payload["_langgraph"]["runtime"] in {"langgraph", "dependency_free_fallback"}
-    assert payload["_langgraph"]["node_path"] == ["advance_work_item"]
+    assert "prepare_work_item" in payload["_langgraph"]["node_path"]
+    assert "run_business_research" in payload["_langgraph"]["node_path"]
+    assert "finalize_step" in payload["_langgraph"]["node_path"]
 
 
 def test_cli_work_items_langgraph_env_uses_stable_work_item_thread(

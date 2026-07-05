@@ -11,8 +11,10 @@ from keystone_agents.schemas.operational_context import AirtableContextResult
 from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.tools.internal_data_tools import (
+    airtable_create_expense_from_receipt,
     airtable_get_base_schema,
     airtable_read_records,
+    airtable_upload_attachment,
     airtable_write_record,
 )
 
@@ -22,6 +24,8 @@ def _airtable_context_tools(*, tool_tier: str | int | None = None) -> list[Any]:
         airtable_get_base_schema,
         airtable_read_records,
         airtable_write_record,
+        airtable_upload_attachment,
+        airtable_create_expense_from_receipt,
     ]
     if tool_tier is None:
         return tools

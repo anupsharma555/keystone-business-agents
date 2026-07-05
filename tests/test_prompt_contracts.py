@@ -173,6 +173,7 @@ def test_skill_bundles_define_reasoning_contracts_not_tools() -> None:
     assert "handoff_contract_packaging" in all_skill_names
     assert "gmail_triage_specialist_contracts" in all_skill_names
     assert "chief_of_staff_specialist_contracts" in all_skill_names
+    assert "data_schema_mapping" in all_skill_names
 
 
 def test_skill_contract_eval_cases_cover_shared_and_specialist_skills() -> None:
@@ -208,6 +209,78 @@ def test_dynamic_skill_selector_includes_core_and_specialist_contracts() -> None
             assert agent_name.endswith("_context_agent")
         else:
             assert len(selected) < len(AGENT_SKILL_NAMES[agent_name])
+
+
+def test_ask_to_target_resolution_skill_selected_for_chief_and_airtable() -> None:
+    request = (
+        "Add a business expense to Airtable business expenses based on receipt details "
+        "in /tmp/example-business-cards-receipt.pdf"
+    )
+
+    chief_selected = select_agent_skill_names("chief_of_staff", request_text=request)
+    airtable_selected = select_agent_skill_names("airtable_context_agent", request_text=request)
+
+    assert "ask_to_target_resolution" in chief_selected
+    assert "artifact_evidence_handling" in chief_selected
+    assert "data_schema_mapping" in chief_selected
+    assert "ask_to_target_resolution" in airtable_selected
+    assert "artifact_evidence_handling" in airtable_selected
+    assert "data_schema_mapping" in airtable_selected
+
+    skill_text = _read_skill("ask_to_target_resolution")
+    assert "Airtable Finance Receipt Mapping" in skill_text
+    assert "Infer `base_alias=\"finance_tax_tracker\"`" in skill_text
+    assert "Business Expenses" in skill_text
+    assert "Do not block by asking for base/table" in skill_text
+
+    mapping_text = _read_skill("data_schema_mapping")
+    assert "Read the input evidence before proposing field values" in mapping_text
+    assert "Use exact destination field names" in mapping_text
+    assert "model-extracted source facts separately from\n  exact target field values" in mapping_text
+
+
+def test_artifact_evidence_skill_selected_for_local_file_requests() -> None:
+    request = "Read the attached invoice image at /tmp/vendor-receipt.png and update the record."
+
+    for agent_name in (
+        "chief_of_staff",
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+        "gmail_triage",
+    ):
+        assert "artifact_evidence_handling" in select_agent_skill_names(
+            agent_name,
+            request_text=request,
+        )
+
+    skill_text = _read_skill("artifact_evidence_handling")
+    assert "Do not infer values from\n   filename" in skill_text
+    assert "Use operator-supplied local files, PDFs, images" in skill_text
+    assert "Must not send, publish, upload, attach, or share private artifacts" in skill_text
+
+
+def test_data_schema_mapping_skill_selected_for_mapping_and_field_requests() -> None:
+    request = (
+        "Map the attached invoice PDF to the Airtable expense schema, infer the "
+        "estimated tax period, and populate the matching fields."
+    )
+
+    for agent_name in (
+        "chief_of_staff",
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "gmail_triage",
+        "business_research_analyst",
+    ):
+        assert "data_schema_mapping" in select_agent_skill_names(
+            agent_name,
+            request_text=request,
+        )
+
+    skill_text = _read_skill("data_schema_mapping")
+    assert "schema-read, model-map, helper-validate, then bounded-write" in skill_text
+    assert "Must not encode one-off natural-language shortcuts" in skill_text
 
 
 def test_dynamic_skill_selector_adds_relevant_optional_contracts() -> None:
@@ -350,6 +423,30 @@ def test_agent_builder_request_text_controls_skill_visibility() -> None:
     assert "<!-- unsupported_claim_and_gap_handling/SKILL.md -->" in request_instructions
 
 
+def test_compact_outreach_builder_preserves_request_aware_skill_visibility() -> None:
+    from keystone_agents.agents.outreach_composer import (
+        build_outreach_composer_compact_synthesis_agent,
+    )
+
+    default_instructions = str(build_outreach_composer_compact_synthesis_agent().instructions)
+    request_instructions = str(
+        build_outreach_composer_compact_synthesis_agent(
+            request_text=(
+                "prepare a source-cited outreach draft and save report to Google Drive "
+                "with missing evidence gaps"
+            )
+        ).instructions
+    )
+
+    assert "<!-- outreach_composer.md -->" in request_instructions
+    assert "<!-- tools.md -->" in request_instructions
+    assert "<!-- action_boundary_enforcement/SKILL.md -->" in request_instructions
+    assert "<!-- context_permission_gating/SKILL.md -->" in request_instructions
+    assert "<!-- workspace_artifact_governance/SKILL.md -->" not in default_instructions
+    assert "<!-- workspace_artifact_governance/SKILL.md -->" in request_instructions
+    assert "<!-- unsupported_claim_and_gap_handling/SKILL.md -->" in request_instructions
+
+
 def test_shared_agent_operating_architecture_covers_schemas_tools_helpers() -> None:
     text = _read_prompt("agent-operating-architecture.md")
 
@@ -362,9 +459,12 @@ def test_shared_agent_operating_architecture_covers_schemas_tools_helpers() -> N
         "and synthesis"
     ) in text
     assert "`structure_web_data_for_schema`" in text
+    assert "`airtable_create_expense_from_receipt`" in text
     assert "`airtable_write_record`" in text
+    assert "`airtable_upload_attachment`" in text
     assert (
-        "no deletes, schema changes, attachment uploads, bulk overwrites, or silent mutations"
+        "No deletes, schema changes, generic attachment uploads, bulk overwrites, "
+        "or silent mutations"
         in text
     )
     assert "use Playwright only as a read-only backend/headless diagnostic rendering helper" in text
@@ -538,10 +638,11 @@ def test_slack_posting_rules_include_readable_finance_example() -> None:
 
 def test_chief_of_staff_finance_doc_prompt_requires_analysis_not_transfer() -> None:
     text = _read_prompt("chief_of_staff.md")
+    normalized = " ".join(text.split())
 
-    assert "pass that exact value to" in text
-    assert "`google_drive_create_folder` and `google_doc_write`" in text
-    assert "include actual analysis, not just data\ntransfer" in text
+    assert "preserve that exact value for downstream execution" in text
+    assert "Google Workspace Context or the\napproved Workspace action handler" in text
+    assert "include actual analysis, not just data transfer" in normalized
     assert "rolling-note assumptions" in text
     assert "Use deterministic arithmetic from\nnormalized records" in text
 
@@ -598,6 +699,18 @@ def test_chief_of_staff_prompt_requires_visible_source_urls_for_external_facts()
     assert "include the source\nURL in the user-visible summary on the first answer" in text
     assert "Do not put the citation only\nin structured `sources`" in text
     assert "source\nverification is still needed" in text
+
+
+def test_chief_of_staff_prompt_handles_business_expense_receipt_periods() -> None:
+    text = _read_prompt("chief_of_staff.md")
+    normalized = " ".join(text.split())
+
+    assert "Map explicit business-expense requests to `Business Expenses`" in normalized
+    assert "explicit personal-expense requests to `Personal Expenses`" in normalized
+    assert "Reason from the receipt date and the tracker period rules" in normalized
+    assert "do not use the current calendar date" in normalized
+    assert "`airtable_create_expense_from_receipt` for the final approved" in normalized
+    assert "lower-level record-write plus attachment operations only when the bounded receipt tool" in normalized
 
 
 def test_chief_of_staff_prompt_keeps_web_briefs_substantive() -> None:
@@ -975,7 +1088,7 @@ def test_outreach_prompt_forbids_em_dashes_and_sets_length_limits() -> None:
     assert "No unsupported claims" in text
     assert "Cold email must be under 180 words" in text
     assert "LinkedIn note must be under 300 characters" in text
-    assert "All drafts approval-gated" in text
+    assert "Approval scope must remain `external_use`" in text
     assert "Gmail reply drafts default to Slack-thread-only review text" in text
     assert "Provider-side Gmail draft creation is a separate setting-backed action" in text
     assert "Internal Workspace Artifacts" in text

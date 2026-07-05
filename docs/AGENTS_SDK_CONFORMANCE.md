@@ -45,9 +45,9 @@ concept in an explicit local boundary.
   natural-language Slack, CLI, WorkItem, scheduled-automation, and explicit
   named-agent paths. Specialists still receive the raw request plus compact
   Orchestrator memo/context.
-- LangGraph is an optional orchestration wrapper around WorkItems. It must call
-  existing typed runners, carry Orchestrator preflight context, and preserve SDK
-  specialists as the behavior boundary.
+- LangGraph is an optional graph runtime around WorkItems. It must call existing
+  typed workflow utilities, carry Orchestrator preflight context, and preserve
+  SDK specialists as the behavior boundary.
 - Sandbox execution is explicit. `run_sandbox_workspace_review(...)` defaults to
   setup preview, and real execution requires `execute=True` with either
   credential-gated `live=True` or an injected fake/local runner for tests.

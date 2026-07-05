@@ -42,8 +42,8 @@ Start here when changing or operating the repository.
   `KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY`.
 - `work-items continue/show/timeline/select/approve-context`: state management
   commands for existing WorkItems.
-- `work-items advance --langgraph`: optional WorkItem graph wrapper for
-  approval-checkpoint metadata and future resumable orchestration.
+- `work-items advance --langgraph`: optional graph-native WorkItem execution
+  with approval-checkpoint metadata and future resumable orchestration.
 
 ## Add Or Change Agents
 

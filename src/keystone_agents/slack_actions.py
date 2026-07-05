@@ -17,6 +17,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from keystone_agents.agents.orchestrator import run_orchestrator_preflight
 from keystone_agents.automation_inventory import build_automation_inventory_report
 from keystone_agents.eval_runtime_diagnostics import slack_eval_blocker_diagnostics
+from keystone_agents.langgraph_workflow import (
+    advance_work_item_manager_loop_with_optional_langgraph,
+)
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
@@ -42,7 +45,9 @@ from keystone_agents.slack_query_prompts import (
     resolve_slack_query_prompt,
     slack_query_prompt_external_context,
 )
-from keystone_agents.workflow_runner import advance_work_item_manager_loop
+from keystone_agents.workflow_runner import (
+    _request_forbids_live_research,
+)
 
 DEFAULT_SLACK_CONTEXT_DIR = Path("artifacts/slack_contexts")
 
@@ -56,6 +61,20 @@ _EVAL_CASE_ID_RE = re.compile(
     r"\b(?:eval\s+case|case(?:_id)?)\s*(?:[:=]\s*|\s+)([A-Za-z0-9_.:-]+)",
     re.IGNORECASE,
 )
+
+_NEEDS_INPUT_BLOCKER_CODES = {
+    "gmail_context_required",
+    "manager_loop_research_not_completed",
+    "manager_loop_opportunity_not_created",
+    "manager_loop_outreach_not_drafted",
+    "no_opportunities_found",
+    "opportunity_context_required",
+    "outreach_requires_approved_context",
+    "research_context_required",
+    "selected_slack_context_required",
+    "source_bundle_required",
+    "source_sufficiency_required",
+}
 
 
 class SlackContextMessage(BaseModel):
@@ -536,6 +555,8 @@ def handle_run_agent_interaction(
                 context_file_path = ""
         if selected_context is not None:
             context_warnings = selected_context.warnings
+        if live_search and _request_forbids_live_research(submission.requested_task):
+            live_search = False
         feedback_events: list[dict[str, Any]] = []
         slack_feedback_callback = _build_feedback_collector(
             feedback_events,
@@ -601,7 +622,7 @@ def handle_run_agent_interaction(
             and "cost_profile" not in request_options
         ):
             request_options["cost_profile"] = slack_query_prompt.cost_profile
-        result = advance_work_item_manager_loop(
+        result = advance_work_item_manager_loop_with_optional_langgraph(
             WorkflowRunRequest(
                 request_text=submission.requested_task,
                 save=True,
@@ -651,6 +672,7 @@ def handle_run_agent_interaction(
                 str(result_payload.get("human_summary") or ""),
                 eval_record=eval_record,
             )
+        _attach_operator_display_fields(result_payload, result=result)
         return SlackAgentActionResult(
             stage="work_item",
             callback_id=RUN_AGENT_VIEW_CALLBACK_ID,
@@ -665,6 +687,58 @@ def handle_run_agent_interaction(
             result=result_payload,
         )
     raise ValueError(f"Unsupported Slack run-agent payload type: {payload_type or 'unknown'}")
+
+
+def _attach_operator_display_fields(result_payload: dict[str, Any], *, result: Any) -> None:
+    """Add Slack-facing display fields without changing canonical WorkItem state."""
+
+    human_summary = str(result_payload.get("human_summary") or "").strip()
+    if human_summary:
+        result_payload.setdefault("slack_display_text", human_summary)
+        result_payload.setdefault("display_text", human_summary)
+    status = str(
+        result_payload.get("status")
+        or getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
+        or ""
+    ).strip()
+    operator_status = _operator_status_for_result_payload(result_payload, canonical_status=status)
+    result_payload["operator_status"] = operator_status
+    result_payload["slack_display_title"] = _operator_title_for_status(operator_status)
+    result_payload["canonical_status"] = status
+
+
+def _operator_status_for_result_payload(
+    result_payload: dict[str, Any],
+    *,
+    canonical_status: str,
+) -> str:
+    status = canonical_status.strip().lower()
+    if status == "blocked":
+        blocker_codes = {
+            str(blocker.get("code") or "").strip()
+            for blocker in result_payload.get("blockers") or []
+            if isinstance(blocker, dict)
+        }
+        if not blocker_codes or blocker_codes & _NEEDS_INPUT_BLOCKER_CODES:
+            return "needs_input"
+        return "needs_review"
+    if status == "needs_approval":
+        return "needs_approval"
+    if status in {"done", "completed"}:
+        return "completed"
+    if status == "failed":
+        return "failed"
+    return status or "unknown"
+
+
+def _operator_title_for_status(operator_status: str) -> str:
+    return {
+        "needs_input": "Business Agents Need Input",
+        "needs_review": "Business Agents Need Review",
+        "needs_approval": "Business Agents Awaiting Approval",
+        "completed": "Business Agents Run Completed",
+        "failed": "Business Agents Run Failed",
+    }.get(operator_status, "Business Agents Run Update")
 
 
 def _slack_cost_conservation_request_options(request_text: str) -> dict[str, Any]:
@@ -1309,6 +1383,14 @@ def _blocked_slack_agent_result(
             "route_result", {}
         ),
     }
+    preflight_summary = str(
+        getattr(route_result, "clarification_request", "")
+        or getattr(route_result, "stop_reason", "")
+        or ""
+    ).strip()
+    if preflight_summary:
+        result_payload["human_summary"] = preflight_summary
+    _attach_operator_display_fields(result_payload, result=None)
     return SlackAgentActionResult(
         stage="work_item",
         callback_id=RUN_AGENT_VIEW_CALLBACK_ID,

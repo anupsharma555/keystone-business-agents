@@ -46,59 +46,59 @@ SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "74aa585ef3fae49791c7e1622b848ae7159ef13d332b38017b263c598d3b8158",
+        "instructions_sha256": "b04988b095b2f2944cb91ecdf734c761d2c6063f82f692d0992fa93d5d21b2f0",
         "tool_names_sha256": "5666cdbfcc42bfd14f3dcd75c544302d6fa9aa7f76697b1d24fdb87a5880dd76",
         "output_schema_sha256": "519be6127e040ff904066e7dd8efe671ce88a3c4c527bdcb730a6e5f131d3345",
     },
     "business_research_analyst": {
-        "instructions_sha256": "a55f0a8ca20b52703b810e0db67ad3de385c687ab4969d88b2874b7f3e5d69e8",
+        "instructions_sha256": "acc5c794e92c0dee962c6f8a3de4fab3c1580bd42a27d7995ac1985987848dae",
         "tool_names_sha256": "8c128ab9eee684363954e52c9b1b8a29e27df6b1509647f4b39479f37ddf1bc1",
         "output_schema_sha256": "b8218a333d85d2f3850203f5ee48b7ec535a6f924a8851c513f1f2b2afeef6e0",
     },
     "opportunity_scout": {
-        "instructions_sha256": "f27df85efb5098da256e510b42c4003b9b74e84a94c48dadf0aa045c62867345",
+        "instructions_sha256": "0e28a3d6d0a707110eb763366aa61fe32e256e6e275759af3d9d07796bbc7b83",
         "tool_names_sha256": "38c690f9feef3bcb9699511283538d4448fe33a4e1f82d68acab135f51e4d51b",
         "output_schema_sha256": "2e91674be427e59361cfb5a9c275a048bf4166fbcd9f88f6e06405a235ab59e8",
     },
     "outreach_composer": {
-        "instructions_sha256": "a7e8c116bd463f725ed2c739f1b10fa0e7c55d9efcf5c359a045c94c5ada1a5f",
+        "instructions_sha256": "b3536342f5d5c306ea1532dd6e5983d267d8f5ac7eb851cd0344e53d091f1045",
         "tool_names_sha256": "b86270338a35685eb23e446ca5ec82e4ff7849e71356129b7920ca33c454de68",
         "output_schema_sha256": "167da45f0bb07c0a255c4115b52e9510272a22cc1c479abe9e97c88693d44b34",
     },
     "airtable_context_agent": {
-        "instructions_sha256": "1cd163cd0093193bf1360c72c1e00737896989a99856ba5d0dea7e5d46b85908",
-        "tool_names_sha256": "8dbe88d3c4789ad1579d96c16bdd4136d16b69801d0b0402e92cbd83c2eb2f23",
-        "output_schema_sha256": "e472babb0c090889cbd7a6afa92dce58e4006e6895754c48d0fe2b5e661e1442",
+        "instructions_sha256": "2dca545fc5698d9a0adabe29b3e7eae3113047416012f4bea85422e22b7f194c",
+        "tool_names_sha256": "64846cdbb1e51dbae23640c4756dfd3c7cfab9d0ef889044ddba79d57bbdfdc6",
+        "output_schema_sha256": "7d4017a4e6833b52f2c408fe16352594a5fa2b393e740433a25b77b2934c4984",
     },
     "google_workspace_context_agent": {
-        "instructions_sha256": "475d35529d78af5019232bca5739ca7c5bc20e23b80309c1e02069339bac3c46",
+        "instructions_sha256": "5e44990da2c1f1c274276f2243e694d8077945ea855209eaebad6056453d29d3",
         "tool_names_sha256": "a20b54ebe4e23acf72fbab3fcba4d67150a81fefc03d00d16c5b94ce9f56c760",
-        "output_schema_sha256": "28dc3fc15522eeaf4693d4e5787f1927f9913a180a958ca1f3228d0fd6741731",
+        "output_schema_sha256": "1b82a4db79f4e9f017351bafb57dbad7399b5c05e6e7ba528d97abbe7f1be506",
     },
     "zotero_context_agent": {
-        "instructions_sha256": "af7e79e408839622a87c4de63b4409db0c97ff9b238a8bd3da36af36299df50c",
+        "instructions_sha256": "05c33fd5bed93b457f4c10a6aacb0bbc8aed2823664f7a6087bd128a9a4bc335",
         "tool_names_sha256": "4b5242fa381337a43a5dbb560a8c99a956ebe2540d011369aa5238236f402b96",
-        "output_schema_sha256": "948058c91335bafdbc38116beb87fc71b8b874ce8c7d2a1b6626bf07893f9426",
+        "output_schema_sha256": "af5ce4abdb61216c64350e2e2e7d2ed262e947cfe84929ce98e2e43d960c75dc",
     },
     "rss_context_agent": {
-        "instructions_sha256": "f6f446f9775866b4104d7fc00d80633393b9ccb8fe10fb83f88c2949b54fa305",
+        "instructions_sha256": "b417fcfa2119ee2e89ae014711e4d305ed9ce4553c21c9b305ccd7e71375179c",
         "tool_names_sha256": "f31fcf99ce67500ab85ceb6130f6c81c8fdeea9668c82ffd10eaf4862b47a55f",
         "output_schema_sha256": "c81421b84589b67baca97d6ae5bc0a8468adbe9bd3b10d1c13639a3148d68936",
     },
     "preprints_context_agent": {
-        "instructions_sha256": "4ffd2f7df41b1fd19ca51352c8dfeeb4791235a44c9f2eae9b1688bece155087",
+        "instructions_sha256": "da5c3bb30e91ca5e24101e3616028bef377e5c352dcbf05fefcf57cf8a098dea",
         "tool_names_sha256": "985bb3e5f395ac4fdab0e2243e450e60eaeab20c34646431415a94dbbb9bef08",
         "output_schema_sha256": "0c360ba87ef900bd5c658029374a445b6c14c22b9067207d8b7ad083c4b1d702",
     },
     "orchestrator": {
-        "instructions_sha256": "d570b258c2ce14ddd2678ca8e2a294c925f8921ac0550ae47ef1043ae58d6a22",
-        "tool_names_sha256": "65a79825b11ddc73b9418be488895e8ba03e4c3d9e9b5a68bc0dd9eb8775cb72",
+        "instructions_sha256": "44690dfb3eafaf3a6b71a0bb65acaedd50a608931c7d5defb76d50d8f46e2893",
+        "tool_names_sha256": "2f52fbbbd1568235c0fb761130b8fa96d5c506ca88e4a62ce4dea8dd1e90189b",
         "output_schema_sha256": "98f0e154658a465df86c498fbf9b1a6c84028fbd02eedef97d1549ef5b5887e7",
     },
     "chief_of_staff": {
-        "instructions_sha256": "21359599661bd362310c81ec69b1a67ce0a5897f647e553c2cc1a85ef9425f3f",
-        "tool_names_sha256": "b1deac379e2121c7c1d4e6c69471845228ce3b6f3accf8e85754ca089b0ce18d",
-        "output_schema_sha256": "c8b0252319afa129becdea43ebbb25b262fbf10f4cda9f4284cf09ad5d0a1cd7",
+        "instructions_sha256": "66d139de62f6f5bc96eb594eb1e61c3656f35f3a2657a8147fdd84cd8019880c",
+        "tool_names_sha256": "7f7c9b6f6ba96d98ccc94274a904a72beb72d64491ca59daf5f0965e89381da1",
+        "output_schema_sha256": "c9fefe2f478448b975a510c132b2b2dce5b00aedd13b5d1f25c0915ca778ef42",
     },
 }
 
@@ -263,6 +263,8 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
 
     assert {"airtable_get_base_schema", "airtable_read_records"} <= airtable_tool_names
     assert "airtable_write_record" in airtable_tool_names
+    assert "airtable_upload_attachment" in airtable_tool_names
+    assert "airtable_create_expense_from_receipt" in airtable_tool_names
     assert workspace_tool_names == {
         "google_doc_read",
         "google_doc_write",
@@ -314,6 +316,8 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     assert disallowed_tool_names("rss_context_agent", sorted(rss_tool_names)) == []
     assert disallowed_tool_names("preprints_context_agent", sorted(preprints_tool_names)) == []
     assert tool_tier_for_name("airtable_write_record") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("airtable_upload_attachment") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("airtable_create_expense_from_receipt") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("google_doc_write") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("zotero_import_article_with_backend") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("retrieve_rss_announcement_history") == ToolTier.CORE_READ
@@ -342,6 +346,8 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
         | _tool_names(nested_preprints)
     )
     assert "airtable_write_record" not in nested_tool_names
+    assert "airtable_upload_attachment" not in nested_tool_names
+    assert "airtable_create_expense_from_receipt" not in nested_tool_names
     assert "google_drive_get_file_metadata" in nested_tool_names
     assert "google_doc_write" not in nested_tool_names
     assert "google_sheet_append_rows" not in nested_tool_names
@@ -446,6 +452,7 @@ def test_tool_tiers_keep_search_and_write_surfaces_separate() -> None:
     assert "fetch_company_page" not in research_web
     assert "extract_research_claims_from_html" in research_deep
     assert "airtable_write_record" not in research_deep
+    assert "airtable_upload_attachment" not in research_deep
     assert "google_sheet_append_rows" not in research_deep
     assert "render_page" in scout_diagnostic
     assert "save_opportunity_memory" not in scout_diagnostic
@@ -466,6 +473,7 @@ def test_search_heavy_agent_builders_support_tiered_tool_attachment() -> None:
     assert "search_web" in research_deep_tools
     assert "extract_research_claims_from_html" in research_deep_tools
     assert "airtable_write_record" not in research_deep_tools
+    assert "airtable_upload_attachment" not in research_deep_tools
     assert "search_web" in scout_web_tools
     assert "render_page" not in scout_web_tools
     assert "render_page" in scout_diagnostic_tools

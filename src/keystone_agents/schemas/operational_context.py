@@ -108,7 +108,7 @@ class HumanWorkContext(BaseModel):
 
 
 class OperationalWritePlan(BaseModel):
-    """A proposed Chief-owned internal write, not an executed nested write."""
+    """A proposed internal write for review, not an executed nested write."""
 
     model_config = ConfigDict(extra="forbid")
 

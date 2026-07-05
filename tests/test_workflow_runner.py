@@ -17,8 +17,10 @@ from keystone_agents.multi_target_research import (
     MultiTargetResearchPlan,
     MultiTargetResearchResult,
     PerTargetResearchPacket,
+    should_run_multi_target_research,
 )
 from keystone_agents.orchestrator.preflight_context import compact_orchestrator_preflight_payload
+from keystone_agents.quality_budget import QualityMode
 from keystone_agents.reporting import render_work_item_result_text
 from keystone_agents.schemas.approval import ApprovalState
 from keystone_agents.schemas.chief_of_staff import (
@@ -66,6 +68,83 @@ from keystone_agents.work_items import (
     set_next_action,
 )
 from keystone_agents.workflow_runner import advance_work_item, advance_work_item_manager_loop
+
+
+def test_chief_workflow_allows_explicit_business_expense_receipt_airtable_write() -> None:
+    request = (
+        "chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: "
+        "/tmp/example-business-cards-receipt.pdf"
+    )
+
+    policy = workflow_runner._chief_workflow_side_effect_policy(request)
+
+    assert workflow_runner._chief_workflow_requests_finance_tracker_airtable_write(request)
+    assert workflow_runner._chief_workflow_approval_reference(request).startswith(
+        "chief-of-staff-workitem:"
+    )
+    assert "explicitly requested finance_tax_tracker Airtable create/update" in policy
+    assert "one receipt attachment upload is allowed through typed Airtable tools" in policy
+    assert "read-only interpretation" not in policy
+    assert workflow_runner._manager_loop_requests_crm_write(request) is False
+
+
+def test_chief_workflow_passes_receipt_write_policy_to_live_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    request_text = (
+        "chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: "
+        "/tmp/example-business-cards-receipt.pdf"
+    )
+    work_item = WorkItem(
+        id="wi_business_expense_receipt",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Business expense receipt",
+        request_text=request_text,
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+    )
+
+    def fake_run_chief_of_staff_sdk(
+        sdk_input: dict[str, object],
+        **kwargs: object,
+    ) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured["sdk_input"] = sdk_input
+        captured["kwargs"] = kwargs
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary="Business expense receipt create path reached Chief.",
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="artifact-write-plan",
+                    target_channel="ai-agents-workflow",
+                ),
+            ),
+            raw_result=None,
+            live=True,
+        )
+
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+
+    result = workflow_runner._advance_chief_of_staff(
+        work_item,
+        request=WorkflowRunRequest(request_text=request_text, live_sdk=True),
+        store=None,
+    )
+
+    sdk_input = captured["sdk_input"]
+    assert result.status == WorkItemStatus.DONE
+    assert sdk_input["request"] == request_text
+    assert str(sdk_input["approval_reference"]).startswith("chief-of-staff-workitem:")
+    assert "explicitly requested finance_tax_tracker Airtable create/update" in str(
+        sdk_input["side_effect_policy"]
+    )
+    assert "one receipt attachment upload is allowed through typed Airtable tools" in str(
+        sdk_input["side_effect_policy"]
+    )
+    assert captured["kwargs"]["force_sdk_interpretation"] is True
 
 
 def _database_url(tmp_path: Path) -> str:
@@ -324,6 +403,28 @@ def test_business_research_category_comparison_dispatches_multi_target_branch(
     assert "Multi-target pass types" in result.human_summary
 
 
+def test_single_company_comparison_smoke_does_not_dispatch_multi_target_branch() -> None:
+    request_text = (
+        "chief of staff NeuroFlow has been coming up as a behavioral-health AI company. "
+        "Do research, assess whether this is a KNI opportunity, and include a "
+        "draft-only Slack-thread sample outreach. Live SDK is approved only for this "
+        "bounded comparison smoke; live web search is not approved."
+    )
+
+    assert not should_run_multi_target_research(
+        request_text=request_text,
+        manual_plan={
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "primary_target": "NeuroFlow",
+            "target_type": "company",
+            "desired_count": 1,
+            "constraints": ["advisory", "source-backed"],
+        },
+        target="NeuroFlow",
+    )
+
+
 @pytest.mark.parametrize(
     ("requested_agent", "expected_specialist"),
     [
@@ -408,6 +509,65 @@ def test_polite_context_agent_ask_gets_useful_chief_wrapper(
     assert "Need clarification before selecting a Slack operations workflow" not in (
         result.human_summary
     )
+
+
+def test_business_expense_receipt_request_is_not_generic_airtable_context_advisory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    prompt = (
+        "@KNI chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: "
+        "/tmp/example-business-cards-receipt.pdf"
+    )
+    monkeypatch.setattr(
+        workflow_runner,
+        "extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="example-business-cards-receipt.pdf",
+            content_read=True,
+            extraction_method="fixture",
+            vendor="Example Print Inc.",
+            receipt_date="2026-06-28",
+            order_number="1002003",
+            description="Business Cards",
+            quantity="50",
+            subtotal="31.00",
+            shipping="45.80",
+            total="76.80",
+            currency="USD",
+            payment_summary="credit card ending in 0000",
+            estimated_tax_periods="Q3",
+        ),
+    )
+    manual_plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=prompt,
+            database_url=_database_url(tmp_path),
+            save=True,
+            manual_request_plan=manual_plan.model_dump(mode="json"),
+            live_sdk=False,
+            live_search=False,
+        ),
+        max_steps=1,
+    )
+
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert result.status == WorkItemStatus.DONE
+    assert result.human_summary.startswith("Chief of Staff finance tracker receipt write plan")
+    assert "Chief of Staff context-agent advisory" not in result.human_summary
+    assert "`Business Expenses`" in result.human_summary
+    assert "Example Print Inc." in result.human_summary
+    assert "2026-06-28" in result.human_summary
+    assert "Q3" in result.human_summary
+    assert "76.80" in result.human_summary
+    assert "`Estimated Tax Periods` from the receipt date" in result.human_summary
+    assert "airtable_create_expense_from_receipt" in result.human_summary
 
 
 def test_requested_opportunity_comparison_gets_artifact_aligned_table() -> None:
@@ -3020,7 +3180,7 @@ def test_chief_of_staff_local_kni_packet_uses_latest_wrapped_request(
             "send_enabled": False,
             "candidate_documents": [
                 {
-                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
                     "content_excerpt": "PRODUCER IAO, Inc. DBA ProAssurance Agency",
                     "local_only": True,
                     "send_enabled": False,
@@ -3045,7 +3205,7 @@ def test_chief_of_staff_local_kni_packet_uses_latest_wrapped_request(
                 mode="llm",
                 summary=(
                     "The broker/producer is ProAssurance. Evidence path: "
-                    "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf."
+                    "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf."
                 ),
                 recommended_route=ChiefOfStaffRouteRecommendation(
                     workflow_type="project-context-review",
@@ -3054,7 +3214,7 @@ def test_chief_of_staff_local_kni_packet_uses_latest_wrapped_request(
                 retrieval_diagnostics={
                     "local_only": True,
                     "send_enabled": False,
-                    "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                    "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
                 },
             ),
             raw_result={"sdk": "called"},
@@ -3107,7 +3267,7 @@ def test_chief_of_staff_local_kni_packet_uses_latest_wrapped_request(
     assert sdk_input["orchestrator_context"]["local_kni_evidence_query"] == latest_ask
     assert sdk_input["local_kni_evidence_packet"]["candidate_documents"][0][
         "relative_path"
-    ].endswith("COI_AnupSharma_2026.pdf")
+    ].endswith("COI_Operator_2026.pdf")
     assert sdk_input["runtime_source_layer_policy"]["agent_name"] == "chief_of_staff"
     layer_status = {
         layer["layer"]: layer["runtime_status"]
@@ -4501,6 +4661,86 @@ def test_manager_loop_final_synthesis_uses_configured_sdk_session(
     }
 
 
+def test_manager_loop_smoke_limited_skips_final_live_response_synthesis(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+
+    def fake_run_chief_of_staff_sdk(
+        _sdk_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary=(
+                    "Stop at an approval checkpoint because source-backed evidence "
+                    "has not been verified."
+                ),
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="research-direction-review",
+                    target_channel="current thread",
+                ),
+                approval_required=True,
+                audit_notes=[],
+            ),
+            raw_result=None,
+            live=True,
+            usage={"requests": 1},
+            cost={"estimated_usd": 0.01, "amount_usd": 0.01},
+            request_cache={"prompt_cache_key_hash": "smoke-chief"},
+        )
+
+    def fail_synthesis(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("smoke-limited manager loop should not call final synthesis")
+
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(
+        workflow_runner,
+        "_maybe_synthesize_user_facing_response",
+        fail_synthesis,
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                "@KNI chief of staff NeuroFlow has payer partnership signals. "
+                "Do research, assess whether this is a KNI opportunity, and include "
+                "a draft-only Slack-thread sample outreach for review. Live SDK is "
+                "approved only for this bounded read-only smoke; live web search is "
+                "not approved. Do not send email, create Gmail drafts, post elsewhere, "
+                "schedule, publish, or write external systems."
+            ),
+            database_url=database_url,
+            save=True,
+            live_sdk=True,
+            live_search=False,
+            cost_profile="slack_smoke_limited",
+            hosted_web_search_max_calls=0,
+            allow_manager_loop_repair=False,
+            include_contact_enrichment=False,
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "chief_of_staff",
+                "target_agent": "chief_of_staff",
+                "intent": "internal_review_handoff",
+                "primary_target": "NeuroFlow",
+                "target_type": "company",
+            },
+        ),
+        max_steps=4,
+    )
+
+    events = SQLiteStore(database_url).list_work_item_events(result.work_item.id)
+    sdk_events = [event for event in events if event.event_type == "workflow_sdk_usage"]
+
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert "Skipped live user-facing response synthesis" in " ".join(result.audit_notes)
+    assert [event.actor for event in sdk_events] == ["chief_of_staff"]
+
+
 def test_manager_loop_continues_compound_request_without_then(
     tmp_path: Path,
 ) -> None:
@@ -5718,6 +5958,26 @@ def test_manager_loop_does_not_treat_negated_email_draft_as_outreach_request() -
     assert workflow_runner._manager_loop_requests_outreach_draft(request) is False
 
 
+def test_manager_loop_planning_only_request_does_not_trigger_outreach_edge() -> None:
+    planning_request = (
+        "orchestrator plan the safest workflow to find 3 behavioral health AI companies, "
+        "research the best candidate, and prepare draft-only outreach. State the route, "
+        "handoff order, blockers, and what evidence is needed before outreach."
+    )
+    execution_request = (
+        "research NeuroFlow, find matching opportunities, and prepare draft-only outreach."
+    )
+
+    assert workflow_runner._manager_loop_request_is_planning_only(
+        planning_request,
+        manual_request_plan={"requested_agent": "orchestrator"},
+    )
+    assert not workflow_runner._manager_loop_request_is_planning_only(
+        execution_request,
+        manual_request_plan={"target_agent": "business_research_analyst"},
+    )
+
+
 def test_gmail_context_gate_message_names_missing_boundary_context() -> None:
     message = workflow_runner._gmail_context_gate_message(
         "draft a reply but the recipient and email thread are not identified; "
@@ -5920,14 +6180,14 @@ def test_gmail_workitem_inline_email_completes_read_only_triage_without_gmail_wr
 ) -> None:
     database_url = _database_url(tmp_path)
     prompt = (
-        "gmail triage classify this sanitized inbound email as read-only triage only. "
+        "gmail triage this sanitized inbound email and tell me whether it needs a reply, "
+        "what the likely business relevance is, and a short Slack-thread draft reply if "
+        "useful. "
         "Email: From: Jordan Lee, Operations at Mindful Care. "
         "Subject: Follow-up on measurement support. "
-        "Body: Hi Anup, our team is reviewing measurement-based care workflows and "
+        "Body: Hi Jordan, our team is reviewing measurement-based care workflows and "
         "may need advisory help on evaluation design. Could you let me know if this "
-        "is relevant for Keystone? Return priority, reply-needed yes/no, action owner, "
-        "and risks. Do not create a Gmail draft, apply labels, send, save, post elsewhere, "
-        "or use external writes. Also keep track of this run costs."
+        "is relevant for Keystone?"
     )
     manual_plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
 
@@ -5966,10 +6226,15 @@ def test_gmail_workitem_inline_email_completes_read_only_triage_without_gmail_wr
     assert "Category:" in result.human_summary
     assert "Summary:" in result.human_summary
     assert "Recommended action:" in result.human_summary
+    assert "*Draft reply:*" in result.human_summary
+    assert "Hi Jordan" in result.human_summary
+    assert "measurement-based care" in result.human_summary
+    assert "evaluation design" in result.human_summary
     assert "Classification basis:" in result.human_summary
     assert "Subject: Follow-up on measurement support" in result.human_summary
     assert "Subject: Follow-up on measurement support From:" not in result.human_summary
     assert "No Gmail draft, label, send" in result.human_summary
+    assert "Fixture mode uses deterministic" not in result.human_summary
     assert "Run metadata:" not in result.human_summary
     assert "Artifacts:" not in result.human_summary
     assert result.next_action is not None
@@ -5987,6 +6252,95 @@ def test_gmail_workitem_inline_email_completes_read_only_triage_without_gmail_wr
     assert gate["gate_id"] == "gmail_sensitive_message_gate"
     assert gate["status"] == "passed"
     assert gate["evidence"]["unsafe_flags"] == []
+
+
+def test_inline_gmail_research_thread_draft_uses_triage_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    prompt = (
+        "gmail triage this sanitized inbound email from Mindful Care, research "
+        "Mindful Care, and prepare a draft-only Slack-thread sample outreach for "
+        "review. Email: From: Jordan Lee, Operations at Mindful Care. Subject: "
+        "Follow-up on measurement support. Body: Hi Jordan, our team is reviewing "
+        "measurement-based care workflows and may need advisory help on evaluation "
+        "design. Could you let me know if this is relevant for Keystone?"
+    )
+    manual_plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
+
+    def fake_run_retrieved_sdk_synthesis(**kwargs):
+        context = kwargs["retrieve"]()
+        typed_input = kwargs["normalize"](context)
+
+        class Outcome:
+            usage = {
+                "requests": 1,
+                "input_tokens": 100,
+                "output_tokens": 80,
+                "total_tokens": 180,
+            }
+            cost = {"estimated_usd": 0.001, "source": "test_pricing"}
+            request_cache = {"dynamic_prompt_chars": len(str(typed_input.approved_context))}
+            final_output = {
+                "company_name": "Mindful Care",
+                "recipient": "Jordan Lee",
+                "email_subject": "Re: Follow-up on measurement support",
+                "email_body": (
+                    "Hi Jordan,\n\n"
+                    "Thanks for reaching out. Keystone can review whether there is "
+                    "a practical fit around measurement-based care workflows and "
+                    "evaluation design. It would be useful to share non-sensitive "
+                    "context on goals, evidence collected so far, and timing so we "
+                    "can assess whether this is relevant for Keystone.\n\n"
+                    "Sincerely,\nKeystone"
+                ),
+                "linkedin_note": "Happy to compare notes if useful.",
+                "personalization_rationale": (
+                    "Used the sanitized inbound email and thread-local Slack context."
+                ),
+                "source_ids_used": ["gmail_thread:inline_email"],
+            }
+
+        return Outcome()
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_retrieved_sdk_synthesis",
+        fake_run_retrieved_sdk_synthesis,
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=prompt,
+            database_url=database_url,
+            save=True,
+            live_sdk=True,
+            external_context={
+                "schema": "keystone.slack.selected_message_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1715366400.000100",
+            },
+            manual_request_plan=manual_plan.model_dump(mode="json"),
+        ),
+        max_steps=5,
+    )
+    store = SQLiteStore(database_url)
+    draft_row = store.fetch_all("outreach_drafts")[0]
+
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.DONE
+    assert result.blockers == []
+    assert result.artifact_refs[-1].artifact_type == "outreach_draft"
+    assert result.artifact_refs[-1].metadata["thread_local_slack_draft"] is True
+    assert result.artifact_refs[-1].metadata["approval_queue_created"] is False
+    assert "Hi Jordan," in draft_row["email_body"]
+    assert "measurement-based care workflows" in draft_row["email_body"]
+    assert "evaluation design" in draft_row["email_body"]
+    assert "relevant for Keystone" in draft_row["email_body"]
+    assert "Hi [Name]" not in result.human_summary
+    assert "Gmail thread body was not available" not in result.human_summary
+    assert store.list_approval_items(object_type="outreach_draft") == []
 
 
 @pytest.mark.parametrize("spec_id", ["GT-1", "GT-2", "GT-3", "GT-4"])
@@ -6039,14 +6393,13 @@ def test_gmail_context_required_block_has_sectioned_operator_summary(
     assert result.route == WorkItemRoute.GMAIL_TRIAGE
     assert result.status == WorkItemStatus.BLOCKED
     assert {blocker.code for blocker in result.blockers} == {"gmail_context_required"}
-    assert "Gmail Triage needs selected message context" in result.human_summary
-    assert "Gmail Triage cannot summarize" in result.human_summary
-    assert "required context is available" in result.human_summary
+    assert "What email should I use?" in result.human_summary
+    assert "I can triage, summarize" in result.human_summary
+    assert "What I need" in result.human_summary
     assert "*Answer:*" in result.human_summary
-    assert "*Detailed Summary:*" in result.human_summary
-    assert "*Next step:*" in result.human_summary
-    assert "Approval boundary" in result.human_summary
-    assert "Human review required" in result.human_summary
+    assert "*Reply with:*" in result.human_summary
+    assert "Boundary" in result.human_summary
+    assert "Human review" in result.human_summary
     assert "no Gmail draft, label, archive" in result.human_summary
     assert review["review_status"] == "pass"
     assert review["review_decision"] == "pass"
@@ -6698,6 +7051,88 @@ def test_advance_opportunity_scout_no_external_context_skips_live_retrieval(
     assert any("forbids external research" in note.lower() for note in result.audit_notes)
     assert any("source-provided" in note.lower() for note in result.audit_notes)
     assert "Rowan Recovery" in result.artifact_refs[0].title
+
+
+def test_advance_opportunity_scout_live_web_search_not_approved_skips_live_retrieval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_live_retrieval(**_: object):
+        raise AssertionError("live retrieval should not run when live web search is not approved")
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fail_live_retrieval,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "opportunity scout agent: use source-provided context for NeuroFlow: "
+                "NeuroFlow is considering measurement workflow partnerships for "
+                "behavioral health clinics. Live web search is not approved. Do not "
+                "send, publish, schedule, or write external systems."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            live_sdk=False,
+            max_results=2,
+        )
+    )
+
+    assert result.advanced is True
+    assert result.route == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert result.artifact_refs
+    assert all(
+        artifact.metadata.get("source_provided")
+        for artifact in result.artifact_refs
+        if artifact.artifact_type == "opportunity"
+    )
+    assert any("forbids external research" in note.lower() for note in result.audit_notes)
+
+
+def test_advance_opportunity_scout_specific_inbound_context_asks_for_sources_when_offline(
+    tmp_path: Path,
+) -> None:
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                "Assess whether Mindful Care's inbound note about measurement-based "
+                "care evaluation design is worth pursuing as a KNI advisory opportunity. "
+                "Explain the opportunity, risks, and next step."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=False,
+            live_sdk=False,
+            max_results=2,
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "opportunity_scout",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": (
+                    "Mindful Care inbound note about measurement-based care "
+                    "evaluation design"
+                ),
+                "desired_count": 1,
+                "requires_live_search": True,
+                "task_objective": "opportunity_discovery",
+            },
+        ),
+        max_steps=1,
+    )
+
+    assert result.route == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert result.status == WorkItemStatus.BLOCKED
+    assert [blocker.code for blocker in result.blockers] == [
+        "opportunity_requires_source_or_live_search"
+    ]
+    assert result.artifact_refs == []
+    assert "source-provided evidence or approved live search" in result.human_summary
+    assert "SAM.gov" not in result.human_summary
+    assert any("specific assessment needs source context" in note for note in result.audit_notes)
 
 
 def test_manager_loop_no_external_opportunity_scout_finishes_with_direction_summary(
@@ -8501,6 +8936,163 @@ def test_slack_chief_deep_search_request_gets_bounded_manager_repair_profile() -
     assert request.reuse_existing_research is False
 
 
+def test_slack_bounded_smoke_overrides_deep_cost_profile() -> None:
+    request = workflow_runner._normalize_workflow_request_for_context(
+        WorkflowRunRequest(
+            request_text=(
+                "business agents LangGraph smoke 3: Chief of Staff coordinate Airtable "
+                "Context agent schema context before Opportunity Scout assesses Example "
+                "Health. Live SDK is approved only for this bounded read-only smoke; "
+                "live web search is not approved."
+            ),
+            cost_profile="slack_manager_deep",
+            hosted_web_search_max_calls=2,
+            external_context={
+                "schema": "keystone.slack.selected_message_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1715366400.000100",
+            },
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "chief_of_staff",
+                "target_agent": "chief_of_staff",
+                "intent": "internal_review_handoff",
+            },
+        )
+    )
+
+    assert request.cost_profile == "slack_smoke_limited"
+    assert request.hosted_web_search_max_calls == 0
+    assert request.allow_manager_loop_repair is False
+    assert request.include_contact_enrichment is False
+    assert request.reuse_existing_research is True
+
+
+def test_slack_query_prompt_bounded_smoke_overrides_deep_cost_profile() -> None:
+    request = workflow_runner._normalize_workflow_request_for_context(
+        WorkflowRunRequest(
+            request_text=(
+                "LangGraph smoke 3: Chief of Staff coordinate Airtable Context agent "
+                "schema context before Opportunity Scout assesses Example Health as an "
+                "internal opportunity-direction planning note. Use Airtable only as "
+                "read-only context for the specialist handoff. Live SDK is approved "
+                "only for this bounded read-only smoke if the backend would normally "
+                "use it; live web search is not approved. Use local/dry-run retrieval "
+                "where possible. Do not send email, create drafts, post elsewhere, "
+                "publish, schedule, create files, update Airtable, upload attachments, "
+                "or write external systems."
+            ),
+            cost_profile="slack_manager_deep",
+            hosted_web_search_max_calls=2,
+            external_context={
+                "schema": "keystone.slack.query_prompt.v1",
+                "source": "slack_reusable_query_prompt",
+                "slack_query_prompt": {
+                    "schema": "keystone.slack.query_prompt.v1",
+                    "kind": "opportunity_search",
+                    "target_route": "chief_of_staff",
+                    "cost_profile": "slack_research_deep",
+                },
+            },
+            manual_request_plan={
+                "source": "llm",
+                "target_agent": "chief_of_staff",
+                "intent": "slack_operations",
+                "primary_target": (
+                    "LangGraph smoke 3: Chief of Staff coordinate Airtable Context "
+                    "agent schema context before Opportunity Scout assesses Example Health"
+                ),
+                "constraints": [
+                    "read-only",
+                    "dry-run-safe",
+                    "no live web search",
+                    "Airtable context only for handoff",
+                    "no external side effects",
+                ],
+            },
+        )
+    )
+
+    assert request.cost_profile == "slack_smoke_limited"
+    assert request.hosted_web_search_max_calls == 0
+    assert request.allow_manager_loop_repair is False
+    assert request.include_contact_enrichment is False
+    assert request.reuse_existing_research is True
+
+
+def test_slack_bounded_smoke_passes_fast_quality_mode_to_chief(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_chief_of_staff_sdk(
+        _sdk_input: dict[str, object],
+        **kwargs: object,
+    ) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured["quality_mode"] = kwargs.get("quality_mode")
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary="Bounded smoke routing reviewed.",
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="research-direction-review",
+                    target_channel="current thread",
+                ),
+                approval_required=True,
+                audit_notes=[],
+            ),
+            raw_result=None,
+            live=True,
+            usage={"requests": 2},
+            cost={"estimated_usd": 0.01, "amount_usd": 0.01},
+            request_cache={"prompt_cache_key_hash": "bounded-smoke-chief"},
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_chief_of_staff_sdk",
+        fake_run_chief_of_staff_sdk,
+    )
+    monkeypatch.setattr(
+        workflow_runner,
+        "_maybe_synthesize_user_facing_response",
+        lambda result, **_kwargs: result,
+    )
+
+    result = workflow_runner.advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "business agents LangGraph smoke 3: Chief of Staff coordinate Airtable "
+                "Context agent schema context before Opportunity Scout assesses Example "
+                "Health. Live SDK is approved only for this bounded read-only smoke; "
+                "live web search is not approved."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=True,
+            live_search=False,
+            cost_profile="slack_manager_deep",
+            hosted_web_search_max_calls=2,
+            external_context={
+                "schema": "keystone.slack.selected_message_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1715366400.000100",
+            },
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "chief_of_staff",
+                "target_agent": "chief_of_staff",
+                "intent": "internal_review_handoff",
+            },
+        )
+    )
+
+    assert captured["quality_mode"] == QualityMode.FAST
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+
+
 def test_slack_gmail_request_does_not_escalate_to_deep_research_cost_profile() -> None:
     request = workflow_runner._normalize_workflow_request_for_context(
         WorkflowRunRequest(
@@ -8827,19 +9419,67 @@ def test_advance_work_item_outreach_blocks_without_approved_context(tmp_path: Pa
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
     assert result.status == WorkItemStatus.BLOCKED
     assert result.blockers[0].code == "outreach_requires_approved_context"
-    assert "Outreach Composer needs approved drafting context" in result.human_summary
+    assert "What should this outreach focus on?" in result.human_summary
     assert "*Answer:*" in result.human_summary
-    assert "*Detailed Summary:*" in result.human_summary
-    assert "*Next step:*" in result.human_summary
-    assert "selected company profile or opportunity record approved for drafting" in (
-        result.human_summary
-    )
+    assert "*What I need:*" in result.human_summary
+    assert "*Reply with:*" in result.human_summary
+    assert "Focus: what the email or message should accomplish." in result.human_summary
+    assert "recipient, target contact, or target organization" in result.human_summary
+    assert "permission to use the context already in this thread" in result.human_summary
+    assert "Outreach Composer needs approved drafting context" not in result.human_summary
+    assert "cannot create draft-only outreach" not in result.human_summary
+    assert "blocked" not in result.human_summary.lower()
     assert "WorkItem" not in result.human_summary
     assert "CompanyProfile" not in result.human_summary
     assert "OpportunityRecord" not in result.human_summary
     assert result.context_pack is not None
     assert result.context_pack["can_synthesize"] is False
     assert result.context_pack["missing_requirements"]
+
+
+def test_thread_local_sample_reply_without_context_asks_for_context(tmp_path: Path) -> None:
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="Write a short Slack-thread sample reply for review.",
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=_database_url(tmp_path),
+            save=True,
+        )
+    )
+
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.advanced is False
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.blockers[0].code == "outreach_requires_approved_context"
+    assert "What should this outreach focus on?" in result.human_summary
+    assert "Thanks for reaching out. This sounds useful" not in result.human_summary
+
+
+def test_thread_local_sample_reply_uses_inline_context_not_placeholder(
+    tmp_path: Path,
+) -> None:
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Using this context: Mindful Care is asking whether Keystone can help "
+                "with measurement-based care workflow evaluation design. Write a short "
+                "Slack-thread sample reply for review."
+            ),
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=_database_url(tmp_path),
+            save=True,
+        )
+    )
+
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.advanced is False
+    assert result.status == WorkItemStatus.BLOCKED
+    assert [blocker.code for blocker in result.blockers] == [
+        "outreach_draft_needs_model_reasoning"
+    ]
+    assert result.artifact_refs == []
+    assert "Draft copy should be model-synthesized" in result.human_summary
+    assert "Thanks for reaching out. This sounds useful" not in result.human_summary
 
 
 def test_advance_work_item_outreach_accepts_approved_inline_context_labels(
@@ -8995,7 +9635,7 @@ def test_live_work_item_rendering_suppresses_operational_footer() -> None:
     assert "Route:" not in rendered
 
 
-def test_thread_local_outreach_draft_can_proceed_without_approved_context(
+def test_thread_local_outreach_draft_without_live_sdk_requests_model_reasoning(
     tmp_path: Path,
 ) -> None:
     database_url = _database_url(tmp_path)
@@ -9015,18 +9655,417 @@ def test_thread_local_outreach_draft_can_proceed_without_approved_context(
         )
     )
 
+    assert result.advanced is False
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.BLOCKED
+    assert [blocker.code for blocker in result.blockers] == [
+        "outreach_requires_approved_context"
+    ]
+    assert result.artifact_refs == []
+    assert "What should this outreach focus on?" in result.human_summary
+    assert store.count("outreach_drafts") == 0
+    assert store.list_approval_items(object_type="outreach_draft") == []
+
+
+def test_outreach_with_known_target_runs_research_before_source_context_block(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="outreach composer draft outreach for NeuroFlow",
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.status == WorkItemStatus.IN_PROGRESS
+    assert result.blockers == []
+    assert result.artifact_refs[0].artifact_type == "company_profile"
+    assert result.artifact_refs[0].title == "NeuroFlow"
+    assert result.next_action is not None
+    assert result.next_action.agent == WorkItemRoute.OUTREACH_COMPOSER
+
+
+def test_slack_thread_sample_outreach_without_live_sdk_requests_model_reasoning(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    research = advance_work_item(
+        WorkflowRunRequest(
+            request_text="research NeuroFlow",
+            database_url=database_url,
+            save=True,
+        )
+    )
+    work_item = research.work_item.model_copy(
+        update={
+            "current_route": WorkItemRoute.OUTREACH_COMPOSER,
+            "next_action": WorkItemNextAction(
+                action="draft_thread_local_sample_outreach",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+            ),
+        }
+    )
+    store.save_work_item(work_item)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "continue with a draft-only Slack-thread sample outreach for review. "
+                "Do not send email, create Gmail drafts, post outside this thread, "
+                "schedule, publish, or write external systems."
+            ),
+            work_item_id=work_item.id,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert workflow_runner.looks_like_thread_local_draft_request(
+        "draft-only Slack-thread sample outreach for review"
+    )
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.BLOCKED
+    assert [blocker.code for blocker in result.blockers] == [
+        "outreach_draft_needs_model_reasoning"
+    ]
+    assert result.artifact_refs == []
+    assert store.count("outreach_drafts") == 0
+    assert store.list_approval_items(object_type="outreach_draft") == []
+
+
+def test_draft_only_outreach_with_no_post_outside_thread_without_live_sdk_requests_model(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    research = advance_work_item(
+        WorkflowRunRequest(
+            request_text="research NeuroFlow",
+            database_url=database_url,
+            save=True,
+        )
+    )
+    work_item = research.work_item.model_copy(
+        update={
+            "current_route": WorkItemRoute.OUTREACH_COMPOSER,
+            "next_action": WorkItemNextAction(
+                action="draft_thread_local_sample_outreach",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+            ),
+        }
+    )
+    store.save_work_item(work_item)
+    request_text = (
+        "continue with draft-only outreach for review. Do not send email, create "
+        "Gmail drafts, post outside this thread, schedule, publish, or write "
+        "external systems."
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            work_item_id=work_item.id,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert workflow_runner.looks_like_thread_local_draft_request(request_text)
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.BLOCKED
+    assert [blocker.code for blocker in result.blockers] == [
+        "outreach_draft_needs_model_reasoning"
+    ]
+    assert result.artifact_refs == []
+    assert store.count("outreach_drafts") == 0
+    assert store.list_approval_items(object_type="outreach_draft") == []
+
+
+def test_slack_context_draft_only_outreach_without_live_sdk_requests_model(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    research = advance_work_item(
+        WorkflowRunRequest(
+            request_text="research NeuroFlow",
+            database_url=database_url,
+            save=True,
+        )
+    )
+    work_item = research.work_item.model_copy(
+        update={
+            "current_route": WorkItemRoute.OUTREACH_COMPOSER,
+            "target": research.work_item.target.model_copy(
+                update={
+                    "metadata": {
+                        **research.work_item.target.metadata,
+                        "slack_context": {
+                            "channel_id": "C123",
+                            "thread_ts": "1783194640.907069",
+                        },
+                    }
+                }
+            ),
+            "next_action": WorkItemNextAction(
+                action="draft_thread_local_sample_outreach",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+            ),
+        }
+    )
+    store.save_work_item(work_item)
+    request_text = (
+        "continue with draft-only outreach for review. Do not send email, create "
+        "Gmail drafts, schedule, publish, or write external systems."
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            work_item_id=work_item.id,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert not workflow_runner.looks_like_thread_local_draft_request(request_text)
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.BLOCKED
+    assert [blocker.code for blocker in result.blockers] == [
+        "outreach_draft_needs_model_reasoning"
+    ]
+    assert result.artifact_refs == []
+    assert store.count("outreach_drafts") == 0
+    assert store.list_approval_items(object_type="outreach_draft") == []
+
+
+def test_non_slack_draft_only_outreach_without_thread_marker_remains_blocked(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    research = advance_work_item(
+        WorkflowRunRequest(
+            request_text="research NeuroFlow",
+            database_url=database_url,
+            save=True,
+        )
+    )
+    work_item = research.work_item.model_copy(
+        update={
+            "current_route": WorkItemRoute.OUTREACH_COMPOSER,
+            "next_action": WorkItemNextAction(
+                action="draft_outreach",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+            ),
+        }
+    )
+    store.save_work_item(work_item)
+    request_text = (
+        "continue with draft-only outreach for review. Do not send email, create "
+        "Gmail drafts, schedule, publish, or write external systems."
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            work_item_id=work_item.id,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert not workflow_runner.looks_like_thread_local_draft_request(request_text)
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.BLOCKED
+    assert [blocker.code for blocker in result.blockers] == [
+        "outreach_requires_approved_context"
+    ]
+    assert store.count("outreach_drafts") == 0
+    assert store.list_approval_items(object_type="outreach_draft") == []
+
+
+def test_slack_context_send_request_does_not_become_thread_local_draft(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    research = advance_work_item(
+        WorkflowRunRequest(
+            request_text="research NeuroFlow",
+            database_url=database_url,
+            save=True,
+        )
+    )
+    work_item = research.work_item.model_copy(
+        update={
+            "current_route": WorkItemRoute.OUTREACH_COMPOSER,
+            "target": research.work_item.target.model_copy(
+                update={
+                    "metadata": {
+                        **research.work_item.target.metadata,
+                        "slack_context": {
+                            "channel_id": "C123",
+                            "thread_ts": "1783194640.907069",
+                        },
+                    }
+                }
+            ),
+            "next_action": WorkItemNextAction(
+                action="send_outreach",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+            ),
+        }
+    )
+    store.save_work_item(work_item)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="continue and send the outreach email now to Jordan.",
+            work_item_id=work_item.id,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.BLOCKED
+    assert [blocker.code for blocker in result.blockers] == [
+        "outreach_requires_approved_context"
+    ]
+    assert store.count("outreach_drafts") == 0
+    assert store.list_approval_items(object_type="outreach_draft") == []
+
+
+def test_slack_thread_sample_outreach_live_sdk_synthesizes_thread_local_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    research = advance_work_item(
+        WorkflowRunRequest(
+            request_text="research NeuroFlow",
+            database_url=database_url,
+            save=True,
+        )
+    )
+    work_item = research.work_item.model_copy(
+        update={
+            "current_route": WorkItemRoute.OUTREACH_COMPOSER,
+            "next_action": WorkItemNextAction(
+                action="draft_thread_local_sample_outreach",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+            ),
+        }
+    )
+    store.save_work_item(work_item)
+    captured: dict[str, object] = {"sdk_calls": 0}
+
+    def fake_run_retrieved_sdk_synthesis(**kwargs):
+        captured["sdk_calls"] = int(captured["sdk_calls"]) + 1
+        context = kwargs["retrieve"]()
+        typed_input = kwargs["normalize"](context)
+        captured["approved_context"] = typed_input.approved_context
+
+        class Outcome:
+            usage = {
+                "requests": 1,
+                "input_tokens": 120,
+                "output_tokens": 80,
+                "total_tokens": 200,
+                "cache_hit_rate": 0.25,
+            }
+            cost = {
+                "estimated_usd": 0.001,
+                "source": "test_pricing",
+                "pricing_provider": "openai",
+                "pricing_model": "gpt-test",
+            }
+            request_cache = {
+                "dynamic_prompt_chars": 420,
+                "session_attached": False,
+            }
+            final_output = {
+                "company_name": "NeuroFlow",
+                "recipient": "Review thread",
+                "email_subject": "Re: NeuroFlow",
+                "email_body": (
+                    "Hi [Name],\n\n"
+                    "I have been looking at whether there may be a useful research "
+                    "or advisory fit here. I would be glad to compare notes if helpful.\n\n"
+                    "Sincerely,\nJordan"
+                ),
+                "linkedin_note": "Open to compare notes if useful.",
+                "personalization_rationale": "Used the thread-local operator request and fixture company context.",
+                "source_ids_used": ["fixture://input"],
+            }
+
+        return Outcome()
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_retrieved_sdk_synthesis",
+        fake_run_retrieved_sdk_synthesis,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "continue with a draft-only Slack-thread sample outreach for review. "
+                "Do not send email, create Gmail drafts, post outside this thread, "
+                "schedule, publish, or write external systems."
+            ),
+            work_item_id=work_item.id,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=database_url,
+            save=True,
+            live_sdk=True,
+        )
+    )
+    artifact = result.artifact_refs[0]
     draft_row = store.fetch_all("outreach_drafts")[0]
 
-    assert result.advanced is True
+    assert captured["sdk_calls"] == 1
+    assert "Thread-local Slack sample outreach context" in str(captured["approved_context"])
+    assert "fixture:neuroflow" in str(captured["approved_context"])
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
     assert result.status == WorkItemStatus.DONE
-    assert result.artifact_refs[0].metadata["thread_local_slack_draft"] is True
-    assert result.artifact_refs[0].metadata["approval_queue_created"] is False
-    assert draft_row["email_body"].endswith("Sincerely,\nAnup")
-    assert "Gmail thread body was not available" in result.human_summary
-    assert "no external message was sent" in result.human_summary
-    assert store.count("outreach_drafts") == 1
+    assert artifact.metadata["thread_local_slack_draft"] is True
+    assert artifact.metadata["sdk_synthesis_attempted"] is True
+    assert artifact.metadata["sdk_synthesis_used"] is True
+    assert artifact.metadata["drafting_mode"] == "llm_constrained"
+    assert artifact.metadata["approval_queue_created"] is False
+    assert artifact.metadata["gmail_draft_created"] is False
+    assert artifact.metadata["send_enabled"] is False
+    assert artifact.metadata["external_write_performed"] is False
+    draft_payload = json.loads(str(draft_row["draft_json"]))
+    assert draft_payload["drafting_mode"] == "llm_constrained"
+    assert "fixture:neuroflow" in draft_payload["source_ids_used"]
+    assert "compare notes" in result.human_summary
+    assert "live SDK draft created" in " ".join(result.audit_notes)
     assert store.list_approval_items(object_type="outreach_draft") == []
+    sdk_event = next(
+        event
+        for event in store.list_work_item_events(result.work_item.id)
+        if event.event_type == "workflow_sdk_usage"
+    )
+    assert sdk_event.actor == WorkItemRoute.OUTREACH_COMPOSER.value
+    assert sdk_event.metadata["schema"] == "keystone.workflow_sdk_usage.v1"
+    assert sdk_event.metadata["run_stage"] == "thread_local_outreach_composer"
+    assert sdk_event.metadata["usage"]["requests"] == 1
+    assert sdk_event.metadata["cost"]["estimated_usd"] == 0.001
+    assert sdk_event.metadata["request_cache"]["dynamic_prompt_chars"] == 420
 
 
 def test_gmail_triage_live_retrieval_reads_recent_matching_threads(
@@ -9060,12 +10099,12 @@ def test_gmail_triage_live_retrieval_reads_recent_matching_threads(
                     "thread_id": "thread-new",
                     "subject": "Halo follow up",
                     "summary": "Halo asked for a quick reply about next steps.",
-                    "thread_context": "Most recent Halo note asks whether Anup can review.",
+                    "thread_context": "Most recent Halo note asks whether the operator can review.",
                     "message_count": 2,
                     "latest_received_at": "2026-05-31T14:30:00Z",
-                    "participants": ["Halo <hello@halo.example>", "Anup <wisegrow05@gmail.com>"],
+                    "participants": ["Halo <hello@halo.example>", "Operator <operator@example.com>"],
                     "action_items": ["Reply to Halo with availability."],
-                    "open_questions": ["Can Anup take a look?"],
+                    "open_questions": ["Can the operator take a look?"],
                     "messages": [
                         {
                             "id": "msg-new",
@@ -9074,7 +10113,7 @@ def test_gmail_triage_live_retrieval_reads_recent_matching_threads(
                             "sender_email": "hello@halo.example",
                             "subject": "Halo follow up",
                             "snippet": "Can you take a look?",
-                            "thread_summary": "Halo asked Anup to take a look.",
+                            "thread_summary": "Halo asked the operator to take a look.",
                         }
                     ],
                 }
@@ -9095,7 +10134,7 @@ def test_gmail_triage_live_retrieval_reads_recent_matching_threads(
     result = workflow_runner._advance_work_item_one_step(
         WorkflowRunRequest(
             request_text=(
-                "Read the current Halo email in my wisegrow05@gmail.com inbox, then "
+                "Read the current Halo email in my operator@example.com inbox, then "
                 "draft a short reply here."
             ),
             requested_route=WorkItemRoute.GMAIL_TRIAGE,
@@ -9113,7 +10152,7 @@ def test_gmail_triage_live_retrieval_reads_recent_matching_threads(
     assert result.next_action.agent == WorkItemRoute.OUTREACH_COMPOSER
     assert "Halo" in queries[0]
     assert "in:inbox" in queries[0]
-    assert "wisegrow05@gmail.com" not in queries[0]
+    assert "operator@example.com" not in queries[0]
     assert result.artifact_refs[0].metadata["selected_thread_id"] == "thread-new"
     assert result.artifact_refs[0].metadata["matched_thread_count"] == 2
 
@@ -9134,13 +10173,13 @@ def test_chief_of_staff_email_reply_workflow_delegates_to_gmail_then_outreach(
             return {
                 "thread_id": "thread-halo",
                 "subject": "Halo partnership note",
-                "summary": "Halo asked if Anup can review a short partnership note.",
+                "summary": "Halo asked if the operator can review a short partnership note.",
                 "thread_context": "Halo wants a concise acknowledgement and next step.",
                 "message_count": 1,
                 "latest_received_at": "2026-05-31T15:00:00Z",
-                "participants": ["Halo <hello@halo.example>", "Anup <wisegrow05@gmail.com>"],
-                "action_items": ["Acknowledge and say Anup can take a look."],
-                "open_questions": ["Can Anup review the partnership note?"],
+                "participants": ["Halo <hello@halo.example>", "Operator <operator@example.com>"],
+                "action_items": ["Acknowledge and say the operator can take a look."],
+                "open_questions": ["Can the operator review the partnership note?"],
                 "messages": [
                     {
                         "id": "msg-halo",
@@ -9202,12 +10241,12 @@ def test_chief_of_staff_email_reply_workflow_delegates_to_gmail_then_outreach(
 
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
     assert result.status == WorkItemStatus.DONE
-    assert "whether Anup can review the partnership note" in result.human_summary
+    assert "Thanks for reaching out" in result.human_summary
     assert "Heading: Draft email for Halo" in result.human_summary
     assert "To: hello@halo.example" in result.human_summary
     assert "Context:" not in result.human_summary
     assert "Triage: direct ask/action detected" not in result.human_summary
-    assert "Sincerely,\nAnup" in result.human_summary
+    assert "Sincerely,\nKeystone" in result.human_summary
     assert result.artifact_refs[0].metadata["thread_local_slack_draft"] is True
     assert result.artifact_refs[0].metadata["recipient_email"] == "hello@halo.example"
     assert result.artifact_refs[0].metadata["boundary_summary"].startswith("Slack-thread-only")
@@ -10036,12 +11075,12 @@ def test_chief_of_staff_email_reply_recovers_from_live_schema_error(
             return {
                 "thread_id": "thread-halo",
                 "subject": "Halo partnership note",
-                "summary": "Halo asked whether Anup can review a short note.",
+                "summary": "Halo asked whether the operator can review a short note.",
                 "thread_context": "Halo wants a concise acknowledgement.",
                 "message_count": 1,
                 "latest_received_at": "2026-05-31T15:00:00Z",
-                "participants": ["Anna <anna@halo.example>", "Anup <wisegrow05@gmail.com>"],
-                "open_questions": ["Can Anup review the note?"],
+                "participants": ["Anna <anna@halo.example>", "Operator <operator@example.com>"],
+                "open_questions": ["Can the operator review the note?"],
                 "messages": [
                     {
                         "id": "msg-halo",
@@ -10107,7 +11146,7 @@ def test_thread_local_gmail_draft_omits_marketing_snippet_from_reply_focus() -> 
             "Our platform makes it easy for innovators to work with industry partners "
             "and move their science forward. Start by creating a profile."
         ),
-        participants=["Anna <anna@halo.science>", "Anup <wisegrow05@gmail.com>"],
+        participants=["Anna <anna@halo.science>", "Operator <operator@example.com>"],
         message_count=1,
     )
 
@@ -10131,7 +11170,7 @@ def test_thread_local_gmail_draft_uses_safe_concrete_detail_when_available() -> 
         thread_context=(
             "Start by creating a Partner Listing. Or, respond to active requests on Halo."
         ),
-        participants=["Anna <anna@halo.science>", "Anup <wisegrow05@gmail.com>"],
+        participants=["Anna <anna@halo.science>", "Operator <operator@example.com>"],
         message_count=1,
     )
 
@@ -10148,7 +11187,7 @@ def test_thread_local_gmail_summary_keeps_email_fields_in_main_body() -> None:
     summary = workflow_runner.GmailThreadSummaryResult(
         thread_id="thread-halo",
         subject="Welcome to Halo!",
-        participants=["Anna <anna@halo.science>", "Anup <wisegrow05@gmail.com>"],
+        participants=["Anna <anna@halo.science>", "Operator <operator@example.com>"],
         message_count=1,
         latest_received_at="2026-05-31T12:01:53Z",
     )
@@ -10471,7 +11510,7 @@ def test_live_outreach_handoff_includes_orchestrator_memo_and_raw_request(
             final_output = {
                 "company_name": "NeuroFlow",
                 "email_subject": "Comparing notes",
-                "email_body": "Hi,\n\nOpen to compare notes?\n\nSincerely,\nAnup",
+                "email_body": "Hi,\n\nOpen to compare notes?\n\nSincerely,\nJordan",
                 "linkedin_note": "Open to compare notes?",
                 "personalization_rationale": "Used only approved WorkItem context.",
                 "source_ids_used": ["keystone_profile"],

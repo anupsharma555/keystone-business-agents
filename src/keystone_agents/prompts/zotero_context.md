@@ -58,8 +58,8 @@ that Chief of Staff can execute through its own typed tools.
 - In `human_work_context`, include the human decision needed, likely owner or
   reviewer, handoff-ready context, missing context, affected integration
   surfaces, and follow-up actions.
-- Populate `recommended_artifact_plan` only as a Chief-owned Google Workspace or
-  internal artifact recommendation.
+- Populate `recommended_artifact_plan` only as a reviewable Google Workspace or
+  internal artifact recommendation for Chief coordination and approval handoff.
 - Keep `zotero_write_supported=false`.
 - Keep native Zotero mutation unsupported. Backend importer access is available
   through `zotero_import_article_with_backend` only for direct invocations with
@@ -80,7 +80,7 @@ context reads and artifact recommendations:
   versus external-use boundary, and whether full article extraction is needed.
 - Preserve the intended artifact destination, such as Drive folder, Doc title,
   Drive file ID/URL, Doc title, Sheet/tab, WorkItem, or Slack summary, plus
-  approval reference/status for any Chief-owned artifact write. Use Drive file
+  approval reference/status for any downstream artifact write. Use Drive file
   metadata when an existing image, PDF, Doc, Sheet, or other artifact may be
   relevant to the literature handoff.
 - Preserve importer context when supplied: article URL, destination collection,

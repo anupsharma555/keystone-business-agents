@@ -19,6 +19,7 @@ from keystone_agents.costing import (
     estimate_usage_cost,
     gemini_free_tier_usage_context,
 )
+from keystone_agents.local_file_inputs import local_file_input_bundle_from_text
 from keystone_agents.model_provider import (
     GEMINI_PROVIDER,
     MissingOpenAIAPIKeyError,
@@ -107,6 +108,51 @@ def prompt_from_typed_input(value: Any) -> str:
     return str(value)
 
 
+def sdk_input_from_typed_input(
+    value: Any,
+    *,
+    live: bool,
+    provider: str,
+) -> str | list[dict[str, Any]]:
+    """Render typed input, preserving explicit local PDFs/images for OpenAI live runs."""
+
+    prompt = prompt_from_typed_input(value)
+    if not live or provider != "openai":
+        return prompt
+    bundle = local_file_input_bundle_from_text(prompt)
+    if not bundle.has_inputs:
+        return prompt
+    return bundle.response_input(prompt)
+
+
+def _sdk_input_audit_text(value: str | list[dict[str, Any]]) -> str:
+    if isinstance(value, str):
+        return value
+    text_parts: list[str] = []
+    file_parts: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        for part in item.get("content", []) or []:
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("type") == "input_text":
+                text_parts.append(str(part.get("text") or ""))
+            elif part.get("type") in {"input_file", "input_image"}:
+                file_parts.append(
+                    dumps(
+                        {
+                            "type": part.get("type"),
+                            "filename": part.get("filename") or "",
+                            "detail": part.get("detail") or "",
+                        },
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    )
+                )
+    return "\n".join([*text_parts, *file_parts])
+
+
 def run_typed_sdk_agent(
     *,
     agent: AgentLike,
@@ -141,10 +187,11 @@ def run_typed_sdk_agent(
         model_provider = model_config.provider
         model_name = model_config.model
     resolved_session = session or build_sdk_session_from_env()
-    prompt = prompt_from_typed_input(typed_input)
+    prompt = sdk_input_from_typed_input(typed_input, live=live, provider=model_provider)
+    audit_prompt = _sdk_input_audit_text(prompt)
     request_cache = _sdk_request_cache_metadata(
         agent=agent,
-        prompt=prompt,
+        prompt=audit_prompt,
         session=resolved_session,
         max_turns=max_turns,
     )
@@ -154,7 +201,7 @@ def run_typed_sdk_agent(
     model_run_mode = "local_sdk" if run_config is not None else ("live_sdk" if live else "sdk")
     while True:
         reset_sdk_search_telemetry()
-        set_sdk_search_request_context(prompt)
+        set_sdk_search_request_context(audit_prompt)
         try:
             raw_result, output = run_typed_sdk_sync(
                 agent,

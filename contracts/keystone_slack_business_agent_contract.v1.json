@@ -384,6 +384,7 @@
     }
   },
   "result_rendering": {
+    "canonical_status_field": "status",
     "context_agents": [
       {
         "output_type": "AirtableContextResult",
@@ -446,13 +447,17 @@
         "route": "outreach_composer"
       }
     ],
+    "operator_status_field": "operator_status",
+    "operator_text_field": "slack_display_text",
+    "operator_title_field": "slack_display_title",
     "optional_sections": [
       "Useful references"
     ],
     "required_sections": [
       "Answer",
       "Detailed Summary"
-    ]
+    ],
+    "status_display_policy": "Use status as canonical machine state only. For Slack headers, prefer operator_status and slack_display_title so missing-context states can read as needs_input instead of blocked while preserving WorkItem gates."
   },
   "schema": "keystone.business_agent_slack_contract.v1",
   "schemas": {

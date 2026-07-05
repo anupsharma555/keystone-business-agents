@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -78,7 +79,10 @@ def chief_of_staff_quality_budget(
     if explicit:
         notes.append(f"Quality mode explicitly requested: {resolved.value}.")
     else:
-        if _looks_like_chief_of_staff_deep_request(request_text):
+        if _looks_like_bounded_live_sdk_smoke_request(request_text):
+            resolved = QualityMode.FAST
+            notes.append("Quality mode inferred as fast for bounded live SDK smoke validation.")
+        elif _looks_like_chief_of_staff_deep_request(request_text):
             resolved = QualityMode.DEEP
             notes.append("Quality mode inferred as deep from operational audit/planning request.")
         elif live_sdk and not _looks_like_chief_of_staff_fast_request(request_text):
@@ -89,7 +93,27 @@ def chief_of_staff_quality_budget(
             notes.append(
                 "Quality mode inferred as fast for simple deterministic Chief of Staff routing."
             )
-    return _budget_for_mode(resolved, notes=notes)
+    budget = _budget_for_mode(resolved, notes=notes)
+    if _looks_like_bounded_live_sdk_smoke_request(request_text):
+        return budget.model_copy(
+            update={
+                "max_turns": min(budget.max_turns or 3, 3),
+                "max_tokens": min(budget.max_tokens or 1600, 1600),
+                "max_tool_calls": min(budget.max_tool_calls or 3, 3),
+                "enable_context_deepening": False,
+                "hosted_web_search_max_calls": 0,
+                "tool_tier": "core_read",
+                "notes": [
+                    *budget.notes,
+                    (
+                        "Bounded smoke validation capped Chief of Staff to three SDK "
+                        "turns, disabled hosted web search, and kept tool use on the "
+                        "core read tier."
+                    ),
+                ],
+            }
+        )
+    return budget
 
 
 def business_research_quality_budget(
@@ -328,11 +352,18 @@ def _quality_mode_from_cost_profile(cost_profile: str) -> QualityMode | None:
         "fast",
         "light",
         "slack_context_light",
+        "slack_smoke_limited",
         "slack_conservative",
         "slack_cost_conservative",
     }:
         return QualityMode.FAST
     return None
+
+
+def quality_mode_from_cost_profile(cost_profile: str) -> QualityMode | None:
+    """Return the quality mode implied by a shared cost profile, if any."""
+
+    return _quality_mode_from_cost_profile(cost_profile)
 
 
 def _looks_like_deep_research_request(text: str) -> bool:
@@ -412,3 +443,12 @@ def _looks_like_chief_of_staff_fast_request(text: str) -> bool:
         "bookmark this",
     )
     return any(marker in normalized for marker in fast_markers)
+
+
+def _looks_like_bounded_live_sdk_smoke_request(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if "smoke" not in normalized:
+        return False
+    return bool(
+        re.search(r"\bbounded\b|\bread[- ]only\b|\blive sdk is approved only\b", normalized)
+    )

@@ -32,6 +32,7 @@ ManualRequestIntent = Literal[
     "slack_operations",
     "browser_diagnostics",
     "reference_capture",
+    "business_system_write",
     "context_lookup",
     "continue_work_item",
     "blocked_send",
@@ -49,6 +50,7 @@ ManualTaskObjective = Literal[
     "slack_operations",
     "browser_diagnostics",
     "reference_capture",
+    "business_system_write",
     "context_lookup",
     "blocked_side_effect",
     "clarification",
@@ -65,6 +67,7 @@ ManualExpectedArtifactType = Literal[
     "slack_ops_summary",
     "browser_diagnostics_report",
     "reference_note",
+    "business_system_write_plan",
     "context_summary",
 ]
 

@@ -5,7 +5,7 @@ Use this folder for local, private source documents that should not be committed
 Suggested CV path:
 
 ```text
-documents/CV_AnupSharma_2026.docx
+documents/CV_Operator_2026.docx
 ```
 
 Suggested founder-fit profile path:
@@ -28,7 +28,7 @@ To create a local CV review packet later:
 
 ```bash
 .venv/bin/python scripts/review_founder_cv.py \
-  --cv documents/CV_AnupSharma_2026.docx \
+  --cv documents/CV_Operator_2026.docx \
   --output documents/founder_cv_review.json
 ```
 

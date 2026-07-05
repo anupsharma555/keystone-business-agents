@@ -91,6 +91,7 @@ from keystone_agents.work_items import (
     select_artifact,
     set_next_action,
 )
+from keystone_agents.workflow_runner import _request_forbids_live_research
 
 ACTION_STATUS_BY_ID = {
     "keystone_approval_yes": ApprovalQueueStatus.APPROVED,
@@ -99,7 +100,7 @@ ACTION_STATUS_BY_ID = {
 }
 KBA_REVISION_FEEDBACK_BLOCK_ID = "kba_revision_feedback_block"
 KBA_REVISION_FEEDBACK_ACTION_ID = "kba_revision_feedback"
-DEFAULT_GMAIL_DRAFT_ACCOUNT = "wisegrow05@gmail.com"
+DEFAULT_GMAIL_DRAFT_ACCOUNT = "operator@example.com"
 GMAIL_DRAFT_ACCOUNT_ENV_KEYS = (
     "KEYSTONE_GMAIL_DRAFT_ACCOUNT",
     "KNI_BUSINESS_AGENTS_GMAIL_DRAFT_ACCOUNT",
@@ -1102,6 +1103,13 @@ def _handle_chief_of_staff_action(
             else "orchestrator"
         )
         live_search = _slack_work_item_live_search_enabled()
+        live_search_constraint_text = "continue"
+        if existing_item is not None:
+            live_search_constraint_text = (
+                f"continue {getattr(existing_item, 'request_text', '') or ''}"
+            )
+        if live_search and _request_forbids_live_research(live_search_constraint_text):
+            live_search = False
         live_sdk = _slack_work_item_live_sdk_enabled(default=live_search)
         orchestrator_preflight = run_orchestrator_preflight(
             "continue",
@@ -1499,6 +1507,8 @@ def _advance_work_item_for_intent(
         work_item=existing_work_item,
     )
     live_search = _slack_work_item_live_search_enabled()
+    if live_search and _request_forbids_live_research(request_text):
+        live_search = False
     live_sdk = _slack_work_item_live_sdk_enabled(default=live_search)
     orchestrator_preflight = run_orchestrator_preflight(
         request_text,
@@ -2039,7 +2049,9 @@ def _revise_approval_item_direct(
 
     try:
         outcome = run_retrieved_sdk_synthesis(
-            agent=build_outreach_composer_compact_synthesis_agent(),
+            agent=build_outreach_composer_compact_synthesis_agent(
+                request_text=feedback,
+            ),
             output_type=OutreachLLMDraftPayload,
             retrieve=lambda: context,
             normalize=normalize,

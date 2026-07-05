@@ -20,6 +20,14 @@ from keystone_agents.tools.zotero_context_tools import ZOTERO_CONTEXT_TOOL_NAMES
 
 AIRTABLE_READ_TOOL_NAMES = ("airtable_get_base_schema", "airtable_read_records")
 AIRTABLE_WRITE_TOOL_NAMES = ("airtable_write_record",)
+GOOGLE_WORKSPACE_READ_TOOL_NAMES = (
+    "google_doc_read",
+    "google_drive_list_folder",
+    "google_drive_search_files",
+    "google_drive_get_file_metadata",
+    "google_sheet_list",
+    "google_sheet_read_table",
+)
 WEB_STRUCTURING_TOOL_NAMES = ("structure_web_data_for_schema",)
 PLAYWRIGHT_RESEARCH_TOOL_NAMES = ("render_page",)
 BROWSER_DIAGNOSTIC_TOOL_NAMES = (
@@ -387,19 +395,21 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "airtable_get_base_schema",
             "airtable_read_records",
             "airtable_write_record",
+            "airtable_upload_attachment",
+            "airtable_create_expense_from_receipt",
         ),
         live_flags_required=("--live-sdk",),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
         validation_paths=("tests/test_agent_registry.py", "tests/test_chief_of_staff.py"),
         handoff_description=(
             "Read Airtable base, table, field, and candidate record context, perform "
-            "direct approved create/update writes, or return nested Chief-owned "
-            "write-plan guidance."
+            "direct approved create/update writes, or return nested reviewable "
+            "write-plan guidance for specialist/action-handler execution."
         ),
         safety_notes=(
             "Direct writes require live flags and approval references",
             "No nested live writes",
-            "Chief of Staff owns writes when this agent is nested as a specialist tool",
+            "Chief of Staff owns review and approval handoff when this agent is nested",
             "Return blockers when record identity or field mapping is ambiguous",
         ),
         handoff_enabled=True,
@@ -447,13 +457,13 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         validation_paths=("tests/test_agent_registry.py", "tests/test_chief_of_staff.py"),
         handoff_description=(
             "Read scoped Google Drive, Docs, Sheets, and file/image metadata, perform "
-            "direct approved Workspace writes, or return nested Chief-owned "
-            "write-plan guidance."
+            "direct approved Workspace writes, or return nested reviewable "
+            "write-plan guidance for specialist/action-handler execution."
         ),
         safety_notes=(
             "Direct writes require live flags and approval references",
             "No nested live writes",
-            "Chief of Staff owns writes when this agent is nested as a specialist tool",
+            "Chief of Staff owns review and approval handoff when this agent is nested",
             "Drive image/media support is metadata-only until download/OCR tooling is added",
             "Return blockers when folder, file, Doc, Sheet, or tab identity is ambiguous",
         ),
@@ -495,12 +505,12 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         handoff_description=(
             "Read local/API Zotero library, collection, item, article, importer, and "
             "evidence context, perform direct approved Workspace artifact writes, "
-            "or return detailed Chief-owned artifact and follow-up guidance."
+            "or return detailed reviewable artifact and follow-up guidance."
         ),
         safety_notes=(
             "Direct backend importer writes require live flags and approval references",
             "No Zotero library mutation except through the guarded backend importer",
-            "Chief of Staff owns writes when this agent is nested as a specialist tool",
+            "Chief of Staff owns review and approval handoff when this agent is nested",
             "Return blockers when library, collection, article, or item identity is ambiguous",
         ),
         handoff_enabled=True,
@@ -588,11 +598,10 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
         "search_web",
         "extract_research_claims_from_html",
         *AIRTABLE_READ_TOOL_NAMES,
-        *AIRTABLE_WRITE_TOOL_NAMES,
         *WEB_STRUCTURING_TOOL_NAMES,
         *PLAYWRIGHT_RESEARCH_TOOL_NAMES,
         *BROWSER_DIAGNOSTIC_TOOL_NAMES,
-        *GOOGLE_WORKSPACE_TOOL_NAMES,
+        *GOOGLE_WORKSPACE_READ_TOOL_NAMES,
     ),
     optional_tools=(
         "file_search",
@@ -662,14 +671,13 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         "publish_internal_artifact",
         "publish_table_mirror",
         "publish_slack_summary",
-        "search_web",
-        "airtable_get_base_schema",
-        "airtable_read_records",
-        "airtable_write_record",
-        *WEB_STRUCTURING_TOOL_NAMES,
+            "search_web",
+            "airtable_get_base_schema",
+            "airtable_read_records",
+            *WEB_STRUCTURING_TOOL_NAMES,
         *PLAYWRIGHT_RESEARCH_TOOL_NAMES,
         *BROWSER_DIAGNOSTIC_TOOL_NAMES,
-        *GOOGLE_WORKSPACE_TOOL_NAMES,
+        *GOOGLE_WORKSPACE_READ_TOOL_NAMES,
     ),
     optional_tools=(
         "file_search",
@@ -691,8 +699,8 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         "Human approval required before outbound Slack copy is used",
         "Keystone Slack repo access is read-only and secret-filtered",
         "Full article reading is default-off and enabled only by explicit natural-language request",
-        "Airtable and Google Workspace writes require typed tools, live flags, "
-        "and approval references",
+        "Airtable, Google Workspace, Gmail, and Zotero writes are executed by "
+        "the owning specialist or approved action handler, not by Chief direct tools",
     ),
 )
 

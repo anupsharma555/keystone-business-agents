@@ -253,13 +253,15 @@ SDK usage expectations:
 
 ## Optional LangGraph Orchestration Layer
 
-LangGraph is implemented only as an optional WorkItem orchestration wrapper. It
-is not part of the core dependency set and does not replace OpenAI Agents SDK
-agent builders, prompts, schemas, tools, or Python safety gates.
+LangGraph is implemented only as an optional WorkItem graph runtime. It is not
+part of the core dependency set and does not replace OpenAI Agents SDK agent
+builders, prompts, schemas, tools, WorkItems, context packs, or Python safety
+gates.
 
-Version 1 orchestration remains a small Python module that:
+Version 1 orchestration remains a small Python graph/runtime module that:
 
 - Runs agents in a deterministic order.
+- Exposes graph-native WorkItem nodes for opted-in LangGraph execution.
 - Passes structured outputs between agents.
 - Persists audit events.
 - Stops at human approval gates.

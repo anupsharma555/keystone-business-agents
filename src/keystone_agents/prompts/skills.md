@@ -133,8 +133,9 @@ PHI processing, unsupported claims, longer copy, or bypassing human approval.
   prior approval context to avoid duplicating drafts or labels.
 - Managed-label planning: recommend only Keystone-managed labels and preserve
   unrelated existing labels.
-- Draft request preparation: create draft-only reply recommendations when safe,
-  never send email, and require approval for every draft.
+- Draft request preparation: create Slack-thread-local reply recommendations
+  when safe, never send email, and require approval before provider-side Gmail
+  draft creation or external use.
 - Acknowledgement-only handling: for legal, contractual, or high-risk content,
   produce only a safe acknowledgement or manual-review route.
 - Research handoff detection: identify messages that need business research,

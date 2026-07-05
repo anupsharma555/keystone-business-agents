@@ -58,6 +58,14 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         default_notes="Optional path to a sibling repo .env for allowlisted read context config.",
     ),
     EnvVarContract(
+        "KNI_BUSINESS_AGENTS_LANGGRAPH",
+        "orchestration",
+        default_notes=(
+            "Slack parent flag is scrubbed for child runs so KBA backend policy "
+            "or explicit KEYSTONE_WORKITEM_LANGGRAPH test overrides own graph selection."
+        ),
+    ),
+    EnvVarContract(
         "FIRECRAWL_API_KEY",
         "website_extraction",
         secret=True,

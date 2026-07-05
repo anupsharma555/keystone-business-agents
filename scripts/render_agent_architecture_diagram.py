@@ -35,6 +35,7 @@ except Exception:  # pragma: no cover - optional when promptfoo deps are absent
 
 
 DEFAULT_OUTPUT = PROJECT_ROOT / "docs" / "assets" / "kba-current-agent-architecture.svg"
+UTC = UTC
 WORKFLOW_ROUTES = {
     "gmail_triage",
     "business_research_analyst",
@@ -141,7 +142,7 @@ def render_svg(*, generated_date: str) -> str:
     lines: list[str] = [
         '<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1280" viewBox="0 0 1800 1280" role="img" aria-labelledby="title desc">',
         '  <title id="title">Keystone Business Agents current architecture</title>',
-        '  <desc id="desc">Generated architecture diagram showing entrypoints, Orchestrator-first preflight and review, Chief of Staff operating synthesis, registered SDK agents, typed context packs, deterministic gates, state, traces, logs, evals, and renderers.</desc>',
+        '  <desc id="desc">Generated architecture diagram showing entrypoints, Orchestrator-first preflight and review, WorkItem canonical state, backend graph selection, optional LangGraph execution, Chief of Staff operating synthesis, registered SDK agents, typed context packs, deterministic gates, traces, logs, evals, and renderers.</desc>',
         "  <defs>",
         '    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>',
         '    <marker id="arrow-det" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#d97706"/></marker>',
@@ -153,6 +154,7 @@ def render_svg(*, generated_date: str) -> str:
         "      .lane { fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 2; }",
         "      .orchestrator { fill: #fff7ed; stroke: #ea580c; stroke-width: 3; }",
         "      .chief { fill: #ecfeff; stroke: #0891b2; stroke-width: 3; }",
+        "      .graph { fill: #eef2ff; stroke: #4f46e5; stroke-width: 3; }",
         "      .specialist { fill: #ecfdf5; stroke: #16a34a; stroke-width: 2; }",
         "      .context { fill: #f0f9ff; stroke: #0284c7; stroke-width: 2; }",
         "      .gate { fill: #fffbeb; stroke: #d97706; stroke-width: 2; }",
@@ -177,7 +179,7 @@ def render_svg(*, generated_date: str) -> str:
         "  </defs>",
         '  <rect class="bg" width="1800" height="1280"/>',
         '  <text class="title" x="52" y="56">Keystone Business Agents Architecture</text>',
-        '  <text class="subtitle" x="54" y="84">Generated from the current AgentSpec registry, workflow runner contracts, trace processor, and eval database shape.</text>',
+        '  <text class="subtitle" x="54" y="84">Generated from the current AgentSpec registry, WorkItem graph runtime contracts, trace processor, and eval database shape.</text>',
         f'  <text class="tiny" x="1510" y="84">Generated {generated_date}</text>',
         '  <rect class="frame" x="40" y="115" width="1720" height="1115" rx="18"/>',
     ]
@@ -223,15 +225,16 @@ def render_svg(*, generated_date: str) -> str:
         (
             "ManualRequestPlan",
             "OrchestratorResult",
-            "WorkItems and decision_trace",
+            "WorkItems / SQLite canonical state",
             "Typed context packs",
+            "Backend graph selection",
             "Approval gates and artifact refs",
         ),
         x=1010,
         y=215,
         max_chars=36,
     )
-    lines.append('<text class="tiny" x="1010" y="350">Schema-light planning; typed execution.</text>')
+    lines.append('<text class="tiny" x="1010" y="350">Schema-light planning; graph-aware typed execution.</text>')
 
     _rect(lines, "lane", 1365, 145, 310, 225)
     lines.append('<text class="section" x="1390" y="181">Connection Legend</text>')
@@ -245,6 +248,9 @@ def render_svg(*, generated_date: str) -> str:
     lines.append('<text class="body" x="1480" y="331">Traces / logs / evals</text>')
     lines.append('<text class="tiny" x="1390" y="356">Dashed dark arrows show deterministic Orchestrator review feedback.</text>')
 
+    _rect(lines, "graph", 985, 382, 690, 42, rx=10)
+    lines.append('<text class="cardTitle" x="1010" y="408">Backend graph selector: single specialist step or LangGraph WorkItem graph</text>')
+
     _rect(lines, "chief", 450, 430, 470, 245)
     lines.append(f'<text class="section" x="482" y="466">{_esc(CHIEF_OF_STAFF_AGENT_SPEC.agent_name)}</text>')
     _bullet_list(
@@ -254,14 +260,14 @@ def render_svg(*, generated_date: str) -> str:
             "Plans Slack, workflow, and automation work",
             "Reads KNI docs, local context, Slack repo context",
             "May call specialists as advisory tools",
-            "Owns Chief-level write plans and blockers",
+            "Stages review plans, approvals, and blockers",
         ),
         x=482,
         y=500,
         max_chars=52,
     )
-    lines.append('<text class="small" x="482" y="642">Positioning: below Orchestrator; above or beside</text>')
-    lines.append('<text class="small" x="482" y="662">specialists when the ask is cross-functional.</text>')
+    lines.append('<text class="small" x="482" y="642">Positioning: inside the centralized Orchestrator + WorkItem path,</text>')
+    lines.append('<text class="small" x="482" y="662">not a parallel router or alternate communication channel.</text>')
 
     _rect(lines, "specialist", 985, 430, 690, 245)
     lines.append('<text class="section" x="1010" y="466">Workflow Specialists</text>')
@@ -286,23 +292,24 @@ def render_svg(*, generated_date: str) -> str:
         lines.append(f'<text class="small" x="{card_x + 16}" y="{role_y}">{_esc(_agent_role(spec.route_name))}</text>')
         lines.append(f'<text class="small" x="{card_x + 16}" y="{tools_y}">{len(spec.tools)} tools</text>')
         card_x += 166
-    lines.append('<text class="body" x="1010" y="610">Each receives raw request + Orchestrator memo + typed context pack.</text>')
-    lines.append('<text class="small" x="1010" y="638">Specialists synthesize; helpers verify facts, scores, records, and source visibility.</text>')
-    lines.append('<text class="small" x="1010" y="660">Live flags are explicit; dry-run fixture mode stays the default.</text>')
+    lines.append('<text class="body" x="1010" y="610">Each run receives raw request + Orchestrator memo + typed context pack.</text>')
+    lines.append('<text class="small" x="1010" y="638">Graph-worthy workflows use backend-selected LangGraph nodes; simple runs stay single-step.</text>')
+    lines.append('<text class="small" x="1010" y="660">Edges include Chief/Gmail/context -> Research -> Opportunity/Outreach checkpoints.</text>')
 
-    _rect(lines, "context", 70, 430, 310, 245)
+    _rect(lines, "context", 70, 430, 310, 285)
     lines.append('<text class="section" x="95" y="466">Read / Context Specialists</text>')
-    _bullet_list(
+    context_y = _bullet_list(
         lines,
         (_agent_label(spec.route_name) for spec in context_specs),
         x=95,
         y=500,
         max_chars=36,
+        line_height=22,
     )
-    lines.append('<text class="body" x="95" y="581">Local KNI document evidence</text>')
-    lines.append('<text class="body" x="95" y="608">Slack and automation context tools</text>')
-    lines.append('<text class="small" x="95" y="642">Nested mode is advisory/read-plan.</text>')
-    lines.append('<text class="small" x="95" y="662">Direct writes require flags and approvals.</text>')
+    lines.append(f'<text class="body" x="95" y="{context_y + 2}">Local KNI document evidence</text>')
+    lines.append(f'<text class="body" x="95" y="{context_y + 26}">Slack and automation context tools</text>')
+    lines.append(f'<text class="small" x="95" y="{context_y + 60}">Context agents stage read-only evidence for graph handoffs.</text>')
+    lines.append(f'<text class="small" x="95" y="{context_y + 80}">Provider writes use owning specialists or approved handlers.</text>')
 
     _rect(lines, "gate", 70, 735, 760, 195)
     lines.append('<text class="section" x="95" y="771">SDK Guardrails + Deterministic Gates</text>')
@@ -312,14 +319,14 @@ def render_svg(*, generated_date: str) -> str:
             "SDK guardrails: input/output/tool scans for PHI, secrets, send-like actions, unsafe claims",
             "Python gates: approvals, source sufficiency, record identity, live flags, provider budgets",
             "Typed checks: schema reads, arithmetic, deduplication, context-pack readiness",
-            "Tool policy: core reads, web search, deep retrieval, diagnostics, internal writes",
+            "Tool policy: core reads, web search, deep retrieval, diagnostics, owned writes",
         ),
         x=95,
         y=805,
         max_chars=112,
         line_height=25,
     )
-    lines.append('<text class="small" x="95" y="914">No send, public post, schedule, CRM write, file write, or library mutation is automatic.</text>')
+    lines.append('<text class="small" x="95" y="914">No send, Gmail draft, post, provider write, file write, or library mutation is automatic.</text>')
 
     _rect(lines, "context", 870, 735, 805, 195)
     lines.append('<text class="section" x="895" y="771">Evidence, Retrieval, and Integrations</text>')
@@ -336,7 +343,7 @@ def render_svg(*, generated_date: str) -> str:
         max_chars=110,
         line_height=25,
     )
-    lines.append('<text class="small" x="895" y="914">Context packs expose can_synthesize, missing_requirements, limitation_notes, and next action.</text>')
+    lines.append('<text class="small" x="895" y="914">Graph-produced sources can satisfy downstream offline evidence gates.</text>')
 
     _rect(lines, "render", 70, 980, 520, 210)
     lines.append('<text class="section" x="95" y="1016">Reviewed Output and Renderers</text>')
@@ -344,6 +351,7 @@ def render_svg(*, generated_date: str) -> str:
         lines,
         (
             "Response synthesis produces operator-facing prose from structured outputs",
+            "No-SDK draft paths ask for model reasoning or exact copy, not placeholders",
             "Slack / CLI / artifact renderers own final layout",
             "Source-backed external facts stay visible in first answer",
         ),
@@ -376,8 +384,10 @@ def render_svg(*, generated_date: str) -> str:
             '  <text class="label" x="398" y="236">raw request</text>',
             '  <path class="detLine" d="M920 250 C950 250 955 250 985 250"/>',
             '  <text class="label" x="938" y="236">state + memo</text>',
-            '  <path class="detLine" d="M1150 370 C1130 405 1125 410 1120 430"/>',
-            '  <text class="label" x="1134" y="405">typed packs</text>',
+            '  <path class="detLine" d="M1150 370 C1150 376 1150 378 1150 382"/>',
+            '  <text class="label" x="1164" y="379">canonical state</text>',
+            '  <path class="routeLine" d="M1320 424 C1320 426 1320 428 1320 430"/>',
+            '  <text class="label" x="1338" y="424">backend selected</text>',
             '  <path class="routeLine" d="M685 370 C685 395 685 405 685 430"/>',
             '  <text class="label" x="700" y="404">broad ops route</text>',
             '  <path class="toolAgentLine dash" d="M920 552 C950 552 955 552 985 552"/>',
@@ -396,8 +406,8 @@ def render_svg(*, generated_date: str) -> str:
             '  <text class="label" x="1200" y="958">diagnostics</text>',
             '  <path class="detLine" d="M1315 370 C1605 450 1650 650 1535 735"/>',
             '  <text class="label" x="1570" y="700">state joins</text>',
-            '  <path class="routeLine" d="M790 370 C870 405 960 405 1040 430"/>',
-            '  <text class="label" x="870" y="388">routing / handoff</text>',
+            '  <path class="routeLine" d="M790 370 C855 388 930 398 985 403"/>',
+            '  <text class="label" x="870" y="388">routing / graph handoff</text>',
             '  <path class="reviewLine" d="M985 610 C880 590 860 430 820 370"/>',
             '  <text class="label" x="830" y="560">deterministic review</text>',
             '  <path class="reviewLine" d="M610 430 C610 400 620 390 640 370"/>',

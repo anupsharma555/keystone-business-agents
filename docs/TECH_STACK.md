@@ -58,8 +58,8 @@ Optional integrations must not be required for tests. They should be introduced 
   one; direct SDK function tools remain the default for Keystone-owned provider
   boundaries.
 - LangGraph: optional durable orchestration for resumable WorkItem workflows. It lives behind
-  the `orchestration` extra and wraps existing WorkItem advancement. It must not replace the
-  OpenAI Agents SDK agent contracts.
+  the `orchestration` extra and runs graph-native WorkItem nodes. It must not replace the
+  OpenAI Agents SDK agent contracts, canonical WorkItems, context packs, or approval gates.
 
 ## Search Provider Configuration
 

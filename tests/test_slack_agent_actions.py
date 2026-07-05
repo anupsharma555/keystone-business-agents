@@ -14,6 +14,7 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffRouteRecommendation,
 )
 from keystone_agents.schemas.work_item import (
+    WorkflowRunRequest,
     WorkflowRunResult,
     WorkItem,
     WorkItemKind,
@@ -21,6 +22,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemStatus,
     WorkItemTarget,
 )
+from keystone_agents.slack_action_contract import business_agent_result_display_text
 from keystone_agents.slack_actions import (
     RUN_AGENT_MESSAGE_CALLBACK_ID,
     RUN_AGENT_TASK_ACTION_ID,
@@ -301,7 +303,7 @@ def test_modal_submission_orchestrator_block_stops_before_work_item(
         raise AssertionError("WorkItem manager loop should not run after preflight block")
 
     monkeypatch.setattr(
-        "keystone_agents.slack_actions.advance_work_item_manager_loop",
+        "keystone_agents.slack_actions.advance_work_item_manager_loop_with_optional_langgraph",
         fail_if_called,
     )
 
@@ -321,6 +323,14 @@ def test_modal_submission_orchestrator_block_stops_before_work_item(
     assert run_result.result is not None
     assert run_result.result["block_kind"] == "send"
     assert run_result.result["send_enabled"] is False
+    assert run_result.result["canonical_status"] == "blocked"
+    assert run_result.result["operator_status"] == "needs_input"
+    assert run_result.result["slack_display_title"] == "Business Agents Need Input"
+    assert "Blocked" not in run_result.result["slack_display_title"]
+    assert "draft-only workflow" in run_result.result["slack_display_text"]
+    assert business_agent_result_display_text(run_result.result) == run_result.result[
+        "human_summary"
+    ]
     assert run_result.feedback_events[0]["payload"]["execution_allowed"] is False
 
 
@@ -617,6 +627,91 @@ def test_modal_submission_selects_reusable_prompt_for_multi_target_source_read(
     assert work_item["status"] == WorkItemStatus.BLOCKED.value
 
 
+def test_modal_submission_suppresses_live_search_when_request_forbids_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_advance_work_item_manager_loop(
+        request: WorkflowRunRequest,
+        **_: object,
+    ) -> WorkflowRunResult:
+        captured["request"] = request
+        captured["kwargs"] = _
+        item = WorkItem(
+            kind=WorkItemKind.COMPANY_RESEARCH,
+            title="Research: NeuroFlow",
+            request_text=request.request_text,
+            target=WorkItemTarget(
+                name="NeuroFlow",
+                metadata={
+                    "slack_context": {
+                        "channel_id": "C123",
+                        "selected_message_ts": "1715366400.000100",
+                        "thread_ts": "1715366400.000100",
+                    }
+                },
+            ),
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=WorkItemStatus.DONE,
+        )
+        return WorkflowRunResult(
+            work_item=item,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=WorkItemStatus.DONE,
+            advanced=True,
+            human_summary="Business Research completed.",
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_actions.advance_work_item_manager_loop_with_optional_langgraph",
+        fake_advance_work_item_manager_loop,
+    )
+    modal_result = handle_run_agent_interaction(
+        _message_action_payload(),
+        context_dir=tmp_path / "contexts",
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task=(
+                "LangGraph smoke 1: use preprints context agent history and Zotero "
+                "context agent handoff, then run Business Research for NeuroFlow as "
+                "an internal evidence-packet planning note. Live SDK is approved only "
+                "for this bounded read-only smoke if the backend would normally use "
+                "it; live web search is not approved. Use local/dry-run retrieval "
+                "where possible. Do not send email, create drafts, post elsewhere, "
+                "publish, schedule, or write external systems."
+            ),
+        ),
+        database_url=_database_url(tmp_path),
+        context_dir=tmp_path / "contexts",
+        live_search=True,
+    )
+
+    request = captured["request"]
+    kwargs = captured["kwargs"]
+    assert isinstance(request, WorkflowRunRequest)
+    assert isinstance(kwargs, dict)
+    assert run_result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert "use_langgraph" not in kwargs
+    assert "require_langgraph" not in kwargs
+    assert "feedback_callback" in kwargs
+    assert request.live_search is False
+    assert request.live_sdk is False
+    assert request.manual_request_plan is not None
+    assert request.manual_request_plan["target_agent"] == (
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    )
+    assert request.manual_request_plan["requires_live_search"] is False
+    assert request.slack_query_prompt is not None
+    assert request.slack_query_prompt["target_route"] == (
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    )
+
+
 def test_modal_submission_gmail_request_uses_gmail_context_gate_not_unsupported_route(
     tmp_path: Path,
 ) -> None:
@@ -649,6 +744,12 @@ def test_modal_submission_gmail_request_uses_gmail_context_gate_not_unsupported_
     assert "manager_loop_outreach_not_drafted" in blocker_codes
     assert "route_not_supported_in_workitem_phase" not in blocker_codes
     assert result_payload.get("send_enabled", False) is False
+    assert result_payload["canonical_status"] == "blocked"
+    assert result_payload["operator_status"] == "needs_input"
+    assert result_payload["slack_display_title"] == "Business Agents Need Input"
+    assert "Blocked" not in result_payload["slack_display_title"]
+    assert result_payload["slack_display_text"] == result_payload["human_summary"]
+    assert business_agent_result_display_text(result_payload) == result_payload["human_summary"]
 
 
 def test_modal_submission_passes_prior_thread_runs_to_orchestrator_preflight(
@@ -773,7 +874,7 @@ def test_modal_submission_rejects_mismatched_final_result_context(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.slack_actions.advance_work_item_manager_loop",
+        "keystone_agents.slack_actions.advance_work_item_manager_loop_with_optional_langgraph",
         fake_advance_work_item_manager_loop,
     )
 
@@ -808,7 +909,7 @@ def test_modal_submission_rejects_missing_final_result_context(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.slack_actions.advance_work_item_manager_loop",
+        "keystone_agents.slack_actions.advance_work_item_manager_loop_with_optional_langgraph",
         fake_advance_work_item_manager_loop,
     )
 
@@ -1277,7 +1378,7 @@ def test_live_slack_run_reuses_thread_sdk_session_for_preflight(
         capture_preflight,
     )
     monkeypatch.setattr(
-        "keystone_agents.slack_actions.advance_work_item_manager_loop",
+        "keystone_agents.slack_actions.advance_work_item_manager_loop_with_optional_langgraph",
         fake_manager_loop,
     )
     modal_result = handle_run_agent_interaction(
@@ -1497,7 +1598,7 @@ def test_slack_chief_of_staff_local_kni_followup_gets_evidence_packet(
                 mode="llm",
                 summary=(
                     "The local KNI evidence identifies ProAssurance as broker/producer. "
-                    "Evidence path: 00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf."
+                    "Evidence path: 00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf."
                 ),
                 recommended_route=ChiefOfStaffRouteRecommendation(
                     workflow_type="project-context-review",
@@ -1508,7 +1609,7 @@ def test_slack_chief_of_staff_local_kni_followup_gets_evidence_packet(
                 retrieval_diagnostics={
                     "local_only": True,
                     "send_enabled": False,
-                    "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                    "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
                 },
             ),
             raw_result={"sdk": "called"},
@@ -1526,7 +1627,7 @@ def test_slack_chief_of_staff_local_kni_followup_gets_evidence_packet(
             "send_enabled": False,
             "candidate_documents": [
                 {
-                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
                     "content_excerpt": "PRODUCER IAO, Inc. DBA ProAssurance Agency",
                     "sensitivity_status": "allowed",
                     "review_required": True,
@@ -1580,7 +1681,7 @@ def test_slack_chief_of_staff_local_kni_followup_gets_evidence_packet(
     assert typed_input["local_kni_evidence_packet"]["local_only"] is True
     assert typed_input["local_kni_evidence_packet"]["candidate_documents"][0][
         "relative_path"
-    ].endswith("COI_AnupSharma_2026.pdf")
+    ].endswith("COI_Operator_2026.pdf")
     assert "not as a prewritten final answer" in typed_input["local_kni_instruction"]
     assert typed_input["orchestrator_context"]["local_kni_evidence_prefetch"] is True
     assert captured["packet_query_text"] == "chief of staff who was the broker for the CFC insurance?"
@@ -1628,7 +1729,7 @@ def test_slack_natural_followup_with_pending_approval_reaches_workflow(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.slack_actions.advance_work_item_manager_loop",
+        "keystone_agents.slack_actions.advance_work_item_manager_loop_with_optional_langgraph",
         fake_manager_loop,
     )
     modal_result = handle_run_agent_interaction(

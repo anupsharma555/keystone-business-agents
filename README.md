@@ -58,9 +58,12 @@ workflow, trace, or eval structure changes with:
 ```
 
 The diagram positions Orchestrator as the first request control plane and output
-review layer, Chief of Staff as the cross-functional operating synthesis layer,
-and uses edge colors to distinguish routing/handoffs, deterministic gate/state
-flows, agents-as-tools calls, and trace/log/eval linkages.
+review layer, WorkItems/SQLite as canonical state, the backend graph selector as
+the decision point between a single specialist step and a LangGraph WorkItem
+graph, and Chief of Staff as a coordinator inside that centralized path rather
+than a parallel router. Edge colors distinguish routing/handoffs,
+deterministic gate/state flows, agents-as-tools calls, and trace/log/eval
+linkages.
 
 Search and extraction architecture visual:
 `docs/assets/web-search-agent-architecture.svg`, with a rendered PNG export at
@@ -480,8 +483,8 @@ Implemented:
   exposed to Business Research Analyst, Opportunity Scout, Chief of Staff, and
   Orchestrator as `extract_research_claims_from_html`.
 - Explicit live Slack approval notifications.
-- Optional LangGraph-backed WorkItem orchestration with a dependency-free
-  fallback path and `langgraph_orchestration` timeline diagnostics.
+- Optional LangGraph-backed WorkItem graph execution with a dependency-free
+  fallback path, graph-node metadata, and `langgraph_orchestration` timeline diagnostics.
 - Exa usage helper for API-side usage checks when service-key access is
   available and local monthly estimate reporting otherwise.
 - GitHub update runbook for fast, repeatable local-to-GitHub publishes with

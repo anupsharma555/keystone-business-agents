@@ -19,7 +19,7 @@ schedule, commit to terms, reveal private information, or bypass review.
 
 ## Approved Identity And Founder Context
 
-- Default business email identity: `anup@keystoneneuroinformatics.com`.
+- Default business email identity: `operator@keystone.example`.
 - Approved search and fit summary: Anup Sharma, MD, PhD is a
   physician-scientist and founder of Keystone Neuroinformatics LLC, focused on
   clinical AI, psychiatry, neuroinformatics, clinical research support, evidence

@@ -31,7 +31,10 @@ from keystone_agents.orchestrator.preflight_context import (
 )
 from keystone_agents.quality_budget import QualityMode, chief_of_staff_quality_budget
 from keystone_agents.schemas.airtable import airtable_base_schema_summary_from_metadata
+from keystone_agents.schemas.automation import AutomationWriteDestination
 from keystone_agents.schemas.chief_of_staff import (
+    ChiefContextHandoff,
+    ChiefDurableHandoff,
     ChiefNestedSpecialistResult,
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
@@ -62,8 +65,10 @@ from keystone_agents.tools.chief_of_staff_tool import (
     summarize_slack_runtime_config,
 )
 from keystone_agents.tools.internal_data_tools import (
+    airtable_create_expense_from_receipt_impl,
     airtable_get_base_schema_impl,
     airtable_read_records_impl,
+    airtable_upload_attachment_impl,
     airtable_write_record_impl,
     explicit_full_article_read_requested,
     google_doc_read_impl,
@@ -116,15 +121,19 @@ def test_chief_of_staff_builder_matches_schema_and_policy() -> None:
     assert "airtable_get_base_schema" in tool_names
     assert "airtable_read_records" in tool_names
     assert "airtable_write_record" in tool_names
+    assert "airtable_upload_attachment" in tool_names
+    assert "airtable_create_expense_from_receipt" in tool_names
     assert "google_doc_read" in tool_names
-    assert "google_doc_write" in tool_names
     assert "google_drive_list_folder" in tool_names
+    assert "google_drive_search_files" in tool_names
+    assert "google_drive_get_file_metadata" in tool_names
+    assert "google_sheet_list" in tool_names
+    assert "google_sheet_read_table" in tool_names
+    assert "google_doc_write" in tool_names
     assert "google_drive_create_folder" in tool_names
     assert "google_drive_rename_folder" in tool_names
     assert "google_drive_remove_folder" in tool_names
-    assert "google_sheet_list" in tool_names
     assert "google_sheet_create" in tool_names
-    assert "google_sheet_read_table" in tool_names
     assert "google_sheet_append_rows" in tool_names
     assert "google_sheet_update_row" in tool_names
     assert "google_sheet_delete_rows" in tool_names
@@ -138,6 +147,102 @@ def test_chief_of_staff_builder_matches_schema_and_policy() -> None:
     policy = tool_policy_for_agent("chief_of_staff")
     assert policy is not None
     assert "search_official_operations_docs" in policy.allowed_tool_names
+
+
+def test_chief_of_staff_result_can_carry_structured_durable_handoff() -> None:
+    result = ChiefOfStaffResult(
+        mode="llm",
+        summary="Business Research is the right durable next owner.",
+        durable_handoff=ChiefDurableHandoff(
+            agent="business_research_analyst",
+            rationale="The request needs source-backed company review before downstream work.",
+        ),
+    )
+
+    assert result.durable_handoff is not None
+    assert result.durable_handoff.agent == "business_research_analyst"
+    assert result.durable_handoff.requires_approval is False
+
+
+def test_chief_of_staff_result_can_carry_structured_context_handoff() -> None:
+    result = ChiefOfStaffResult(
+        mode="llm",
+        summary="Stage Airtable schema context before the durable research owner.",
+        durable_handoff=ChiefDurableHandoff(agent="business_research_analyst"),
+        context_handoffs=[
+            ChiefContextHandoff(
+                agent="airtable_context_agent",
+                before_agent="business_research_analyst",
+                rationale="Read-only schema context should inform the research step.",
+            )
+        ],
+    )
+
+    assert result.context_handoffs[0].agent == "airtable_context_agent"
+    assert result.context_handoffs[0].before_agent == "business_research_analyst"
+    assert result.context_handoffs[0].requires_approval is False
+
+
+def test_chief_of_staff_result_can_carry_multiple_structured_context_handoffs() -> None:
+    result = ChiefOfStaffResult(
+        mode="llm",
+        summary="Stage feed and saved-library context before research.",
+        durable_handoff=ChiefDurableHandoff(agent="business_research_analyst"),
+        context_handoffs=[
+            ChiefContextHandoff(
+                agent="preprints_context_agent",
+                before_agent="business_research_analyst",
+            ),
+            ChiefContextHandoff(
+                agent="zotero_context_agent",
+                before_agent="business_research_analyst",
+            ),
+        ],
+    )
+
+    assert [handoff.agent for handoff in result.context_handoffs] == [
+        "preprints_context_agent",
+        "zotero_context_agent",
+    ]
+    assert all(
+        handoff.stage == "before_durable_handoff"
+        for handoff in result.context_handoffs
+    )
+
+
+def test_internal_handoff_request_extracts_feed_and_zotero_context_handoffs() -> None:
+    result = plan_chief_of_staff_request(
+        "chief of staff agent: Use preprints context agent history and Zotero "
+        "context agent saved-library evidence before Business Research Agent "
+        "reviews NeuroFlow. Return the best next owner and keep all sends, posts, "
+        "drafts, file writes, and external system mutations blocked."
+    )
+
+    assert result.durable_handoff is not None
+    assert result.durable_handoff.agent == "business_research_analyst"
+    assert [handoff.agent for handoff in result.context_handoffs] == [
+        "preprints_context_agent",
+        "zotero_context_agent",
+    ]
+    assert all(
+        handoff.before_agent == "business_research_analyst"
+        for handoff in result.context_handoffs
+    )
+
+
+def test_internal_handoff_request_extracts_rss_context_handoff() -> None:
+    result = plan_chief_of_staff_request(
+        "chief of staff agent: Use RSS context agent announcement history before "
+        "Opportunity Scout Agent reviews behavioral-health opportunity signals. "
+        "Return the best next owner and keep sends, posts, drafts, and writes blocked."
+    )
+
+    assert result.durable_handoff is not None
+    assert result.durable_handoff.agent == "opportunity_scout"
+    assert [handoff.agent for handoff in result.context_handoffs] == [
+        "rss_context_agent",
+    ]
+    assert result.context_handoffs[0].before_agent == "opportunity_scout"
 
 
 def test_chief_of_staff_specialist_tools_are_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -627,8 +732,8 @@ def test_chief_of_staff_peo_insurance_question_uses_local_kni_documents(
             "blocked_result_count": 0,
             "matches": [
                 {
-                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
-                    "title": "COI AnupSharma 2026",
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
+                    "title": "COI Operator 2026",
                     "snippet": (
                         "CERTIFICATE OF LIABILITY INSURANCE PRODUCER IAO Inc dba "
                         "ProAssurance Agency INSURER A: CFC Underwriters"
@@ -701,8 +806,8 @@ def test_chief_of_staff_cfc_broker_question_prefers_proassurance_producer(
                     "review_reasons": ["insurance_policy"],
                 },
                 {
-                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
-                    "title": "COI AnupSharma 2026",
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
+                    "title": "COI Operator 2026",
                     "snippet": (
                         "CERTIFICATE OF LIABILITY INSURANCE PRODUCER IAO, Inc. "
                         "DBA ProAssurance Agency INSURER A: CFC Underwriters"
@@ -748,10 +853,10 @@ def test_chief_of_staff_cfc_broker_question_prefers_proassurance_producer(
 
     assert result.recommended_route.workflow_type == "project-context-review"
     assert "does not decide the substantive answer" in result.summary
-    assert "COI_AnupSharma_2026.pdf" in result.summary
+    assert "COI_Operator_2026.pdf" in result.summary
     assert result.retrieval_diagnostics["answer_focus"] == "broker"
     assert result.retrieval_diagnostics["effective_answer_focus"] == "broker"
-    assert result.retrieval_diagnostics["evidence_paths"][0].endswith("COI_AnupSharma_2026.pdf")
+    assert result.retrieval_diagnostics["evidence_paths"][0].endswith("COI_Operator_2026.pdf")
     assert any("Review candidate evidence path: " in action for action in result.recommended_actions)
 
 
@@ -1251,12 +1356,110 @@ def test_run_script_live_sdk_passes_web_query_plan_to_chief(
     assert os.environ["KEYSTONE_ENABLE_LIVE_RESEARCH"] == "true"
 
 
+def test_run_script_live_sdk_skips_web_query_plan_for_business_system_write(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from keystone_agents.agents.orchestrator import OrchestratorPreflight
+    from keystone_agents.schemas.orchestrator import OrchestratorResult
+
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="heuristic",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        primary_target="airtable business expense receipt",
+        target_type="business_system_context",
+        objective="Create a business expense from a receipt.",
+        task_objective="business_system_write",
+        expected_artifact_type="business_system_write_plan",
+        side_effect_policy="internal_write_approval_required",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_preflight(*args: object, **_kwargs: object) -> OrchestratorPreflight:
+        return OrchestratorPreflight(
+            request_text=str(args[0]),
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            manual_request_plan=plan,
+            route_result=OrchestratorResult(
+                route="chief_of_staff",
+                target_agent="chief_of_staff",
+                rationale="Use Chief of Staff with Airtable tools.",
+            ),
+        )
+
+    def fail_resolve_web_query_plan(**_kwargs: object) -> object:
+        raise AssertionError("web query planner should not run for business-system writes")
+
+    def fake_run_chief_of_staff_sdk(*args: object, **kwargs: object) -> TypedAgentRunResult:
+        captured["sdk_args"] = args
+        captured["sdk_kwargs"] = kwargs
+        output = ChiefOfStaffResult(
+            mode="deterministic",
+            summary="Airtable receipt write plan.",
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="artifact-write-plan",
+                target_channel="docs",
+            ),
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.delenv(MANUAL_REQUEST_PLAN_ENV, raising=False)
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(script, "resolve_web_query_plan", fail_resolve_web_query_plan)
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--live-search",
+                "--live-search-plan",
+                "--json",
+                "--input",
+                (
+                    "chief of staff add a business expense to the airtable business "
+                    "expenses based on the receipt details which are: "
+                    "/tmp/example-business-cards-receipt.pdf"
+                ),
+            ]
+        )
+        == 0
+    )
+
+    typed_input = captured["sdk_args"][0]
+    payload = _payload(capsys.readouterr().out)
+    assert typed_input["live_web_research_enabled"] is True
+    assert "web_query_plan" not in typed_input
+    assert "web_query_plan" not in payload
+
+
 def test_run_script_live_sdk_executes_recommended_work_item_handoff(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
 ) -> None:
-    import keystone_agents.workflow_runner as workflow_runner
+    import keystone_agents.langgraph_workflow as langgraph_workflow
     from keystone_agents.schemas.work_item import (
         WorkflowRunRequest,
         WorkflowRunResult,
@@ -1278,7 +1481,7 @@ def test_run_script_live_sdk_executes_recommended_work_item_handoff(
         task_objective="route_or_continue",
         expected_artifact_type="none",
     )
-    captured: dict[str, WorkflowRunRequest] = {}
+    captured: dict[str, object] = {}
 
     class FakeModelConfig:
         def as_log_dict(self) -> dict[str, str]:
@@ -1309,6 +1512,7 @@ def test_run_script_live_sdk_executes_recommended_work_item_handoff(
         **_kwargs: object,
     ) -> WorkflowRunResult:
         captured["request"] = request
+        captured["kwargs"] = _kwargs
         work_item = WorkItem(
             kind=WorkItemKind.COMPANY_RESEARCH,
             title="Research: Cobalt Yard Operations",
@@ -1349,8 +1553,8 @@ def test_run_script_live_sdk_executes_recommended_work_item_handoff(
     monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
     monkeypatch.setattr(script, "_chief_of_staff_output_review", lambda **_: {"status": "pass"})
     monkeypatch.setattr(
-        workflow_runner,
-        "advance_work_item_manager_loop",
+        langgraph_workflow,
+        "advance_work_item_manager_loop_with_optional_langgraph",
         fake_advance_work_item_manager_loop,
     )
 
@@ -1373,9 +1577,15 @@ def test_run_script_live_sdk_executes_recommended_work_item_handoff(
     assert isinstance(output, dict)
     delegated = payload["delegated_work_item_result"]
     assert isinstance(delegated, dict)
-    assert captured["request"].requested_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
-    assert captured["request"].live_sdk is False
-    assert captured["request"].live_search is False
+    captured_request = captured["request"]
+    captured_kwargs = captured["kwargs"]
+    assert isinstance(captured_request, WorkflowRunRequest)
+    assert isinstance(captured_kwargs, dict)
+    assert captured_request.requested_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert captured_request.live_sdk is False
+    assert captured_request.live_search is False
+    assert "use_langgraph" not in captured_kwargs
+    assert "require_langgraph" not in captured_kwargs
     assert delegated["route"] == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
     assert output["recommended_route"]["workflow_type"] == "clarification"
     assert output["summary"].startswith("Chief of Staff handed this to Business Research Agent.")
@@ -1577,7 +1787,7 @@ def test_run_script_live_sdk_passes_local_kni_evidence_packet_to_model(
             summary=(
                 "Based on the local KNI evidence packet, the broker/producer/agency "
                 "is IAO, Inc. DBA ProAssurance Agency. Evidence path: "
-                "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf."
+                "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf."
             ),
             recommended_route=ChiefOfStaffRouteRecommendation(
                 workflow_type="project-context-review",
@@ -1587,7 +1797,7 @@ def test_run_script_live_sdk_passes_local_kni_evidence_packet_to_model(
                 "local_only": True,
                 "send_enabled": False,
                 "lookup_kind": "insurance",
-                "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
             },
         )
         return TypedAgentRunResult(
@@ -1630,8 +1840,8 @@ def test_run_script_live_sdk_passes_local_kni_evidence_packet_to_model(
             "status": "ready",
             "matches": [
                 {
-                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
-                    "title": "COI AnupSharma 2026",
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
+                    "title": "COI Operator 2026",
                     "snippet": "PRODUCER IAO, Inc. DBA ProAssurance Agency",
                     "sensitivity_status": "allowed",
                     "review_required": True,
@@ -1712,14 +1922,14 @@ def test_run_script_live_sdk_passes_local_kni_evidence_packet_to_model(
     assert packet["answer_policy"]["deterministic_prefetch_is_not_final_answer"] is True
     assert packet["retrieval_diagnostics"]["effective_lookup_kind"] == "insurance"
     assert packet["retrieval_diagnostics"]["effective_answer_focus"] == "broker"
-    assert packet["candidate_documents"][0]["relative_path"].endswith("COI_AnupSharma_2026.pdf")
+    assert packet["candidate_documents"][0]["relative_path"].endswith("COI_Operator_2026.pdf")
     assert "ProAssurance" in packet["candidate_documents"][0]["content_excerpt"]
     assert any(
         doc["relative_path"].endswith("CFC POLICY stamped 042126.pdf")
         for doc in packet["candidate_documents"]
     )
     assert any(
-        match["relative_path"].endswith("COI_AnupSharma_2026.pdf")
+        match["relative_path"].endswith("COI_Operator_2026.pdf")
         for match in packet["search_matches"]
     )
     assert "not as a prewritten final answer" in typed_input["local_kni_instruction"]
@@ -2116,6 +2326,23 @@ def test_run_script_allows_bounded_workspace_writes_for_explicit_doc_request() -
     assert "Live Google Workspace folder/doc writes are allowed" in policy
     assert "supplied approval_reference" in policy
     assert "mutate Airtable unless separately requested" in policy
+
+
+def test_run_script_allows_explicit_finance_tracker_airtable_receipt_write() -> None:
+    script = _load_run_chief_of_staff_script()
+    request = (
+        "chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: /tmp/receipt.pdf"
+    )
+
+    policy = script._live_side_effect_policy(request)
+
+    assert "explicitly requested finance_tax_tracker Airtable create/update" in policy
+    assert "supplied approval_reference" in policy
+    assert "typed Airtable tools" in policy
+    assert "one receipt attachment upload is allowed through typed Airtable tools" in policy
+    assert "delete records" in policy
+    assert script._requests_finance_tracker_airtable_write(request) is True
 
 
 def test_chief_of_staff_article_reader_is_default_off_until_explicit() -> None:
@@ -2918,10 +3145,10 @@ def test_chief_of_staff_finance_tracker_prepares_total_expenses_sync_plan(
         live=True,
     )
 
-    assert "Live writes were requested for blank values only" in live_result.output.summary
+    assert "No live write was performed" in live_result.output.summary
     assert write_previews[-2:] == [
-        ("Business Expenses", "rec1", {"Total Expenses": 108.0}, True),
-        ("Personal Expenses", "rec3", {"Total Expenses": 25.0}, True),
+        ("Business Expenses", "rec1", {"Total Expenses": 108.0}, False),
+        ("Personal Expenses", "rec3", {"Total Expenses": 25.0}, False),
     ]
 
 
@@ -3505,6 +3732,844 @@ def test_airtable_live_write_returns_read_after_write_verification(
     assert "RECORD_ID()" in requests[1]["params"]["filterByFormula"]
 
 
+def test_airtable_upload_attachment_dry_run_redacts_local_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    receipt = tmp_path / "receipt.pdf"
+    receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
+
+    result = airtable_upload_attachment_impl(
+        str(receipt),
+        table="Business Expenses",
+        record_id="rec_verified",
+        field_id="fld_receipt",
+        approval_reference="slack-test-approved",
+        live=False,
+    )
+
+    assert result["status"] == "dry-run"
+    assert result["request"]["table"] == "Business Expenses"
+    assert result["request"]["payload"]["filename"] == "receipt.pdf"
+    assert result["request"]["payload"]["contentType"] == "application/pdf"
+    assert str(result["request"]["payload"]["file"]).startswith("<base64 ")
+    assert "uploadAttachment" in result["request"]["url"]
+    assert "JVBER" not in json.dumps(result, sort_keys=True)
+
+
+def test_airtable_create_expense_from_receipt_dry_run_maps_and_attaches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="receipt.pdf",
+            content_read=True,
+            extraction_method="fixture",
+            vendor="Example Print Inc.",
+            receipt_date="2026-06-28",
+            order_number="1002003",
+            description="Business Cards",
+            quantity="50",
+            subtotal="31.00",
+            shipping="45.80",
+            total="76.80",
+            currency="USD",
+            payment_summary="credit card ending in 0000",
+            estimated_tax_periods="Q3",
+        ),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Business Expenses",
+                        "fields": [
+                            {"name": "Item", "field_type": "multilineText"},
+                            {"name": "Date of Expense", "field_type": "date"},
+                            {"name": "Estimated Tax Periods", "field_type": "multilineText"},
+                            {"name": "Expense Client/Vendor", "field_type": "multilineText"},
+                            {"name": "Description", "field_type": "multilineText"},
+                            {"name": "Amount", "field_type": "currency"},
+                            {"name": "Receipt Available", "field_type": "checkbox"},
+                            {
+                                "name": "Payment Method",
+                                "field_type": "multipleSelects",
+                                "select_choices": ["Credit card (personal)"],
+                            },
+                            {
+                                "name": "Categories",
+                                "field_type": "singleSelect",
+                                "select_choices": ["Professional", "Supplies"],
+                            },
+                            {"name": "Total Expenses", "field_type": "currency"},
+                            {
+                                "name": "Attachments",
+                                "field_type": "multipleAttachments",
+                                "field_id": "fldAttachment",
+                            },
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    receipt = tmp_path / "receipt.pdf"
+    receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
+
+    result = airtable_create_expense_from_receipt_impl(
+        str(receipt),
+        table="Business Expenses",
+        category="Professional",
+        payment_method="Credit card (personal)",
+        approval_reference="slack-test-approved",
+        live=False,
+    )
+
+    assert result["status"] == "dry-run"
+    assert result["mapped_fields"]["Expense Client/Vendor"] == "Example Print Inc."
+    assert result["mapped_fields"]["Estimated Tax Periods"] == "Q3"
+    assert result["mapped_fields"]["Total Expenses"] == 76.8
+    assert result["mapped_fields"]["Categories"] == "Professional"
+    assert result["mapped_fields"]["Payment Method"] == ["Credit card (personal)"]
+    assert result["write_result"]["status"] == "dry-run"
+    assert result["attachment_result"]["status"] == "dry-run"
+    assert result["attachment_result"]["request"]["payload"]["file"].startswith("<base64 ")
+    assert result["mapping"]["attachment_field"]["field_id"] == "fldAttachment"
+
+
+def test_airtable_create_expense_from_receipt_accepts_model_receipt_facts_and_schema_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="receipt.pdf",
+            content_read=False,
+            extraction_method="fixture_unreadable",
+            blocker="fixture extraction unavailable",
+        ),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Business Expenses",
+                        "fields": [
+                            {"name": "Merchant", "field_type": "multilineText"},
+                            {"name": "Expense Date", "field_type": "date"},
+                            {
+                                "name": "Period",
+                                "field_type": "singleSelect",
+                                "select_choices": ["Q1", "Q2", "Q3", "Q4"],
+                            },
+                            {"name": "Grand Total", "field_type": "currency"},
+                            {
+                                "name": "Receipt File",
+                                "field_type": "multipleAttachments",
+                                "field_id": "fldReceipt",
+                            },
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    receipt = tmp_path / "receipt.pdf"
+    receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
+
+    result = airtable_create_expense_from_receipt_impl(
+        str(receipt),
+        table="Business Expenses",
+        receipt_fields_json=json.dumps(
+            {
+                "vendor": "Acme Labs",
+                "receipt_date": "2026-09-15",
+                "description": "Lab supplies",
+                "total": "199.25",
+                "currency": "USD",
+            },
+            sort_keys=True,
+        ),
+        field_values_json=json.dumps(
+            {
+                "Merchant": "Acme Labs",
+                "Expense Date": "2026-09-15",
+                "Period": "Q4",
+                "Grand Total": "199.25",
+            },
+            sort_keys=True,
+        ),
+        approval_reference="slack-test-approved",
+        live=False,
+    )
+
+    assert result["status"] == "dry-run"
+    assert result["receipt_evidence"]["vendor"] == "Acme Labs"
+    assert result["receipt_evidence"]["estimated_tax_periods"] == "Q4"
+    assert result["mapped_fields"] == {
+        "Merchant": "Acme Labs",
+        "Expense Date": "2026-09-15",
+        "Period": "Q4",
+        "Grand Total": 199.25,
+    }
+    assert "model_receipt_fields_used" in result["evidence_notes"]
+    assert "deterministic_blocker: fixture extraction unavailable" in result["evidence_notes"]
+    assert result["attachment_result"]["status"] == "dry-run"
+    assert result["attachment_result"]["request"]["payload"]["filename"] == "receipt.pdf"
+    assert result["mapping"]["attachment_field"]["field_id"] == "fldReceipt"
+
+
+def test_airtable_create_expense_from_receipt_blocks_conflicting_model_facts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="receipt.pdf",
+            content_read=True,
+            extraction_method="fixture",
+            vendor="Example Print Inc.",
+            receipt_date="2026-06-28",
+            total="76.80",
+            estimated_tax_periods="Q3",
+        ),
+    )
+
+    def fail_write(*_args: object, **_kwargs: object) -> dict[str, object]:
+        pytest.fail("conflicting critical receipt facts must block before Airtable write")
+
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_write_record_impl",
+        fail_write,
+    )
+    receipt = tmp_path / "receipt.pdf"
+    receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
+
+    result = airtable_create_expense_from_receipt_impl(
+        str(receipt),
+        table="Business Expenses",
+        receipt_fields_json=json.dumps(
+            {
+                "vendor": "Example Print Inc.",
+                "receipt_date": "2026-06-28",
+                "total": "99.00",
+            },
+            sort_keys=True,
+        ),
+        field_values_json=json.dumps({"Total Expenses": "99.00"}, sort_keys=True),
+        approval_reference="slack-test-approved",
+        live=False,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "Model-extracted receipt fields conflict with deterministic extraction."
+    assert result["conflicts"] == ["conflict:total:76.80!=99.00"]
+
+
+def test_airtable_create_expense_from_receipt_live_preflights_upload_gate_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+    monkeypatch.delenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS", raising=False)
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="receipt.pdf",
+            content_read=True,
+            extraction_method="fixture",
+            vendor="Example Print Inc.",
+            receipt_date="2026-06-28",
+            description="Business Cards",
+            subtotal="31.00",
+            total="76.80",
+            estimated_tax_periods="Q3",
+        ),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Business Expenses",
+                        "fields": [
+                            {"name": "Item", "field_type": "multilineText"},
+                            {"name": "Date of Expense", "field_type": "date"},
+                            {"name": "Estimated Tax Periods", "field_type": "multilineText"},
+                            {"name": "Expense Client/Vendor", "field_type": "multilineText"},
+                            {"name": "Amount", "field_type": "currency"},
+                            {"name": "Total Expenses", "field_type": "currency"},
+                            {
+                                "name": "Attachments",
+                                "field_type": "multipleAttachments",
+                                "field_id": "fldAttachment",
+                            },
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+
+    def fail_write(**_kwargs: object) -> dict[str, object]:
+        pytest.fail("live receipt tool must preflight upload gate before Airtable write")
+
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_write_record_impl",
+        fail_write,
+    )
+    receipt = tmp_path / "receipt.pdf"
+    receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
+
+    with pytest.raises(RuntimeError, match="AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true"):
+        airtable_create_expense_from_receipt_impl(
+            str(receipt),
+            table="Business Expenses",
+            approval_reference="slack-test-approved",
+            live=True,
+        )
+
+
+def test_airtable_create_expense_from_receipt_live_success_writes_then_attaches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    calls: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+    monkeypatch.setenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS", "true")
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="receipt.pdf",
+            content_read=True,
+            extraction_method="fixture",
+            vendor="Example Print Inc.",
+            receipt_date="2026-06-28",
+            description="Business Cards",
+            subtotal="31.00",
+            total="76.80",
+            estimated_tax_periods="Q3",
+        ),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Business Expenses",
+                        "fields": [
+                            {"name": "Item", "field_type": "multilineText"},
+                            {"name": "Date of Expense", "field_type": "date"},
+                            {"name": "Estimated Tax Periods", "field_type": "multilineText"},
+                            {"name": "Expense Client/Vendor", "field_type": "multilineText"},
+                            {"name": "Amount", "field_type": "currency"},
+                            {"name": "Total Expenses", "field_type": "currency"},
+                            {
+                                "name": "Attachments",
+                                "field_type": "multipleAttachments",
+                                "field_id": "fldAttachment",
+                            },
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+
+    def fake_write(fields_json: str, **kwargs: object) -> dict[str, object]:
+        calls.append(("write", {"fields_json": fields_json, **kwargs}))
+        return {"status": "success", "record_id": "rec_created", "verified_record": {}}
+
+    def fake_upload(local_file_path: str, **kwargs: object) -> dict[str, object]:
+        calls.append(("upload", {"local_file_path": local_file_path, **kwargs}))
+        return {"status": "success", "record_id": kwargs["record_id"], "field_id": "fldAttachment"}
+
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_write_record_impl",
+        fake_write,
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_upload_attachment_impl",
+        fake_upload,
+    )
+    receipt = tmp_path / "receipt.pdf"
+    receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
+
+    result = airtable_create_expense_from_receipt_impl(
+        str(receipt),
+        table="Business Expenses",
+        approval_reference="slack-test-approved",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert [name for name, _payload in calls] == ["write", "upload"]
+    write_call = calls[0][1]
+    upload_call = calls[1][1]
+    assert write_call["live"] is True
+    assert upload_call["live"] is True
+    assert upload_call["record_id"] == "rec_created"
+    assert upload_call["field_id"] == "fldAttachment"
+    assert result["write_result"]["record_id"] == "rec_created"
+    assert result["attachment_result"]["status"] == "success"
+
+
+def test_chief_of_staff_live_business_expense_receipt_uses_llm_tool_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS", "true")
+
+    def fake_run_typed_sdk_agent(**kwargs: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured.update(kwargs)
+        output = ChiefOfStaffResult(
+            mode="llm",
+            summary="Receipt interpreted by Chief of Staff LLM/tool path.",
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="budget-resource-review",
+                target_channel="ai-agents-workflow",
+            ),
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=output,
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.agents.chief_of_staff.run_typed_sdk_agent",
+        fake_run_typed_sdk_agent,
+    )
+    request = (
+        "chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: "
+        "/tmp/example-business-cards-receipt.pdf"
+    )
+
+    result = run_chief_of_staff_sdk(request, live=True)
+
+    assert result.raw_result == {"sdk": "called"}
+    typed_input = captured["typed_input"]
+    assert isinstance(typed_input, dict)
+    assert typed_input["request"] == request
+    assert "finance_expense_receipt_instruction" in typed_input
+    provider_context = {
+        item["key"]: item["value"] for item in typed_input["provider_call_context"]
+    }
+    assert provider_context["airtable_base_alias"] == "finance_tax_tracker"
+    assert provider_context["airtable_target_table"] == "Business Expenses"
+    assert provider_context["receipt_local_path"].endswith("example-business-cards-receipt.pdf")
+    tool_plan = typed_input["finance_expense_receipt_tool_plan"]
+    assert tool_plan["handoff_tool_name"] == "airtable_create_expense_from_receipt"
+    assert tool_plan["arguments"]["base_alias"] == "finance_tax_tracker"
+    assert tool_plan["arguments"]["table"] == "Business Expenses"
+    assert tool_plan["arguments"]["approval_reference"] == ""
+    assert tool_plan["arguments"]["live"] is True
+    assert json.loads(tool_plan["arguments"]["receipt_fields_json"]) == {}
+    assert json.loads(tool_plan["arguments"]["field_values_json"]) == {}
+    assert tool_plan["arguments"]["local_file_path"].endswith(
+        "example-business-cards-receipt.pdf"
+    )
+    assert "Inspect Airtable schema before creating the record." in tool_plan[
+        "llm_reasoning_required"
+    ]
+    agent = captured["agent"]
+    tool_names = {getattr(tool, "name", "") for tool in agent.tools}
+    assert "airtable_get_base_schema" in tool_names
+    assert "airtable_write_record" in tool_names
+    assert "airtable_upload_attachment" in tool_names
+    assert "airtable_create_expense_from_receipt" in tool_names
+
+
+def test_chief_of_staff_receipt_typed_input_preserves_pdf_for_openai_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.run import sdk_input_from_typed_input
+
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS", "true")
+    receipt = tmp_path / "receipt.pdf"
+    receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
+
+    def fake_run_typed_sdk_agent(**kwargs: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured.update(kwargs)
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(mode="llm", summary="Receipt interpreted."),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.agents.chief_of_staff.run_typed_sdk_agent",
+        fake_run_typed_sdk_agent,
+    )
+    request = (
+        "chief of staff add a business expense to the airtable business expenses "
+        f"based on the receipt details which are: {receipt}"
+    )
+
+    run_chief_of_staff_sdk(request, live=True)
+
+    typed_input = captured["typed_input"]
+    sdk_input = sdk_input_from_typed_input(typed_input, live=True, provider="openai")
+
+    assert isinstance(sdk_input, list)
+    content = sdk_input[0]["content"]
+    text_part = next(part for part in content if part.get("type") == "input_text")
+    file_part = next(part for part in content if part.get("type") == "input_file")
+    assert "finance_expense_receipt_tool_plan" in text_part["text"]
+    assert "airtable_create_expense_from_receipt" in text_part["text"]
+    assert file_part["filename"] == "receipt.pdf"
+    assert str(file_part["file_data"]).startswith("data:application/pdf;base64,")
+
+
+def test_chief_of_staff_live_receipt_blocks_without_attachment_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS", raising=False)
+    monkeypatch.delenv("KEYSTONE_AIRTABLE_LIVE_READS", raising=False)
+
+    def fail_run_typed_sdk_agent(**_kwargs: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        pytest.fail("receipt create should preflight-block before live SDK/model execution")
+
+    monkeypatch.setattr(
+        "keystone_agents.agents.chief_of_staff.run_typed_sdk_agent",
+        fail_run_typed_sdk_agent,
+    )
+    request = (
+        "chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: "
+        "/tmp/example-business-cards-receipt.pdf"
+    )
+
+    result = run_chief_of_staff_sdk(request, live=True, force_sdk_interpretation=True)
+
+    assert result.live is False
+    assert result.raw_result == {
+        "blocked": "airtable_receipt_attachment_upload_gate",
+        "missing_env": "AIRTABLE_ALLOW_ATTACHMENT_UPLOADS",
+    }
+    assert "AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true" in result.output.summary
+    assert "creating an expense record without attaching the receipt" in result.output.summary
+    assert "blocked_receipt_attachment_upload_gate" in " ".join(result.output.audit_notes)
+
+
+def test_chief_of_staff_live_receipt_blocker_can_include_live_schema_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    monkeypatch.delenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS", raising=False)
+    monkeypatch.setenv("KEYSTONE_AIRTABLE_LIVE_READS", "true")
+
+    def fail_run_typed_sdk_agent(**_kwargs: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        pytest.fail("receipt create should preflight-block before live SDK/model execution")
+
+    monkeypatch.setattr(
+        "keystone_agents.agents.chief_of_staff.run_typed_sdk_agent",
+        fail_run_typed_sdk_agent,
+    )
+    monkeypatch.setattr(
+        chief_of_staff_module,
+        "extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="receipt.pdf",
+            content_read=True,
+            extraction_method="fixture",
+            vendor="Example Print Inc.",
+            receipt_date="2026-06-28",
+            description="Business Cards",
+            subtotal="31.00",
+            total="76.80",
+            payment_summary="credit card ending in 0000",
+            estimated_tax_periods="Q3",
+        ),
+    )
+    monkeypatch.setattr(
+        chief_of_staff_module,
+        "airtable_get_base_schema_impl",
+        lambda *, base_alias, live: {
+            "status": "success" if live else "dry-run",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Business Expenses",
+                        "fields": [
+                            {"name": "Item", "field_type": "multilineText"},
+                            {"name": "Date of Expense", "field_type": "date"},
+                            {"name": "Estimated Tax Periods", "field_type": "multilineText"},
+                            {"name": "Expense Client/Vendor", "field_type": "multilineText"},
+                            {"name": "Description", "field_type": "multilineText"},
+                            {"name": "Amount", "field_type": "currency"},
+                            {"name": "Receipt Available", "field_type": "checkbox"},
+                            {"name": "Total Expenses", "field_type": "currency"},
+                            {
+                                "name": "Payment Method",
+                                "field_type": "multipleSelects",
+                                "select_choices": ["Credit card (personal)"],
+                            },
+                            {
+                                "name": "Attachments",
+                                "field_type": "multipleAttachments",
+                                "field_id": "fldAttachment",
+                            },
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    request = (
+        "chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: "
+        "/tmp/example-business-cards-receipt.pdf"
+    )
+
+    result = run_chief_of_staff_sdk(request, live=True, force_sdk_interpretation=True)
+
+    metadata = json.loads(result.output.write_requests[0].metadata)
+    assert result.live is False
+    assert metadata["schema_mapping_status"] == "success"
+    assert metadata["schema_field_mapping"]["fields"]["Total Expenses"] == 76.8
+    assert metadata["schema_field_mapping"]["attachment_field"] == {
+        "name": "Attachments",
+        "field_id": "fldAttachment",
+    }
+    assert "Schema mapping resolved (success)" in result.output.summary
+    assert "AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true" in result.output.summary
+
+
+def test_chief_of_staff_receipt_create_fallback_is_write_plan_not_context_advisory() -> None:
+    request = (
+        "chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: "
+        "/tmp/example-business-cards-receipt.pdf"
+    )
+
+    result = plan_chief_of_staff_request(
+        request,
+        manual_request_plan={
+            "source": "test",
+            "target_agent": "chief_of_staff",
+            "intent": "slack_operations",
+        },
+    )
+
+    assert result.recommended_route.workflow_type == "artifact-write-plan"
+    assert "Business Expenses" in result.summary
+    assert "Estimated Tax Periods" in result.summary
+    assert "receipt date" in result.summary
+    assert "context-agent advisory" not in result.summary
+    assert result.write_requests
+    write_request = result.write_requests[0]
+    assert write_request.destination == AutomationWriteDestination.AIRTABLE
+    assert write_request.title == "Create Business Expenses receipt expense"
+    assert "AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true" in write_request.blocked_reason
+    metadata = json.loads(write_request.metadata)
+    if metadata["receipt_evidence_read"]:
+        field_preview = metadata["receipt_field_preview"]
+        assert field_preview["Vendor or Merchant"] == "Example Print Inc."
+        assert field_preview["Date of Expense"] == "2026-06-28"
+        assert field_preview["Estimated Tax Periods"] == "Q3"
+        assert field_preview["Total Expenses"] == "76.80"
+        assert field_preview["Order or Receipt Number"] == "1002003"
+        assert "Receipt evidence read from artifact" in result.summary
+    assert "allowed_finance_receipt_create_plan" in " ".join(result.audit_notes)
+
+
+def test_chief_of_staff_receipt_create_live_plan_includes_schema_field_mapping(
+    monkeypatch,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    request = (
+        "chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: "
+        "/tmp/example-business-cards-receipt.pdf"
+    )
+
+    monkeypatch.setattr(
+        chief_of_staff_module,
+        "airtable_get_base_schema_impl",
+        lambda *, base_alias, live: {
+            "status": "success" if live else "dry-run",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Business Expenses",
+                        "fields": [
+                            {
+                                "name": "Item",
+                                "field_type": "multilineText",
+                                "field_id": "fldCoWHTa87Djd2yI",
+                            },
+                            {
+                                "name": "Estimated Tax Periods",
+                                "field_type": "multilineText",
+                                "field_id": "fld0xvGeviEdGZHXu",
+                            },
+                            {
+                                "name": "Date of Expense",
+                                "field_type": "date",
+                                "field_id": "fldh7Ytfs4kjmELEM",
+                            },
+                            {
+                                "name": "Expense Client/Vendor",
+                                "field_type": "multilineText",
+                                "field_id": "fldLAegBqE71DcgTp",
+                            },
+                            {
+                                "name": "Description",
+                                "field_type": "multilineText",
+                                "field_id": "fldEu6dO89poGCgA7",
+                            },
+                            {
+                                "name": "Amount",
+                                "field_type": "currency",
+                                "field_id": "fldN0YKCncbRFpq80",
+                            },
+                            {
+                                "name": "Receipt Available",
+                                "field_type": "checkbox",
+                                "field_id": "fldsYpls7cWu7DqhM",
+                            },
+                            {
+                                "name": "Payment Method",
+                                "field_type": "multipleSelects",
+                                "field_id": "fld7gIOO36UjeZQW1",
+                                "select_choices": ["Credit card (personal)"],
+                            },
+                            {
+                                "name": "Total Expenses",
+                                "field_type": "currency",
+                                "field_id": "fldXvUqX9yXQQ9l2B",
+                            },
+                            {
+                                "name": "Attachments",
+                                "field_type": "multipleAttachments",
+                                "field_id": "fldpT1bIw45DIkm68",
+                            },
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        chief_of_staff_module,
+        "extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="example-business-cards-receipt.pdf",
+            content_read=True,
+            extraction_method="fixture",
+            vendor="Example Print Inc.",
+            receipt_date="2026-06-28",
+            order_number="1002003",
+            description="Business Cards",
+            quantity="50",
+            subtotal="31.00",
+            shipping="45.80",
+            total="76.80",
+            currency="USD",
+            payment_summary="credit card ending in 0000",
+            estimated_tax_periods="Q3",
+        ),
+    )
+
+    result = chief_of_staff_module._plan_finance_tracker_request(request, live=True)
+
+    metadata = json.loads(result.write_requests[0].metadata)
+    mapping = metadata["schema_field_mapping"]
+    assert metadata["schema_mapping_status"] == "success"
+    assert mapping["fields"]["Expense Client/Vendor"] == "Example Print Inc."
+    assert mapping["fields"]["Date of Expense"] == "2026-06-28"
+    assert mapping["fields"]["Estimated Tax Periods"] == "Q3"
+    assert mapping["fields"]["Total Expenses"] == 76.8
+    assert mapping["attachment_field"] == {
+        "name": "Attachments",
+        "field_id": "fldpT1bIw45DIkm68",
+    }
+    assert mapping["select_candidates"]["Payment Method"] == ["Credit card (personal)"]
+    assert "Payment Method" not in mapping["fields"]
+
+
+def test_chief_of_staff_non_live_sdk_receipt_create_uses_write_plan() -> None:
+    request = (
+        "chief of staff add a business expense to the airtable business expenses "
+        "based on the receipt details which are: "
+        "/tmp/example-business-cards-receipt.pdf"
+    )
+
+    result = run_chief_of_staff_sdk(
+        request,
+        live=False,
+        manual_request_plan={
+            "source": "test",
+            "target_agent": "chief_of_staff",
+            "intent": "slack_operations",
+        },
+    )
+
+    assert result.raw_result == {"deterministic": "finance_tax_tracker_receipt_create_plan"}
+    assert result.output.recommended_route.workflow_type == "artifact-write-plan"
+    assert "read-only lookup" not in result.output.summary
+    assert result.output.write_requests[0].title == "Create Business Expenses receipt expense"
+
+
 def test_chief_of_staff_registry_card_is_canonical() -> None:
     spec = AGENT_REGISTRY["chief_of_staff"]
 
@@ -3521,6 +4586,24 @@ def test_chief_of_staff_quality_budget_fast_for_simple_scope() -> None:
     assert budget.mode == QualityMode.FAST
     assert budget.max_turns == 4
     assert budget.reasoning_effort == "low"
+    assert budget.enable_context_deepening is False
+
+
+def test_chief_of_staff_quality_budget_caps_bounded_live_smoke() -> None:
+    budget = chief_of_staff_quality_budget(
+        request_text=(
+            "LangGraph smoke 3: Chief of Staff coordinate Airtable Context agent "
+            "schema context before Opportunity Scout. Live SDK is approved only for "
+            "this bounded read-only smoke."
+        ),
+        live_sdk=True,
+    )
+
+    assert budget.mode == QualityMode.FAST
+    assert budget.max_turns == 3
+    assert budget.max_tokens == 1600
+    assert budget.max_tool_calls == 3
+    assert budget.hosted_web_search_max_calls == 0
     assert budget.enable_context_deepening is False
 
 
@@ -3760,6 +4843,8 @@ def test_internal_handoff_request_uses_agent_handoff_notation() -> None:
 
     assert result.recommended_route.workflow_type == "research-direction-review"
     assert result.recommended_route.command_text == "Chief of Staff -> Business Research Agent"
+    assert result.durable_handoff is not None
+    assert result.durable_handoff.agent == "business_research_analyst"
     assert "internal handoff" in result.summary
     assert any("Chief of Staff -> Agent notation" in action for action in result.recommended_actions)
     assert result.send_enabled is False
@@ -3777,6 +4862,8 @@ def test_internal_handoff_request_preserves_named_downstream_agent() -> None:
     )
 
     assert result.recommended_route.command_text == "Chief of Staff -> Opportunity Scout Agent"
+    assert result.durable_handoff is not None
+    assert result.durable_handoff.agent == "opportunity_scout"
     assert result.send_enabled is False
 
 

@@ -46,17 +46,17 @@ SPECIALIST_CONTEXT_GUIDANCE: dict[str, str] = {
     ),
     "airtable_context_agent": (
         "Return relevant base/table/field context, candidate record identity, mapping "
-        "assumptions, blockers, approval needs, human work context, and a Chief-owned "
-        "Airtable write plan. Do not execute writes."
+        "assumptions, blockers, approval needs, human work context, and a reviewable "
+        "Airtable write plan for specialist/action-handler execution. Do not execute writes."
     ),
     "google_workspace_context_agent": (
         "Return relevant Drive folder/file, Doc, Sheet, and tab context, target-selection "
-        "rationale, blockers, approval needs, human work context, and a Chief-owned "
-        "Workspace write plan. Do not execute writes."
+        "rationale, blockers, approval needs, human work context, and a reviewable "
+        "Workspace write plan for specialist/action-handler execution. Do not execute writes."
     ),
     "zotero_context_agent": (
         "Return relevant Zotero library, collection, item, article, source ID, "
-        "evidence-gap, and human work context plus a Chief-owned artifact plan. "
+        "evidence-gap, and human work context plus a reviewable artifact plan. "
         "Do not mutate Zotero libraries, collections, notes, tags, attachments, or metadata."
     ),
     "rss_context_agent": (
@@ -158,7 +158,7 @@ def _chief_nested_type_contract(
         payload_mode="adapted" if parsed_output_status != "malformed" else "malformed",
         parsed_output_status=parsed_output_status,  # type: ignore[arg-type]
         compatibility_notes=[
-            "Nested specialist output is adapted into a Chief-owned review envelope."
+            "Nested specialist output is adapted into a Chief review envelope."
         ],
     )
 
@@ -258,7 +258,7 @@ def extract_nested_specialist_result(
     route_name: str,
     tool_name: str,
 ) -> ChiefNestedSpecialistResult:
-    """Normalize one nested specialist SDK result into a Chief-owned envelope."""
+    """Normalize one nested specialist SDK result into a Chief review envelope."""
 
     raw_output = getattr(run_result, "final_output", None)
     try:

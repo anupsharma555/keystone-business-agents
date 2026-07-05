@@ -1135,7 +1135,7 @@ def build_local_run_config(
 
 def _run_sync_with_optional_session(
     agent: AgentLike,
-    prompt: str,
+    prompt: Any,
     *,
     run_config: Any,
     session: Any | None = None,
@@ -1151,7 +1151,7 @@ def _run_sync_with_optional_session(
 
 def run_sdk_sync(
     agent: AgentLike,
-    prompt: str,
+    prompt: Any,
     config: ModelConfig | None = None,
     *,
     session: Any | None = None,
@@ -1213,7 +1213,7 @@ def _close_run_config_openai_client(run_config: Any) -> None:
 
 def run_sdk_sync_with_config(
     agent: AgentLike,
-    prompt: str,
+    prompt: Any,
     run_config: Any,
     *,
     session: Any | None = None,
@@ -1243,7 +1243,7 @@ def _coerce_typed_output(output: Any, output_type: type[TOutput]) -> TOutput:
 
 def run_typed_sdk_sync(
     agent: AgentLike,
-    prompt: str,
+    prompt: Any,
     output_type: type[TOutput],
     *,
     run_config: Any | None = None,

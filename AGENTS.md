@@ -89,7 +89,7 @@ inspectable state:
 - Use the KNI Finance Operations local app only as a read-only finance
   operations context source unless a separate write integration is approved.
   The canonical local app is
-  `/Users/anup/Desktop/AllFiles/Professional/KeystoneNeuroinformatics/kni-finance-ops-local/`
+  `/path/to/kni-finance-ops-local/`
   at `http://127.0.0.1:8765`; bridge through its documented JSON API or
   exports for data reads. If Anup explicitly asks from CLI or Slack for a
   business agent to visualize or read the finance operations webpage, read-only
@@ -336,6 +336,29 @@ model names inside prompts, tools, or CLI branches.
   nano variant for smoke/eval runs when quality requirements allow. Request a
   higher OpenAI limit only when compact prompts and reasonable backoff are not
   enough.
+
+## API Cost-Aware Agent Testing
+
+For future OpenAI/API-backed agent tests, live SDK smoke runs, Promptfoo or
+local evals that can trigger model calls, or multi-agent live validation, use
+the global `codex-general-api-cost-aware-agent-testing` skill together with this
+repo's `codex-skills/kba-live-sdk-smoke-and-cost/SKILL.md`. Exhaust static,
+fixture, mocked-provider, dry-run, and single-agent diagnostics before any live
+API call. Do not run broad live eval suites until the relevant individual agent
+or workflow has a bounded live smoke result and the broadest visible root causes
+have been fixed.
+
+Before the first live API call, require an explicit live-test budget or stop
+condition, identify the exact agent/workflow, model, input, tool scope, expected
+output surface, and logging path, and keep live runs serial. Use
+`codex-general-openai-cost-monitor` for current OpenAI billing or Admin
+Costs/Usage snapshots before, during, and after live testing whenever platform
+access or an admin key is available. If direct billing evidence is unavailable,
+proceed only with an explicit small budget and state that limitation.
+
+This repo still uses `KEYSTONE_OPENAI_API_KEY` for KBA live SDK work. Do not
+assume a generic `OPENAI_API_KEY` belongs to this project, and never print,
+commit, or paste secrets while setting up cost monitoring or live tests.
 
 ## Output Formatting Model
 

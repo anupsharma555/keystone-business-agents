@@ -160,6 +160,12 @@ def resolve_slack_query_prompt(
 
     detected_route = _default_route_for_kind(detected)
     target_route = _safe_target_route(prompt_input.target_route) or detected_route
+    if (
+        target_route != detected_route
+        and detected_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+        and _explicit_business_research_requested(request_text)
+    ):
+        target_route = detected_route
     route_mismatch = {}
     if target_route != detected_route:
         route_mismatch = {
@@ -228,6 +234,8 @@ def _detect_prompt_kind(prompt_input: SlackQueryPromptInput) -> SlackQueryPrompt
     ).lower()
     if not text.strip():
         return None
+    if _explicit_business_research_requested(prompt_input.raw_request):
+        return SlackQueryPromptKind.RESEARCH_SUMMARY
     if any(marker in text for marker in ("revise", "revision", "continue", "run again", "redo")):
         return SlackQueryPromptKind.CONTINUE_OR_REVISE
     if any(marker in text for marker in ("more_research", "more research", "deeper", "deep read")):
@@ -285,6 +293,16 @@ def _detect_prompt_kind(prompt_input: SlackQueryPromptInput) -> SlackQueryPrompt
     if prompt_input.target_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
         return SlackQueryPromptKind.RESEARCH_SUMMARY
     return None
+
+
+def _explicit_business_research_requested(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\bbusiness\s+research(?:\s+analyst|\s+agent)?\b",
+            str(text or ""),
+            flags=re.I,
+        )
+    )
 
 
 def _render_task_brief(

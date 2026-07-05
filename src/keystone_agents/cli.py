@@ -42,6 +42,10 @@ from keystone_agents.costing import estimate_usage_cost
 from keystone_agents.eval_runtime_diagnostics import slack_eval_blocker_diagnostics
 from keystone_agents.evals import generate_eval_report, run_static_evals
 from keystone_agents.file_search import local_file_search_config_summary
+from keystone_agents.finance_expense_receipts import (
+    finance_expense_receipt_field_hints,
+    infer_finance_expense_receipt_target,
+)
 from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
 from keystone_agents.model_provider import get_runtime_agent_model_config
@@ -120,7 +124,10 @@ from keystone_agents.work_items import (
     select_artifact,
     set_next_action,
 )
-from keystone_agents.workflow_runner import advance_work_item_manager_loop
+from keystone_agents.workflow_runner import (
+    _inline_gmail_fixture_from_request,
+    advance_work_item_manager_loop,
+)
 from keystone_agents.workflows import (
     pipeline_markdown_report,
     run_keystone_pipeline,
@@ -544,11 +551,16 @@ def _run_ask(args: argparse.Namespace) -> int:
         if eval_status is not None:
             return _print_eval_status(eval_status, json_output=args.json)
     live_sdk = _ask_live_sdk_enabled(args)
-    live_manual_plan = args.live_manual_plan or live_sdk
+    requested_route = args.agent or (mention.route if mention.explicit else None)
     live_search = args.live_search or (live_sdk and cli_default_live_research())
+    if live_search and _request_forbids_live_research(input_text):
+        live_search = False
+    live_manual_plan = (args.live_manual_plan or live_sdk) and not (
+        live_sdk
+        and _skip_live_manual_plan_for_request(input_text, requested_route=requested_route)
+    )
     if live_manual_plan:
         load_settings(force_dotenv=True)
-    requested_route = args.agent or (mention.route if mention.explicit else None)
     orchestrator_preflight = run_orchestrator_preflight(
         input_text,
         requested_agent=requested_route,
@@ -1277,6 +1289,30 @@ def _ask_live_sdk_enabled(args: argparse.Namespace) -> bool:
     return cli_default_live_sdk()
 
 
+def _skip_live_manual_plan_for_request(
+    input_text: str,
+    *,
+    requested_route: str | None,
+) -> bool:
+    """Avoid pre-gate model planning for bounded requests with deterministic plans."""
+
+    if _ask_request_is_bounded_live_sdk_smoke(input_text):
+        return True
+    if infer_finance_expense_receipt_target(input_text) is None:
+        return False
+    route = str(requested_route or "").strip()
+    return route in {"", "chief_of_staff", "orchestrator"}
+
+
+def _ask_request_is_bounded_live_sdk_smoke(input_text: str) -> bool:
+    normalized = " ".join(str(input_text or "").lower().split())
+    if "smoke" not in normalized:
+        return False
+    return bool(
+        re.search(r"\bbounded\b|\bread[- ]only\b|\blive sdk is approved only\b", normalized)
+    )
+
+
 def _sdk_session_spec_for_ask(
     args: argparse.Namespace,
     *,
@@ -1680,6 +1716,8 @@ def _run_ask_work_item(
     cost_tracking_requested: bool = False,
 ) -> int:
     try:
+        if live_search and _request_forbids_live_research(input_text):
+            live_search = False
         store = SQLiteStore(database_url or database_url_from_env())
         work_item_id = _resolve_continue_work_item_id(
             store,
@@ -1688,29 +1726,34 @@ def _run_ask_work_item(
             json_output=json_output,
         )
         existing_work_item = store.get_work_item(work_item_id) if work_item_id else None
-        result = advance_work_item_manager_loop(
-            WorkflowRunRequest(
+        request = WorkflowRunRequest(
+            request_text=input_text,
+            work_item_id=work_item_id,
+            save=True,
+            database_url=database_url,
+            live_search=live_search,
+            live_sdk=live_sdk,
+            max_results=max_results,
+            manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
+            orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
+            context_file_path=context_file_path,
+            sdk_session_enabled=sdk_session_enabled,
+            sdk_session_id=sdk_session_id,
+            sdk_session_db_path=sdk_session_db_path,
+            sdk_session_history_limit=sdk_session_history_limit,
+            cost_tracking_requested=cost_tracking_requested,
+            **_workflow_cost_options_for_request_context(
                 request_text=input_text,
-                work_item_id=work_item_id,
-                save=True,
-                database_url=database_url,
-                live_search=live_search,
-                live_sdk=live_sdk,
-                max_results=max_results,
-                manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
-                orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
                 context_file_path=context_file_path,
-                sdk_session_enabled=sdk_session_enabled,
-                sdk_session_id=sdk_session_id,
-                sdk_session_db_path=sdk_session_db_path,
-                sdk_session_history_limit=sdk_session_history_limit,
-                cost_tracking_requested=cost_tracking_requested,
-                **_workflow_cost_options_for_request_context(
-                    request_text=input_text,
-                    context_file_path=context_file_path,
-                    work_item=existing_work_item,
-                ),
+                work_item=existing_work_item,
             ),
+        )
+        from keystone_agents.langgraph_workflow import (
+            advance_work_item_manager_loop_with_optional_langgraph,
+        )
+
+        result = advance_work_item_manager_loop_with_optional_langgraph(
+            request,
             max_steps=max_manager_steps,
             feedback_callback=None if json_output else _print_manager_loop_feedback,
         )
@@ -2441,6 +2484,7 @@ def _context_agent_dry_run_output(
     )
     if route == "airtable_context_agent":
         topic_terms = _airtable_context_topic_terms(objective)
+        expense_receipt_target = infer_finance_expense_receipt_target(objective)
         finance_tax_focus = _airtable_context_is_finance_tax_request(topic_terms, objective)
         eval_tracker_focus = _airtable_context_is_eval_tracker_request(topic_terms, objective)
         blockers = (
@@ -2461,32 +2505,72 @@ def _context_agent_dry_run_output(
                 "required before Chief of Staff can approve any Airtable write."
             ),
             base_alias=(
-                "finance_tax_tracker"
+                expense_receipt_target.base_alias
+                if expense_receipt_target is not None
+                else "finance_tax_tracker"
                 if finance_tax_focus
                 else "eval_tracker"
                 if eval_tracker_focus
                 else "requested_airtable_base"
             ),
             relevant_tables=[
+                expense_receipt_target.table
+            ] if expense_receipt_target is not None else [
                 "Tax Payments"
-            ] if finance_tax_focus else ["Eval tracker"] if eval_tracker_focus else ["requested table"],
-            relevant_fields=_airtable_context_field_hints(topic_terms, objective),
+            ] if finance_tax_focus else ["Eval tracker"] if eval_tracker_focus else [
+                "requested table"
+            ],
+            relevant_fields=(
+                finance_expense_receipt_field_hints(expense_receipt_target)
+                if expense_receipt_target is not None
+                else _airtable_context_field_hints(topic_terms, objective)
+            ),
             recommended_record_identity=_airtable_context_record_identity(topic_terms, objective),
             recommended_actions=[
                 "Read Airtable schema before records.",
                 "Use exact table and field names before interpreting records.",
-                "Keep all Airtable writes Chief-owned and approval gated.",
+                *(
+                    [
+                        (
+                            "Infer `finance_tax_tracker` and the requested expense table "
+                            "from the Airtable expense receipt ask; do not ask the operator "
+                            "to restate the base/table."
+                        ),
+                        (
+                            "Use receipt evidence and schema field matching to prepare the "
+                            "create plan; ask only for fields or attachment support that schema "
+                            "does not expose."
+                        ),
+                    ]
+                    if expense_receipt_target is not None
+                    else []
+                ),
+                "Keep Airtable writes owned by Airtable Context or the approved action handler.",
             ],
             write_plan=OperationalWritePlan(
                 target_system="airtable",
-                operation="chief_owned_update_after_approval",
-                target="Airtable record selected after schema and record identity are confirmed",
-                scope="read-only context handoff unless a separate approved write is provided",
+                operation=(
+                    "airtable_specialist_create_from_receipt_after_schema_and_approval"
+                    if expense_receipt_target is not None
+                    else "airtable_specialist_update_after_approval"
+                ),
+                target=(
+                    f"{expense_receipt_target.base_alias} / {expense_receipt_target.table}"
+                    if expense_receipt_target is not None
+                    else "Airtable record selected after schema and record identity are confirmed"
+                ),
+                scope=(
+                    "one receipt-backed expense create plus optional receipt attachment after schema mapping"
+                    if expense_receipt_target is not None
+                    else "read-only context handoff unless a separate approved write is provided"
+                ),
                 field_mapping=[
                     OperationalContextEntry(
                         key="base_alias",
                         value=(
-                            "finance_tax_tracker"
+                            expense_receipt_target.base_alias
+                            if expense_receipt_target is not None
+                            else "finance_tax_tracker"
                             if finance_tax_focus
                             else "eval_tracker"
                             if eval_tracker_focus
@@ -2496,30 +2580,75 @@ def _context_agent_dry_run_output(
                     OperationalContextEntry(
                         key="table",
                         value=(
-                            "Tax Payments"
+                            expense_receipt_target.table
+                            if expense_receipt_target is not None
+                            else "Tax Payments"
                             if finance_tax_focus
                             else "Eval tracker"
                             if eval_tracker_focus
                             else "requested table"
                         ),
                     ),
+                    *(
+                        [
+                            OperationalContextEntry(
+                                key="receipt_local_path",
+                                value=expense_receipt_target.receipt_local_path,
+                            ),
+                            OperationalContextEntry(
+                                key="estimated_tax_period",
+                                value="derive from receipt date using tracker period rules",
+                            ),
+                        ]
+                        if expense_receipt_target is not None
+                        else []
+                    ),
                     OperationalContextEntry(key="filter", value=_airtable_context_record_identity(topic_terms, objective)),
                 ],
                 rationale="Specialist is read-only; Chief of Staff owns any approved write.",
             ),
             blockers=blockers,
-            approval_needs=[
-                "Scoped Airtable approval reference",
-                "Confirmed base/table/record identity",
-            ],
+            approval_needs=(
+                [
+                    "Scoped Airtable approval reference",
+                    "Confirmed expense-table schema field mapping",
+                    "Created record id before receipt attachment upload",
+                    "Confirmed attachment field support before upload",
+                ]
+                if expense_receipt_target is not None
+                else [
+                    "Scoped Airtable approval reference",
+                    "Confirmed base/table/record identity",
+                ]
+            ),
             human_work_context=HumanWorkContext(
                 work_functions=_airtable_context_work_functions(topic_terms, objective),
                 human_owner_hint="Chief of Staff",
-                decision_needed="Confirm exact Airtable base, table, schema, and record identity before any write.",
-                handoff_ready_context=["schema mapping", "record identity questions", "read-only result limits"],
+                decision_needed=(
+                    "Confirm schema field mapping and attachment-field support before Chief creates the expense record."
+                    if expense_receipt_target is not None
+                    else "Confirm exact Airtable base, table, schema, and record identity before any write."
+                ),
+                handoff_ready_context=(
+                    [
+                        "inferred finance_tax_tracker expense target",
+                        "candidate receipt field mapping",
+                        "read-only result limits",
+                    ]
+                    if expense_receipt_target is not None
+                    else ["schema mapping", "record identity questions", "read-only result limits"]
+                ),
                 missing_context=[*blockers, "live Airtable schema and record reads"],
                 integration_surfaces=["Airtable"],
-                follow_up_actions=["run live read if record values are needed", "confirm target record"],
+                follow_up_actions=(
+                    [
+                        "run live schema read for the expense table",
+                        "match receipt fields to exact Airtable field names",
+                        "confirm attachment field before upload",
+                    ]
+                    if expense_receipt_target is not None
+                    else ["run live read if record values are needed", "confirm target record"]
+                ),
             ),
             sources=[
                 OperationalContextSource(
@@ -2592,11 +2721,11 @@ def _context_agent_dry_run_output(
             recommended_actions=[
                 "List scoped Drive folder before selecting a handoff source.",
                 "Read existing Doc or Sheet context before naming specific files.",
-                "Keep all Workspace writes Chief-owned and approval gated.",
+                "Keep Workspace writes owned by Google Workspace Context or the approved action handler.",
             ],
             write_plan=OperationalWritePlan(
                 target_system="google_workspace",
-                operation="chief_owned_artifact_update_after_approval",
+                operation="workspace_specialist_artifact_update_after_approval",
                 target="Drive folder, Doc, or Sheet selected after live read",
                 scope="internal handoff context, source notes, and optional tracker metadata",
                 field_mapping=[
@@ -3095,6 +3224,18 @@ def _airtable_context_is_eval_tracker_request(
 
 def _airtable_context_summary(topic_terms: list[str], request_text: str) -> str:
     topic_focus = ", ".join(topic_terms[:4]) if topic_terms else "the requested Airtable context"
+    expense_receipt_target = infer_finance_expense_receipt_target(request_text)
+    if expense_receipt_target is not None:
+        return (
+            "Airtable read-only context dry-run inferred base alias "
+            f"`{expense_receipt_target.base_alias}` and table "
+            f"`{expense_receipt_target.table}` from the explicit Airtable expense receipt "
+            "ask. It should not ask the operator to restate the base or table. Airtable "
+            "schema, records, attachments, and receipt contents were not read in this "
+            "dry-run; use the live Airtable/Chief path to match exact fields, derive "
+            "`Estimated Tax Periods` from the receipt date, create the expense record, "
+            "and attach the receipt after record identity and attachment field are known."
+        )
     if _airtable_context_is_finance_tax_request(topic_terms, request_text):
         return (
             "Airtable read-only context dry-run recognized the requested focus on "
@@ -3121,6 +3262,9 @@ def _airtable_context_summary(topic_terms: list[str], request_text: str) -> str:
 
 
 def _airtable_context_field_hints(topic_terms: list[str], request_text: str) -> list[str]:
+    expense_receipt_target = infer_finance_expense_receipt_target(request_text)
+    if expense_receipt_target is not None:
+        return finance_expense_receipt_field_hints(expense_receipt_target)
     if _airtable_context_is_finance_tax_request(topic_terms, request_text):
         return [
             "Payment Name",
@@ -3145,6 +3289,13 @@ def _airtable_context_field_hints(topic_terms: list[str], request_text: str) -> 
 
 
 def _airtable_context_record_identity(topic_terms: list[str], request_text: str) -> str:
+    expense_receipt_target = infer_finance_expense_receipt_target(request_text)
+    if expense_receipt_target is not None:
+        return (
+            "This is a create operation, so there is no existing target record id. "
+            "Resolve record identity from the record created by `airtable_write_record`; "
+            "then use that record id for the receipt attachment upload."
+        )
     if _airtable_context_is_finance_tax_request(topic_terms, request_text):
         return (
             "Filter Tax Payments records where Estimated Tax Periods equals 2; include "
@@ -3159,6 +3310,8 @@ def _airtable_context_record_identity(topic_terms: list[str], request_text: str)
 
 
 def _airtable_context_work_functions(topic_terms: list[str], request_text: str) -> list[str]:
+    if infer_finance_expense_receipt_target(request_text) is not None:
+        return ["finance operations context", "expense receipt processing"]
     if _airtable_context_is_finance_tax_request(topic_terms, request_text):
         return ["finance operations context", "tax payment record review"]
     return ["structured record context", "Airtable schema review"]
@@ -3917,6 +4070,11 @@ def _request_forbids_live_research(text: str) -> bool:
             r"browser\s+automation|research\s+externally)\b",
             normalized,
         )
+        or re.search(
+            r"\b(?:web\s+search|live\s+web|live\s+search|external\s+(?:search|research|tools?))"
+            r"\b[^.;\n]{0,80}\b(?:not\s+approved|not\s+allowed|disabled|off)\b",
+            normalized,
+        )
     )
 
 
@@ -3987,6 +4145,24 @@ def _run_ask_gmail_triage_live(
 ) -> int:
     gmail_plan = infer_gmail_execution_plan(input_text)
     explicit_fixture_path = _gmail_direct_fixture_path(input_text)
+    inline_fixture = _inline_gmail_fixture_from_request(input_text)
+    if inline_fixture is not None and _gmail_inline_request_needs_work_item_graph(input_text):
+        return _run_ask_work_item(
+            input_text,
+            database_url=database_url,
+            live_search=False,
+            live_sdk=True,
+            max_results=3,
+            json_output=json_output,
+            max_manager_steps=3,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
+            sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
+            sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
+            sdk_session_history_limit=sdk_session_spec.history_limit if sdk_session_spec else None,
+            cost_tracking_requested=cost_tracking_requested,
+        )
     if gmail_plan.operation == "priority_grouping" and gmail_plan.live_read_required:
         command = [
             sys.executable,
@@ -4017,14 +4193,18 @@ def _run_ask_gmail_triage_live(
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
         )
-    if gmail_plan.operation == "draft_reply" and explicit_fixture_path is None:
+    if (
+        gmail_plan.operation == "draft_reply"
+        and explicit_fixture_path is None
+        and inline_fixture is None
+    ):
         return _print_ask_clarification(
             "gmail_triage",
             input_text,
             (
-                "Gmail Triage needs a selected Gmail thread, message, or explicit email "
-                "fixture before drafting a reply. No synthetic email was created from the "
-                "operator request."
+                "Gmail Triage needs usable email context before drafting a reply: a pasted "
+                "sanitized email, selected message/thread, explicit fixture, or approved "
+                "bounded read-only Gmail retrieval scope."
             ),
             json_output=json_output,
             manual_plan=manual_plan,
@@ -4034,8 +4214,9 @@ def _run_ask_gmail_triage_live(
                 "block_kind": "missing_gmail_context",
                 "requires_gmail_context": True,
                 "recommended_next_action": (
-                    "Select the Gmail thread/message or provide an explicit fixture path, "
-                    "then rerun Gmail Triage."
+                    "Paste the sanitized email, select the Gmail message/thread, provide an "
+                    "explicit fixture path, or approve bounded read-only retrieval; then rerun "
+                    "Gmail Triage."
                 ),
                 "agent_execution_plan": gmail_plan.model_dump(mode="json"),
             },
@@ -4044,6 +4225,18 @@ def _run_ask_gmail_triage_live(
     temp_path: Path | None = None
     if explicit_fixture_path is not None:
         selected_fixture = str(explicit_fixture_path)
+    elif inline_fixture is not None:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".txt",
+            prefix="keystone-gmail-inline-",
+            delete=False,
+        ) as tmp:
+            tmp.write(f"Subject: {inline_fixture.subject}\n\n")
+            tmp.write(inline_fixture.body)
+            temp_path = Path(tmp.name)
+        selected_fixture = str(temp_path)
     else:
         with tempfile.NamedTemporaryFile(
             "w",
@@ -4068,6 +4261,13 @@ def _run_ask_gmail_triage_live(
         "--live-sdk",
         "--json",
     ]
+    if inline_fixture is not None and explicit_fixture_path is None:
+        if inline_fixture.subject:
+            command.extend(["--subject", inline_fixture.subject])
+        if inline_fixture.sender_name:
+            command.extend(["--sender-name", inline_fixture.sender_name])
+        if inline_fixture.sender_email:
+            command.extend(["--sender-email", inline_fixture.sender_email])
     if manual_plan and manual_plan.lookback_days is not None:
         command.extend(["--lookback-days", str(manual_plan.lookback_days)])
     try:
@@ -4099,6 +4299,21 @@ def _gmail_direct_fixture_path(input_text: str) -> Path | None:
         return path if path.is_file() else None
     except (OSError, RuntimeError):
         return None
+
+
+def _gmail_inline_request_needs_work_item_graph(input_text: str) -> bool:
+    """Return whether inline Gmail context asks for durable downstream work."""
+
+    normalized = " ".join(str(input_text or "").lower().split())
+    if not normalized:
+        return False
+    has_downstream_research = bool(
+        re.search(r"\b(?:research|source-backed|source backed|company profile)\b", normalized)
+    )
+    has_downstream_outreach = bool(
+        re.search(r"\b(?:outreach|slack-thread sample|sample outreach)\b", normalized)
+    )
+    return has_downstream_research or has_downstream_outreach
 
 
 def _run_ask_outreach_composer_live(
@@ -4869,23 +5084,29 @@ def _run_work_items_advance(args: argparse.Namespace) -> int:
         ),
     )
     graph_metadata = None
-    if args.langgraph:
+    from keystone_agents.langgraph_workflow import (
+        should_use_langgraph_for_work_item,
+        work_item_langgraph_env_override,
+    )
+
+    override = work_item_langgraph_env_override()
+    use_langgraph = (
+        True
+        if args.langgraph
+        else override
+        if override is not None
+        else should_use_langgraph_for_work_item(request, manager_loop=True)
+    )
+    if use_langgraph:
         outcome = _run_work_item_langgraph_for_request(request)
         result = outcome.result
         graph_metadata = _work_item_langgraph_metadata(outcome)
     else:
-        from keystone_agents.langgraph_workflow import work_item_langgraph_enabled
-
-        if work_item_langgraph_enabled():
-            outcome = _run_work_item_langgraph_for_request(request)
-            result = outcome.result
-            graph_metadata = _work_item_langgraph_metadata(outcome)
-        else:
-            result = advance_work_item_manager_loop(
-                request,
-                max_steps=args.max_manager_steps,
-                feedback_callback=None if args.json else _print_manager_loop_feedback,
-            )
+        result = advance_work_item_manager_loop(
+            request,
+            max_steps=args.max_manager_steps,
+            feedback_callback=None if args.json else _print_manager_loop_feedback,
+        )
     return _print_work_item_result(result, json_output=args.json, graph_metadata=graph_metadata)
 
 

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+from collections.abc import Mapping
+from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlparse
@@ -12,7 +16,13 @@ from urllib.request import Request, urlopen
 
 from keystone_agents.config import parse_bool
 from keystone_agents.context_env import context_env_path, context_env_value
+from keystone_agents.finance_expense_receipts import (
+    FinanceReceiptEvidence,
+    extract_finance_receipt_evidence,
+    match_receipt_evidence_to_airtable_fields,
+)
 from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
+from keystone_agents.local_file_inputs import read_supported_local_file
 from keystone_agents.memory import chief_of_staff_memory_item
 from keystone_agents.schemas.airtable import (
     FINANCE_TAX_TRACKER_BASE_NAME,
@@ -681,6 +691,362 @@ def airtable_write_record(
             approval_reference=approval_reference,
             operation=operation,
             match_filter_formula=match_filter_formula,
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def airtable_upload_attachment_impl(
+    local_file_path: str,
+    *,
+    table: str = "",
+    base_alias: str = "",
+    base_id: str = "",
+    record_id: str = "",
+    field_id: str = "",
+    field_name: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Upload an approved local PDF/image to an Airtable attachment field."""
+
+    clean_record_id = record_id.strip()
+    clean_field_id = field_id.strip()
+    clean_field_name = field_name.strip()
+    if not clean_record_id:
+        raise ValueError("Airtable attachment uploads require record_id.")
+    if not clean_field_id and not clean_field_name:
+        raise ValueError("Airtable attachment uploads require field_id or field_name.")
+    local_file = read_supported_local_file(local_file_path)
+    config = _airtable_base_config(
+        base_alias=_infer_airtable_base_alias(
+            base_alias=base_alias,
+            base_id=base_id,
+            table=table,
+        ),
+        base_id=base_id,
+    )
+    table_name = _airtable_table(table, config=config)
+    if not clean_field_id and clean_field_name:
+        schema = airtable_get_base_schema_impl(
+            base_alias=config["base_alias"],
+            base_id=config["base_id"],
+            live=live or _airtable_live_reads_default(),
+        )
+        tables = schema.get("schema", {}).get("tables", []) if isinstance(schema, Mapping) else []
+        for schema_table in tables:
+            if not isinstance(schema_table, Mapping) or schema_table.get("name") != table_name:
+                continue
+            for field in schema_table.get("fields", []):
+                if not isinstance(field, Mapping):
+                    continue
+                if field.get("name") == clean_field_name:
+                    if str(field.get("field_type") or "") != "multipleAttachments":
+                        raise ValueError(
+                            f"Airtable field '{clean_field_name}' is not an attachment field."
+                        )
+                    clean_field_id = str(field.get("field_id") or "").strip()
+                    break
+        if not clean_field_id:
+            raise ValueError(
+                f"Airtable attachment field '{clean_field_name}' was not found in {table_name}."
+            )
+    request = {
+        "method": "POST",
+        "url": (
+            "https://content.airtable.com/v0/"
+            f"{quote(config['base_id'] or 'app_dry_run', safe='')}/"
+            f"{quote(clean_record_id, safe='')}/"
+            f"{quote(clean_field_id, safe='')}/uploadAttachment"
+        ),
+        "table": table_name,
+        "params": {},
+        "payload": {
+            "contentType": local_file.mime_type,
+            "filename": local_file.filename,
+            "file": base64.b64encode(local_file.data).decode("ascii"),
+        },
+    }
+    dry_run = not live or parse_bool(os.getenv("AIRTABLE_WRITE_DRY_RUN", "true"))
+    if dry_run:
+        preview = _safe_request_preview(request)
+        payload = dict(preview.get("payload", {}))
+        payload["file"] = f"<base64 {local_file.size_bytes} bytes>"
+        preview["payload"] = payload
+        return {
+            "status": "dry-run",
+            "request": preview,
+            "approval_reference": approval_reference.strip(),
+            "send_enabled": False,
+        }
+    if not approval_reference.strip():
+        raise RuntimeError("Airtable attachment uploads require a non-empty approval_reference.")
+    if not parse_bool(os.getenv("AIRTABLE_ALLOW_WRITES")):
+        raise RuntimeError("Airtable live writes are disabled. Set AIRTABLE_ALLOW_WRITES=true.")
+    if not parse_bool(os.getenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS")):
+        raise RuntimeError(
+            "Airtable attachment uploads are disabled. Set AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true."
+        )
+    _require_airtable_credentials(base_id=config["base_id"], access_token=config["access_token"])
+    payload = _airtable_send(request, access_token=config["access_token"])
+    return {
+        "status": "success",
+        "table": table_name,
+        "record_id": clean_record_id,
+        "field_id": clean_field_id,
+        "filename": local_file.filename,
+        "attachment": payload,
+        "approval_reference": approval_reference.strip(),
+        "send_enabled": False,
+        "audit_notes": ["Airtable attachment upload completed."],
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def airtable_upload_attachment(
+    local_file_path: str,
+    table: str = "",
+    base_alias: str = "",
+    base_id: str = "",
+    record_id: str = "",
+    field_id: str = "",
+    field_name: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Upload an approved local PDF/image to an Airtable attachment field."""
+
+    return json.dumps(
+        airtable_upload_attachment_impl(
+            local_file_path,
+            table=table,
+            base_alias=base_alias,
+            base_id=base_id,
+            record_id=record_id,
+            field_id=field_id,
+            field_name=field_name,
+            approval_reference=approval_reference,
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def airtable_create_expense_from_receipt_impl(
+    local_file_path: str,
+    *,
+    table: str = "",
+    base_alias: str = "finance_tax_tracker",
+    base_id: str = "",
+    receipt_fields_json: str = "",
+    field_values_json: str = "",
+    category: str = "",
+    payment_method: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Create one finance tracker expense record from a receipt, then attach it."""
+
+    config = _airtable_base_config(
+        base_alias=_infer_airtable_base_alias(
+            base_alias=base_alias,
+            base_id=base_id,
+            table=table,
+        ),
+        base_id=base_id,
+        default_allowed_tables=FINANCE_TAX_TRACKER_TABLES,
+    )
+    table_name = _airtable_table(table, config=config)
+    if table_name not in {"Business Expenses", "Personal Expenses"}:
+        return {
+            "status": "blocked",
+            "reason": "Receipt expense creates are limited to Business Expenses or Personal Expenses.",
+            "table": table_name,
+            "send_enabled": False,
+        }
+    extracted_evidence = extract_finance_receipt_evidence(local_file_path)
+    model_evidence = _model_receipt_evidence_from_json(
+        receipt_fields_json,
+        source_path=local_file_path,
+    )
+    evidence, evidence_notes = _merge_receipt_evidence(
+        extracted_evidence,
+        model_evidence,
+    )
+    if not evidence.content_read:
+        return {
+            "status": "blocked",
+            "reason": (
+                "Receipt content could not be read by the model or deterministic extraction; "
+                "no Airtable write was attempted."
+            ),
+            "receipt_blocker": evidence.blocker,
+            "table": table_name,
+            "send_enabled": False,
+        }
+    conflict_notes = [note for note in evidence_notes if note.startswith("conflict:")]
+    if conflict_notes:
+        return {
+            "status": "blocked",
+            "reason": "Model-extracted receipt fields conflict with deterministic extraction.",
+            "conflicts": conflict_notes,
+            "table": table_name,
+            "send_enabled": False,
+        }
+    schema = airtable_get_base_schema_impl(
+        base_alias=config["base_alias"] or base_alias,
+        base_id=config["base_id"],
+        live=live or _airtable_live_reads_default(),
+    )
+    schema_fields = _airtable_schema_fields_for_table(schema, table_name)
+    if not schema_fields:
+        return {
+            "status": "blocked",
+            "reason": "Airtable schema fields were unavailable for the target expense table.",
+            "schema_status": schema.get("status") if isinstance(schema, Mapping) else "",
+            "table": table_name,
+            "send_enabled": False,
+        }
+    mapping = match_receipt_evidence_to_airtable_fields(evidence, schema_fields)
+    fields = dict(mapping.get("fields") or {})
+    field_by_name = {
+        str(field.get("name") or ""): field
+        for field in schema_fields
+        if isinstance(field, Mapping) and str(field.get("name") or "")
+    }
+    optional_field_notes: list[str] = []
+    _apply_schema_select_override(
+        fields,
+        field_by_name,
+        "Categories",
+        category,
+        optional_field_notes,
+    )
+    _apply_schema_select_override(
+        fields,
+        field_by_name,
+        "Payment Method",
+        payment_method,
+        optional_field_notes,
+    )
+    _apply_model_schema_field_values(
+        fields,
+        schema_fields,
+        field_values_json,
+        optional_field_notes,
+    )
+    if not fields:
+        return {
+            "status": "blocked",
+            "reason": "No receipt-backed schema fields were available for the expense create.",
+            "mapping": mapping,
+            "send_enabled": False,
+        }
+    attachment_field = mapping.get("attachment_field") if isinstance(mapping, Mapping) else {}
+    live_write_requested = live and not parse_bool(os.getenv("AIRTABLE_WRITE_DRY_RUN", "true"))
+    if live_write_requested:
+        if not approval_reference.strip():
+            raise RuntimeError("Airtable receipt expense creates require approval_reference.")
+        if not parse_bool(os.getenv("AIRTABLE_ALLOW_WRITES")):
+            raise RuntimeError("Airtable live writes are disabled. Set AIRTABLE_ALLOW_WRITES=true.")
+        if isinstance(attachment_field, Mapping) and attachment_field and not parse_bool(
+            os.getenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS")
+        ):
+            raise RuntimeError(
+                "Airtable attachment uploads are disabled. Set "
+                "AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true before creating receipt-backed expenses."
+            )
+        _require_airtable_credentials(base_id=config["base_id"], access_token=config["access_token"])
+    write_result = airtable_write_record_impl(
+        json.dumps(fields, ensure_ascii=True, sort_keys=True),
+        table=table_name,
+        base_alias=config["base_alias"] or base_alias,
+        base_id=config["base_id"],
+        approval_reference=approval_reference,
+        operation="create",
+        live=live,
+    )
+    record_id = str(write_result.get("record_id") or "").strip()
+    dry_run = write_result.get("status") == "dry-run"
+    attachment_result: dict[str, Any] = {}
+    if isinstance(attachment_field, Mapping) and attachment_field:
+        attachment_record_id = record_id
+        if dry_run and not attachment_record_id:
+            attachment_record_id = "rec_dry_run_after_create"
+        if attachment_record_id:
+            attachment_result = airtable_upload_attachment_impl(
+                local_file_path,
+                table=table_name,
+                base_alias=config["base_alias"] or base_alias,
+                base_id=config["base_id"],
+                record_id=attachment_record_id,
+                field_id=str(attachment_field.get("field_id") or ""),
+                field_name=str(attachment_field.get("name") or ""),
+                approval_reference=approval_reference,
+                live=live and bool(record_id),
+            )
+    status = (
+        "success"
+        if write_result.get("status") == "success"
+        and attachment_result.get("status") in {"success", ""}
+        else "dry-run"
+        if dry_run
+        else "partial"
+    )
+    return {
+        "status": status,
+        "table": table_name,
+        "receipt_evidence": {
+            "vendor": evidence.vendor,
+            "receipt_date": evidence.receipt_date,
+            "estimated_tax_periods": evidence.estimated_tax_periods,
+            "order_number": evidence.order_number,
+            "total": evidence.total,
+            "currency": evidence.currency,
+            "extraction_method": evidence.extraction_method,
+        },
+        "mapped_fields": fields,
+        "mapping": mapping,
+        "optional_field_notes": optional_field_notes,
+        "evidence_notes": evidence_notes,
+        "write_result": write_result,
+        "attachment_result": attachment_result,
+        "approval_reference": approval_reference.strip(),
+        "send_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def airtable_create_expense_from_receipt(
+    local_file_path: str,
+    table: str = "",
+    base_alias: str = "finance_tax_tracker",
+    base_id: str = "",
+    receipt_fields_json: str = "",
+    field_values_json: str = "",
+    category: str = "",
+    payment_method: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Create an approved finance tracker expense from a local receipt and attach it."""
+
+    return json.dumps(
+        airtable_create_expense_from_receipt_impl(
+            local_file_path,
+            table=table,
+            base_alias=base_alias,
+            base_id=base_id,
+            receipt_fields_json=receipt_fields_json,
+            field_values_json=field_values_json,
+            category=category,
+            payment_method=payment_method,
+            approval_reference=approval_reference,
             live=live,
         ),
         ensure_ascii=True,
@@ -2241,6 +2607,250 @@ def _airtable_table(table: str, *, config: dict[str, Any] | None = None) -> str:
     if allowed and table_name not in allowed:
         raise RuntimeError(f"Airtable table '{table_name}' is not in AIRTABLE_ALLOWED_TABLES.")
     return table_name
+
+
+def _airtable_schema_fields_for_table(
+    schema_result: Mapping[str, Any],
+    table_name: str,
+) -> list[Mapping[str, Any]]:
+    tables = schema_result.get("schema", {}).get("tables", [])
+    if not isinstance(tables, list):
+        return []
+    for table in tables:
+        if not isinstance(table, Mapping) or table.get("name") != table_name:
+            continue
+        fields = table.get("fields", [])
+        if not isinstance(fields, list):
+            return []
+        return [field for field in fields if isinstance(field, Mapping)]
+    return []
+
+
+def _apply_schema_select_override(
+    fields: dict[str, Any],
+    fields_by_name: Mapping[str, Mapping[str, Any]],
+    field_name: str,
+    requested_value: str,
+    notes: list[str],
+) -> None:
+    value = str(requested_value or "").strip()
+    if not value:
+        return
+    field = fields_by_name.get(field_name)
+    if not field:
+        notes.append(f"`{field_name}` was requested but is not present in schema.")
+        return
+    choices = [
+        str(choice).strip()
+        for choice in field.get("select_choices", [])
+        if str(choice).strip()
+    ]
+    selected = next((choice for choice in choices if choice.lower() == value.lower()), "")
+    if not selected:
+        notes.append(f"`{field_name}` value `{value}` is not a configured Airtable option.")
+        return
+    field_type = str(field.get("field_type") or "")
+    fields[field_name] = [selected] if field_type == "multipleSelects" else selected
+
+
+def _apply_model_schema_field_values(
+    fields: dict[str, Any],
+    schema_fields: list[Mapping[str, Any]],
+    field_values_json: str,
+    notes: list[str],
+) -> None:
+    raw = str(field_values_json or "").strip()
+    if not raw:
+        return
+    requested_fields = _json_object(raw, "field_values_json")
+    fields_by_name = {
+        str(field.get("name") or ""): field
+        for field in schema_fields
+        if str(field.get("name") or "")
+    }
+    for field_name, value in requested_fields.items():
+        clean_name = str(field_name or "").strip()
+        if not clean_name:
+            continue
+        field = fields_by_name.get(clean_name)
+        if not field:
+            notes.append(f"`{clean_name}` was model-proposed but is not present in schema.")
+            continue
+        if bool(field.get("is_computed")):
+            notes.append(f"`{clean_name}` is computed and was not written.")
+            continue
+        coerced = _coerce_airtable_schema_value(field, value)
+        if coerced is _UNSET_AIRTABLE_VALUE:
+            notes.append(
+                f"`{clean_name}` value `{value}` is not compatible with "
+                f"{field.get('field_type') or 'unknown'}."
+            )
+            continue
+        fields[clean_name] = coerced
+
+
+_UNSET_AIRTABLE_VALUE = object()
+
+
+def _coerce_airtable_schema_value(field: Mapping[str, Any], value: object) -> object:
+    field_type = str(field.get("field_type") or "")
+    if value in (None, ""):
+        return _UNSET_AIRTABLE_VALUE
+    if field_type in {"currency", "number", "percent"}:
+        try:
+            return float(Decimal(str(value).replace(",", "")))
+        except InvalidOperation:
+            return _UNSET_AIRTABLE_VALUE
+    if field_type == "checkbox":
+        if isinstance(value, bool):
+            return value
+        lowered = str(value).strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+        return _UNSET_AIRTABLE_VALUE
+    if field_type == "date":
+        raw = str(value).strip()
+        return raw if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw) else _UNSET_AIRTABLE_VALUE
+    if field_type == "singleSelect":
+        selected = _schema_select_choice(field, str(value))
+        return selected or _UNSET_AIRTABLE_VALUE
+    if field_type == "multipleSelects":
+        values = value if isinstance(value, list | tuple | set) else [value]
+        selected = [_schema_select_choice(field, str(item)) for item in values]
+        selected = [item for item in selected if item]
+        return selected or _UNSET_AIRTABLE_VALUE
+    if field_type == "multipleAttachments":
+        return _UNSET_AIRTABLE_VALUE
+    return str(value).strip()
+
+
+def _schema_select_choice(field: Mapping[str, Any], requested: str) -> str:
+    value = str(requested or "").strip()
+    for choice in field.get("select_choices", []):
+        clean_choice = str(choice).strip()
+        if clean_choice.lower() == value.lower():
+            return clean_choice
+    return ""
+
+
+def _model_receipt_evidence_from_json(
+    receipt_fields_json: str,
+    *,
+    source_path: str,
+) -> FinanceReceiptEvidence | None:
+    raw = str(receipt_fields_json or "").strip()
+    if not raw:
+        return None
+    fields = _json_object(raw, "receipt_fields_json")
+    normalized = {
+        "vendor": _first_present(fields, "vendor", "merchant", "seller"),
+        "receipt_date": _first_present(fields, "receipt_date", "date", "date_of_expense"),
+        "order_number": _first_present(fields, "order_number", "order", "receipt_number"),
+        "description": _first_present(fields, "description", "item", "service"),
+        "quantity": _first_present(fields, "quantity", "qty"),
+        "subtotal": _first_present(fields, "subtotal", "amount"),
+        "shipping": _first_present(fields, "shipping", "fees", "shipping_or_fees"),
+        "total": _first_present(fields, "total", "total_expenses", "total_paid"),
+        "currency": _first_present(fields, "currency"),
+        "payment_summary": _first_present(fields, "payment_summary", "payment_method"),
+        "estimated_tax_periods": _first_present(
+            fields,
+            "estimated_tax_periods",
+            "estimated_tax_period",
+            "tax_period",
+        ),
+    }
+    if normalized["receipt_date"] and not normalized["estimated_tax_periods"]:
+        normalized["estimated_tax_periods"] = _finance_tax_period_for_date(
+            normalized["receipt_date"]
+        )
+    return FinanceReceiptEvidence(
+        source_path=source_path,
+        filename=Path(source_path).name,
+        content_read=any(value for value in normalized.values()),
+        extraction_method="model_receipt_fields",
+        blocker="" if any(value for value in normalized.values()) else "empty model receipt fields",
+        **normalized,
+    )
+
+
+def _merge_receipt_evidence(
+    extracted: FinanceReceiptEvidence,
+    model: FinanceReceiptEvidence | None,
+) -> tuple[FinanceReceiptEvidence, list[str]]:
+    if model is None or not model.content_read:
+        return extracted, ["deterministic_extraction_used"] if extracted.content_read else []
+    if not extracted.content_read:
+        return model, ["model_receipt_fields_used", f"deterministic_blocker: {extracted.blocker}"]
+    notes = ["model_receipt_fields_used", "deterministic_extraction_used_as_validation"]
+    conflicts: list[str] = []
+    for field_name in ("vendor", "receipt_date", "total"):
+        extracted_value = getattr(extracted, field_name)
+        model_value = getattr(model, field_name)
+        if extracted_value and model_value and not _receipt_values_equivalent(
+            field_name,
+            extracted_value,
+            model_value,
+        ):
+            conflicts.append(f"conflict:{field_name}:{extracted_value}!={model_value}")
+    if conflicts:
+        return extracted, [*notes, *conflicts]
+    merged_values: dict[str, str] = {}
+    for field_name in (
+        "vendor",
+        "receipt_date",
+        "order_number",
+        "description",
+        "quantity",
+        "subtotal",
+        "shipping",
+        "total",
+        "currency",
+        "payment_summary",
+        "estimated_tax_periods",
+    ):
+        merged_values[field_name] = getattr(model, field_name) or getattr(extracted, field_name)
+    return (
+        replace(
+            extracted,
+            extraction_method="model_receipt_fields+deterministic_validation",
+            **merged_values,
+        ),
+        notes,
+    )
+
+
+def _first_present(fields: Mapping[str, Any], *names: str) -> str:
+    for name in names:
+        value = fields.get(name)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def _receipt_values_equivalent(field_name: str, left: str, right: str) -> bool:
+    if field_name == "total":
+        try:
+            return Decimal(str(left).replace(",", "")) == Decimal(str(right).replace(",", ""))
+        except InvalidOperation:
+            return str(left).strip() == str(right).strip()
+    return " ".join(str(left).lower().split()) == " ".join(str(right).lower().split())
+
+
+def _finance_tax_period_for_date(date_value: str) -> str:
+    match = re.fullmatch(r"(\d{4})-(\d{2})-\d{2}", str(date_value or "").strip())
+    if not match or match.group(1) != "2026":
+        return ""
+    month = int(match.group(2))
+    if month <= 3:
+        return "Q1"
+    if month <= 5:
+        return "Q2"
+    if month <= 8:
+        return "Q3"
+    return "Q4"
 
 
 def _airtable_base_schema_url(base_id: str) -> str:

@@ -5,7 +5,7 @@ founder-fit, memory, or style context.
 
 ## Current Status
 
-- `documents/CV_AnupSharma_2026.docx` exists locally.
+- `documents/CV_Operator_2026.docx` exists locally.
 - `documents/founder_fit_profile.json` exists, but currently has
   `approved_for_search=false` and `approved_for_drafting=false`.
 - CV-derived facts should not be used by agents until reviewed and approved.

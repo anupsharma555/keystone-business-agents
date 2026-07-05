@@ -12,6 +12,7 @@ from keystone_agents.orchestrator.routing import (
     looks_like_email,
     looks_like_resume_request,
     looks_like_send_side_effect,
+    looks_like_thread_local_draft_request,
     payload_text,
 )
 from keystone_agents.schemas.manual_request_plan import (
@@ -77,7 +78,7 @@ _ROUTE_INTENT: dict[ManualTargetAgent, ManualRequestIntent] = {
     "opportunity_scout": "opportunity_search",
     "gmail_triage": "gmail_triage",
     "outreach_composer": "outreach_draft",
-    "chief_of_staff": "slack_operations",
+    "chief_of_staff": "route_request",
     "airtable_context_agent": "context_lookup",
     "google_workspace_context_agent": "context_lookup",
     "zotero_context_agent": "context_lookup",
@@ -91,7 +92,7 @@ _ROUTE_TARGET_TYPE: dict[ManualTargetAgent, ManualTargetType] = {
     "opportunity_scout": "topic",
     "gmail_triage": "gmail_thread",
     "outreach_composer": "company",
-    "chief_of_staff": "slack_channel",
+    "chief_of_staff": "unknown",
     "airtable_context_agent": "business_system_context",
     "google_workspace_context_agent": "business_system_context",
     "zotero_context_agent": "business_system_context",
@@ -109,13 +110,23 @@ _CONTEXT_AGENT_TARGETS: frozenset[ManualTargetAgent] = frozenset(
         "preprints_context_agent",
     }
 )
+_FINANCE_EXPENSE_RECEIPT_WRITE_RE = re.compile(
+    r"\bairtable\b[\s\S]{0,240}\b(?:business|personal)\s+expenses?\b"
+    r"|\b(?:business|personal)\s+expenses?\b[\s\S]{0,240}\bairtable\b",
+    re.I,
+)
+_LOCAL_ARTIFACT_PATH_RE = re.compile(
+    r"(?:~|/Users/|/private/|/tmp/)[^\s\"'<>]+?\.(?:pdf|png|jpe?g|webp|gif)",
+    re.I,
+)
 _COUNT_RE = re.compile(
     r"\b(?:compare|discover|find|return|list|top|show|identify|source)\s+"
+    r"(?:how\s+)?"
     r"(?:up\s+to\s+)?(?P<count>\d{1,2})\b"
     r"|\b(?P<count2>\d{1,2})\s+"
     r"(?:[a-z][\w-]*\s+){0,4}"
     r"(?:opportunities|companies|institutes|researchers|conferences|people|leads|emails|"
-    r"roles|jobs|positions|postings|openings)\b",
+    r"roles|jobs|positions|postings|openings|products|targets|vendors)\b",
     re.I,
 )
 _COUNT_WORDS = {
@@ -132,12 +143,13 @@ _COUNT_WORDS = {
 }
 _COUNT_WORD_RE = re.compile(
     r"\b(?:compare|discover|find|return|list|top|show|identify|source|best)\s+"
+    r"(?:how\s+)?"
     r"(?:up\s+to\s+|the\s+)?"
     r"(?P<count_word>one|two|three|four|five|six|seven|eight|nine|ten)\b"
     r"|\b(?P<count_word2>one|two|three|four|five|six|seven|eight|nine|ten)\s+"
     r"(?:[a-z][\w-]*\s+){0,4}"
     r"(?:opportunities|companies|institutes|researchers|conferences|people|leads|emails|"
-    r"roles|jobs|positions|postings|openings)\b",
+    r"roles|jobs|positions|postings|openings|products|targets|vendors)\b",
     re.I,
 )
 _PREFIX_RE = re.compile(
@@ -166,6 +178,30 @@ _NO_OUTREACH_DRAFT_RE = re.compile(
     r"(?:create\s+|queue\s+|produce\s+)?(?:draft|drafting|compose|write|prepare)\b",
     re.I,
 )
+_NEGATED_ROUTE_ACTION_CLAUSE_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|avoid|skip|no|without)\b"
+    r"[^.;\n]{0,220}\b(?:scout|find|identify|search|source|discover|list|"
+    r"assess|evaluate|review|qualify)\b"
+    r"[^.;\n]{0,160}\b(?:opportunities?|leads?|grants?|partners?|"
+    r"partnerships?|pilots?|companies?|targets?|roles?|jobs?|positions?|"
+    r"postings?|openings?)\b"
+    r"[^.;\n]*[.;]?"
+    r"|"
+    r"\b(?:do\s+not|don't|dont|never|avoid|skip|no|without)\b"
+    r"[^.;\n]{0,220}\b(?:draft|drafting|compose|write|prepare|outline|"
+    r"create|queue|produce)\b"
+    r"[^.;\n]{0,160}\b(?:outreach|emails?|messages?|reply|response|"
+    r"follow-up|followup|note)\b"
+    r"[^.;\n]*[.;]?"
+    r"|"
+    r"\b(?:do\s+not|don't|dont|never|avoid|skip|no|without)\b"
+    r"[^.;\n]{0,220}\b(?:outreach|emails?|messages?|reply|response|"
+    r"follow-up|followup|note)\b"
+    r"[^.;\n]{0,160}\b(?:draft|drafting|compose|write|prepare|outline|"
+    r"create|queue|produce)\b"
+    r"[^.;\n]*[.;]?",
+    re.I,
+)
 _LOOP_TOPIC_STOP_RE = re.compile(
     r"\s*(?:[.;]\s*)?(?:top\s+\d+|post\s+approval|request\s+approval|approval\s+to|"
     r"draft\s+only|do\s+not\s+send|don't\s+send|save\b|send\b).*$",
@@ -189,6 +225,10 @@ _NO_EXTERNAL_RESEARCH_RE = re.compile(
     r"[^.;\n]{0,180}\b"
     r"(?:web\s+search|live\s+web|live\s+search|external\s+(?:search|research|tools?)|"
     r"browser\s+automation|research\s+externally)\b"
+    r"|"
+    r"\b(?:web\s+search|live\s+web\s+search|live\s+search|external\s+"
+    r"(?:search|research|tools?))\b[^.;\n]{0,80}\b"
+    r"(?:not\s+approved|not\s+allowed|not\s+permitted|disabled|off-limits)\b"
     r"|"
     r"\buse\s+only\s+(?:this\s+)?(?:approved\s+|sanitized\s+|provided\s+|"
     r"source-provided\s+|inline\s+)*"
@@ -254,6 +294,14 @@ _DISCOVERY_OUTREACH_WORKFLOW_RE = re.compile(
     r"\b(?:draft|write|compose|prepare|send|outreach|emails?|messages?|companies|targets?|leads?)\b",
     re.I,
 )
+_EXPLICIT_BUSINESS_RESEARCH_INSTRUCTION_RE = re.compile(
+    r"\b(?:then\s+)?(?:run|use|call|route\s+to|handoff\s+to|hand\s+off\s+to)\s+"
+    r"(?:the\s+)?business\s+research(?:\s+(?:analyst|agent))?\b"
+    r"|"
+    r"\bbusiness\s+research(?:\s+(?:analyst|agent))?\s+"
+    r"(?:for|on|to\s+review|reviews?|as\s+an?\s+internal|as\s+the\s+next)\b",
+    re.I,
+)
 
 
 def normalize_manual_agent(value: str | None) -> ManualTargetAgent | None:
@@ -307,7 +355,11 @@ def infer_manual_request_plan(
         tone=_tone(text) if target_agent == "outreach_composer" else "",
         requires_live_search=_requires_live_search_for_plan(text, target_agent=target_agent),
         requires_approved_context=target_agent == "outreach_composer",
-        side_effect_policy="draft_or_read_only",
+        side_effect_policy=(
+            "internal_write_approval_required"
+            if intent == "business_system_write"
+            else "draft_or_read_only"
+        ),
         rationale="Local semantic planner inferred the manual request before agent execution.",
     )
     if target_agent == "clarification":
@@ -393,7 +445,11 @@ def merge_manual_request_plan(
     merged.desired_count = max(1, min(10, merged.desired_count or base.desired_count))
     if base.target_agent == "outreach_composer" or merged.target_agent == "outreach_composer":
         merged.requires_approved_context = True
-    merged.side_effect_policy = "draft_or_read_only"
+    merged.side_effect_policy = (
+        "internal_write_approval_required"
+        if merged.intent == "business_system_write"
+        else "draft_or_read_only"
+    )
     return merged
 
 
@@ -403,7 +459,8 @@ def _semantic_target_agent(
     *,
     requested_agent: ManualTargetAgent | None,
 ) -> ManualTargetAgent:
-    lower = text.lower()
+    route_text = _without_negated_route_action_clauses(text)
+    lower = route_text.lower()
     explicit_text_agent = _direct_agent_prefix_agent(text)
     conversational_agent = _conversational_named_agent(text)
     if requested_agent in {None, "orchestrator"} and explicit_text_agent not in {
@@ -422,15 +479,18 @@ def _semantic_target_agent(
             if requested_agent in {"chief_of_staff", "orchestrator"}
             else "chief_of_staff"
         )
-    if requested_agent == "business_research_analyst" and _looks_like_unnamed_company_set_discovery(
-        text
+    if (
+        requested_agent == "business_research_analyst"
+        and _looks_like_unnamed_company_set_discovery(route_text)
     ):
         return "opportunity_scout"
     if requested_agent and requested_agent != "orchestrator":
         return requested_agent
     if _looks_like_eval_scorecard_review(lower):
         return "chief_of_staff"
-    if _looks_like_research_table_synthesis(text):
+    if _looks_like_finance_expense_receipt_write(text):
+        return "chief_of_staff"
+    if _looks_like_research_table_synthesis(route_text):
         return "business_research_analyst"
     if _looks_like_chief_of_staff_operational_request(lower):
         return "chief_of_staff"
@@ -438,15 +498,15 @@ def _semantic_target_agent(
         return "gmail_triage"
     if _looks_like_outreach_variant_request(lower):
         return "outreach_composer"
-    if looks_like_opportunity_to_outreach_loop(text):
+    if looks_like_opportunity_to_outreach_loop(route_text):
         return "opportunity_scout"
     if (
         looks_like_send_side_effect(text)
         and _looks_like_direct_outreach_send_request(lower)
-        and not _looks_like_discovery_outreach_workflow(text)
+        and not _looks_like_discovery_outreach_workflow(route_text)
     ):
         return "outreach_composer"
-    if looks_like_send_side_effect(text) and not _looks_like_discovery_outreach_workflow(text):
+    if looks_like_send_side_effect(text) and not _looks_like_discovery_outreach_workflow(route_text):
         return "clarification"
     if _company_comparison_target(text):
         return "business_research_analyst"
@@ -454,8 +514,10 @@ def _semantic_target_agent(
         return "orchestrator"
     if looks_like_zotero_article_request(text) or looks_like_zotero_collection_request(text):
         return "business_research_analyst"
-    if _looks_like_orchestrator_owned_workflow(text):
-        return _workflow_start_agent(text)
+    if _looks_like_explicit_business_research_instruction(text):
+        return "business_research_analyst"
+    if _looks_like_orchestrator_owned_workflow(route_text):
+        return _workflow_start_agent(route_text)
     if _looks_like_gmail_followup_request(lower):
         return "gmail_triage"
     if looks_like_company(text) and re.search(
@@ -467,12 +529,12 @@ def _semantic_target_agent(
     if looks_like_email(request, text):
         return "gmail_triage"
     if OUTREACH_RE.search(lower):
-        if _looks_like_discovery_outreach_workflow(text):
+        if _looks_like_discovery_outreach_workflow(route_text):
             return "opportunity_scout"
         return "outreach_composer"
     if OPPORTUNITY_RE.search(lower):
         return "opportunity_scout"
-    if _looks_like_discovery_outreach_workflow(text):
+    if _looks_like_discovery_outreach_workflow(route_text):
         return "opportunity_scout"
     if looks_like_company(text):
         return "business_research_analyst"
@@ -485,9 +547,11 @@ def _intent_for_target(
     *,
     workflow_allowed: bool = True,
 ) -> ManualRequestIntent:
-    lower = text.lower()
+    lower = _without_negated_route_action_clauses(text).lower()
     if _looks_like_browser_diagnostics_only_request(text):
         return "browser_diagnostics"
+    if target_agent == "chief_of_staff" and _looks_like_finance_expense_receipt_write(text):
+        return "business_system_write"
     if target_agent == "chief_of_staff" and _looks_like_reference_capture_request(lower):
         return "reference_capture"
     if (
@@ -514,7 +578,7 @@ def _intent_for_target(
 
 
 def _looks_like_slack_operations_request(lower: str) -> bool:
-    if "chief of staff" in lower or "slack ops" in lower or "slack operations" in lower:
+    if "slack ops" in lower or "slack operations" in lower:
         return True
     return bool(
         "slack" in lower
@@ -541,6 +605,17 @@ def _looks_like_slack_operations_request(lower: str) -> bool:
             )
         )
     )
+
+
+def _looks_like_finance_expense_receipt_write(text: str) -> bool:
+    lower = " ".join(str(text or "").lower().split())
+    if not _FINANCE_EXPENSE_RECEIPT_WRITE_RE.search(str(text or "")):
+        return False
+    has_receipt_marker = any(marker in lower for marker in ("receipt", "invoice"))
+    has_local_artifact = bool(_LOCAL_ARTIFACT_PATH_RE.search(str(text or "")))
+    if not has_receipt_marker and not has_local_artifact:
+        return False
+    return bool(re.search(r"\b(?:add|create|insert|record|update|change|set|fill)\b", lower))
 
 
 def _looks_like_chief_of_staff_operational_request(lower: str) -> bool:
@@ -675,6 +750,8 @@ def _looks_like_direct_outreach_send_request(lower: str) -> bool:
 
 def _looks_like_blocked_side_effect_request(text: str) -> bool:
     lower = " ".join(str(text or "").lower().split())
+    if looks_like_thread_local_draft_request(text):
+        return False
     if (
         re.search(r"\bdraft\b[\s\S]{0,120}\b(?:response|reply|email|message|outreach)\b", lower)
         and re.search(r"\b(?:after|with|pending)\s+(?:human\s+)?approval\b", lower)
@@ -902,8 +979,12 @@ def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetT
     lower = text.lower()
     if _looks_like_browser_diagnostics_request(text):
         return "url"
+    if target_agent == "chief_of_staff" and _looks_like_finance_expense_receipt_write(text):
+        return "business_system_context"
     if target_agent == "chief_of_staff" and _looks_like_reference_capture_request(lower):
         return "operator_reference"
+    if target_agent == "chief_of_staff" and looks_like_company(text):
+        return "company"
     if target_agent == "business_research_analyst":
         if looks_like_zotero_article_request(text):
             return "zotero_article"
@@ -1002,6 +1083,8 @@ def _task_objective(
         return "browser_diagnostics"
     if intent == "reference_capture":
         return "reference_capture"
+    if intent == "business_system_write":
+        return "business_system_write"
     if intent == "context_lookup":
         return "context_lookup"
     if intent == "gmail_triage":
@@ -1069,6 +1152,8 @@ def _expected_artifact_type(
         return "browser_diagnostics_report"
     if objective == "reference_capture":
         return "reference_note"
+    if objective == "business_system_write":
+        return "business_system_write_plan"
     if objective == "context_lookup":
         return "context_summary"
     return "none"
@@ -1176,7 +1261,7 @@ def _looks_like_orchestrator_owned_workflow(text: str) -> bool:
 
 
 def _workflow_start_agent(text: str) -> ManualTargetAgent:
-    lower = str(text or "").lower()
+    lower = _without_negated_route_action_clauses(text).lower()
     if (
         "best company" in lower
         or "candidate company" in lower
@@ -1295,12 +1380,27 @@ def _constraints(text: str) -> list[str]:
         constraints.append("provider-diagnostics")
     if re.search(r"\b(?:metadata|providers?\s+used|lane\s+status)\b", lower):
         constraints.append("metadata-section")
-    if re.search(r"\b(?:comparison|compare|table|matrix)\b", lower):
+    if _looks_like_comparison_format_constraint(lower):
         constraints.append("comparison-format")
     if re.search(r"\banswer\b", lower) and re.search(r"\bsynthesis\b", lower):
         constraints.append("answer-and-synthesis")
     constraints.extend(_exclusion_constraints(text))
     return constraints
+
+
+def _looks_like_comparison_format_constraint(lower: str) -> bool:
+    """Return true for requested comparison output, not test/control wording."""
+
+    if re.search(r"\b(?:comparison|compare)\s+(?:smoke|test|run|control|variant|variants)\b", lower):
+        return False
+    if re.search(r"\b(?:table|matrix|side[- ]by[- ]side)\b", lower):
+        return True
+    if re.search(r"\bcompare\s+(?!notes\b)", lower):
+        return True
+    return bool(
+        re.search(r"\bcomparison\b", lower)
+        and re.search(r"\b(?:format|table|matrix|between|of|for)\b", lower)
+    )
 
 
 def _exclusion_constraints(text: str) -> list[str]:
@@ -1319,14 +1419,22 @@ def _exclusion_constraints(text: str) -> list[str]:
 def looks_like_opportunity_to_outreach_loop(text: str) -> bool:
     """Return whether text asks for the integrated opportunity -> outreach workflow."""
 
-    raw_text = str(text or "")
+    raw_text = _without_negated_route_action_clauses(text)
     if _NO_OUTREACH_DRAFT_RE.search(raw_text):
         return False
     return bool(_OPPORTUNITY_TO_OUTREACH_RE.search(raw_text))
 
 
 def _looks_like_discovery_outreach_workflow(text: str) -> bool:
-    return bool(_DISCOVERY_OUTREACH_WORKFLOW_RE.search(str(text or "")))
+    return bool(_DISCOVERY_OUTREACH_WORKFLOW_RE.search(_without_negated_route_action_clauses(text)))
+
+
+def _looks_like_explicit_business_research_instruction(text: str) -> bool:
+    return bool(_EXPLICIT_BUSINESS_RESEARCH_INSTRUCTION_RE.search(str(text or "")))
+
+
+def _without_negated_route_action_clauses(text: str) -> str:
+    return _NEGATED_ROUTE_ACTION_CLAUSE_RE.sub(" ", str(text or ""))
 
 
 def _strip_direct_agent_prefix(text: str) -> str:

@@ -60,7 +60,7 @@ def test_local_kni_evidence_packet_filters_insurance_candidates(
         summary="Prefetch only.",
         sources=[
             ChiefOfStaffSourceRef(
-                title="00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+                title="00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
                 url="",
                 source_type="local_kni_document",
             )
@@ -68,7 +68,7 @@ def test_local_kni_evidence_packet_filters_insurance_candidates(
         retrieval_diagnostics={
             "lookup_kind": "insurance",
             "answer_focus": "broker",
-            "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
+            "evidence_path": "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
             "local_only": True,
             "send_enabled": False,
         },
@@ -132,7 +132,7 @@ def test_local_kni_evidence_packet_filters_insurance_candidates(
     assert packet["send_enabled"] is False
     assert "summary" not in packet
     assert "synthesis" not in packet
-    assert paths[0] == "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf"
+    assert paths[0] == "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf"
     assert set(paths[1:]) == {
         "00_Admin/Insurance/InsurancePolicy/CFC POLICY stamped 042126.pdf",
         "00_Admin/Insurance/InsuranceQuote/CFC QUOTE Keystone Neuroinformatics 041626.pdf",
@@ -176,8 +176,8 @@ def test_local_kni_evidence_packet_broker_focus_beats_prefetch_insurer_path(
                     "review_reasons": ["insurance_policy"],
                 },
                 {
-                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_AnupSharma_2026.pdf",
-                    "title": "COI AnupSharma 2026",
+                    "relative_path": "00_Admin/Insurance/InsurancePolicy/COI_Operator_2026.pdf",
+                    "title": "COI Operator 2026",
                     "snippet": "PRODUCER IAO, Inc. DBA ProAssurance Agency",
                     "sensitivity_status": "allowed",
                     "review_required": True,
@@ -207,7 +207,7 @@ def test_local_kni_evidence_packet_broker_focus_beats_prefetch_insurer_path(
         query_text="who was the broker for the CFC insurance?",
     )
 
-    assert packet["candidate_documents"][0]["relative_path"].endswith("COI_AnupSharma_2026.pdf")
+    assert packet["candidate_documents"][0]["relative_path"].endswith("COI_Operator_2026.pdf")
     assert packet["candidate_documents"][0]["content_excerpt"].startswith("PRODUCER IAO")
     assert packet["retrieval_diagnostics"]["evidence_path"].endswith(
         "CFC POLICY stamped 042126.pdf"

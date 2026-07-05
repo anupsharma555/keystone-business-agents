@@ -377,6 +377,238 @@ def render_work_item_result_text(
     return "\n".join(line for line in lines if line is not None)
 
 
+def render_work_item_graph_report(
+    work_item: Any,
+    events: list[Any],
+    *,
+    max_artifacts: int = 8,
+    max_sources: int = 6,
+) -> str:
+    """Render an operator report from persisted WorkItem and graph events."""
+
+    graph_event = _latest_event(events, "langgraph_orchestration")
+    loop_event = _latest_event(events, "langgraph_manager_loop_completed")
+    approval_event = _latest_event(events, "approval_gate_updated")
+    graph_metadata = _event_metadata(graph_event)
+    loop_metadata = _event_metadata(loop_event)
+    completion_review = _graph_completion_review_from_events(graph_metadata, loop_metadata)
+    checkpoint_payload = graph_metadata.get("checkpoint_payload")
+    if not isinstance(checkpoint_payload, dict):
+        checkpoint_payload = {}
+    node_path = _graph_report_node_path(graph_metadata, completion_review)
+    steps = loop_metadata.get("steps")
+    if not isinstance(steps, list):
+        steps = []
+    step_routes = _graph_report_step_routes(steps, node_path, completion_review)
+    side_effects = _graph_report_side_effects(graph_metadata, loop_metadata, completion_review)
+
+    lines = [
+        "Keystone LangGraph Run Report",
+        "",
+        f"WorkItem: {_clean(getattr(work_item, 'id', ''))}",
+        f"Title: {_clean(getattr(work_item, 'title', ''))}",
+        f"Status: {_enum_or_clean(getattr(work_item, 'status', ''))}",
+        f"Route: {_enum_or_clean(getattr(work_item, 'current_route', ''))}",
+    ]
+    target = getattr(work_item, "target", None)
+    target_name = _clean(getattr(target, "name", "")) if target is not None else ""
+    if target_name:
+        lines.append(f"Target: {target_name}")
+
+    if node_path:
+        lines.extend(["", "Graph Path:", " -> ".join(node_path)])
+    if step_routes:
+        lines.extend(["", "Specialist Steps:", " -> ".join(step_routes)])
+
+    stop_reason = (
+        _clean(loop_metadata.get("stop_reason"))
+        or _clean(completion_review.get("stop_reason"))
+        or _clean(graph_metadata.get("checkpoint_reason"))
+    )
+    if stop_reason:
+        lines.extend(["", f"Stop Reason: {stop_reason}"])
+
+    review_lines = [
+        _clean(item)
+        for item in completion_review.get("renderer_summary_lines", [])
+        if _clean(item)
+    ]
+    if review_lines:
+        lines.extend(["", "Graph Review:"])
+        lines.extend(f"- {item}" for item in review_lines[:8])
+
+    checkpoint_required = bool(graph_metadata.get("checkpoint_required"))
+    if checkpoint_required or checkpoint_payload:
+        reason = _clean(
+            checkpoint_payload.get("reason") or graph_metadata.get("checkpoint_reason")
+        )
+        lines.extend(["", "Approval Checkpoint:"])
+        lines.append(f"- Required: {_yes_no(checkpoint_required)}")
+        if reason:
+            lines.append(f"- Reason: {reason}")
+        gates = checkpoint_payload.get("approval_gates")
+        if isinstance(gates, list) and gates:
+            gate_summaries = [
+                f"{_clean(gate.get('scope'))}:{_clean(gate.get('state'))}"
+                for gate in gates
+                if isinstance(gate, dict)
+            ]
+            if gate_summaries:
+                lines.append("- Gates: " + ", ".join(gate_summaries[:6]))
+
+    artifacts = list(getattr(work_item, "artifact_refs", []) or [])
+    if artifacts:
+        lines.extend(["", "Artifacts:"])
+        for artifact in artifacts[:max_artifacts]:
+            lines.append(
+                "- "
+                + " ".join(
+                    part
+                    for part in (
+                        f"{_clean(artifact.artifact_type)}:{_clean(artifact.artifact_id)}",
+                        _clean(artifact.approval_state),
+                        _clean(artifact.title),
+                    )
+                    if part
+                )
+            )
+
+    blockers = [
+        blocker
+        for blocker in list(getattr(work_item, "blockers", []) or [])
+        if not bool(getattr(blocker, "resolved", False))
+    ]
+    if blockers:
+        lines.extend(["", "Open Blockers:"])
+        lines.extend(
+            f"- {_clean(blocker.code)}: {_clean(blocker.message)}"
+            for blocker in blockers[:8]
+        )
+
+    sources = list(getattr(work_item, "sources", []) or [])
+    if sources:
+        lines.extend(["", "Sources:"])
+        for source in sources[:max_sources]:
+            label = _clean(getattr(source, "title", "")) or _clean(
+                getattr(source, "source_id", "")
+            )
+            url = _clean(getattr(source, "url", ""))
+            lines.append(f"- {label}" + (f" ({url})" if url else ""))
+
+    gates = list(getattr(work_item, "approval_gates", []) or [])
+    if gates:
+        lines.extend(["", "Stored Approval Gates:"])
+        lines.extend(
+            f"- {_clean(gate.scope)}: {_clean(gate.state)}"
+            + (f" ({_clean(gate.approval_id)})" if _clean(gate.approval_id) else "")
+            for gate in gates[:8]
+        )
+
+    if approval_event is not None:
+        approval_meta = _event_metadata(approval_event)
+        lines.extend(
+            [
+                "",
+                "Latest Approval Decision:",
+                (
+                    f"- {_clean(approval_meta.get('approval_id'))}: "
+                    f"{_clean(approval_meta.get('previous_state'))} -> "
+                    f"{_clean(approval_meta.get('new_state'))}"
+                ),
+            ]
+        )
+
+    if side_effects:
+        lines.extend(["", "Side Effects:"])
+        lines.extend(f"- {item}" for item in side_effects)
+    return "\n".join(line for line in lines if line is not None).strip()
+
+
+def _latest_event(events: list[Any], event_type: str) -> Any | None:
+    for event in reversed(events):
+        if _clean(getattr(event, "event_type", "")) == event_type:
+            return event
+    return None
+
+
+def _event_metadata(event: Any | None) -> dict[str, Any]:
+    metadata = getattr(event, "metadata", {}) if event is not None else {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _graph_completion_review_from_events(
+    graph_metadata: dict[str, Any],
+    loop_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    for metadata in (loop_metadata, graph_metadata):
+        review = metadata.get("graph_completion_review")
+        if isinstance(review, dict):
+            return review
+    return {}
+
+
+def _graph_report_node_path(
+    graph_metadata: dict[str, Any],
+    completion_review: dict[str, Any],
+) -> list[str]:
+    node_path = graph_metadata.get("node_path")
+    if isinstance(node_path, list):
+        return [_clean(item) for item in node_path if _clean(item)]
+    completed = completion_review.get("completed_nodes")
+    if isinstance(completed, list):
+        return [_clean(item) for item in completed if _clean(item)]
+    return []
+
+
+def _graph_report_step_routes(
+    steps: list[Any],
+    node_path: list[str],
+    completion_review: dict[str, Any],
+) -> list[str]:
+    routes = [
+        _clean(step.get("route"))
+        for step in steps
+        if isinstance(step, dict) and _clean(step.get("route"))
+    ]
+    if routes:
+        return routes
+    completed_routes = completion_review.get("completed_routes")
+    if isinstance(completed_routes, list):
+        routes = [_clean(route) for route in completed_routes if _clean(route)]
+    if routes:
+        return routes
+    node_to_route = {
+        "run_chief_of_staff": "chief_of_staff",
+        "run_gmail_triage": "gmail_triage",
+        "run_business_research": "business_research_analyst",
+        "run_opportunity_scout": "opportunity_scout",
+        "run_outreach_composer": "outreach_composer",
+    }
+    return [node_to_route[node] for node in node_path if node in node_to_route]
+
+
+def _graph_report_side_effects(
+    graph_metadata: dict[str, Any],
+    loop_metadata: dict[str, Any],
+    completion_review: dict[str, Any],
+) -> list[str]:
+    flags: list[str] = []
+    for key, label in (
+        ("send_enabled", "send enabled"),
+        ("external_writes_enabled", "external writes enabled"),
+    ):
+        value = (
+            completion_review.get(key)
+            if key in completion_review
+            else loop_metadata.get(key)
+            if key in loop_metadata
+            else graph_metadata.get(key)
+        )
+        if value is not None:
+            flags.append(f"{label}: {_yes_no(bool(value))}")
+    return flags
+
+
 def _work_item_result_is_live(result: Any) -> bool:
     pack = getattr(result, "context_pack", None)
     if not isinstance(pack, dict):

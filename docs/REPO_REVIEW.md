@@ -306,8 +306,8 @@ Browserless, or other live services.
   implementation.
 - Research and scoring remain hybrid heuristic/source-driven rather than fully
   model-mediated.
-- LangGraph is implemented as an optional WorkItem orchestration wrapper. It remains outside
-  core dependencies and does not replace SDK agent contracts.
+- LangGraph is implemented as optional WorkItem graph execution. It remains outside
+  core dependencies and does not replace SDK agent contracts, WorkItems, or context packs.
 
 ## Recommended Next Work
 
@@ -324,7 +324,7 @@ Browserless, or other live services.
    visible before it becomes latency and cost drift.
 6. Turn representative no-side-effect Slack and CLI scenarios into a recurring
    cost/latency benchmark.
-7. Keep LangGraph limited to the optional WorkItem wrapper until SDK agent
+7. Keep LangGraph limited to optional WorkItem graph execution until SDK agent
    contracts and the audit layer remain stable under real use.
 
 ## Status Table
@@ -349,4 +349,4 @@ Browserless, or other live services.
 | Approval queue | Implemented locally | Approval does not send or publish. |
 | Table mirror | Fixture/SQLite implemented | Airtable and Google Sheets live writes are not implemented. |
 | Apify/Browserless | Placeholder | Dry-run or `NotImplementedError` for live. |
-| LangGraph | Optional wrapper | WorkItem advancement graph behind optional dependency. |
+| LangGraph | Optional graph runtime | WorkItem graph execution behind optional dependency. |

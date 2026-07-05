@@ -92,8 +92,10 @@ from keystone_agents.tools.browser_diagnostics_tool import (
 )
 from keystone_agents.tools.html_review_tool import extract_research_claims_from_html
 from keystone_agents.tools.internal_data_tools import (
+    airtable_create_expense_from_receipt,
     airtable_get_base_schema,
     airtable_read_records,
+    airtable_upload_attachment,
     airtable_write_record,
     google_workspace_tools,
 )
@@ -252,6 +254,16 @@ _NEGATED_OUTREACH_DRAFT_CLAUSE_RE = re.compile(
     r"|\b(?:do\s+not|don't|dont|never|avoid|skip|no)\b"
     r"[^.;\n]{0,220}\b(?:outreach|email|reply|response|follow-up|followup|message|note)\b"
     r"[^.;\n]{0,160}\b(?:draft|write|compose|prepare|outline)\b"
+    r"[^.;\n]*[.;]?",
+    re.I,
+)
+_NEGATED_OPPORTUNITY_DISCOVERY_CLAUSE_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|avoid|skip|no|without)\b"
+    r"[^.;\n]{0,220}\b(?:scout|find|identify|search|source|discover|list|"
+    r"assess|evaluate|review|qualify)\b"
+    r"[^.;\n]{0,160}\b(?:opportunities?|leads?|grants?|partners?|"
+    r"partnerships?|pilots?|companies?|targets?|roles?|jobs?|positions?|"
+    r"postings?|openings?)\b"
     r"[^.;\n]*[.;]?",
     re.I,
 )
@@ -908,11 +920,30 @@ def _result(
 
 def _looks_like_crm_write_request(text: str) -> bool:
     cleaned = _NEGATED_CRM_WRITE_CLAUSE_RE.sub(" ", str(text or ""))
+    lowered = " ".join(cleaned.lower().split())
+    if "airtable" in lowered and any(
+        marker in lowered
+        for marker in (
+            "finance_tax_tracker",
+            "finance tax tracker",
+            "tax tracker",
+            "business expense",
+            "business expenses",
+            "personal expense",
+            "personal expenses",
+        )
+    ):
+        return False
     return bool(_CRM_WRITE_RE.search(cleaned))
 
 
 def _without_negated_outreach_draft_clauses(text: str) -> str:
-    return _NEGATED_OUTREACH_DRAFT_CLAUSE_RE.sub(" ", str(text or ""))
+    return _without_negated_route_action_clauses(text)
+
+
+def _without_negated_route_action_clauses(text: str) -> str:
+    cleaned = _NEGATED_OUTREACH_DRAFT_CLAUSE_RE.sub(" ", str(text or ""))
+    return _NEGATED_OPPORTUNITY_DISCOVERY_CLAUSE_RE.sub(" ", cleaned)
 
 
 def _without_negated_context_send_clauses(text: str) -> str:
@@ -1109,7 +1140,7 @@ def _send_refusal(
 
 
 def _looks_like_discovery_outreach_workflow(text: str) -> bool:
-    return bool(_DISCOVERY_OUTREACH_WORKFLOW_RE.search(str(text or "")))
+    return bool(_DISCOVERY_OUTREACH_WORKFLOW_RE.search(_without_negated_route_action_clauses(text)))
 
 
 def _gmail_cross_agent_workflow(text: str) -> list[str]:
@@ -1221,6 +1252,26 @@ def _requires_research_before_outreach(text: str) -> bool:
     return bool(_EXPLICIT_RESEARCH_BEFORE_OUTREACH_RE.search(normalized))
 
 
+def _looks_like_explicit_business_research_request(text: str) -> bool:
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:run|use|ask|call|have|route\s+to|send\s+to)?\s*"
+            r"business\s+research(?:\s+analyst|\s+agent)?\b",
+            cleaned,
+            flags=re.I,
+        )
+        and re.search(
+            r"\b(?:research|source-backed|source\s+backed|company|profile|"
+            r"evidence[- ]?packet|evidence\s+planning|planning\s+note|brief)\b",
+            cleaned,
+            flags=re.I,
+        )
+    )
+
+
 def _safe_discovery_outreach_workflow_result(
     *,
     request_text: str,
@@ -1328,22 +1379,20 @@ def _missing_outreach_context_refusal(
             "context, is required before outreach."
         ),
         clarification_request=(
-            "Outreach Composer needs approved drafting context\n\n"
+            "What should this outreach focus on?\n\n"
             "*Answer:*\n"
-            "I cannot create draft-only outreach until a source-backed company profile or "
-            "opportunity record is approved for drafting and recipient/contact context is present. "
-            "Approval is required before any external-use draft context, CRM action, send, post, "
-            "schedule, or file write.\n\n"
-            "*Detailed Summary:*\n"
-            "* Required: approved company profile or opportunity record.\n"
-            "* Required: recipient, target contact, or target organization.\n"
-            "* Approval boundary: no outreach draft or external action can proceed until the "
-            "approved context and recipient scope are explicit.\n"
-            "* Current status: draft-only outreach remains blocked; no email, LinkedIn note, "
-            "Slack post, CRM record, file write, send, schedule, publish, or external action was taken.\n\n"
-            "*Next step:*\n"
-            "Attach or approve source-backed company or opportunity context, then provide "
-            "the recipient or target organization before requesting a draft."
+            "I can keep this as draft-only thread help, but I need the intended focus and "
+            "either the recipient or target organization before writing copy that could be "
+            "used externally.\n\n"
+            "*What I need:*\n"
+            "* Focus: what the email or message should accomplish.\n"
+            "* Target: recipient, target contact, or target organization.\n"
+            "* Evidence: approved source-backed company or opportunity context, or permission "
+            "to use the context already in this thread.\n"
+            "* Boundary: no email, Gmail draft, Slack post outside this thread, CRM record, "
+            "file write, send, schedule, publish, or external action has been taken.\n\n"
+            "*Reply with:*\n"
+            "\"Focus: ...; target: ...; use these source-backed facts: ...\""
         ),
         approval_scope=ApprovalScope.DRAFTING,
         approval_rationale=(
@@ -3002,6 +3051,8 @@ def route_request(
 
     text = _payload_text(request)
     lower_text = text.lower()
+    route_text = _without_negated_route_action_clauses(text)
+    route_lower_text = route_text.lower()
     loaded_state_context = (
         load_workflow_state_context(database_url=database_url) if database_url else None
     )
@@ -3104,7 +3155,23 @@ def route_request(
             )
         )
 
-    if _OUTREACH_RE.search(lower_text) and _request_has_inline_approved_outreach_context(text):
+    if _looks_like_explicit_business_research_request(text):
+        return finish(
+            _result(
+                route="business_research_analyst",
+                rationale=(
+                    "The request explicitly asks Business Research to handle a "
+                    "source-backed company or evidence-planning task."
+                ),
+                workflow_state=state_context,
+                retrieval_hint=_route_retrieval_hint(
+                    "business_research_analyst",
+                    request_text=text,
+                ),
+            )
+        )
+
+    if _OUTREACH_RE.search(route_lower_text) and _request_has_inline_approved_outreach_context(text):
         return finish(
             _result(
                 route="outreach_composer",
@@ -3139,7 +3206,7 @@ def route_request(
             )
         )
 
-    if _OUTREACH_RE.search(lower_text):
+    if _OUTREACH_RE.search(route_lower_text):
         if (
             not approved_context_present
             and _requires_research_before_outreach(text)
@@ -3178,7 +3245,7 @@ def route_request(
     if _looks_like_company(text) and re.search(
         r"\b(?:research\s+brief|company\s+research|company\s+profile|"
         r"source-attributed|source\s+attributed|confirmed\s+facts)\b",
-        lower_text,
+        route_lower_text,
     ):
         return finish(
             _result(
@@ -3195,7 +3262,7 @@ def route_request(
             )
         )
 
-    if _OPPORTUNITY_RE.search(lower_text):
+    if _OPPORTUNITY_RE.search(route_lower_text):
         return finish(
             _result(
                 route="opportunity_scout",
@@ -3358,6 +3425,8 @@ def build_orchestrator_agent(
             airtable_get_base_schema,
             airtable_read_records,
             airtable_write_record,
+            airtable_upload_attachment,
+            airtable_create_expense_from_receipt,
             search_web,
             structure_web_data_for_schema,
             render_page,

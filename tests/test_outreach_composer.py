@@ -38,6 +38,7 @@ from keystone_agents.schemas.outreach import (
     OutreachDraftStatusResult,
     OutreachDraftVariantSet,
     OutreachExampleGuidance,
+    OutreachLLMDraftPayload,
 )
 from keystone_agents.sdk import load_prompt
 from keystone_agents.storage.sqlite_store import SQLiteStore
@@ -53,6 +54,23 @@ def _fixture_draft() -> OutreachDraft:
         recent_signal="decentralized clinical trial operations",
         outreach_goal="compare notes on clinical AI evaluation support",
     )
+
+
+def test_compact_llm_draft_payload_ignores_harmless_extra_fields() -> None:
+    payload = OutreachLLMDraftPayload.model_validate(
+        {
+            "company_name": "NeuroFlow",
+            "email_subject": "Re: NeuroFlow",
+            "email_body": "Hi [Name],\n\nHappy to compare notes if useful.\n\nSincerely,\nAnup",
+            "linkedin_note": "Happy to compare notes if useful.",
+            "personalization_rationale": "Used only approved thread-local context.",
+            "source_ids_used": ["user_provided:thread_local_request"],
+            "recipient": "Review thread",
+        }
+    )
+
+    assert payload.company_name == "NeuroFlow"
+    assert not hasattr(payload, "recipient")
 
 
 def _approved_llm_context(

@@ -21,6 +21,8 @@ def test_env_contract_lists_child_runtime_keys_with_safety_metadata() -> None:
     assert len(by_name) == len(env_vars)
     assert by_name["KEYSTONE_OPENAI_API_KEY"]["secret"] is True
     assert by_name["KEYSTONE_OPENAI_API_KEY"]["display_safety"] == "secret"
+    assert by_name["KNI_BUSINESS_AGENTS_LANGGRAPH"]["category"] == "orchestration"
+    assert by_name["KNI_BUSINESS_AGENTS_LANGGRAPH"]["secret"] is False
     assert by_name["SEARXNG_BASE_URL"]["category"] == "search"
     assert by_name["KEYSTONE_ORCHESTRATOR_MODEL"]["category"] == "model"
     assert "read environment values" in contract["notes"][0]

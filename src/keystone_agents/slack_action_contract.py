@@ -494,6 +494,15 @@ def business_agent_slack_contract() -> dict[str, Any]:
             "named_agents": [dict(item) for item in NAMED_AGENT_RESULT_RENDERERS],
             "required_sections": ["Answer", "Detailed Summary"],
             "optional_sections": ["Useful references"],
+            "canonical_status_field": "status",
+            "operator_status_field": "operator_status",
+            "operator_title_field": "slack_display_title",
+            "operator_text_field": "slack_display_text",
+            "status_display_policy": (
+                "Use status as canonical machine state only. For Slack headers, prefer "
+                "operator_status and slack_display_title so missing-context states can "
+                "read as needs_input instead of blocked while preserving WorkItem gates."
+            ),
             "fallback_text_fields": [
                 "human_summary",
                 "slack_display_text",

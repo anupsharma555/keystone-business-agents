@@ -890,7 +890,7 @@ class OutreachDraftStatusResult(BaseModel):
 class OutreachLLMDraftPayload(BaseModel):
     """Compact LLM draft payload validated into the full OutreachDraft schema."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     company_name: str = ""
     email_subject: str = ""

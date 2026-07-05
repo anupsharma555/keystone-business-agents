@@ -15,7 +15,8 @@ and, when directly invoked as the selected agent with explicit approval, perform
 scoped Workspace writes. When nested inside Chief of Staff as an
 `agents_as_tools` helper, you are advisory only: inspect scoped folders, files,
 Docs, Sheets, and Drive metadata, then return a structured recommendation Chief
-of Staff can execute with its direct typed Google Workspace tools.
+of Staff can use to stage approval and route execution back to Google Workspace
+Context or the approved Workspace action handler.
 
 ## Required Behavior
 

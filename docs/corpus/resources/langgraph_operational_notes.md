@@ -49,6 +49,12 @@ retries, resumption, and future multi-step routing.
 - Do not require LangGraph for individual specialist CLI execution.
 - Do not put business rules only in graph edges. Python gates remain
   authoritative for readiness, approvals, no-PHI behavior, and no-send rules.
+- Keep planner hints schema-light and structural. They may identify target,
+  route, requested count, live-search denial, and no-send/no-write constraints,
+  but they must not interpret LLM-owned substance such as evidence strength,
+  opportunity fit, or outreach strategy. Test/control wording such as
+  "comparison smoke" is orchestration metadata, not a reason to force
+  comparison-format output or multi-target research.
 - Do not persist raw Slack exports, Gmail bodies, credentials, PHI, or
   patient-specific data in checkpoints or traces.
 - For Slack-triggered WorkItems, record graph runtime, node path, checkpoint
@@ -60,7 +66,30 @@ retries, resumption, and future multi-step routing.
 
 ## Fit With Existing Keystone Work
 
-The current thin wrapper around `advance_work_item()` is the right starting
-shape. Future expansion should add nodes only when they improve observability,
+The current graph-native WorkItem step is the right starting shape. Future
+expansion should add multi-step edges only when they improve observability,
 resumption, approval checkpointing, or retry behavior without changing the
 specialist agent contracts.
+
+Implemented context-agent edges follow that rule: RSS/preprints and Zotero
+context are staged as read-only WorkItem sources/artifacts, then downstream
+Business Research or Opportunity Scout produces the durable specialist artifact.
+Graph-produced source context can satisfy downstream offline Opportunity Scout
+source requirements. If a specific opportunity-fit ask has no live-search
+approval and no WorkItem source context, the graph should stop and ask for
+evidence rather than using unrelated generic fixture opportunities.
+When the original ask requests an internal artifact, packet, or brief plan from
+that context-backed evidence, the graph may stage a Google Workspace artifact
+plan after the specialist pass and stop at an approval checkpoint. This remains
+a no-write/no-send planning edge; Drive, Docs, Sheets, sharing, publication, and
+external-use actions still require a separately scoped approval and live
+integration path.
+Chief and Orchestrator should coordinate review, approval, and graph resumes,
+not execute provider-specific writes directly. Airtable, Google Workspace,
+Gmail draft, Zotero importer, Slack post, or other mutations should run through
+the owning specialist or explicitly approved action handler after the scoped
+approval boundary is satisfied.
+Slack-thread-local outreach draft text is draft-only output, not external
+delivery. It still needs model-backed synthesis or exact operator-provided
+copy; offline deterministic placeholders should not be used as a substitute for
+the Outreach Composer reasoning step.

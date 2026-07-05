@@ -570,7 +570,7 @@ def test_gmail_get_thread_returns_summary_fields() -> None:
                                 "labelIds": ["SENT"],
                                 "payload": {
                                     "headers": [
-                                        {"name": "From", "value": "Anup <wisegrow05@gmail.com>"},
+                                        {"name": "From", "value": "Anup <operator@example.com>"},
                                         {"name": "To", "value": "Alex <alex@example.com>"},
                                         {"name": "Subject", "value": "Clinical validation scope"},
                                     ],
@@ -587,7 +587,7 @@ def test_gmail_get_thread_returns_summary_fields() -> None:
                                 "payload": {
                                     "headers": [
                                         {"name": "From", "value": "Alex <alex@example.com>"},
-                                        {"name": "To", "value": "Anup <wisegrow05@gmail.com>"},
+                                        {"name": "To", "value": "Anup <operator@example.com>"},
                                         {
                                             "name": "Subject",
                                             "value": "Re: Clinical validation scope",
@@ -649,7 +649,7 @@ def test_gmail_get_thread_does_not_promote_onboarding_ctas_to_action_items() -> 
                                 "payload": {
                                     "headers": [
                                         {"name": "From", "value": "Anna <anna@halo.science>"},
-                                        {"name": "To", "value": "Anup <wisegrow05@gmail.com>"},
+                                        {"name": "To", "value": "Anup <operator@example.com>"},
                                         {"name": "Subject", "value": "Welcome to Halo!"},
                                     ],
                                     "mimeType": "text/plain",
@@ -1177,7 +1177,7 @@ def test_live_cli_thread_summary_reads_sent_label(
                         "id": "msg-sent",
                         "received_at": "2026-04-22T12:00:00Z",
                         "sender_name": "Anup",
-                        "sender_email": "wisegrow05@gmail.com",
+                        "sender_email": "operator@example.com",
                         "subject": "Clinical validation scope",
                         "snippet": "Please send the draft SOW by next Tuesday.",
                         "prior_labels": ["SENT"],

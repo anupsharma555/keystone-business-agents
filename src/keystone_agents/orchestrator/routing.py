@@ -18,7 +18,7 @@ EMAIL_WORKFLOW_RE = re.compile(
 URL_RE = re.compile(r"\b(?:https?://|www\.)\S+|\b[\w.-]+\.(?:com|org|net|ai|io|health)\b", re.I)
 OPPORTUNITY_RE = re.compile(
     r"\b(find|identify|search|scout|source|discover|list)\b[\s\S]*?"
-    r"\b(opportunities?|leads?|grants?|partners?|partnerships?|pilots?|"
+    r"\b(opportunit(?:y|ies)|leads?|grants?|partners?|partnerships?|pilots?|"
     r"buyer[- ]intent|funding\s+signals?|validation\s+activity|companies?|people|individuals?|"
     r"institutes?|labs?|conferences?|rfps?|funders?|roles?|jobs?|positions?|"
     r"postings?|openings?)\b"
@@ -123,11 +123,17 @@ def looks_like_thread_local_draft_request(text: str) -> bool:
     cleaned = " ".join(str(text or "").lower().split())
     if not re.search(r"\b(draft|compose|reply|respond|email|outreach)\b", cleaned):
         return False
-    if not re.search(r"\b(thread-local|slack thread|in this thread|in slack only)\b", cleaned):
+    if not re.search(
+        r"\b(thread-local|slack[- ]thread|in this thread|in slack only|"
+        r"(?:post|publish|share)\s+outside\s+this\s+thread|"
+        r"outside\s+this\s+thread|slack[- ]only|slack email draft|"
+        r"email draft in slack)\b",
+        cleaned,
+    ):
         return False
     return bool(
         re.search(
-            r"\b(out of scope|no external|without external|draft only|draft-only)\b",
+            r"\b(out of scope|no external|without external|draft only|draft-only|for review)\b",
             cleaned,
         )
     )

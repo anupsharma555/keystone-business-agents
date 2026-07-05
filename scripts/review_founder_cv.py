@@ -13,7 +13,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Review a local founder CV for profile extraction."
     )
-    parser.add_argument("--cv", default="documents/CV_AnupSharma_2026.docx")
+    parser.add_argument("--cv", default="documents/CV_Operator_2026.docx")
     parser.add_argument("--output", default=None, help="Optional JSON output path.")
     parser.add_argument(
         "--include-extracted-text",

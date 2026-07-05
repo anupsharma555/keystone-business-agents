@@ -18,7 +18,11 @@ This safety policy applies to every Keystone Neuroinformatics LLC business agent
 - Do not process patient-specific content.
 - No auto-send.
 - Draft-only behavior is mandatory for outbound communication.
-- Human approval is required for every draft.
+- Human approval is required before draft text is used externally, converted
+  into a provider-side Gmail draft, sent, posted outside the current review
+  thread, scheduled, published, or written to an external system.
+- Slack-thread-local draft text for human review is allowed when no provider-side
+  Gmail draft, send, post, schedule, publish, or external write is performed.
 - Do not provide medical, legal, tax, or regulatory advice.
 - Source attribution required for research, opportunity, and outreach claims.
 - Material claims must map to claim-level records with source IDs.

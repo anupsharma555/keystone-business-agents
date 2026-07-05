@@ -100,7 +100,7 @@ WEEKLY_OUTREACH_FALLBACK_GOAL = (
     "compare notes on clinical AI evaluation, research operations, and "
     "opportunity-fit collaboration after human approval"
 )
-DEFAULT_GMAIL_DRAFT_ACCOUNT = "wisegrow05@gmail.com"
+DEFAULT_GMAIL_DRAFT_ACCOUNT = "operator@example.com"
 GMAIL_DRAFT_ACCOUNT_ENV_KEYS = (
     "KEYSTONE_GMAIL_DRAFT_ACCOUNT",
     "KNI_BUSINESS_AGENTS_GMAIL_DRAFT_ACCOUNT",
@@ -766,7 +766,9 @@ def _synthesize_weekly_outreach_draft(
         )
 
     outcome = run_retrieved_sdk_synthesis(
-        agent=build_outreach_composer_compact_synthesis_agent(),
+        agent=build_outreach_composer_compact_synthesis_agent(
+            request_text=objective,
+        ),
         output_type=OutreachLLMDraftPayload,
         retrieve=retrieve,
         normalize=normalize,

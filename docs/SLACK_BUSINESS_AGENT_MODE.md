@@ -52,7 +52,7 @@ so business-agent developers can see the safety boundary from this repo.
 | Slack message actions | `KNI_BUSINESS_AGENTS_MESSAGE_ACTIONS_ENABLED` | Slack interactivity enabled | Buttons update local approval records for the named scope; they do not send email, post externally, publish, or schedule. |
 | Slack history context | `KNI_BUSINESS_AGENTS_HISTORY_CONTEXT_ENABLED`, `SLACK_APP_MENTION_POLLING_ENABLED` | Slack `channels:history` and `groups:history` if intentionally enabled | Optional fallback/history access; disabled by default. |
 | Selected-message thread context | `KNI_BUSINESS_AGENTS_THREAD_CONTEXT_ENABLED`, `KNI_BUSINESS_AGENTS_THREAD_CONTEXT_MAX_MESSAGES`, `KNI_BUSINESS_AGENTS_THREAD_CONTEXT_MAX_CHARS` | Slack `conversations.replies` access for the selected channel plus `SLACK_BOT_TOKEN` | Optional bounded thread context for message actions. The bridge writes a compact context file for KBA; failures are warnings, not approval or send authority. |
-| LangGraph WorkItem orchestration | `KNI_BUSINESS_AGENTS_LANGGRAPH` | KBA installed with `.[orchestration]` in `KNI_BUSINESS_AGENTS_PYTHON` | Routes WorkItem advancement through the optional graph wrapper; does not change live side-effect gates. |
+| LangGraph WorkItem orchestration | `KNI_BUSINESS_AGENTS_LANGGRAPH` | KBA installed with `.[orchestration]` in `KNI_BUSINESS_AGENTS_PYTHON` | Routes WorkItem advancement through optional graph-native nodes; does not change live side-effect gates. |
 | SDK conversation sessions | `KEYSTONE_SDK_SESSIONS`, `KEYSTONE_SDK_SESSION_DB`, `KEYSTONE_SDK_SESSION_ID` | OpenAI Agents SDK live or local SDK run | Local SQLite conversation continuity for follow-up wording. Default automatic capture is limited to Chief of Staff and live WorkItem scopes; WorkItems remain canonical state. |
 | Live model execution | `KNI_BUSINESS_AGENTS_LIVE_SDK` and workflow-specific live SDK flags | Business-agent model credentials | Enables LLM synthesis/planning only. |
 | Live search | `KNI_BUSINESS_AGENTS_LIVE_SEARCH` | Search provider config in this repo | Enables retrieval only. |
@@ -130,6 +130,15 @@ priority order:
 3. Keep provider diagnostics, model names, retrieval counts, timing, WorkItem
    ids, route/status fields, and other audit data out of the main Slack answer
    unless the operator explicitly asks for debugging details.
+
+The payload `status` field remains canonical machine state for WorkItems,
+traces, evals, and continuation gates. Slack headers should prefer
+`operator_status` and `slack_display_title` from the result payload when
+present. Missing-context waits may therefore display as `needs_input` /
+`Business Agents Need Input` while preserving canonical `status=blocked` for
+backend state. The body should come from `human_summary` or
+`slack_display_text` and ask the operator for the next useful input instead of
+leading with a generic blocked message.
 
 The side-effect-free helper
 `keystone_agents.slack_action_contract.business_agent_result_display_text()`

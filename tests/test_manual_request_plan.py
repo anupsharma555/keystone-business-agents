@@ -61,6 +61,23 @@ def test_context_agent_negated_side_effect_constraints_remain_read_only_context(
     assert plan.planner_warnings == []
 
 
+def test_slack_thread_sample_reply_is_draft_text_not_send_blocker() -> None:
+    prompt = (
+        "Using this context: Mindful Care is asking whether Keystone can help with "
+        "measurement-based care workflow evaluation design. Write a short "
+        "Slack-thread sample reply for review."
+    )
+
+    plan = infer_manual_request_plan(prompt, requested_agent="outreach_composer")
+    result = route_request(prompt, manual_plan=plan)
+
+    assert plan.target_agent == "outreach_composer"
+    assert plan.intent == "outreach_draft"
+    assert result.route == "outreach_composer"
+    assert result.refused is False
+    assert result.send_enabled is False
+
+
 @pytest.mark.parametrize("spec_id", ["BR-1", "BR-4"])
 def test_manual_plan_keeps_research_brief_prompts_with_outreach_mentions_on_research(
     spec_id: str,
@@ -89,6 +106,26 @@ def test_manual_plan_routes_company_comparison_to_business_research() -> None:
     assert plan.target_agent == "business_research_analyst"
     assert plan.intent == "company_research"
     assert plan.primary_target == "Lindus Health vs Holmusk"
+
+
+def test_manual_plan_preserves_business_research_smoke_with_context_edges() -> None:
+    plan = infer_manual_request_plan(
+        "LangGraph smoke 1: use preprints context agent history and Zotero context "
+        "agent handoff, then run Business Research for NeuroFlow as an internal "
+        "evidence-packet planning note. Live SDK is approved only for this bounded "
+        "read-only smoke if the backend would normally use it; live web search is "
+        "not approved. Use local/dry-run retrieval where possible. Do not send "
+        "email, create drafts, post elsewhere, publish, schedule, or write external "
+        "systems.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "research_brief"
+    assert "NeuroFlow" in plan.primary_target
+    assert plan.task_objective == "source_research"
+    assert plan.expected_artifact_type == "source_summary"
+    assert plan.requires_live_search is False
 
 
 @pytest.mark.parametrize(
@@ -242,6 +279,57 @@ def test_manual_plan_routes_generic_opportunity_to_outreach_loop_to_workflow() -
     assert "behavioral health" in plan.constraints
 
 
+@pytest.mark.parametrize(
+    ("company_prompt", "expected_target"),
+    [
+        (
+            (
+                "NeuroFlow has been coming up as a behavioral-health AI company with "
+                "payer partnership and outcomes-evidence signals."
+            ),
+            "NeuroFlow",
+        ),
+        (
+            (
+                "Example Health has been coming up as a care-delivery analytics vendor "
+                "with payer partnership signals."
+            ),
+            "Example Health",
+        ),
+        (
+            (
+                "Alto Neuroscience has been coming up as a precision-psychiatry company "
+                "with biomarker-stratified trial signals."
+            ),
+            "Alto Neuroscience",
+        ),
+    ],
+)
+def test_manual_plan_keeps_chief_front_door_for_multi_step_research_request(
+    company_prompt: str,
+    expected_target: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        (
+            f"{company_prompt} Do research, assess whether this is a real KNI "
+            "advisory/research opportunity, identify what source-backed evidence is "
+            "still missing, and decide whether it should stop at an approval checkpoint "
+            "before any outreach. If the evidence supports pursuing it, include a "
+            "draft-only Slack-thread sample outreach for review. Do not send email, "
+            "create Gmail drafts, post outside this thread, schedule, publish, or write "
+            "external systems."
+        ),
+        requested_agent="chief_of_staff",
+    )
+
+    assert plan.requested_agent == "chief_of_staff"
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.intent == "route_request"
+    assert plan.target_type == "company"
+    assert plan.expected_artifact_type == "none"
+    assert expected_target in plan.primary_target
+
+
 def test_manual_plan_blocks_opportunity_to_outreach_loop_when_draft_outreach_is_negated() -> None:
     plan = infer_manual_request_plan(
         "Find 2 lightweight opportunity directions for Keystone related to behavioral health AI "
@@ -269,6 +357,21 @@ def test_manual_plan_preserves_safe_workflow_for_find_and_send_request() -> None
     assert plan.desired_count == 3
     assert plan.side_effect_policy == "draft_or_read_only"
     assert any("Send request blocked" in warning for warning in plan.planner_warnings)
+
+
+def test_manual_plan_counts_compare_how_three_products() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "business research analyst: Compare how three public AI companion "
+            "or chatbot products describe teen safety."
+        ),
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.desired_count == 3
+    assert "comparison-format" in plan.constraints
 
 
 def test_manual_plan_preserves_workflow_when_llm_candidate_misreads_company() -> None:
@@ -334,10 +437,40 @@ def test_manual_plan_routes_operational_planning_to_chief_of_staff(prompt: str) 
 
     assert plan.requested_agent == "orchestrator"
     assert plan.target_agent == "chief_of_staff"
-    assert plan.intent == "slack_operations"
-    assert plan.task_objective == "slack_operations"
-    assert plan.expected_artifact_type == "slack_ops_summary"
+    assert plan.intent == "route_request"
+    assert plan.task_objective == "route_or_continue"
+    assert plan.expected_artifact_type == "none"
     assert plan.side_effect_policy == "draft_or_read_only"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "requested_agent"),
+    [
+        (
+            "@KNI chief of staff add a business expense to the airtable business expenses "
+            "based on the receipt details which are: "
+            "/tmp/example-business-cards-receipt.pdf",
+            "orchestrator",
+        ),
+        (
+            "Add a business expense to Airtable business expenses from "
+            "/tmp/example-business-cards-receipt.pdf",
+            "orchestrator",
+        ),
+    ],
+)
+def test_manual_plan_routes_finance_receipt_write_to_business_system_plan(
+    prompt: str,
+    requested_agent: str,
+) -> None:
+    plan = infer_manual_request_plan(prompt, requested_agent=requested_agent)
+
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.intent == "business_system_write"
+    assert plan.task_objective == "business_system_write"
+    assert plan.target_type == "business_system_context"
+    assert plan.expected_artifact_type == "business_system_write_plan"
+    assert plan.side_effect_policy == "internal_write_approval_required"
 
 
 @pytest.mark.parametrize(
@@ -394,7 +527,7 @@ def test_manual_plan_planning_first_workflow_uses_safe_scout_target() -> None:
         (
             "Audit why a previous @KNI response felt unrelated and tell me which agent path should have handled it.",
             "chief_of_staff",
-            "slack_operations",
+            "route_request",
         ),
     ],
 )
@@ -434,7 +567,7 @@ def test_manual_plan_extracts_business_research_target_from_direct_call() -> Non
 
     assert plan.requested_agent == "business_research_analyst"
     assert plan.target_agent == "business_research_analyst"
-    assert plan.primary_target == "NeuroFlow"
+    assert "NeuroFlow" in plan.primary_target
     assert plan.task_objective == "source_research"
     assert plan.expected_artifact_type == "research_brief"
     assert "NeuroFlow" in plan.objective
@@ -565,6 +698,21 @@ def test_manual_plan_routes_source_backed_vendor_table_to_business_research() ->
     assert "comparison-format" in plan.constraints
 
 
+def test_manual_plan_does_not_treat_comparison_smoke_as_output_format() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "chief of staff NeuroFlow has payer partnership signals. Do research and "
+            "assess whether this is a KNI opportunity. Live SDK is approved only for "
+            "this bounded comparison smoke; live web search is not approved."
+        ),
+        requested_agent="chief_of_staff",
+    )
+
+    assert "NeuroFlow" in plan.primary_target
+    assert plan.desired_count == 1
+    assert "comparison-format" not in plan.constraints
+
+
 def test_manual_plan_routes_source_provided_vendor_summary_table_to_business_research() -> None:
     plan = infer_manual_request_plan(
         (
@@ -593,9 +741,9 @@ def test_manual_plan_routes_eval_scorecard_followup_to_chief_of_staff() -> None:
     )
 
     assert plan.target_agent == "chief_of_staff"
-    assert plan.intent == "slack_operations"
-    assert plan.task_objective == "slack_operations"
-    assert plan.expected_artifact_type == "slack_ops_summary"
+    assert plan.intent == "route_request"
+    assert plan.task_objective == "route_or_continue"
+    assert plan.expected_artifact_type == "none"
 
 
 def test_manual_plan_cleans_quoted_direct_agent_discovery_prompt() -> None:
@@ -659,6 +807,26 @@ def test_manual_plan_preserves_deep_search_output_constraints() -> None:
         "answer-and-synthesis",
     } <= set(plan.constraints)
     assert plan.required_entities == []
+
+
+def test_manual_plan_bounded_business_research_smoke_ignores_negated_scouting() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "Research smoke: research NeuroFlow for a short internal read-only company note. "
+            "Stay on Business Research only; do not scout opportunities or draft outreach. "
+            "Live SDK is approved only for this bounded read-only smoke if the backend would "
+            "normally use it; live web search is not approved. Use local/dry-run retrieval "
+            "where possible. Do not send email, create drafts, post elsewhere, publish, "
+            "schedule, or write external systems."
+        ),
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.primary_target == "NeuroFlow"
+    assert plan.requires_live_search is False
+    assert plan.expected_artifact_type == "research_brief"
 
 
 def test_manual_plan_merge_preserves_unnamed_company_discovery_over_live_company_plan() -> None:

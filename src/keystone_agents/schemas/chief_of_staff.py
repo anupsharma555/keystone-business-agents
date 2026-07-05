@@ -44,6 +44,23 @@ ChiefOfStaffWorkflowType = Literal[
     "memory-review",
     "clarification",
 ]
+ChiefDurableHandoffAgent = Literal[
+    "gmail_triage",
+    "business_research_analyst",
+    "opportunity_scout",
+    "outreach_composer",
+]
+ChiefContextHandoffAgent = Literal[
+    "rss_context_agent",
+    "preprints_context_agent",
+    "zotero_context_agent",
+    "airtable_context_agent",
+    "google_workspace_context_agent",
+]
+ChiefContextHandoffStage = Literal[
+    "before_durable_handoff",
+    "after_durable_handoff",
+]
 
 
 def _clean_text(value: object) -> str:
@@ -316,6 +333,34 @@ class ChiefOfStaffRouteRecommendation(BaseModel):
         return _clean_text(value)
 
 
+class ChiefDurableHandoff(BaseModel):
+    """A durable WorkItem handoff selected by Chief of Staff."""
+
+    agent: ChiefDurableHandoffAgent
+    rationale: str = ""
+    requires_approval: bool = False
+
+    @field_validator("rationale", mode="before")
+    @classmethod
+    def _clean_rationale(cls, value: object) -> str:
+        return _clean_text(value)
+
+
+class ChiefContextHandoff(BaseModel):
+    """A read-only context-agent handoff selected by Chief of Staff."""
+
+    agent: ChiefContextHandoffAgent
+    stage: ChiefContextHandoffStage = "before_durable_handoff"
+    before_agent: ChiefDurableHandoffAgent | None = None
+    rationale: str = ""
+    requires_approval: bool = False
+
+    @field_validator("rationale", mode="before")
+    @classmethod
+    def _clean_rationale(cls, value: object) -> str:
+        return _clean_text(value)
+
+
 class ChiefOfStaffResult(BaseModel):
     """Structured Chief of Staff recommendation with gated operating writes."""
 
@@ -330,6 +375,8 @@ class ChiefOfStaffResult(BaseModel):
     recommended_route: ChiefOfStaffRouteRecommendation = Field(
         default_factory=ChiefOfStaffRouteRecommendation
     )
+    durable_handoff: ChiefDurableHandoff | None = None
+    context_handoffs: list[ChiefContextHandoff] = Field(default_factory=list)
     recommended_actions: list[str] = Field(default_factory=list)
     blocked_side_effects: list[str] = Field(
         default_factory=lambda: [

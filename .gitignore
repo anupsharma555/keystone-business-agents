@@ -13,9 +13,15 @@ authorized_user*.json
 .ruff_cache/
 .keystone/
 .local/
+.codex/
 .playwright-mcp/
+.playwright-cli/
 .cache/
 artifacts/
+output/
+images/
+LINEAR_BACKLOG.MD
+kni-slack-dashboard-*.png
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -25,3 +31,4 @@ dist/
 keystone_agents.db
 *.sqlite
 *.sqlite3
+DB
