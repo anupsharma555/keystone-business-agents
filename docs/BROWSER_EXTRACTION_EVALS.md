@@ -104,11 +104,35 @@ The eval scores agent-useful outcomes, not just page load status:
 - title preservation
 - useful text length
 - boilerplate ratio
+- extraction quality bucket: `strong`, `partial`, `weak`, or `unreadable`
+- compact quality diagnosis for missing signals, blocked pages, low text,
+  high boilerplate, missing titles, and provider errors
 - useful internal links found
 - latency p50/p95
 - timeout/error rate
 - repeatability across repeated runs
 - improvement over the `trafilatura` baseline
+
+Reports also include provider diagnostic specs: intended role, budget class,
+promotion status, readiness, default use, live requirement, benchmark focus,
+next validation, and promotion rule. Treat `trafilatura` as the static
+extraction baseline, Firecrawl as an explicit managed scrape fallback,
+Playwright as read-only diagnostics, and Browserless/Apify/Crawl4AI as eval or
+future boundaries until reviewed live adapters and attribution tests exist.
+
+## Extraction Readiness Matrix
+
+This is the selected-page counterpart to the search-provider matrix in
+`docs/SEARCH_COVERAGE_EVALS.md`.
+
+| Provider | Current fit | Readiness | Gap | Useful benchmark | Next small validation |
+| --- | --- | --- | --- | --- | --- |
+| Trafilatura | Static HTTP extraction baseline | Ready as the default selected-page baseline | Can be weak on JS-heavy, blocked, or boilerplate-heavy pages | Signal recall, useful text length, boilerplate ratio, blocked-page rate | Rerun as baseline for every selected-page extraction comparison |
+| Firecrawl | Managed scrape/extraction fallback | Credential-gated fallback candidate | Needs credit/rate and attribution evidence over Trafilatura | Signal recall and blocked-page recovery over Trafilatura | Small Firecrawl-vs-Trafilatura selected-page probe with explicit credit budget |
+| Playwright diagnostics | Local rendered-page diagnostics | Ready for explicit read-only diagnostics, not routine extraction | Does not become a production extractor just because search review is requested | Console/page-error/request-failure diagnosis for selected URLs | Use only after static extraction is weak or rendered diagnostics are requested |
+| Browserless | Rendered-browser boundary | Placeholder/eval boundary | Live production adapter and safety constraints are not implemented | JS-heavy selected pages after adapter review | Keep out of production until adapter, safety constraints, and attribution tests exist |
+| Apify | Actor-based future extraction boundary | Not implemented | No reviewed adapter | Not applicable yet | Add adapter/tests before any provider comparison |
+| Crawl4AI | Local/open-source future extraction boundary | Not implemented | No reviewed adapter or repeatable quality evidence | Local extraction lift over Trafilatura after adapter review | Prototype behind eval boundary before runtime promotion |
 
 Promotion criteria should stay conservative:
 

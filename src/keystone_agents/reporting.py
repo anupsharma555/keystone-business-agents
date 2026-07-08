@@ -434,7 +434,7 @@ def render_work_item_graph_report(
         if _clean(item)
     ]
     if review_lines:
-        lines.extend(["", "Graph Review:"])
+        lines.extend(["", "Run Explanation:"])
         lines.extend(f"- {item}" for item in review_lines[:8])
 
     checkpoint_required = bool(graph_metadata.get("checkpoint_required"))

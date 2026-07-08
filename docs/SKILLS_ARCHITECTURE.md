@@ -45,9 +45,13 @@ backend gates instead of executable skill scripts.
 
 Shared skills can be selected before each specialist contract:
 
+- `ask_to_target_resolution`
+- `artifact_evidence_handling`
+- `data_schema_mapping`
 - `identity_and_record_resolution`
 - `prior_work_and_duplicate_checking`
 - `evidence_attribution_and_claim_mapping`
+- `source_triage_decision`
 - `context_permission_gating`
 - `action_boundary_enforcement`
 - `unsupported_claim_and_gap_handling`
@@ -56,6 +60,7 @@ Shared skills can be selected before each specialist contract:
 - `workspace_artifact_governance`
 - `workflow_lifecycle_tracking`
 - `handoff_contract_packaging`
+- `writing_style_adaptation`
 - `request_to_specialist_brief` (Orchestrator route-default skill)
 
 ## Specialist Contracts
@@ -66,11 +71,18 @@ Each registered agent also declares one specialist contract bundle:
 - Business Research Analyst: `business_research_specialist_contracts`
 - Opportunity Scout: `opportunity_scout_specialist_contracts`
 - Outreach Composer: `outreach_composer_specialist_contracts`
+- Airtable Context: `airtable_context_specialist_contracts`
+- Google Workspace Context: `google_workspace_context_specialist_contracts`
+- Zotero Context: `zotero_context_specialist_contracts`
+- RSS Context: `rss_context_specialist_contracts`
+- Preprints Context: `preprints_context_specialist_contracts`
 - Orchestrator: `orchestrator_specialist_contracts`
 - Chief of Staff: `chief_of_staff_specialist_contracts`
 
 The canonical full catalog lives in `src/keystone_agents/skill_sets.py` and is
 mirrored through `AgentSpec.skills` for agent cards and CLI inspection.
+The current audited disposition for each Codex-facing and runtime skill lives in
+`docs/SKILL_INVENTORY.md`.
 
 ## Design Rules
 

@@ -218,6 +218,25 @@ def test_company_live_retrieval_defaults_to_searxng_with_hosted_parallel_lane(
     assert diagnostics["hosted_web_search_lane_used"] is True
     assert diagnostics["retrieval_ladder"][0]["raw_result_count"] == 2
     assert diagnostics["search_quality_summary"]["official_source_present"] is True
+    assert diagnostics["provider_policy"] == [
+        {
+            "provider": "searxng",
+            "role": "local broad-recall baseline",
+            "budget_class": "free/local",
+            "default_use": "primary live baseline",
+        },
+        {
+            "provider": "agents-web-search",
+            "role": "OpenAI hosted corroboration",
+            "budget_class": "OpenAI metered",
+            "default_use": "capped lane; not expanded by default",
+        },
+    ]
+    ladder = {item["provider"]: item for item in diagnostics["provider_use_ladder"]}
+    assert ladder["searxng"]["use_frequency"] == "always_default"
+    assert ladder["agents-web-search"]["use_frequency"] == "default_capped"
+    assert ladder["serper"]["use_frequency"] == "disabled"
+    assert ladder["browserless"]["use_frequency"] == "eval_only"
 
 
 def test_retrieval_diagnostics_keeps_partial_provider_errors_backend_only() -> None:
@@ -245,6 +264,83 @@ def test_retrieval_diagnostics_keeps_partial_provider_errors_backend_only() -> N
     )
 
     assert diagnostics["errors"] == []
+
+
+def test_retrieval_diagnostics_summarizes_source_limits() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    diagnostics = live_retrieval.retrieval_diagnostics_from_metadata(
+        {
+            "mode": "live_search",
+            "live_search": True,
+            "search_providers_used": ["searxng", "exa"],
+            "source_coverage": {
+                "missing_lanes": ["clinical_trials"],
+                "missing_expected_domains": ["clinicaltrials.gov"],
+            },
+            "search_quality": {
+                "official_source_present": False,
+                "needs_search_review": True,
+                "reasons": ["clinical trial source missing"],
+            },
+        }
+    )
+
+    assert diagnostics["provider_policy"][0]["provider"] == "searxng"
+    assert diagnostics["provider_policy"][1]["role"] == "semantic deepening"
+    assert diagnostics["source_limits"] == {
+        "missing_lanes": ["clinical_trials"],
+        "missing_expected_domains": ["clinicaltrials.gov"],
+        "official_source_present": False,
+        "needs_search_review": True,
+        "source_verification_needed": True,
+        "reasons": ["clinical trial source missing"],
+    }
+    ladder = {item["provider"]: item for item in diagnostics["provider_use_ladder"]}
+    assert ladder["exa"]["use_now"] is True
+    assert ladder["tavily"]["use_now"] is True
+
+
+def test_retrieval_diagnostics_surfaces_orchestrator_provider_policy_reasons() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    diagnostics = live_retrieval.retrieval_diagnostics_from_metadata(
+        {
+            "mode": "live_search",
+            "live_search": True,
+            "search_providers_used": ["searxng"],
+            "search_queries": ["research Mentavi leadership and market context"],
+            "autonomy_hint": {
+                "source": "orchestrator",
+                "needs_structured_enrichment": True,
+                "reasons": ["leadership context needed"],
+            },
+        }
+    )
+
+    ladder = {item["provider"]: item for item in diagnostics["provider_use_ladder"]}
+    assert ladder["exa"]["use_now"] is True
+    assert "orchestrator_structured_enrichment" in ladder["exa"]["reason_codes"]
+    assert ladder["playwright"]["use_now"] is False
+
+
+def test_retrieval_diagnostics_ladder_marks_extraction_fallbacks() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    diagnostics = live_retrieval.retrieval_diagnostics_from_metadata(
+        {
+            "mode": "live_search",
+            "live_search": True,
+            "search_providers_used": ["searxng"],
+            "website_extraction": {"status": "unreadable"},
+            "search_queries": ["research selected company sources"],
+        }
+    )
+
+    ladder = {item["provider"]: item for item in diagnostics["provider_use_ladder"]}
+    assert ladder["trafilatura"]["use_now"] is True
+    assert ladder["firecrawl"]["use_now"] is True
+    assert ladder["playwright"]["use_now"] is True
 
 
 def test_retrieval_diagnostics_keeps_bounded_provider_result_samples() -> None:

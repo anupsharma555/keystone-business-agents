@@ -154,8 +154,9 @@ again.
 ### P1 - SLACK-BRIDGE-RSS-001: RSS/preprints context results are routed but not rendered by Slack bridge
 
 - Found: 2026-06-20 13:15 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-07-06 16:33 EDT
+- Status: pre-live complete; fixed locally in sibling `keystone-slack`; live
+  Slack probe still pending.
 - Area: sibling `keystone-slack` app-mention bridge, context-agent direct
   prefixes, context result rendering, KBA RSS/preprints context agents,
   `src/keystone_agents/agent_mentions.py`, `src/keystone_agents/cli.py`.
@@ -186,20 +187,70 @@ again.
   the RSS/preprints agents look broken even when KBA produced a valid result.
   It also blocks reliable one-agent-at-a-time Slack testing for these two
   context agents.
-- Expected fix: In sibling `keystone-slack`, add RSS/preprints direct prefixes
-  and context-route mappings, then render `RssContextResult` and
-  `PreprintsContextResult` through the same context-agent summary path. Preserve
-  the KBA section contract and keep Slack output low-metadata.
-- Validation: Add sibling bridge tests for direct `@KNI rss context agent` and
-  `@KNI preprints context agent` app mentions, plus generic
-  `@KNI business agents ...` fallback cases. Verify Slack displays the KBA
-  `human_summary` instead of the generic WorkItem completion text.
+- Fix: In sibling `keystone-slack`, added RSS/preprints direct prefixes and
+  context-route mappings, then allowed `RssContextResult` and
+  `PreprintsContextResult` through the same context-agent summary path. The
+  rendered Slack text now uses the KBA `human_summary` instead of generic
+  WorkItem completion text.
+- Verification: KBA contract tests passed:
+  `.venv/bin/python -m pytest tests/test_slack_action_contract.py -q`
+  (`52 passed`) and
+  `.venv/bin/python scripts/validate_slack_bridge_contract.py`. Sibling focused
+  bridge tests passed:
+  `python3 -m unittest tests.test_app_mentions.SlackAppMentionTests.test_direct_rss_context_agent_request_renders_human_summary tests.test_app_mentions.SlackAppMentionTests.test_direct_preprints_context_agent_request_renders_human_summary`.
+- Remaining proof boundary: no fresh live Slack probe was run after the sibling
+  bridge fix.
+- Readiness update: 2026-07-06 17:12 EDT. Restarted the local KBA eval
+  dashboard and reran strict Slack readiness outside the sandbox because Python
+  localhost sockets are sandbox-blocked while `curl` can reach the same
+  dashboard. The unsandboxed preflight passed with 0 warnings:
+  `artifacts/anu60_strict_readiness_unsandboxed.json`. The operator-facing
+  command `npm run eval:slack:strict-readiness -- --json` also passed with 0
+  warnings. The sibling Socket Mode worker is running and the KBA dashboard
+  health endpoint is reachable at `http://127.0.0.1:8769/api/status`.
+- Current no-live validation: 2026-07-06. After adding the focused ANU-60 proof
+  packet, acceptance map, and doc-contract guard, the local contract suite
+  `.venv/bin/python -m pytest tests/test_prompt_contracts.py
+  tests/test_slack_action_contract.py -q` passed (`111 passed`);
+  `scripts/validate_slack_bridge_contract.py` and
+  `scripts/validate_slack_result_rendering_examples.py` passed;
+  `npm run eval:slack:anu60-proof` and
+  `npm run eval:slack:anu60-preflight` passed; and the broad
+  Slack expansion gate passed `36/36` with route coverage in
+  `artifacts/anu60_expansion_gate_after_acceptance_map.json`.
+- Current sibling bridge validation: 2026-07-06 17:50 EDT. In sibling
+  `keystone-slack`, the focused no-live bridge suite passed (`8` tests):
+  direct RSS/preprints `human_summary` rendering, conversational Business
+  Research named-agent routing, focused company-brief `human_summary`
+  precedence over metadata-heavy formatting, timeout failure wording, and
+  blocked preflight rendering.
+- Current timeout/failure validation: 2026-07-06. The focused sibling timeout
+  fixture pair passed (`2` tests):
+  `python3 -B -m unittest tests.test_app_mentions.SlackAppMentionTests.test_business_agents_run_command_timeout_returns_structured_failure_and_kills_group tests.test_app_mentions.SlackAppMentionTests.test_business_agents_streaming_run_command_timeout_kills_group`.
+  This remains fixture-backed proof for structured timeout failure text and
+  process-group cleanup unless a safe forced live timeout probe is explicitly
+  approved.
+- Live proof checklist: after explicit approval for Slack posting, run
+  the no-live handoff first with `npm run eval:slack:anu60-preflight`, then
+  readiness with `npm run eval:slack:strict-readiness` or, when read-only Slack
+  Web API checks are approved,
+  `npm run eval:slack:strict-live-readiness`. Confirm the sibling Socket Mode
+  worker with `../keystone-slack/scripts/manage_slack_socket.sh status`. In
+  `#ai-agents-workflow`, post one direct RSS context ask and one direct
+  preprints context ask. Each must render the KBA `human_summary` answer first,
+  show `*Answer:*` / `*Detailed Summary:*` and useful-reference or explicit
+  retrieval-limit language when applicable, avoid generic `WorkItem Ready` as
+  the visible body, and leave feed/preprint state unmutated. Stop after the
+  first failed visible render or runtime failure. Use
+  `docs/ANU60_LIVE_SLACK_PROOF_PLAN.md` as the focused live-proof packet and
+  `docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md` as the capture form.
 
 ### P1 - SLACK-BRIDGE-NAMED-001: Named-agent Slack results ignore the KBA human-summary contract
 
 - Found: 2026-06-20 20:45 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-07-06 16:33 EDT
+- Status: pre-live complete; fixed locally in sibling `keystone-slack`; live
+  Slack probe still pending.
 - Area: sibling `keystone-slack` app-mention bridge, named-agent result
   rendering, conversational app mentions, KBA Slack business-agent contract,
   `src/keystone_agents/slack_action_contract.py`,
@@ -231,19 +282,69 @@ again.
   displays audit details as the main answer, and natural operator phrasing can
   fail at the sibling bridge rather than exercising KBA's Orchestrator-first
   routing.
-- Expected fix: In sibling `keystone-slack`, consume the KBA
-  `result_rendering.named_agents` contract or call the side-effect-free KBA
-  display helper before route-specific legacy formatting. Preserve the
-  `*Answer:*`, `*Detailed Summary:*`, and `*Useful references:*` sections, and
-  keep provider/model/timing diagnostics out of the main Slack answer unless
-  explicitly requested. Also pass conversational app-mention text that includes
-  a known named-agent alias through to KBA instead of treating it as an
-  unsupported slash-command-style command.
-- Validation: Add sibling bridge fixture tests for direct and conversational
-  Business Research app mentions. Verify the bridge displays the KBA
-  `human_summary` for `CompanyResearchFocusedBrief`, does not prepend provider
-  metadata, and does not reject conversational named-agent wording before KBA
-  planning.
+- Fix: In KBA, aligned `business_agent_result_display_text()` with the published
+  renderer contract so matched named-agent/context-agent payloads prefer
+  `human_summary` before stale display fields. In sibling `keystone-slack`,
+  added a local answer-first resolver before `CompanyResearchFocusedBrief`
+  legacy formatting, so provider/model/retrieval/timing/profile metadata no
+  longer leads when KBA supplies `human_summary`.
+- Verification: KBA contract tests passed:
+  `.venv/bin/python -m pytest tests/test_slack_action_contract.py -q`
+  (`52 passed`) and
+  `.venv/bin/python scripts/validate_slack_bridge_contract.py`. Sibling focused
+  bridge tests passed:
+  `python3 -m unittest tests.test_app_mentions.SlackAppMentionTests.test_conversational_named_agent_request_uses_canonical_ask_and_human_summary tests.test_app_mentions.SlackAppMentionTests.test_focused_company_brief_prefers_human_summary_over_metadata tests.test_app_mentions.SlackAppMentionTests.test_focused_company_brief_renders_links_contacts_and_clean_copy`.
+- Remaining proof boundary: no fresh live Slack probe was run after the
+  answer-first rendering and conversational named-agent fixture fixes.
+- Follow-up validation: KBA Gmail blocker wording now names `Gmail Triage`
+  inside the provider-visible answer body. Chief/context-agent advisory routing
+  now stays Chief-owned for read-only advisory prompts instead of being swallowed
+  by Airtable/Workspace approval-plan checkpoints. The broad no-live Slack
+  expansion gate now passes `36/36` cases with route coverage satisfied
+  (`artifacts/anu60_expansion_gate_after_stripped_chief_regression.json`), and
+  focused LangGraph regression coverage verifies stripped Chief advisory context
+  requests do not stage `airtable_write_plan` or enter an approval checkpoint.
+  Live Slack proof remains pending. The local readiness preflight was refreshed
+  on 2026-07-06 17:12 EDT after restarting the KBA eval dashboard; unsandboxed
+  strict readiness passed with 0 warnings in
+  `artifacts/anu60_strict_readiness_unsandboxed.json`, and the operator-facing
+  `npm run eval:slack:strict-readiness -- --json` command also passed with 0
+  warnings. After adding `docs/ANU60_LIVE_SLACK_PROOF_PLAN.md`, the acceptance
+  map, and its doc-contract guard, the local contract suite passed
+  (`111 passed`), the Slack bridge contract/rendering validators passed, and the
+  ANU-60 proof-packet validator passed. The broad no-live Slack expansion gate
+  passed `36/36` in
+  `artifacts/anu60_expansion_gate_after_acceptance_map.json`. Sibling
+  `keystone-slack` focused bridge tests also passed (`8` tests) for direct
+  RSS/preprints `human_summary`, conversational Business Research routing,
+  metadata suppression, timeout failure wording, and blocked preflight
+  rendering.
+- The focused sibling timeout fixture pair also passed independently (`2`
+  tests) for structured timeout failure text and process-group cleanup:
+  `python3 -B -m unittest tests.test_app_mentions.SlackAppMentionTests.test_business_agents_run_command_timeout_returns_structured_failure_and_kills_group tests.test_app_mentions.SlackAppMentionTests.test_business_agents_streaming_run_command_timeout_kills_group`.
+- Live proof checklist: after explicit approval for Slack posting and any API
+  spend, run no more than these bounded probes before reassessing:
+  0. No-live proof handoff: `npm run eval:slack:anu60-preflight`.
+  1. Direct named-agent ask: `@KNI business research analyst "research Suki AI
+     for a concise source-backed fit check; include visible source URLs; do not
+     draft outreach, send, post elsewhere, schedule, or write files."`
+  2. Conversational named-agent ask: `@KNI could the business research analyst
+     research Nabla for a concise answer-first fit check? Include visible source
+     URLs and keep this read-only.`
+  3. Blocked/missing-context ask: `@KNI gmail triage summarize the selected
+     email thread` from a thread with no selected Gmail context, or the closest
+     existing Slack fixture path that produces the Gmail context-required
+     blocker.
+  4. Timeout/failure wording only if a safe forced-timeout env override is
+     available; otherwise rely on the sibling process-group timeout fixture
+     until a non-disruptive live failure probe is approved.
+  Passing evidence requires answer-first `human_summary` rendering, no
+  provider/model/timing metadata ahead of the answer, conversational wording
+  reaching KBA rather than bridge rejection, blocked output titled and worded as
+  blocked rather than started/completed, no external writes/sends, and captured
+  Slack permalinks plus local run ids for each probe. Use
+  `docs/ANU60_LIVE_SLACK_PROOF_PLAN.md` as the focused live-proof packet and
+  `docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md` as the capture form.
 
 ### P2 - CONTEXT-UX-001: Direct context-agent summaries use a different section contract than Slack synthesis
 

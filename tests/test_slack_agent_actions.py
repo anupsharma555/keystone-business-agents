@@ -748,8 +748,12 @@ def test_modal_submission_gmail_request_uses_gmail_context_gate_not_unsupported_
     assert result_payload["operator_status"] == "needs_input"
     assert result_payload["slack_display_title"] == "Business Agents Need Input"
     assert "Blocked" not in result_payload["slack_display_title"]
-    assert result_payload["slack_display_text"] == result_payload["human_summary"]
-    assert business_agent_result_display_text(result_payload) == result_payload["human_summary"]
+    assert "Run explanation:" in result_payload["slack_graph_completion_text"]
+    assert "Still needs attention:" in result_payload["slack_graph_completion_text"]
+    assert "run_business_research" not in result_payload["slack_graph_completion_text"]
+    assert result_payload["human_summary"] in result_payload["slack_display_text"]
+    assert result_payload["slack_graph_completion_text"] in result_payload["slack_display_text"]
+    assert business_agent_result_display_text(result_payload) == result_payload["slack_display_text"]
 
 
 def test_modal_submission_passes_prior_thread_runs_to_orchestrator_preflight(

@@ -27,6 +27,9 @@ Read the smallest set that matches the task:
 - WorkItem lifecycle: `src/keystone_agents/work_items.py`,
   `src/keystone_agents/workflow_runner.py`,
   `src/keystone_agents/schemas/work_item.py`.
+- Optional LangGraph orchestration: `docs/LANGGRAPH_OPTION.md`,
+  `src/keystone_agents/langgraph_workflow.py`,
+  `src/keystone_agents/langgraph_plan.py`.
 - Context packs and gates: `src/keystone_agents/schemas/context_pack.py`,
   `tests/test_context_packs.py`, `tests/test_workflow_runner.py`.
 - Slack actions/continuations: `src/keystone_agents/slack_actions.py`,
@@ -51,7 +54,8 @@ Use this workflow for requests like:
 1. Preserve the original operator wording. Do not rewrite away route, safety,
    approval, time, target, or context constraints before Orchestrator preflight.
 2. Identify the entrypoint: dry-run CLI, `@KNI` explicit named-agent CLI,
-   WorkItem manager loop, Slack action, scheduled automation, or direct script.
+   WorkItem manager loop, optional LangGraph-backed WorkItem flow, Slack action,
+   scheduled automation, or direct script.
 3. Inspect Orchestrator preflight, deterministic gates, selected route, context
    pack type, WorkItem timeline, approval state, and final renderer output.
 4. Keep Python gates authoritative for approval, recipient readiness, source
@@ -68,6 +72,9 @@ Use this workflow for requests like:
 - Do not add broad intent taxonomies or phrase-specific shortcuts for normal
   natural-language requests. Prefer context packs, schemas, tools, and gates.
 - Do not confuse SDK session continuity with business-state persistence.
+- Treat LangGraph as an optional orchestration backend around WorkItem
+  advancement; it must preserve the same Orchestrator preflight, context packs,
+  Python gates, and renderer-owned output as the non-LangGraph path.
 - Do not treat a Slack thread summary, prompt text, or model rationale as
   approval to send, post, schedule, publish, or write externally.
 - Keep Slack selected-message/thread context bounded, deduped, read-only, and

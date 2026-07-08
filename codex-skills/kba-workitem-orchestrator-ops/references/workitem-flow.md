@@ -27,6 +27,9 @@ them as the canonical business state unless the repo architecture changes.
 - Orchestrator preflight: `src/keystone_agents/agents/orchestrator.py` and
   `src/keystone_agents/orchestrator/preflight_context.py`.
 - WorkItem advancement: `src/keystone_agents/workflow_runner.py`.
+- Optional LangGraph orchestration: `docs/LANGGRAPH_OPTION.md`,
+  `src/keystone_agents/langgraph_workflow.py`,
+  `src/keystone_agents/langgraph_plan.py`.
 - WorkItem schemas/state: `src/keystone_agents/work_items.py`,
   `src/keystone_agents/schemas/work_item.py`.
 - Context packs: `src/keystone_agents/schemas/context_pack.py` and route-specific
@@ -71,8 +74,10 @@ Run focused local evals around workflow behavior:
 3. Inspect WorkItem route, next action, artifact refs, approval state, and
    timeline events.
 4. Inspect selected context pack and deterministic readiness gate result.
-5. Inspect specialist output schema and Orchestrator/deterministic review.
-6. Inspect final renderer output for visible sources, no-send/no-post language,
+5. If LangGraph is enabled, inspect graph backend selection and node events
+   while keeping WorkItems as the state contract.
+6. Inspect specialist output schema and Orchestrator/deterministic review.
+7. Inspect final renderer output for visible sources, no-send/no-post language,
    and absence of raw trace noise.
 
 ## Prior Failure Anchors
@@ -86,6 +91,8 @@ Run focused local evals around workflow behavior:
 - Context-pack loss causes specialists to receive loose summaries; prefer typed
   `ResearchContextPack`, `OpportunityContextPack`, `OutreachContextPack`, and
   `GmailContextPack`.
+- LangGraph is a backend orchestration option, not a separate permission model;
+  route, approval, source, and write gates must match the normal WorkItem path.
 
 ## Focused Tests
 

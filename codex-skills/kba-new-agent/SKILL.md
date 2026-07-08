@@ -28,6 +28,9 @@ Read the smallest useful set before editing:
 - WorkItem or route execution: `src/keystone_agents/work_items.py`,
   `src/keystone_agents/workflow_runner.py`, and
   `codex-skills/kba-workitem-orchestrator-ops/SKILL.md`.
+- LangGraph-backed orchestration: `docs/LANGGRAPH_OPTION.md`,
+  `src/keystone_agents/langgraph_workflow.py`, and
+  `src/keystone_agents/langgraph_plan.py`.
 - Search or extraction agent: `codex-skills/kba-search-provider-eval/SKILL.md`.
 - Live SDK/model smoke work: `codex-skills/kba-live-sdk-smoke-and-cost/SKILL.md`.
 - Detailed agent pattern checklist: `references/agent-patterns.md`.
@@ -90,7 +93,9 @@ is requested.
    Natural-language entrypoints must keep raw operator wording, Orchestrator
    preflight, Python safety gates, typed context packs, specialist execution,
    and review before rendering. Explicit agent mentions are routing advice, not
-   permission to bypass gates.
+   permission to bypass gates. If the route can run through LangGraph, keep the
+   graph nodes aligned with the same WorkItem state, context packs, approvals,
+   source checks, and no-write boundaries as the non-graph path.
 
 5. Keep context agents context-first.
    A context specialist should inspect schemas or bounded source context first,

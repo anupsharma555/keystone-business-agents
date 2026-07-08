@@ -759,6 +759,201 @@ def test_ranked_agent_goals_include_distinctive_source_grounded_answers() -> Non
     assert "budget-aware, dry-run-testable, source-attributed" in text
 
 
+def test_agent_capability_boundaries_define_orchestrator_and_chief_rwm() -> None:
+    text = _read_repo_doc("docs/AGENT_CAPABILITY_BOUNDARIES.md")
+
+    assert "This note is the repo-local contract for ANU-193, ANU-194, and ANU-124" in text
+    assert "## Orchestrator R/W/M" in text
+    assert "preflight route advice, missing-context blockers" in text
+    assert "revise route advice and specialist briefs" in text
+    assert "## Chief Of Staff R/W/M" in text
+    assert "manager workflow plans with objective, selected specialists" in text
+    assert "`durable_handoff.agent` for the specialist" in text
+    assert "`context_handoffs` for read-only context agents" in text
+    assert "## Agents-As-Tools Boundary" in text
+    assert "Nested specialist calls must" in text
+    assert "advisory context to Chief" in text
+    assert "## Durable Graph Handoff Boundary" in text
+    assert "Durable graph handoffs are WorkItem state transitions" in text
+    assert "## Backend Graph Selector Boundary" in text
+    assert "It does not own business routing, provider permissions" in text
+    assert "## Unresolved Architecture Decisions" in text
+    assert "## Test Acceptance Criteria" in text
+
+
+def test_control_plane_runtime_skills_point_to_capability_boundaries() -> None:
+    orchestrator = _read_repo_doc(
+        "src/keystone_agents/skills/orchestrator_specialist_contracts/SKILL.md"
+    )
+    chief = _read_repo_doc(
+        "src/keystone_agents/skills/chief_of_staff_specialist_contracts/SKILL.md"
+    )
+
+    assert "`docs/AGENT_CAPABILITY_BOUNDARIES.md`" in orchestrator
+    assert "write planning/review metadata" in orchestrator
+    assert "WorkItem/storage layer records them" in orchestrator
+    assert "`docs/AGENT_CAPABILITY_BOUNDARIES.md`" in chief
+    assert "write internal\n  manager plans/handoffs" in chief
+    assert "agents-as-tools nested specialist result" in chief
+    assert "structured `durable_handoff.agent`" in chief
+
+
+def test_major_milestones_include_rwm_acceptance_criteria() -> None:
+    backlog = _read_repo_doc("LINEAR_BACKLOG.MD")
+    goals = _read_repo_doc("docs/AGENT_GOALS.md")
+
+    assert "Milestone definition:" in backlog
+    assert "`docs/AGENT_CAPABILITY_BOUNDARIES.md` now defines" in backlog
+    assert "Whether Chief needs a dedicated first-class `ManagerWorkflowPlan`" in backlog
+    assert "`ANU-193`: route correction updates route plans/review notes" in backlog
+    assert "`ANU-194`: Chief broad asks produce internal plans" in backlog
+    assert "`ANU-124`: broad/project/ops/cross-agent asks default to Chief" in backlog
+    assert "ANU-193 is the Orchestrator read/write/modify contract" in goals
+    assert "ANU-124 and ANU-194 make Chief of Staff" in goals
+    assert "backend graph selection belongs to WorkItem execution\npolicy" in goals
+
+
+def test_anu60_live_slack_proof_plan_preserves_acceptance_boundary() -> None:
+    proof_plan = _read_repo_doc("docs/ANU60_LIVE_SLACK_PROOF_PLAN.md")
+    evidence_template = _read_repo_doc("docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md")
+    normalized_proof_plan = " ".join(proof_plan.split())
+    index = _read_repo_doc("docs/INDEX.md")
+    backlog = _read_repo_doc("docs/ORCHESTRATOR_BRIDGE_BACKLOG.md")
+    linear_backlog = _read_repo_doc("LINEAR_BACKLOG.MD")
+    workflow_status = _read_repo_doc("docs/AI_AGENTS_WORKFLOW_TEST_STATUS.md")
+    package = json.loads(_read_repo_doc("package.json"))
+
+    assert "explicit approval for live Slack posting" in proof_plan
+    assert "The strict readiness harness validates the local `#evals` flow" in proof_plan
+    assert "ANU-60 acceptance still needs visible output proof in `#ai-agents-workflow`" in proof_plan
+    assert "Do not treat the `#evals` readiness pass as the final ANU-60 proof" in proof_plan
+    assert "npm run eval:slack:strict-readiness -- --json" in proof_plan
+    assert "npm run eval:slack:strict-live-readiness -- --json" in proof_plan
+    assert "../keystone-slack/scripts/manage_slack_socket.sh status" in proof_plan
+    assert "## Current No-Live Evidence" in proof_plan
+    assert "tests/test_prompt_contracts.py\n  tests/test_slack_action_contract.py -q" in proof_plan
+    assert "111 passed" in proof_plan
+    assert "validate_slack_bridge_contract.py" in proof_plan
+    assert "validate_slack_result_rendering_examples.py" in proof_plan
+    assert "npm run eval:slack:anu60-proof" in proof_plan
+    assert "npm run eval:slack:anu60-preflight" in proof_plan
+    assert "acceptance map, and doc-contract guard were added" in proof_plan
+    assert "artifacts/anu60_expansion_gate_after_acceptance_map.json" in proof_plan
+    assert "36/36" in proof_plan
+    assert "sibling `keystone-slack`" in proof_plan
+    assert "focused no-live bridge suite passed `8`" in proof_plan
+    assert "focused sibling timeout fixture pair below also passed independently" in proof_plan
+    assert "(`2` tests)" in proof_plan
+    assert "It still does not prove the live visible Slack output" in proof_plan
+
+    for probe_marker in (
+        "slack_rss_context_announcement_history_001",
+        "slack_preprints_context_preliminary_evidence_001",
+        "Suki AI",
+        "Nabla",
+        "slack_gmail_missing_thread_identity_001",
+    ):
+        assert probe_marker in proof_plan
+
+    for approval_boundary in (
+        "No external sends, writes, drafts, schedules, file creation",
+        "Stop after the first failed visible render",
+        "No Gmail draft is created and no email is sent",
+        "Expected: no",
+    ):
+        assert approval_boundary in proof_plan
+
+    for evidence_field in (
+        "Slack permalink",
+        "Local run id or WorkItem id",
+        "Route and output type",
+        "external write/send/draft/feed-refresh",
+        "Visible body starts with answer-first human_summary",
+        "Provider/model/timing metadata appears before answer",
+        "Required source URLs or source-limit language present",
+        "External write/send/draft/feed-refresh observed",
+    ):
+        assert evidence_field in proof_plan
+
+    assert "`scripts/sync_slack_eval_thread.py` is a read-only importer" in proof_plan
+    assert "do not use a saved `#evals` row as a substitute" in normalized_proof_plan
+    assert "answer-first `human_summary`" in proof_plan
+    assert "No provider/model/timing/retrieval metadata appears before the answer" in proof_plan
+    assert "Gmail Triage needs email context" in proof_plan
+    assert "## Acceptance Coverage Map" in proof_plan
+    assert "Direct Business Research Slack probes render the KBA answer first" in proof_plan
+    assert "Conversational Business Research Slack probes render the KBA answer first" in proof_plan
+    assert "RSS context-agent Slack probes display `RssContextResult` summaries" in proof_plan
+    assert "Preprints context-agent Slack probes display `PreprintsContextResult` summaries" in proof_plan
+    assert "Blocked preflights render accurate, redacted, actionable statuses" in proof_plan
+    assert "Timeouts render accurate, redacted, actionable statuses" in proof_plan
+    assert "test_business_agents_run_command_timeout_returns_structured_failure_and_kills_group" in proof_plan
+    assert "test_business_agents_streaming_run_command_timeout_kills_group" in proof_plan
+    assert "record this as fixture-backed proof, not live Slack acceptance evidence" in proof_plan
+    assert "ANU-60 can move to Done only when the live evidence above is captured" in proof_plan
+    assert "`docs/ANU60_LIVE_SLACK_PROOF_PLAN.md`" in index
+    assert "`docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md`" in index
+    assert "`docs/ANU60_LIVE_SLACK_PROOF_PLAN.md`" in backlog
+    assert "`docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md` as the capture form" in backlog
+    assert "Current ANU-60 handoff: `docs/ANU60_LIVE_SLACK_PROOF_PLAN.md`, with" in linear_backlog
+    assert "`docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md` as the capture form" in linear_backlog
+    assert "ANU-60 should remain short of Done" in linear_backlog
+    assert "Use `docs/ANU60_LIVE_SLACK_PROOF_PLAN.md` as\n" "the current handoff packet" in workflow_status
+    assert "`docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md`" in workflow_status
+    assert "the capture form before any additional `#ai-agents-workflow` live probe" in workflow_status
+    assert "npm run eval:slack:anu60-proof" in workflow_status
+    assert "npm run eval:slack:anu60-preflight" in workflow_status
+    assert "ANU-60 is complete through the no-live/pre-live boundary" in workflow_status
+    assert "Status: pre-live complete; fixed locally in sibling `keystone-slack`" in backlog
+    assert "do not move ANU-60 to Done until fresh live" in workflow_status
+    assert (
+        package["scripts"]["eval:slack:anu60-proof"]
+        == ".venv/bin/python scripts/validate_anu60_live_slack_proof_packet.py"
+    )
+    assert (
+        package["scripts"]["eval:slack:anu60-preflight"]
+        == ".venv/bin/python scripts/run_anu60_no_live_preflight.py"
+    )
+
+    assert "`docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md`" in proof_plan
+    assert "Do not fill this from\n`#evals` rows alone" in evidence_template
+    for section in (
+        "## Run Boundary",
+        "### RSS Context",
+        "### Preprints Context",
+        "### Direct Business Research",
+        "### Conversational Business Research",
+        "### Gmail Missing Context",
+        "### Timeout / Failure Fixture Boundary",
+        "## Acceptance Coverage Map",
+        "## Completion Summary",
+    ):
+        assert section in evidence_template
+    for required_field in (
+        "Slack permalink:",
+        "Local run id or WorkItem id:",
+        "Visible body starts with answer-first `human_summary`: yes/no",
+        "Provider/model/timing metadata appears before answer: yes/no",
+        "External write/send/draft/feed-refresh observed: yes/no",
+        "Visible body says `Gmail Triage needs email context`: yes/no",
+        "Failure output is redacted and actionable: yes/no",
+        "Timeout/failure done criterion covered by fixture or approved live probe: yes/no",
+        "test_business_agents_run_command_timeout_returns_structured_failure_and_kills_group",
+        "test_business_agents_streaming_run_command_timeout_kills_group",
+        "All required probes passed: yes/no",
+        "Recommendation for ANU-60 state:",
+    ):
+        assert required_field in evidence_template
+
+
+def test_anu60_live_slack_proof_packet_validator_passes() -> None:
+    from scripts.validate_anu60_live_slack_proof_packet import (
+        validate_anu60_live_slack_proof_packet,
+    )
+
+    assert validate_anu60_live_slack_proof_packet() == []
+
+
 def test_shared_slack_rules_require_visible_source_urls() -> None:
     text = _read_prompt("slack-posting-rules.md")
 

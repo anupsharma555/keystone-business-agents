@@ -46,7 +46,7 @@ SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "b04988b095b2f2944cb91ecdf734c761d2c6063f82f692d0992fa93d5d21b2f0",
+        "instructions_sha256": "59d95e35183fef3596ef1baa59780dac62548de906fad81f0c92138417fc7bc6",
         "tool_names_sha256": "5666cdbfcc42bfd14f3dcd75c544302d6fa9aa7f76697b1d24fdb87a5880dd76",
         "output_schema_sha256": "519be6127e040ff904066e7dd8efe671ce88a3c4c527bdcb730a6e5f131d3345",
     },
@@ -56,12 +56,12 @@ STATIC_PREFIX_FINGERPRINTS = {
         "output_schema_sha256": "b8218a333d85d2f3850203f5ee48b7ec535a6f924a8851c513f1f2b2afeef6e0",
     },
     "opportunity_scout": {
-        "instructions_sha256": "0e28a3d6d0a707110eb763366aa61fe32e256e6e275759af3d9d07796bbc7b83",
+        "instructions_sha256": "80aced00765bf7d0facb33fbdbbba2291698cb401a079d59b0010339ef489d34",
         "tool_names_sha256": "38c690f9feef3bcb9699511283538d4448fe33a4e1f82d68acab135f51e4d51b",
         "output_schema_sha256": "2e91674be427e59361cfb5a9c275a048bf4166fbcd9f88f6e06405a235ab59e8",
     },
     "outreach_composer": {
-        "instructions_sha256": "b3536342f5d5c306ea1532dd6e5983d267d8f5ac7eb851cd0344e53d091f1045",
+        "instructions_sha256": "5f8028fac3f3002dcd9e4dcaf4135bc572683ac62840fcd8b867d5da1f9bd0c4",
         "tool_names_sha256": "b86270338a35685eb23e446ca5ec82e4ff7849e71356129b7920ca33c454de68",
         "output_schema_sha256": "167da45f0bb07c0a255c4115b52e9510272a22cc1c479abe9e97c88693d44b34",
     },
@@ -91,12 +91,12 @@ STATIC_PREFIX_FINGERPRINTS = {
         "output_schema_sha256": "0c360ba87ef900bd5c658029374a445b6c14c22b9067207d8b7ad083c4b1d702",
     },
     "orchestrator": {
-        "instructions_sha256": "44690dfb3eafaf3a6b71a0bb65acaedd50a608931c7d5defb76d50d8f46e2893",
+        "instructions_sha256": "4f58ec2b8a3b67ddad76e766a1b2f92b379b46d0567e58d0055d6b5ad50952dc",
         "tool_names_sha256": "2f52fbbbd1568235c0fb761130b8fa96d5c506ca88e4a62ce4dea8dd1e90189b",
         "output_schema_sha256": "98f0e154658a465df86c498fbf9b1a6c84028fbd02eedef97d1549ef5b5887e7",
     },
     "chief_of_staff": {
-        "instructions_sha256": "66d139de62f6f5bc96eb594eb1e61c3656f35f3a2657a8147fdd84cd8019880c",
+        "instructions_sha256": "34ce05ac4e4f4fcc917ba02e062d6803b5f2b8fc99cdfdc7d15d6898b57a5c67",
         "tool_names_sha256": "7f7c9b6f6ba96d98ccc94274a904a72beb72d64491ca59daf5f0965e89381da1",
         "output_schema_sha256": "c9fefe2f478448b975a510c132b2b2dce5b00aedd13b5d1f25c0915ca778ef42",
     },

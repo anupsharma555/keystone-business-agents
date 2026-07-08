@@ -918,6 +918,7 @@ def _multi_target_search_client(
     search_config = build_shared_search_provider_config(
         requested_provider=None,
         configured_provider=settings.search_provider,
+        serper_enabled=bool(getattr(settings, "serper_enabled", False)),
         agents_web_search_max_calls=agents_web_search_max_calls,
         agents_web_search_parallel=True,
     )

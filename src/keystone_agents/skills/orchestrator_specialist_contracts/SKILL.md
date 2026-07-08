@@ -1,6 +1,6 @@
 ---
 skill_id: orchestrator_specialist_contracts
-skill_version: 2026-05-31.2
+skill_version: 2026-07-06.1
 skill_purpose: Control-plane reasoning contracts for request intake, preflight compaction, permission checks, handoffs, and result assembly.
 applies_to:
   - orchestrator
@@ -12,6 +12,7 @@ validation_paths:
   - tests/test_orchestrator.py
   - tests/test_orchestrator_preflight_context.py
   - tests/test_handoff_contracts.py
+  - tests/test_prompt_contracts.py
 safety_notes:
   - Orchestrator skills are advisory and never bypass deterministic Python gates.
 ---
@@ -30,10 +31,15 @@ Orchestrator.
 ## Typical Inputs
 
 - Raw user request, Slack/thread context, WorkItems, approvals, artifacts, prior
-  runs, context packs, decision trace, audit notes, and specialist outputs.
+  runs, context packs, optional LangGraph node state, decision trace, audit
+  notes, and specialist outputs.
 
 ## Required Behavior
 
+- `read_write_modify_boundary`: follow the Orchestrator R/W/M contract in
+  `docs/AGENT_CAPABILITY_BOUNDARIES.md`; read compact request/state/context,
+  write planning/review metadata, and modify route plans only inside internal
+  WorkItem/decision-trace surfaces.
 - `request_intake_and_route_planning`: identify intended outcome, action level,
   required specialists, and missing constraints.
 - `request_to_specialist_brief_expansion`: convert short prompts into compact
@@ -45,6 +51,9 @@ Orchestrator.
   artifact, send, update, and publish permissions.
 - `workflow_state_recovery`: resume from current state without assuming
   completion.
+- `workitem_graph_alignment`: when a request runs through a LangGraph-backed
+  manager flow, preserve the same WorkItem state, context pack, approval, source,
+  and renderer contracts used by the non-graph path.
 - `specialist_handoff_contracting`: specify task, context, constraints, schema,
   source requirements, stop condition, and action boundary.
 - `multi_agent_result_assembly`: preserve disagreements, gaps, source
@@ -63,6 +72,10 @@ Orchestrator.
 ## Boundaries
 
 - Must not treat explicit agent mentions as permission to bypass preflight.
+- Must not treat LangGraph backend selection as permission to bypass preflight,
+  context packs, deterministic gates, or no-write/no-send policy.
+- Must not treat Orchestrator review notes, route advice, or repair guidance as
+  authoritative workflow state until the WorkItem/storage layer records them.
 - Must not approve, send, publish, or update external systems.
 - Must not soften exact-match, review-only, source-backed, draft-only, or
   no-downstream constraints when packaging a specialist brief.

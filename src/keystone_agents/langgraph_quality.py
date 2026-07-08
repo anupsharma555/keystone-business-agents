@@ -13,8 +13,11 @@ LIVE_OUTPUT_REVIEW_RUBRIC_SCHEMA = "keystone.langgraph.live_output_review_rubric
 LIVE_OPEN_SMOKE_CHECKPOINT_SCHEMA = "keystone.langgraph.live_open_smoke_checkpoint.v1"
 LIVE_OUTPUT_REVIEW_DECISION_SCHEMA = "keystone.langgraph.live_output_review_decision.v1"
 LIVE_SMOKE_PLAN_SCHEMA = "keystone.langgraph.live_smoke_plan.v1"
+LLM_REASONING_TOUCHPOINTS_SCHEMA = "keystone.langgraph.llm_reasoning_touchpoints.v1"
 APPROVED_MAX_LIVE_SDK_CALLS = 5
 FORCED_COMPARISON_MIN_LIVE_SDK_CALLS = 2
+INTERNAL_SDK_REQUEST_REVIEW_THRESHOLD_PER_RUN = 4
+INTERNAL_SDK_REQUEST_COMPLEX_GRAPH_CANDIDATE_THRESHOLD = 8
 LIVE_OUTPUT_GRAPH_EVIDENCE_MODES = {"forced_langgraph_true"}
 LIVE_OUTPUT_GRAPH_EVENT_SCHEMA = "keystone.langgraph.orchestration.v1"
 LIVE_OUTPUT_GRAPH_OFF_EVIDENCE_MODES = {"forced_langgraph_false_control"}
@@ -117,6 +120,96 @@ _REQUIRED_EDGE_INVARIANTS = (
     "no_send_no_write_defaults",
     "source_attribution_visible_or_preserved",
     "offline_first_cost_aware_validation",
+)
+_LLM_REASONING_TOUCHPOINTS: tuple[dict[str, Any], ...] = (
+    {
+        "touchpoint": "relevance_usefulness_review",
+        "owning_node": "manager_loop_finalize",
+        "may_use_llm": True,
+        "default_model_call": False,
+        "purpose": (
+            "Judge whether completed graph output is specific, useful, and relevant "
+            "after deterministic stage and safety review."
+        ),
+        "deterministic_authority": (
+            "status, approval, no-send/no-write, artifact/source presence, and blocker gates"
+        ),
+    },
+    {
+        "touchpoint": "repair_routing",
+        "owning_node": "manager_loop_continue",
+        "may_use_llm": True,
+        "default_model_call": False,
+        "purpose": (
+            "Convert review feedback into observed gaps, repair route, requested output "
+            "type, source issue, and next safe action."
+        ),
+        "deterministic_authority": (
+            "repair eligibility, max repair attempts, side-effect blockers, and approval gates"
+        ),
+    },
+    {
+        "touchpoint": "source_sufficiency_judgment",
+        "owning_node": "finalize_step",
+        "may_use_llm": True,
+        "default_model_call": False,
+        "purpose": (
+            "Assess whether available sources are actually adequate for the requested "
+            "answer when deterministic source checks are ambiguous."
+        ),
+        "deterministic_authority": (
+            "missing source refs, source count thresholds, provider reachability, "
+            "recipient readiness, and live-search approval"
+        ),
+    },
+    {
+        "touchpoint": "final_answer_satisfaction",
+        "owning_node": "manager_loop_finalize",
+        "may_use_llm": True,
+        "default_model_call": False,
+        "purpose": (
+            "Decide whether the final answer satisfies the latest user ask or needs "
+            "a targeted rewrite/deepen/stop recommendation."
+        ),
+        "deterministic_authority": (
+            "terminal status, checkpoint state, side-effect safety, and renderer contract"
+        ),
+    },
+)
+_DETERMINISTIC_GRAPH_NODES = (
+    "normalize_request",
+    "state_followup",
+    "prepare_work_item",
+    "stage_feed_context",
+    "stage_zotero_context",
+    "stage_google_workspace_context",
+    "stage_airtable_context",
+    "approval_checkpoint",
+)
+_LLM_REVIEW_TRIGGER_POLICY = (
+    "deterministic_review_ambiguous_or_failed_without_hard_blocker",
+    "high_value_multistep_route_research_opportunity_outreach",
+    "high_value_multistep_route_gmail_research_outreach",
+    "chief_led_coordination_with_final_output_quality_risk",
+    "source_bundle_quality_or_answer_satisfaction_risk",
+    "explicit_fake_or_live_review_mode_with_cost_budget",
+)
+_LLM_REVIEW_EVIDENCE_FIELDS = (
+    "review_mode",
+    "llm_review_used",
+    "cost_guard",
+    "deterministic_gates_authoritative",
+)
+_LLM_REPAIR_CONTEXT_FIELDS = (
+    "observed_gaps",
+    "recommended_next_step",
+    "target_output_type",
+    "source_issue",
+    "repair_route",
+    "qualitative_feedback",
+    "review_mode",
+    "llm_review_used",
+    "cost_guard",
 )
 _LIVE_COMPARISON_MODES = (
     "open_default_backend_selected",
@@ -233,8 +326,16 @@ def langgraph_edge_program_inventory() -> dict[str, Any]:
         "selected_edges": [_copy_inventory_entry(item) for item in _SELECTED_EDGE_PROGRAM_ENTRIES],
         "future_edges": [_copy_inventory_entry(item) for item in _FUTURE_EDGE_PROGRAM_ENTRIES],
         "required_invariants": list(_REQUIRED_EDGE_INVARIANTS),
+        "llm_reasoning_policy": langgraph_llm_reasoning_touchpoints(),
         "live_smoke_boundary": {
             "max_live_sdk_calls": APPROVED_MAX_LIVE_SDK_CALLS,
+            "live_api_test_budget": APPROVED_MAX_LIVE_SDK_CALLS,
+            "internal_sdk_request_review_threshold_per_run": (
+                INTERNAL_SDK_REQUEST_REVIEW_THRESHOLD_PER_RUN
+            ),
+            "internal_sdk_request_complex_graph_candidate_threshold": (
+                INTERNAL_SDK_REQUEST_COMPLEX_GRAPH_CANDIDATE_THRESHOLD
+            ),
             "serial_only": True,
             "offline_first": True,
             "comparison_modes": list(_LIVE_COMPARISON_MODES),
@@ -270,6 +371,31 @@ def langgraph_edge_program_inventory() -> dict[str, Any]:
     }
 
 
+def langgraph_llm_reasoning_touchpoints() -> dict[str, Any]:
+    """Return the minimal contained LLM-review contract for graph workflows.
+
+    This contract documents where manager-style model judgment may be plugged in
+    without changing default graph execution. It is deliberately a policy shape:
+    model calls remain opt-in/fake/live-review specific, and Python gates keep
+    authority over safety, approvals, source presence, and side effects.
+    """
+
+    return {
+        "schema": LLM_REASONING_TOUCHPOINTS_SCHEMA,
+        "default_api_calls": False,
+        "model_reasoning_may_run_at": [_copy_inventory_entry(item) for item in _LLM_REASONING_TOUCHPOINTS],
+        "deterministic_only_nodes": list(_DETERMINISTIC_GRAPH_NODES),
+        "trigger_policy": list(_LLM_REVIEW_TRIGGER_POLICY),
+        "evidence_fields": list(_LLM_REVIEW_EVIDENCE_FIELDS),
+        "manager_loop_repair_context_fields": list(_LLM_REPAIR_CONTEXT_FIELDS),
+        "deterministic_gates_authoritative": True,
+        "live_validation_policy": (
+            "Live validation is outside normal graph execution and must use the "
+            "KBA cost-aware live SDK boundary with a separate budget."
+        ),
+    }
+
+
 def validate_langgraph_edge_program_inventory(
     inventory: dict[str, Any] | None = None,
     *,
@@ -291,6 +417,8 @@ def validate_langgraph_edge_program_inventory(
     required_invariants = set(_string_list(data.get("required_invariants")))
     if required_invariants != set(_REQUIRED_EDGE_INVARIANTS):
         blockers.append("required_invariants_changed")
+    if data.get("llm_reasoning_policy") != langgraph_llm_reasoning_touchpoints():
+        blockers.append("llm_reasoning_policy_changed")
     for item in selected_edges:
         if not isinstance(item, dict):
             blockers.append("invalid_edge_entry")
@@ -382,8 +510,24 @@ def render_langgraph_edge_program_inventory(inventory: dict[str, Any] | None = N
         f"- Selected durable edges: {int(validation.get('selected_edge_count') or 0)}",
         f"- Inventory valid: {_yes_no(validation.get('valid'))}",
         f"- Max live SDK calls: {int(boundary.get('max_live_sdk_calls') or 0)}",
+        "- Internal SDK request review threshold per run: "
+        f"{int(boundary.get('internal_sdk_request_review_threshold_per_run') or 0)}",
         f"- Offline first: {_yes_no(boundary.get('offline_first'))}",
     ]
+    policy = data.get("llm_reasoning_policy")
+    if isinstance(policy, dict):
+        touchpoints = policy.get("model_reasoning_may_run_at")
+        evidence_fields = _string_list(policy.get("evidence_fields"))
+        lines.append(
+            "- Default LLM manager-review API calls: "
+            f"{_yes_no(bool(policy.get('default_api_calls')))}"
+        )
+        lines.append(
+            "- Optional LLM reasoning touchpoints: "
+            f"{len(touchpoints) if isinstance(touchpoints, list) else 0}"
+        )
+        if evidence_fields:
+            lines.append("- LLM review evidence fields: " + ", ".join(evidence_fields))
     mode_requirements = boundary.get("mode_evidence_requirements")
     if isinstance(mode_requirements, dict):
         for mode in _LIVE_COMPARISON_MODES:
@@ -644,6 +788,20 @@ def langgraph_live_output_review_packet(
                 expected_environment={"KEYSTONE_WORKITEM_LANGGRAPH": "true"},
             ),
         ],
+        "internal_sdk_request_policy": {
+            "review_threshold_per_run": INTERNAL_SDK_REQUEST_REVIEW_THRESHOLD_PER_RUN,
+            "complex_graph_candidate_threshold": (
+                INTERNAL_SDK_REQUEST_COMPLEX_GRAPH_CANDIDATE_THRESHOLD
+            ),
+            "threshold_type": "per_run_internal_sdk_requests",
+            "separate_from_live_api_test_budget": True,
+            "review_blocker": "internal_sdk_request_threshold_exceeded",
+            "migration_requirement": (
+                "Raising the bounded-smoke threshold toward 8 requires trace evidence "
+                "that added calls improve relevance, detail, planning quality, or "
+                "execution quality."
+            ),
+        },
         "review_questions": [
             {
                 "criterion": item["criterion"],
@@ -712,6 +870,8 @@ def finalize_langgraph_live_output_review(packet: dict[str, Any]) -> dict[str, A
     evidence_blockers = _live_output_evidence_blockers(packet)
     blockers.extend(evidence_blockers)
     live_sdk_request_count = _live_sdk_request_count(packet)
+    live_api_test_attempt_count = _live_api_test_attempt_count(packet)
+    internal_threshold_blockers = _internal_sdk_request_threshold_blockers(packet)
     efficiency_winner = winners.get("efficiency", "unreviewed")
     safety_winner = winners.get("safety_and_permissions", "unreviewed")
     graph_meets_minimum = bool(
@@ -745,6 +905,15 @@ def finalize_langgraph_live_output_review(packet: dict[str, Any]) -> dict[str, A
         "blockers": blockers,
         "live_sdk_request_count": live_sdk_request_count,
         "approved_max_live_sdk_calls": APPROVED_MAX_LIVE_SDK_CALLS,
+        "live_api_test_attempt_count": live_api_test_attempt_count,
+        "approved_live_api_test_budget": APPROVED_MAX_LIVE_SDK_CALLS,
+        "internal_sdk_request_review_threshold_per_run": (
+            INTERNAL_SDK_REQUEST_REVIEW_THRESHOLD_PER_RUN
+        ),
+        "internal_sdk_request_complex_graph_candidate_threshold": (
+            INTERNAL_SDK_REQUEST_COMPLEX_GRAPH_CANDIDATE_THRESHOLD
+        ),
+        "internal_sdk_request_threshold_blockers": internal_threshold_blockers,
         "graph_meets_minimum": graph_meets_minimum,
         "efficiency_winner": efficiency_winner,
         "safety_winner": safety_winner,
@@ -788,11 +957,17 @@ def langgraph_open_smoke_checkpoint(packet: dict[str, Any]) -> dict[str, Any]:
     if graph_expected_route and route and route != graph_expected_route:
         blockers.append(f"open_default_route_mismatch:{route}!={graph_expected_route}")
     live_sdk_request_count = _live_sdk_request_count(packet)
-    remaining_live_sdk_calls = max(0, APPROVED_MAX_LIVE_SDK_CALLS - live_sdk_request_count)
-    if remaining_live_sdk_calls < FORCED_COMPARISON_MIN_LIVE_SDK_CALLS:
+    live_api_test_attempt_count = _live_api_test_attempt_count(packet)
+    remaining_live_api_test_attempts = max(
+        0,
+        APPROVED_MAX_LIVE_SDK_CALLS - live_api_test_attempt_count,
+    )
+    threshold_blockers = _internal_sdk_request_threshold_blockers(packet)
+    blockers.extend(threshold_blockers)
+    if remaining_live_api_test_attempts < FORCED_COMPARISON_MIN_LIVE_SDK_CALLS:
         blockers.append(
-            "open_default_live_sdk_budget_too_low_for_forced_modes:"
-            f"{remaining_live_sdk_calls}<{FORCED_COMPARISON_MIN_LIVE_SDK_CALLS}"
+            "open_default_live_api_test_budget_too_low_for_forced_modes:"
+            f"{remaining_live_api_test_attempts}<{FORCED_COMPARISON_MIN_LIVE_SDK_CALLS}"
         )
     return {
         "schema": LIVE_OPEN_SMOKE_CHECKPOINT_SCHEMA,
@@ -812,8 +987,15 @@ def langgraph_open_smoke_checkpoint(packet: dict[str, Any]) -> dict[str, Any]:
         "expected_route": graph_expected_route,
         "live_sdk_request_count": live_sdk_request_count,
         "approved_max_live_sdk_calls": APPROVED_MAX_LIVE_SDK_CALLS,
-        "remaining_live_sdk_calls": remaining_live_sdk_calls,
+        "live_api_test_attempt_count": live_api_test_attempt_count,
+        "approved_live_api_test_budget": APPROVED_MAX_LIVE_SDK_CALLS,
+        "remaining_live_api_test_attempts": remaining_live_api_test_attempts,
+        "remaining_live_sdk_calls": remaining_live_api_test_attempts,
         "forced_comparison_min_live_sdk_calls": FORCED_COMPARISON_MIN_LIVE_SDK_CALLS,
+        "internal_sdk_request_review_threshold_per_run": (
+            INTERNAL_SDK_REQUEST_REVIEW_THRESHOLD_PER_RUN
+        ),
+        "internal_sdk_request_threshold_blockers": threshold_blockers,
         "requires_next_step": (
             "run_forced_langgraph_false_control"
             if not blockers
@@ -871,6 +1053,26 @@ def langgraph_live_smoke_plan(
         ),
         "max_live_sdk_calls": max_live_sdk_calls,
         "approved_max_live_sdk_calls": APPROVED_MAX_LIVE_SDK_CALLS,
+        "live_api_test_budget": max_live_sdk_calls,
+        "approved_live_api_test_budget": APPROVED_MAX_LIVE_SDK_CALLS,
+        "internal_sdk_request_review_threshold_per_run": (
+            INTERNAL_SDK_REQUEST_REVIEW_THRESHOLD_PER_RUN
+        ),
+        "internal_sdk_request_complex_graph_candidate_threshold": (
+            INTERNAL_SDK_REQUEST_COMPLEX_GRAPH_CANDIDATE_THRESHOLD
+        ),
+        "internal_sdk_request_policy": {
+            "review_threshold_per_run": INTERNAL_SDK_REQUEST_REVIEW_THRESHOLD_PER_RUN,
+            "complex_graph_candidate_threshold": (
+                INTERNAL_SDK_REQUEST_COMPLEX_GRAPH_CANDIDATE_THRESHOLD
+            ),
+            "separate_from_live_api_test_budget": True,
+            "threshold_type": "per_run_internal_sdk_requests",
+            "migration_requirement": (
+                "Raising the threshold toward 8 requires trace evidence that added "
+                "calls improve relevance, detail, planning quality, or execution quality."
+            ),
+        },
         "max_live_workflow_runs_before_review": 1,
         "run_sequence": [
             {
@@ -935,8 +1137,9 @@ def langgraph_live_smoke_plan(
             "any send, Gmail draft, external post, schedule, publish, or write is attempted",
             "workflow_sdk_usage is missing after a live SDK run",
             "forced graph run lacks langgraph_orchestration_event evidence",
-            "live SDK call count would exceed the approved budget",
-            f"live SDK call budget must stay at or below {APPROVED_MAX_LIVE_SDK_CALLS}",
+            "live API test attempt count would exceed the approved budget",
+            f"live API test budget must stay at or below {APPROVED_MAX_LIVE_SDK_CALLS}",
+            "per-run internal SDK requests exceed the bounded-smoke review threshold",
             "visible output is less useful, less detailed, less relevant, or less source-grounded than control",
             "visible prompt wording includes harness labels that change backend routing",
             "all-scenarios offline readiness gate is missing or not ready",
@@ -1026,6 +1229,10 @@ def render_langgraph_live_smoke_plan(plan: dict[str, Any]) -> str:
         f"- Ready for live smoke: {_yes_no(plan.get('ready_for_live_smoke'))}",
         f"- Recommended next run: {str(plan.get('recommended_next_run') or 'n/a')}",
         f"- Max live SDK calls: {int(plan.get('max_live_sdk_calls') or 0)}",
+        "- Internal SDK request threshold/run: "
+        f"{int(plan.get('internal_sdk_request_review_threshold_per_run') or 0)}",
+        "- Complex-route candidate threshold/run: "
+        f"{int(plan.get('internal_sdk_request_complex_graph_candidate_threshold') or 0)}",
         "- Max live workflow runs before review: "
         f"{int(plan.get('max_live_workflow_runs_before_review') or 0)}",
         f"- Cost profile: {str(controls.get('cost_profile') or 'n/a')}",
@@ -1131,9 +1338,15 @@ def render_langgraph_open_smoke_checkpoint(checkpoint: dict[str, Any]) -> str:
         f"- Operator status: {str(checkpoint.get('operator_status') or 'n/a')}",
         f"- Slack display title: {str(checkpoint.get('slack_display_title') or 'n/a')}",
         f"- Expected route: {str(checkpoint.get('expected_route') or 'n/a')}",
-        f"- Live SDK calls used: {int(checkpoint.get('live_sdk_request_count') or 0)}",
-        f"- Live SDK calls remaining: {int(checkpoint.get('remaining_live_sdk_calls') or 0)}",
-        "- Forced-mode call reserve: "
+        "- Internal SDK requests observed: "
+        f"{int(checkpoint.get('live_sdk_request_count') or 0)}",
+        "- Internal SDK request threshold/run: "
+        f"{int(checkpoint.get('internal_sdk_request_review_threshold_per_run') or 0)}",
+        "- Live API test attempts used: "
+        f"{int(checkpoint.get('live_api_test_attempt_count') or 0)}",
+        "- Live API test attempts remaining: "
+        f"{int(checkpoint.get('remaining_live_api_test_attempts') or 0)}",
+        "- Forced-mode live-test reserve: "
         f"{int(checkpoint.get('forced_comparison_min_live_sdk_calls') or 0)}",
         f"- Required next step: {str(checkpoint.get('requires_next_step') or 'n/a')}",
     ]
@@ -1266,13 +1479,7 @@ def _live_output_evidence_blockers(packet: dict[str, Any]) -> list[str]:
 
 
 def _live_sdk_request_budget_blockers(packet: dict[str, Any]) -> list[str]:
-    total_requests = _live_sdk_request_count(packet)
-    if total_requests > APPROVED_MAX_LIVE_SDK_CALLS:
-        return [
-            "live_sdk_call_budget_exceeded:"
-            f"{total_requests}>{APPROVED_MAX_LIVE_SDK_CALLS}"
-        ]
-    return []
+    return _internal_sdk_request_threshold_blockers(packet)
 
 
 def _live_sdk_request_count(packet: dict[str, Any]) -> int:
@@ -1291,6 +1498,62 @@ def _live_sdk_request_count(packet: dict[str, Any]) -> int:
                 total += int(usage.get("requests") or 0)
             except (TypeError, ValueError):
                 continue
+    return total
+
+
+def _live_api_test_attempt_count(packet: dict[str, Any]) -> int:
+    evidence = packet.get("mode_evidence")
+    if not isinstance(evidence, list):
+        return 0
+    total = 0
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        if _workflow_sdk_usage_events(item) or str(item.get("work_item_id") or "").strip():
+            total += 1
+    return total
+
+
+def _internal_sdk_request_threshold_blockers(packet: dict[str, Any]) -> list[str]:
+    threshold = _internal_sdk_request_review_threshold(packet)
+    blockers: list[str] = []
+    evidence = packet.get("mode_evidence")
+    if not isinstance(evidence, list):
+        return blockers
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        mode = str(item.get("mode") or "unknown").strip() or "unknown"
+        count = _workflow_sdk_request_count_for_mode(item)
+        if count > threshold:
+            blockers.append(
+                f"internal_sdk_request_threshold_exceeded:{mode}:{count}>{threshold}"
+            )
+    return blockers
+
+
+def _internal_sdk_request_review_threshold(packet: dict[str, Any]) -> int:
+    policy = packet.get("internal_sdk_request_policy")
+    if isinstance(policy, dict):
+        try:
+            value = int(policy.get("review_threshold_per_run") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return INTERNAL_SDK_REQUEST_REVIEW_THRESHOLD_PER_RUN
+
+
+def _workflow_sdk_request_count_for_mode(item: dict[str, Any]) -> int:
+    total = 0
+    for usage_event in _workflow_sdk_usage_events(item):
+        usage = usage_event.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        try:
+            total += int(usage.get("requests") or 0)
+        except (TypeError, ValueError):
+            continue
     return total
 
 

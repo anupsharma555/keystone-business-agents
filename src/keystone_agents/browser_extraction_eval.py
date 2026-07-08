@@ -124,6 +124,8 @@ class BrowserExtractionScore(BaseModel):
     useful_internal_link_count: int = 0
     latency_ms: int = 0
     error: str | None = None
+    quality_bucket: str = "unreadable"
+    quality_diagnosis: list[str] = Field(default_factory=list)
     improvement_over_baseline: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -155,6 +157,20 @@ class BrowserExtractionEvalReport(BaseModel):
     case_count: int
     results: list[BrowserExtractionCaseResult] = Field(default_factory=list)
     summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class BrowserProviderDiagnosticSpec(BaseModel):
+    """Human-readable rendered-page provider role and promotion guidance."""
+
+    role: str
+    promotion_status: str
+    readiness: str
+    budget_class: str
+    default_use: str
+    live_requirement: str
+    benchmark_focus: str
+    next_validation: str
+    promotion_rule: str
 
 
 class RenderedPageProvider(Protocol):
@@ -527,16 +543,33 @@ def render_browser_extraction_eval_report(report: BrowserExtractionEvalReport) -
             f"{provider}: success {metrics.get('success_rate', 0):.2f}, "
             f"avg recall {metrics.get('average_expected_signal_recall', 0):.2f}, "
             f"text avg {metrics.get('average_useful_text_length', 0)}, "
+            f"strong {metrics.get('strong_quality_count', 0)}, "
+            f"weak/unreadable {metrics.get('weak_or_unreadable_count', 0)}, "
             f"p50/p95 {metrics.get('latency_p50_ms', 0)}/"
             f"{metrics.get('latency_p95_ms', 0)} ms, "
             f"errors {metrics.get('error_rate', 0):.2f}"
         )
+    provider_specs = report.summary.get("provider_specs") or {}
+    if provider_specs:
+        lines.extend(["", "## Provider Roles"])
+        for provider in report.providers:
+            spec = provider_specs.get(provider)
+            if not isinstance(spec, Mapping):
+                continue
+            lines.append(
+                "- "
+                f"{provider}: {spec.get('promotion_status')} - {spec.get('role')} "
+                f"({spec.get('budget_class')}; {spec.get('default_use')}; "
+                f"readiness: {spec.get('readiness')})"
+            )
     lines.extend(["", "## Cases"])
     for case_result in report.results:
         improvement_count = int(case_result.summary.get("providers_improved_over_baseline") or 0)
+        weak_count = int(case_result.summary.get("weak_or_unreadable_runs") or 0)
         lines.append(
             f"- {case_result.case.id} ({case_result.case.mode}, {case_result.case.category}): "
-            f"{improvement_count} provider run(s) improved over baseline"
+            f"{improvement_count} provider run(s) improved over baseline; "
+            f"{weak_count} weak/unreadable run(s)"
         )
     return "\n".join(lines)
 
@@ -631,6 +664,15 @@ def score_rendered_page(
     access_blocked = bool(forbidden_hits) or page.status in {"error", "blocked", "timeout"}
     recall = len(expected_hits) / len(case.expected_signals) if case.expected_signals else 0.0
     useful_text_length = len(page.text_or_markdown.strip())
+    boilerplate_ratio = _boilerplate_ratio(page.text_or_markdown)
+    quality_bucket = _quality_bucket(
+        status=page.status,
+        access_blocked=access_blocked,
+        expected_signal_recall=round(recall, 3),
+        useful_text_length=useful_text_length,
+        boilerplate_ratio=boilerplate_ratio,
+        has_expected_signals=bool(case.expected_signals),
+    )
     return BrowserExtractionScore(
         provider=page.provider,
         status=page.status,
@@ -641,10 +683,21 @@ def score_rendered_page(
         access_blocked=access_blocked,
         title_present=bool(page.title.strip()),
         useful_text_length=useful_text_length,
-        boilerplate_ratio=_boilerplate_ratio(page.text_or_markdown),
+        boilerplate_ratio=boilerplate_ratio,
         useful_internal_link_count=_useful_internal_link_count(page.links, case.expected_signals),
         latency_ms=page.latency_ms,
         error=page.error,
+        quality_bucket=quality_bucket,
+        quality_diagnosis=_quality_diagnosis(
+            quality_bucket=quality_bucket,
+            expected_signals=case.expected_signals,
+            expected_hits=expected_hits,
+            forbidden_hits=forbidden_hits,
+            title_present=bool(page.title.strip()),
+            useful_text_length=useful_text_length,
+            boilerplate_ratio=boilerplate_ratio,
+            page_error=page.error,
+        ),
     )
 
 
@@ -684,6 +737,9 @@ def _summarize_case(runs: Sequence[BrowserExtractionRunResult]) -> dict[str, Any
         "providers_improved_over_baseline": sum(
             1 for run in runs if bool(run.score.improvement_over_baseline.get("improved"))
         ),
+        "weak_or_unreadable_runs": sum(
+            1 for run in runs if run.score.quality_bucket in {"weak", "unreadable"}
+        ),
         "providers": _summarize_provider_runs(runs),
     }
 
@@ -700,6 +756,10 @@ def _summarize_eval(
     return {
         "baseline_provider": baseline_provider,
         "case_modes": dict(modes),
+        "provider_specs": {
+            provider: spec.model_dump(mode="json")
+            for provider, spec in build_browser_provider_diagnostic_specs().items()
+        },
         "providers": _summarize_provider_runs(runs),
     }
 
@@ -718,6 +778,8 @@ def _summarize_provider_runs(
         success_count = sum(1 for score in scores if score.extraction_success)
         error_count = sum(1 for score in scores if score.status == "error" or score.error)
         blocked_count = sum(1 for score in scores if score.access_blocked)
+        strong_count = sum(1 for score in scores if score.quality_bucket == "strong")
+        weak_count = sum(1 for score in scores if score.quality_bucket in {"weak", "unreadable"})
         improved_count = sum(
             1 for score in scores if bool(score.improvement_over_baseline.get("improved"))
         )
@@ -728,6 +790,12 @@ def _summarize_provider_runs(
             "error_count": error_count,
             "error_rate": _rate(error_count, len(provider_runs)),
             "blocked_or_forbidden_count": blocked_count,
+            "strong_quality_count": strong_count,
+            "weak_or_unreadable_count": weak_count,
+            "quality_buckets": {
+                bucket: sum(1 for score in scores if score.quality_bucket == bucket)
+                for bucket in ("strong", "partial", "weak", "unreadable")
+            },
             "average_expected_signal_recall": _average(
                 score.expected_signal_recall for score in scores
             ),
@@ -738,6 +806,138 @@ def _summarize_provider_runs(
             "improved_over_baseline_count": improved_count,
         }
     return summary
+
+
+def build_browser_provider_diagnostic_specs() -> dict[str, BrowserProviderDiagnosticSpec]:
+    """Return extraction provider role and budget guidance without changing defaults."""
+
+    return {
+        "trafilatura": BrowserProviderDiagnosticSpec(
+            role="static HTTP extraction baseline",
+            promotion_status="baseline",
+            readiness="ready as selected-page extraction baseline",
+            budget_class="free/local library plus target HTTP request",
+            default_use="baseline included for extraction eval comparisons",
+            live_requirement="network access for target URL",
+            benchmark_focus=(
+                "signal recall, useful text length, boilerplate ratio, blocked-page rate"
+            ),
+            next_validation="rerun as baseline for every selected-page extraction comparison",
+            promotion_rule="keep as baseline unless rendered providers consistently outperform it",
+        ),
+        "firecrawl": BrowserProviderDiagnosticSpec(
+            role="managed scrape/extraction fallback",
+            promotion_status="explicit_fallback",
+            readiness="credential-gated fallback candidate",
+            budget_class="configured free-tier or metered",
+            default_use="explicit live extraction lane",
+            live_requirement="Firecrawl credentials and live flags",
+            benchmark_focus="signal recall and blocked-page recovery over Trafilatura",
+            next_validation=(
+                "small Firecrawl-vs-Trafilatura selected-page probe with explicit "
+                "credit budget"
+            ),
+            promotion_rule="promote only when it improves signal recall or blocked-page access",
+        ),
+        "browserless": BrowserProviderDiagnosticSpec(
+            role="rendered-browser boundary",
+            promotion_status="eval_only",
+            readiness="placeholder/eval boundary",
+            budget_class="metered candidate",
+            default_use="eval boundary unless a reviewed adapter is enabled",
+            live_requirement="reviewed Browserless adapter and live flags",
+            benchmark_focus="JS-heavy selected pages only after adapter review",
+            next_validation=(
+                "keep out of production until adapter, safety constraints, and "
+                "attribution tests exist"
+            ),
+            promotion_rule="promote only for JS-heavy pages with stable attribution gains",
+        ),
+        "playwright": BrowserProviderDiagnosticSpec(
+            role="local read-only rendered diagnostics",
+            promotion_status="diagnostic_only",
+            readiness="ready for explicit diagnostics, not routine extraction",
+            budget_class="local compute",
+            default_use="explicit diagnostics only",
+            live_requirement="KEYSTONE_PLAYWRIGHT_ENABLED=true and read-only constraints",
+            benchmark_focus="console/page-error/request-failure diagnosis for selected URLs",
+            next_validation=(
+                "use only after static extraction is weak or rendered diagnostics "
+                "are requested"
+            ),
+            promotion_rule="keep as diagnostics unless runtime policy approves rendered extraction",
+        ),
+        "apify": BrowserProviderDiagnosticSpec(
+            role="future actor-based extraction boundary",
+            promotion_status="future_boundary",
+            readiness="not implemented",
+            budget_class="metered candidate",
+            default_use="unsupported eval boundary",
+            live_requirement="reviewed adapter not implemented",
+            benchmark_focus="not applicable until adapter exists",
+            next_validation="add adapter/tests before any provider comparison",
+            promotion_rule="requires adapter, tests, credentials, and attribution checks",
+        ),
+        "crawl4ai": BrowserProviderDiagnosticSpec(
+            role="future local/open-source extraction boundary",
+            promotion_status="future_boundary",
+            readiness="not implemented",
+            budget_class="local or self-hosted candidate",
+            default_use="unsupported eval boundary",
+            live_requirement="reviewed adapter not implemented",
+            benchmark_focus="local extraction lift over Trafilatura after adapter review",
+            next_validation="prototype behind eval boundary before runtime promotion",
+            promotion_rule="requires adapter, tests, and repeatable quality evidence",
+        ),
+    }
+
+
+def _quality_bucket(
+    *,
+    status: str,
+    access_blocked: bool,
+    expected_signal_recall: float,
+    useful_text_length: int,
+    boilerplate_ratio: float,
+    has_expected_signals: bool,
+) -> str:
+    if status != "success" or access_blocked or useful_text_length == 0:
+        return "unreadable"
+    if has_expected_signals and expected_signal_recall >= 0.8 and boilerplate_ratio < 0.5:
+        return "strong"
+    if useful_text_length >= 800 and boilerplate_ratio < 0.7:
+        return "partial"
+    return "weak"
+
+
+def _quality_diagnosis(
+    *,
+    quality_bucket: str,
+    expected_signals: Sequence[str],
+    expected_hits: Sequence[str],
+    forbidden_hits: Sequence[str],
+    title_present: bool,
+    useful_text_length: int,
+    boilerplate_ratio: float,
+    page_error: str | None,
+) -> list[str]:
+    diagnosis: list[str] = []
+    if page_error:
+        diagnosis.append(page_error)
+    missing_signals = [signal for signal in expected_signals if signal not in expected_hits]
+    if missing_signals:
+        diagnosis.append("missing expected signals: " + ", ".join(missing_signals[:5]))
+    if forbidden_hits:
+        diagnosis.append("blocked or forbidden signals: " + ", ".join(forbidden_hits[:5]))
+    if not title_present:
+        diagnosis.append("page title missing")
+    if useful_text_length < 800:
+        diagnosis.append("low useful text length")
+    if boilerplate_ratio >= 0.7:
+        diagnosis.append("high boilerplate ratio")
+    if not diagnosis and quality_bucket == "strong":
+        diagnosis.append("strong extracted evidence")
+    return list(dict.fromkeys(diagnosis))
 
 
 def _providers_with_baseline(
@@ -880,6 +1080,7 @@ __all__ = [
     "BrowserExtractionEvalReport",
     "BrowserExtractionRunResult",
     "BrowserExtractionScore",
+    "BrowserProviderDiagnosticSpec",
     "BrowserlessRenderedPageProvider",
     "DryRunRenderedPageProvider",
     "FirecrawlRenderedPageProvider",
@@ -889,6 +1090,7 @@ __all__ = [
     "RenderedPageProvider",
     "TrafilaturaRenderedPageProvider",
     "UnsupportedRenderedPageProvider",
+    "build_browser_provider_diagnostic_specs",
     "build_rendered_page_provider",
     "load_browser_extraction_cases",
     "normalize_browser_providers",

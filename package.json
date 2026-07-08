@@ -10,6 +10,8 @@
     "eval:promptfoo:dashboard:restart": "./scripts/manage_eval_dashboard.sh restart",
     "eval:promptfoo:list": ".venv/bin/python scripts/promptfoo_eval_db.py list",
     "eval:slack:readiness": ".venv/bin/python scripts/check_eval_slack_readiness.py",
+    "eval:slack:anu60-proof": ".venv/bin/python scripts/validate_anu60_live_slack_proof_packet.py",
+    "eval:slack:anu60-preflight": ".venv/bin/python scripts/run_anu60_no_live_preflight.py",
     "eval:slack:live-readiness": ".venv/bin/python scripts/check_eval_slack_readiness.py --live-slack-probe",
     "eval:slack:strict-readiness": ".venv/bin/python scripts/check_eval_slack_readiness.py --strict",
     "eval:slack:strict-live-readiness": ".venv/bin/python scripts/check_eval_slack_readiness.py --strict --live-slack-probe",

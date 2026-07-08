@@ -672,6 +672,9 @@ def handle_run_agent_interaction(
                 str(result_payload.get("human_summary") or ""),
                 eval_record=eval_record,
             )
+        graph_completion_text = _slack_graph_completion_text(feedback_events)
+        if graph_completion_text:
+            result_payload["slack_graph_completion_text"] = graph_completion_text
         _attach_operator_display_fields(result_payload, result=result)
         return SlackAgentActionResult(
             stage="work_item",
@@ -693,9 +696,17 @@ def _attach_operator_display_fields(result_payload: dict[str, Any], *, result: A
     """Add Slack-facing display fields without changing canonical WorkItem state."""
 
     human_summary = str(result_payload.get("human_summary") or "").strip()
-    if human_summary:
-        result_payload.setdefault("slack_display_text", human_summary)
-        result_payload.setdefault("display_text", human_summary)
+    graph_completion_text = str(result_payload.get("slack_graph_completion_text") or "").strip()
+    display_text = human_summary
+    if graph_completion_text and graph_completion_text not in display_text:
+        display_text = (
+            f"{display_text}\n\n{graph_completion_text}"
+            if display_text
+            else graph_completion_text
+        )
+    if display_text:
+        result_payload.setdefault("slack_display_text", display_text)
+        result_payload.setdefault("display_text", display_text)
     status = str(
         result_payload.get("status")
         or getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
@@ -739,6 +750,29 @@ def _operator_title_for_status(operator_status: str) -> str:
         "completed": "Business Agents Run Completed",
         "failed": "Business Agents Run Failed",
     }.get(operator_status, "Business Agents Run Update")
+
+
+def _slack_graph_completion_text(feedback_events: list[dict[str, Any]]) -> str:
+    """Return compact graph completion text suitable for the final Slack result."""
+
+    for event in reversed(feedback_events):
+        if str(event.get("event_type") or "") != "manager_loop_completed":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        review = payload.get("graph_completion_review")
+        if not isinstance(review, dict):
+            continue
+        lines = [
+            _clean_text(item, max_chars=220)
+            for item in review.get("renderer_summary_lines", [])
+            if _clean_text(item, max_chars=220)
+        ]
+        if not lines:
+            continue
+        return "Run explanation:\n" + "\n".join(f"- {line}" for line in lines[:5])
+    return ""
 
 
 def _slack_cost_conservation_request_options(request_text: str) -> dict[str, Any]:

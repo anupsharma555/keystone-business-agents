@@ -542,6 +542,9 @@ def business_agent_result_display_text(payload: dict[str, Any]) -> str:
 
     if not isinstance(payload, dict):
         return ""
+    slack_display_text = _payload_text_at_path(payload, "slack_display_text")
+    if payload.get("slack_graph_completion_text") and slack_display_text:
+        return slack_display_text
     route = str(payload.get("route") or payload.get("selected_agent") or "").strip()
     output_type = str(payload.get("output_type") or "").strip()
     for renderer in (*CONTEXT_AGENT_RESULT_RENDERERS, *NAMED_AGENT_RESULT_RENDERERS):

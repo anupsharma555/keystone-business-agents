@@ -11,6 +11,7 @@ from keystone_agents.langgraph_quality import (
     langgraph_edge_program_inventory,
     langgraph_live_smoke_plan,
     langgraph_live_smoke_plan_from_packet,
+    langgraph_llm_reasoning_touchpoints,
     langgraph_open_smoke_checkpoint,
     render_langgraph_edge_program_inventory,
     render_langgraph_live_output_review_decision,
@@ -66,6 +67,12 @@ def test_langgraph_edge_program_inventory_names_selected_durable_edges() -> None
     }
     assert "Selected durable edges: 4" in report
     assert "Inventory valid: yes" in report
+    assert "Default LLM manager-review API calls: no" in report
+    assert "Optional LLM reasoning touchpoints: 4" in report
+    assert (
+        "LLM review evidence fields: review_mode, llm_review_used, cost_guard, "
+        "deterministic_gates_authoritative"
+    ) in report
     assert "Evidence open_default_backend_selected: 12 fields" in report
     assert "Evidence forced_langgraph_false_control: 12 fields" in report
     assert (
@@ -106,6 +113,52 @@ def test_langgraph_edge_program_inventory_names_selected_durable_edges() -> None
         "legacy Chief of Staff -> Agent prose remains compatibility fallback only",
         "agents_as_tools advisory output must not replace durable graph specialist nodes",
     ]
+
+
+def test_langgraph_llm_reasoning_touchpoints_are_offline_and_authority_bounded() -> None:
+    policy = langgraph_llm_reasoning_touchpoints()
+
+    assert policy["schema"] == "keystone.langgraph.llm_reasoning_touchpoints.v1"
+    assert policy["default_api_calls"] is False
+    assert policy["deterministic_gates_authoritative"] is True
+    assert policy["evidence_fields"] == [
+        "review_mode",
+        "llm_review_used",
+        "cost_guard",
+        "deterministic_gates_authoritative",
+    ]
+    touchpoints = {item["touchpoint"]: item for item in policy["model_reasoning_may_run_at"]}
+    assert set(touchpoints) == {
+        "relevance_usefulness_review",
+        "repair_routing",
+        "source_sufficiency_judgment",
+        "final_answer_satisfaction",
+    }
+    assert all(item["may_use_llm"] is True for item in touchpoints.values())
+    assert all(item["default_model_call"] is False for item in touchpoints.values())
+    assert "approval_checkpoint" in policy["deterministic_only_nodes"]
+    assert "explicit_fake_or_live_review_mode_with_cost_budget" in policy["trigger_policy"]
+    assert policy["manager_loop_repair_context_fields"] == [
+        "observed_gaps",
+        "recommended_next_step",
+        "target_output_type",
+        "source_issue",
+        "repair_route",
+        "qualitative_feedback",
+        "review_mode",
+        "llm_review_used",
+        "cost_guard",
+    ]
+
+
+def test_langgraph_edge_program_inventory_requires_llm_reasoning_policy() -> None:
+    inventory = langgraph_edge_program_inventory()
+    inventory["llm_reasoning_policy"]["default_api_calls"] = True
+
+    validation = validate_langgraph_edge_program_inventory(inventory)
+
+    assert validation["valid"] is False
+    assert "llm_reasoning_policy_changed" in validation["blockers"]
 
 
 def test_langgraph_edge_program_inventory_rejects_unknown_quality_scenarios() -> None:
@@ -567,22 +620,22 @@ def test_compare_langgraph_quality_script_runs_gmail_thread_draft_scenario(
     packet = output["live_output_review_packet"]
     assert output["scenario"] == "gmail-research-thread-draft"
     assert output["control"]["quality_markers"]["route"] == "outreach_composer"
-    assert output["control"]["quality_markers"]["status"] == "blocked"
+    assert output["control"]["quality_markers"]["status"] == "done"
     assert graph_markers["route"] == "outreach_composer"
-    assert graph_markers["status"] == "blocked"
+    assert graph_markers["status"] == "done"
     assert graph_markers["stage_statuses"]["gmail_triage"] == "completed"
     assert graph_markers["stage_statuses"]["business_research"] == "completed"
     assert graph_markers["stage_statuses"]["outreach_composer"] == "completed"
-    assert "outreach_draft" not in graph_markers["artifact_types"]
+    assert "outreach_draft" in graph_markers["artifact_types"]
     assert output["comparison"]["same_route"] is True
     assert output["comparison"]["same_status"] is True
     assert output["comparison"]["status_improved"] is False
     assert output["comparison"]["ready_for_live_smoke"] is True
     assert output["comparison"]["regression_markers"] == []
     assert packet["decision"] == "unreviewed"
-    assert packet["graph_output"]["blockers"] == ["outreach_draft_needs_model_reasoning"]
-    assert packet["graph_output"]["status"] == "blocked"
-    assert "Draft copy should be model-synthesized" in packet["graph_output"]["human_summary"]
+    assert packet["graph_output"]["blockers"] == []
+    assert packet["graph_output"]["status"] == "done"
+    assert "Draft-only" in packet["graph_output"]["human_summary"]
     assert output["live_smoke_plan"]["slack_prompt_template"].startswith("@KNI gmail triage")
     assert "Do not send" not in output["live_smoke_plan"]["slack_prompt_template"]
     assert "Live SDK is approved" not in output["live_smoke_plan"]["slack_prompt_template"]
@@ -1001,23 +1054,30 @@ def test_finalize_live_output_review_requires_all_scenarios_gate() -> None:
     assert "all_scenarios_offline_gate_not_ready" in decision["evidence_blockers"]
 
 
-def test_finalize_live_output_review_blocks_positive_decision_over_sdk_call_budget() -> None:
+def test_finalize_live_output_review_blocks_positive_decision_over_internal_request_threshold() -> None:
     packet = run_comparison(scenario="gmail-research-thread-draft")["live_output_review_packet"]
     _mark_review_packet_graph_better(packet)
     _fill_open_default_mode_evidence(packet)
     _fill_required_mode_evidence(packet)
     for item in packet["mode_evidence"]:
+        if item["mode"] != "forced_langgraph_true":
+            continue
         usage_event = item.get("workflow_sdk_usage_event")
         if isinstance(usage_event, dict):
-            usage_event["usage"]["requests"] = 2
+            usage_event["usage"]["requests"] = 5
 
     decision = finalize_langgraph_live_output_review(packet)
 
     assert decision["decision"] == "unreviewed"
     assert decision["graph_meets_minimum"] is False
-    assert decision["live_sdk_request_count"] == 6
+    assert decision["live_sdk_request_count"] == 7
     assert decision["approved_max_live_sdk_calls"] == 5
-    assert "live_sdk_call_budget_exceeded:6>5" in decision["evidence_blockers"]
+    assert decision["approved_live_api_test_budget"] == 5
+    assert decision["internal_sdk_request_review_threshold_per_run"] == 4
+    assert (
+        "internal_sdk_request_threshold_exceeded:forced_langgraph_true:5>4"
+        in decision["evidence_blockers"]
+    )
 
 
 def test_finalize_live_output_review_counts_plural_sdk_usage_events() -> None:
@@ -1042,10 +1102,10 @@ def test_finalize_live_output_review_counts_plural_sdk_usage_events() -> None:
 
     decision = finalize_langgraph_live_output_review(packet)
 
-    assert decision["decision"] == "unreviewed"
-    assert decision["graph_meets_minimum"] is False
+    assert decision["decision"] == "graph_better"
+    assert decision["graph_meets_minimum"] is True
     assert decision["live_sdk_request_count"] == 6
-    assert "live_sdk_call_budget_exceeded:6>5" in decision["evidence_blockers"]
+    assert decision["internal_sdk_request_threshold_blockers"] == []
 
 
 def test_open_smoke_checkpoint_blocks_forced_runs_until_open_evidence_is_present() -> None:
@@ -1075,11 +1135,16 @@ def test_open_smoke_checkpoint_allows_forced_runs_after_open_evidence_is_present
     assert checkpoint["route"] == "outreach_composer"
     assert checkpoint["status"] == "done"
     assert checkpoint["live_sdk_request_count"] == 1
+    assert checkpoint["live_api_test_attempt_count"] == 1
     assert checkpoint["remaining_live_sdk_calls"] == 4
+    assert checkpoint["remaining_live_api_test_attempts"] == 4
     assert checkpoint["forced_comparison_min_live_sdk_calls"] == 2
+    assert checkpoint["internal_sdk_request_review_threshold_per_run"] == 4
     assert checkpoint["blockers"] == []
-    assert "- Live SDK calls used: 1" in report
-    assert "- Live SDK calls remaining: 4" in report
+    assert "- Internal SDK requests observed: 1" in report
+    assert "- Internal SDK request threshold/run: 4" in report
+    assert "- Live API test attempts used: 1" in report
+    assert "- Live API test attempts remaining: 4" in report
 
 
 def test_open_smoke_checkpoint_allows_backend_selected_graph_evidence() -> None:
@@ -1127,23 +1192,25 @@ def test_open_smoke_checkpoint_blocks_invalid_backend_selected_graph_evidence() 
     )
 
 
-def test_open_smoke_checkpoint_blocks_forced_runs_when_budget_remaining_is_too_low() -> None:
+def test_open_smoke_checkpoint_blocks_forced_runs_when_internal_request_threshold_exceeded() -> None:
     packet = run_comparison(scenario="gmail-research-thread-draft")["live_output_review_packet"]
     _fill_open_default_mode_evidence(packet)
-    packet["mode_evidence"][0]["workflow_sdk_usage_event"]["usage"]["requests"] = 4
+    packet["mode_evidence"][0]["workflow_sdk_usage_event"]["usage"]["requests"] = 5
 
     checkpoint = langgraph_open_smoke_checkpoint(packet)
     report = render_langgraph_open_smoke_checkpoint(checkpoint)
 
     assert checkpoint["ready_for_forced_comparison"] is False
     assert checkpoint["requires_next_step"] == "inspect_or_fix_open_default_run"
-    assert checkpoint["live_sdk_request_count"] == 4
-    assert checkpoint["remaining_live_sdk_calls"] == 1
+    assert checkpoint["live_sdk_request_count"] == 5
+    assert checkpoint["live_api_test_attempt_count"] == 1
+    assert checkpoint["remaining_live_api_test_attempts"] == 4
     assert (
-        "open_default_live_sdk_budget_too_low_for_forced_modes:1<2"
+        "internal_sdk_request_threshold_exceeded:open_default_backend_selected:5>4"
         in checkpoint["blockers"]
     )
-    assert "- Live SDK calls remaining: 1" in report
+    assert "- Internal SDK requests observed: 5" in report
+    assert "- Live API test attempts remaining: 4" in report
 
 
 def test_open_smoke_checkpoint_blocks_forced_runs_without_slack_display_evidence() -> None:
@@ -2542,6 +2609,20 @@ def test_live_smoke_plan_preserves_cost_and_side_effect_controls() -> None:
     assert plan["ready_for_live_smoke"] is True
     assert plan["max_live_sdk_calls"] == 5
     assert plan["approved_max_live_sdk_calls"] == 5
+    assert plan["live_api_test_budget"] == 5
+    assert plan["approved_live_api_test_budget"] == 5
+    assert plan["internal_sdk_request_review_threshold_per_run"] == 4
+    assert plan["internal_sdk_request_complex_graph_candidate_threshold"] == 8
+    assert plan["internal_sdk_request_policy"] == {
+        "review_threshold_per_run": 4,
+        "complex_graph_candidate_threshold": 8,
+        "separate_from_live_api_test_budget": True,
+        "threshold_type": "per_run_internal_sdk_requests",
+        "migration_requirement": (
+            "Raising the threshold toward 8 requires trace evidence that added "
+            "calls improve relevance, detail, planning quality, or execution quality."
+        ),
+    }
     assert plan["max_live_workflow_runs_before_review"] == 1
     assert [item["mode"] for item in plan["run_sequence"]] == [
         "open_default_backend_selected",
@@ -2568,6 +2649,9 @@ def test_live_smoke_plan_preserves_cost_and_side_effect_controls() -> None:
     }
     assert "workflow_sdk_usage is missing after a live SDK run" in plan["stop_conditions"]
     assert "forced graph run lacks langgraph_orchestration_event evidence" in (
+        plan["stop_conditions"]
+    )
+    assert "per-run internal SDK requests exceed the bounded-smoke review threshold" in (
         plan["stop_conditions"]
     )
     assert "visible prompt wording includes harness labels that change backend routing" in (

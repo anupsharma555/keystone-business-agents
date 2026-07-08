@@ -219,6 +219,11 @@ def test_langgraph_manager_loop_emits_graph_feedback_events(tmp_path: Path) -> N
     assert completed_payload["node_path"] == outcome.node_path
     completion_review = completed_payload["graph_completion_review"]
     assert completion_review["schema"] == "keystone.langgraph.completion_review.v1"
+    assert completion_review["review_mode"] == "deterministic"
+    assert completion_review["llm_review_used"] is False
+    assert completion_review["cost_guard"]["model_call"] is False
+    assert completion_review["cost_guard"]["deterministic_hard_gates_authoritative"] is True
+    assert completion_review["deterministic_gates_authoritative"] is True
     assert completion_review["completed_nodes"] == outcome.node_path
     assert completion_review["send_enabled"] is False
     assert completion_review["external_writes_enabled"] is False
@@ -4813,6 +4818,56 @@ def test_langgraph_stages_zotero_context_before_business_research(
         for artifact in outcome.result.work_item.artifact_refs
         if artifact.source_agent == "zotero_context_agent"
     )
+
+
+def test_langgraph_stripped_chief_advisory_context_stays_chief_owned(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text=(
+                "use Airtable Context as an advisory specialist to identify metadata "
+                "for Airtable base alias eval_tracker and table Eval tracker: case id, "
+                "agent, promptfoo status, Slack run id, human reviewer, missing evidence, "
+                "next follow-up, and analysis inclusion. Return a read-only tracker-field "
+                "plan with risks and unresolved record-identity questions. Do not create, "
+                "update, mark complete, or write Airtable records."
+            ),
+            database_url=database_url,
+            save=True,
+            manual_request_plan={
+                "source": "heuristic",
+                "requested_agent": "orchestrator",
+                "target_agent": "chief_of_staff",
+                "intent": "route_request",
+                "primary_target": "eval tracker field advisory",
+            },
+        ),
+        manager_loop=True,
+        max_manager_steps=1,
+    )
+
+    artifact_types = {artifact.artifact_type for artifact in outcome.result.work_item.artifact_refs}
+
+    assert outcome.result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert outcome.result.status == WorkItemStatus.DONE
+    assert outcome.checkpoint_required is False
+    assert outcome.node_path == [
+        "normalize_request",
+        "orchestrator_preflight",
+        "state_followup",
+        "prepare_work_item",
+        "run_chief_of_staff",
+        "finalize_step",
+        "manager_loop_finalize",
+    ]
+    assert "chief_of_staff_plan" in artifact_types
+    assert "airtable_write_plan" not in artifact_types
+    assert "Chief of Staff Airtable tracker-field plan" in outcome.result.human_summary
+    assert "Record identity" in outcome.result.human_summary
+    assert "Airtable write" in outcome.result.human_summary
 
 
 def test_langgraph_stages_rss_context_before_opportunity_scout(

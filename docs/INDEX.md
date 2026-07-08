@@ -12,6 +12,18 @@ Start here when changing or operating the repository.
   result rendering, and approval boundaries.
 - `docs/AI_AGENTS_WORKFLOW_TEST_STATUS.md`: current `#ai-agents-workflow`
   named-agent testing status, gaps, and next low-cost probe plan.
+- `docs/ANU60_LIVE_SLACK_PROOF_PLAN.md`: focused ANU-60 live Slack proof plan
+  for answer-first rendering, metadata suppression, named-agent routing, and
+  blocker wording after explicit live-posting approval.
+- `docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md`: copyable evidence template for
+  filling the ANU-60 live Slack probe results after approval.
+- `docs/AGENT_CAPABILITY_BOUNDARIES.md`: ANU-193/194/124 Orchestrator and Chief
+  read/write/modify boundaries, agents-as-tools, durable handoff, graph selector,
+  unresolved decisions, and test acceptance criteria.
+- `docs/BASIC_AGENT_EXECUTION_SMOKE_TASKS.md`: concise ANU-174 operator smoke
+  queue with offline, live-read, and write-gated validation lanes.
+- `docs/DIFFERENTIATION_MATRIX.md`: ANU-175 comparison and validation matrix
+  defining how KBA should differ from ChatGPT and Codex.
 - `docs/VISUAL_CONTEXT.md`: repo-local architecture visuals for operator and agent context.
 - `docs/assets/kba-current-agent-architecture.svg`: generated current architecture visual.
 - `scripts/render_agent_architecture_diagram.py`: regenerate the current architecture visual from
@@ -44,6 +56,10 @@ Start here when changing or operating the repository.
   commands for existing WorkItems.
 - `work-items advance --langgraph`: optional graph-native WorkItem execution
   with approval-checkpoint metadata and future resumable orchestration.
+- `docs/MULTI_AGENT_WORKFLOW_TEMPLATES.md`: backend-selected templates for
+  independent, combined, scheduled, and modification-loop agent workflows.
+- `docs/CONTEXT_AGENT_CONTRACTS.md`: ANU-198 through ANU-202 context-agent
+  read/write/modify boundaries, graph-candidate edges, and evidence handoffs.
 
 ## Add Or Change Agents
 

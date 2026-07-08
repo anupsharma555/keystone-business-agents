@@ -1,10 +1,40 @@
 # AI Agents Workflow Test Status
 
-Last updated: 2026-06-21
+Last updated: 2026-07-06
 
 This note tracks the focused `#ai-agents-workflow` diagnostic pass for KBA named-agent runs. It is intentionally compact and excludes secrets, local absolute paths, `.env` details, and private Slack links.
 
 ## Current Position
+
+ANU-60 is complete through the no-live/pre-live boundary: KBA local proof,
+sibling `keystone-slack` fixture coverage, and the full no-live preflight are
+green. It is not live-complete. Use `docs/ANU60_LIVE_SLACK_PROOF_PLAN.md` as
+the current handoff packet and `docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md` as
+the capture form before any additional `#ai-agents-workflow` live probe.
+
+Current no-live evidence on 2026-07-06:
+
+- KBA prompt/doc and Slack action contract suite passed: `.venv/bin/python -m
+  pytest tests/test_prompt_contracts.py tests/test_slack_action_contract.py -q`
+  returned `111 passed`.
+- KBA bridge validators passed:
+  `scripts/validate_slack_bridge_contract.py` and
+  `scripts/validate_slack_result_rendering_examples.py`.
+- ANU-60 proof-packet validator passed:
+  `npm run eval:slack:anu60-proof`.
+- ANU-60 no-live preflight passed:
+  `npm run eval:slack:anu60-preflight`.
+- KBA Slack expansion gate passed `36/36` with no live Slack/API/model/search
+  calls in `artifacts/anu60_expansion_gate_after_acceptance_map.json`.
+- Sibling `keystone-slack` focused bridge tests passed `8` cases covering
+  direct RSS/preprints `human_summary`, conversational Business Research
+  routing, company-brief metadata suppression, timeout failure wording, and
+  blocked preflight rendering.
+
+Remaining proof boundary: do not move ANU-60 to Done until fresh live
+`#ai-agents-workflow` probes produce Slack permalinks, local run ids, pass/fail
+evidence, answer-first visible `human_summary`, no metadata-first body, correct
+blocked wording, and no sends/writes/drafts/feed refreshes.
 
 Live Slack/API testing is paused after the latest bounded probes to control API cost. Offline checks should be preferred until the next targeted Slack probe is worth the cost.
 

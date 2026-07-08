@@ -250,6 +250,41 @@ Google Workspace, Gmail draft, Zotero importer, Slack post, or other mutation
 execution belongs to the owning specialist or explicitly approved action
 handler. Nested `agents_as_tools` calls remain advisory/read-plan only.
 
+## Minimal LLM Reasoning Touchpoints
+
+Graph execution does not add default manager-review model calls. The default
+graph completion review is deterministic and records `review_mode`,
+`llm_review_used`, `cost_guard`, and `deterministic_gates_authoritative` in
+review evidence. Any live validation of model review belongs to the repo's
+cost-aware live SDK boundary and must be budgeted separately from normal graph
+execution.
+
+Model reasoning may be plugged in only at contained manager-review points:
+
+- Relevance/usefulness review at `manager_loop_finalize`, after deterministic
+  stage, source/artifact, status, approval, and side-effect checks.
+- Repair routing at `manager_loop_continue`, where review feedback becomes
+  observed gaps, target output type, source issue, repair route, and next safe
+  action for the existing `manager_loop_repair` context.
+- Source sufficiency judgment at `finalize_step`, only when deterministic source
+  presence/count/provider checks are ambiguous rather than hard-failed.
+- Final answer satisfaction at `manager_loop_finalize`, to decide whether the
+  final answer satisfies the latest user ask or needs a targeted
+  rewrite/deepen/stop recommendation.
+
+These nodes may use fake/local LLM review in offline tests or explicit live
+review under a cost budget. They must not change the hard authority of Python
+gates: missing source refs, approval boundaries, no-send/no-write defaults,
+recipient readiness, side-effect blockers, repair-attempt caps, and checkpoint
+state remain deterministic.
+
+The graph nodes that must stay deterministic are request normalization, state
+follow-up routing, WorkItem/context preparation, read-only context staging,
+approval checkpoints, backend selection, and all send/write/publish/schedule
+gates. Specialist nodes may call their owning SDK agents when the existing
+live/fixture flags allow it, but that is specialist execution, not an implicit
+manager-review pass.
+
 ## Implemented Edges
 
 - `run_business_research -> run_opportunity_scout -> run_outreach_composer -> approval_checkpoint` when a source-backed company profile should become an opportunity review and then draft-only outreach.
@@ -501,10 +536,20 @@ comparison:
 
 That inventory is a structural readiness contract. It names the selected
 durable edges, their docs/tests surfaces, required invariants, and the approved
-live-smoke boundary: offline first, serial live runs, at most five live SDK
-calls across the comparison, no live search by default, and no sends or external
-writes. It does not claim the graph produces better user-facing prose; use the
-live-output review packet below for that.
+live-smoke boundary: offline first, serial live runs, an operator-approved live
+API test budget of five comparison attempts, no live search by default, and no
+sends or external writes. It does not claim the graph produces better
+user-facing prose; use the live-output review packet below for that.
+
+The live API test budget is separate from internal SDK request telemetry. A
+single WorkItem run may emit multiple `workflow_sdk_usage` events, and those
+events are used as an over-orchestration review signal rather than as the
+session-level live-test budget. For bounded smoke, the current per-run review
+threshold is `internal_sdk_request_review_threshold_per_run = 4`. A run above
+that threshold is review-blocked until inspected. Raising the threshold toward
+`8` is only a future option for complex Chief-led or multi-specialist routes
+after trace evidence shows the additional calls improve relevance, detail,
+planning quality, or execution quality.
 
 Before any live Slack/API comparison, run the aggregate selected-scenario gate:
 
@@ -647,7 +692,9 @@ question, then finalize it without spending another API call:
 
 # Only after the open/default checkpoint reports ready should forced comparison
 # modes be run and copied into the packet. The checkpoint also verifies that the
-# open/default run left enough of the five-call budget for both forced modes.
+# open/default run left enough live API test attempts for both forced modes and
+# that its per-run internal SDK request count did not exceed the bounded-smoke
+# review threshold.
 # After all Slack outputs, WorkItem ids, route/status, operator display fields,
 # and usage events are present:
 .venv/bin/python scripts/compare_langgraph_quality.py \
@@ -738,11 +785,13 @@ evidence with usage, cost, and request-cache proof before a positive decision
 can be accepted. The forced-on comparison slot additionally needs
 `langgraph_orchestration_event`; without it, a positive review would only prove
 "a run completed," not that the run actually exercised the LangGraph path.
-The finalizer also sums `usage.requests` across every populated mode evidence
+The finalizer also inspects `usage.requests` for every populated mode evidence
 slot, including the open/default run. It prefers `workflow_sdk_usage_events`
-when present and falls back to the legacy single `workflow_sdk_usage_event`;
-`graph_better` is blocked if the total exceeds the approved five-call
-comparison budget.
+when present and falls back to the legacy single `workflow_sdk_usage_event`.
+`graph_better` is blocked when any single run exceeds the current per-run
+internal SDK request threshold. This is separate from the operator-approved live
+API test count, which controls how many live comparison attempts may be run in
+the session.
 The `--evidence-from-work-item` helper is intentionally partial. It can prefill
 route/status, source URLs, SDK usage events, and the latest LangGraph event from
 SQLite, but it leaves `slack_permalink`, `operator_status`,
@@ -785,13 +834,15 @@ enrichment disabled, and all send/write/draft/post-outside-thread flags false.
 The plan is live-ready only when the selected-scenario aggregate gate is present
 and true; helper runs that skip that gate must report `do_not_run_live` even if
 their single scenario comparison is structurally ready.
-The same plan enforces the approved call budget: `max_live_sdk_calls` must be
-between 1 and 5, and any larger budget keeps the recommended next run at
-`do_not_run_live`.
+The same plan enforces the operator-approved live API test budget:
+`max_live_sdk_calls` is kept as the legacy field name, but it represents the
+number of live comparison attempts allowed by the operator, not the maximum
+internal SDK requests inside one WorkItem run. It must be between 1 and 5, and
+any larger budget keeps the recommended next run at `do_not_run_live`.
 After that run, inspect the full Slack/API output, WorkItem route/status,
 `langgraph_orchestration`, and `workflow_sdk_usage` with usage, cost, and
 request-cache proof before deciding whether a forced-off control run and then a
-forced-on graph run are worth spending from the remaining live SDK budget.
+forced-on graph run are worth spending from the remaining live API test budget.
 
 The open/default run has its own checkpoint. After the first Slack run, fill the
 `open_default_backend_selected` evidence slot in the review packet with the
@@ -801,10 +852,13 @@ usage, cost, and request-cache proof. Also copy `operator_status` and
 `slack_display_title` from the Slack/KBA result payload when available. The
 checkpoint must report
 `ready_for_forced_comparison=true` before running either forced comparison mode.
-It also reports `live_sdk_request_count`, `remaining_live_sdk_calls`, and the
-minimum two-call reserve needed for the forced graph-off and forced graph-on
-modes. If the open/default run leaves fewer than two live SDK calls inside the
-approved five-call budget, stop instead of running forced comparisons.
+It also reports internal SDK request count, the per-run internal request
+threshold, live API test attempts used/remaining, and the minimum two-attempt
+reserve needed for the forced graph-off and forced graph-on modes. If the
+open/default run leaves fewer than two live API test attempts inside the
+approved five-attempt budget, stop instead of running forced comparisons. If
+the open/default run exceeds the current per-run internal request threshold,
+stop and inspect for over-orchestration before spending another live attempt.
 If the open/default status is failed/blocked, route differs from the expected
 offline graph route, SDK usage is missing, or the visible output implies a send,
 Gmail draft, external post, schedule, publish, or write, stop and inspect/fix

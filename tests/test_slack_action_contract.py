@@ -383,6 +383,30 @@ def test_named_agent_result_display_text_prefers_human_summary(
     )
 
 
+def test_result_display_text_prefers_renderer_human_summary_over_stale_display_fields() -> None:
+    summary = (
+        "*Answer:*\n"
+        "Render the named-agent answer first.\n\n"
+        "*Detailed Summary:*\n"
+        "The Slack bridge should not let stale display text outrank the matched renderer."
+    )
+
+    assert (
+        business_agent_result_display_text(
+            {
+                "route": "business_research_analyst",
+                "output_type": "CompanyResearchFocusedBrief",
+                "human_summary": summary,
+                "slack_display_text": "Stale display text.",
+                "display_text": "Older display text.",
+                "summary": "Generic summary.",
+                "message": "Business Agents Company Research Brief Ready",
+            }
+        )
+        == summary
+    )
+
+
 def test_action_and_selected_context_models_share_contract_schema_names() -> None:
     value = business_agent_action_value(
         intent=KBA_INTENT_MORE_RESEARCH,

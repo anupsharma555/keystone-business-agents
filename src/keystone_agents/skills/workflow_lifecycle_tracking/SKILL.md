@@ -1,6 +1,6 @@
 ---
 skill_id: workflow_lifecycle_tracking
-skill_version: 2026-05-31.2
+skill_version: 2026-07-06.1
 skill_purpose: Track WorkItem, draft, approval, outreach, reply, outcome, artifact, and next-step state without inventing completion.
 applies_to:
   - gmail_triage
@@ -31,8 +31,9 @@ manual sends, replies, outcomes, artifacts, and next steps.
 
 ## Applicable Agents
 
-Gmail Triage, Outreach Composer, Opportunity Scout, Orchestrator, and Chief of
-Staff use this skill when current work depends on prior state.
+Gmail Triage, Business Research Analyst, Opportunity Scout, Outreach Composer,
+Orchestrator, and Chief of Staff use this skill when current work depends on
+prior state.
 
 ## Typical Inputs
 

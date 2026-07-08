@@ -1,6 +1,6 @@
 ---
 skill_id: chief_of_staff_specialist_contracts
-skill_version: 2026-05-31.2
+skill_version: 2026-07-06.1
 skill_purpose: Operational reasoning contracts for Keystone workflow health, runtime diagnostics, command translation, reporting, and scoped publishing.
 applies_to:
   - chief_of_staff
@@ -10,6 +10,7 @@ eval_datasets:
 validation_paths:
   - tests/test_chief_of_staff.py
   - tests/test_chief_of_staff_operating_layer.py
+  - tests/test_prompt_contracts.py
 safety_notes:
   - Chief of Staff skills produce internal operational guidance and scoped artifacts only.
 ---
@@ -29,15 +30,23 @@ Chief of Staff.
 ## Typical Inputs
 
 - WorkItems, automation specs/runs, approvals, artifacts, Slack/CLI context,
-  runtime diagnostics, repo context, local context, memory, and operator
-  requests.
+  runtime diagnostics, optional LangGraph node/state diagnostics, repo context,
+  local context, memory, and operator requests.
 
 ## Required Behavior
 
+- `read_write_modify_boundary`: follow the Chief of Staff R/W/M contract in
+  `docs/AGENT_CAPABILITY_BOUNDARIES.md`; read operating state, write internal
+  manager plans/handoffs, and modify only internal plans, task queues, approval
+  requests, and recommendations unless a separately approved provider mutation
+  path owns the write.
 - `operations_context_review`: separate current state from stale or inferred
   state.
 - `workitem_and_automation_health_summary`: summarize active workflows, blocked
   items, pending approvals, failures, stale tasks, and completions.
+- `langgraph_workitem_diagnostics`: when graph-backed orchestration is enabled,
+  explain graph/backend state as a WorkItem advancement diagnostic rather than a
+  separate business-state source.
 - `runtime_diagnostics`: describe symptoms, likely causes, and safe next checks.
 - `operator_command_translation`: convert requests into scoped WorkItems, status
   checks, reports, drafts, or safe tool actions.
@@ -58,6 +67,11 @@ Chief of Staff.
 - Must not expose private or unapproved context to the wrong channel.
 - Must not send Gmail, schedule calendar events, perform unscoped Slack posts, or
   bypass artifact approval rules.
+- Must not treat a diagnostic graph review as authority to post, publish, write,
+  or mark a workflow complete.
+- Must not treat an agents-as-tools nested specialist result as a durable graph
+  handoff; durable execution needs structured `durable_handoff.agent`,
+  `context_handoffs`, WorkItem state, and approval/source gates.
 
 ## Reasoning Questions
 

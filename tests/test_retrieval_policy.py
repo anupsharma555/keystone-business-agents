@@ -6,6 +6,7 @@ from keystone_agents.retrieval_policy import (
     RetrievalQualityAssessment,
     assess_opportunity_search_quality,
     build_provider_sequence,
+    build_provider_use_ladder,
     coerce_retrieval_autonomy_hint,
 )
 from keystone_agents.schemas.retrieval import RetrievalHint
@@ -42,8 +43,39 @@ def test_build_provider_sequence_defaults_to_searxng_only() -> None:
 def test_build_provider_sequence_respects_configured_primary_override() -> None:
     assert build_provider_sequence(
         requested_provider=None,
+        configured_provider="tavily",
+    ) == ("tavily",)
+
+
+def test_build_provider_sequence_requires_serper_enabled_for_configured_primary() -> None:
+    assert build_provider_sequence(
+        requested_provider=None,
         configured_provider="serper",
+    ) == ("searxng",)
+    assert build_provider_sequence(
+        requested_provider=None,
+        configured_provider="serper",
+        serper_enabled=True,
     ) == ("serper",)
+
+
+def test_build_provider_sequence_preserves_explicit_requested_serper() -> None:
+    assert build_provider_sequence(
+        requested_provider="serper",
+        configured_provider="searxng",
+    ) == ("serper",)
+
+
+def test_build_provider_sequence_excludes_rendered_providers_from_defaults() -> None:
+    assert build_provider_sequence(
+        requested_provider=None,
+        configured_provider="browserless",
+    ) == ("searxng",)
+    assert build_provider_sequence(
+        requested_provider=None,
+        configured_provider="searxng",
+        fallback_provider="playwright",
+    ) == ("searxng",)
 
 
 def test_build_provider_sequence_allows_explicit_non_serper_fallback() -> None:
@@ -60,6 +92,121 @@ def test_build_provider_sequence_omits_serper_fallback() -> None:
         configured_provider="searxng",
         fallback_provider="serper",
     ) == ("searxng",)
+
+
+def test_build_provider_sequence_allows_serper_fallback_when_enabled() -> None:
+    assert build_provider_sequence(
+        requested_provider=None,
+        configured_provider="searxng",
+        fallback_provider="serper",
+        serper_enabled=True,
+    ) == ("searxng", "serper")
+
+
+def test_provider_use_ladder_identifies_default_live_search_lanes() -> None:
+    ladder = build_provider_use_ladder(request_text="research Mentavi")
+
+    assert ladder.active_providers() == ("searxng", "agents-web-search")
+    assert ladder.rule_for("searxng").use_frequency == "always_default"
+    assert ladder.rule_for("agents-web-search").use_frequency == "default_capped"
+    assert ladder.rule_for("serper").use_frequency == "disabled"
+    assert ladder.rule_for("browserless").use_frequency == "eval_only"
+
+
+def test_provider_use_ladder_deepens_for_missing_official_lanes() -> None:
+    ladder = build_provider_use_ladder(
+        request_text="find behavioral health AI grants, RFPs, trials, and conference CFPs",
+        missing_source_lanes=("grants_funding", "procurement_rfp", "clinical_trials"),
+    )
+
+    assert ladder.rule_for("exa").use_now is True
+    assert ladder.rule_for("tavily").use_now is True
+    assert ladder.rule_for("exa").stage == "semantic_deepening"
+    assert ladder.rule_for("tavily").stage == "research_deepening"
+
+
+def test_provider_use_ladder_uses_orchestrator_structured_hint_for_exa() -> None:
+    ladder = build_provider_use_ladder(
+        request_text="research Mentavi",
+        autonomy_hint=RetrievalHint(
+            source="orchestrator",
+            needs_structured_enrichment=True,
+            reasons=["leadership context needed"],
+        ),
+    )
+
+    exa = ladder.rule_for("exa")
+    assert exa.use_now is True
+    assert "orchestrator_structured_enrichment" in exa.reason_codes
+    assert ladder.active_providers() == ("searxng", "agents-web-search", "exa")
+
+
+def test_provider_use_ladder_uses_orchestrator_precision_for_formal_research() -> None:
+    ladder = build_provider_use_ladder(
+        request_text="find current behavioral health AI grants and clinical trials",
+        autonomy_hint={
+            "source": "orchestrator",
+            "needs_precision_search": True,
+            "reasons": ["strict date and source filters"],
+        },
+    )
+
+    tavily = ladder.rule_for("tavily")
+    assert tavily.use_now is True
+    assert "formal_research_request" in tavily.reason_codes
+    assert "orchestrator_precision_search" in tavily.reason_codes
+
+
+def test_provider_use_ladder_keeps_search_review_separate_from_rendered_browser() -> None:
+    ladder = build_provider_use_ladder(
+        request_text="review conflicting claims for a thin-data company",
+        autonomy_hint=RetrievalAutonomyHint(
+            source="orchestrator",
+            needs_search_review=True,
+            reasons=("thin data",),
+        ),
+    )
+
+    assert ladder.rule_for("playwright").use_now is False
+    assert "orchestrator_search_review_not_rendered_browser" in (
+        ladder.rule_for("playwright").reason_codes
+    )
+    assert ladder.rule_for("browserless").use_now is False
+
+
+def test_provider_use_ladder_separates_extraction_baseline_from_fallbacks() -> None:
+    baseline = build_provider_use_ladder(
+        request_text="summarize selected source pages",
+        requires_extraction=True,
+        extraction_quality="strong",
+    )
+    fallback = build_provider_use_ladder(
+        request_text="summarize selected source pages",
+        requires_extraction=True,
+        extraction_quality="unreadable",
+    )
+
+    assert baseline.rule_for("trafilatura").use_now is True
+    assert baseline.rule_for("firecrawl").use_now is False
+    assert fallback.rule_for("trafilatura").use_now is True
+    assert fallback.rule_for("firecrawl").use_now is True
+    assert fallback.rule_for("playwright").use_now is True
+
+
+def test_provider_use_ladder_keeps_rendered_and_future_providers_non_production() -> None:
+    ladder = build_provider_use_ladder(
+        request_text="inspect rendered page failure",
+        rendered_diagnostics_requested=True,
+        serper_enabled=True,
+    )
+
+    assert ladder.rule_for("playwright").use_frequency == "diagnostic_only"
+    assert ladder.rule_for("playwright").use_now is True
+    assert ladder.rule_for("browserless").use_now is False
+    assert ladder.rule_for("apify").use_frequency == "future_boundary"
+    assert ladder.rule_for("crawl4ai").use_frequency == "future_boundary"
+    assert ladder.rule_for("serper").use_frequency == "specific_opt_in"
+    assert ladder.rule_for("serper").use_now is False
 
 
 def test_coerce_retrieval_autonomy_hint_accepts_schema_payload() -> None:

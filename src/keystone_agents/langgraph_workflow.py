@@ -680,6 +680,7 @@ def _emit_langgraph_feedback(
         return
 
 
+
 def _run_dependency_free_graph(state: WorkItemGraphState) -> WorkItemGraphState:
     state = _normalize_request_node(state)
     state = _orchestrator_preflight_node(state)
@@ -811,6 +812,18 @@ def _graph_completion_review(
     )
     return {
         "schema": "keystone.langgraph.completion_review.v1",
+        "review_mode": "deterministic",
+        "llm_review_used": False,
+        "cost_guard": {
+            "mode": "deterministic_graph_completion",
+            "model_call": False,
+            "scope": (
+                "requested stage coverage, checkpoint state, source/artifact "
+                "presence, and side-effect boundaries"
+            ),
+            "deterministic_hard_gates_authoritative": True,
+        },
+        "deterministic_gates_authoritative": True,
         "stop_reason": stop_reason,
         "completed_nodes": list(node_path),
         "completed_routes": completed_routes,
@@ -975,7 +988,7 @@ def _graph_completion_summary_lines(
         f"Graph stop reason: {stop_reason}",
     ]
     if incomplete:
-        lines.append("Graph review gaps: " + ", ".join(incomplete))
+        lines.append("Still needs attention: " + ", ".join(incomplete))
     if checkpoint_required:
         lines.append(f"Approval checkpoint: {checkpoint_reason or 'required'}")
     lines.append(
@@ -1914,7 +1927,9 @@ def _chief_coordination_should_run_before_context_edges(
         return False
     request_text = _context_edge_request_text(state, prepared)
     normalized = " ".join(str(request_text or "").lower().split())
-    if "chief of staff" not in normalized:
+    if "chief of staff" not in normalized and not _chief_context_advisory_only_request(
+        normalized
+    ):
         return False
     if not (
         _feed_context_edge_kind(request_text, prepared)
@@ -1927,15 +1942,29 @@ def _chief_coordination_should_run_before_context_edges(
         re.search(
             r"\b(?:coordinate|orchestrate|select|selected|before|then|handoff|"
             r"recommend(?:ing)?|next owner|best next owner|best next specialist|"
-            r"assess|review|decide|evaluate|triage|prioritize)\b",
+            r"assess|review|decide|evaluate|triage|prioritize|summarize|explain|"
+            r"identify|return|design|advisory|advisor|advisors)\b",
             normalized,
         )
         and re.search(
             r"\b(?:business research|opportunity scout|gmail triage|outreach composer|"
             r"specialist|specialists?|main agent|main specialist|opportunit\w*|"
-            r"research|evidence|source-backed|approval checkpoint|outreach)\b",
+            r"research|evidence|source-backed|approval checkpoint|outreach|"
+            r"context agents?|airtable context|google workspace context|"
+            r"zotero context|rss context|preprints context)\b",
             normalized,
         )
+    )
+
+
+def _chief_context_advisory_only_request(normalized: str) -> bool:
+    return bool(
+        "agents-as-tools only" in normalized
+        or "advisory specialist" in normalized
+        or "advisory context" in normalized
+        or "read-only advisors" in normalized
+        or "read-only advisor" in normalized
+        or re.search(r"\bcontext\s+as\s+an?\s+advisory\b", normalized)
     )
 
 

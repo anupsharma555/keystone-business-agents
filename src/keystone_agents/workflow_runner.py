@@ -1957,11 +1957,19 @@ def _review_manager_loop_step(
         "route": result.route.value,
         "status": result.status.value,
         "latest_user_request": focused_request,
+        "review_mode": str(getattr(review, "review_mode", "deterministic") or "deterministic"),
+        "llm_review_used": bool(getattr(review, "llm_review_used", False)),
+        "cost_guard": _review_cost_guard_payload(review),
+        "deterministic_gates_authoritative": True,
         "review_status": review.status,
         "overall_score": review.overall_score,
         "approval_boundary_ok": review.approval_boundary_ok,
         "observed_gaps": review.observed_gaps[:6],
         "recommended_next_step": review.recommended_next_step,
+        "target_output_type": _manager_loop_target_output_type(result),
+        "source_issue": "",
+        "repair_route": result.route.value,
+        "qualitative_feedback": _manager_loop_review_qualitative_feedback(review),
     }
     depth_gap = _manager_loop_business_research_depth_gap(original_request, result)
     if depth_gap:
@@ -2011,6 +2019,7 @@ def _review_manager_loop_step(
             f"Manager loop review step {step_index}: "
             f"{review_context['review_status']} ({review_context['overall_score']}/100)."
         )
+    review_context["source_issue"] = _manager_loop_source_issue(review_context)
     review_blocking = _manager_review_should_block(
         review_context,
         result,
@@ -2109,6 +2118,8 @@ def _review_manager_loop_step(
                 "advisory": review_context["advisory"],
                 "review_decision": review_decision,
                 "recommended_next_step": review_context["recommended_next_step"],
+                "review_mode": review_context["review_mode"],
+                "llm_review_used": review_context["llm_review_used"],
             },
         )
     if store is not None:
@@ -2393,6 +2404,56 @@ def _attach_route_specific_review_fields(
     )
 
 
+def _review_cost_guard_payload(review: object) -> dict[str, Any]:
+    cost_guard = getattr(review, "cost_guard", None)
+    if hasattr(cost_guard, "model_dump"):
+        payload = cost_guard.model_dump(mode="json")
+        if isinstance(payload, dict):
+            return payload
+    if isinstance(cost_guard, dict):
+        return dict(cost_guard)
+    return {
+        "mode": str(getattr(review, "review_mode", "deterministic") or "deterministic"),
+        "model_call": bool(getattr(review, "llm_review_used", False)),
+        "deterministic_hard_gates_authoritative": True,
+    }
+
+
+def _manager_loop_target_output_type(result: WorkflowRunResult) -> str:
+    for artifact in result.artifact_refs:
+        artifact_type = str(artifact.artifact_type or "").strip()
+        if artifact_type:
+            return artifact_type
+    return result.route.value
+
+
+def _manager_loop_review_qualitative_feedback(review: object) -> list[str]:
+    feedback = getattr(review, "qualitative_feedback", None)
+    if isinstance(feedback, list):
+        cleaned = [str(item or "").strip() for item in feedback if str(item or "").strip()]
+        if cleaned:
+            return cleaned[:6]
+    observed_gaps = [
+        str(item or "").strip()
+        for item in list(getattr(review, "observed_gaps", []) or [])[:6]
+        if str(item or "").strip()
+    ]
+    next_step = str(getattr(review, "recommended_next_step", "") or "").strip()
+    return [*observed_gaps, next_step][:6] if next_step else observed_gaps
+
+
+def _manager_loop_source_issue(review_context: dict[str, Any]) -> str:
+    hint = _manager_loop_search_repair_hint(review_context)
+    if hint == "broaden_or_deepen_search_within_cost_profile":
+        return "source_sufficiency_or_retrieval_gap"
+    if any(
+        "source" in str(gap or "").lower() or "evidence" in str(gap or "").lower()
+        for gap in list(review_context.get("observed_gaps") or [])
+    ):
+        return "source_presentation_or_synthesis_gap"
+    return ""
+
+
 def _manager_loop_can_consider_repair(
     result: WorkflowRunResult,
     *,
@@ -2488,9 +2549,17 @@ def _attempt_manager_loop_repair(
         "step": step_index,
         "route": result.route.value,
         "work_item_id": result.work_item.id,
+        "review_mode": review_context.get("review_mode") or "deterministic",
+        "llm_review_used": bool(review_context.get("llm_review_used", False)),
+        "cost_guard": dict(review_context.get("cost_guard") or {}),
+        "deterministic_gates_authoritative": True,
         "review_status": review_context.get("review_status"),
         "observed_gaps": list(review_context.get("observed_gaps") or [])[:6],
         "recommended_next_step": review_context.get("recommended_next_step") or "",
+        "target_output_type": review_context.get("target_output_type") or "",
+        "source_issue": review_context.get("source_issue") or "",
+        "repair_route": review_context.get("repair_route") or result.route.value,
+        "qualitative_feedback": list(review_context.get("qualitative_feedback") or [])[:6],
         "search_repair_hint": _manager_loop_search_repair_hint(review_context),
         "send_enabled": False,
     }
@@ -2622,6 +2691,10 @@ def _manager_loop_repair_external_context(
         "schema": "keystone.manager_loop.repair_context.v1",
         "source": "manager_loop_review",
         "route": str(review_context.get("route") or ""),
+        "review_mode": str(review_context.get("review_mode") or "deterministic"),
+        "llm_review_used": bool(review_context.get("llm_review_used", False)),
+        "cost_guard": dict(review_context.get("cost_guard") or {}),
+        "deterministic_gates_authoritative": True,
         "review_status": str(review_context.get("review_status") or ""),
         "overall_score": review_context.get("overall_score"),
         "observed_gaps": [
@@ -2630,6 +2703,14 @@ def _manager_loop_repair_external_context(
             if str(item or "").strip()
         ],
         "recommended_next_step": str(review_context.get("recommended_next_step") or ""),
+        "target_output_type": str(review_context.get("target_output_type") or ""),
+        "source_issue": str(review_context.get("source_issue") or ""),
+        "repair_route": str(review_context.get("repair_route") or review_context.get("route") or ""),
+        "qualitative_feedback": [
+            str(item or "").strip()
+            for item in list(review_context.get("qualitative_feedback") or [])[:6]
+            if str(item or "").strip()
+        ],
         "search_repair_hint": _manager_loop_search_repair_hint(review_context),
     }
     return context
@@ -4289,6 +4370,8 @@ def _chief_request_should_start_with_chief(request_text: str) -> bool:
         "agents-as-tools only" in normalized
         or "advisory specialist" in normalized
         or "advisory context" in normalized
+        or "read-only advisors" in normalized
+        or "read-only advisor" in normalized
         or "use only sanitized inline context" in normalized
         or re.search(r"\bcontext\s+as\s+an?\s+advisory\b", normalized)
     )
@@ -7695,9 +7778,35 @@ def _external_context_event_payload(
     if isinstance(repair_context, dict):
         payload["manager_loop_repair"] = {
             "route": _compact_context_text(repair_context.get("route"), max_chars=80),
+            "review_mode": _compact_context_text(
+                repair_context.get("review_mode"),
+                max_chars=40,
+            ),
+            "llm_review_used": bool(repair_context.get("llm_review_used", False)),
+            "cost_guard": dict(repair_context.get("cost_guard") or {}),
+            "deterministic_gates_authoritative": bool(
+                repair_context.get("deterministic_gates_authoritative", False)
+            ),
             "review_status": _compact_context_text(
                 repair_context.get("review_status"),
                 max_chars=40,
+            ),
+            "target_output_type": _compact_context_text(
+                repair_context.get("target_output_type"),
+                max_chars=120,
+            ),
+            "source_issue": _compact_context_text(
+                repair_context.get("source_issue"),
+                max_chars=160,
+            ),
+            "repair_route": _compact_context_text(
+                repair_context.get("repair_route"),
+                max_chars=80,
+            ),
+            "qualitative_feedback": _context_string_list(
+                repair_context.get("qualitative_feedback"),
+                max_items=6,
+                max_chars=240,
             ),
             "search_repair_hint": _compact_context_text(
                 repair_context.get("search_repair_hint"),
@@ -7835,11 +7944,37 @@ def _bounded_context_metadata(context: dict[str, Any]) -> dict[str, Any]:
             "schema": _compact_context_text(repair_context.get("schema"), max_chars=120),
             "source": _compact_context_text(repair_context.get("source"), max_chars=120),
             "route": _compact_context_text(repair_context.get("route"), max_chars=80),
+            "review_mode": _compact_context_text(
+                repair_context.get("review_mode"),
+                max_chars=40,
+            ),
+            "llm_review_used": bool(repair_context.get("llm_review_used", False)),
+            "cost_guard": dict(repair_context.get("cost_guard") or {}),
+            "deterministic_gates_authoritative": bool(
+                repair_context.get("deterministic_gates_authoritative", False)
+            ),
             "review_status": _compact_context_text(
                 repair_context.get("review_status"),
                 max_chars=40,
             ),
             "overall_score": repair_context.get("overall_score"),
+            "target_output_type": _compact_context_text(
+                repair_context.get("target_output_type"),
+                max_chars=120,
+            ),
+            "source_issue": _compact_context_text(
+                repair_context.get("source_issue"),
+                max_chars=160,
+            ),
+            "repair_route": _compact_context_text(
+                repair_context.get("repair_route"),
+                max_chars=80,
+            ),
+            "qualitative_feedback": _context_string_list(
+                repair_context.get("qualitative_feedback"),
+                max_items=6,
+                max_chars=240,
+            ),
             "search_repair_hint": _compact_context_text(
                 repair_context.get("search_repair_hint"),
                 max_chars=120,
@@ -9225,7 +9360,10 @@ def _advance_chief_of_staff(
             action="review_chief_of_staff_plan",
             agent=WorkItemRoute.CHIEF_OF_STAFF,
             description=("Review the Chief of Staff plan before any live internal write or post."),
-            requires_approval=bool(output.approval_required),
+            requires_approval=bool(
+                output.approval_required
+                and not _chief_context_agent_advisory_summary(request_text)
+            ),
         )
     status = WorkItemStatus.IN_PROGRESS if delegated_agent else WorkItemStatus.DONE
     updated = attach_artifact(
@@ -14712,6 +14850,32 @@ def _request_demands_external_outreach_side_effect(normalized: str) -> bool:
     return not bool(negated_side_effect)
 
 
+def _request_requires_approval_before_outreach(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized:
+        return False
+    approval_before_outreach = bool(
+        re.search(
+            r"\bapproval checkpoint\b[^.\n;]{0,120}\b(?:before|prior to)\b"
+            r"[^.\n;]{0,80}\boutreach\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:before|prior to)\b[^.\n;]{0,80}\b(?:any\s+)?outreach\b"
+            r"[^.\n;]{0,120}\bapproval checkpoint\b",
+            normalized,
+        )
+    )
+    stop_before_outreach = bool(
+        re.search(
+            r"\b(?:stop|pause|block|hold)\b[^.\n;]{0,120}\bapproval checkpoint\b"
+            r"[^.\n;]{0,120}\b(?:before|prior to)\b[^.\n;]{0,80}\boutreach\b",
+            normalized,
+        )
+    )
+    return approval_before_outreach or stop_before_outreach
+
+
 def _thread_local_request_has_draft_context(
     request: WorkflowRunRequest,
     *,
@@ -14735,12 +14899,16 @@ def _advance_thread_local_outreach_draft(
     gmail_thread_context: GmailThreadSummaryResult | None = None,
     target_name: str = "",
 ) -> WorkflowRunResult:
-    if not request.live_sdk:
+    if (
+        not request.live_sdk
+        and _request_requires_approval_before_outreach(request.request_text)
+    ):
         blocker = WorkItemBlocker(
             code="outreach_draft_needs_model_reasoning",
             message=(
-                "Draft copy should be model-synthesized from the provided context. "
-                "No deterministic placeholder draft was created."
+                "Draft copy should be model-synthesized from the provided context "
+                "after the requested approval checkpoint. No deterministic placeholder "
+                "draft was created."
             ),
         )
         return _blocked_result(
@@ -14750,8 +14918,8 @@ def _advance_thread_local_outreach_draft(
                 action="run_model_backed_draft_or_provide_exact_copy",
                 agent=WorkItemRoute.OUTREACH_COMPOSER,
                 description=(
-                    "Run Outreach Composer with live SDK/model reasoning, or provide "
-                    "the exact copy to store as a thread-local draft."
+                    "Run Outreach Composer with live SDK/model reasoning after approval, "
+                    "or provide the exact copy to store as a thread-local draft."
                 ),
                 requires_approval=False,
             ),
@@ -14760,8 +14928,8 @@ def _advance_thread_local_outreach_draft(
             audit_notes=[
                 (
                     "Thread-local Outreach Composer did not create deterministic "
-                    "fallback copy; it returned a request for model-backed drafting "
-                    "or exact operator-provided copy."
+                    "fallback copy because the request required an approval checkpoint "
+                    "before outreach."
                 )
             ],
         )
@@ -15294,7 +15462,7 @@ def _thread_local_outreach_draft(
         style_profile_used=True,
         style_profile_id="operator_default_writing_style",
         revision_request=request_text,
-        approved_context_used=bool(inline_context),
+        approved_context_used=bool(gmail_thread_context or inline_context or source_context),
         unsupported_claims_flagged=unsupported,
     )
 
@@ -16529,11 +16697,11 @@ def _blocked_human_summary(
         needs_reply_context = any("Recipient identity" in message for message in requirements)
         return "\n\n".join(
             [
-                "What email should I use?",
+                "Gmail Triage needs email context",
                 (
                     "*Answer:*\n"
-                    "I can triage, summarize, label-plan, or prepare reply guidance once I have "
-                    "the email context to work from."
+                    "Gmail Triage can summarize, label-plan, or prepare reply guidance once "
+                    "I have the email context to work from."
                 ),
                 (
                     "*What I need:*\n"

@@ -4017,6 +4017,21 @@ def test_manager_loop_repairs_done_opportunity_packet_after_authoritative_review
                 if status == "fail"
                 else "Ready for review."
             )
+            self.review_mode = "llm" if status == "fail" else "deterministic"
+            self.llm_review_used = status == "fail"
+            self.cost_guard = {
+                "mode": "fake_llm_review" if status == "fail" else "deterministic",
+                "model_call": status == "fail",
+                "deterministic_hard_gates_authoritative": True,
+            }
+            self.qualitative_feedback = (
+                [
+                    "The packet is relevant but still too generic for the operator ask.",
+                    "Repair should produce source-backed formal opportunity records.",
+                ]
+                if status == "fail"
+                else []
+            )
 
     def fake_review_specialist_output(**_kwargs: object) -> FakeReview:
         nonlocal review_calls
@@ -4066,13 +4081,39 @@ def test_manager_loop_repairs_done_opportunity_packet_after_authoritative_review
     assert result.status == WorkItemStatus.DONE
     assert not any(blocker.code == "manager_loop_review_failed" for blocker in result.blockers)
     assert review_events[0].metadata["review_decision"] == "repair"
+    assert review_events[0].metadata["review_mode"] == "llm"
+    assert review_events[0].metadata["llm_review_used"] is True
+    assert review_events[0].metadata["cost_guard"]["mode"] == "fake_llm_review"
+    assert review_events[0].metadata["deterministic_gates_authoritative"] is True
+    assert review_events[0].metadata["target_output_type"] == "opportunity"
+    assert review_events[0].metadata["repair_route"] == WorkItemRoute.OPPORTUNITY_SCOUT.value
+    assert "too generic" in review_events[0].metadata["qualitative_feedback"][0]
     assert review_events[-1].metadata["review_decision"] == "pass"
     repair_started = next(
         event for event in events if event.event_type == "manager_loop_repair_started"
     )
+    assert repair_started.metadata["review_mode"] == "llm"
+    assert repair_started.metadata["llm_review_used"] is True
+    assert repair_started.metadata["cost_guard"]["mode"] == "fake_llm_review"
+    assert repair_started.metadata["target_output_type"] == "opportunity"
+    assert repair_started.metadata["repair_route"] == WorkItemRoute.OPPORTUNITY_SCOUT.value
+    assert "too generic" in repair_started.metadata["qualitative_feedback"][0]
     assert repair_started.metadata["search_repair_hint"] == (
         "repair_synthesis_from_existing_context"
     )
+    repair_advance_started = [
+        event for event in events if event.event_type == "advance_started"
+    ][1]
+    repair_context = repair_advance_started.metadata["external_context"][
+        "manager_loop_repair"
+    ]
+    assert repair_context["review_mode"] == "llm"
+    assert repair_context["llm_review_used"] is True
+    assert repair_context["cost_guard"]["mode"] == "fake_llm_review"
+    assert repair_context["deterministic_gates_authoritative"] is True
+    assert repair_context["target_output_type"] == "opportunity"
+    assert repair_context["repair_route"] == WorkItemRoute.OPPORTUNITY_SCOUT.value
+    assert "too generic" in repair_context["qualitative_feedback"][0]
     assert any(event.event_type == "manager_loop_repair_completed" for event in events)
 
 
@@ -6393,8 +6434,8 @@ def test_gmail_context_required_block_has_sectioned_operator_summary(
     assert result.route == WorkItemRoute.GMAIL_TRIAGE
     assert result.status == WorkItemStatus.BLOCKED
     assert {blocker.code for blocker in result.blockers} == {"gmail_context_required"}
-    assert "What email should I use?" in result.human_summary
-    assert "I can triage, summarize" in result.human_summary
+    assert "Gmail Triage needs email context" in result.human_summary
+    assert "Gmail Triage can summarize" in result.human_summary
     assert "What I need" in result.human_summary
     assert "*Answer:*" in result.human_summary
     assert "*Reply with:*" in result.human_summary
@@ -9458,6 +9499,9 @@ def test_thread_local_sample_reply_without_context_asks_for_context(tmp_path: Pa
 def test_thread_local_sample_reply_uses_inline_context_not_placeholder(
     tmp_path: Path,
 ) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+
     result = advance_work_item(
         WorkflowRunRequest(
             request_text=(
@@ -9466,20 +9510,24 @@ def test_thread_local_sample_reply_uses_inline_context_not_placeholder(
                 "Slack-thread sample reply for review."
             ),
             requested_route=WorkItemRoute.OUTREACH_COMPOSER,
-            database_url=_database_url(tmp_path),
+            database_url=database_url,
             save=True,
         )
     )
 
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
-    assert result.advanced is False
-    assert result.status == WorkItemStatus.BLOCKED
-    assert [blocker.code for blocker in result.blockers] == [
-        "outreach_draft_needs_model_reasoning"
-    ]
-    assert result.artifact_refs == []
-    assert "Draft copy should be model-synthesized" in result.human_summary
+    assert result.advanced is True
+    assert result.status == WorkItemStatus.DONE
+    assert result.blockers == []
+    assert result.artifact_refs[0].metadata["thread_local_slack_draft"] is True
+    assert result.artifact_refs[0].metadata["gmail_draft_created"] is False
+    assert result.artifact_refs[0].metadata["send_enabled"] is False
+    assert result.artifact_refs[0].metadata["external_write_performed"] is False
+    assert result.artifact_refs[0].metadata["approval_queue_created"] is False
+    assert "measurement-based care workflow evaluation design" in result.human_summary
     assert "Thanks for reaching out. This sounds useful" not in result.human_summary
+    assert store.count("outreach_drafts") == 1
+    assert store.list_approval_items(object_type="outreach_draft") == []
 
 
 def test_advance_work_item_outreach_accepts_approved_inline_context_labels(
@@ -9689,7 +9737,7 @@ def test_outreach_with_known_target_runs_research_before_source_context_block(
     assert result.next_action.agent == WorkItemRoute.OUTREACH_COMPOSER
 
 
-def test_slack_thread_sample_outreach_without_live_sdk_requests_model_reasoning(
+def test_slack_thread_sample_outreach_without_live_sdk_creates_thread_local_draft(
     tmp_path: Path,
 ) -> None:
     database_url = _database_url(tmp_path)
@@ -9730,16 +9778,21 @@ def test_slack_thread_sample_outreach_without_live_sdk_requests_model_reasoning(
         "draft-only Slack-thread sample outreach for review"
     )
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
-    assert result.status == WorkItemStatus.BLOCKED
-    assert [blocker.code for blocker in result.blockers] == [
-        "outreach_draft_needs_model_reasoning"
-    ]
-    assert result.artifact_refs == []
-    assert store.count("outreach_drafts") == 0
+    assert result.status == WorkItemStatus.DONE
+    assert result.blockers == []
+    assert result.artifact_refs[0].metadata["thread_local_slack_draft"] is True
+    assert result.artifact_refs[0].metadata["sdk_synthesis_attempted"] is False
+    assert result.artifact_refs[0].metadata["gmail_draft_created"] is False
+    assert result.artifact_refs[0].metadata["send_enabled"] is False
+    assert result.artifact_refs[0].metadata["external_write_performed"] is False
+    assert result.artifact_refs[0].metadata["approval_queue_created"] is False
+    assert "NeuroFlow" in result.human_summary
+    assert "Draft-only" in result.human_summary
+    assert store.count("outreach_drafts") == 1
     assert store.list_approval_items(object_type="outreach_draft") == []
 
 
-def test_draft_only_outreach_with_no_post_outside_thread_without_live_sdk_requests_model(
+def test_draft_only_outreach_with_no_post_outside_thread_creates_thread_local_draft(
     tmp_path: Path,
 ) -> None:
     database_url = _database_url(tmp_path)
@@ -9779,16 +9832,19 @@ def test_draft_only_outreach_with_no_post_outside_thread_without_live_sdk_reques
 
     assert workflow_runner.looks_like_thread_local_draft_request(request_text)
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
-    assert result.status == WorkItemStatus.BLOCKED
-    assert [blocker.code for blocker in result.blockers] == [
-        "outreach_draft_needs_model_reasoning"
-    ]
-    assert result.artifact_refs == []
-    assert store.count("outreach_drafts") == 0
+    assert result.status == WorkItemStatus.DONE
+    assert result.blockers == []
+    assert result.artifact_refs[0].metadata["thread_local_slack_draft"] is True
+    assert result.artifact_refs[0].metadata["gmail_draft_created"] is False
+    assert result.artifact_refs[0].metadata["send_enabled"] is False
+    assert result.artifact_refs[0].metadata["external_write_performed"] is False
+    assert result.artifact_refs[0].metadata["approval_queue_created"] is False
+    assert "NeuroFlow" in result.human_summary
+    assert store.count("outreach_drafts") == 1
     assert store.list_approval_items(object_type="outreach_draft") == []
 
 
-def test_slack_context_draft_only_outreach_without_live_sdk_requests_model(
+def test_slack_context_draft_only_outreach_without_live_sdk_creates_thread_local_draft(
     tmp_path: Path,
 ) -> None:
     database_url = _database_url(tmp_path)
@@ -9838,12 +9894,15 @@ def test_slack_context_draft_only_outreach_without_live_sdk_requests_model(
 
     assert not workflow_runner.looks_like_thread_local_draft_request(request_text)
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
-    assert result.status == WorkItemStatus.BLOCKED
-    assert [blocker.code for blocker in result.blockers] == [
-        "outreach_draft_needs_model_reasoning"
-    ]
-    assert result.artifact_refs == []
-    assert store.count("outreach_drafts") == 0
+    assert result.status == WorkItemStatus.DONE
+    assert result.blockers == []
+    assert result.artifact_refs[0].metadata["thread_local_slack_draft"] is True
+    assert result.artifact_refs[0].metadata["gmail_draft_created"] is False
+    assert result.artifact_refs[0].metadata["send_enabled"] is False
+    assert result.artifact_refs[0].metadata["external_write_performed"] is False
+    assert result.artifact_refs[0].metadata["approval_queue_created"] is False
+    assert "NeuroFlow" in result.human_summary
+    assert store.count("outreach_drafts") == 1
     assert store.list_approval_items(object_type="outreach_draft") == []
 
 

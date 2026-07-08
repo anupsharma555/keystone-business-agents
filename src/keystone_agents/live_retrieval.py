@@ -32,6 +32,7 @@ from keystone_agents.retrieval_policy import (
     assess_company_search_quality,
     assess_opportunity_search_quality,
     build_provider_sequence,
+    build_provider_use_ladder,
     derive_request_autonomy_hint,
     provider_value_summary,
 )
@@ -127,6 +128,8 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
         "live_search": bool(metadata.get("live_search")),
         "provider_summary": provider_summary,
         "providers_used": list(dict.fromkeys(providers_used)),
+        "provider_policy": _compact_provider_policy(providers_used),
+        "provider_use_ladder": _compact_provider_use_ladder(metadata, source_coverage, quality),
         "search_queries": _compact_search_queries(metadata.get("search_queries")),
         "provider_usage": _compact_provider_usage(provider_usage),
         "provider_result_samples": _compact_provider_result_samples(
@@ -137,6 +140,7 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
         "retrieval_ladder": _compact_retrieval_ladder(metadata.get("retrieval_ladder")),
         "search_quality_summary": _compact_quality_summary(quality),
         "source_coverage_summary": _compact_source_coverage(source_coverage),
+        "source_limits": _compact_source_limits(source_coverage, quality),
         "fallback_used": bool(
             metadata.get("search_provider_fallback_used")
             or metadata.get("provider_error_fallback_used")
@@ -164,6 +168,162 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
 
 def _split_provider_summary(value: str) -> list[str]:
     return [item.strip() for item in value.replace("+", ",").split(",") if item.strip()]
+
+
+def _compact_provider_policy(providers_used: Sequence[str]) -> list[dict[str, str]]:
+    specs = {
+        "dry-run": {
+            "role": "fixture validation",
+            "budget_class": "free/local",
+            "default_use": "dry-run only",
+        },
+        "searxng": {
+            "role": "local broad-recall baseline",
+            "budget_class": "free/local",
+            "default_use": "primary live baseline",
+        },
+        "agents-web-search": {
+            "role": "OpenAI hosted corroboration",
+            "budget_class": "OpenAI metered",
+            "default_use": "capped lane; not expanded by default",
+        },
+        "exa": {
+            "role": "semantic deepening",
+            "budget_class": "configured free-tier or metered",
+            "default_use": "policy-capped deepening",
+        },
+        "tavily": {
+            "role": "research deepening",
+            "budget_class": "free-tier-aware or metered",
+            "default_use": "policy-capped deepening",
+        },
+        "firecrawl": {
+            "role": "managed extraction/search",
+            "budget_class": "configured free-tier or metered",
+            "default_use": "explicit extraction/search lane",
+        },
+        "serper": {
+            "role": "Google-style fallback",
+            "budget_class": "metered and disabled by policy",
+            "default_use": "disabled unless credits are restored",
+        },
+        "browserless": {
+            "role": "rendered-page boundary",
+            "budget_class": "metered candidate",
+            "default_use": "eval/placeholder unless promoted",
+        },
+        "playwright": {
+            "role": "read-only rendered diagnostics",
+            "budget_class": "local compute",
+            "default_use": "explicit diagnostics only",
+        },
+    }
+    policy: list[dict[str, str]] = []
+    for provider in dict.fromkeys(
+        str(item).strip() for item in providers_used if str(item).strip()
+    ):
+        spec = specs.get(provider)
+        if spec is None:
+            continue
+        policy.append({"provider": provider, **spec})
+    return policy
+
+
+def _compact_provider_use_ladder(
+    metadata: Mapping[str, Any],
+    source_coverage: Mapping[str, Any],
+    quality: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    website = (
+        metadata.get("website_extraction")
+        if isinstance(metadata.get("website_extraction"), Mapping)
+        else {}
+    )
+    missing_lanes = (
+        source_coverage.get("missing_lanes")
+        or source_coverage.get("missing_source_lanes")
+        or quality.get("missing_source_lanes")
+        or []
+    )
+    request_text = str(
+        metadata.get("request_text")
+        or metadata.get("topic")
+        or " ".join(_compact_search_queries(metadata.get("search_queries")))
+    )
+    extraction_status = str(website.get("status") or "").strip().lower()
+    extraction_required = bool(
+        metadata.get("requires_extraction")
+        or website
+        or metadata.get("website_extraction_summary")
+    )
+    ladder = build_provider_use_ladder(
+        request_text=request_text,
+        missing_source_lanes=[str(item) for item in missing_lanes if str(item).strip()],
+        autonomy_hint=metadata.get("autonomy_hint") or metadata.get("retrieval_hint"),
+        requires_extraction=extraction_required,
+        extraction_quality=extraction_status or None,
+        rendered_diagnostics_requested=bool(metadata.get("rendered_diagnostics_requested")),
+        serper_enabled=bool(metadata.get("serper_enabled")),
+    )
+    return [
+        {
+            "provider": rule.provider,
+            "stage": rule.stage,
+            "use_frequency": rule.use_frequency,
+            "use_now": rule.use_now,
+            "trigger": rule.trigger,
+            "reason_codes": list(rule.reason_codes),
+        }
+        for rule in ladder.rules
+        if rule.use_now
+        or rule.use_frequency
+        in {
+            "always_default",
+            "default_capped",
+            "conditional_deepening",
+            "selected_url_baseline",
+            "specific_fallback",
+            "diagnostic_only",
+            "disabled",
+            "eval_only",
+            "future_boundary",
+        }
+    ]
+
+
+def _compact_source_limits(
+    source_coverage: Mapping[str, Any],
+    quality: Mapping[str, Any],
+) -> dict[str, Any]:
+    missing_lanes = [
+        str(item)
+        for item in (
+            source_coverage.get("missing_lanes")
+            or source_coverage.get("missing_source_lanes")
+            or quality.get("missing_source_lanes")
+            or []
+        )
+        if str(item).strip()
+    ]
+    missing_domains = [
+        str(item)
+        for item in (
+            source_coverage.get("missing_expected_domains")
+            or quality.get("missing_expected_domains")
+            or []
+        )
+        if str(item).strip()
+    ]
+    reasons = quality.get("reasons")
+    reason_values = reasons if isinstance(reasons, list) else []
+    return {
+        "missing_lanes": missing_lanes[:8],
+        "missing_expected_domains": missing_domains[:8],
+        "official_source_present": bool(quality.get("official_source_present")),
+        "needs_search_review": bool(quality.get("needs_search_review")),
+        "source_verification_needed": bool(missing_lanes or missing_domains),
+        "reasons": [str(item) for item in reason_values[:5]],
+    }
 
 
 def _compact_source_triage(value: Any) -> dict[str, Any]:
@@ -808,6 +968,7 @@ def retrieve_company_profile_live(
     search_config = build_shared_search_provider_config(
         requested_provider=requested_provider,
         configured_provider=settings.search_provider,
+        serper_enabled=bool(getattr(settings, "serper_enabled", False)),
         agents_web_search_max_calls=agents_web_search_max_calls,
         agents_web_search_parallel=agents_web_search_parallel,
     )
@@ -1428,6 +1589,7 @@ def build_shared_search_provider_config(
     tavily_search_fallback: bool | None = None,
     exa_search_fallback: bool | None = None,
     exa_search_max_calls: int | None = None,
+    serper_enabled: bool = False,
 ) -> SharedSearchProviderConfig:
     """Resolve the shared live-search policy for search-heavy Keystone agents."""
 
@@ -1435,6 +1597,7 @@ def build_shared_search_provider_config(
         requested_provider=requested_provider,
         configured_provider=configured_provider,
         fallback_provider=fallback_provider,
+        serper_enabled=serper_enabled,
     )
     agents_enabled = _env_bool("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", default=True)
     parallel_agents_enabled = agents_enabled and (
@@ -1896,6 +2059,7 @@ def build_opportunity_search_provider(
         requested_provider=requested_provider,
         configured_provider=settings.search_provider,
         fallback_provider=fallback_provider,
+        serper_enabled=bool(getattr(settings, "serper_enabled", False)),
         agents_web_search_max_calls=agents_web_search_max_calls,
         agents_web_search_parallel=agents_web_search_parallel,
         tavily_search_fallback=tavily_search_fallback,

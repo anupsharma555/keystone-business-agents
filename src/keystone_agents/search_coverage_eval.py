@@ -17,6 +17,7 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, Field
 
 from keystone_agents.source_registry import (
+    PRIMARY_SOURCE_LANES,
     assess_source_coverage,
     classify_source_lanes,
     normalize_domain,
@@ -95,9 +96,16 @@ class SearchCoverageScore(BaseModel):
     missing_expected_domains: list[str] = Field(default_factory=list)
     forbidden_domain_hits: list[str] = Field(default_factory=list)
     primary_source_count: int = 0
+    first_primary_source_rank: int | None = None
+    first_expected_domain_rank: int | None = None
+    top_ranked_domains: list[str] = Field(default_factory=list)
     useful_unique_domain_count: int = 0
     useful_claim_count: int = 0
+    content_result_count: int = 0
+    requires_extraction_followup: bool = False
     stale_or_noisy_result_count: int = 0
+    needs_followup_queries: bool = False
+    suggested_followup_lanes: list[str] = Field(default_factory=list)
     latency_ms: int = 0
     provider_calls: int = 0
     estimated_cost_units: int = 0
@@ -133,6 +141,20 @@ class SearchCoverageEvalReport(BaseModel):
     case_count: int
     results: list[SearchCoverageCaseResult] = Field(default_factory=list)
     summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class SearchProviderDiagnosticSpec(BaseModel):
+    """Human-readable provider role and budget guidance for eval interpretation."""
+
+    role: str
+    promotion_status: str
+    readiness: str
+    budget_class: str
+    default_use: str
+    live_requirement: str
+    benchmark_focus: str
+    next_validation: str
+    promotion_rule: str
 
 
 class SearchCoverageProvider(Protocol):
@@ -293,17 +315,36 @@ def render_search_coverage_eval_report(report: SearchCoverageEvalReport) -> str:
             f"{provider}: lane recall {metrics.get('average_expected_lane_recall', 0):.2f}, "
             f"domain recall {metrics.get('average_expected_domain_recall', 0):.2f}, "
             f"primary {metrics.get('average_primary_source_count', 0):.1f}, "
+            f"first primary rank {metrics.get('average_first_primary_source_rank') or 'n/a'}, "
             f"domains {metrics.get('average_unique_domain_count', 0):.1f}, "
+            f"followups {metrics.get('needs_followup_query_count', 0)}, "
+            f"extraction followups {metrics.get('requires_extraction_followup_count', 0)}, "
+            f"cost units {metrics.get('estimated_cost_units', 0)}, "
             f"p50/p95 {metrics.get('latency_p50_ms', 0)}/"
             f"{metrics.get('latency_p95_ms', 0)} ms, "
             f"errors {metrics.get('error_rate', 0):.2f}"
         )
+    provider_specs = report.summary.get("provider_specs") or {}
+    if provider_specs:
+        lines.extend(["", "## Provider Roles"])
+        for provider in report.providers:
+            spec = provider_specs.get(provider)
+            if not isinstance(spec, Mapping):
+                continue
+            lines.append(
+                "- "
+                f"{provider}: {spec.get('promotion_status')} - {spec.get('role')} "
+                f"({spec.get('budget_class')}; {spec.get('default_use')}; "
+                f"readiness: {spec.get('readiness')})"
+            )
     lines.extend(["", "## Cases"])
     for case_result in report.results:
         best = case_result.summary.get("best_provider_by_lane_recall") or ""
+        followups = case_result.summary.get("suggested_followup_lanes") or []
+        followup_text = f"; follow up {', '.join(followups)}" if followups else ""
         lines.append(
             f"- {case_result.case.id} ({case_result.case.mode}, "
-            f"{case_result.case.category}): best lane recall {best or 'n/a'}"
+            f"{case_result.case.category}): best lane recall {best or 'n/a'}{followup_text}"
         )
     return "\n".join(lines)
 
@@ -367,12 +408,25 @@ def score_search_results(
     ]
     signal_hits = _signal_hits(normalized_results, case.expected_signals)
     diagnosis = list(coverage.diagnosis)
-    if (
+    content_result_count = sum(
+        1 for result in normalized_results if str(result.get("content") or "").strip()
+    )
+    requires_extraction_followup = bool(
         case.requires_extraction
         and normalized_results
-        and not any(str(result.get("content") or "").strip() for result in normalized_results)
-    ):
+        and content_result_count == 0
+    )
+    if requires_extraction_followup:
         diagnosis.append("selected URL extraction required but provider returned snippets only")
+    suggested_followup_lanes = _suggest_followup_lanes(
+        missing_lanes=coverage.missing_lanes,
+        missing_domains=coverage.missing_expected_domains,
+    )
+    if suggested_followup_lanes:
+        diagnosis.append(
+            "run targeted follow-up queries for missing lanes: "
+            + ", ".join(suggested_followup_lanes)
+        )
     if error:
         diagnosis.append(error)
     return SearchCoverageScore(
@@ -388,12 +442,22 @@ def score_search_results(
         missing_expected_domains=list(coverage.missing_expected_domains),
         forbidden_domain_hits=list(coverage.forbidden_domain_hits),
         primary_source_count=coverage.primary_source_count,
+        first_primary_source_rank=_first_primary_source_rank(normalized_results),
+        first_expected_domain_rank=_first_expected_domain_rank(
+            normalized_results,
+            expected_domains=case.expected_domains,
+        ),
+        top_ranked_domains=_top_ranked_domains(normalized_results),
         useful_unique_domain_count=coverage.useful_unique_domain_count,
         useful_claim_count=len(signal_hits),
+        content_result_count=content_result_count,
+        requires_extraction_followup=requires_extraction_followup,
         stale_or_noisy_result_count=_stale_or_noisy_count(
             normalized_results,
             forbidden_domains=coverage.forbidden_domains,
         ),
+        needs_followup_queries=bool(suggested_followup_lanes),
+        suggested_followup_lanes=suggested_followup_lanes,
         latency_ms=latency_ms,
         provider_calls=1,
         estimated_cost_units=1 if provider in PAID_OR_METERED_PROVIDERS else 0,
@@ -459,6 +523,8 @@ def _provider_estimated_cost_units(
     *,
     default: int,
 ) -> int:
+    if getattr(provider_instance, "dry_run", False):
+        return 0
     usage = getattr(provider_instance, "last_credit_usage", None)
     if isinstance(usage, dict):
         try:
@@ -493,12 +559,18 @@ def _search_with_provider(provider: SearchCoverageProvider, case: SearchCoverage
 def _summarize_case(runs: Sequence[SearchCoverageRunResult]) -> dict[str, Any]:
     best_provider = ""
     best_recall = -1.0
+    suggested_followup_lanes: list[str] = []
     for run in runs:
         if run.score.expected_lane_recall > best_recall:
             best_recall = run.score.expected_lane_recall
             best_provider = run.provider
+        for lane in run.score.suggested_followup_lanes:
+            if lane not in suggested_followup_lanes:
+                suggested_followup_lanes.append(lane)
     return {
         "best_provider_by_lane_recall": best_provider,
+        "needs_followup_queries": bool(suggested_followup_lanes),
+        "suggested_followup_lanes": suggested_followup_lanes,
         "providers": _summarize_provider_runs(runs),
     }
 
@@ -508,7 +580,14 @@ def _summarize_eval(case_results: Sequence[SearchCoverageCaseResult]) -> dict[st
     modes: dict[str, int] = defaultdict(int)
     for case_result in case_results:
         modes[case_result.case.mode] += 1
-    return {"case_modes": dict(modes), "providers": _summarize_provider_runs(runs)}
+    return {
+        "case_modes": dict(modes),
+        "provider_specs": {
+            provider: spec.model_dump(mode="json")
+            for provider, spec in build_search_provider_diagnostic_specs().items()
+        },
+        "providers": _summarize_provider_runs(runs),
+    }
 
 
 def _summarize_provider_runs(
@@ -521,6 +600,16 @@ def _summarize_provider_runs(
     for provider, provider_runs in grouped.items():
         scores = [run.score for run in provider_runs]
         latencies = [score.latency_ms for score in scores]
+        first_primary_ranks = [
+            score.first_primary_source_rank
+            for score in scores
+            if score.first_primary_source_rank is not None
+        ]
+        first_expected_domain_ranks = [
+            score.first_expected_domain_rank
+            for score in scores
+            if score.first_expected_domain_rank is not None
+        ]
         error_count = sum(1 for score in scores if score.status == "error" or score.error)
         summary[provider] = {
             "run_count": len(provider_runs),
@@ -535,14 +624,198 @@ def _summarize_provider_runs(
             "average_primary_source_count": _average(
                 score.primary_source_count for score in scores
             ),
+            "average_first_primary_source_rank": round(_average(first_primary_ranks))
+            if first_primary_ranks
+            else None,
+            "average_first_expected_domain_rank": round(_average(first_expected_domain_ranks))
+            if first_expected_domain_ranks
+            else None,
             "average_unique_domain_count": _average(score.unique_domain_count for score in scores),
             "average_useful_claim_count": _average(score.useful_claim_count for score in scores),
+            "content_result_count": sum(score.content_result_count for score in scores),
+            "requires_extraction_followup_count": sum(
+                1 for score in scores if score.requires_extraction_followup
+            ),
+            "needs_followup_query_count": sum(
+                1 for score in scores if score.needs_followup_queries
+            ),
+            "suggested_followup_lanes": sorted(
+                {
+                    lane
+                    for score in scores
+                    for lane in score.suggested_followup_lanes
+                    if lane
+                }
+            ),
             "estimated_cost_units": sum(score.estimated_cost_units for score in scores),
             "latency_p50_ms": _percentile(latencies, 50),
             "latency_p95_ms": _percentile(latencies, 95),
             "repeatability": _repeatability(provider_runs),
         }
     return summary
+
+
+def build_search_provider_diagnostic_specs() -> dict[str, SearchProviderDiagnosticSpec]:
+    """Return provider role and budget guidance without changing runtime defaults."""
+
+    return {
+        "dry-run": SearchProviderDiagnosticSpec(
+            role="fixture-safe contract validation",
+            promotion_status="baseline",
+            readiness="ready for tests and policy checks",
+            budget_class="free/local",
+            default_use="default for tests and dry-run evals",
+            live_requirement="none",
+            benchmark_focus="schema, scoring, artifact writing, and zero-live-call boundaries",
+            next_validation="keep in every provider-policy regression suite",
+            promotion_rule="never a live discovery provider",
+        ),
+        "searxng": SearchProviderDiagnosticSpec(
+            role="local broad-recall discovery baseline",
+            promotion_status="baseline",
+            readiness="ready when repo-local endpoint is reachable",
+            budget_class="free/local",
+            default_use="primary live baseline when live research is enabled",
+            live_requirement="repo-local SearXNG endpoint",
+            benchmark_focus="lane/domain recall, primary-source rank, extraction-needed followups",
+            next_validation=(
+                "rerun targeted official-lane probes before changing broad-search defaults"
+            ),
+            promotion_rule=(
+                "keep as baseline when recall is useful and source attribution is visible"
+            ),
+        ),
+        "exa": SearchProviderDiagnosticSpec(
+            role="semantic deepening and similar-source discovery",
+            promotion_status="experimental_deepening",
+            readiness="configured-provider candidate; not a default fanout",
+            budget_class="configured free-tier or metered",
+            default_use="explicit or policy-capped deepening lane",
+            live_requirement="Exa credentials and live flags",
+            benchmark_focus="semantic/landscape recall and related-source quality over SearXNG",
+            next_validation=(
+                "small no-OpenAI Exa-vs-SearXNG probe if credentials and "
+                "free-tier budget are explicit"
+            ),
+            promotion_rule="promote only with better lane/domain recall without noisy attribution",
+        ),
+        "tavily": SearchProviderDiagnosticSpec(
+            role="research-oriented deepening with local credit accounting",
+            promotion_status="fallback_deepening",
+            readiness="configured-provider candidate with local credit guard",
+            budget_class="free-tier-aware or metered",
+            default_use="explicit or policy-capped deepening lane",
+            live_requirement="Tavily credentials, live flags, and credit preflight",
+            benchmark_focus=(
+                "formal opportunity, grant, trial, RFP, literature, and "
+                "conference lane recall"
+            ),
+            next_validation=(
+                "compare basic-depth Tavily against targeted SearXNG "
+                "official-domain followups"
+            ),
+            promotion_rule="prefer basic depth unless evals prove advanced depth is worth credits",
+        ),
+        "firecrawl": SearchProviderDiagnosticSpec(
+            role="selected-page extraction and optional search provider",
+            promotion_status="explicit_fallback",
+            readiness="fallback candidate for selected pages; search use remains explicit",
+            budget_class="configured free-tier or metered",
+            default_use="explicit extraction/search lane",
+            live_requirement="Firecrawl credentials and live flags",
+            benchmark_focus="blocked/weak selected-page extraction lift over Trafilatura",
+            next_validation="run selected-page Firecrawl-vs-Trafilatura cases before promotion",
+            promotion_rule="promote for extraction only when it improves over Trafilatura",
+        ),
+        "serper": SearchProviderDiagnosticSpec(
+            role="Google-style fallback search",
+            promotion_status="not_recommended",
+            readiness="disabled",
+            budget_class="metered and currently disabled by policy",
+            default_use="disabled unless credits are deliberately restored",
+            live_requirement="Serper credentials plus KEYSTONE_SERPER_ENABLED=true",
+            benchmark_focus="none while disabled",
+            next_validation="restore only after credit availability and policy review",
+            promotion_rule="do not use until credits and policy are reviewed",
+        ),
+        "agents-web-search": SearchProviderDiagnosticSpec(
+            role="OpenAI hosted corroboration lane",
+            promotion_status="capped_fallback",
+            readiness="policy-defined but not used in no-OpenAI diagnostics",
+            budget_class="OpenAI metered",
+            default_use="capped parallel lane only, not increased by this eval",
+            live_requirement="OpenAI SDK credentials and explicit live execution",
+            benchmark_focus="corroboration value per hosted-search call",
+            next_validation="defer until an operator-approved OpenAI live-test budget exists",
+            promotion_rule="do not increase default use without eval evidence and budget approval",
+        ),
+        "brave": SearchProviderDiagnosticSpec(
+            role="future broad-recall boundary",
+            promotion_status="future_boundary",
+            readiness="not implemented",
+            budget_class="unknown/free-tier candidate",
+            default_use="eval boundary only",
+            live_requirement="reviewed adapter not implemented",
+            benchmark_focus="not applicable until adapter exists",
+            next_validation="add adapter/tests before any provider comparison",
+            promotion_rule="requires adapter, credentials, tests, and attribution checks",
+        ),
+        "browserless": SearchProviderDiagnosticSpec(
+            role="future rendered-page extraction boundary, not search",
+            promotion_status="not_search_provider",
+            readiness="not a search provider",
+            budget_class="metered candidate",
+            default_use="eval boundary only",
+            live_requirement="reviewed search adapter not implemented",
+            benchmark_focus="rendered extraction only, not discovery",
+            next_validation="keep out of search-provider evals unless backed by a real search API",
+            promotion_rule="do not promote to search unless backed by a real search index/API",
+        ),
+    }
+
+
+def _suggest_followup_lanes(
+    *,
+    missing_lanes: Sequence[str],
+    missing_domains: Sequence[str],
+) -> list[str]:
+    lanes = [str(lane) for lane in missing_lanes if str(lane).strip()]
+    if not lanes and missing_domains:
+        lanes.append("expected_domain")
+    return list(dict.fromkeys(lanes))
+
+
+def _first_primary_source_rank(results: Sequence[Mapping[str, Any]]) -> int | None:
+    for index, result in enumerate(results, 1):
+        domain = normalize_domain(str(result.get("url") or ""))
+        lanes = {str(item) for item in result.get("source_lanes") or []}
+        if domain.endswith(".gov") or domain.endswith(".edu") or lanes & PRIMARY_SOURCE_LANES:
+            return index
+    return None
+
+
+def _first_expected_domain_rank(
+    results: Sequence[Mapping[str, Any]],
+    *,
+    expected_domains: Sequence[str],
+) -> int | None:
+    domains = [normalize_domain(domain) for domain in expected_domains if str(domain).strip()]
+    if not domains:
+        return None
+    for index, result in enumerate(results, 1):
+        observed = normalize_domain(str(result.get("url") or ""))
+        if any(observed == domain or observed.endswith(f".{domain}") for domain in domains):
+            return index
+    return None
+
+
+def _top_ranked_domains(results: Sequence[Mapping[str, Any]]) -> list[str]:
+    domains: list[str] = []
+    for result in results[:5]:
+        domain = normalize_domain(str(result.get("url") or ""))
+        if domain and domain not in domains:
+            domains.append(domain)
+    return domains
 
 
 def _jsonable_result(result: Any) -> dict[str, Any]:
@@ -676,8 +949,10 @@ __all__ = [
     "SearchCoverageEvalReport",
     "SearchCoverageRunResult",
     "SearchCoverageScore",
+    "SearchProviderDiagnosticSpec",
     "UnsupportedSearchCoverageProvider",
     "build_search_coverage_provider",
+    "build_search_provider_diagnostic_specs",
     "load_search_coverage_cases",
     "normalize_search_coverage_providers",
     "render_search_coverage_eval_report",

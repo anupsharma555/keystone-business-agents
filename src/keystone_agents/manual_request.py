@@ -490,6 +490,19 @@ def _semantic_target_agent(
         return "chief_of_staff"
     if _looks_like_finance_expense_receipt_write(text):
         return "chief_of_staff"
+    if _looks_like_reference_capture_request(lower):
+        return "chief_of_staff"
+    if _looks_like_explicit_business_research_instruction(text):
+        return "business_research_analyst"
+    context_target_agent = _business_context_target_agent(route_text)
+    if context_target_agent == "zotero_context_agent" and _looks_like_zotero_context_request(
+        route_text
+    ):
+        return context_target_agent
+    if looks_like_zotero_article_request(text) or looks_like_zotero_collection_request(text):
+        return "business_research_analyst"
+    if context_target_agent is not None:
+        return context_target_agent
     if _looks_like_research_table_synthesis(route_text):
         return "business_research_analyst"
     if _looks_like_chief_of_staff_operational_request(lower):
@@ -512,10 +525,6 @@ def _semantic_target_agent(
         return "business_research_analyst"
     if looks_like_resume_request(text):
         return "orchestrator"
-    if looks_like_zotero_article_request(text) or looks_like_zotero_collection_request(text):
-        return "business_research_analyst"
-    if _looks_like_explicit_business_research_instruction(text):
-        return "business_research_analyst"
     if _looks_like_orchestrator_owned_workflow(route_text):
         return _workflow_start_agent(route_text)
     if _looks_like_gmail_followup_request(lower):
@@ -721,6 +730,52 @@ def _looks_like_gmail_followup_request(lower: str) -> bool:
     )
 
 
+def _business_context_target_agent(text: str) -> ManualTargetAgent | None:
+    """Resolve explicit business-system context targets without phrase-specific lanes."""
+
+    lower = " ".join(str(text or "").lower().split())
+    if not lower:
+        return None
+    if "airtable" in lower:
+        return "airtable_context_agent"
+    if re.search(
+        r"\b(?:google\s+workspace|google\s+drive|google\s+docs?|google\s+sheets?|"
+        r"gdrive|drive\s+folder|workspace\s+(?:doc|sheet|artifact|folder)|kniops)\b",
+        lower,
+    ):
+        return "google_workspace_context_agent"
+    if re.search(r"\bzotero\b", lower):
+        return "zotero_context_agent"
+    if re.search(
+        r"\b(?:rss\s+context|rss\s+feed|announcement\s+feed|"
+        r"announcements?\s+context|#announcements)\b",
+        lower,
+    ):
+        return "rss_context_agent"
+    if re.search(
+        r"\b(?:preprints?\s+context|preprints?\s+history|preprint\s+history|"
+        r"#knowledge[- ]hub|knowledge\s+hub\s+preprints?)\b",
+        lower,
+    ):
+        return "preprints_context_agent"
+    return None
+
+
+def _looks_like_zotero_context_request(text: str) -> bool:
+    lower = " ".join(str(text or "").lower().split())
+    return bool(
+        "zotero context" in lower
+        or re.search(r"\bzotero\s+context\s+agent\b", lower)
+        or re.search(r"\buse\s+zotero\b[^.\n;]{0,80}\bas\s+context\b", lower)
+        or ("zotero" in lower and re.search(r"\bitem\s+key\b", lower))
+        or re.search(
+            r"\buse\s+the\s+zotero\s+(?:article|paper|item|source|study|trial)\b"
+            r"[^.\n;]{0,160}\bbefore\b",
+            lower,
+        )
+    )
+
+
 def _looks_like_outreach_variant_request(lower: str) -> bool:
     return bool(
         re.search(r"\b(?:create|prepare|draft|write|compose)\b", lower)
@@ -778,11 +833,16 @@ def _looks_like_external_write_side_effect(text: str) -> bool:
     )
     target_object = (
         r"(?:record|row|table|tracker|field|file|doc|document|sheet|folder|attachment|"
-        r"airtable|drive|workspace|gmail\s+draft|slack|crm|calendar|collection|item|library)"
+        r"airtable|drive|workspace|gmail\s+draft|slack|crm|calendar|meeting|event|"
+        r"collection|item|library)"
     )
     return bool(
         re.search(rf"\b{write_verb}\b[\s\S]{{0,100}}\b{target_object}\b", lower)
         or re.search(rf"\b{target_object}\b[\s\S]{{0,100}}\b{write_verb}\b", lower)
+        or re.search(
+            r"\bschedule\b[\s\S]{0,80}\b(?:meeting|event|call|follow-up|follow up)\b",
+            lower,
+        )
     )
 
 

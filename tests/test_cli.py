@@ -16,6 +16,7 @@ from keystone_agents.orchestrator.preflight_context import (
     ORCHESTRATOR_ROUTE_RESULT_ENV,
 )
 from keystone_agents.schemas.work_item import (
+    WorkflowRunRequest,
     WorkflowRunResult,
     WorkItem,
     WorkItemKind,
@@ -70,6 +71,41 @@ def test_cli_promptfoo_agent_eval_mode_disables_eval_helpers(monkeypatch) -> Non
 
     monkeypatch.setenv("KEYSTONE_PROMPTFOO_EVAL", "true")
     assert cli._promptfoo_agent_eval_mode() is True
+
+
+def test_cli_langgraph_helper_preserves_manager_step_limit(monkeypatch) -> None:
+    import keystone_agents.langgraph_workflow as langgraph_workflow
+
+    captured: dict[str, object] = {}
+    graph_result = WorkflowRunResult(
+        work_item=WorkItem(kind=WorkItemKind.RESEARCH_BRIEF, title="Graph result"),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary="Graph path used.",
+    )
+
+    class FakeOutcome:
+        result = graph_result
+
+    def fake_run_work_item_langgraph(request, **kwargs):  # type: ignore[no-untyped-def]
+        captured["request"] = request
+        captured.update(kwargs)
+        return FakeOutcome()
+
+    monkeypatch.setattr(
+        langgraph_workflow,
+        "run_work_item_langgraph",
+        fake_run_work_item_langgraph,
+    )
+    request = WorkflowRunRequest(request_text="@KNI chief of staff summarize eval gaps")
+
+    outcome = cli._run_work_item_langgraph_for_request(request, max_manager_steps=1)
+
+    assert outcome.result is graph_result
+    assert captured["request"] is request
+    assert captured["manager_loop"] is True
+    assert captured["max_manager_steps"] == 1
 
 
 def test_cli_init_db_uses_explicit_database_url(tmp_path: Path, capsys) -> None:

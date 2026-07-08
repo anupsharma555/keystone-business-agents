@@ -18,6 +18,10 @@ Load this reference when changing Keystone SDK agent contracts in
   route-specific builders/tests.
 - WorkItems and lifecycle: `src/keystone_agents/work_items.py`,
   `src/keystone_agents/workflow_runner.py`.
+- Optional LangGraph orchestration: `docs/LANGGRAPH_OPTION.md`,
+  `src/keystone_agents/langgraph_workflow.py`,
+  `src/keystone_agents/langgraph_plan.py`,
+  `src/keystone_agents/langgraph_quality.py`.
 - Orchestrator preflight: `src/keystone_agents/orchestrator/preflight_context.py`.
 
 ## Common Change Lanes
@@ -76,7 +80,10 @@ Use this lane when updating architecture docs or instruction surfaces:
 2. Keep `docs/REPO_REVIEW.md` as the concise snapshot review.
 3. Preserve the distinction between repo policy (`AGENTS.md`), runtime prompts,
    runtime skill bundles, tools, schemas, gates, and tests.
-4. Avoid duplicating the same rule across every layer unless tests require it.
+4. Keep WorkItems/context packs as the canonical business-state contract;
+   LangGraph docs and code describe an optional orchestration backend, not a
+   separate write, route, or approval authority.
+5. Avoid duplicating the same rule across every layer unless tests require it.
 
 ## Focused Validation
 

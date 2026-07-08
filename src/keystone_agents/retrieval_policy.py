@@ -194,6 +194,16 @@ _SCOUT_COMPANY_TERMS = (
     "startup",
     "team",
 )
+_RENDERED_PAGE_ONLY_PROVIDERS = frozenset(
+    {
+        "apify",
+        "browserless",
+        "crawl4ai",
+        "crawl-4-ai",
+        "playwright",
+        "trafilatura",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -253,6 +263,46 @@ class RetrievalProviderUsage:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ProviderUseRule:
+    """One provider's role in the shared retrieval ladder."""
+
+    provider: str
+    stage: str
+    use_frequency: str
+    use_now: bool
+    budget_class: str
+    trigger: str
+    rationale: str
+    reason_codes: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ProviderUseLadder:
+    """Provider-use plan for retrieval diagnostics and dry-run tests."""
+
+    rules: tuple[ProviderUseRule, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "active_providers": list(self.active_providers()),
+            "rules": [rule.to_dict() for rule in self.rules],
+        }
+
+    def rule_for(self, provider: str) -> ProviderUseRule:
+        normalized = _normalize_provider_name(provider)
+        for rule in self.rules:
+            if rule.provider == normalized:
+                return rule
+        raise KeyError(provider)
+
+    def active_providers(self) -> tuple[str, ...]:
+        return tuple(rule.provider for rule in self.rules if rule.use_now)
 
 
 def provider_value_summary(
@@ -373,24 +423,327 @@ def build_provider_sequence(
     requested_provider: str | None,
     configured_provider: str | None = None,
     fallback_provider: str | None = None,
+    serper_enabled: bool = False,
 ) -> tuple[str, ...]:
     """Return the deterministic provider order for the retrieval ladder."""
 
     if requested_provider:
-        providers = [requested_provider]
+        providers = [_normalize_provider_name(requested_provider)]
     else:
-        configured = (configured_provider or "").strip().lower()
-        if configured in ("", SearchProviderName.DRY_RUN.value, SearchProviderName.SEARXNG.value):
-            providers = [SearchProviderName.SEARXNG.value]
-        else:
-            providers = [configured]
-    if (
-        fallback_provider
-        and fallback_provider != SearchProviderName.SERPER.value
-        and fallback_provider not in providers
-    ):
-        providers.append(fallback_provider)
+        providers = [
+            _default_search_provider_name(
+                configured_provider,
+                serper_enabled=serper_enabled,
+            )
+        ]
+    fallback = _fallback_search_provider_name(
+        fallback_provider,
+        serper_enabled=serper_enabled,
+    )
+    if fallback and fallback not in providers:
+        providers.append(fallback)
     return tuple(_dedupe_sequence(providers))
+
+
+def build_provider_use_ladder(
+    *,
+    request_text: str = "",
+    missing_source_lanes: Sequence[str] = (),
+    autonomy_hint: (
+        RetrievalAutonomyHint | RetrievalHint | Mapping[str, Any] | BaseModel | None
+    ) = None,
+    requires_extraction: bool = False,
+    extraction_quality: str | None = None,
+    rendered_diagnostics_requested: bool = False,
+    serper_enabled: bool = False,
+) -> ProviderUseLadder:
+    """Classify provider use as default, conditional, specific, or disabled.
+
+    This is a planning contract, not an execution fanout. It answers which
+    providers should be used routinely and which should only run for evidence
+    gaps, selected-page extraction, diagnostics, or explicit opt-in.
+    """
+
+    text = f" {request_text.strip().lower()} "
+    hint = coerce_retrieval_autonomy_hint(autonomy_hint)
+    missing_lanes = tuple(
+        dict.fromkeys(str(lane).strip().lower() for lane in missing_source_lanes if lane)
+    )
+    extraction_quality_value = str(extraction_quality or "").strip().lower()
+    semantic_request = any(
+        term in text
+        for term in (
+            "similar",
+            "landscape",
+            "competitor",
+            "related companies",
+            "semantic",
+            "deep research",
+        )
+    )
+    formal_research_request = any(
+        term in text
+        for term in (
+            "cfp",
+            "conference",
+            "grant",
+            "literature",
+            "opportunit",
+            "procurement",
+            "rfp",
+            "trial",
+        )
+    )
+    official_lane_gap = any(
+        lane in missing_lanes
+        for lane in (
+            "clinical_trials",
+            "conference_events",
+            "grants_funding",
+            "literature",
+            "procurement_rfp",
+        )
+    )
+    needs_semantic_deepening = (
+        bool(missing_lanes) or semantic_request or bool(hint and hint.needs_structured_enrichment)
+    )
+    needs_research_deepening = (
+        official_lane_gap
+        or formal_research_request
+        or bool(
+            hint
+            and hint.needs_precision_search
+            and (official_lane_gap or formal_research_request)
+        )
+    )
+    extraction_failed_or_weak = extraction_quality_value in {
+        "blocked",
+        "error",
+        "failed",
+        "unreadable",
+        "weak",
+    }
+    needs_rendered_diagnostics = rendered_diagnostics_requested or extraction_quality_value in {
+        "blocked",
+        "unreadable",
+    }
+    search_review_requested = bool(hint and hint.needs_search_review)
+
+    rules = [
+        ProviderUseRule(
+            provider="searxng",
+            stage="discovery",
+            use_frequency="always_default",
+            use_now=True,
+            budget_class="free/local",
+            trigger="every live search-heavy run unless explicitly overridden",
+            rationale="Broad local recall baseline for source-visible discovery.",
+            reason_codes=("default_broad_recall", "source_visible_baseline"),
+        ),
+        ProviderUseRule(
+            provider="agents-web-search",
+            stage="discovery_corroboration",
+            use_frequency="default_capped",
+            use_now=True,
+            budget_class="OpenAI metered",
+            trigger="capped lane beside SearXNG when live hosted search is enabled",
+            rationale="Corroborates broad recall without increasing default hosted-search budget.",
+            reason_codes=("default_capped_corroboration", "openai_metered_cap"),
+        ),
+        ProviderUseRule(
+            provider="exa",
+            stage="semantic_deepening",
+            use_frequency="conditional_deepening",
+            use_now=needs_semantic_deepening,
+            budget_class="configured free-tier or metered",
+            trigger="semantic request or missing source lanes after broad recall",
+            rationale="Use for related-source discovery when broad keyword recall is not enough.",
+            reason_codes=tuple(
+                dict.fromkeys(
+                    [
+                        *(
+                            ("missing_source_lanes",)
+                            if missing_lanes
+                            else ()
+                        ),
+                        *(
+                            ("semantic_or_landscape_request",)
+                            if semantic_request
+                            else ()
+                        ),
+                        *(
+                            ("orchestrator_structured_enrichment",)
+                            if hint and hint.needs_structured_enrichment
+                            else ()
+                        ),
+                    ]
+                )
+            ),
+        ),
+        ProviderUseRule(
+            provider="tavily",
+            stage="research_deepening",
+            use_frequency="conditional_deepening",
+            use_now=needs_research_deepening,
+            budget_class="free-tier-aware or metered",
+            trigger="formal opportunities, grants, trials, RFPs, literature, or conference gaps",
+            rationale="Use for source-rich research deepening with local credit accounting.",
+            reason_codes=tuple(
+                dict.fromkeys(
+                    [
+                        *(
+                            ("formal_research_request",)
+                            if formal_research_request
+                            else ()
+                        ),
+                        *(
+                            ("missing_official_source_lanes",)
+                            if official_lane_gap
+                            else ()
+                        ),
+                        *(
+                            ("orchestrator_precision_search",)
+                            if hint and hint.needs_precision_search
+                            else ()
+                        ),
+                    ]
+                )
+            ),
+        ),
+        ProviderUseRule(
+            provider="trafilatura",
+            stage="selected_page_extraction",
+            use_frequency="selected_url_baseline",
+            use_now=requires_extraction,
+            budget_class="free/local library plus target HTTP request",
+            trigger="after URL selection when page text is needed for claims",
+            rationale="Default extraction baseline before managed or rendered fallbacks.",
+            reason_codes=("selected_url_extraction_baseline",) if requires_extraction else (),
+        ),
+        ProviderUseRule(
+            provider="firecrawl",
+            stage="selected_page_extraction_fallback",
+            use_frequency="specific_fallback",
+            use_now=requires_extraction and extraction_failed_or_weak,
+            budget_class="configured free-tier or metered",
+            trigger="Trafilatura is weak, blocked, or unreadable for a selected URL",
+            rationale="Managed scraping fallback for selected sources, not broad default fanout.",
+            reason_codes=("weak_or_blocked_extraction_fallback",)
+            if requires_extraction and extraction_failed_or_weak
+            else (),
+        ),
+        ProviderUseRule(
+            provider="playwright",
+            stage="rendered_diagnostics",
+            use_frequency="diagnostic_only",
+            use_now=needs_rendered_diagnostics,
+            budget_class="local compute",
+            trigger="visible/rendered-page diagnostics are requested or extraction is blocked",
+            rationale="Read-only diagnostics for JS/rendering failures, not production extraction.",
+            reason_codes=tuple(
+                dict.fromkeys(
+                    [
+                        *(
+                            ("rendered_diagnostics_requested",)
+                            if rendered_diagnostics_requested
+                            else ()
+                        ),
+                        *(
+                            ("blocked_or_unreadable_extraction",)
+                            if extraction_quality_value in {"blocked", "unreadable"}
+                            else ()
+                        ),
+                        *(
+                            ("orchestrator_search_review_not_rendered_browser",)
+                            if search_review_requested and not needs_rendered_diagnostics
+                            else ()
+                        ),
+                    ]
+                )
+            ),
+        ),
+        ProviderUseRule(
+            provider="serper",
+            stage="search_fallback",
+            use_frequency="specific_opt_in" if serper_enabled else "disabled",
+            use_now=False,
+            budget_class="metered",
+            trigger=(
+                "explicit configured fallback after credits are restored"
+                if serper_enabled
+                else "disabled until KEYSTONE_SERPER_ENABLED=true"
+            ),
+            rationale="Google-style fallback remains off unless credits and policy are restored.",
+            reason_codes=("serper_explicitly_enabled",)
+            if serper_enabled
+            else ("serper_disabled_no_credits",),
+        ),
+        ProviderUseRule(
+            provider="browserless",
+            stage="rendered_extraction_boundary",
+            use_frequency="eval_only",
+            use_now=False,
+            budget_class="metered candidate",
+            trigger="eval evidence and safety boundaries are implemented",
+            rationale="Not a search provider and not production extraction yet.",
+            reason_codes=("rendered_provider_eval_only",),
+        ),
+        ProviderUseRule(
+            provider="apify",
+            stage="future_extraction_boundary",
+            use_frequency="future_boundary",
+            use_now=False,
+            budget_class="metered candidate",
+            trigger="reviewed adapter, tests, credentials, and attribution checks",
+            rationale="Keep out of live retrieval until a reviewed adapter exists.",
+            reason_codes=("future_adapter_boundary",),
+        ),
+        ProviderUseRule(
+            provider="crawl4ai",
+            stage="future_extraction_boundary",
+            use_frequency="future_boundary",
+            use_now=False,
+            budget_class="local or self-hosted candidate",
+            trigger="reviewed adapter and repeatable quality evidence",
+            rationale="Potential local extraction path, but not enabled as a provider today.",
+            reason_codes=("future_adapter_boundary",),
+        ),
+    ]
+    return ProviderUseLadder(tuple(rules))
+
+
+def _default_search_provider_name(
+    value: str | None,
+    *,
+    serper_enabled: bool,
+) -> str:
+    provider = _normalize_provider_name(value)
+    if provider in ("", SearchProviderName.DRY_RUN.value, SearchProviderName.SEARXNG.value):
+        return SearchProviderName.SEARXNG.value
+    if provider == SearchProviderName.SERPER.value and not serper_enabled:
+        return SearchProviderName.SEARXNG.value
+    if provider in _RENDERED_PAGE_ONLY_PROVIDERS:
+        return SearchProviderName.SEARXNG.value
+    return provider
+
+
+def _fallback_search_provider_name(
+    value: str | None,
+    *,
+    serper_enabled: bool,
+) -> str:
+    provider = _normalize_provider_name(value)
+    if not provider:
+        return ""
+    if provider == SearchProviderName.SERPER.value and not serper_enabled:
+        return ""
+    if provider in _RENDERED_PAGE_ONLY_PROVIDERS:
+        return ""
+    return provider
+
+
+def _normalize_provider_name(value: str | None) -> str:
+    return str(value or "").strip().lower().replace("_", "-")
 
 
 def assess_company_search_quality(

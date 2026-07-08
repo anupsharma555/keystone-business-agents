@@ -5098,7 +5098,10 @@ def _run_work_items_advance(args: argparse.Namespace) -> int:
         else should_use_langgraph_for_work_item(request, manager_loop=True)
     )
     if use_langgraph:
-        outcome = _run_work_item_langgraph_for_request(request)
+        outcome = _run_work_item_langgraph_for_request(
+            request,
+            max_manager_steps=args.max_manager_steps,
+        )
         result = outcome.result
         graph_metadata = _work_item_langgraph_metadata(outcome)
     else:
@@ -5119,14 +5122,23 @@ def _work_item_preflight_requested_agent(work_item: WorkItem | None) -> str | No
     return route.value
 
 
-def _run_work_item_langgraph_for_request(request: WorkflowRunRequest):
+def _run_work_item_langgraph_for_request(
+    request: WorkflowRunRequest,
+    *,
+    max_manager_steps: int = 3,
+):
     from keystone_agents.langgraph_workflow import (
         run_work_item_langgraph,
         work_item_graph_thread_id,
     )
 
     thread_id = work_item_graph_thread_id(request.work_item_id or "")
-    return run_work_item_langgraph(request, thread_id=thread_id or None)
+    return run_work_item_langgraph(
+        request,
+        thread_id=thread_id or None,
+        manager_loop=True,
+        max_manager_steps=max_manager_steps,
+    )
 
 
 def _work_item_langgraph_metadata(outcome) -> dict:
@@ -5136,7 +5148,9 @@ def _work_item_langgraph_metadata(outcome) -> dict:
         "checkpoint_required": outcome.checkpoint_required,
         "checkpoint_reason": outcome.checkpoint_reason,
         "checkpoint_key": outcome.checkpoint_key,
-        "node_path": outcome.node_path,
+        "node_path": [
+            node for node in outcome.node_path if node != "manager_loop_finalize"
+        ],
         "improvements": outcome.improvements,
     }
 

@@ -8,6 +8,11 @@ The benchmarking additions are based on current agent-evaluation guidance and pu
 
 Make Orchestrator the consistent first reasoning layer for Slack, CLI, WorkItems, automations, and explicit agent mentions. It should interpret the raw request, identify the objective, route or plan the work, and pass compact guidance to specialists while Python gates remain authoritative for approvals, safety, and side effects.
 
+Milestone definition: ANU-193 is the Orchestrator read/write/modify contract.
+It is complete when Orchestrator can read compact request/state/context, write
+planning and review metadata, and modify internal route plans after feedback or
+failed validation without becoming a hidden executor or provider mutation owner.
+
 ## 2. Request Understanding Before Execution
 
 Every meaningful request should be interpreted for objective, target, constraints, missing context, risk, required tools, and expected output shape before specialist execution begins. This is the foundation for better routing, fewer wrong-lane answers, and more useful blocked states.
@@ -53,6 +58,12 @@ For workflows that read or write local state, evaluate the final SQLite, WorkIte
 ## 9. Seamless Cross-Agent Handoffs
 
 Research, Opportunity Scout, Outreach, Gmail, Chief of Staff, and Orchestrator should pass structured context through WorkItems, context packs, artifact refs, source refs, blockers, approval gates, and prior run summaries without losing the original user request or downstream intent.
+
+Milestone definition: ANU-124 and ANU-194 make Chief of Staff the predictable
+manager for broad goals while preserving structured `durable_handoff.agent` and
+`context_handoffs` as the durable handoff surface. Agents-as-tools remain
+advisory/read-plan unless a future approved nested-write contract explicitly
+changes that boundary.
 
 ## 10. Reliable Context Selection
 
@@ -109,6 +120,12 @@ Let the user start in Slack, continue in CLI, approve through a WorkItem, and la
 ## 23. OpenAI Agents SDK Alignment
 
 Keep the repo standardized around top-level OpenAI Agents SDK patterns: SDK `Agent` builders, tools, structured outputs, guardrails, handoffs, sessions, tracing, approval patterns, and agents-as-tools where useful. Avoid custom orchestration that duplicates SDK primitives without a clear project-specific reason.
+
+Milestone definition: backend graph selection belongs to WorkItem execution
+policy. It chooses simple runner versus LangGraph for structural workflow
+boundaries; it does not choose business substance, grant write permission, or
+replace Orchestrator preflight, Chief manager planning, context packs, approval
+gates, or specialist ownership.
 
 ## 24. Tool Surfaces That Match Agent Jobs
 
