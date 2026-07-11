@@ -72,26 +72,26 @@ the case still needs a recorded operator smoke result.
 
 | ID | Current coverage | Coverage lane | Next offline validation | Future live probe |
 | --- | --- | --- | --- | --- |
-| SMK-01 | Orchestrator decomposition, WorkItem handoffs, NeuroFlow research, and draft-only outreach gates have automated coverage, but this exact research-then-draft ask still needs a recorded natural-prompt result. | automated + dry-run | Add one no-live WorkItem smoke that routes research first, then allows draft-only outreach only if approved context exists. | Optional one live SDK route-review after offline pass; no Slack post, Gmail draft, send, or external write. |
-| SMK-02 | Chief of Staff WorkItem and Slack-thread advisory paths are covered, but selected Slack-thread proof is still mostly manual. | automated + manual | Use pasted sanitized thread context and assert summary, safest next step, and no-post boundary. | Worth one read-only selected Slack-thread probe once a real test thread is chosen. |
+| SMK-01 | Recorded no-live WorkItem/graph proof routes research before draft-only Outreach and preserves the approval checkpoint with no send, post, Gmail draft, or external write. | automated + recorded no-live | Reuse the recorded graph proof; rerun only after shared routing, handoff, or approval-checkpoint changes. | Optional one live SDK route review over supplied sources; no provider writes. |
+| SMK-02 | Recorded selected-thread fixture proof keeps Chief of Staff as manager, returns a bounded synthesis and safest next step, and does not post outside the response. | automated + recorded no-live | Reuse the sanitized selected-thread proof; rerun only after Chief ownership or Slack-context changes. | One bounded read-only real-thread probe remains worthwhile. |
 | SMK-03 | NeuroFlow company research appears in automated route, context-pack, and source-attribution fixtures. | automated + fixture | Run the exact short-note ask through the no-live WorkItem or named-agent path and record source proof. | Worth one current live-search/read probe if source freshness is part of signoff. |
-| SMK-04 | Multi-target research is covered by local evals and tests, but not for this exact NeuroFlow/Headway/Spring Health comparison. | automated + dry-run | Add/source a fixture comparison for the three named companies and assert distinct per-company takeaways. | Worth one live read/search probe because current company facts can drift. |
+| SMK-04 | Recorded source-provided comparison proof preserves the supplied NeuroFlow, Headway, and Spring Health evidence and distinct per-company takeaways. | automated + recorded no-live | Reuse the fixed-source comparison proof; rerun only after multi-target or source-preservation changes. | A current live read/search probe is optional when freshness matters. |
 | SMK-05 | Opportunity Scout source-provided ranking, weak-match handling, and no-write recommendation behavior have automated coverage. | automated + fixture | Reuse source-backed opportunity rows and record recommendation-only output. | Not a priority; live SDK synthesis is optional over the same rows. |
 | SMK-06 | Broad opportunity requests and missing-scope blockers are covered in no-live tests. | automated + dry-run | Record the exact broad weekly-opportunity ask and require a useful source-context blocker when no current evidence is provided. | Defer until the operator supplies geography/source scope or approves live search. |
 | SMK-07 | Approved inline context, Example Health-style outreach, and no Gmail draft/send boundaries have automated coverage. | automated + fixture | Record the exact approved-context draft ask and require draft-only output plus review notes. | Optional copy-quality check only; no provider writes. |
-| SMK-08 | Outreach revision and variant helpers are covered, including shorter/tone changes, but this standalone natural revision ask needs a smoke record. | automated + fixture | Use a pasted draft fixture and assert the revised copy keeps the same facts, removes unsupported personalization, and does not send. | Optional live SDK revision-quality check after offline pass. |
+| SMK-08 | Recorded pasted-draft proof makes the copy shorter and warmer while preserving approved facts, rejecting unsupported personalization, and producing no provider side effect. | automated + recorded no-live | Reuse the approved-context revision proof; rerun only after Outreach revision or claim-validation changes. | Optional live SDK revision-quality check with no provider write. |
 | SMK-09 | Pasted email fixture triage, action-item extraction, and reply-needed assessment have automated coverage. | automated + fixture | Record the exact pasted-email ask through no-live Gmail Triage. | Not needed unless testing Gmail connector read access. |
 | SMK-10 | Gmail `get_thread` and read-only CLI behavior have fake-tool tests, but live most-recent-thread selection needs manual proof. | automated + manual | Add a fake GmailTool smoke for the date/window/non-newsletter selection and no-draft reply suggestion. | Worth one read-only Gmail probe; no Gmail draft creation. |
-| SMK-11 | Calendar write blocking exists in Chief/Slack capability tests, while Gmail-to-calendar staged event extraction is not yet a focused smoke. | partial + manual | Use pasted email with a meeting time and assert staged event details or an exact calendar-integration blocker. | Defer until the offline staged-plan contract is explicit; later read-only Gmail plus write-gated calendar blocker is worthwhile. |
+| SMK-11 | Recorded no-live proof returns the exact `gmail_context_required` blocker when no selected email is supplied and performs no draft, send, schedule, or Calendar mutation. | automated + recorded no-live | Reuse the exact blocker proof; add staged extraction only when a selected-email fixture is part of the requested contract. | A joined read-only Gmail selection plus explicitly scoped Calendar write remains a separate live task. |
 | SMK-12 | Airtable Context has read-only schema/table tests, no-live finance-topic routing, and prior live-read rows. | automated + dry-run | Record the exact current-quarter finance tracker ask with table and field basis from fixture or dry-run context. | Worth one read-only Airtable probe to prove current table/field access. |
 | SMK-13 | Receipt-to-Airtable write-plan handling and receipt attachment/write gates have automated Chief coverage. | automated + fixture | Use pasted receipt text and assert field mapping plus review-only write plan. | Defer writes; a read-only Airtable schema probe is useful before any approved write-gated test. |
 | SMK-14 | Google Workspace Context has read-only formatter/tool tests and prior KNIOps live-read rows, but exact doc selection still needs smoke proof. | automated + dry-run | Record blocker behavior when no document is selected, then fixture a bounded onboarding/research-notes doc summary. | Worth one read-only KNIOps doc probe; no file creation or edits. |
-| SMK-15 | Workspace write boundaries are covered, but pasted-note-to-brief-outline is not yet a focused smoke. | partial + fixture | Add a pasted research-note fixture and assert one-page outline output with no Drive write. | Do not spend live write budget until the offline artifact-plan path is clean. |
+| SMK-15 | Recorded artifact-plan proof turns pasted research-note context into a bounded brief plan while keeping Drive/Docs mutation approval-gated. | automated + recorded no-live | Reuse the artifact-plan proof; rerun only after Workspace ownership or write-gate changes. | Exact approved Doc creation/read-back is a separate live task. |
 | SMK-16 | Zotero Context has a repeatable local fixture for collection `KNI Collections - Behavioral Health AI Validation`, item key `ITEM1`, and article title `Measurement-based care AI evaluation`. | automated + fixture | Record the exact ask and require the item key plus evidence limitations. | Optional local/live Zotero read of a resolved real item key. |
-| SMK-17 | LangGraph/context tests cover preprints/Zotero-to-research patterns, but this exact Zotero article plus NeuroFlow comparison is not yet recorded. | automated + dry-run | Add a no-live handoff smoke that passes `ITEM1` context into Business Research and compares changed vs unchanged takeaways. | Worth one live search/read after the real Zotero item key resolves. |
+| SMK-17 | Recorded LangGraph proof stages exact Zotero context before Business Research and preserves the source identity through the handoff. | automated + recorded no-live | Reuse the typed handoff proof; rerun only after Zotero context-pack or graph-ordering changes. | Provider-backed handoff is already proven separately; repeat only if its contract changes. |
 | SMK-18 | Preprints Context has route/output, parser, renderer, and Promptfoo no-live coverage. | automated + dry-run | Record the exact clinical AI psychiatry preprints ask with fixture feed evidence and preliminary-evidence caveats. | Worth one current preprints probe after RSS/preprints Slack rendering is confirmed. |
 | SMK-19 | RSS Context has route/output, renderer, and Promptfoo no-live coverage; Slack rendering remains the main known gap. | automated + dry-run | Record the exact feeds/action-items ask through dry-run RSS context and assert no-post language. | Defer live feed/Slack probe until sibling Slack rendering supports `RssContextResult`. |
-| SMK-20 | Chief/local KNI document policy and prompt-contract coverage exist, but capability-statement retrieval needs local-index proof or a clear blocker. | partial + manual | Add a sanitized local-document fixture or local-index availability check that returns evidence paths or an exact unavailable-index blocker. | No external live provider; validate local-only when the index/source folder is available. |
+| SMK-20 | Recorded local-only proof returns evidence paths when the bounded source resolves and an exact local-source blocker when it does not, without hosted retrieval or external writes. | automated + recorded no-live | Reuse the evidence/blocker proof; rerun only after local retrieval, ranking, or evidence-path changes. | No external live provider is required for this smoke contract. |
 
 ## Major Milestones
 
@@ -100,15 +100,15 @@ the case still needs a recorded operator smoke result.
   Google Workspace Context, Zotero Context, RSS Context, and Preprints Context
   all have at least route-family coverage in automated, dry-run, fixture, or
   documented prior live-read form.
-- Main uncovered gaps: exact natural-prompt smoke records are still missing for
-  several cross-agent asks, especially SMK-01, SMK-02, SMK-04, SMK-08, SMK-11,
-  SMK-15, SMK-17, and SMK-20. These should be closed with normal route/gate
-  assertions, not prompt-specific deterministic shortcuts.
-- Next offline tests: add focused no-live WorkItem or named-agent smokes for
-  research-to-draft decomposition, selected-thread summary, multi-company
-  comparison, outreach draft revision, Gmail-to-calendar staged event details,
-  pasted research-note outline, Zotero-to-Business-Research handoff, and local
-  KNI document evidence/blocker behavior.
+- The previously missing no-live proof for SMK-01, SMK-02, SMK-04, SMK-08,
+  SMK-11, SMK-15, SMK-17, and SMK-20 is now recorded in
+  `docs/AI_AGENTS_WORKFLOW_NO_LIVE_VALIDATION.md`. The evidence uses current
+  `ai-agents-workflow` WorkItem/graph contracts, not the pre-graph Promptfoo
+  suite.
+- Current offline fixes preserve source-provided comparison/claim evidence,
+  Chief advisory ownership, route-taxonomy semantics, approved draft-revision
+  context, Gmail/calendar blocking, Workspace artifact planning,
+  Zotero-to-research staging, and local KNI evidence/blocker behavior.
 - Future live probes worth budget: one read-only Slack selected-thread probe,
   one read-only Gmail thread probe, one read-only Airtable current-quarter
   probe, one read-only KNIOps Drive document probe, one current source-backed
@@ -133,7 +133,17 @@ For each smoke result, record:
 
 ## Resolution Boundary
 
+The separate 20-row list in Linear issue ANU-174 is reconciled in
+`docs/ANU174_LINEAR_TASK_EVIDENCE.md`. It is authoritative for Linear task
+completion; this repository's `SMK-01` through `SMK-20` evidence cannot close
+those differently numbered Linear rows by proxy.
+
 ANU-174 can be considered ready for resolution when this queue has at least one
 recorded offline result per route family, the write-gated prompts visibly stop
 before mutation, and the remaining live cases are queued with exact connector
 requirements and scoped approval needs.
+
+That offline boundary is now met. ANU-174 remains `validation/live-required`
+until its separately queued read-only connector probes are approved and run; it
+does not require the future 102-case Promptfoo migration to complete its basic
+function smoke contract.

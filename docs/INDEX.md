@@ -22,6 +22,18 @@ Start here when changing or operating the repository.
   unresolved decisions, and test acceptance criteria.
 - `docs/BASIC_AGENT_EXECUTION_SMOKE_TASKS.md`: concise ANU-174 operator smoke
   queue with offline, live-read, and write-gated validation lanes.
+- `docs/ANU174_LINEAR_TASK_EVIDENCE.md`: exact row-by-row evidence map for the
+  distinct 20 tasks listed in Linear issue ANU-174.
+- `docs/HUMAN_AGENT_EXECUTION_JOBS.md`: natural user jobs across every agent,
+  with reasoning, execution, modification, verification, and cleanup proof.
+- `docs/AGENT_OPERATIONAL_VALIDATION_STATUS.md`: evidence-backed status for
+  every agent family across interpretation, tool/provider execution, reasoning,
+  lifecycle, safety, continuation, and next proof.
+- `docs/INITIAL_OPERATIONAL_MODEL_VALIDATION.md`: plan-only first paid batch,
+  fresh billing-baseline requirement, exact request estimate, and hard stops.
+- `docs/AI_AGENTS_WORKFLOW_NO_LIVE_VALIDATION.md`: current pre-live proof gate
+  for basic agent functions and backend-selected graph runs; the legacy
+  Promptfoo suite is explicitly deferred for future migration.
 - `docs/DIFFERENTIATION_MATRIX.md`: ANU-175 comparison and validation matrix
   defining how KBA should differ from ChatGPT and Codex.
 - `docs/VISUAL_CONTEXT.md`: repo-local architecture visuals for operator and agent context.

@@ -4,6 +4,13 @@ This is the short operator runbook. The fuller local-first deployment guide is `
 
 Default posture: dry-run first, draft-only, approval required, no PHI, no auto-send, and no secrets in the repo.
 
+For a bounded Gmail provider lifecycle, use
+`scripts/run_gmail_test_draft_lifecycle.py`. Its live mode creates one marked
+draft, reads it back, updates the same draft ID, reads it back again, deletes
+only that marked test draft, and verifies absence. It never sends. Live cleanup
+also requires `KEYSTONE_GMAIL_ALLOW_TEST_DRAFT_DELETES=true`; provide account
+and recipient values at runtime rather than storing them in the repository.
+
 For publishing local changes to GitHub, use `docs/GITHUB_UPDATE_RUNBOOK.md`.
 
 ## Local Setup
@@ -229,6 +236,25 @@ or review flag, repair the missing provenance from the bounded evidence packet
 and preserve the answer. Only fall back to the deterministic planner when the
 live output is unrelated, unsafe, or structurally unusable; planner text should
 not become the user-facing answer for a normal local-document QA request.
+
+For the bounded ANU-174 capability-statement proof, validate source readiness
+without a model using `npm run run:local-kni-capability-summary`. Live mode is
+one no-tool `gpt-5.4-mini` request with a `$0.05` ceiling and requires
+`--live-sdk --approve-private-context`; obtain explicit approval before sending
+the five guarded local-document excerpts to OpenAI. This private-context lane
+forces `store=false`, in-memory prompt caching, disabled SDK tracing, and no
+sensitive trace content. It uses local retrieval and attaches no hosted file
+search, web search, remote MCP, background execution, or provider-write tools.
+Keep private KNI material out of hosted vector stores by default because files
+and vector-store application state persist until deleted and those endpoints
+are not Zero Data Retention eligible. OpenAI API inputs are not used for model
+training by default, but default API abuse-monitoring logs may retain customer
+content for up to 30 days. For stronger organizational controls, apply for
+Modified Abuse Monitoring or Zero Data Retention and configure the approved
+setting under Platform organization/project data controls. A Codex managed
+execution denial is separate from this KBA contract; do not weaken or disguise
+the payload to bypass it. Run the reviewed command from the trusted operator
+runtime or use a local model when that launch boundary applies.
 
 ## WorkItem Natural-Language Smoke Test
 
@@ -987,6 +1013,14 @@ remain canonical. Scoped Airtable record reads/writes use typed tools and requir
 allowed tables, explicit live flags, write env gates, and an approval or command
 audit reference.
 
+To join an atomically persisted Business Research result to a disposable Google
+Doc proof, use `npm run run:research-doc-lifecycle -- --input <result.json>` for
+dry-run validation. Live execution additionally requires
+`--live-google-workspace --no-dry-run`, the test-lifecycle environment gate, and
+an exact approval reference. The runner creates, reads, modifies, rereads,
+trashes, and verifies one marked document while persisting hashes rather than
+the research body.
+
 Finance/tax tracker setup for `2026 Finance & Tax Tracker`:
 
 ```bash
@@ -995,6 +1029,7 @@ Finance/tax tracker setup for `2026 Finance & Tax Tracker`:
 # AIRTABLE_ACCESS_TOKEN=pat...
 # AIRTABLE_ALLOWED_TABLES="Business Income,Business Expenses,Personal Income,Personal Expenses,Tax Payments"
 # AIRTABLE_WRITE_DRY_RUN=true
+# AIRTABLE_ALLOW_TEST_DELETES=false
 # AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=false
 
 .venv/bin/python scripts/run_chief_of_staff.py \
@@ -1016,6 +1051,12 @@ use them as final tax advice. Tracker semantics should be captured in
 the preferred expense amount, `Tax Payments` are excluded from expense totals
 unless explicitly requested, and the default tax profile is U.S. federal,
 Pennsylvania, and Philadelphia.
+
+Disposable lifecycle validation may additionally set
+`AIRTABLE_ALLOW_TEST_DELETES=true` for one approved process. The cleanup tool
+requires an exact record ID and provider read-back of the literal
+`KBA_TEST_RECORD` marker before deletion, then verifies the record is absent.
+It cannot delete ordinary records or perform bulk cleanup.
 
 First scheduled job should be weekly Opportunity Scout dry-run with local audit storage:
 

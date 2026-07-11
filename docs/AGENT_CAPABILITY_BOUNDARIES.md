@@ -4,11 +4,14 @@ This note is the repo-local contract for ANU-193, ANU-194, and ANU-124. It
 defines what Orchestrator and Chief of Staff may read, write, and modify as KBA
 adds broader manager workflows.
 
-It does not grant new live provider authority. Provider sends, posts, schedules,
-CRM/Airtable writes, Gmail drafts, Google Workspace mutations, Zotero imports,
-and Slack broadcast changes still require the owning specialist or approved
-action handler, explicit live flags, exact target scope, and a human approval
-reference.
+An authenticated direct operator command is the human approval reference for
+the exact supported operation and target it names. Provider sends, posts,
+schedules, CRM/Airtable writes, Gmail drafts, Google Workspace mutations,
+Zotero imports, and Slack broadcast changes still require the owning specialist
+or approved action handler, explicit live flags, exact target scope, typed tool
+support, provider read-back, and an audit reference derived from or supplied by
+that command. Approval does not expand to inferred targets, bulk changes,
+schema mutations, or unrelated side effects.
 
 ## Control-Plane Split
 
@@ -172,7 +175,10 @@ edges, approval requirements, blocked mutations, and validation gates.
 The short rule is: context agents stage bounded evidence and write plans by
 default. Airtable and Google Workspace may execute direct internal writes only
 as selected top-level agents with exact target identity, approval reference, and
-live flags. Zotero library mutation stays behind the guarded importer path.
+live flags. Ordinary Zotero library mutation stays behind the guarded importer
+path; the sole native exception is a versioned disposable note containing
+`KBA_TEST_NOTE`, with approval, a dedicated live flag, read-back verification,
+and cleanup.
 RSS and Preprints remain read-only until a separate feed/library management
 contract exists.
 

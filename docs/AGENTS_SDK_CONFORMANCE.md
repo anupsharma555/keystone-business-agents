@@ -52,6 +52,22 @@ concept in an explicit local boundary.
   setup preview, and real execution requires `execute=True` with either
   credential-gated `live=True` or an injected fake/local runner for tests.
 
+## Architecture Fitness Check
+
+`tests/test_architecture.py` keeps SDK execution on a small, reviewed allowlist.
+New modules may not call `Runner.run`, `Runner.run_sync`, `run_sdk_sync`, or
+`run_typed_sdk_sync` directly. The central SDK wrapper, typed live-synthesis
+bridge, legacy CLI adapter, and separately gated sandbox boundary are the current
+accepted exceptions. Add an allowlist entry only when a new execution boundary
+is intentional, documented, cost/trace aware, and covered by focused tests; do
+not update the allowlist merely to silence a failing architecture check.
+
+Run the check locally without credentials or network access:
+
+```bash
+.venv/bin/python -m pytest tests/test_architecture.py -q
+```
+
 ## 2026 SDK Review Follow-Up
 
 The current SDK and public-implementation review lives in

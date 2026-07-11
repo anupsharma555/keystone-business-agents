@@ -11,5 +11,9 @@ adding phrase-specific planner branches for each prompt.
 
 Focused coverage lives in `tests/test_target_action_matrix.py`. The tests
 assert that the manual planner preserves the expected target action, keeps
-approval-required actions draft/read-only or write-plan-only, and blocks
-unsupported post/schedule/write requests before any live side effect.
+approval-required actions draft/read-only or typed internal-write-plan only,
+and blocks unsupported or underspecified post/schedule/write requests before
+any live side effect. An authenticated exact internal write ask may proceed only
+through the owning typed tool with provider flags, unique target identity,
+approval reference, and read-back evidence; the matrix does not itself execute
+provider mutations.

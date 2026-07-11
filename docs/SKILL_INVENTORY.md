@@ -55,16 +55,16 @@ bypass source, approval, cost, dry-run, no-send, or no-write gates.
 | `data_schema_mapping` | Keep | Current schema-read, model-map, helper-validate, bounded-write contract remains aligned. |
 | `evidence_attribution_and_claim_mapping` | Keep | Current claim/source mapping contract preserves source attribution and uncertainty. |
 | `gmail_triage_specialist_contracts` | Keep | Current Gmail triage contract remains draft-only and approval-gated. |
-| `google_workspace_context_specialist_contracts` | Keep | Context-agent Workspace write language is bounded by direct selection, exact identity, approval references, and live-write gates; nested Chief calls remain advisory. |
+| `google_workspace_context_specialist_contracts` | Keep | Workspace writes are bounded by direct selection, exact identity, approval/live gates, and verified marked-Sheet lifecycle cleanup; nested Chief calls remain advisory. |
 | `handoff_contract_packaging` | Keep | Current compact handoff contract preserves source, approval, and blocker state. |
 | `identity_and_record_resolution` | Keep | Current entity/record matching contract prevents silent merges. |
 | `opportunity_scout_specialist_contracts` | Keep | Current opportunity discovery contract avoids outreach generation and requires validation. |
 | `orchestrator_specialist_contracts` | Update now | Refreshed to name WorkItems/context packs and optional LangGraph manager flow without letting route advice bypass Python gates. |
 | `outreach_composer_specialist_contracts` | Keep | Current outreach drafting contract remains draft-only, source-backed, and approval-gated. |
-| `preprints_context_specialist_contracts` | Keep | Current preprint context contract is read/context oriented and blocks unsupported claims. |
+| `preprints_context_specialist_contracts` | Keep | Current preprint context contract supports the allowlisted linked discovery-store read in SQLite read-only mode and blocks unsupported claims. |
 | `prior_work_and_duplicate_checking` | Keep | Current prior-work contract avoids brittle duplicate blockers. |
 | `request_to_specialist_brief` | Keep | Current brief-expansion contract preserves raw request, route authority, and permission gates. |
-| `rss_context_specialist_contracts` | Keep | Current RSS context contract is read/context oriented and blocks posting/scraping overreach. |
+| `rss_context_specialist_contracts` | Keep | Current RSS context contract supports the explicitly live-gated structured Slack history read while blocking posting, modification, and browser-scraping overreach. |
 | `source_triage_decision` | Keep | Current source-selection contract aligns with live-search, extraction, source gaps, and cost-aware deepen/broaden behavior. |
 | `structured_output_quality_review` | Keep | Current final-output review contract preserves schema, source, approval, and action-state checks. |
 | `tool_result_resilience` | Keep | Current provider/tool failure contract preserves diagnostics without unsafe inference. |
@@ -72,7 +72,7 @@ bypass source, approval, cost, dry-run, no-send, or no-write gates.
 | `workflow_lifecycle_tracking` | Update now | Refreshed applicable-agent text to match metadata and current WorkItem lifecycle scope. |
 | `workspace_artifact_governance` | Keep | Current internal artifact governance preserves approval, source, and no external-write boundaries. |
 | `writing_style_adaptation` | Keep | Current writing-style contract stays draft-only and does not add unsupported facts. |
-| `zotero_context_specialist_contracts` | Keep | Current Zotero context/importer contract blocks native Zotero mutation and keeps nested Chief calls advisory. |
+| `zotero_context_specialist_contracts` | Keep | Zotero context/importer contract blocks ordinary native mutation, permits only versioned `KBA_TEST_NOTE` lifecycles, and keeps nested Chief calls advisory. |
 
 ## Agent Coverage Check
 

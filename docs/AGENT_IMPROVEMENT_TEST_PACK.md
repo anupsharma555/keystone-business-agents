@@ -129,6 +129,7 @@ The executable spec registry currently contains these harness IDs:
 - `OS-1`, `OS-2`, `OS-3`, `OS-4`, `OS-5`
 - `OC-1`, `OC-2`, `OC-3`, `OC-4`, `OC-5`
 - `OR-1`, `OR-2`, `OR-3`, `OR-4`, `OR-5`
+- `COS-1`, `COS-2`, `COS-3`, `COS-4`, `COS-5`
 
 This snapshot is intentionally separate from behavior-level pass/fail status.
 It means the case exists in `src/keystone_agents/test_pack_specs.py` and has
@@ -162,9 +163,13 @@ eval row, local JSONL eval, or documented live smoke test.
 
 Existing executable IDs should remain stable unless the spec registry is
 intentionally migrated. Map these rows onto existing IDs first, then add future
-IDs only when a real uncovered behavior needs its own harness case. The Chief of
-Staff row is included because it is part of the current operating architecture,
-even though it is not yet represented as a five-case executable test-pack group.
+IDs only when a real uncovered behavior needs its own harness case. Chief of
+Staff is represented by the executable `COS-1` through `COS-5` group. Its first
+validation path is intentionally no-live: run `.venv/bin/python -m pytest
+tests/test_test_pack_specs.py tests/test_chief_of_staff_operating_layer.py -q`
+with sanitized fixtures and all post/write integrations disabled. Promptfoo and
+live Slack/model execution are later validation layers, not prerequisites for
+the executable contract.
 
 ### Orchestrator / Planner
 
@@ -187,8 +192,8 @@ Expanded scenario queue:
 
 | Ask type | Representative asks | Evaluation focus | Candidate coverage |
 | --- | --- | --- | --- |
-| Diverse / open-ended | `summarize this Slack thread and next steps`; `review the business-agent bridge architecture`; `diagnose why @KNI keeps posting unrelated output`; `plan how to improve agent feedback loops`. | Handles broad management/diagnostic requests, uses Slack context and WorkItem state, returns an actionable plan, and does not collapse into a canned route-specific answer. | Chief of Staff WorkItem tests, Slack selected-thread tests, future `COS-*` executable specs. |
-| Deterministic / exact | `audit automations`; `show blockers`; `generate an internal doc`; `post an internal summary after approval`; `do not post or write anything`. | Executes only safe read/planning steps unless approval is explicit, distinguishes internal draft artifacts from Slack posts, and records audit notes. | Chief of Staff operating-layer tests and Slack action safety tests. |
+| Diverse / open-ended | `summarize this Slack thread and next steps`; `review the business-agent bridge architecture`; `diagnose why @KNI keeps posting unrelated output`; `plan how to improve agent feedback loops`. | Handles broad management/diagnostic requests, uses Slack context and WorkItem state, returns an actionable plan, and does not collapse into a canned route-specific answer. | `COS-1` to `COS-3`, Chief of Staff WorkItem tests, Slack selected-thread tests. |
+| Deterministic / exact | `audit automations`; `show blockers`; `generate an internal doc`; `post an internal summary after approval`; `do not post or write anything`. | Executes only safe read/planning steps unless approval is explicit, distinguishes internal draft artifacts from Slack posts, and records audit notes. | `COS-3` to `COS-5`, Chief of Staff operating-layer tests and Slack action safety tests. |
 | Prior Slack regression shapes | Bridge questions, architecture image requests, channel automation audits, real-time feedback requests, and `wrong request` corrections. | CoS should synthesize the operational state and recommend next actions without performing side effects or reusing stale answer text. | Add manual/live smoke rows once the live Slack bridge is verified. |
 
 Expanded scenario queue:
