@@ -95,8 +95,9 @@ MANAGER_DELEGATION_READINESS_CASES: tuple[ManagerDelegationReadinessCase, ...] =
         ),
         manager_provider_join_proven=False,
         next_live_proof=(
-            "One manager-entry marked record lifecycle; reuse provider mechanics and "
-            "stop after the first join defect."
+            "One manager-entry rerun with the delegated Airtable turn limit capped at "
+            "four and the sanitized provider-ID-free receipt; reuse the verified "
+            "create/update/delete mechanics."
         ),
     ),
     ManagerDelegationReadinessCase(

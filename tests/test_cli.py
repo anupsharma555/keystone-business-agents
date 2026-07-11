@@ -2763,6 +2763,26 @@ def test_context_agent_tool_receipts_are_bounded_and_report_verified_writes() ->
             },
         }
     ]
+
+
+def test_context_agent_blocked_read_is_not_reported_as_blocked_write() -> None:
+    receipts = [
+        {"status": "blocked", "table": "Business Expenses", "send_enabled": False},
+        {
+            "status": "success",
+            "operation": "create",
+            "table": "Business Expenses",
+            "approval_reference": "approval:test:create",
+            "verification": {"status": "verified", "passed": True},
+            "send_enabled": False,
+        },
+    ]
+
+    assert cli._context_agent_blocked_write_attempts(
+        {"agent_name": "airtable_context_agent"},
+        tool_receipts=receipts,
+    ) == []
+    assert cli._context_agent_external_write_performed(receipts) is True
     assert "private_field" not in json.dumps(receipts)
 
 
@@ -3437,6 +3457,42 @@ def test_context_agent_human_summary_includes_airtable_record_summaries() -> Non
         "  - PA Estimated Taxes: Period 2 2026: Tax Type: State; "
         "Amount: $920.00; Payment Date: 6/1/2026 (Period 2)"
     )
+
+
+def test_context_agent_human_summary_keeps_airtable_provider_ids_internal() -> None:
+    summary = cli._context_agent_human_summary(
+        {
+            "summary": "Created, updated, and removed one marked test record.",
+            "base_alias": "finance_tax_tracker",
+            "relevant_tables": ["Business Expenses"],
+            "recommended_record_identity": "recProviderInternal123",
+            "record_summaries": [
+                {
+                    "key": "recProviderInternal123",
+                    "value": "Business Expenses test record updated and removed.",
+                    "note": "Provider read-back and absence verification passed.",
+                }
+            ],
+            "sources": [
+                {
+                    "title": "Airtable verified test deletion",
+                    "note": "Confirmed the marked record was absent after deletion.",
+                    "location": "Business Expenses / recProviderInternal123",
+                },
+                {
+                    "title": "Airtable base schema",
+                    "note": "Verified the table before writing.",
+                    "location": "finance_tax_tracker / appProviderInternal123",
+                },
+            ],
+        }
+    )
+
+    assert "recProviderInternal123" not in summary
+    assert "appProviderInternal123" not in summary
+    assert "Record filter guidance" not in summary
+    assert "Business Expenses test record updated and removed" in summary
+    assert "Airtable verified test deletion" in summary
 
 
 def test_context_agent_human_summary_includes_zotero_reference_summaries() -> None:
@@ -4361,6 +4417,49 @@ def test_cli_connector_backed_gmail_graph_budget_blocks_before_preflight(
         "manager_specialist_step_3",
         "final_response_synthesis",
     ]
+    assert payload["openai_requests_made"] == 0
+
+
+def test_cli_explicit_chief_budget_uses_delegated_context_owner_turn_limit(
+    monkeypatch,
+    capsys,
+) -> None:
+    preflight_calls: list[str] = []
+    request = (
+        "Using Airtable context, create one marked KBA test expense in the Business "
+        "Expenses table, verify it, update the same record description, verify it "
+        "again, and remove only that test record."
+    )
+
+    def unexpected_preflight(request_text, **_kwargs):
+        preflight_calls.append(request_text)
+        pytest.fail("delegated-route request budget must block before preflight")
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_CHIEF_OF_STAFF_SDK_MAX_TURNS", "4")
+    monkeypatch.delenv("KEYSTONE_AIRTABLE_CONTEXT_AGENT_SDK_MAX_TURNS", raising=False)
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", unexpected_preflight)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--live-sdk",
+            "--no-live-manual-plan",
+            "--max-openai-requests",
+            "4",
+            "--json",
+            request,
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert preflight_calls == []
+    assert payload["estimated_requests"]["max"] == 6
+    assert payload["estimated_requests"]["stages"] == ["airtable_context_agent_sdk"]
     assert payload["openai_requests_made"] == 0
 
 

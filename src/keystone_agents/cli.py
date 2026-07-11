@@ -54,6 +54,7 @@ from keystone_agents.finance_expense_receipts import (
 )
 from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
+from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
 from keystone_agents.operator_failures import (
@@ -1550,9 +1551,19 @@ def _estimate_ask_openai_requests(
         stages.append("outreach_composer_synthesis")
         maximum += 1
     elif args.agent is not None:
-        stages.append(f"{args.agent}_sdk")
+        estimated_route = str(args.agent)
+        if estimated_route != "orchestrator":
+            deterministic_plan = infer_manual_request_plan(
+                input_text,
+                requested_agent=estimated_route,
+            )
+            estimated_route = _route_with_manual_plan_advice(
+                estimated_route,
+                deterministic_plan,
+            )
+        stages.append(f"{estimated_route}_sdk")
         maximum += resolve_sdk_turn_policy(
-            args.agent,
+            estimated_route,
             request_text=input_text,
             live_search=bool(args.live_search),
         ).max_turns
@@ -3827,6 +3838,7 @@ def _context_agent_blocked_write_attempts(
         for receipt in list(tool_receipts or [])
         if str(receipt.get("status") or "").lower()
         in {"blocked", "error", "failed", "verification_failed"}
+        and _context_agent_receipt_is_write(receipt)
     ]
     if failed_receipts:
         return [f"{agent_name}: provider write or cleanup did not verify"]
@@ -3915,7 +3927,7 @@ def _context_agent_reference_summary_lines(output: dict[str, object]) -> list[st
             label = title
             if note:
                 label = f"{label} - {note}"
-            if location:
+            if location and not _contains_internal_provider_identity(location):
                 label = f"{label} ({location})"
             lines.append(f"  - {label}")
     article_refs = _context_agent_article_reference_lines(output)
@@ -3945,7 +3957,12 @@ def _context_agent_record_summary_lines(output: dict[str, object]) -> list[str]:
             note = ""
         if not value and not key:
             continue
-        label = f"{key}: {value}" if key and value else key or value
+        visible_key = "" if _contains_internal_provider_identity(key) else key
+        label = (
+            f"{visible_key}: {value}"
+            if visible_key and value
+            else visible_key or value
+        )
         if note:
             label = f"{label} ({note})"
         lines.append(f"  - {label}")
@@ -4001,9 +4018,14 @@ def _context_agent_airtable_context_lines(output: dict[str, object]) -> list[str
     if fields:
         lines.append("- Field hints:")
         lines.extend(f"  - {item}" for item in fields)
-    if record_identity:
+    if record_identity and not _contains_internal_provider_identity(record_identity):
         lines.append(f"- Record filter guidance: {record_identity}")
     return lines
+
+
+def _contains_internal_provider_identity(value: object) -> bool:
+    text = str(value or "")
+    return bool(re.search(r"(?:^|[\s/(])(?:rec|app)[A-Za-z0-9]{8,}(?:$|[\s/)])", text))
 
 
 def _context_agent_workspace_context_lines(output: dict[str, object]) -> list[str]:
@@ -4424,6 +4446,16 @@ def _context_agent_external_write_performed(
 ) -> bool:
     """Classify successful typed context-agent provider mutations."""
 
+    return any(
+        _context_agent_receipt_is_write(receipt)
+        and receipt.get("status") == "success"
+        for receipt in tool_receipts
+    )
+
+
+def _context_agent_receipt_is_write(receipt: dict[str, object]) -> bool:
+    """Return whether a bounded tool receipt represents a provider mutation."""
+
     write_operations = {
         "create",
         "update",
@@ -4441,10 +4473,9 @@ def _context_agent_external_write_performed(
         "extract_slide_copy",
         "delete_test_slide_artifact",
     }
-    return any(
+    return bool(
         receipt.get("operation") in write_operations
-        and receipt.get("status") == "success"
-        for receipt in tool_receipts
+        or str(receipt.get("approval_reference") or "").strip()
     )
 
 

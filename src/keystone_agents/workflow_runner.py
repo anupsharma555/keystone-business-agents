@@ -4195,7 +4195,7 @@ def _manager_loop_requests_opportunity_record(normalized_text: str) -> bool:
     return bool(
         re.search(
             r"\b(?:create|save|add|prepare|record|pipeline)\b[^.\n]{0,160}"
-            r"\b(?:opportunit|crm|record|pipeline)\b",
+            r"\b(?:opportunit\w*|crm|pipeline)\b",
             scrubbed,
             flags=re.I,
         )
@@ -10161,7 +10161,33 @@ def _chief_workflow_requests_finance_tracker_airtable_write(request_text: str) -
     return has_airtable_tracker and has_write_intent
 
 
+def _chief_workflow_requests_marked_airtable_test_lifecycle(request_text: str) -> bool:
+    lowered = " ".join(str(request_text or "").lower().split())
+    if not _chief_workflow_requests_finance_tracker_airtable_write(request_text):
+        return False
+    has_marker_scope = bool(
+        re.search(r"\b(?:marked\s+(?:kba\s+)?test|kba_test_record|test\s+record)\b", lowered)
+    )
+    has_create = bool(re.search(r"\b(?:create|add|insert)\b", lowered))
+    has_update = bool(re.search(r"\b(?:update|modify|revise|change)\b", lowered))
+    has_cleanup = bool(re.search(r"\b(?:remove|delete|clean\s*up)\b", lowered))
+    same_object_scope = bool(re.search(r"\b(?:same|that|only\s+that)\s+(?:test\s+)?record\b", lowered))
+    return has_marker_scope and has_create and has_update and has_cleanup and same_object_scope
+
+
 def _chief_workflow_side_effect_policy(request_text: str) -> str:
+    if _chief_workflow_requests_marked_airtable_test_lifecycle(request_text):
+        return (
+            "The authenticated operator request approves one exact marked Airtable test "
+            "record lifecycle in finance_tax_tracker / Business Expenses. Use typed "
+            "Airtable tools to create one record containing KBA_TEST_RECORD, require "
+            "provider read-back, update that same internal record identity, require a "
+            "second read-back, then use airtable_delete_test_record for only that exact "
+            "record and verify absence. Reuse the supplied approval_reference without a "
+            "second approval prompt. Ordinary deletes, schema changes, attachments, bulk "
+            "writes, Slack posts, Gmail actions, calendar writes, and all unrelated "
+            "mutations remain blocked."
+        )
     if _chief_workflow_requests_finance_tracker_airtable_write(request_text):
         return (
             "Live internal Airtable schema reads, capped record reads, and the explicitly "
@@ -10413,6 +10439,7 @@ def _advance_chief_of_staff(
             description=("Review the Chief of Staff plan before any live internal write or post."),
             requires_approval=bool(
                 output.approval_required
+                and not _chief_workflow_requests_marked_airtable_test_lifecycle(request_text)
                 and not _chief_request_should_start_with_chief(request_text)
                 and not _chief_context_agent_advisory_summary(request_text)
                 and not _chief_multi_source_portfolio_summary_request(request_text)

@@ -386,9 +386,9 @@ def infer_manual_request_plan(
         plan.planner_warnings.append(
             "Manual request did not contain enough information for a safe route."
         )
-    if _looks_like_blocked_side_effect_request(text):
+    if intent == "blocked_send" or looks_like_send_side_effect(text):
         plan.planner_warnings.append(
-            "Send request blocked; external send/write requests remain draft/read-only."
+            "Send request blocked; external sends and posts remain draft/read-only."
         )
     return plan
 
@@ -505,6 +505,13 @@ def _semantic_target_agent(
         and _looks_like_unnamed_company_set_discovery(route_text)
     ):
         return "opportunity_scout"
+    delegated_context_target = _business_context_target_agent(route_text)
+    if (
+        requested_agent == "chief_of_staff"
+        and delegated_context_target in _MUTABLE_CONTEXT_AGENT_TARGETS
+        and _looks_like_internal_business_system_mutation(route_text)
+    ):
+        return delegated_context_target
     if requested_agent and requested_agent != "orchestrator":
         return requested_agent
     if _looks_like_underspecified_modify_request(route_text):
@@ -521,7 +528,7 @@ def _semantic_target_agent(
         return "business_research_analyst"
     if looks_like_opportunity_to_outreach_loop(route_text):
         return "opportunity_scout"
-    context_target_agent = _business_context_target_agent(route_text)
+    context_target_agent = delegated_context_target
     if context_target_agent == "zotero_context_agent" and _looks_like_zotero_context_request(
         route_text
     ):
@@ -600,6 +607,8 @@ def _intent_for_target(
     if _looks_like_browser_diagnostics_only_request(text):
         return "browser_diagnostics"
     if target_agent == "chief_of_staff" and _looks_like_finance_expense_receipt_write(text):
+        return "business_system_write"
+    if target_agent == "chief_of_staff" and _looks_like_internal_business_system_mutation(text):
         return "business_system_write"
     if target_agent == "chief_of_staff" and _looks_like_reference_capture_request(lower):
         return "reference_capture"

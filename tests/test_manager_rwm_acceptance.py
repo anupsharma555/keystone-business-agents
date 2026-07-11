@@ -49,6 +49,24 @@ def test_orchestrator_write_contract_creates_internal_advice_not_provider_state(
     assert any("not written externally" in note for note in result.artifacts.notes)
 
 
+def test_orchestrator_allows_scoped_chief_airtable_lifecycle_to_reach_manager() -> None:
+    request = (
+        "Using Airtable context, create one marked KBA test expense in the Business "
+        "Expenses table, verify it, update the same record description, verify it "
+        "again, and remove only that test record."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    result = route_request(request, manual_plan=plan)
+
+    assert result.route == "airtable_context_agent"
+    assert result.refused is False
+    assert result.send_enabled is False
+    assert result.decision_trace is not None
+    assert result.decision_trace.selected_route == "airtable_context_agent"
+    assert "send_email" in result.forbidden_actions
+
+
 def test_orchestrator_modify_contract_replans_after_explicit_user_correction() -> None:
     original = _orchestrate("Find current behavioral-health partnership opportunities.")
     corrected_request = (

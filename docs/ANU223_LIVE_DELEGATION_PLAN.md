@@ -48,3 +48,27 @@ deterministic manager/owner path can safely skip model planning.
   to spend on the same stage again.
 - Do not advance to the next provider merely because cleanup succeeded; inspect
   answer usefulness, manager friction, identity continuity, and receipt quality.
+
+## 2026-07-11 Stage A checkpoint
+
+The natural Chief request reached `airtable_context_agent` through Orchestrator
+preflight and completed one marked `Business Expenses` lifecycle: schema check,
+create/read-back, same-record update/read-back, marker-gated delete, and confirmed
+absence. The authenticated operator scope was reused without a second approval.
+No Slack, Gmail, Calendar, attachment, schema, or unrelated provider write ran.
+
+This is partial evidence rather than a Stage A pass because two control-plane
+acceptance checks failed:
+
+- The declared four-request ceiling was calculated from the named Chief route,
+  while execution delegated to Airtable's six-turn default. The run used six
+  requests at an estimated $0.0492. The CLI estimator now resolves deterministic
+  delegation before enforcing the ceiling, so this mismatch blocks before any
+  future model call.
+- The first rendered receipt exposed provider record/base IDs. Airtable IDs now
+  remain in internal structured state while the human summary shows only the
+  table, marked lifecycle result, verification, and cleanup evidence.
+
+The run also contained one safely blocked pre-write record read; it was not a
+mutation and no longer appears as a blocked-write side effect. Do not rerun Stage
+A until a new four-request budget is approved. Stages B and C remain unrun.

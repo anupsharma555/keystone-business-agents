@@ -69,6 +69,15 @@ evidence, but the manager-to-provider join is not yet proven; they remain the
 only candidates for a bounded live delegation batch. This 2/5 joined result is
 intentional evidence separation, not a partial pass disguised as completion.
 
+The 2026-07-11 Airtable Stage A run adds partial joined evidence: a natural
+Chief request selected Airtable and completed one exact marked create/update/
+delete lifecycle with provider read-back and confirmed absence. It is not yet a
+joined pass because execution used six model requests after the CLI accepted a
+four-request ceiling, and the original receipt exposed provider IDs. The
+delegated-route budget estimator and provider-ID-free renderer are now fixed
+offline. Airtable remains pending one separately approved capped rerun; Workspace
+and Zotero remain unrun.
+
 The remaining Slack goal now has an exact two-probe readiness registry. The
 direct Business Research and connector-backed Gmail→Research→Outreach graph
 pre-live evidence both pass, but live Slack evidence remains 0/2. The scorecard
@@ -109,7 +118,7 @@ unintended side effects. No fixture result can mark these live rows complete.
   scoring, and unsupported-claim validation respectively. Gmail, Chief, and
   the five context agents already had executable typed-tool proof; Orchestrator
   remains a control-plane routing/review contract rather than a provider owner.
-- `npm run test:ai-agents-workflow:no-live`: 606 workflow and current-context
+- `npm run test:ai-agents-workflow:no-live`: 609 workflow and current-context
   contract tests, seven
   LangGraph scenarios, 36/36 Slack routes, and ANU-60 preflight; zero live
   model/search/connector calls.

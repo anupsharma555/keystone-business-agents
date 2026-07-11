@@ -92,6 +92,23 @@ def test_chief_workflow_allows_explicit_business_expense_receipt_airtable_write(
     assert workflow_runner._manager_loop_requests_crm_write(request) is False
 
 
+def test_chief_marked_airtable_lifecycle_allows_only_verified_test_cleanup() -> None:
+    request = (
+        "Using Airtable context, create one marked KBA test expense in the Business "
+        "Expenses table, verify it, update the same record description, verify it "
+        "again, and remove only that test record."
+    )
+
+    policy = workflow_runner._chief_workflow_side_effect_policy(request)
+
+    assert workflow_runner._chief_workflow_requests_marked_airtable_test_lifecycle(request)
+    assert "one exact marked Airtable test record lifecycle" in policy
+    assert "KBA_TEST_RECORD" in policy
+    assert "airtable_delete_test_record" in policy
+    assert "Reuse the supplied approval_reference without a second approval prompt" in policy
+    assert "Ordinary deletes" in policy
+
+
 def test_chief_workflow_passes_receipt_write_policy_to_live_sdk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6642,6 +6659,16 @@ def test_manager_loop_does_not_treat_negated_record_update_as_crm_write() -> Non
     )
 
     assert workflow_runner._manager_loop_requests_crm_write(request) is False
+
+
+def test_manager_loop_does_not_treat_marked_airtable_expense_as_opportunity() -> None:
+    request = (
+        "Using Airtable context, create one marked KBA test expense in the Business "
+        "Expenses table, verify it, update the same record description, verify it "
+        "again, and remove only that test record."
+    )
+
+    assert workflow_runner._manager_loop_requests_opportunity_record(request) is False
 
 
 @pytest.mark.parametrize(

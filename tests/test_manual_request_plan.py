@@ -60,6 +60,24 @@ def test_context_agent_internal_update_routes_to_owner_for_approval_gating() -> 
     assert plan.side_effect_policy == "internal_write_approval_required"
 
 
+def test_chief_scoped_airtable_lifecycle_is_not_misclassified_as_send() -> None:
+    request = (
+        "Using Airtable context, create one marked KBA test expense in the Business "
+        "Expenses table, verify it, update the same record description, verify it "
+        "again, and remove only that test record."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    assert plan.requested_agent == "chief_of_staff"
+    assert plan.target_agent == "airtable_context_agent"
+    assert plan.intent == "business_system_write"
+    assert plan.task_objective == "business_system_write"
+    assert plan.expected_artifact_type == "business_system_write_plan"
+    assert plan.side_effect_policy == "internal_write_approval_required"
+    assert plan.planner_warnings == []
+
+
 def test_context_agent_negated_side_effect_constraints_remain_read_only_context() -> None:
     plan = infer_manual_request_plan(
         "@KNI rss context agent: inspect announcement history. Do not post to Slack "
