@@ -203,6 +203,40 @@ def test_company_research_focused_brief_payload_exposes_clean_slack_summary() ->
     assert business_agent_result_display_text(payload) == summary
 
 
+def test_company_research_focused_brief_summary_avoids_internal_jargon_and_fragments() -> None:
+    import scripts.run_company_research as run_company_research
+
+    payload = {
+        "output_type": "CompanyResearchFocusedBrief",
+        "output": {
+            "company_name": "Example Health",
+            "product": "A clinical AI workflow.",
+            "traction_signals": (
+                "The approved context says the platform is embedded in clinical workflows. "
+                "A separate source describes additional deployment signals that would exceed "
+                "the compact answer limit when repeated in full."
+            ),
+            "why_it_matters": (
+                "Example Health is relevant to Keystone's clinical AI evaluation work. "
+                "The approved context says the platform may also support broader advisory "
+                "work across several long and highly detailed implementation scenarios that "
+                "should not be cut into an unfinished sentence in the Slack answer."
+            ),
+            "facts": [],
+            "unknowns": [],
+            "sources": [],
+        },
+    }
+
+    summary = run_company_research._company_research_sdk_human_summary(payload)
+
+    answer = summary.split("\n\n*Detailed Summary:*", 1)[0]
+    assert "approved context" not in summary.lower()
+    assert "Source evidence indicates" in summary
+    assert "..." not in answer
+    assert "Example Health is relevant to Keystone's clinical AI evaluation work." in answer
+
+
 def test_early_run_smoke_opportunity_scout_cli_high_confidence_and_weak_stale() -> None:
     high_confidence = _run_cli_json(
         "run_opportunity_scout.py",

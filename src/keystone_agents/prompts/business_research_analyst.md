@@ -171,6 +171,9 @@ The brief must:
   "source-backed context suggests", or "source set points to". The structured
   fact/source fields already carry provenance, so write concrete subject-verb
   sentences instead.
+- Do not expose internal phrases such as "approved context", "source bundle",
+  or "supplied context" in user-facing fields. State supported facts directly
+  and let the structured citations carry provenance.
 
 ## Keystone Fit
 

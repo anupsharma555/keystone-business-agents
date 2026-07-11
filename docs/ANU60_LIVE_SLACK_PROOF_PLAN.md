@@ -103,7 +103,7 @@ Committed eval case: `slack_preprints_context_preliminary_evidence_001`.
 3. Direct named-agent Business Research answer-first rendering.
 
 ```text
-@KNI business research analyst "research Suki AI for a concise source-backed fit check; include visible source URLs; do not draft outreach, send, post elsewhere, schedule, or write files."
+@KNI business research analyst "research Suki AI. Return a concise brief covering what the company does, current signals, KNI fit, evidence gaps, recommendation, and visible source URLs."
 ```
 
 Manual ANU-60 probe. This is not a committed Promptfoo case.

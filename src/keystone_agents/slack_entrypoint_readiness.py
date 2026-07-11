@@ -24,9 +24,9 @@ SLACK_ENTRYPOINT_READINESS_CASES: tuple[SlackEntrypointReadinessCase, ...] = (
         title="Direct named Business Research answer-first proof",
         backend="direct_specialist",
         prompt=(
-            '@KNI business research analyst "research Suki AI for a concise '
-            "source-backed fit check; include visible source URLs; do not draft "
-            'outreach, send, post elsewhere, schedule, or write files."'
+            '@KNI business research analyst "research Suki AI. Return a concise '
+            "brief covering what the company does, current signals, KNI fit, "
+            'evidence gaps, recommendation, and visible source URLs."'
         ),
         proof_nodeids=(
             "tests/test_slack_action_contract.py::"

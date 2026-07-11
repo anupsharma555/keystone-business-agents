@@ -419,6 +419,9 @@ class BusinessResearchFocusedBriefSDKInput:
             "If leadership is not source-backed, set leadership to unknown and list it in "
             "unknowns.",
             "Keep the brief concise and decision-oriented.",
+            "Write user-facing fields in direct operator language. Do not refer to "
+            "approved context, supplied context, source bundles, or internal evidence "
+            "handling; state the supported facts directly and let citations carry provenance.",
             f"Company: {self.company_name}",
         ]
         if self.company_url:

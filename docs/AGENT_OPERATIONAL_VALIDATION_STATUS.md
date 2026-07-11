@@ -109,7 +109,7 @@ unintended side effects. No fixture result can mark these live rows complete.
   scoring, and unsupported-claim validation respectively. Gmail, Chief, and
   the five context agents already had executable typed-tool proof; Orchestrator
   remains a control-plane routing/review contract rather than a provider owner.
-- `npm run test:ai-agents-workflow:no-live`: 604 workflow and current-context
+- `npm run test:ai-agents-workflow:no-live`: 606 workflow and current-context
   contract tests, seven
   LangGraph scenarios, 36/36 Slack routes, and ANU-60 preflight; zero live
   model/search/connector calls.

@@ -857,7 +857,17 @@ def _attach_company_research_display_text(payload: dict[str, Any], human_summary
 
 
 def _summary_text(value: Any) -> str:
-    return str(value or "").strip()
+    text = str(value or "").strip()
+    replacements = (
+        ("The approved context says", "Source evidence indicates"),
+        ("the approved context says", "source evidence indicates"),
+        ("in the approved context", "in the source evidence"),
+        ("approved source-backed context", "source evidence"),
+        ("approved context", "source evidence"),
+    )
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
 
 
 def _summary_list(value: Any, *, limit: int) -> list[str]:
@@ -908,7 +918,15 @@ def _truncate_summary(text: str, limit: int) -> str:
     clean = " ".join(str(text or "").split())
     if len(clean) <= limit:
         return clean
-    return clean[: max(limit - 1, 0)].rstrip() + "..."
+    window = clean[:limit]
+    sentence_ends = [window.rfind(marker) for marker in (". ", "? ", "! ")]
+    sentence_end = max(sentence_ends)
+    if sentence_end >= max(40, limit // 3):
+        return window[: sentence_end + 1].rstrip()
+    word_end = window.rfind(" ")
+    if word_end > 0:
+        window = window[:word_end]
+    return window.rstrip(" ,;:-") + "…"
 
 
 def _save_retrieval_tool_performance_memory(
