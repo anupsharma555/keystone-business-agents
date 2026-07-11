@@ -54,8 +54,9 @@ SLACK_ENTRYPOINT_READINESS_CASES: tuple[SlackEntrypointReadinessCase, ...] = (
         prompt=(
             "@KNI read the latest Gmail thread from the configured exact test sender, "
             "research the sender organization using only the selected thread context, "
-            "and prepare a draft reply for review without sending, creating a Gmail "
-            "draft, searching the web, posting elsewhere, or writing externally."
+            "and return a formatted review summary with the thread's main point, "
+            "organization context, a suggested reply, supporting evidence, and the "
+            "approval status."
         ),
         proof_nodeids=(
             "tests/test_workflow_runner.py::"

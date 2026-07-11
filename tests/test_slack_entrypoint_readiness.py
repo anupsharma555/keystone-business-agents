@@ -36,6 +36,24 @@ def test_slack_entrypoint_readiness_budget_is_bounded() -> None:
     assert sum(case.max_cost_usd for case in SLACK_ENTRYPOINT_READINESS_CASES) == 0.60
 
 
+def test_graph_probe_asks_for_output_shape_without_repeating_safety_boilerplate() -> None:
+    graph = next(
+        case for case in SLACK_ENTRYPOINT_READINESS_CASES if case.probe_id == "SLACK-GRAPH-01"
+    )
+    normalized = graph.prompt.lower()
+    assert "formatted review summary" in normalized
+    assert "suggested reply" in normalized
+    assert "approval status" in normalized
+    for redundant_phrase in (
+        "do not send",
+        "without sending",
+        "posting elsewhere",
+        "writing externally",
+        "do not draft outreach",
+    ):
+        assert redundant_phrase not in normalized
+
+
 def test_slack_entrypoint_proof_nodeids_exist() -> None:
     for case in SLACK_ENTRYPOINT_READINESS_CASES:
         for nodeid in case.proof_nodeids:

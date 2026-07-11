@@ -63,7 +63,8 @@ Before running these probes, confirm:
 - Slack posting in `#ai-agents-workflow` is approved.
 - Any live model/search/API spend is approved with a stop condition.
 - No external sends, writes, drafts, schedules, file creation, or feed/preprint
-  refreshes are approved.
+  refreshes are approved. This is the run authorization boundary, not wording
+  the operator must repeat in each natural ask.
 - Stop after the first failed visible render or unexpected side effect.
 
 ## Preflight
@@ -82,7 +83,11 @@ npm run eval:slack:strict-live-readiness -- --json
 
 ## Probes
 
-Run the probes in `#ai-agents-workflow`.
+Run the probes in `#ai-agents-workflow`. The two primary remaining acceptance
+probes are the direct Business Research ask and the connector-backed graph ask.
+RSS, preprints, conversational routing, blocked-preflight wording, and timeout
+cleanup remain supporting coverage and should be reused unless a distinct
+regression requires a rerun.
 
 1. RSS context answer-first rendering.
 
@@ -108,7 +113,19 @@ Committed eval case: `slack_preprints_context_preliminary_evidence_001`.
 
 Manual ANU-60 probe. This is not a committed Promptfoo case.
 
-4. Conversational named-agent Business Research bridge routing.
+4. Connector-backed graph-worthy review.
+
+```text
+@KNI read the latest Gmail thread from the configured exact test sender, research the sender organization using only the selected thread context, and return a formatted review summary with the thread's main point, organization context, a suggested reply, supporting evidence, and the approval status.
+```
+
+This must invoke the KNI Slack app, select the LangGraph path, keep the selected
+Gmail identity internal, and return suggested reply text for review without
+creating a provider draft. Safety policy and approval gates own the no-send and
+no-write behavior; those restrictions are intentionally not repeated in the
+natural ask.
+
+5. Conversational named-agent Business Research bridge routing.
 
 ```text
 @KNI could the business research analyst research Nabla for a concise answer-first fit check? Include visible source URLs and keep this read-only.
@@ -117,7 +134,7 @@ Manual ANU-60 probe. This is not a committed Promptfoo case.
 Manual ANU-60 probe. This verifies the sibling bridge does not reject polite
 named-agent wording before KBA planning.
 
-5. Blocked/missing-context wording.
+6. Blocked/missing-context wording.
 
 ```text
 @KNI gmail triage "find that email from the investor and tell me what to reply"
@@ -161,6 +178,7 @@ fixture-backed evidence must cover every row.
 | Acceptance item | Required proof |
 | --- | --- |
 | Direct Business Research Slack probes render the KBA answer first without provider metadata leading the message. | Direct Suki probe passes with Slack permalink, local run id, answer-first `human_summary`, visible source URLs or source-limit language, and no provider/model/timing metadata before the answer. |
+| Connector-backed graph ask invokes the KNI app and returns one review result without requiring safety boilerplate in the ask. | Gmail graph probe passes with Slack permalink, WorkItem id, selected-thread identity kept internal, Gmail -> Research -> Outreach review path, suggested reply text, approval state, one final response, usage/cost trace, and no provider draft/send/post/file write. |
 | Conversational Business Research Slack probes render the KBA answer first and reach KBA planning. | Conversational Nabla probe passes with Slack permalink, local run id, bridge-accepted conversational wording, route/output type, answer-first `human_summary`, and no metadata-first body. |
 | RSS context-agent Slack probes display `RssContextResult` summaries instead of generic WorkItem completion text. | RSS context probe passes with Slack permalink, local run id or WorkItem id, `rss_context_agent` route, `RssContextResult` output type, answer-first body, and no generic `WorkItem Ready` or `WorkItem command completed` body. |
 | Preprints context-agent Slack probes display `PreprintsContextResult` summaries instead of generic WorkItem completion text. | Preprints context probe passes with Slack permalink, local run id or WorkItem id, `preprints_context_agent` route, `PreprintsContextResult` output type, answer-first body, and no generic `WorkItem Ready` or `WorkItem command completed` body. |

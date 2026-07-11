@@ -12,7 +12,11 @@ remaining issue-level acceptance rows.
    repeating generic no-send/no-write policy already enforced by the agent.
 2. `SLACK-GRAPH-01`: one connector-backed Gmail → Business Research → Outreach
    graph ask using one configured exact safe sender, no live search, and a
-   review-only Slack draft. Hard ceiling: 8 OpenAI requests and $0.50.
+   formatted Slack review summary containing the thread's main point,
+   organization context, suggested reply, evidence, and approval state. The
+   natural ask does not repeat generic no-send/no-write boilerplate; policy and
+   deterministic gates enforce those boundaries. Hard ceiling: 8 OpenAI
+   requests and $0.50.
 
 Combined hard ceiling: 11 OpenAI requests and $0.60. Run serially in
 `#ai-agents-workflow`; stop after the first failed render, retry, missing usage

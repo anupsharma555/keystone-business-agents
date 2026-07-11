@@ -19,7 +19,7 @@ or shared routing/identity defect.
 
 | Stage | Natural manager ask | Maximum OpenAI requests | Maximum estimated cost | Provider scope |
 |---|---|---:|---:|---|
-| A | Create one marked Airtable expense in the configured test-safe table, read it, update the same record from a natural follow-up, verify it, and remove only that marked record. | 4 | $0.10 | One marked record; no schema change |
+| A | Create one marked Airtable expense in the configured test-safe table, read it, update the same record from a natural follow-up, verify it, and remove only that marked record. | 4 | $0.10 | One marked record; no schema change; Airtable owner override fixed at four turns |
 | B | Create one marked Sheet in the approved KNIOps location, add and revise one marked row without an ID in the follow-up, verify it, and trash the test Sheet. | 8 | $0.12 | One marked Sheet; no share |
 | C | Create one marked Zotero note for the selected test item, revise the same note without its key, verify it, and remove the note. | 6 | $0.10 | One marked note; no library-wide mutation |
 
@@ -70,5 +70,9 @@ acceptance checks failed:
   table, marked lifecycle result, verification, and cleanup evidence.
 
 The run also contained one safely blocked pre-write record read; it was not a
-mutation and no longer appears as a blocked-write side effect. Do not rerun Stage
-A until a new four-request budget is approved. Stages B and C remain unrun.
+mutation and no longer appears as a blocked-write side effect. The rerun command
+must set `KEYSTONE_AIRTABLE_CONTEXT_AGENT_SDK_MAX_TURNS=4`; both preflight
+estimation and delegated execution resolve that same owner-specific limit. If
+the lifecycle cannot complete in four requests, stop and improve the owner path
+offline rather than silently increasing the stage budget. Do not rerun Stage A
+until a new four-request budget is approved. Stages B and C remain unrun.
