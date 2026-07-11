@@ -34,6 +34,7 @@ keystone = "keystone_agents.cli:main"
 dev = [
   "coverage[toml]",
   "pip-audit",
+  "PyYAML>=6.0.3,<7",
   "pytest>=8.0",
   "ruff",
 ]
