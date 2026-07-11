@@ -46,8 +46,10 @@ def test_operational_status_preserves_evidence_dimensions_and_eval_boundary() ->
         assert phrase in text
 
 
-def test_airtable_backlog_matches_current_attachment_evidence_boundary() -> None:
-    backlog = LINEAR_BACKLOG.read_text()
+def test_airtable_backlog_matches_current_attachment_evidence_boundary(
+    require_local_evidence,
+) -> None:
+    backlog = require_local_evidence(LINEAR_BACKLOG).read_text()
 
     assert "private-PNG lifecycle also passed" in backlog
     assert "Fake-model\n   SDK execution now distinguishes HTTPS URLs" in backlog
@@ -56,8 +58,10 @@ def test_airtable_backlog_matches_current_attachment_evidence_boundary() -> None
     assert "local-file\n   local-file receipt upload" not in backlog
 
 
-def test_workspace_backlog_matches_current_live_and_structural_evidence() -> None:
-    backlog = LINEAR_BACKLOG.read_text()
+def test_workspace_backlog_matches_current_live_and_structural_evidence(
+    require_local_evidence,
+) -> None:
+    backlog = require_local_evidence(LINEAR_BACKLOG).read_text()
 
     assert "natural selected-file read/synthesis, a natural marked-Sheet lifecycle" in backlog
     assert "separate folder/Doc lifecycles, exact identity/read-back/cleanup" in backlog

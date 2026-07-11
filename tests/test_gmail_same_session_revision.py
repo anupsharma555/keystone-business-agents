@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -116,6 +115,7 @@ def test_typed_input_places_existing_draft_in_current_model_prompt() -> None:
 def test_live_revision_runner_defaults_to_one_request_and_five_cent_budget(
     monkeypatch,
     tmp_path,
+    require_local_evidence,
 ) -> None:
     monkeypatch.setattr(
         "sys.argv",
@@ -130,9 +130,9 @@ def test_live_revision_runner_defaults_to_one_request_and_five_cent_budget(
     _write_result_atomic(receipt, {"status": "pass", "requests": 1})
     assert json.loads(receipt.read_text(encoding="utf-8"))["requests"] == 1
     plan = json.loads(
-        Path("artifacts/test-pack/next-live-gmail-revision-plan.json").read_text(
-            encoding="utf-8"
-        )
+        require_local_evidence(
+            "artifacts/test-pack/next-live-gmail-revision-plan.json"
+        ).read_text(encoding="utf-8")
     )
     assert plan["approval_status"] == "completed_within_eight_sequential_run_allowance"
     assert "SDK trace metadata" in plan["execution_identity"]

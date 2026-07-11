@@ -129,7 +129,8 @@ def _identity():
     )
 
 
-def test_source_packet_retains_exact_two_pages_and_one_domain() -> None:
+def test_source_packet_retains_exact_two_pages_and_one_domain(require_local_evidence) -> None:
+    require_local_evidence(SOURCE_PACKET)
     packet = _load_packet(SOURCE_PACKET)
 
     assert {source["url"] for source in packet["sources"]} == EXPECTED_URLS
@@ -147,7 +148,8 @@ def test_runner_defaults_to_one_request_and_five_cent_budget(monkeypatch) -> Non
     assert args.budget_usd == 0.05
 
 
-def test_typed_input_forbids_search_tools_and_outreach() -> None:
+def test_typed_input_forbids_search_tools_and_outreach(require_local_evidence) -> None:
+    require_local_evidence(SOURCE_PACKET)
     typed_input = _typed_input(_load_packet(SOURCE_PACKET))
 
     assert "attach_tools\": false" in typed_input.context
@@ -244,7 +246,9 @@ def test_main_uses_same_execution_identity_for_trace_and_receipt(
     tmp_path: Path,
     monkeypatch,
     capsys,
+    require_local_evidence,
 ) -> None:
+    require_local_evidence(SOURCE_PACKET)
     import scripts.run_opportunity_normalization_validation as runner
 
     captured: dict[str, object] = {}
