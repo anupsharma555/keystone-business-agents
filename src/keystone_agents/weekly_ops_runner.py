@@ -12,6 +12,7 @@ from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.quality_budget import AgentQualityBudget, QualityMode
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
 from keystone_agents.schemas.weekly_ops import WeeklyOpsAssemblyInput
+from keystone_agents.sdk import private_context_sdk_profile
 from keystone_agents.weekly_ops_packet import (
     build_weekly_ops_external_synthesis_bundle,
     build_weekly_ops_source_bundle,
@@ -39,6 +40,12 @@ def weekly_ops_live_run_plan(payload: WeeklyOpsAssemblyInput) -> dict[str, Any]:
         "slack_post": False,
         "packet_title": bundle["delivery_plan"]["document_title"],
         "synthesis_ready": bundle["synthesis_ready"],
+        "data_handling": {
+            "response_store": False,
+            "prompt_cache_retention": "in_memory",
+            "tracing_disabled": True,
+            "trace_include_sensitive_data": False,
+        },
     }
 
 
@@ -77,9 +84,13 @@ def run_weekly_ops_packet_synthesis(
     if not external_bundle["synthesis_ready"]:
         raise ValueError("External weekly operations bundle is not synthesis-ready.")
 
+    date_min = external_bundle["window"]["date_min"]
+    date_max = external_bundle["window"]["date_max"]
     request = (
         "Prepare the internal KNI weekly operations packet from only the supplied bounded "
-        "July 4-11 source bundle. Follow section_order exactly. Prioritize one-time Calendar "
+        f"{date_min} through {date_max} source bundle. Follow section_order exactly, using "
+        "clear human-readable headings corresponding to every section. Prioritize "
+        "one-time Calendar "
         "events, mention recurring cadence briefly, include only explicitly relevant completed "
         "agent runs, and keep operational health and metadata succinct at the end. Return a "
         "review-only packet. Do not search, call tools, create a Google Doc, post to Slack, "
@@ -114,15 +125,16 @@ def run_weekly_ops_packet_synthesis(
         allow_manager_loop_repair=False,
         notes=["One-request weekly packet synthesis; no tools or writes."],
     )
-    result = runner(
-        sdk_input,
-        live=True,
-        model=WEEKLY_PACKET_MODEL,
-        quality_budget=budget,
-        force_sdk_interpretation=True,
-        include_specialist_tools=False,
-        attach_tools=False,
-    )
+    with private_context_sdk_profile() as data_profile:
+        result = runner(
+            sdk_input,
+            live=True,
+            model=WEEKLY_PACKET_MODEL,
+            quality_budget=budget,
+            force_sdk_interpretation=True,
+            include_specialist_tools=False,
+            attach_tools=False,
+        )
     _validate_live_result(
         result,
         max_openai_requests=max_openai_requests,
@@ -135,6 +147,7 @@ def run_weekly_ops_packet_synthesis(
         "usage": dict(result.usage or {}),
         "cost": dict(result.cost or {}),
         "request_cache": dict(result.request_cache or {}),
+        "data_handling": data_profile.audit_metadata(),
         "request_count_bound": max_openai_requests,
         "provider_writes": False,
         "send_enabled": False,
@@ -164,12 +177,18 @@ def _validate_live_result(
     output = result.output
     if output.send_enabled or output.slack_post_allowed or output.write_requests:
         raise RuntimeError("Weekly packet synthesis returned an unexpected side-effect request.")
+    packet_text = "\n".join(
+        value
+        for value in (str(output.synthesis or "").strip(), str(output.summary or "").strip())
+        if value
+    )
+    _validate_packet_sections(packet_text)
     usage = dict(result.usage or {})
     if not usage:
         raise RuntimeError("Weekly packet synthesis is missing SDK usage evidence.")
     observed_requests = _numeric_value(usage, "requests", "request_count", "total_requests")
-    if observed_requests is not None and observed_requests > max_openai_requests:
-        raise RuntimeError("Weekly packet synthesis exceeded the OpenAI request ceiling.")
+    if observed_requests != max_openai_requests:
+        raise RuntimeError("Weekly packet synthesis must use exactly one OpenAI request.")
     cost = dict(result.cost or {})
     observed_cost = _numeric_value(cost, "estimated_usd", "total_usd", "actual_usd")
     if observed_cost is None:
@@ -184,3 +203,32 @@ def _numeric_value(payload: dict[str, Any], *keys: str) -> int | float | None:
         if isinstance(value, int | float) and not isinstance(value, bool):
             return value
     return None
+
+
+def _validate_packet_sections(packet_text: str) -> None:
+    normalized = " ".join(packet_text.casefold().replace("_", " ").split())
+    section_aliases = (
+        ("executive focus areas",),
+        ("workstreams and decisions",),
+        ("completed runs and outcomes", "completed agent runs"),
+        ("carry forward", "carry-forward"),
+        ("non recurring calendar", "non-recurring calendar", "one-time calendar"),
+        ("recurring calendar cadence", "recurring cadence"),
+        ("next actions",),
+        ("source basis", "sources"),
+        ("operational health",),
+        ("packet metadata",),
+    )
+    missing = [
+        aliases[0]
+        for aliases in section_aliases
+        if not any(alias in normalized for alias in aliases)
+    ]
+    if missing:
+        raise RuntimeError(
+            "Weekly packet synthesis omitted required sections: " + ", ".join(missing)
+        )
+    health_index = normalized.rfind("operational health")
+    metadata_index = normalized.rfind("packet metadata")
+    if health_index < 0 or metadata_index <= health_index:
+        raise RuntimeError("Weekly packet terminal sections are out of order.")

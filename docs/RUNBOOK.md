@@ -241,7 +241,12 @@ For the bounded ANU-174 capability-statement proof, validate source readiness
 without a model using `npm run run:local-kni-capability-summary`. Live mode is
 one no-tool `gpt-5.4-mini` request with a `$0.05` ceiling and requires
 `--live-sdk --approve-private-context`; obtain explicit approval before sending
-the five guarded local-document excerpts to OpenAI. This private-context lane
+the guarded local-document excerpts selected by the offline plan to OpenAI. The
+offline gate rejects a packet unless every candidate matches the requested
+document family; for the current capability-statement ask it excludes archived
+source templates, internal strategy memos, unsupported presentation/workbook
+formats, agreements, and operational trackers before model context is built.
+This private-context lane
 forces `store=false`, in-memory prompt caching, disabled SDK tracing, and no
 sensitive trace content. It uses local retrieval and attaches no hosted file
 search, web search, remote MCP, background execution, or provider-write tools.
@@ -1020,6 +1025,59 @@ dry-run validation. Live execution additionally requires
 an exact approval reference. The runner creates, reads, modifies, rereads,
 trashes, and verifies one marked document while persisting hashes rather than
 the research body.
+
+For ANU-174 L174-16, use the joined latest-research-note workflow rather than
+combining the read receipt and company-research Doc lifecycle manually. A
+read-only preparation run is:
+
+```bash
+npm run run:workspace-research-brief-lifecycle -- --live-google-workspace-reads
+```
+
+It uniquely resolves and fully reads the latest Google Doc in
+`KNIOps/Research`, but persists only source hashes and a no-model/no-write plan.
+The reviewed trusted-runtime proof adds `--live-sdk --approve-private-context`
+for exactly one no-tool model request. Add `--live-google-workspace-writes`, an
+exact `--approval-reference`, and
+`KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE=true` only for the same approved
+run to create, read back, update, reread, trash, and verify one marked
+`KBA_TEST_DOC`. The selected provider ID and note body stay in-process; the
+receipt retains hashes, usage/cost evidence, same-object verification, and
+cleanup status.
+
+For ANU-174 L174-19, collect a real current-quarter Airtable aggregate and
+persist only its sanitized receipt with:
+
+```bash
+npm run run:finance-bd-priority-validation -- --live-airtable-reads
+```
+
+The preparation step uses deterministic schema-selected Airtable reads and
+local arithmetic, preserves both supplied option identities, and performs no
+model call, search, write, send, or post. The trusted-runtime decision adds
+`--live-sdk --approve-private-context` for one no-tool Chief turn capped at one
+request and `$0.05`. A pass requires both options to be visibly compared,
+exactly one priority to be selected, a finance-aware rationale, and a sanitized
+handoff receipt naming Opportunity Scout as the downstream owner.
+
+After a successful Chief Prior Week Packet synthesis has been saved with
+`--output`, deliver from that receipt rather than repeating the model call:
+
+```bash
+npm run deliver:chief-prior-week-packet -- \
+  --input artifacts/test-pack/weekly-chief-packet-live.json \
+  --live-google-workspace-write \
+  --workspace-approval-reference <exact-doc-approval>
+```
+
+This first resolves exactly one `KNIOps` folder, creates the dated durable Doc,
+and verifies its exact identity, title, full body, and parent folder. Its status
+is `doc_verified_slack_pending`. Only then add `--live-slack-post`, the exact
+`--slack-channel-id`, and a separate `--slack-approval-reference`. A Slack
+failure retains the verified Doc receipt for a post-only retry; it must not
+repeat packet synthesis or create a second Doc. For that retry, omit
+`--live-google-workspace-write` and pass the prior local receipt with
+`--resume-delivery-receipt`.
 
 Finance/tax tracker setup for `2026 Finance & Tax Tracker`:
 

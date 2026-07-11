@@ -85,9 +85,20 @@ def local_kni_live_instruction() -> str:
 
 def _inferred_lookup_kind(query_text: str, diagnostics: dict[str, Any]) -> str:
     diagnostic_kind = str(diagnostics.get("lookup_kind") or "").lower()
-    if diagnostic_kind in {"insurance", "formation"}:
+    if diagnostic_kind in {"insurance", "formation", "commercial_material"}:
         return diagnostic_kind
     lowered = str(query_text or "").lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "capability statement",
+            "statement of capabilities",
+            "client proposal",
+            "service areas",
+            "service offerings",
+        )
+    ):
+        return "commercial_material"
     if any(
         marker in lowered
         for marker in (
@@ -161,7 +172,15 @@ def _packet_search_queries(query_text: str, diagnostics: dict[str, Any]) -> list
     queries = [str(query_text or "").strip()]
     lookup_kind = _inferred_lookup_kind(query_text, diagnostics)
     answer_focus = _inferred_answer_focus(query_text, diagnostics)
-    if lookup_kind == "insurance":
+    if lookup_kind == "commercial_material":
+        queries.extend(
+            [
+                "KNI client proposal capability statement services",
+                "Keystone Neuroinformatics proposal service areas",
+                "KNI capabilities service offerings",
+            ]
+        )
+    elif lookup_kind == "insurance":
         if answer_focus == "broker":
             queries.extend(
                 [
@@ -208,7 +227,26 @@ def _candidate_path_score(relative_path: str, diagnostics: dict[str, Any]) -> in
     answer_focus = str(diagnostics.get("answer_focus") or "").lower()
     evidence_path = str(diagnostics.get("evidence_path") or "").lower()
     score = 0
-    if lookup_kind == "insurance":
+    if lookup_kind == "commercial_material":
+        if "04_projects/latest_client_docs" in path:
+            score += 80
+        if "proposal" in path:
+            score += 60
+        if "capabilit" in path:
+            score += 55
+        if "client" in path:
+            score += 15
+        if "statement" in path:
+            score += 10
+        if "template" in path:
+            score -= 5
+        if "boardroom-memos" in path or "internal_policies" in path:
+            score -= 60
+        if "template_sources_to_adapt" in path or "06_archive" in path:
+            score -= 100
+        if any(term in path for term in ("agreement", "nda", "kickoff", "invoice")):
+            score -= 35
+    elif lookup_kind == "insurance":
         if "00_admin/insurance" in path:
             score += 60
         if "coi" in path or "certificate" in path:
@@ -241,9 +279,26 @@ def _candidate_path_score(relative_path: str, diagnostics: dict[str, Any]) -> in
     else:
         if "00_admin" in path:
             score += 10
-    if path == evidence_path and (lookup_kind not in {"insurance", "formation"} or score > 0):
+    if path == evidence_path and (
+        lookup_kind not in {"insurance", "formation", "commercial_material"} or score > 0
+    ):
         score += 5 if lookup_kind == "insurance" and answer_focus == "broker" else 100
     return score
+
+
+def _candidate_matches_lookup(relative_path: str, diagnostics: dict[str, Any]) -> bool:
+    """Require source-family suitability before model context is assembled."""
+
+    path = str(relative_path or "").lower()
+    lookup_kind = str(diagnostics.get("lookup_kind") or "").lower()
+    if lookup_kind == "commercial_material":
+        return (
+            ("proposal" in path or "capabilit" in path)
+            and "template_sources_to_adapt" not in path
+            and "06_archive" not in path
+            and "boardroom-memos" not in path
+        )
+    return _candidate_path_score(relative_path, diagnostics) > 0
 
 
 def local_kni_evidence_paths(packet: object | None) -> list[str]:
@@ -323,6 +378,8 @@ def build_local_kni_evidence_packet(
                     "query": search_query,
                     "relative_path": relative_path,
                     "title": match.get("title") or "",
+                    "extension": match.get("extension") or "",
+                    "modified_at": match.get("modified_at") or "",
                     "snippet": match.get("snippet") or "",
                     "sensitivity_status": match.get("sensitivity_status") or "",
                     "review_required": bool(match.get("review_required")),
@@ -334,11 +391,13 @@ def build_local_kni_evidence_packet(
 
     unique_candidate_paths = list(dict.fromkeys(candidate_paths))
     lookup_kind = effective_lookup_kind
-    if lookup_kind in {"insurance", "formation"}:
+    if lookup_kind in {"insurance", "formation", "commercial_material"}:
         unique_candidate_paths = [
             path
             for path in unique_candidate_paths
-            if _candidate_path_score(path, scoring_diagnostics) > 0
+            if _candidate_matches_lookup(path, scoring_diagnostics)
+            and str(search_matches_by_path.get(path, {}).get("extension") or "").lower()
+            not in {"pptx", "xlsx"}
         ]
     unique_candidate_paths.sort(
         key=lambda path: (-_candidate_path_score(path, scoring_diagnostics), path.lower())
@@ -365,6 +424,7 @@ def build_local_kni_evidence_packet(
                 "relative_path": path,
                 "title": read_payload.get("title") or "",
                 "extension": read_payload.get("extension") or "",
+                "modified_at": search_matches_by_path.get(path, {}).get("modified_at") or "",
                 "sensitivity_status": read_payload.get("sensitivity_status") or "",
                 "review_required": bool(read_payload.get("review_required")),
                 "review_reasons": list(read_payload.get("review_reasons") or []),
@@ -395,6 +455,16 @@ def build_local_kni_evidence_packet(
             **diagnostics,
             "effective_lookup_kind": effective_lookup_kind,
             "effective_answer_focus": effective_answer_focus,
+            "candidate_selection_valid": bool(candidate_documents)
+            and (
+                effective_lookup_kind != "commercial_material"
+                or all(
+                    _candidate_matches_lookup(
+                        doc.get("relative_path", ""), scoring_diagnostics
+                    )
+                    for doc in candidate_documents
+                )
+            ),
         },
     }
 
