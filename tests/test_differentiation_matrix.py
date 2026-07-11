@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from keystone_agents.differentiation_matrix import (
+    DifferentiationObservation,
+    compare_differentiation_observations,
+    differentiation_commitments,
     differentiation_comparison_matrix,
     differentiation_validation_milestones,
+    observation_is_safe_and_useful,
 )
 
 EXPECTED_DIFFERENTIATORS = {
@@ -89,3 +93,105 @@ def test_milestones_have_evidence_and_no_side_effect_guards() -> None:
         assert milestone.required_evidence
         assert milestone.must_not_do
         assert all(issue.startswith("ANU-") for issue in milestone.owner_issues)
+
+
+def _observation(system: str, **overrides: object) -> DifferentiationObservation:
+    values = {
+        "system": system,
+        "workflow_id": "selected_gmail_thread_followup",
+        "natural_request_sha256": "a" * 64,
+        "useful_result": True,
+        "route_correct": True,
+        "sources_visible": True,
+        "followup_continuity": True,
+        "context_reentry_fields": 0,
+        "manual_provider_ids": 0,
+        "approval_round_trips": 1,
+        "unintended_writes": 0,
+        "duplicate_artifacts": 0,
+        "developer_intervention": False,
+        "latency_ms": 1200,
+        "estimated_cost_usd": 0.02,
+        "evidence_refs": ("test:manager_stateful_followup",),
+    }
+    values.update(overrides)
+    return DifferentiationObservation(**values)
+
+
+def test_commitments_select_five_measurable_near_term_claims() -> None:
+    commitments = differentiation_commitments()
+
+    assert len(commitments) == 5
+    assert {commitment.case_id for commitment in commitments} <= EXPECTED_DIFFERENTIATORS
+    for commitment in commitments:
+        assert commitment.product_commitment
+        assert commitment.representative_workflows
+        assert commitment.required_metrics
+        assert commitment.minimum_proof
+        assert {"ANU-10", "ANU-125", "ANU-175"} <= set(commitment.owner_issues)
+
+
+def test_safe_offline_observation_proves_no_side_effect_execution_boundary() -> None:
+    observation = _observation("kba")
+
+    assert observation_is_safe_and_useful(observation) is True
+    assert observation.unintended_writes == 0
+    assert observation.duplicate_artifacts == 0
+    assert observation.developer_intervention is False
+
+
+def test_comparison_supports_claim_only_for_matched_direct_evidence() -> None:
+    kba = _observation("kba")
+    baseline = _observation(
+        "codex_chatgpt_baseline",
+        sources_visible=False,
+        followup_continuity=False,
+        context_reentry_fields=3,
+        manual_provider_ids=1,
+        approval_round_trips=2,
+        evidence_refs=("baseline:controlled_run",),
+    )
+
+    comparison = compare_differentiation_observations(kba, baseline)
+
+    assert comparison.status == "supported"
+    assert comparison.kba_safe_and_useful is True
+    assert set(comparison.improvements) == {
+        "context_reentry_fields",
+        "manual_provider_ids",
+        "approval_round_trips",
+        "sources_visible",
+        "followup_continuity",
+    }
+    assert comparison.regressions == ()
+
+
+def test_comparison_rejects_mismatched_ask_instead_of_inventing_baseline() -> None:
+    kba = _observation("kba")
+    baseline = _observation(
+        "codex_chatgpt_baseline",
+        natural_request_sha256="b" * 64,
+        evidence_refs=("baseline:different_run",),
+    )
+
+    try:
+        compare_differentiation_observations(kba, baseline)
+    except ValueError as exc:
+        assert "same workflow and natural ask" in str(exc)
+    else:
+        raise AssertionError("Expected mismatched comparison to fail")
+
+
+def test_comparison_does_not_support_unsafe_or_regressive_kba_result() -> None:
+    kba = _observation("kba", unintended_writes=1, sources_visible=False)
+    baseline = _observation(
+        "codex_chatgpt_baseline",
+        context_reentry_fields=2,
+        evidence_refs=("baseline:controlled_run",),
+    )
+
+    comparison = compare_differentiation_observations(kba, baseline)
+
+    assert comparison.status == "not_supported"
+    assert comparison.kba_safe_and_useful is False
+    assert set(comparison.regressions) == {"sources_visible", "unintended_writes"}

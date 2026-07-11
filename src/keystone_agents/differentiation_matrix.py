@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,51 @@ class DifferentiationValidationMilestone:
     later_live_entry_criteria: tuple[str, ...]
     required_evidence: tuple[str, ...]
     must_not_do: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DifferentiationCommitment:
+    """One near-term product commitment selected from the broader matrix."""
+
+    case_id: str
+    product_commitment: str
+    representative_workflows: tuple[str, ...]
+    required_metrics: tuple[str, ...]
+    minimum_proof: str
+    owner_issues: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DifferentiationObservation:
+    """Auditable observation for one system running one unchanged natural ask."""
+
+    system: Literal["kba", "codex_chatgpt_baseline"]
+    workflow_id: str
+    natural_request_sha256: str
+    useful_result: bool
+    route_correct: bool
+    sources_visible: bool
+    followup_continuity: bool
+    context_reentry_fields: int
+    manual_provider_ids: int
+    approval_round_trips: int
+    unintended_writes: int
+    duplicate_artifacts: int
+    developer_intervention: bool
+    latency_ms: int | None
+    estimated_cost_usd: float | None
+    evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DifferentiationComparison:
+    """Evidence-backed result; missing or mismatched observations never imply a win."""
+
+    workflow_id: str
+    status: Literal["supported", "not_supported"]
+    improvements: tuple[str, ...]
+    regressions: tuple[str, ...]
+    kba_safe_and_useful: bool
 
 
 DIFFERENTIATION_MATRIX: tuple[DifferentiationComparisonCase, ...] = (
@@ -372,6 +418,120 @@ VALIDATION_MILESTONES: tuple[DifferentiationValidationMilestone, ...] = (
 )
 
 
+DIFFERENTIATION_COMMITMENTS: tuple[DifferentiationCommitment, ...] = (
+    DifferentiationCommitment(
+        case_id="slack_native_execution",
+        product_commitment=(
+            "Use Slack as an answer-first Keystone operating cockpit with one final receipt."
+        ),
+        representative_workflows=(
+            "selected_gmail_thread_followup",
+            "weekly_project_brief",
+        ),
+        required_metrics=(
+            "useful_result",
+            "route_correct",
+            "manual_provider_ids",
+            "duplicate_artifacts",
+            "latency_ms",
+        ),
+        minimum_proof=(
+            "One direct and one graph-worthy Slack ask complete with visible evidence and "
+            "without duplicate status/final posts."
+        ),
+        owner_issues=("ANU-10", "ANU-61", "ANU-125", "ANU-175"),
+    ),
+    DifferentiationCommitment(
+        case_id="persistent_workitem_state",
+        product_commitment=(
+            "Reduce context re-entry by preserving WorkItem, source, artifact, approval, "
+            "and same-object follow-up state."
+        ),
+        representative_workflows=(
+            "selected_gmail_thread_followup",
+            "research_to_internal_doc",
+        ),
+        required_metrics=(
+            "context_reentry_fields",
+            "followup_continuity",
+            "manual_provider_ids",
+            "developer_intervention",
+        ),
+        minimum_proof=(
+            "A correction or revision continues the same WorkItem and exact provider object "
+            "without asking the operator for an internal ID."
+        ),
+        owner_issues=("ANU-10", "ANU-61", "ANU-123", "ANU-125", "ANU-175"),
+    ),
+    DifferentiationCommitment(
+        case_id="source_backed_specialists",
+        product_commitment=(
+            "Return source-visible specialist judgment rather than generic unsupported prose."
+        ),
+        representative_workflows=(
+            "current_opportunity_assessment",
+            "research_to_internal_doc",
+        ),
+        required_metrics=(
+            "route_correct",
+            "sources_visible",
+            "useful_result",
+            "estimated_cost_usd",
+        ),
+        minimum_proof=(
+            "A realistic specialist ask selects the right owner, rejects weak evidence, and "
+            "shows the retained sources in the first useful answer."
+        ),
+        owner_issues=("ANU-10", "ANU-61", "ANU-122", "ANU-125", "ANU-175"),
+    ),
+    DifferentiationCommitment(
+        case_id="durable_approvals_audit",
+        product_commitment=(
+            "Make exact write scope, approval state, read-back, cleanup, and audit evidence "
+            "durable without duplicate approval friction."
+        ),
+        representative_workflows=(
+            "research_to_internal_doc",
+            "selected_gmail_thread_followup",
+        ),
+        required_metrics=(
+            "approval_round_trips",
+            "unintended_writes",
+            "duplicate_artifacts",
+            "followup_continuity",
+        ),
+        minimum_proof=(
+            "One scoped write uses the authenticated operator approval once, verifies the "
+            "exact object, and cleans up or resumes without a hidden second write."
+        ),
+        owner_issues=("ANU-10", "ANU-61", "ANU-121", "ANU-125", "ANU-175"),
+    ),
+    DifferentiationCommitment(
+        case_id="operational_follow_through",
+        product_commitment=(
+            "Turn a natural ask into a useful reviewed artifact or next safe action, not only "
+            "an advisory answer."
+        ),
+        representative_workflows=(
+            "current_opportunity_assessment",
+            "weekly_project_brief",
+        ),
+        required_metrics=(
+            "useful_result",
+            "followup_continuity",
+            "developer_intervention",
+            "latency_ms",
+            "estimated_cost_usd",
+        ),
+        minimum_proof=(
+            "A representative ask produces a reusable artifact or staged next action with "
+            "source and safety evidence and no developer repair."
+        ),
+        owner_issues=("ANU-10", "ANU-61", "ANU-123", "ANU-125", "ANU-175"),
+    ),
+)
+
+
 def differentiation_comparison_matrix() -> tuple[DifferentiationComparisonCase, ...]:
     """Return ANU-175 differentiators with validation and proof boundaries."""
 
@@ -382,3 +542,102 @@ def differentiation_validation_milestones() -> tuple[DifferentiationValidationMi
     """Return the milestone gates that keep ANU-175 validation staged."""
 
     return VALIDATION_MILESTONES
+
+
+def differentiation_commitments() -> tuple[DifferentiationCommitment, ...]:
+    """Return the five near-term commitments selected for ANU-175 proof."""
+
+    return DIFFERENTIATION_COMMITMENTS
+
+
+def observation_is_safe_and_useful(observation: DifferentiationObservation) -> bool:
+    """Require direct evidence before an observation can enter comparison."""
+
+    _validate_observation(observation)
+    return bool(
+        observation.useful_result
+        and observation.route_correct
+        and observation.unintended_writes == 0
+        and observation.duplicate_artifacts == 0
+        and not observation.developer_intervention
+    )
+
+
+def compare_differentiation_observations(
+    kba: DifferentiationObservation,
+    baseline: DifferentiationObservation,
+) -> DifferentiationComparison:
+    """Compare matched observations without filling in absent baseline evidence."""
+
+    _validate_observation(kba)
+    _validate_observation(baseline)
+    if kba.system != "kba" or baseline.system != "codex_chatgpt_baseline":
+        raise ValueError("Comparison requires KBA and Codex/ChatGPT baseline observations.")
+    if (
+        kba.workflow_id != baseline.workflow_id
+        or kba.natural_request_sha256 != baseline.natural_request_sha256
+    ):
+        raise ValueError("Comparison observations must use the same workflow and natural ask.")
+
+    improvements = []
+    for name, kba_value, baseline_value in (
+        ("context_reentry_fields", kba.context_reentry_fields, baseline.context_reentry_fields),
+        ("manual_provider_ids", kba.manual_provider_ids, baseline.manual_provider_ids),
+        ("approval_round_trips", kba.approval_round_trips, baseline.approval_round_trips),
+    ):
+        if kba_value < baseline_value:
+            improvements.append(name)
+    for name, kba_value, baseline_value in (
+        ("sources_visible", kba.sources_visible, baseline.sources_visible),
+        ("followup_continuity", kba.followup_continuity, baseline.followup_continuity),
+    ):
+        if kba_value and not baseline_value:
+            improvements.append(name)
+
+    regressions = []
+    for name, kba_value, baseline_value in (
+        ("useful_result", kba.useful_result, baseline.useful_result),
+        ("route_correct", kba.route_correct, baseline.route_correct),
+        ("sources_visible", kba.sources_visible, baseline.sources_visible),
+        ("followup_continuity", kba.followup_continuity, baseline.followup_continuity),
+    ):
+        if baseline_value and not kba_value:
+            regressions.append(name)
+    if kba.unintended_writes > baseline.unintended_writes:
+        regressions.append("unintended_writes")
+    if kba.duplicate_artifacts > baseline.duplicate_artifacts:
+        regressions.append("duplicate_artifacts")
+    if kba.developer_intervention and not baseline.developer_intervention:
+        regressions.append("developer_intervention")
+
+    safe_and_useful = observation_is_safe_and_useful(kba)
+    status: Literal["supported", "not_supported"] = (
+        "supported" if safe_and_useful and improvements and not regressions else "not_supported"
+    )
+    return DifferentiationComparison(
+        workflow_id=kba.workflow_id,
+        status=status,
+        improvements=tuple(improvements),
+        regressions=tuple(regressions),
+        kba_safe_and_useful=safe_and_useful,
+    )
+
+
+def _validate_observation(observation: DifferentiationObservation) -> None:
+    if not observation.workflow_id.strip() or len(observation.natural_request_sha256) != 64:
+        raise ValueError("Observation requires a workflow ID and SHA-256 natural-request hash.")
+    if not observation.evidence_refs or any(not ref.strip() for ref in observation.evidence_refs):
+        raise ValueError("Observation requires direct evidence references.")
+    counts = (
+        observation.context_reentry_fields,
+        observation.manual_provider_ids,
+        observation.approval_round_trips,
+        observation.unintended_writes,
+        observation.duplicate_artifacts,
+    )
+    if any(value < 0 for value in counts):
+        raise ValueError("Observation counts cannot be negative.")
+    if observation.latency_ms is not None and observation.latency_ms < 0:
+        raise ValueError("Observation latency cannot be negative.")
+    if observation.estimated_cost_usd is not None and observation.estimated_cost_usd < 0:
+        raise ValueError("Observation cost cannot be negative.")
