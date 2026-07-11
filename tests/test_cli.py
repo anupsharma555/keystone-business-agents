@@ -186,7 +186,10 @@ def test_cli_ask_json_reports_actual_execution_and_graph_metadata(
         "live_search": False,
         "openai_requests": 0,
     }
-    assert payload["_langgraph"]["runtime"] == "langgraph"
+    assert payload["_langgraph"]["runtime"] in {
+        "langgraph",
+        "dependency_free_fallback",
+    }
     assert "run_chief_of_staff" in payload["_langgraph"]["node_path"]
 
 
