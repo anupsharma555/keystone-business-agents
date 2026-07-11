@@ -57,3 +57,24 @@ every natural-language request.
 The acceptance test is operator friction: a complete low-risk ask should reach
 its owning agent and return one useful result without extra route selection,
 approval ceremony, repeated review messages, or duplicate final output.
+
+## ANU-222 advanced scenario gate
+
+`src/keystone_agents/advanced_manager_scenarios.py` is the canonical registry
+for the 12 advanced no-live manager scenarios. It covers multi-turn correction,
+selected-object continuity, conflicting instructions, partial specialist
+failure, evidence disagreement, approved-write transition, reversal, advanced
+advisory synthesis, and completion receipts.
+
+Run the complete gate with:
+
+```bash
+npm run test:advanced-manager:no-live -- \
+  --json-output artifacts/test-pack/advanced-manager-scorecard.json
+```
+
+The runner executes the registry's focused pytest evidence one scenario at a
+time and stops on the first failure. Its scorecard records pass/fail, failure
+category, next fix, proof node IDs, zero OpenAI requests, no live connectors,
+and no external side effects. This gate must pass before proposing the bounded
+live ANU-222 batch.

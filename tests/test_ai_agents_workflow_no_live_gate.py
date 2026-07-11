@@ -21,6 +21,7 @@ def test_current_no_live_gate_excludes_legacy_promptfoo_and_live_flags() -> None
         for row in rendered
     )
     assert any("run_slack_agent_expansion_gate.py --quiet" in row for row in rendered)
+    assert any("run_advanced_manager_acceptance.py" in row for row in rendered)
     assert any("eval:slack:anu60-preflight" in row for row in rendered)
     assert all("eval:slack:strict-readiness" not in row for row in rendered)
     assert all("eval:promptfoo:json" not in row for row in rendered)
@@ -33,8 +34,8 @@ def test_current_no_live_gate_can_isolate_repo_only_checks() -> None:
     module = _load_gate_module()
     commands = module.gate_commands(include_anu60=False)
 
-    assert len(commands) == 3
-    assert commands[0][2:4] == ["pytest", "tests/test_basic_agent_execution_smoke_tasks.py"]
+    assert len(commands) == 4
+    assert commands[0][2:4] == ["pytest", "tests/test_advanced_manager_scenarios.py"]
 
 
 def test_current_no_live_gate_can_optionally_check_deferred_evals_runtime() -> None:

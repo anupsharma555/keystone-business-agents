@@ -17,6 +17,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 FOCUSED_TESTS = (
+    "tests/test_advanced_manager_scenarios.py",
     "tests/test_basic_agent_execution_smoke_tasks.py",
     "tests/test_human_agent_execution_jobs.py",
     "tests/test_agent_operational_validation_status.py",
@@ -45,6 +46,10 @@ def gate_commands(
             sys.executable,
             "scripts/run_slack_agent_expansion_gate.py",
             "--quiet",
+        ],
+        [
+            sys.executable,
+            "scripts/run_advanced_manager_acceptance.py",
         ],
     ]
     if include_anu60:

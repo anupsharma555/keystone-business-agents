@@ -51,6 +51,16 @@ delegated provider execution through the manager entrypoint, and one direct plus
 one connector-backed graph-worthy Slack proof. Existing provider primitives
 should be reused rather than rerun.
 
+ANU-222 now has a separate executable 12-scenario manager gate. The first
+2026-07-11 run passed all scenarios with zero OpenAI requests, live connectors,
+or external side effects. It proves low-friction direct ownership, broad-goal
+Chief ownership, explicit route correction, ambiguous-object blocking,
+selected Gmail identity propagation, newest-instruction precedence, saved-state
+resume without repeated specialists, contradictory-source review, scoped
+Airtable write gating, stale-write reversal, typed context handoffs, and useful
+completion review without false blocking. Live model comparison remains a later
+bounded quality proof, not a prerequisite for these deterministic invariants.
+
 - ANU-221 Gmail mailbox-state execution now passes on one real marked provider
   message. A zero-model lifecycle verified label add/remove, unread/read,
   star/unstar, important/not-important, archive/unarchive, trash/restore, and
@@ -84,7 +94,7 @@ should be reused rather than rerun.
   scoring, and unsupported-claim validation respectively. Gmail, Chief, and
   the five context agents already had executable typed-tool proof; Orchestrator
   remains a control-plane routing/review contract rather than a provider owner.
-- `npm run test:ai-agents-workflow:no-live`: 590 workflow and current-context
+- `npm run test:ai-agents-workflow:no-live`: 596 workflow and current-context
   contract tests, seven
   LangGraph scenarios, 36/36 Slack routes, and ANU-60 preflight; zero live
   model/search/connector calls.
