@@ -75,15 +75,20 @@ no-live flow.
 
 Common repo work across all five workflows:
 
-- Add a minimal `ProjectContextPack` or equivalent project reference contract
-  with project id/name, objective, status, owner/reviewer, sensitivity flags,
-  source refs, Slack/thread refs, Drive/Docs/Sheets refs, Airtable refs,
-  WorkItem links, allowed actions, and blocked actions.
-- Add two synthetic real-Keystone-shaped fixtures before any private project
-  data is used: one Gmail/research/outreach fixture and one
-  Workspace/Airtable/Zotero/RSS fixture.
-- Extend WorkItem context-pack builders so project context is attached beside
-  the route-specific specialist pack, not as loose hand-written JSON.
+- The minimal `ProjectContextPack` contract is now implemented with project
+  id/name/objective, status, owner/reviewer, sensitivity and approval flags,
+  source refs, Slack/Workspace/Airtable/Zotero refs, WorkItem links, and
+  allowed/blocked actions. It is nested beside every route-specific specialist
+  pack and removed from the loose target-metadata summary before prompting.
+- One synthetic Gmail/research/outreach project fixture now proves project
+  identity survives Gmail, Research, and Outreach pack construction. It does
+  not promote that workflow into live project use. A second
+  Workspace/Airtable/Zotero/RSS fixture remains future work only when a selected
+  pilot workflow requires it.
+- Project context remains optional for ordinary asks. When supplied, missing
+  identity, absent agent-use approval, or any PHI/patient-specific flag becomes
+  an authoritative readiness blocker before specialist use; blocked actions
+  override overlapping allowed actions.
 - Add a focused no-live acceptance test for each promoted workflow template and
   keep live/API pilots behind the KBA cost-aware ladder.
 

@@ -52,6 +52,7 @@ from keystone_agents.schemas.context_pack import (
     OpportunityContextPack,
     OutreachContactContext,
     OutreachContextPack,
+    ProjectContextPack,
     ResearchContextPack,
 )
 from keystone_agents.schemas.crm import (
@@ -270,6 +271,7 @@ __all__ = [
     "OpportunityContextPack",
     "OutreachContactContext",
     "OutreachContextPack",
+    "ProjectContextPack",
     "ResearchContextPack",
     "CRMLeadRecord",
     "CRMProviderName",

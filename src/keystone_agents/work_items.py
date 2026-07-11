@@ -23,6 +23,7 @@ from keystone_agents.schemas.context_pack import (
     OpportunityContextPack,
     OutreachContactContext,
     OutreachContextPack,
+    ProjectContextPack,
     ResearchContextPack,
 )
 from keystone_agents.schemas.memory import normalize_memory_key
@@ -687,7 +688,11 @@ def build_context_pack_for_route(
 
 def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
     ready = research_ready(work_item)
-    gates = [_gate("research_target_readiness", ready)]
+    project_context = build_project_context_pack(work_item)
+    gates = [
+        *_project_context_gates(project_context),
+        _gate("research_target_readiness", ready),
+    ]
     source_summary = _source_bundle_summary(work_item.sources, work_item.artifact_refs)
     return ResearchContextPack(
         work_item_id=work_item.id,
@@ -711,7 +716,8 @@ def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
         can_synthesize=_required_gates_ready(gates),
         missing_requirements=_missing_requirements_from_gates(gates),
         limitation_notes=_limitation_notes_from_gates(gates),
-        summary=summarize_work_item_for_agent(work_item),
+        project_context=project_context,
+        summary=_specialist_context_summary(work_item),
         research_goal=work_item.request_text or work_item.target.name or work_item.target.url,
         source_bundle_summary=source_summary,
         missing_evidence=(
@@ -723,7 +729,9 @@ def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
 def build_opportunity_context_pack(work_item: WorkItem) -> OpportunityContextPack:
     objective_ready = opportunity_objective_clarity(work_item)
     source_ready = source_sufficiency(work_item)
+    project_context = build_project_context_pack(work_item)
     gates = [
+        *_project_context_gates(project_context),
         _gate("opportunity_objective_clarity", objective_ready),
         _gate("source_sufficiency", source_ready, required=False),
     ]
@@ -750,7 +758,8 @@ def build_opportunity_context_pack(work_item: WorkItem) -> OpportunityContextPac
         can_synthesize=_required_gates_ready(gates),
         missing_requirements=_missing_requirements_from_gates(gates),
         limitation_notes=_limitation_notes_from_gates(gates),
-        summary=summarize_work_item_for_agent(work_item),
+        project_context=project_context,
+        summary=_specialist_context_summary(work_item),
         objective=work_item.request_text or work_item.target.name,
         constraints=_metadata_text_list(work_item.target.metadata, "constraints"),
         entity_types=_metadata_text_list(work_item.target.metadata, "entity_types"),
@@ -770,7 +779,9 @@ def build_outreach_context_pack(work_item: WorkItem) -> OutreachContextPack:
     sources_ready = source_sufficiency(work_item)
     research_ready_result = research_sufficiency(work_item)
     external_ready = external_use_ready(work_item)
+    project_context = build_project_context_pack(work_item)
     gates = [
+        *_project_context_gates(project_context),
         _gate("outreach_recipient_readiness", recipient_ready),
         _gate(
             "outreach_contact_channel_readiness",
@@ -811,7 +822,8 @@ def build_outreach_context_pack(work_item: WorkItem) -> OutreachContextPack:
         can_synthesize=_required_gates_ready(gates),
         missing_requirements=_missing_requirements_from_gates(gates),
         limitation_notes=_limitation_notes_from_gates(gates),
-        summary=summarize_work_item_for_agent(work_item),
+        project_context=project_context,
+        summary=_specialist_context_summary(work_item),
         selected_company_artifact=company_ref,
         selected_opportunity_artifact=opportunity_ref,
         contact=_outreach_contact(work_item, company_ref, opportunity_ref),
@@ -829,7 +841,9 @@ def build_outreach_context_pack(work_item: WorkItem) -> OutreachContextPack:
 def build_gmail_context_pack(work_item: WorkItem) -> GmailContextPack:
     thread_ready = gmail_thread_readiness(work_item)
     external_ready = external_use_ready(work_item)
+    project_context = build_project_context_pack(work_item)
     gates = [
+        *_project_context_gates(project_context),
         _gate("gmail_thread_readiness", thread_ready),
         _gate("external_use_readiness", external_ready, required=False),
     ]
@@ -858,7 +872,8 @@ def build_gmail_context_pack(work_item: WorkItem) -> GmailContextPack:
         can_synthesize=_required_gates_ready(gates),
         missing_requirements=_missing_requirements_from_gates(gates),
         limitation_notes=_limitation_notes_from_gates(gates),
-        summary=summarize_work_item_for_agent(work_item),
+        project_context=project_context,
+        summary=_specialist_context_summary(work_item),
         thread_id=thread_id,
         message_id=message_id,
         selected_thread_ids=_metadata_text_list(metadata, "selected_thread_ids") or [thread_id]
@@ -873,6 +888,83 @@ def build_gmail_context_pack(work_item: WorkItem) -> GmailContextPack:
         reply_objective=str(metadata.get("reply_objective") or work_item.request_text or ""),
         risk_flags=_metadata_text_list(metadata, "risk_flags"),
         approval_state=_highest_gate_state(work_item),
+    )
+
+
+def build_project_context_pack(work_item: WorkItem) -> ProjectContextPack | None:
+    """Normalize optional project metadata into one bounded typed contract."""
+
+    payload = work_item.target.metadata.get("project_context")
+    if not isinstance(payload, dict):
+        return None
+    project_id = _bounded_project_text(payload.get("project_id"), max_chars=120)
+    name = _bounded_project_text(payload.get("name"), max_chars=160)
+    objective = _bounded_project_text(payload.get("objective"), max_chars=600)
+    approved = bool(payload.get("approved_for_agent_use"))
+    contains_phi = bool(payload.get("contains_phi"))
+    missing: list[str] = []
+    blockers: list[WorkItemBlocker] = []
+    if not project_id or not name or not objective:
+        missing.append("Project id, name, and objective are required.")
+        blockers.append(
+            WorkItemBlocker(
+                code="project_context_missing_identity",
+                message="Project context requires an exact project id, name, and objective.",
+            )
+        )
+    if not approved:
+        missing.append("Project context must be approved for agent use.")
+        blockers.append(
+            WorkItemBlocker(
+                code="project_context_not_approved",
+                message="Approve this bounded project context before specialist use.",
+            )
+        )
+    if contains_phi:
+        missing.append("Project context containing PHI is out of scope.")
+        blockers.append(
+            WorkItemBlocker(
+                code="project_context_contains_phi",
+                message="Project context containing PHI or patient-specific data cannot be used.",
+            )
+        )
+    blocked_actions = _project_text_list(payload, "blocked_actions", max_items=20)
+    blocked_normalized = {item.casefold() for item in blocked_actions}
+    allowed_actions = [
+        item
+        for item in _project_text_list(payload, "allowed_actions", max_items=20)
+        if item.casefold() not in blocked_normalized
+    ]
+    source_refs = []
+    for raw_ref in payload.get("source_refs") or []:
+        if isinstance(raw_ref, dict):
+            source_refs.append(WorkItemSourceRef.model_validate(raw_ref))
+        if len(source_refs) >= 12:
+            break
+    sensitivity = str(payload.get("sensitivity") or "internal").strip().casefold()
+    if sensitivity not in {"public", "internal", "private", "restricted"}:
+        sensitivity = "internal"
+    return ProjectContextPack(
+        project_id=project_id,
+        name=name,
+        objective=objective,
+        status=_bounded_project_text(payload.get("status"), max_chars=80),
+        owner=_bounded_project_text(payload.get("owner"), max_chars=160),
+        reviewer=_bounded_project_text(payload.get("reviewer"), max_chars=160),
+        sensitivity=sensitivity,
+        approved_for_agent_use=approved,
+        contains_phi=contains_phi,
+        source_refs=source_refs,
+        slack_refs=_project_text_list(payload, "slack_refs"),
+        workspace_refs=_project_text_list(payload, "workspace_refs"),
+        airtable_refs=_project_text_list(payload, "airtable_refs"),
+        zotero_refs=_project_text_list(payload, "zotero_refs"),
+        related_work_item_ids=_project_text_list(payload, "related_work_item_ids"),
+        allowed_actions=allowed_actions,
+        blocked_actions=blocked_actions,
+        blockers=blockers,
+        ready=not blockers,
+        missing_requirements=missing,
     )
 
 
@@ -1526,6 +1618,73 @@ def _bounded_memory_text(value: Any, *, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return f"{text[: max_chars - 3].rstrip()}..."
+
+
+def _bounded_project_text(value: Any, *, max_chars: int) -> str:
+    return _bounded_memory_text(value, max_chars=max_chars)
+
+
+def _project_text_list(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    max_items: int = 12,
+) -> list[str]:
+    raw = payload.get(key)
+    values = raw if isinstance(raw, list | tuple | set) else [raw] if raw else []
+    cleaned = [
+        _bounded_project_text(value, max_chars=320)
+        for value in values
+        if _bounded_project_text(value, max_chars=320)
+    ]
+    return list(dict.fromkeys(cleaned))[:max_items]
+
+
+def _project_context_gates(
+    project_context: ProjectContextPack | None,
+) -> list[ContextPackReadinessGate]:
+    if project_context is None:
+        return []
+    readiness = ReadinessResult(
+        ready=project_context.ready,
+        blockers=tuple(project_context.blockers),
+        next_action=(
+            None
+            if project_context.ready
+            else WorkItemNextAction(
+                action="review_project_context",
+                agent=WorkItemRoute.ORCHESTRATOR,
+                description=(
+                    "Provide an approved, non-PHI project id, name, objective, and scoped "
+                    "allowed/blocked actions before project-aware execution."
+                ),
+            )
+        ),
+    )
+    return [
+        _gate(
+            "project_context_readiness",
+            readiness,
+            details={
+                "project_id": project_context.project_id,
+                "sensitivity": project_context.sensitivity,
+                "allowed_actions": project_context.allowed_actions,
+                "blocked_actions": project_context.blocked_actions,
+            },
+        )
+    ]
+
+
+def _specialist_context_summary(work_item: WorkItem) -> dict[str, Any]:
+    """Keep project context typed instead of duplicating the loose input blob."""
+
+    summary = summarize_work_item_for_agent(work_item)
+    target = dict(summary.get("target") or {})
+    metadata = dict(target.get("metadata") or {})
+    metadata.pop("project_context", None)
+    target["metadata"] = metadata
+    summary["target"] = target
+    return summary
 
 
 def _gate(
