@@ -295,7 +295,11 @@ def _pmid(text: str) -> str:
 
 def _doi(text: str) -> str:
     match = re.search(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", text or "", flags=re.I)
-    return match.group(0).rstrip(".,;)").lower() if match else ""
+    if not match:
+        return ""
+    doi = match.group(0).rstrip(".,;)")
+    doi = re.sub(r"/(?:full|abstract|pdf|epdf|html)$", "", doi, flags=re.I)
+    return doi.lower()
 
 
 def _zotero_key(source_id: str) -> str:

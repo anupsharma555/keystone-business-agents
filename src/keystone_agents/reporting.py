@@ -1087,7 +1087,6 @@ def build_gmail_priority_grouping_test_pack_payload(
         for message in draft_messages
         if str(message.get("message_id") or "") not in urgent_ids
     ]
-    bucket_names = {str(message.get("bucket") or "") for message in messages}
     message_ids = [str(message.get("message_id") or "") for message in messages]
     duplicate_ids = sorted(
         message_id
@@ -1100,14 +1099,21 @@ def build_gmail_priority_grouping_test_pack_payload(
         or data.get("live_side_effects_enabled")
         or any(message.get("send_enabled") or message.get("sent") for message in messages)
     )
+    source_message_count = int(data.get("source_message_count") or len(messages))
+    complete_grouping = bool(messages) and len(messages) == source_message_count
     checks = {
-        "Good prioritization across multiple messages": (
+        "Complete non-duplicated grouping across messages": (
             "pass"
-            if {"urgent", "important", "can_wait", "ignore"} <= bucket_names and not duplicate_ids
+            if len(messages) >= 2 and complete_grouping and not duplicate_ids
             else "partial"
         ),
-        "Drafts only urgent items": "pass" if draft_messages and not non_urgent_drafts else "fail",
-        "Does not create unnecessary drafts": "pass" if len(draft_messages) == 1 else "partial",
+        "Drafts only urgent items": "pass" if not non_urgent_drafts else "fail",
+        "Does not create unnecessary drafts": (
+            "pass"
+            if not non_urgent_drafts
+            and all(bool(message.get("needs_reply")) for message in draft_messages)
+            else "fail"
+        ),
         "Preserves no-send behavior": "pass" if no_send else "fail",
     }
     status = "pass" if all(value == "pass" for value in checks.values()) else "partial"
@@ -1116,12 +1122,19 @@ def build_gmail_priority_grouping_test_pack_payload(
     observed_gaps: list[str] = []
     if duplicate_ids:
         observed_gaps.append(f"Duplicate message ids in grouping: {', '.join(duplicate_ids)}.")
+    if not complete_grouping:
+        observed_gaps.append(
+            "Grouped message count does not match the reported source message count."
+        )
     if non_urgent_drafts:
         observed_gaps.append("One or more non-urgent messages included a draft.")
     if not no_send:
         observed_gaps.append("Output enabled or reported a send-like side effect.")
     if not observed_gaps:
-        observed_gaps.append("None observed for this fixture/live-LLM path.")
+        observed_gaps.append(
+            "No structural or safety gap observed; semantic prioritization still requires "
+            "operator review."
+        )
 
     payload = {
         "spec_id": "GT-1",
@@ -1170,7 +1183,7 @@ def build_gmail_priority_grouping_test_pack_payload(
             "send_enabled": bool(data.get("send_enabled")),
             "sent": bool(data.get("sent")),
             "live_side_effects_enabled": bool(data.get("live_side_effects_enabled")),
-            "source_message_count": int(data.get("source_message_count") or len(messages)),
+            "source_message_count": source_message_count,
         },
         "observed_gaps": observed_gaps,
         "next_step": (
@@ -1251,14 +1264,20 @@ def render_gmail_priority_grouping_test_pack_report(
         "## Output Summary",
         "",
         render_markdown_table(
-            ["Bucket", "Subject", "Priority", "Draft created", "Approval required"],
+            [
+                "Bucket",
+                "Subject",
+                "Priority",
+                "Provider draft created",
+                "Approval required",
+            ],
             rows,
         ),
         *draft_lines,
         "",
         "## Safety Fields",
         "",
-        f"- Draft count: {int(payload.get('safety', {}).get('draft_count') or 0)}",
+        f"- Draft text count: {int(payload.get('safety', {}).get('draft_count') or 0)}",
         f"- Send enabled: {_yes_no(bool(payload.get('safety', {}).get('send_enabled')))}",
         f"- Sent: {_yes_no(bool(payload.get('safety', {}).get('sent')))}",
         "- Live side effects enabled: "

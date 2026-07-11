@@ -1284,8 +1284,24 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
     prepared = _prepared_step_from_state(state)
     request_text = _context_edge_request_text(state, prepared)
     work_item = prepared.work_item
-    source_ref = _zotero_context_source_ref(work_item.id, request_text)
-    artifact = _zotero_context_artifact(work_item.id, request_text, source_ref)
+    existing_zotero_sources = [
+        source
+        for source in work_item.sources
+        if source.source_id.startswith("zotero:item:")
+        or source.provider in {"zotero", "zotero_context_agent"}
+    ]
+    provider_evidence = bool(existing_zotero_sources)
+    source_ref = (
+        existing_zotero_sources[0]
+        if existing_zotero_sources
+        else _zotero_context_source_ref(work_item.id, request_text)
+    )
+    artifact = _zotero_context_artifact(
+        work_item.id,
+        request_text,
+        source_ref,
+        provider_evidence=provider_evidence,
+    )
     existing_source_ids = {source.source_id for source in work_item.sources}
     sources = list(work_item.sources)
     if source_ref.source_id not in existing_source_ids:
@@ -1294,10 +1310,13 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         **work_item.target.metadata,
         "zotero_context_handoff": {
             "agent_name": "zotero_context_agent",
-            "mode": "dry_run_context_handoff",
+            "mode": (
+                "provider_source_handoff" if provider_evidence else "dry_run_context_handoff"
+            ),
             "artifact_type": artifact.artifact_type,
             "artifact_id": artifact.artifact_id,
             "source_id": source_ref.source_id,
+            "provider_evidence": provider_evidence,
             "external_writes_enabled": False,
         },
     }
@@ -1367,12 +1386,28 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
         )
     request_text = _context_edge_request_text(state, prepared)
     work_item = prepared.work_item
-    source_ref = _airtable_context_source_ref(work_item.id, request_text)
+    existing_airtable_sources = [
+        source
+        for source in work_item.sources
+        if source.source_id.startswith("airtable:")
+        or source.provider == "airtable_context_agent"
+    ]
+    provider_evidence = bool(existing_airtable_sources)
+    source_ref = (
+        existing_airtable_sources[0]
+        if existing_airtable_sources
+        else _airtable_context_source_ref(work_item.id, request_text)
+    )
     if (
         not prior_result_present
         and _airtable_context_should_stage_before_specialist(request_text, prepared)
     ):
-        artifact = _airtable_context_summary_artifact(work_item.id, request_text, source_ref)
+        artifact = _airtable_context_summary_artifact(
+            work_item.id,
+            request_text,
+            source_ref,
+            provider_evidence=provider_evidence,
+        )
         existing_source_ids = {source.source_id for source in work_item.sources}
         sources = list(work_item.sources)
         if source_ref.source_id not in existing_source_ids:
@@ -1381,10 +1416,15 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
             **work_item.target.metadata,
             "airtable_context_handoff": {
                 "agent_name": "airtable_context_agent",
-                "mode": "dry_run_read_context_handoff",
+                "mode": (
+                    "provider_source_handoff"
+                    if provider_evidence
+                    else "dry_run_read_context_handoff"
+                ),
                 "artifact_type": artifact.artifact_type,
                 "artifact_id": artifact.artifact_id,
                 "source_id": source_ref.source_id,
+                "provider_evidence": provider_evidence,
                 "external_writes_enabled": False,
             },
         }
@@ -2507,6 +2547,8 @@ def _feed_context_edge_kind(
     if prepared.route not in {
         WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
         WorkItemRoute.OPPORTUNITY_SCOUT,
+        WorkItemRoute.RSS_CONTEXT_AGENT,
+        WorkItemRoute.PREPRINTS_CONTEXT_AGENT,
         WorkItemRoute.CHIEF_OF_STAFF,
         WorkItemRoute.ORCHESTRATOR,
         WorkItemRoute.CLARIFICATION,
@@ -2748,6 +2790,8 @@ def _zotero_context_artifact(
     work_item_id: str,
     request_text: str,
     source_ref: WorkItemSourceRef,
+    *,
+    provider_evidence: bool = False,
 ) -> WorkItemArtifactRef:
     return WorkItemArtifactRef(
         artifact_type="zotero_context_summary",
@@ -2756,13 +2800,15 @@ def _zotero_context_artifact(
         approval_state="approved_for_research",
         title="Zotero context handoff",
         summary=(
-            "Read-only Zotero context staged for downstream synthesis. The specialist "
+            "A concrete read-only Zotero item was staged for downstream synthesis."
+            if provider_evidence
+            else "Read-only Zotero context staged for downstream synthesis. The specialist "
             "must still cite concrete local Zotero items or other retrieved sources."
         ),
         selected=True,
         metadata={
             "agent_name": "zotero_context_agent",
-            "mode": "dry_run_context_handoff",
+            "mode": "provider_source_handoff" if provider_evidence else "dry_run_context_handoff",
             "source_refs": [source_ref.model_dump(mode="json")],
             "source_count": 1,
             "recommended_downstream_route": "context_selected_downstream_specialist",
@@ -2774,7 +2820,8 @@ def _zotero_context_artifact(
             "request_excerpt": _compact_context_edge_text(request_text, 500),
             "external_writes_enabled": False,
             "send_enabled": False,
-            "live_reads_enabled": False,
+            "live_reads_enabled": provider_evidence,
+            "provider_evidence": provider_evidence,
         },
     )
 
@@ -2885,6 +2932,8 @@ def _airtable_context_summary_artifact(
     work_item_id: str,
     request_text: str,
     source_ref: WorkItemSourceRef,
+    *,
+    provider_evidence: bool = False,
 ) -> WorkItemArtifactRef:
     return WorkItemArtifactRef(
         artifact_type="airtable_context_summary",
@@ -2893,13 +2942,19 @@ def _airtable_context_summary_artifact(
         approval_state="approved_for_research",
         title="Airtable context handoff",
         summary=(
-            "Read-only Airtable context staged for downstream specialist work. "
+            "Concrete read-only Airtable evidence staged for downstream specialist work."
+            if provider_evidence
+            else "Read-only Airtable context staged for downstream specialist work. "
             "Live schema or record reads were not performed by this graph handoff."
         ),
         selected=True,
         metadata={
             "agent_name": "airtable_context_agent",
-            "mode": "dry_run_read_context_handoff",
+            "mode": (
+                "provider_source_handoff"
+                if provider_evidence
+                else "dry_run_read_context_handoff"
+            ),
             "source_refs": [source_ref.model_dump(mode="json")],
             "source_count": 1,
             "recommended_artifact_plan": [
@@ -2910,7 +2965,8 @@ def _airtable_context_summary_artifact(
             "request_excerpt": _compact_context_edge_text(request_text, 500),
             "external_writes_enabled": False,
             "send_enabled": False,
-            "live_reads_enabled": False,
+            "live_reads_enabled": provider_evidence,
+            "provider_evidence": provider_evidence,
             "live_write_allowed_for_specialist": False,
         },
     )

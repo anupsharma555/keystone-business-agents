@@ -83,6 +83,7 @@ from keystone_agents.tools.memory_tool import (
     save_retrieval_tool_performance_memory,
 )
 from keystone_agents.tools.playwright_tool import render_page
+from keystone_agents.tools.public_contact_tool import discover_public_company_contacts
 from keystone_agents.tools.serper_tool import SearchResult, search_web
 from keystone_agents.tools.storage_tool import (
     load_approved_contact_context,
@@ -447,6 +448,7 @@ def _business_research_analyst_tools(*, tool_tier: str | int | None = None) -> l
             capture_browser_diagnostics,
             summarize_rendered_page_diagnostics,
             fetch_linkedin_or_profile_placeholder,
+            discover_public_company_contacts,
             extract_company_signals,
             dedupe_and_rank_sources,
             build_source_bundle_for_synthesis,
@@ -489,6 +491,7 @@ def _business_research_analyst_company_profile_tools(
             capture_browser_diagnostics,
             summarize_rendered_page_diagnostics,
             fetch_linkedin_or_profile_placeholder,
+            discover_public_company_contacts,
             extract_company_signals,
             dedupe_and_rank_sources,
             build_source_bundle_for_synthesis,
@@ -509,6 +512,7 @@ def build_business_research_analyst_focused_brief_agent(
     request_text: str = "",
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
+    attach_tools: bool = True,
 ) -> Agent:
     """Build Business Research Analyst for BR-1 focused brief synthesis."""
 
@@ -528,7 +532,7 @@ def build_business_research_analyst_focused_brief_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=CompanyResearchFocusedBrief,
-        tools=_business_research_analyst_tools(tool_tier=tool_tier),
+        tools=_business_research_analyst_tools(tool_tier=tool_tier) if attach_tools else [],
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -581,6 +585,7 @@ def build_business_research_analyst_research_brief_agent(
     request_text: str = "",
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
+    attach_tools: bool = True,
 ) -> Agent:
     """Build the broader Business Research Analyst for non-company research briefs."""
 
@@ -600,7 +605,11 @@ def build_business_research_analyst_research_brief_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=ResearchBrief,
-        tools=_business_research_analyst_tools(tool_tier=tool_tier),
+        tools=(
+            _business_research_analyst_tools(tool_tier=tool_tier)
+            if attach_tools
+            else []
+        ),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -889,6 +898,7 @@ def run_business_research_analyst_research_brief_sdk(
     session: Any | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    attach_tools: bool = True,
 ) -> TypedAgentRunResult[ResearchBrief]:
     """Run the broader Business Research Analyst through the typed SDK harness."""
 
@@ -908,6 +918,7 @@ def run_business_research_analyst_research_brief_sdk(
             model=model,
             request_text=skill_request_text(typed_input),
             tool_tier=resolved_tool_tier,
+            attach_tools=attach_tools,
         ),
         typed_input=typed_input_for_run,
         output_type=ResearchBrief,

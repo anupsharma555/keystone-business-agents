@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -41,6 +42,11 @@ class SlackConfigurationError(RuntimeError):
     """Raised when a live Slack call is requested without required credentials."""
 
 
+SLACK_TEST_MESSAGE_MARKER = "KBA_TEST_SLACK_MESSAGE"
+SLACK_TEST_WRITES_ENV = "KEYSTONE_SLACK_ALLOW_TEST_MESSAGE_WRITES"
+SLACK_TEST_CHANNEL_ENV = "KEYSTONE_SLACK_TEST_CHANNEL"
+
+
 _OMIT_FROM_SLACK_FLAGS = frozenset({"possible_phi", "secret", "security", "professional_advice"})
 _REVIEW_OBJECT_TYPES = {
     "gmail_triage",
@@ -66,6 +72,26 @@ _HUMAN_LABELS = {
 }
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x1b]*(?:\x1b\\|\x07)|[@-Z\\-_])")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _looks_like_kni_operator_request(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    route_terms = (
+        "chief of staff",
+        "business research",
+        "gmail triage",
+        "opportunity scout",
+        "outreach composer",
+        "airtable context",
+        "workspace context",
+        "zotero context",
+        "rss context",
+        "preprints context",
+    )
+    return "@kni" in normalized or (
+        bool(re.search(r"<@[a-z0-9]+>", normalized))
+        and any(term in normalized for term in route_terms)
+    )
 
 
 @dataclass(frozen=True)
@@ -1374,6 +1400,430 @@ class SlackTool:
             },
         )
 
+    def read_message(self, channel: str, ts: str) -> dict[str, Any]:
+        """Read one exact Slack message for provider verification."""
+
+        clean_channel = channel.strip()
+        clean_ts = ts.strip()
+        if not clean_channel or not clean_ts:
+            raise ValueError("Slack message reads require exact channel and timestamp.")
+        if not self.live:
+            return {"status": "dry-run", "channel": clean_channel, "ts": clean_ts}
+        token, _default_channel = self._resolved_credentials()
+        if not token:
+            raise SlackConfigurationError("Live Slack message reads require SLACK_BOT_TOKEN.")
+        payload = _slack_api_request(
+            "GET",
+            "conversations.history",
+            token=token,
+            params={
+                "channel": clean_channel,
+                "oldest": clean_ts,
+                "latest": clean_ts,
+                "inclusive": "true",
+                "limit": 1,
+            },
+        )
+        messages = payload.get("messages", [])
+        match = next(
+            (
+                item
+                for item in messages
+                if isinstance(item, Mapping) and str(item.get("ts") or "") == clean_ts
+            ),
+            None,
+        ) if isinstance(messages, list) else None
+        if not isinstance(match, Mapping):
+            return {"status": "not_found", "channel": clean_channel, "ts": clean_ts}
+        return {
+            "status": "success",
+            "channel": clean_channel,
+            "ts": clean_ts,
+            "text": str(match.get("text") or ""),
+            "bot_id": str(match.get("bot_id") or ""),
+        }
+
+    def list_recent_thread_roots(self, channel: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        """List bounded recent thread roots without returning message text."""
+
+        clean_channel = channel.strip()
+        if not clean_channel:
+            raise ValueError("Slack thread-root reads require an exact channel.")
+        if not self.live:
+            return []
+        token, _default_channel = self._resolved_credentials()
+        if not token:
+            raise SlackConfigurationError("Live Slack thread reads require SLACK_BOT_TOKEN.")
+        requested = max(1, min(200, int(limit)))
+        scanned = 0
+        cursor = ""
+        roots: list[dict[str, Any]] = []
+        while scanned < requested:
+            params: dict[str, Any] = {
+                "channel": clean_channel,
+                "limit": min(100, requested - scanned),
+            }
+            if cursor:
+                params["cursor"] = cursor
+            payload = _slack_api_request(
+                "GET",
+                "conversations.history",
+                token=token,
+                params=params,
+            )
+            messages = payload.get("messages", [])
+            if not isinstance(messages, list) or not messages:
+                break
+            scanned += len(messages)
+            roots.extend(
+                {
+                    "channel": clean_channel,
+                    "thread_ts": str(item.get("ts") or ""),
+                    "reply_count": int(item.get("reply_count") or 0),
+                }
+                for item in messages
+                if isinstance(item, Mapping)
+                and str(item.get("ts") or "")
+                and not str(item.get("thread_ts") or "")
+            )
+            metadata = payload.get("response_metadata")
+            cursor = (
+                str(metadata.get("next_cursor") or "").strip()
+                if isinstance(metadata, Mapping)
+                else ""
+            )
+            if not cursor:
+                break
+        return roots
+
+    def read_thread(self, channel: str, thread_ts: str, *, limit: int = 50) -> dict[str, Any]:
+        """Read one exact bounded Slack thread without posting or modifying it."""
+
+        clean_channel = channel.strip()
+        clean_ts = thread_ts.strip()
+        if not clean_channel or not clean_ts:
+            raise ValueError("Slack thread reads require exact channel and root timestamp.")
+        if not self.live:
+            return {
+                "status": "dry-run",
+                "channel": clean_channel,
+                "thread_ts": clean_ts,
+                "messages": [],
+                "post_enabled": False,
+            }
+        token, _default_channel = self._resolved_credentials()
+        if not token:
+            raise SlackConfigurationError("Live Slack thread reads require SLACK_BOT_TOKEN.")
+        payload = _slack_api_request(
+            "GET",
+            "conversations.replies",
+            token=token,
+            params={
+                "channel": clean_channel,
+                "ts": clean_ts,
+                "limit": max(1, min(100, int(limit))),
+            },
+        )
+        messages = payload.get("messages", [])
+        bounded = [
+            {
+                "ts": str(item.get("ts") or ""),
+                "text": str(item.get("text") or ""),
+                "user": str(item.get("user") or ""),
+                "bot_id": str(item.get("bot_id") or ""),
+            }
+            for item in messages
+            if isinstance(item, Mapping) and str(item.get("ts") or "")
+        ] if isinstance(messages, list) else []
+        return {
+            "status": "success" if bounded else "not_found",
+            "channel": clean_channel,
+            "thread_ts": clean_ts,
+            "message_count": len(bounded),
+            "messages": bounded,
+            "post_enabled": False,
+        }
+
+    def resolve_latest_thread_root(
+        self,
+        channel: str,
+        *,
+        scan_limit: int = 20,
+    ) -> dict[str, Any]:
+        """Resolve the newest actual reply thread when history omits reply counts."""
+
+        clean_channel = channel.strip()
+        if not clean_channel:
+            raise ValueError("Latest Slack thread resolution requires an exact channel.")
+        roots = self.list_recent_thread_roots(
+            clean_channel,
+            limit=max(1, min(50, int(scan_limit))),
+        )
+        direct = next((root for root in roots if int(root.get("reply_count") or 0) > 0), None)
+        if direct is not None or not self.live:
+            return direct or {}
+        token, _default_channel = self._resolved_credentials()
+        if not token:
+            raise SlackConfigurationError("Live Slack thread reads require SLACK_BOT_TOKEN.")
+        for root in roots:
+            thread_ts = str(root.get("thread_ts") or "").strip()
+            if not thread_ts:
+                continue
+            payload = _slack_api_request(
+                "GET",
+                "conversations.replies",
+                token=token,
+                params={"channel": clean_channel, "ts": thread_ts, "limit": 2},
+            )
+            messages = payload.get("messages", [])
+            if isinstance(messages, list) and len(messages) > 1:
+                return {
+                    "channel": clean_channel,
+                    "thread_ts": thread_ts,
+                    "reply_count": len(messages) - 1,
+                    "resolution": "bounded_replies_probe",
+                }
+        return {}
+
+    def find_latest_kni_request(
+        self,
+        channel: str,
+        *,
+        scan_limit: int = 200,
+    ) -> dict[str, Any]:
+        """Return the newest bounded user-authored KNI request and no unrelated text."""
+
+        clean_channel = channel.strip()
+        if not clean_channel:
+            raise ValueError("Latest KNI request lookup requires an exact channel.")
+        if not self.live:
+            return {}
+        token, _default_channel = self._resolved_credentials()
+        if not token:
+            raise SlackConfigurationError("Live Slack request lookup requires SLACK_BOT_TOKEN.")
+        requested = max(1, min(200, int(scan_limit)))
+        scanned = 0
+        cursor = ""
+        while scanned < requested:
+            params: dict[str, Any] = {
+                "channel": clean_channel,
+                "limit": min(100, requested - scanned),
+            }
+            if cursor:
+                params["cursor"] = cursor
+            payload = _slack_api_request(
+                "GET",
+                "conversations.history",
+                token=token,
+                params=params,
+            )
+            messages = payload.get("messages", [])
+            if not isinstance(messages, list) or not messages:
+                break
+            scanned += len(messages)
+            for item in messages:
+                if not isinstance(item, Mapping):
+                    continue
+                text = str(item.get("text") or "").strip()
+                if (
+                    text
+                    and str(item.get("user") or "").strip()
+                    and not str(item.get("bot_id") or "").strip()
+                    and _looks_like_kni_operator_request(text)
+                ):
+                    return {
+                        "channel": clean_channel,
+                        "ts": str(item.get("ts") or ""),
+                        "text": text,
+                        "user_present": True,
+                    }
+            metadata = payload.get("response_metadata")
+            cursor = (
+                str(metadata.get("next_cursor") or "").strip()
+                if isinstance(metadata, Mapping)
+                else ""
+            )
+            if not cursor:
+                break
+        return {}
+
+    def find_test_messages(self, channel: str, exact_text: str, *, limit: int = 20) -> list[str]:
+        """Return timestamps for recent exact marked messages without exposing other text."""
+
+        clean_channel = channel.strip()
+        if not clean_channel or SLACK_TEST_MESSAGE_MARKER not in exact_text:
+            raise ValueError("Slack test-message recovery requires exact channel and marked text.")
+        if not self.live:
+            return []
+        token, _default_channel = self._resolved_credentials()
+        if not token:
+            raise SlackConfigurationError("Live Slack message recovery requires SLACK_BOT_TOKEN.")
+        payload = _slack_api_request(
+            "GET",
+            "conversations.history",
+            token=token,
+            params={"channel": clean_channel, "limit": max(1, min(50, int(limit)))},
+        )
+        messages = payload.get("messages", [])
+        if not isinstance(messages, list):
+            return []
+        return [
+            str(item.get("ts") or "")
+            for item in messages
+            if isinstance(item, Mapping)
+            and str(item.get("text") or "") == exact_text
+            and str(item.get("ts") or "")
+        ]
+
+    def post_test_message(
+        self,
+        channel: str,
+        text: str,
+        *,
+        approval_reference: str,
+    ) -> dict[str, Any]:
+        """Post and verify one exact marked Slack test message."""
+
+        clean_channel = _require_slack_test_write_scope(
+            channel,
+            text=text,
+            approval_reference=approval_reference,
+            live=self.live,
+        )
+        if not self.live:
+            return {
+                "status": "dry-run",
+                "operation": "post_test_message",
+                "channel": clean_channel,
+                "ts": "",
+                "verification": {"status": "preview", "passed": False},
+            }
+        posted = self._post_message_payload(channel=clean_channel, text=text)
+        ts = str(posted.get("ts") or "")
+        after = self.read_message(clean_channel, ts)
+        passed = after.get("status") == "success" and after.get("text") == text
+        return {
+            **posted,
+            "status": "posted" if passed else "verification_failed",
+            "operation": "post_test_message",
+            "approval_reference": approval_reference.strip(),
+            "verification": {
+                "status": "verified" if passed else "verification_failed",
+                "passed": passed,
+                "channel_match": after.get("channel") == clean_channel,
+                "ts_match": after.get("ts") == ts,
+                "text_match": after.get("text") == text,
+            },
+        }
+
+    def update_test_message(
+        self,
+        channel: str,
+        ts: str,
+        text: str,
+        *,
+        approval_reference: str,
+    ) -> dict[str, Any]:
+        """Update and verify one exact bot-authored marked Slack test message."""
+
+        clean_channel = _require_slack_test_write_scope(
+            channel,
+            text=text,
+            approval_reference=approval_reference,
+            live=self.live,
+        )
+        clean_ts = ts.strip()
+        if not clean_ts:
+            raise ValueError("Slack test-message update requires exact timestamp.")
+        if not self.live:
+            return {
+                "status": "dry-run",
+                "operation": "update_test_message",
+                "channel": clean_channel,
+                "ts": clean_ts,
+                "verification": {"status": "preview", "passed": False},
+            }
+        before = self.read_message(clean_channel, clean_ts)
+        if SLACK_TEST_MESSAGE_MARKER not in str(before.get("text") or ""):
+            raise RuntimeError("Slack test update refused: provider message lacks test marker.")
+        token, _default_channel = self._resolved_credentials()
+        if not token:
+            raise SlackConfigurationError("Live Slack message updates require SLACK_BOT_TOKEN.")
+        _slack_api_request(
+            "POST",
+            "chat.update",
+            token=token,
+            json_body={"channel": clean_channel, "ts": clean_ts, "text": text},
+        )
+        after = self.read_message(clean_channel, clean_ts)
+        passed = after.get("status") == "success" and after.get("text") == text
+        return {
+            "status": "updated" if passed else "verification_failed",
+            "operation": "update_test_message",
+            "channel": clean_channel,
+            "ts": clean_ts,
+            "approval_reference": approval_reference.strip(),
+            "verification": {
+                "status": "verified" if passed else "verification_failed",
+                "passed": passed,
+                "same_ts": after.get("ts") == clean_ts,
+                "text_match": after.get("text") == text,
+            },
+        }
+
+    def delete_test_message(
+        self,
+        channel: str,
+        ts: str,
+        *,
+        approval_reference: str,
+    ) -> dict[str, Any]:
+        """Delete one exact marked Slack test message and verify absence."""
+
+        clean_channel = _require_slack_test_write_scope(
+            channel,
+            text=SLACK_TEST_MESSAGE_MARKER,
+            approval_reference=approval_reference,
+            live=self.live,
+        )
+        clean_ts = ts.strip()
+        if not clean_ts:
+            raise ValueError("Slack test-message deletion requires exact timestamp.")
+        if not self.live:
+            return {
+                "status": "dry-run",
+                "operation": "delete_test_message",
+                "channel": clean_channel,
+                "ts": clean_ts,
+                "verification": {"status": "preview", "passed": False},
+            }
+        before = self.read_message(clean_channel, clean_ts)
+        if SLACK_TEST_MESSAGE_MARKER not in str(before.get("text") or ""):
+            raise RuntimeError("Slack test deletion refused: provider message lacks test marker.")
+        token, _default_channel = self._resolved_credentials()
+        if not token:
+            raise SlackConfigurationError("Live Slack message deletion requires SLACK_BOT_TOKEN.")
+        _slack_api_request(
+            "POST",
+            "chat.delete",
+            token=token,
+            json_body={"channel": clean_channel, "ts": clean_ts},
+        )
+        absent = self.read_message(clean_channel, clean_ts).get("status") == "not_found"
+        return {
+            "status": "deleted" if absent else "verification_failed",
+            "operation": "delete_test_message",
+            "channel": clean_channel,
+            "ts": clean_ts,
+            "approval_reference": approval_reference.strip(),
+            "verification": {
+                "status": "verified" if absent else "verification_failed",
+                "passed": absent,
+                "message_absent_after": absent,
+                "test_marker_verified": True,
+            },
+        }
+
     def _post_message_payload(
         self,
         *,
@@ -1416,3 +1866,60 @@ class SlackTool:
             error = payload.get("error") or "unknown_error"
             raise RuntimeError(f"Slack approval notification failed: {error}")
         return {"status": "posted", "channel": resolved_channel, "ts": str(payload.get("ts") or "")}
+
+
+def _require_slack_test_write_scope(
+    channel: str,
+    *,
+    text: str,
+    approval_reference: str,
+    live: bool,
+) -> str:
+    clean_channel = channel.strip()
+    if not clean_channel or not approval_reference.strip():
+        raise RuntimeError("Slack test writes require exact channel and approval reference.")
+    if SLACK_TEST_MESSAGE_MARKER not in text:
+        raise RuntimeError("Slack test writes require the exact test marker in message text.")
+    if live:
+        allowed = os.getenv(SLACK_TEST_CHANNEL_ENV, "").strip()
+        enabled = os.getenv(SLACK_TEST_WRITES_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not enabled:
+            raise RuntimeError(f"Slack test writes require {SLACK_TEST_WRITES_ENV}=true.")
+        if not allowed or allowed != clean_channel:
+            raise RuntimeError("Slack test write channel is not the exact configured channel.")
+    return clean_channel
+
+
+def _slack_api_request(
+    method: str,
+    endpoint: str,
+    *,
+    token: str,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    import requests
+
+    response = requests.request(
+        method,
+        f"https://slack.com/api/{endpoint}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        params=params,
+        json=json_body,
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Slack {endpoint} failed with HTTP {response.status_code}.")
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        error = payload.get("error") if isinstance(payload, dict) else "invalid_response"
+        raise RuntimeError(f"Slack {endpoint} failed: {error or 'unknown_error'}")
+    return payload

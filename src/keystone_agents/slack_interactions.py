@@ -17,6 +17,10 @@ from keystone_agents.agents.orchestrator import (
 )
 from keystone_agents.agents.outreach_composer import build_outreach_composer_compact_synthesis_agent
 from keystone_agents.automation_inventory import build_automation_inventory_report
+from keystone_agents.gmail_triage.draft_actions import (
+    execute_approved_gmail_draft_action,
+    existing_provider_draft_id,
+)
 from keystone_agents.langgraph_workflow import (
     advance_work_item_manager_loop_with_optional_langgraph,
 )
@@ -287,6 +291,9 @@ def handle_slack_approval_interaction(
                 metadata["gmail_draft_created_from_slack_approval"] = bool(
                     gmail_draft_result.get("status") == "draft_created"
                 )
+                metadata["gmail_draft_updated_from_slack_approval"] = bool(
+                    gmail_draft_result.get("status") == "draft_updated"
+                )
             else:
                 metadata["gmail_draft_duplicate_ignored"] = True
             item = _save_metadata(store, item, metadata)
@@ -301,11 +308,25 @@ def handle_slack_approval_interaction(
                     f"Approved. Gmail draft was created{account} for human review; "
                     "no email was sent."
                 )
-            elif draft_status == "dry-run":
+            elif draft_status == "draft_updated":
                 account = _gmail_draft_account_text(gmail_draft_result)
                 followup_text = (
-                    f"Approved. Gmail draft creation{account} returned a dry-run preview; "
+                    f"Approved. Existing Gmail draft was updated and verified{account} "
+                    "for human review; no email was sent."
+                )
+            elif draft_status == "dry-run":
+                account = _gmail_draft_account_text(gmail_draft_result)
+                operation = str(gmail_draft_result.get("operation") or "create")
+                action_text = "update" if operation == "update" else "creation"
+                followup_text = (
+                    f"Approved. Gmail draft {action_text}{account} returned a dry-run preview; "
                     "no email was sent."
+                )
+            elif draft_status == "verification_failed":
+                account = _gmail_draft_account_text(gmail_draft_result)
+                followup_text = (
+                    f"Gmail draft action completed{account}, but provider read-back verification "
+                    "failed. Review the draft manually; no email was sent."
                 )
             elif draft_status == "skipped":
                 reason = str(gmail_draft_result.get("reason") or "missing required draft metadata")
@@ -2327,11 +2348,14 @@ def _maybe_create_email_draft(
             "gmail_account": target_account,
             "send_enabled": False,
         }
-    return GmailTool(live=live_gmail).create_draft(
+    return execute_approved_gmail_draft_action(
+        GmailTool(live=live_gmail),
         to=recipient,
         subject=subject,
         body=body,
         expected_account=target_account,
+        approval_reference=item.id,
+        draft_id=existing_provider_draft_id(metadata),
     )
 
 

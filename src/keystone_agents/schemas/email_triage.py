@@ -35,6 +35,20 @@ EmailRiskFlag = Literal[
     "unsupported_claim",
 ]
 GmailRequestStatus = Literal["clarification_required", "blocked"]
+GmailMailboxAction = Literal[
+    "add_label",
+    "remove_label",
+    "archive",
+    "unarchive",
+    "mark_read",
+    "mark_unread",
+    "star",
+    "unstar",
+    "mark_important",
+    "mark_not_important",
+    "trash",
+    "restore",
+]
 
 KEYSTONE_TRIAGE_LABEL = "Keystone/Triage"
 GMAIL_PRIMARY_CATEGORY_LABELS: dict[EmailCategory, str] = {
@@ -64,6 +78,34 @@ GMAIL_MANAGED_LABELS = tuple(
     )
 )
 GMAIL_PRIMARY_LABEL_SET = frozenset(GMAIL_PRIMARY_CATEGORY_LABELS.values())
+
+
+class GmailMailboxActionPlan(BaseModel):
+    """LLM interpretation of one bounded natural-language mailbox-state ask."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_summary: str = Field(min_length=1)
+    target_basis: Literal["selected_exact_message"] = "selected_exact_message"
+    operations: list[GmailMailboxAction] = Field(min_length=1, max_length=4)
+    label: str = ""
+    rationale: str = Field(min_length=1)
+    provider_id_required_from_user: bool = False
+    approval_reference_required: Literal[True] = True
+    send_enabled: Literal[False] = False
+    sent: Literal[False] = False
+
+    @field_validator("request_summary", "label", "rationale")
+    @classmethod
+    def clean_plan_text(cls, value: str) -> str:
+        return " ".join(value.replace("\u2014", "-").split())
+
+    @model_validator(mode="after")
+    def validate_label_scope(self) -> GmailMailboxActionPlan:
+        uses_label = any(item in {"add_label", "remove_label"} for item in self.operations)
+        if uses_label != bool(self.label):
+            raise ValueError("Label operations require one label; other operations forbid it.")
+        return self
 
 
 def managed_gmail_labels(
@@ -481,27 +523,37 @@ class GmailPriorityGroupedMessage(BaseModel):
             return value
         return value.replace("\u2014", "-")
 
-    @field_validator("send_enabled", "sent")
+    @field_validator("draft_created", "send_enabled", "sent")
     @classmethod
     def reject_send_state(cls, value: bool) -> bool:
         if value:
-            raise ValueError("Gmail priority grouping must not enable or report sending.")
+            raise ValueError(
+                "Gmail priority grouping must not create provider drafts, enable sending, "
+                "or report sending."
+            )
         return value
 
     @model_validator(mode="after")
     def require_urgent_only_drafts(self) -> GmailPriorityGroupedMessage:
         self.recommended_labels = normalize_managed_gmail_labels(self.recommended_labels)
+        allowed_priorities: dict[GmailPriorityBucket, frozenset[EmailPriority]] = {
+            "urgent": frozenset({"urgent", "high"}),
+            "important": frozenset({"high", "normal"}),
+            "can_wait": frozenset({"normal", "low"}),
+            "ignore": frozenset({"normal", "low"}),
+        }
+        if self.priority not in allowed_priorities[self.bucket]:
+            raise ValueError(
+                f"Priority {self.priority!r} is inconsistent with Gmail bucket "
+                f"{self.bucket!r}."
+            )
         if self.bucket != "urgent" and (self.draft_reply or self.draft_created):
             raise ValueError("Only urgent messages may include draft replies.")
         if self.draft_reply:
             if not self.needs_reply:
                 raise ValueError("Draft replies require needs_reply=true.")
-            if not self.draft_created:
-                raise ValueError("Draft replies require draft_created=true.")
             if not self.approval_required:
                 raise ValueError("Draft replies require approval_required=true.")
-        if self.draft_created and not self.draft_reply:
-            raise ValueError("draft_created=true requires draft_reply content.")
         return self
 
 
@@ -558,7 +610,7 @@ class GmailPriorityGroupingResult(BaseModel):
                 if bucket_name != "urgent" and (message.draft_reply or message.draft_created):
                     raise ValueError("Draft replies are only allowed in the urgent bucket.")
 
-        self.draft_count = sum(1 for message in self.urgent if message.draft_created)
+        self.draft_count = sum(1 for message in self.urgent if message.draft_reply)
         if not self.source_message_count:
             self.source_message_count = sum(
                 len(getattr(self, bucket_name))

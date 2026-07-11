@@ -1,7 +1,7 @@
 ---
 skill_id: gmail_triage_specialist_contracts
-skill_version: 2026-05-31.2
-skill_purpose: Specialist reasoning contracts for inbound Gmail triage, thread review, labels, draft-only replies, and handoffs.
+skill_version: 2026-07-11.1
+skill_purpose: Specialist reasoning contracts for inbound Gmail triage, thread review, scoped mailbox-state actions, draft-only replies, and handoffs.
 applies_to:
   - gmail_triage
 eval_datasets:
@@ -12,7 +12,7 @@ validation_paths:
   - tests/test_gmail_triage.py
   - tests/test_sdk_execution.py
 safety_notes:
-  - Gmail skills remain draft-only and never authorize sending, archiving, or external use.
+  - Gmail skills never authorize ordinary sending, permanent deletion, bulk mailbox mutation, or external use.
 ---
 
 # Gmail Triage Specialist Contracts
@@ -44,6 +44,9 @@ Gmail Triage.
   commitments, unresolved questions, and next safe action.
 - `label_queue_and_handoff_planning`: recommend labels, queues, and handoffs
   without mutating Gmail unless a tool and gate permit it.
+- `mailbox_state_execution`: for an explicit exact-message ask, map the request
+  to one label, archive/unarchive, read/unread, star/unstar, importance,
+  trash, or restore operation and require provider read-back.
 - `reply_draft_preparation`: prepare Slack-thread-only draft replies or reply
   guidance with approval requirements; treat provider-side Gmail drafts as a
   separate setting-backed action.
@@ -61,11 +64,23 @@ Gmail Triage.
 
 ## Boundaries
 
-- Must not send email, archive, delete, expose private content externally, or
-  infer unavailable attachment bodies.
+- Must not send ordinary email, permanently delete mailbox messages, mutate an
+  ambiguous or expanded batch, expose private content externally, or infer
+  unavailable attachment bodies. Exact mailbox-state actions require one
+  resolved message identity, a scoped operator approval reference, the
+  dedicated live gate, account verification when configured, and provider
+  read-back. Trash is reversible and is not permanent deletion. A deterministic cleanup
+  harness may delete one exact provider draft only when its subject and body
+  both contain `KBA_TEST_DRAFT`, an approval reference and authenticated-account
+  match are present, the dedicated live delete gate is enabled, and absence is
+  verified after deletion.
 - Must not create Gmail drafts by default. Inbound reply drafts should remain
   Slack-thread-only unless a backend Gmail-draft setting, live tool path, and
   approval gate permit provider-side draft creation.
+- An explicit attachment-draft ask may attach one derived PNG or PDF from the
+  configured local artifact root to one exact allowlisted recipient. The
+  provider draft must be read back, the attachment bytes hashed, updates must
+  reuse the same draft identity, and sending remains disabled.
 - Must not escalate priority solely because language is intense.
 
 ## Reasoning Questions
@@ -128,5 +143,6 @@ handoff target, and next safe action.
 
 - Urgent and risky messages are flagged with rationale.
 - Drafts remain Slack-thread-only by default and approval-gated.
-- Labels are recommendations unless a live tool path is explicitly allowed.
+- Labels and mailbox-state changes are recommendations unless the exact live
+  tool path, identity, approval, and provider verification are present.
 - Research/outreach handoffs preserve context and boundaries.

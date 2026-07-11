@@ -9,6 +9,7 @@ from typing import Any
 
 from keystone_agents.schemas.approval import (
     ApprovalQueueStatus,
+    ApprovalScope,
     ApprovalState,
     approved_state_for_scope,
     normalize_approval_queue_status,
@@ -352,6 +353,12 @@ def apply_slack_approval_to_work_item_gate(
             approval_id=cleaned_approval_id,
             new_state=new_state,
         )
+        if store is not None and matching_gate.scope == ApprovalScope.DRAFTING.value:
+            _persist_approved_email_style_profile(
+                updated,
+                approval_id=cleaned_approval_id,
+                store=store,
+            )
     blocker_code = _gate_blocker_code(cleaned_approval_id)
     if resolved_status == ApprovalQueueStatus.APPROVED:
         updated = resolve_blocker(updated, blocker_code)
@@ -416,8 +423,6 @@ def _apply_approved_gate_to_artifacts(
     approval_id: str,
     new_state: str,
 ) -> WorkItem:
-    if gate.scope != "external_use":
-        return work_item
     artifacts: list[WorkItemArtifactRef] = []
     changed = False
     for artifact in work_item.artifact_refs:
@@ -437,6 +442,32 @@ def _apply_approved_gate_to_artifacts(
     if not changed:
         return work_item
     return work_item.model_copy(update={"artifact_refs": artifacts}).touch()
+
+
+def _persist_approved_email_style_profile(
+    work_item: WorkItem,
+    *,
+    approval_id: str,
+    store: SQLiteStore,
+) -> None:
+    for artifact in work_item.artifact_refs:
+        if artifact.artifact_type != "email_style_profile":
+            continue
+        if str(artifact.metadata.get("approval_queue_id") or "") != approval_id:
+            continue
+        profile_id = str(artifact.metadata.get("profile_id") or "").strip()
+        if not profile_id:
+            continue
+        profiles = store.list_email_style_profiles(profile_id=profile_id)
+        if not profiles:
+            continue
+        profile = profiles[-1]
+        if profile.approval_state != ApprovalState.APPROVED_FOR_DRAFTING:
+            store.save_email_style_profile(
+                profile.model_copy(
+                    update={"approval_state": ApprovalState.APPROVED_FOR_DRAFTING}
+                )
+            )
 
 
 def record_event(
@@ -1188,6 +1219,22 @@ def research_sufficiency(work_item: WorkItem) -> ReadinessResult:
 
 def gmail_thread_readiness(work_item: WorkItem) -> ReadinessResult:
     metadata = work_item.target.metadata
+    execution_plan = metadata.get("gmail_execution_plan")
+    if isinstance(execution_plan, dict) and execution_plan.get("operation") == "style_profile":
+        if selected_artifacts(work_item, "email_style_profile"):
+            return ReadinessResult(ready=True)
+        return ReadinessResult(
+            ready=False,
+            blockers=(
+                WorkItemBlocker(
+                    code="gmail_sent_style_profile_required",
+                    message=(
+                        "A bounded aggregate SENT style profile must be built before "
+                        "style-aware drafting."
+                    ),
+                ),
+            ),
+        )
     if work_item.kind == WorkItemKind.GMAIL_THREAD and (
         work_item.target.external_id or metadata.get("thread_id") or metadata.get("message_id")
     ):

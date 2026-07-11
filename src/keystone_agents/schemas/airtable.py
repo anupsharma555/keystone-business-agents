@@ -63,6 +63,7 @@ class AirtableFieldSummary(BaseModel):
     is_manual: bool = True
     linked_table_ids: list[str] = Field(default_factory=list)
     select_choices: list[str] = Field(default_factory=list)
+    select_choices_exact: list[str] = Field(default_factory=list)
     formula: str = ""
     result_type: str = ""
 
@@ -83,6 +84,12 @@ class AirtableFieldSummary(BaseModel):
     @classmethod
     def _clean_lists(cls, value: object) -> list[str]:
         return _clean_list(value)
+
+    @field_validator("select_choices_exact", mode="before")
+    @classmethod
+    def _preserve_exact_select_choices(cls, value: object) -> list[str]:
+        values = value if isinstance(value, list | tuple | set) else [value]
+        return [str(item)[:120] for item in values if str(item)][:20]
 
     @model_validator(mode="after")
     def _derive_manual_flag(self) -> AirtableFieldSummary:
@@ -145,12 +152,14 @@ def airtable_field_summary_from_metadata(field: Mapping[str, Any]) -> AirtableFi
     options = field.get("options") if isinstance(field.get("options"), Mapping) else {}
     field_type = _clean_text(field.get("type"), max_chars=80)
     choices = []
+    exact_choices = []
     raw_choices = options.get("choices") if isinstance(options, Mapping) else None
     if isinstance(raw_choices, Sequence) and not isinstance(raw_choices, str):
-        choices = [
-            _clean_text(choice.get("name") if isinstance(choice, Mapping) else choice)
+        exact_choices = [
+            str(choice.get("name") if isinstance(choice, Mapping) else choice)
             for choice in raw_choices
         ]
+        choices = [_clean_text(choice) for choice in exact_choices]
     linked_table_ids = []
     if isinstance(options, Mapping):
         linked_table_ids = _clean_list(
@@ -168,6 +177,7 @@ def airtable_field_summary_from_metadata(field: Mapping[str, Any]) -> AirtableFi
         is_computed=field_type in COMPUTED_AIRTABLE_FIELD_TYPES,
         linked_table_ids=linked_table_ids,
         select_choices=choices,
+        select_choices_exact=exact_choices,
         formula=str(options.get("formula") or "") if isinstance(options, Mapping) else "",
         result_type=str(options.get("result", {}).get("type") or "")
         if isinstance(options.get("result"), Mapping)

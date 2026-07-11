@@ -23,7 +23,10 @@ from keystone_agents.finance_expense_receipts import (
     match_receipt_evidence_to_airtable_fields,
 )
 from keystone_agents.guardrails import keystone_guardrails
-from keystone_agents.local_kni_evidence import build_local_kni_evidence_packet_for_query
+from keystone_agents.local_kni_evidence import (
+    build_local_kni_evidence_packet_for_query,
+    looks_like_local_kni_evidence_lookup,
+)
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.memory import (
     build_chief_of_staff_memory_context,
@@ -85,6 +88,12 @@ from keystone_agents.tools.chief_of_staff_tool import (
     search_official_operations_docs,
     search_slack_repo_context,
     summarize_slack_runtime_config,
+)
+from keystone_agents.tools.google_calendar_tool import (
+    create_google_calendar_event,
+    delete_google_calendar_event,
+    read_google_calendar_window,
+    update_google_calendar_event,
 )
 from keystone_agents.tools.html_review_tool import extract_research_claims_from_html
 from keystone_agents.tools.internal_data_tools import (
@@ -318,6 +327,10 @@ def _chief_of_staff_tools(
         airtable_write_record,
         airtable_upload_attachment,
         airtable_create_expense_from_receipt,
+        create_google_calendar_event,
+        update_google_calendar_event,
+        delete_google_calendar_event,
+        read_google_calendar_window,
         *(specialist_tools or []),
         google_doc_read,
         google_drive_list_folder,
@@ -338,54 +351,7 @@ def _chief_of_staff_tools(
 
 
 def _local_kni_document_context_requested(request_text: str) -> bool:
-    lowered = str(request_text or "").lower()
-    has_kni_scope = any(
-        marker in lowered
-        for marker in (
-            "local kni document",
-            "local kni documents",
-            "kni document",
-            "kni documents",
-            "keystone neuroinformatics",
-            "cfc insurance",
-            "cfc policy",
-            "proassurance",
-            "iao inc",
-            "iao, inc",
-        )
-    )
-    has_local_source_intent = any(
-        marker in lowered
-        for marker in (
-            "using local",
-            "local source",
-            "evidence path",
-            "formed",
-            "formation",
-            "date filed",
-            "certificate of organization",
-            "articles of organization",
-            "organizer",
-            "organized",
-            "organised",
-            "registered agent",
-            "registered office",
-            "signer",
-            "who filed",
-            "filer",
-            "formally organized",
-            "formally organised",
-            "insurance",
-            "policy",
-            "certificate of insurance",
-            "coi",
-            "peo",
-            "provider",
-            "carrier",
-            "broker",
-        )
-    )
-    return has_kni_scope and has_local_source_intent
+    return looks_like_local_kni_evidence_lookup(request_text)
 
 
 def _looks_like_local_kni_document_lookup_request(request_text: str) -> bool:
@@ -424,6 +390,11 @@ def _looks_like_local_kni_document_lookup_request(request_text: str) -> bool:
             "provider",
             "carrier",
             "broker",
+            "proposal",
+            "capability statement",
+            "statement of capabilities",
+            "service areas",
+            "service offerings",
         )
     )
 
@@ -768,7 +739,7 @@ def _manual_plan_allows_finance_tracker_shortcut(
     ).lower()
     has_finance_context = bool(
         re.search(
-            r"\b(?:finance|tax|taxes|airtable\s+tracker|finance_tax_tracker|"
+            r"\b(?:finance|financial|tax|taxes|airtable\s+tracker|finance_tax_tracker|"
             r"business\s+income|business\s+expense|personal\s+income|personal\s+expense|"
             r"tax\s+payments|estimated\s+tax|total\s+expenses|additional\s+taxes|"
             r"amount|q[1-4])\b",
@@ -806,6 +777,7 @@ def _looks_like_finance_tracker_request(text: str) -> bool:
         "2026 finance",
         "tax tracker",
         "airtable tracker",
+        "financial tracker",
         "total expenses",
         "business income",
         "business expense",
@@ -1330,6 +1302,7 @@ def _is_aggregate_request(normalized: str) -> bool:
         or "how much" in normalized
         or "all income" in normalized
         or "all expenses" in normalized
+        or _looks_like_finance_period_summary_request(normalized)
     )
 
 
@@ -1350,7 +1323,23 @@ def _aggregate_topics(normalized: str) -> list[str]:
         topics.append("expense")
     if "payment" in normalized or "estimated tax" in normalized:
         topics.append("payment")
+    if not topics and _looks_like_finance_period_summary_request(normalized):
+        topics.extend(("income", "expense"))
     return list(dict.fromkeys(topics))
+
+
+def _looks_like_finance_period_summary_request(normalized: str) -> bool:
+    has_summary_task = bool(re.search(r"\b(?:summary|summarize|overview|snapshot)\b", normalized))
+    has_period = bool(
+        re.search(
+            r"\b(?:current|this)\s+quarter\b|\bq[1-4]\b|\bquarter\s+[1-4]\b",
+            normalized,
+        )
+    )
+    has_finance_anchor = bool(
+        re.search(r"\b(?:finance|financial|airtable|tracker|income|expenses?)\b", normalized)
+    )
+    return has_summary_task and has_period and has_finance_anchor
 
 
 def _looks_like_rolling_tax_summary_request(normalized: str) -> bool:
@@ -1507,6 +1496,8 @@ def _requested_quarters(normalized: str) -> tuple[int, ...]:
         int(match.group(1))
         for match in re.finditer(r"\bquarter\s+([1-4])\b", normalized, flags=re.I)
     )
+    if re.search(r"\b(?:current|this)\s+quarter\b", normalized, flags=re.I):
+        quarters.add(_current_estimated_tax_period())
     return tuple(sorted(quarters))
 
 
@@ -1515,7 +1506,12 @@ def _requested_years(normalized: str) -> tuple[int, ...]:
 
 
 def _finance_tracker_years(normalized: str) -> tuple[int, ...]:
-    return _requested_years(normalized) or (FINANCE_TRACKER_DEFAULT_YEAR,)
+    years = _requested_years(normalized)
+    if years:
+        return years
+    if re.search(r"\b(?:current|this)\s+quarter\b", normalized, flags=re.I):
+        return (datetime.now(ZoneInfo("America/New_York")).year,)
+    return (FINANCE_TRACKER_DEFAULT_YEAR,)
 
 
 def _current_estimated_tax_period() -> int:
@@ -2231,10 +2227,18 @@ def _compute_airtable_topic_aggregate(
     quarters: tuple[int, ...],
     years: tuple[int, ...],
     live: bool,
-) -> tuple[Decimal, list[str], list[AirtableTableView]]:
+) -> tuple[
+    Decimal,
+    list[str],
+    list[AirtableTableView],
+    dict[str, Decimal],
+    int,
+]:
     selected_tables = _aggregate_topic_tables(topic=topic, normalized=normalized, tables=tables)
     total = Decimal("0")
     table_parts: list[str] = []
+    category_totals: dict[str, Decimal] = {}
+    uncategorized_count = 0
 
     for table in selected_tables:
         exact_fields = _mentioned_metric_fields(normalized, table.fields)
@@ -2271,6 +2275,22 @@ def _compute_airtable_topic_aggregate(
                 matched_count += 1
                 if normalized_record.amount != Decimal("0"):
                     contributing_count += 1
+            if topic == "expense" and normalized_record.amount_fields:
+                category = next(
+                    (
+                        str(fields.get(field_name) or "").strip()
+                        for field_name in ("Categories", "Category")
+                        if str(fields.get(field_name) or "").strip()
+                    ),
+                    "",
+                )
+                if category:
+                    category_totals[category] = (
+                        category_totals.get(category, Decimal("0"))
+                        + normalized_record.amount
+                    )
+                else:
+                    uncategorized_count += 1
         total += subtotal
         truncation_note = (
             f"; read truncated at {read.get('record_limit')} records"
@@ -2292,7 +2312,7 @@ def _compute_airtable_topic_aggregate(
             f"{matched_count} matching records{contribution_note}"
             f"{truncation_note}"
         )
-    return total, table_parts, selected_tables
+    return total, table_parts, selected_tables, category_totals, uncategorized_count
 
 
 def _finance_tracker_topic_label(topic: str) -> str:
@@ -2482,9 +2502,17 @@ def _plan_airtable_aggregate_from_schema(
     if _is_aggregate_request(normalized) and len(topics) > 1:
         totals_by_topic: dict[str, Decimal] = {}
         details_by_topic: dict[str, list[str]] = {}
+        expense_category_totals: dict[str, Decimal] = {}
+        uncategorized_expense_count = 0
         selected_any: list[AirtableTableView] = []
         for topic in topics:
-            total, table_parts, selected_tables = _compute_airtable_topic_aggregate(
+            (
+                total,
+                table_parts,
+                selected_tables,
+                category_totals,
+                uncategorized_count,
+            ) = _compute_airtable_topic_aggregate(
                 topic=topic,
                 normalized=normalized,
                 tables=tables,
@@ -2497,6 +2525,9 @@ def _plan_airtable_aggregate_from_schema(
             selected_any.extend(selected_tables)
             totals_by_topic[topic] = total
             details_by_topic[topic] = table_parts
+            if topic == "expense":
+                expense_category_totals = category_totals
+                uncategorized_expense_count = uncategorized_count
         if not selected_any:
             return _finance_tracker_result(
                 text=text,
@@ -2535,6 +2566,20 @@ def _plan_airtable_aggregate_from_schema(
             sections.extend(["", section_title, ""])
             sections.append(f"* Combined {label}: {_format_money(totals_by_topic[topic])}")
             sections.extend(f"* {part}" for part in table_parts)
+        if expense_category_totals or "expense" in totals_by_topic:
+            sections.extend(["", "Expense categories", ""])
+            if expense_category_totals:
+                sections.extend(
+                    f"* {category}: {_format_money(amount)}"
+                    for category, amount in sorted(expense_category_totals.items())
+                )
+            else:
+                sections.append("* No categorized expense amounts matched the requested period.")
+            sections.append(
+                "* Uncategorized gap: "
+                f"{uncategorized_expense_count} matching expense "
+                f"record{'s' if uncategorized_expense_count != 1 else ''}."
+            )
         summary = "\n".join(sections)
         return _finance_tracker_result(
             text=text,
@@ -5167,6 +5212,7 @@ def build_chief_of_staff_agent(
     request_text: str = "",
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
+    attach_tools: bool = True,
 ) -> Agent:
     """Build the KNI Chief of Staff SDK agent."""
 
@@ -5205,7 +5251,11 @@ def build_chief_of_staff_agent(
         name="chief_of_staff",
         instructions=instructions,
         output_type=ChiefOfStaffResult,
-        tools=_chief_of_staff_tools(request_text, specialist_tools=specialist_tools),
+        tools=(
+            _chief_of_staff_tools(request_text, specialist_tools=specialist_tools)
+            if attach_tools
+            else []
+        ),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="chief_of_staff",
@@ -5236,6 +5286,7 @@ def run_chief_of_staff_sdk(
     context_flags: Mapping[str, bool] | None = None,
     include_specialist_tools: bool | None = None,
     specialist_tool_mode: SpecialistToolMode = "read_plan",
+    attach_tools: bool = True,
 ) -> TypedAgentRunResult[ChiefOfStaffResult]:
     """Run Chief of Staff through the shared typed SDK harness."""
 
@@ -5362,6 +5413,7 @@ def run_chief_of_staff_sdk(
             specialist_tool_mode=specialist_tool_mode,
             request_text=request_text,
             context_flags=context_flags,
+            attach_tools=attach_tools,
         ),
         typed_input=typed_input_for_run,
         output_type=ChiefOfStaffResult,

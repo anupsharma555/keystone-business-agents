@@ -95,7 +95,12 @@ def infer_finance_expense_receipt_target(text: object) -> FinanceExpenseReceiptT
 
     raw_text = str(text or "")
     lowered = " ".join(raw_text.lower().split())
-    if "airtable" not in lowered:
+    names_finance_tracker = (
+        "finance & tax tracker" in lowered
+        or "finance and tax tracker" in lowered
+        or "finance_tax_tracker" in lowered
+    )
+    if "airtable" not in lowered and not names_finance_tracker:
         return None
     has_receipt_evidence = (
         "receipt" in lowered

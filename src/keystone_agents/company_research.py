@@ -1169,25 +1169,29 @@ def aggregate_research_sources(
 ) -> ResearchSourceAggregation:
     """Aggregate fixture, search, website, and profile-like inputs into source records."""
 
-    raw_sources = [
-        *_source_records(
+    search_sources = _search_source_records(search_results)
+    website_sources = _website_source_records(
+        website_inputs or data.get("website_inputs") or data.get("website_sources"),
+        company_name=company_name,
+        company_url=company_url,
+    )
+    profile_sources = _profile_source_records(
+        profile_inputs or data.get("profile_inputs") or data.get("profile_sources"),
+        company_name=company_name,
+        linkedin_url=linkedin_url,
+    )
+    external_sources = [*search_sources, *website_sources, *profile_sources]
+    fixture_sources = (
+        _source_records(
             data,
             company_name=company_name,
             company_url=company_url,
             fixture_ref=fixture_ref,
-        ),
-        *_search_source_records(search_results),
-        *_website_source_records(
-            website_inputs or data.get("website_inputs") or data.get("website_sources"),
-            company_name=company_name,
-            company_url=company_url,
-        ),
-        *_profile_source_records(
-            profile_inputs or data.get("profile_inputs") or data.get("profile_sources"),
-            company_name=company_name,
-            linkedin_url=linkedin_url,
-        ),
-    ]
+        )
+        if data or not external_sources
+        else []
+    )
+    raw_sources = [*fixture_sources, *external_sources]
 
     sources: list[SourceRecord] = []
     unsupported: list[str] = []

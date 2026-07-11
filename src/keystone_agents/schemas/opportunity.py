@@ -10,7 +10,11 @@ from pydantic.json_schema import SkipJsonSchema
 
 from keystone_agents.schemas.company_profile import ClaimEvidenceRecord
 from keystone_agents.schemas.decision_trace import DecisionTrace
-from keystone_agents.source_quality import SourceQualityScore, SourceQualitySummary
+from keystone_agents.source_quality import (
+    SourceQualityScore,
+    SourceQualitySummary,
+    independent_source_count,
+)
 
 _DISCOVERY_METADATA_FIELDS = (
     "entity_kind",
@@ -60,6 +64,7 @@ OpportunityType = Literal[
     "journal article or publication call",
     "contract or RFP opportunity",
     "open-source repository opportunity",
+    "hackathon or challenge opportunity",
 ]
 
 OpportunitySourceType = Literal[
@@ -273,6 +278,45 @@ class OpportunityRecord(BaseModel):
 
     @model_validator(mode="after")
     def populate_scoring_and_validate_claims(self) -> OpportunityRecord:
+        unique_bundles: list[OpportunitySourceBundle] = []
+        seen_bundle_keys: set[tuple[str, str, str]] = set()
+        for bundle in self.source_bundles:
+            bundle_key = (
+                bundle.bundle_id.strip(),
+                bundle.company_name.strip().casefold(),
+                bundle.source_category,
+            )
+            if bundle_key in seen_bundle_keys:
+                continue
+            seen_bundle_keys.add(bundle_key)
+            unique_bundles.append(bundle)
+        self.source_bundles = unique_bundles
+
+        source_scores = [
+            source.source_quality
+            for source in self.sources
+            if source.source_quality is not None
+        ]
+        if self.source_quality_summary is not None and len(source_scores) == len(self.sources):
+            self.source_quality_summary.source_count = len(self.sources)
+            self.source_quality_summary.independent_source_count = independent_source_count(
+                source_scores
+            )
+        for bundle in self.source_bundles:
+            bundle_scores = [
+                source.source_quality
+                for source in bundle.sources
+                if source.source_quality is not None
+            ]
+            if (
+                bundle.source_quality_summary is not None
+                and len(bundle_scores) == len(bundle.sources)
+            ):
+                bundle.source_quality_summary.source_count = len(bundle.sources)
+                bundle.source_quality_summary.independent_source_count = (
+                    independent_source_count(bundle_scores)
+                )
+
         if self.score_breakdown.priority_score == 0 and self.priority_score > 0:
             self.score_breakdown = OpportunityScoreBreakdown(
                 relevance_score=self.priority_score,
@@ -372,6 +416,60 @@ class OpportunityScoutResult(BaseModel):
     audit_notes: list[str] = Field(default_factory=list)
     constraint_relaxation_suggestion: str = ""
     outreach_generated: bool = False
+
+    @model_validator(mode="after")
+    def normalize_result_evidence(self) -> OpportunityScoutResult:
+        if self.search_provider.strip().lower() in {"", "none"} and (
+            self.raw_search_result_count == 0
+        ):
+            self.search_queries = []
+
+        unique_bundles: list[OpportunitySourceBundle] = []
+        seen_bundle_keys: set[tuple[str, str, str]] = set()
+        for bundle in self.source_bundles:
+            bundle_key = (
+                bundle.bundle_id.strip(),
+                bundle.company_name.strip().casefold(),
+                bundle.source_category,
+            )
+            if bundle_key in seen_bundle_keys:
+                continue
+            seen_bundle_keys.add(bundle_key)
+            unique_bundles.append(bundle)
+        self.source_bundles = unique_bundles
+
+        sources_by_key: dict[str, OpportunitySource] = {}
+        for bundle in self.source_bundles:
+            for source in bundle.sources:
+                sources_by_key.setdefault(source.url.strip() or source.source_id, source)
+        if not sources_by_key:
+            for record in self.records:
+                for source in record.sources:
+                    sources_by_key.setdefault(source.url.strip() or source.source_id, source)
+        sources = list(sources_by_key.values())
+        source_scores = [
+            source.source_quality for source in sources if source.source_quality is not None
+        ]
+        if self.source_quality_summary is not None and len(source_scores) == len(sources):
+            self.source_quality_summary.source_count = len(sources)
+            self.source_quality_summary.independent_source_count = independent_source_count(
+                source_scores
+            )
+        for bundle in self.source_bundles:
+            bundle_scores = [
+                source.source_quality
+                for source in bundle.sources
+                if source.source_quality is not None
+            ]
+            if (
+                bundle.source_quality_summary is not None
+                and len(bundle_scores) == len(bundle.sources)
+            ):
+                bundle.source_quality_summary.source_count = len(bundle.sources)
+                bundle.source_quality_summary.independent_source_count = (
+                    independent_source_count(bundle_scores)
+                )
+        return self
 
     @model_serializer(mode="wrap")
     def serialize_model(self, handler: Any) -> dict[str, Any]:

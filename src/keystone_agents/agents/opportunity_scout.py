@@ -6767,6 +6767,7 @@ def build_opportunity_scout_agent(
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
+    attach_tools: bool = True,
 ) -> Agent:
     """Build the opportunity scout agent."""
 
@@ -6820,7 +6821,7 @@ def build_opportunity_scout_agent(
         name="opportunity_scout",
         instructions=instructions,
         output_type=OpportunityScoutResult,
-        tools=tools,
+        tools=tools if attach_tools else [],
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="opportunity_scout",
@@ -6841,6 +6842,7 @@ def run_opportunity_scout_sdk(
     context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    attach_tools: bool = True,
 ) -> TypedAgentRunResult[OpportunityScoutResult]:
     """Run Opportunity Scout through the typed SDK harness."""
 
@@ -6860,6 +6862,7 @@ def run_opportunity_scout_sdk(
             request_text=skill_request_text(typed_input),
             context_flags=context_flags,
             tool_tier=resolved_tool_tier,
+            attach_tools=attach_tools,
         ),
         typed_input=typed_input,
         output_type=OpportunityScoutResult,

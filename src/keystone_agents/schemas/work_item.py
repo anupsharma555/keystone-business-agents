@@ -48,6 +48,8 @@ class WorkItemRoute(StrEnum):
     OPPORTUNITY_SCOUT = "opportunity_scout"
     OUTREACH_COMPOSER = "outreach_composer"
     CHIEF_OF_STAFF = "chief_of_staff"
+    RSS_CONTEXT_AGENT = "rss_context_agent"
+    PREPRINTS_CONTEXT_AGENT = "preprints_context_agent"
     CLARIFICATION = "clarification"
 
 
@@ -186,6 +188,7 @@ class WorkflowRunRequest(BaseModel):
     database_url: str | None = None
     live_search: bool = False
     live_sdk: bool = False
+    live_rss_slack_read: bool = False
     max_results: int = Field(default=3, ge=1, le=20)
     requested_route: WorkItemRoute | None = None
     manual_request_plan: dict[str, Any] | None = None

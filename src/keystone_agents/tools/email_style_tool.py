@@ -41,11 +41,15 @@ STYLE_PHRASES = (
 )
 SALESY_AVOIDED_PHRASES = ("act now", "guaranteed", "proven results", "limited time")
 STYLE_SAMPLE_EXCLUSION_FLAGS = {
+    "finance_review",
+    "long_or_forwarded_content",
     "possible_phi",
     "professional_advice",
+    "quoted_or_forwarded_content",
     "secret",
     "security",
 }
+STYLE_SAMPLE_MAX_WORDS = 220
 
 
 @dataclass(frozen=True)
@@ -145,6 +149,15 @@ def _body_hash(value: str) -> str:
 
 def _sample_summary(sample: SentEmailStyleSample) -> EmailStyleSampleSummary:
     flags = _sent_text_sensitive_flags(f"{sample.subject}\n{sample.body}")
+    if len(_clean_text(sample.body).split()) > STYLE_SAMPLE_MAX_WORDS:
+        flags.append("long_or_forwarded_content")
+    if re.search(
+        r"(?:^|\n)(?:-{2,}\s*)?(?:forwarded message|original message|from:)\s*[:\-]?",
+        sample.body,
+        flags=re.I,
+    ) or re.match(r"\s*fwd\s*:", sample.subject, flags=re.I):
+        flags.append("quoted_or_forwarded_content")
+    flags = list(dict.fromkeys(flags))
     return EmailStyleSampleSummary(
         source_id=sample.source_id,
         source_url=sample.source_url,
@@ -187,6 +200,15 @@ def _extract_signoff(body: str) -> str | None:
         lowered = line.lower()
         if lowered in known:
             return known[lowered]
+    inline_matches = list(
+        re.finditer(
+            r"\b(sincerely|thank\s+you|thanks|regards|warmly|best)\s*,?\b",
+            body,
+            flags=re.I,
+        )
+    )
+    if inline_matches:
+        return known[" ".join(inline_matches[-1].group(1).lower().split())]
     return None
 
 
@@ -336,7 +358,7 @@ def build_email_style_profile_from_samples(
     )
     signoffs = _top_or_default(
         [signoff for sample in usable if (signoff := _extract_signoff(sample.body))],
-        "Best,",
+        "Sincerely,",
     )
     excluded_count = len(samples) - len(usable)
     limitations = [
@@ -346,8 +368,8 @@ def build_email_style_profile_from_samples(
     ]
     if excluded_count:
         limitations.append(
-            f"{excluded_count} sent-email sample(s) were excluded because guardrails "
-            "flagged sensitive content."
+            f"{excluded_count} sent-email sample(s) were excluded because sensitivity "
+            "or sample-quality guardrails flagged them."
         )
     profile = EmailStyleProfile(
         profile_id=profile_id,

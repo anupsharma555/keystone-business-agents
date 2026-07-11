@@ -7,6 +7,11 @@ import json
 import os
 
 from keystone_agents.config import require_cli_live_confirmation, with_cli_environment
+from keystone_agents.gmail_triage.draft_actions import (
+    delete_approved_gmail_test_draft,
+    execute_approved_gmail_draft_action,
+    existing_provider_draft_id,
+)
 from keystone_agents.schemas.approval import ApprovalQueueObjectType, ApprovalQueueStatus
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.gmail_tool import GmailTool
@@ -25,6 +30,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("approval_id", help="Approved outreach_draft approval queue item id.")
     parser.add_argument("--to", default=None, help="Recipient email override.")
     parser.add_argument("--subject", default=None, help="Subject override.")
+    parser.add_argument(
+        "--draft-id",
+        default=None,
+        help="Existing provider draft id to update instead of creating another draft.",
+    )
+    parser.add_argument(
+        "--delete-test-draft",
+        action="store_true",
+        help=(
+            "Delete the exact --draft-id only when subject and body contain "
+            "KBA_TEST_DRAFT and the dedicated test-delete gate is enabled."
+        ),
+    )
     parser.add_argument("--database-url", default=None, help="SQLite URL.")
     parser.add_argument(
         "--live-gmail",
@@ -104,6 +122,31 @@ def main() -> int:
     recipient = (args.to or metadata.get("recipient_email") or "").strip()
     subject = (args.subject or metadata.get("email_subject") or parsed_subject).strip()
     target_account = _target_gmail_draft_account(metadata)
+    if args.delete_test_draft:
+        if not args.draft_id:
+            raise SystemExit("--delete-test-draft requires --draft-id.")
+        result = delete_approved_gmail_test_draft(
+            GmailTool(live=args.live_gmail),
+            draft_id=args.draft_id,
+            expected_account=target_account,
+            approval_reference=item.id,
+        )
+        payload = {
+            "approval_id": item.id,
+            "approval_status": item.approval_status.value,
+            "gmail_result": result,
+            "gmail_account": result.get("gmail_account") or target_account,
+            "sent": False,
+            "send_enabled": False,
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+        else:
+            print(
+                f"{result.get('status')}\tapproval={item.id}\t"
+                f"draft_id={result.get('draft_id', '')}\tsent=false"
+            )
+        return 0
     if not recipient:
         raise SystemExit("Recipient email is required. Pass --to or save recipient_email metadata.")
     if not subject:
@@ -113,11 +156,14 @@ def main() -> int:
     if not parsed_body:
         raise SystemExit(f"Approval item {item.id} has no email body.")
 
-    result = GmailTool(live=args.live_gmail).create_draft(
+    result = execute_approved_gmail_draft_action(
+        GmailTool(live=args.live_gmail),
         to=recipient,
         subject=subject,
         body=parsed_body,
         expected_account=target_account,
+        approval_reference=item.id,
+        draft_id=(args.draft_id or existing_provider_draft_id(metadata)),
     )
     payload = {
         "approval_id": item.id,

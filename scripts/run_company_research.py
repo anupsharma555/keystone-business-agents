@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -246,6 +247,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     parser.add_argument("--markdown", action="store_true", help="Print markdown output.")
     parser.add_argument(
+        "--result-output",
+        type=Path,
+        default=None,
+        help=(
+            "Atomically persist the complete bounded result before console rendering. "
+            "Recommended for live SDK validation so output truncation cannot erase evidence."
+        ),
+    )
+    parser.add_argument(
         "--retrieval-hint-json",
         default=None,
         help=(
@@ -330,6 +340,21 @@ def _apply_live_test_defaults(args: argparse.Namespace) -> argparse.Namespace:
         and cli_default_live_sdk()
     ):
         args.live_sdk = True
+    return args
+
+
+def _apply_fixture_safety_defaults(
+    args: argparse.Namespace,
+    argv: list[str] | tuple[str, ...],
+) -> argparse.Namespace:
+    """Keep explicit fixtures offline unless the operator explicitly enables live flags."""
+
+    if not (args.fixture or args.compare_fixture):
+        return args
+    if "--live-search" not in argv:
+        args.live_search = False
+    if "--no-dry-run" not in argv:
+        args.dry_run = True
     return args
 
 
@@ -908,9 +933,30 @@ def _save_retrieval_tool_performance_memory(
         payload["storage"]["retrieval_tool_performance_memory_id"] = saved["id"]
 
 
+def _write_result_output_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _persist_requested_result(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    if args.result_output is not None:
+        _write_result_output_atomic(args.result_output, payload)
+
+
 @with_cli_environment()
 def main() -> int:
-    args = _apply_manual_request_plan(_apply_live_test_defaults(build_parser().parse_args()))
+    raw_argv = sys.argv[1:]
+    args = _apply_manual_request_plan(
+        _apply_fixture_safety_defaults(
+            _apply_live_test_defaults(build_parser().parse_args(raw_argv)),
+            raw_argv,
+        )
+    )
 
     if args.improvement_case and not sdk_execution_requested(args):
         raise SystemExit("--improvement-case requires --run-sdk or --live-sdk.")
@@ -926,6 +972,7 @@ def main() -> int:
             payload = _run_sdk_synthesis(args)
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
+        _persist_requested_result(args, payload)
         if args.markdown and not args.json:
             review_markdown = render_orchestrator_output_review(payload.get("orchestrator_review"))
             if payload.get("output_type") == "CompanyResearchFocusedBrief":
@@ -1019,6 +1066,7 @@ def main() -> int:
                     status="success",
                 ),
             }
+        _persist_requested_result(args, payload)
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
@@ -1085,6 +1133,7 @@ def main() -> int:
                 status="success",
             ),
         }
+    _persist_requested_result(args, payload)
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,7 @@ from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.email_style import EmailStyleProfile
 from keystone_agents.schemas.email_triage import (
     EmailTriageResult,
+    GmailMailboxActionPlan,
     GmailMessageEnvelope,
     GmailPriorityGroupingResult,
     managed_gmail_labels,
@@ -53,8 +54,11 @@ from keystone_agents.tools.email_style_tool import load_email_style_profile
 from keystone_agents.tools.gmail_tool import (
     apply_gmail_labels,
     create_gmail_draft_reply,
+    create_gmail_draft_with_attachment,
     get_gmail_message,
     gmail_message_envelope_from_dict,
+    modify_gmail_message_state,
+    send_gmail_test_draft,
 )
 from keystone_agents.tools.internal_data_tools import (
     airtable_get_base_schema,
@@ -477,7 +481,7 @@ def run_gmail_priority_grouping_sdk(
         request_text=skill_request_text(typed_input),
         explicit_max_turns=max_turns,
     )
-    return run_typed_sdk_agent(
+    result = run_typed_sdk_agent(
         agent=agent,
         typed_input=typed_input,
         output_type=GmailPriorityGroupingResult,
@@ -486,6 +490,18 @@ def run_gmail_priority_grouping_sdk(
         session=session,
         max_turns=turn_policy.max_turns,
     )
+    if not isinstance(result, TypedAgentRunResult):
+        return result
+    authoritative_summary = typed_input.operator_request or typed_input.request
+    normalized_output = result.final_output.model_copy(
+        update={
+            "request_summary": authoritative_summary,
+            "source_label": typed_input.source_label,
+            "lookback_days": typed_input.lookback_days,
+            "source_message_count": len(typed_input.messages),
+        }
+    )
+    return replace(result, output=normalized_output)
 
 
 def build_gmail_triage_agent(
@@ -515,7 +531,10 @@ def build_gmail_triage_agent(
         [
             get_gmail_message,
             apply_gmail_labels,
+            modify_gmail_message_state,
+            create_gmail_draft_with_attachment,
             create_gmail_draft_reply,
+            send_gmail_test_draft,
             load_email_style_profile,
             list_local_context_sources,
             search_local_context,
@@ -546,6 +565,26 @@ def build_gmail_triage_agent(
         handoff_description=(
             "Use for inbound email classification, label planning, suspicious message review, "
             "and draft-only reply preparation."
+        ),
+    )
+
+
+def build_gmail_mailbox_action_agent(model: str | None = None) -> Agent:
+    """Build a one-turn no-tool interpreter for an exact Gmail state request."""
+
+    return build_sdk_agent(
+        name="gmail_triage",
+        instructions=compose_instructions(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "gmail_mailbox_action.md",
+        ),
+        output_type=GmailMailboxActionPlan,
+        tools=[],
+        guardrails=keystone_guardrails(),
+        model=model,
+        handoff_description=(
+            "Interpret one exact-message mailbox-state request; Python executes and verifies it."
         ),
     )
 

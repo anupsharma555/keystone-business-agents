@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from keystone_agents.orchestrator.routing import (
     OPPORTUNITY_RE,
@@ -61,6 +63,8 @@ _AGENT_ALIASES: dict[str, ManualTargetAgent] = {
     "google drive context": "google_workspace_context_agent",
     "google docs context": "google_workspace_context_agent",
     "google sheets context": "google_workspace_context_agent",
+    "google slides context": "google_workspace_context_agent",
+    "powerpoint context": "google_workspace_context_agent",
     "zotero context agent": "zotero_context_agent",
     "zotero context": "zotero_context_agent",
     "zotero agent": "zotero_context_agent",
@@ -110,6 +114,13 @@ _CONTEXT_AGENT_TARGETS: frozenset[ManualTargetAgent] = frozenset(
         "preprints_context_agent",
     }
 )
+_MUTABLE_CONTEXT_AGENT_TARGETS: frozenset[ManualTargetAgent] = frozenset(
+    {
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+    }
+)
 _FINANCE_EXPENSE_RECEIPT_WRITE_RE = re.compile(
     r"\bairtable\b[\s\S]{0,240}\b(?:business|personal)\s+expenses?\b"
     r"|\b(?:business|personal)\s+expenses?\b[\s\S]{0,240}\bairtable\b",
@@ -126,7 +137,8 @@ _COUNT_RE = re.compile(
     r"|\b(?P<count2>\d{1,2})\s+"
     r"(?:[a-z][\w-]*\s+){0,4}"
     r"(?:opportunities|companies|institutes|researchers|conferences|people|leads|emails|"
-    r"roles|jobs|positions|postings|openings|products|targets|vendors)\b",
+    r"roles|jobs|positions|postings|openings|products|targets|vendors|"
+    r"preprints|papers|articles)\b",
     re.I,
 )
 _COUNT_WORDS = {
@@ -149,7 +161,8 @@ _COUNT_WORD_RE = re.compile(
     r"|\b(?P<count_word2>one|two|three|four|five|six|seven|eight|nine|ten)\s+"
     r"(?:[a-z][\w-]*\s+){0,4}"
     r"(?:opportunities|companies|institutes|researchers|conferences|people|leads|emails|"
-    r"roles|jobs|positions|postings|openings|products|targets|vendors)\b",
+    r"roles|jobs|positions|postings|openings|products|targets|vendors|"
+    r"preprints|papers|articles)\b",
     re.I,
 )
 _PREFIX_RE = re.compile(
@@ -159,6 +172,8 @@ _PREFIX_RE = re.compile(
 )
 _OPPORTUNITY_TO_OUTREACH_RE = re.compile(
     r"\bopportunit(?:y|ies)\s*(?:-|to\s+)?outreach\b"
+    r"|"
+    r"\bopportunit(?:y|ies)\b.*\b(?:draft|compose|prepare)\b.*\boutreach\b"
     r"|"
     r"\bopportunit(?:y|ies)\b.*\boutreach\b.*\b(loop|draft|email|approval|collaboration)\b"
     r"|"
@@ -267,6 +282,11 @@ _COMPANY_COMPARISON_RE = re.compile(
     r"(?P<company_a>(?:[A-Z][\w&.-]*|[A-Z]{2,})(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})"
     r"\s+(?:and|vs\.?|versus)\s+"
     r"(?P<company_b>(?:[A-Z][\w&.-]*|[A-Z]{2,})(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})\b",
+    re.I,
+)
+_COMPANY_LIST_COMPARISON_RE = re.compile(
+    r"\bcompare\s+(?P<companies>[^.;:]+?)"
+    r"(?=\s+and\s+(?:explain|summarize|tell|show|identify|describe)\b|[.;:]|$)",
     re.I,
 )
 _COMPANY_WORTH_RE = re.compile(
@@ -424,17 +444,16 @@ def merge_manual_request_plan(
         merged.primary_target = base.primary_target
     if not merged.objective:
         merged.objective = base.objective
-    if not merged.constraints:
-        merged.constraints = list(base.constraints)
-    if not merged.required_entities:
-        merged.required_entities = list(base.required_entities)
-    if not merged.required_terms:
-        merged.required_terms = list(base.required_terms)
-    if not merged.gmail_query:
+    merged.constraints = list(dict.fromkeys([*base.constraints, *merged.constraints]))
+    merged.required_entities = list(
+        dict.fromkeys([*base.required_entities, *merged.required_entities])
+    )
+    merged.required_terms = list(dict.fromkeys([*base.required_terms, *merged.required_terms]))
+    if base.gmail_query:
         merged.gmail_query = base.gmail_query
-    if merged.lookback_days is None:
+    if base.lookback_days is not None:
         merged.lookback_days = base.lookback_days
-    if not merged.draft_policy:
+    if base.draft_policy:
         merged.draft_policy = base.draft_policy
     if not merged.recipient:
         merged.recipient = base.recipient
@@ -442,6 +461,8 @@ def merge_manual_request_plan(
         merged.outreach_channel = base.outreach_channel
     if not merged.tone:
         merged.tone = base.tone
+    if base.desired_count != 1:
+        merged.desired_count = base.desired_count
     merged.desired_count = max(1, min(10, merged.desired_count or base.desired_count))
     if base.target_agent == "outreach_composer" or merged.target_agent == "outreach_composer":
         merged.requires_approved_context = True
@@ -486,14 +507,20 @@ def _semantic_target_agent(
         return "opportunity_scout"
     if requested_agent and requested_agent != "orchestrator":
         return requested_agent
+    if _looks_like_underspecified_modify_request(route_text):
+        return "clarification"
     if _looks_like_eval_scorecard_review(lower):
         return "chief_of_staff"
     if _looks_like_finance_expense_receipt_write(text):
         return "chief_of_staff"
     if _looks_like_reference_capture_request(lower):
         return "chief_of_staff"
+    if _looks_like_contact_discovery_request(route_text):
+        return "business_research_analyst"
     if _looks_like_explicit_business_research_instruction(text):
         return "business_research_analyst"
+    if looks_like_opportunity_to_outreach_loop(route_text):
+        return "opportunity_scout"
     context_target_agent = _business_context_target_agent(route_text)
     if context_target_agent == "zotero_context_agent" and _looks_like_zotero_context_request(
         route_text
@@ -509,10 +536,10 @@ def _semantic_target_agent(
         return "chief_of_staff"
     if _looks_like_gmail_label_request(lower):
         return "gmail_triage"
+    if _looks_like_gmail_style_request(lower):
+        return "gmail_triage"
     if _looks_like_outreach_variant_request(lower):
         return "outreach_composer"
-    if looks_like_opportunity_to_outreach_loop(route_text):
-        return "opportunity_scout"
     if (
         looks_like_send_side_effect(text)
         and _looks_like_direct_outreach_send_request(lower)
@@ -550,6 +577,19 @@ def _semantic_target_agent(
     return "clarification"
 
 
+def _looks_like_underspecified_modify_request(text: str) -> bool:
+    """Block pronoun-only mutations when no selected object context is attached."""
+
+    normalized = " ".join(str(text or "").lower().split()).strip(" .?!")
+    return bool(
+        re.fullmatch(
+            r"(?:please\s+)?(?:update|edit|modify|change|revise|delete|remove)\s+"
+            r"(?:it|this|that|the\s+(?:item|record|draft|event|file|document|row|note))",
+            normalized,
+        )
+    )
+
+
 def _intent_for_target(
     target_agent: ManualTargetAgent,
     text: str,
@@ -569,6 +609,11 @@ def _intent_for_target(
         and looks_like_opportunity_to_outreach_loop(text)
     ):
         return "opportunity_to_outreach_loop"
+    if (
+        target_agent in _MUTABLE_CONTEXT_AGENT_TARGETS
+        and _looks_like_internal_business_system_mutation(text)
+    ):
+        return "business_system_write"
     if _looks_like_blocked_side_effect_request(
         text
     ) and not _looks_like_discovery_outreach_workflow(text):
@@ -586,8 +631,31 @@ def _intent_for_target(
     return _ROUTE_INTENT.get(target_agent, "clarification")
 
 
+def _looks_like_contact_discovery_request(text: str) -> bool:
+    lower = " ".join(_without_negated_route_action_clauses(str(text or "")).lower().split())
+    has_discovery = bool(
+        re.search(r"\b(?:find|identify|locate|research|source|look\s+up)\b", lower)
+    )
+    has_contact = bool(
+        re.search(
+            r"\b(?:contact|decision[- ]maker|partnerships?\s+lead|"
+            r"partner\s+lead|commercial\s+lead)\b",
+            lower,
+        )
+    )
+    has_drafting = bool(
+        re.search(r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,80}\b(?:email|message|outreach)\b", lower)
+    )
+    return has_discovery and has_contact and not has_drafting
+
+
 def _looks_like_slack_operations_request(lower: str) -> bool:
     if "slack ops" in lower or "slack operations" in lower:
+        return True
+    if "ai-agents-workflow" in lower and any(
+        term in lower
+        for term in ("post", "message", "thread", "update", "edit", "delete", "remove")
+    ):
         return True
     return bool(
         "slack" in lower
@@ -730,6 +798,21 @@ def _looks_like_gmail_followup_request(lower: str) -> bool:
     )
 
 
+def _looks_like_gmail_style_request(lower: str) -> bool:
+    """Recognize sent-mail style learning as a Gmail-owned capability."""
+
+    has_mail_context = bool(
+        re.search(r"\b(?:gmail|emails?|sent\s+(?:mail|emails?|messages?))\b", lower)
+    )
+    has_style_intent = bool(
+        re.search(
+            r"\b(?:style|tone|voice|wording|phrasing|write\s+like|similar\s+style|mimic)\b",
+            lower,
+        )
+    )
+    return has_mail_context and has_style_intent
+
+
 def _business_context_target_agent(text: str) -> ManualTargetAgent | None:
     """Resolve explicit business-system context targets without phrase-specific lanes."""
 
@@ -740,20 +823,21 @@ def _business_context_target_agent(text: str) -> ManualTargetAgent | None:
         return "airtable_context_agent"
     if re.search(
         r"\b(?:google\s+workspace|google\s+drive|google\s+docs?|google\s+sheets?|"
-        r"gdrive|drive\s+folder|workspace\s+(?:doc|sheet|artifact|folder)|kniops)\b",
+        r"google\s+slides?|powerpoint|pptx|slide\s+deck|presentation\s+deck|"
+        r"gdrive|drive\s+folder|workspace\s+(?:doc|sheet|slide|deck|artifact|folder)|kniops)\b",
         lower,
     ):
         return "google_workspace_context_agent"
     if re.search(r"\bzotero\b", lower):
         return "zotero_context_agent"
     if re.search(
-        r"\b(?:rss\s+context|rss\s+feed|announcement\s+feed|"
+        r"\b(?:rss(?:\s+context|\s+feed|\s+announcements?)?|announcement\s+feed|"
         r"announcements?\s+context|#announcements)\b",
         lower,
     ):
         return "rss_context_agent"
     if re.search(
-        r"\b(?:preprints?\s+context|preprints?\s+history|preprint\s+history|"
+        r"\b(?:preprints?(?:\s+context|\s+history)?|preprint\s+history|"
         r"#knowledge[- ]hub|knowledge\s+hub\s+preprints?)\b",
         lower,
     ):
@@ -767,7 +851,16 @@ def _looks_like_zotero_context_request(text: str) -> bool:
         "zotero context" in lower
         or re.search(r"\bzotero\s+context\s+agent\b", lower)
         or re.search(r"\buse\s+zotero\b[^.\n;]{0,80}\bas\s+context\b", lower)
-        or ("zotero" in lower and re.search(r"\bitem\s+key\b", lower))
+        or ("zotero" in lower and re.search(r"\bitem\s+keys?\b", lower))
+        or (
+            "zotero" in lower
+            and re.search(
+                r"\b(?:create|add|write|update|edit|modify|revise|rename|delete|remove|"
+                r"clean\s*up|verify)\b[^.\n;]{0,120}"
+                r"\b(?:notes?|tags?|collections?|item\s+metadata)\b",
+                lower,
+            )
+        )
         or re.search(
             r"\buse\s+the\s+zotero\s+(?:article|paper|item|source|study|trial)\b"
             r"[^.\n;]{0,160}\bbefore\b",
@@ -834,7 +927,7 @@ def _looks_like_external_write_side_effect(text: str) -> bool:
     target_object = (
         r"(?:record|row|table|tracker|field|file|doc|document|sheet|folder|attachment|"
         r"airtable|drive|workspace|gmail\s+draft|slack|crm|calendar|meeting|event|"
-        r"collection|item|library)"
+        r"collection|item|library|slide|deck|presentation)"
     )
     return bool(
         re.search(rf"\b{write_verb}\b[\s\S]{{0,100}}\b{target_object}\b", lower)
@@ -844,6 +937,13 @@ def _looks_like_external_write_side_effect(text: str) -> bool:
             lower,
         )
     )
+
+
+def _looks_like_internal_business_system_mutation(text: str) -> bool:
+    lower = " ".join(str(text or "").lower().split())
+    if re.search(r"\b(?:send|post|publish|share|deliver)\b", lower):
+        return False
+    return _looks_like_external_write_side_effect(text)
 
 
 def _looks_like_reference_capture_request(lower: str) -> bool:
@@ -1153,6 +1253,10 @@ def _task_objective(
         return "outreach_draft"
     if intent == "slack_operations":
         return "slack_operations"
+    if target_agent == "business_research_analyst" and _looks_like_contact_discovery_request(
+        text
+    ):
+        return "contact_discovery"
     if intent == "opportunity_to_outreach_loop":
         return "opportunity_discovery"
     if intent == "company_research":
@@ -1360,13 +1464,23 @@ def _workflow_company_target(text: str) -> str:
 
 def _company_comparison_target(text: str) -> str:
     match = _COMPANY_COMPARISON_RE.search(str(text or ""))
-    if not match:
+    if match:
+        company_a = _clean_company_candidate(match.group("company_a"))
+        company_b = _clean_company_candidate(match.group("company_b"))
+        if company_a and company_b:
+            return f"{company_a} vs {company_b}"
+    list_match = _COMPANY_LIST_COMPARISON_RE.search(str(text or ""))
+    if not list_match:
         return ""
-    company_a = _clean_company_candidate(match.group("company_a"))
-    company_b = _clean_company_candidate(match.group("company_b"))
-    if not company_a or not company_b:
-        return ""
-    return f"{company_a} vs {company_b}"
+    companies = [
+        _clean_company_candidate(item)
+        for item in re.split(
+            r"\s*,\s*and\s+|\s*,\s*|\s+and\s+",
+            list_match.group("companies"),
+        )
+    ]
+    cleaned = [company for company in companies if company]
+    return " vs ".join(cleaned) if len(cleaned) >= 2 else ""
 
 
 def _looks_like_unnamed_company_set_discovery(text: str) -> bool:
@@ -1533,7 +1647,8 @@ def _conversational_named_agent(text: str) -> ManualTargetAgent | None:
             continue
         if re.search(
             rf"\b(?:could|can|would|please|ask|have|get|let)\b"
-            rf".{{0,80}}\b(?:the\s+)?{re.escape(alias)}\b",
+            rf".{{0,80}}\b(?:the\s+)?{re.escape(alias)}\b"
+            rf"|\bact\s+as\s+(?:my\s+|the\s+)?{re.escape(alias)}\b",
             lead,
         ):
             return _AGENT_ALIASES[alias]
@@ -1633,6 +1748,8 @@ def _first_nonempty(*values: str) -> str:
 
 
 def _lookback_days(text: str) -> int | None:
+    if re.search(r"\b(?:today|this\s+morning|this\s+afternoon)\b", text, re.I):
+        return 1
     match = re.search(r"\b(?:last|past)\s+(?P<days>\d{1,3})\s+days?\b", text, re.I)
     if match is None:
         return None
@@ -1646,6 +1763,12 @@ def _draft_policy(text: str) -> str:
     lower = text.lower()
     if "draft" not in lower and "reply" not in lower:
         return "no_drafts_requested"
+    if re.search(
+        r"\b(?:do\s+not|don't|dont|never|no|without)\b[^.;\n]{0,80}"
+        r"\b(?:draft|drafting|reply|replies)\b",
+        lower,
+    ):
+        return "no_drafts_requested"
     if "urgent" in lower:
         return "draft_only_for_urgent"
     return "draft_only_when_reply_needed"
@@ -1658,10 +1781,37 @@ def _gmail_query(text: str) -> str:
         parts.append("is:unread")
     if "inbox" in lower:
         parts.append("in:inbox")
-    days = _lookback_days(text)
-    if days is not None:
-        parts.append(f"newer_than:{days}d")
+    if re.search(r"\b(?:today|this\s+morning|this\s+afternoon)\b", text, re.I):
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        parts.append(f"after:{today.strftime('%Y/%m/%d')}")
+    else:
+        days = _lookback_days(text)
+        if days is not None:
+            parts.append(f"newer_than:{days}d")
+    sender_hint = _gmail_sender_hint(text)
+    if sender_hint:
+        parts.append(f'"{sender_hint}"')
     return " ".join(parts)
+
+
+def _gmail_sender_hint(text: str) -> str:
+    match = re.search(
+        r"\b(?:email|message|thread)s?\s+from\s+"
+        r"(?P<sender>[A-Za-z0-9][A-Za-z0-9&.' -]{1,80}?)"
+        r"(?=\s+(?:and|that|about|with|then|to)\b|[,.?]|$)",
+        text,
+        re.I,
+    )
+    if not match:
+        return ""
+    sender = " ".join(match.group("sender").split()).strip()
+    if re.fullmatch(
+        r"(?:today|yesterday|the\s+(?:last|past)\s+\d+\s+days?)",
+        sender,
+        re.I,
+    ):
+        return ""
+    return sender
 
 
 def _recipient(text: str) -> str:

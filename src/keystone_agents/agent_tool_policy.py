@@ -13,6 +13,8 @@ from keystone_agents.tools.zotero_context_tools import (
     ZOTERO_CONTEXT_TOOL_NAMES,
     ZOTERO_IMPORT_TOOL_NAMES,
     ZOTERO_READ_CONTEXT_TOOL_NAMES,
+    ZOTERO_TEST_LIBRARY_TOOL_NAMES,
+    ZOTERO_TEST_NOTE_TOOL_NAMES,
 )
 
 GOOGLE_WORKSPACE_ALLOWED_TOOLS = frozenset(GOOGLE_WORKSPACE_TOOL_NAMES)
@@ -22,6 +24,9 @@ GOOGLE_WORKSPACE_READ_TOOLS = frozenset(
         "google_drive_list_folder",
         "google_drive_search_files",
         "google_drive_get_file_metadata",
+        "google_slide_deck_read",
+        "presentation_search_local",
+        "presentation_read_local",
         "google_sheet_list",
         "google_sheet_read_table",
     }
@@ -32,9 +37,12 @@ AIRTABLE_WRITE_ALLOWED_TOOLS = frozenset(
     {
         "airtable_write_record",
         "airtable_upload_attachment",
+        "airtable_link_attachment",
         "airtable_create_expense_from_receipt",
     }
 )
+AIRTABLE_TEST_CLEANUP_TOOLS = frozenset({"airtable_delete_test_record"})
+CALENDAR_READ_TOOL_NAMES = frozenset({"read_google_calendar_window"})
 WEB_STRUCTURING_ALLOWED_TOOLS = frozenset({"structure_web_data_for_schema"})
 PLAYWRIGHT_RESEARCH_ALLOWED_TOOLS = frozenset({"render_page"})
 BROWSER_DIAGNOSTIC_ALLOWED_TOOLS = frozenset(
@@ -183,6 +191,7 @@ CORE_READ_TOOL_NAMES = frozenset(
         *ZOTERO_READ_CONTEXT_TOOL_NAMES,
         *GOOGLE_WORKSPACE_READ_TOOLS,
         *AIRTABLE_READ_ALLOWED_TOOLS,
+        *CALENDAR_READ_TOOL_NAMES,
     }
 )
 WEB_SEARCH_TOOL_NAMES = frozenset(
@@ -206,6 +215,7 @@ DEEP_RETRIEVAL_TOOL_NAMES = (
             "fetch_company_page",
             "extract_research_claims_from_html",
             "fetch_linkedin_or_profile_placeholder",
+            "discover_public_company_contacts",
             "extract_company_signals",
             "dedupe_and_rank_sources",
             "build_source_bundle_for_synthesis",
@@ -231,14 +241,26 @@ CONTACT_CONTEXT_TOOL_NAMES = frozenset(
         "build_approved_outreach_drafting_context",
     }
 )
+CALENDAR_WRITE_TOOL_NAMES = frozenset(
+    {
+        "create_google_calendar_event",
+        "update_google_calendar_event",
+        "delete_google_calendar_event",
+    }
+)
 INTERNAL_WRITE_TOOL_NAMES = (
     AIRTABLE_WRITE_ALLOWED_TOOLS
+    | AIRTABLE_TEST_CLEANUP_TOOLS
     | GOOGLE_WORKSPACE_WRITE_TOOLS
     | CONTACT_CONTEXT_TOOL_NAMES
+    | CALENDAR_WRITE_TOOL_NAMES
     | frozenset(
         {
             "apply_gmail_labels",
+            "modify_gmail_message_state",
+            "create_gmail_draft_with_attachment",
             "create_gmail_draft_reply",
+            "send_gmail_test_draft",
             "create_approval_queue_item",
             "create_approval_request_placeholder",
             "check_unsupported_claims",
@@ -254,6 +276,8 @@ INTERNAL_WRITE_TOOL_NAMES = (
             "learn_email_style_profile",
             "save_initial_outreach_tracking_record",
             *ZOTERO_IMPORT_TOOL_NAMES,
+            *ZOTERO_TEST_NOTE_TOOL_NAMES,
+            *ZOTERO_TEST_LIBRARY_TOOL_NAMES,
         }
     )
 )
@@ -295,6 +319,7 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "fetch_company_page",
                 "extract_research_claims_from_html",
                 "fetch_linkedin_or_profile_placeholder",
+                "discover_public_company_contacts",
                 "extract_company_signals",
                 "dedupe_and_rank_sources",
                 "build_source_bundle_for_synthesis",
@@ -405,7 +430,10 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
             {
                 "get_gmail_message",
                 "apply_gmail_labels",
+                "modify_gmail_message_state",
+                "create_gmail_draft_with_attachment",
                 "create_gmail_draft_reply",
+                "send_gmail_test_draft",
                 "load_email_style_profile",
                 "list_local_context_sources",
                 "search_local_context",
@@ -427,7 +455,11 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
     ),
     "airtable_context_agent": AgentToolPolicy(
         agent_name="airtable_context_agent",
-        allowed_tool_names=AIRTABLE_READ_ALLOWED_TOOLS | AIRTABLE_WRITE_ALLOWED_TOOLS,
+        allowed_tool_names=(
+            AIRTABLE_READ_ALLOWED_TOOLS
+            | AIRTABLE_WRITE_ALLOWED_TOOLS
+            | AIRTABLE_TEST_CLEANUP_TOOLS
+        ),
         rationale=(
             "The Airtable context agent reads schema and capped records, may perform "
             "direct approved create/update writes, and remains advisory when nested "
@@ -457,7 +489,8 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
         rationale=(
             "The Zotero context agent reads local/API Zotero metadata and may perform "
             "direct approved Google Workspace artifact writes; Zotero library mutation "
-            "is limited to the guarded backend importer, and nested Chief calls remain advisory."
+            "is limited to the guarded backend importer and marked disposable test-note "
+            "tools, and nested Chief calls remain advisory."
         ),
     ),
     "rss_context_agent": AgentToolPolicy(
@@ -544,6 +577,8 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
         )
         | GOOGLE_WORKSPACE_ALLOWED_TOOLS
         | AIRTABLE_WRITE_ALLOWED_TOOLS
+        | CALENDAR_WRITE_TOOL_NAMES
+        | CALENDAR_READ_TOOL_NAMES
         | WEB_STRUCTURING_ALLOWED_TOOLS
         | PLAYWRIGHT_RESEARCH_ALLOWED_TOOLS
         | BROWSER_DIAGNOSTIC_ALLOWED_TOOLS,

@@ -425,7 +425,7 @@ def _extract_token_detail(value: Any, field_name: str) -> int:
     return _usage_attr(value, field_name)
 
 
-def _extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
+def extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
     """Return safe request/token usage metadata when the SDK exposes it."""
 
     prompt_cache_metadata = _prompt_cache_metadata(raw_result)
@@ -499,6 +499,9 @@ def _extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
         "cache_hit_rate": _cache_hit_rate(input_tokens, cached_input_tokens),
         **prompt_cache_metadata,
     }
+
+
+_extract_sdk_usage = extract_sdk_usage
 
 
 def _cache_hit_rate(input_tokens: int | None, cached_input_tokens: int | None) -> float | None:

@@ -12,6 +12,8 @@ import inspect
 import json
 import os
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from functools import wraps
@@ -51,6 +53,7 @@ try:
         ToolOutputGuardrailData,
         input_guardrail,
         output_guardrail,
+        set_tracing_export_api_key,
         tool_input_guardrail,
         tool_output_guardrail,
     )
@@ -80,6 +83,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional local insta
     SessionSettings = Any  # type: ignore
     SQLiteSession = Any  # type: ignore
     _sdk_function_tool = None  # type: ignore[assignment]
+    set_tracing_export_api_key = None  # type: ignore[assignment]
     AsyncOpenAI = Any  # type: ignore
     SDKWebSearchTool = None  # type: ignore[assignment]
     SDKFileSearchTool = None  # type: ignore[assignment]
@@ -110,6 +114,56 @@ SDK_INCLUDE_USAGE_ENV = "KEYSTONE_SDK_INCLUDE_USAGE"
 SDK_PROMPT_CACHE_RETENTION_ENV = "KEYSTONE_SDK_PROMPT_CACHE_RETENTION"
 DEFAULT_PROMPT_CACHE_RETENTION = "24h"
 _FALSE_ENV_VALUES = {"", "0", "false", "no", "off", "disabled"}
+
+
+@dataclass(frozen=True)
+class SDKDataHandlingProfile:
+    """Request-local SDK data controls for bounded private-context execution."""
+
+    name: str
+    store: bool
+    prompt_cache_retention: str | None
+    tracing_disabled: bool
+    trace_include_sensitive_data: bool
+
+    def audit_metadata(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "response_store": self.store,
+            "prompt_cache_retention": self.prompt_cache_retention,
+            "tracing_disabled": self.tracing_disabled,
+            "trace_include_sensitive_data": self.trace_include_sensitive_data,
+        }
+
+
+PRIVATE_CONTEXT_SDK_PROFILE = SDKDataHandlingProfile(
+    name="bounded_private_context",
+    store=False,
+    prompt_cache_retention="in_memory",
+    tracing_disabled=True,
+    trace_include_sensitive_data=False,
+)
+_SDK_DATA_HANDLING_PROFILE: ContextVar[SDKDataHandlingProfile | None] = ContextVar(
+    "keystone_sdk_data_handling_profile",
+    default=None,
+)
+
+
+@contextmanager
+def private_context_sdk_profile():
+    """Force non-persistent SDK settings for one bounded private-context run."""
+
+    token = _SDK_DATA_HANDLING_PROFILE.set(PRIVATE_CONTEXT_SDK_PROFILE)
+    try:
+        yield PRIVATE_CONTEXT_SDK_PROFILE
+    finally:
+        _SDK_DATA_HANDLING_PROFILE.reset(token)
+
+
+def active_sdk_data_handling_profile() -> SDKDataHandlingProfile | None:
+    """Return the request-local data profile, if one is active."""
+
+    return _SDK_DATA_HANDLING_PROFILE.get()
 
 if _SDK_IMPORT_ERROR is not None:
     _SANDBOX_IMPORT_ERROR: ImportError | None = _SDK_IMPORT_ERROR
@@ -985,18 +1039,30 @@ def _cache_friendly_model_settings(model_settings: Any | None = None) -> Any:
     """Apply repo-wide cache/cost telemetry defaults to SDK model settings."""
 
     include_usage = _sdk_include_usage_enabled()
-    retention = _sdk_prompt_cache_retention()
+    profile = active_sdk_data_handling_profile()
+    retention = (
+        profile.prompt_cache_retention if profile else _sdk_prompt_cache_retention()
+    )
     if _SDK_IMPORT_ERROR is not None:
         settings = dict(model_settings or {})
         settings.setdefault("include_usage", include_usage)
+        if profile is not None:
+            settings["store"] = profile.store
         if retention is not None:
-            settings.setdefault("prompt_cache_retention", retention)
+            if profile is not None:
+                settings["prompt_cache_retention"] = retention
+            else:
+                settings.setdefault("prompt_cache_retention", retention)
         return settings
     settings = model_settings or ModelSettings()
     updates: dict[str, Any] = {}
     if getattr(settings, "include_usage", None) is None:
         updates["include_usage"] = include_usage
-    if retention is not None and getattr(settings, "prompt_cache_retention", None) is None:
+    if profile is not None:
+        updates["store"] = profile.store
+    if profile is not None and retention is not None:
+        updates["prompt_cache_retention"] = retention
+    elif retention is not None and getattr(settings, "prompt_cache_retention", None) is None:
         updates["prompt_cache_retention"] = retention
     return dataclass_replace(settings, **updates) if updates else settings
 
@@ -1040,6 +1106,18 @@ def _live_model_max_retries() -> int:
     return max(0, value)
 
 
+def _sdk_export_trace_metadata(metadata: Mapping[str, Any]) -> dict[str, str]:
+    """Convert safe Keystone trace scalars to the SDK exporter's string contract."""
+
+    exported: dict[str, str] = {}
+    for key, value in metadata.items():
+        if isinstance(value, bool):
+            exported[key] = "true" if value else "false"
+        else:
+            exported[key] = str(value)
+    return exported
+
+
 def build_live_run_config(
     config: ModelConfig | None = None,
     *,
@@ -1065,12 +1143,24 @@ def build_live_run_config(
         tracing_disabled=tracing_disabled,
         trace_include_sensitive_data=trace_include_sensitive_data,
     )
+    profile = active_sdk_data_handling_profile()
+    if profile is not None:
+        run_trace_config = run_trace_config.with_overrides(
+            tracing_disabled=profile.tracing_disabled,
+            trace_include_sensitive_data=profile.trace_include_sensitive_data,
+        )
     model_config.require_live_execution_ready()
     validate_sdk_available()
     from keystone_agents.trace_processor import register_configured_trace_processor
 
     register_configured_trace_processor()
     provider_kwargs = model_config.openai_provider_kwargs()
+    if (
+        not run_trace_config.tracing_disabled
+        and model_config.provider == "openai"
+        and provider_kwargs.get("api_key")
+    ):
+        set_tracing_export_api_key(str(provider_kwargs["api_key"]))
     openai_client = AsyncOpenAI(
         api_key=provider_kwargs.get("api_key"),
         base_url=provider_kwargs.get("base_url") or None,
@@ -1086,7 +1176,7 @@ def build_live_run_config(
         model_provider=provider,
         workflow_name=run_trace_config.workflow_name,
         group_id=run_trace_config.group_id,
-        trace_metadata=dict(run_trace_config.trace_metadata) or None,
+        trace_metadata=_sdk_export_trace_metadata(run_trace_config.trace_metadata) or None,
         tracing_disabled=run_trace_config.tracing_disabled,
         trace_include_sensitive_data=run_trace_config.trace_include_sensitive_data,
         sandbox=sandbox,

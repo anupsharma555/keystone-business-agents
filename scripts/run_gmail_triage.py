@@ -47,6 +47,11 @@ from keystone_agents.founder_profile import (
     founder_profile_audit_payload,
     load_founder_fit_profile,
 )
+from keystone_agents.gmail_triage.draft_actions import (
+    execute_approved_gmail_draft_action,
+    execute_approved_gmail_draft_reply_action,
+    resolve_unique_gmail_draft,
+)
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import (
     DEFAULT_GMAIL_PRIORITY_GROUPING_REQUEST,
@@ -421,6 +426,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create Gmail drafts for reply-needed messages.",
     )
     parser.add_argument(
+        "--update-draft",
+        action="store_true",
+        default=False,
+        help="Resolve and update one existing Gmail draft without sending it.",
+    )
+    parser.add_argument("--draft-subject-hint", default="")
+    parser.add_argument("--draft-recipient-hint", default="")
+    parser.add_argument(
+        "--approval-reference",
+        default="",
+        help=(
+            "Exact scoped operator approval reference for a requested Gmail draft write. "
+            "This never authorizes sending."
+        ),
+    )
+    parser.add_argument(
+        "--expected-account",
+        default="",
+        help="Expected authenticated Gmail account for a scoped draft write.",
+    )
+    parser.add_argument(
         "--apply-labels",
         action="store_true",
         default=False,
@@ -570,7 +596,6 @@ def _run_sdk_synthesis(
         {
             "live_slack": "--live-slack",
             "request_approval": "--request-approval",
-            "create_draft": "--create-draft",
             "apply_labels": "--apply-labels",
             "preview_labels": "--preview-labels",
             "cleanup_labels": "--cleanup-labels",
@@ -587,12 +612,63 @@ def _run_sdk_synthesis(
         args,
         run_config_factory=SDK_RUN_CONFIG_FACTORY,
     )
+    if args.create_draft and args.update_draft:
+        raise SystemExit("Use either --create-draft or --update-draft, not both.")
+    if args.create_draft or args.update_draft:
+        if not args.live_gmail or not live:
+            raise SystemExit(
+                "Gmail draft writes with SDK synthesis require --live-gmail and --live-sdk."
+            )
+        if not str(args.approval_reference or "").strip():
+            raise SystemExit(
+                "Gmail draft writes require an exact --approval-reference from the "
+                "authenticated operator command."
+            )
+        if not str(args.expected_account or "").strip():
+            raise SystemExit("Gmail draft writes require --expected-account for scoping.")
+    if args.update_draft and not (
+        str(args.draft_subject_hint or "").strip()
+        or str(args.draft_recipient_hint or "").strip()
+    ):
+        raise SystemExit(
+            "--update-draft requires a natural subject or recipient hint; no draft was changed."
+        )
     style_context = _style_profile_context(email_style_profile)
     founder_context = founder_drafting_context(founder_fit_profile)
     preflight_context = orchestrator_preflight_context_text(args)
 
+    resolved_draft: dict[str, Any] = {}
+
     def retrieve() -> GmailMessageEnvelope:
         if args.live_gmail:
+            if args.update_draft:
+                gmail = GmailTool(live=True)
+                resolution = resolve_unique_gmail_draft(
+                    gmail,
+                    subject_hint=args.draft_subject_hint,
+                    recipient_hint=args.draft_recipient_hint,
+                )
+                if resolution.get("status") != "resolved":
+                    raise RuntimeError(
+                        "Gmail draft target was not unique; no draft was changed. "
+                        f"reason_code={resolution.get('reason_code')} "
+                        f"candidate_count={resolution.get('candidate_count')}"
+                    )
+                draft = gmail.get_draft(str(resolution.get("draft_id") or ""))
+                resolved_draft.update(draft)
+                resolved_draft["resolution"] = resolution
+                return GmailMessageEnvelope(
+                    message_id=str(draft.get("message_id") or ""),
+                    thread_id="",
+                    sender_name="Draft recipient",
+                    sender_email=str(draft.get("to") or ""),
+                    subject=str(draft.get("subject") or ""),
+                    normalized_body=str(draft.get("body") or ""),
+                    triage_limitations=[
+                        "Existing Gmail draft resolved uniquely by natural subject/recipient "
+                        "reference; provider ID remains internal."
+                    ],
+                )
             label = _priority_grouping_source_label(args)
             gmail = GmailTool(live=True)
             message_refs = gmail.list_recent_messages(
@@ -670,6 +746,30 @@ def _run_sdk_synthesis(
         openai_cost_project_id=args.openai_cost_project_id,
     )
     _repair_gmail_triage_output_hygiene(payload)
+    if args.create_draft:
+        draft_result = _create_verified_sdk_reply_draft(args, outcome)
+        payload["gmail_draft_result"] = draft_result
+        payload["side_effects"] = {
+            "gmail_draft_created": bool(
+                draft_result.get("verification", {}).get("passed")
+            ),
+            "gmail_draft_updated": False,
+            "email_sent": False,
+            "send_enabled": False,
+            "approval_reference": str(args.approval_reference),
+        }
+    elif args.update_draft:
+        draft_result = _update_verified_sdk_draft(args, outcome, resolved_draft)
+        payload["gmail_draft_result"] = draft_result
+        payload["side_effects"] = {
+            "gmail_draft_created": False,
+            "gmail_draft_updated": bool(
+                draft_result.get("verification", {}).get("passed")
+            ),
+            "email_sent": False,
+            "send_enabled": False,
+            "approval_reference": str(args.approval_reference),
+        }
     if args.orchestrator_review:
         payload["orchestrator_review"] = build_cli_orchestrator_review(
             args,
@@ -684,6 +784,56 @@ def _run_sdk_synthesis(
         )
     attach_orchestrator_preflight_payload(payload, args)
     return payload
+
+
+def _create_verified_sdk_reply_draft(
+    args: argparse.Namespace,
+    outcome: Any,
+) -> dict[str, Any]:
+    envelope = outcome.raw_context
+    if not isinstance(envelope, GmailMessageEnvelope):
+        raise SystemExit("Gmail draft creation requires one resolved Gmail message.")
+    draft_reply = str(outcome.final_output.draft_reply or "").strip()
+    if not draft_reply:
+        raise SystemExit(
+            "Gmail Triage did not recommend a reply, so no provider draft was created."
+        )
+    reply_subject = envelope.subject.strip()
+    if not reply_subject.lower().startswith("re:"):
+        reply_subject = f"Re: {reply_subject}".strip()
+    return execute_approved_gmail_draft_reply_action(
+        GmailTool(live=True),
+        message_id=envelope.message_id,
+        body=draft_reply,
+        expected_to=envelope.sender_email,
+        expected_subject=reply_subject,
+        expected_account=str(args.expected_account),
+        approval_reference=str(args.approval_reference),
+    )
+
+
+def _update_verified_sdk_draft(
+    args: argparse.Namespace,
+    outcome: Any,
+    resolved_draft: dict[str, Any],
+) -> dict[str, Any]:
+    draft_reply = str(outcome.final_output.draft_reply or "").strip()
+    if not draft_reply:
+        raise SystemExit(
+            "Gmail Triage returned no revised draft text, so no provider draft was changed."
+        )
+    draft_id = str(resolved_draft.get("draft_id") or "").strip()
+    if not draft_id:
+        raise SystemExit("No uniquely resolved Gmail draft ID was available for update.")
+    return execute_approved_gmail_draft_action(
+        GmailTool(live=True),
+        to=str(resolved_draft.get("to") or ""),
+        subject=str(resolved_draft.get("subject") or ""),
+        body=draft_reply,
+        expected_account=str(args.expected_account),
+        approval_reference=str(args.approval_reference),
+        draft_id=draft_id,
+    )
 
 
 def _repair_gmail_triage_output_hygiene(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1109,7 +1259,7 @@ def _write_priority_grouping_test_pack_report(
         result,
         run_type="live SDK" if live else "local SDK",
         model=_priority_grouping_report_model(live),
-        input_summary=GT1_PRIORITY_GROUPING_PROMPT,
+        input_summary=str(args.request or "").strip() or GT1_PRIORITY_GROUPING_PROMPT,
         input_source=_priority_grouping_report_source(args),
         usage=usage,
         cost=cost,
@@ -1173,6 +1323,7 @@ def _run_priority_grouping_sdk_synthesis(
         return GmailPriorityGroupingSDKInput.from_envelopes(
             envelopes,
             request=request_context,
+            operator_request=str(getattr(args, "request", "") or "").strip(),
             lookback_days=args.lookback_days,
             source_label=source_label,
             email_style_profile=style_context,
@@ -1217,6 +1368,16 @@ def _run_priority_grouping_sdk_synthesis(
         storage=storage,
         model_label="sdk-live" if live else "sdk-local",
     )
+    authoritative_summary = str(getattr(args, "request", "") or "").strip() or request_context
+    normalized_output = outcome.final_output.model_copy(
+        update={
+            "request_summary": authoritative_summary,
+            "source_label": source_label,
+            "lookback_days": args.lookback_days,
+            "source_message_count": len(outcome.typed_input.messages),
+        }
+    )
+    outcome = replace(outcome, result=replace(outcome.result, output=normalized_output))
     payload = sdk_synthesis_payload(
         outcome,
         include_provider_cost_window=args.include_provider_cost_window,

@@ -310,6 +310,8 @@ def load_settings(env_file: str | Path | None = None, *, force_dotenv: bool = Fa
 
 def with_cli_environment(
     env_file: str | Path = ".env",
+    *,
+    force_dotenv: bool = False,
 ) -> Callable[[Callable[..., object]], Callable[..., object]]:
     """Load a repo-local dotenv file for a CLI entrypoint, then restore the prior env."""
 
@@ -317,7 +319,7 @@ def with_cli_environment(
         @wraps(func)
         def wrapped(*args: object, **kwargs: object) -> object:
             snapshot = dict(os.environ)
-            load_settings(env_file=env_file)
+            load_settings(env_file=env_file, force_dotenv=force_dotenv)
             try:
                 return func(*args, **kwargs)
             finally:

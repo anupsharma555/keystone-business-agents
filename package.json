@@ -1,5 +1,11 @@
 {
   "scripts": {
+    "test:ai-agents-workflow:no-live": ".venv/bin/python scripts/run_ai_agents_workflow_no_live_gate.py",
+    "test:agent-execution-tiers": ".venv/bin/python scripts/run_agent_execution_tier_gate.py",
+    "run:chief-prior-week-packet": ".venv/bin/python scripts/run_chief_prior_week_packet.py",
+    "run:local-kni-capability-summary": ".venv/bin/python scripts/run_local_kni_capability_summary.py",
+    "run:research-doc-lifecycle": ".venv/bin/python scripts/run_research_doc_lifecycle.py",
+    "run:workspace-research-note-read": ".venv/bin/python scripts/run_workspace_research_note_read_validation.py",
     "eval:promptfoo": "mkdir -p .keystone/promptfoo/config .keystone/promptfoo/cache .keystone/promptfoo/logs && PROMPTFOO_CONFIG_DIR=.keystone/promptfoo/config PROMPTFOO_CACHE_PATH=.keystone/promptfoo/cache PROMPTFOO_LOG_DIR=.keystone/promptfoo/logs promptfoo eval -c promptfooconfig.yaml --no-cache --max-concurrency 1",
     "eval:promptfoo:json": "mkdir -p .keystone/promptfoo/config .keystone/promptfoo/cache .keystone/promptfoo/logs && PROMPTFOO_CONFIG_DIR=.keystone/promptfoo/config PROMPTFOO_CACHE_PATH=.keystone/promptfoo/cache PROMPTFOO_LOG_DIR=.keystone/promptfoo/logs promptfoo eval -c promptfooconfig.yaml --no-cache --max-concurrency 1 --no-table -o .keystone/promptfoo/latest-eval.json",
     "eval:promptfoo:db": "npm run eval:promptfoo:json && .venv/bin/python scripts/promptfoo_eval_db.py import-latest",

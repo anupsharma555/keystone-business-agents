@@ -1,6 +1,6 @@
 ---
 skill_id: preprints_context_specialist_contracts
-skill_version: 2026-06-20.2
+skill_version: 2026-07-10.1
 skill_purpose: Resolve historical preprint/#knowledge-hub context for Chief of Staff decisions.
 applies_to:
   - preprints_context_agent
@@ -24,7 +24,9 @@ opportunity scouting, and literature follow-up.
 ## Required Behavior
 
 - Retrieve historical records through the canonical preprint announcement
-  history tool.
+  history tool. If the KBA announcement table is empty, the tool may read
+  persisted preprint candidates from the allowlisted `DISCOVERY_STORE_PATH` in
+  SQLite read-only mode through explicit linked Keystone context configuration.
 - Preserve feed item IDs, URLs, dates, source names, publication identifiers,
   evidence notes, and Slack links when available.
 - Label preprints as preliminary evidence and avoid overstating clinical

@@ -38,7 +38,7 @@ from keystone_agents.agents.outreach_composer import (
 from keystone_agents.agents.web_query_planner import resolve_web_query_plan
 from keystone_agents.cli_sdk import jsonable
 from keystone_agents.company_research import research_company_fixture
-from keystone_agents.config import cli_default_live_gmail
+from keystone_agents.config import cli_default_live_gmail, load_settings
 from keystone_agents.contact_enrichment import build_contact_enrichment_artifact
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.finance_expense_receipts import (
@@ -102,6 +102,14 @@ from keystone_agents.schemas.email_triage import (
     GmailThreadSummaryMessage,
     GmailThreadSummaryResult,
 )
+from keystone_agents.schemas.operational_context import (
+    HistoricalFeedContextItem,
+    HumanWorkContext,
+    OperationalContextEntry,
+    OperationalContextSource,
+    PreprintsContextResult,
+    RssContextResult,
+)
 from keystone_agents.schemas.opportunity import (
     FilteredOpportunityCandidate,
     OpportunityScoutResult,
@@ -127,6 +135,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemApprovalGate,
     WorkItemArtifactRef,
     WorkItemBlocker,
+    WorkItemFact,
     WorkItemNextAction,
     WorkItemRoute,
     WorkItemSourceRef,
@@ -154,7 +163,14 @@ from keystone_agents.source_layer_context import runtime_source_layer_policy_con
 from keystone_agents.specialist_tool_names import specialist_agent_tool_name
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.temporal_policy import temporal_depth_policy
+from keystone_agents.tools.announcement_context_tools import (
+    retrieve_announcement_feed_history_impl,
+)
 from keystone_agents.tools.approval_tool import build_approval_queue_item
+from keystone_agents.tools.email_style_tool import (
+    build_email_style_profile_from_samples,
+    load_sent_email_style_samples_fixture,
+)
 from keystone_agents.tools.gmail_tool import GmailAPIError, GmailConfigurationError, GmailTool
 from keystone_agents.tools.internal_data_tools import read_linked_article_impl
 from keystone_agents.visible_sources import append_visible_source_urls_to_output
@@ -955,6 +971,16 @@ def run_prepared_work_item_specialist(prepared: PreparedWorkItemStep) -> Workflo
             request=request,
             store=store,
             sdk_session=sdk_session,
+        )
+    elif route in {
+        WorkItemRoute.RSS_CONTEXT_AGENT,
+        WorkItemRoute.PREPRINTS_CONTEXT_AGENT,
+    }:
+        result = _advance_announcement_context_agent(
+            work_item,
+            request=request,
+            store=store,
+            route=route,
         )
     else:
         result = _block_unsupported_route(work_item, route=route, store=store)
@@ -2141,6 +2167,35 @@ def _attach_route_specific_review_fields(
 ) -> None:
     """Expose route-native fields to the deterministic manager reviewer."""
 
+    if result.route in {
+        WorkItemRoute.RSS_CONTEXT_AGENT,
+        WorkItemRoute.PREPRINTS_CONTEXT_AGENT,
+    }:
+        source_refs = [
+            {
+                "source_id": source.source_id,
+                "title": source.title,
+                "url": source.url,
+                "supported_claim": source.supported_claim,
+            }
+            for source in result.work_item.sources
+        ]
+        review_payload.update(
+            {
+                "summary": result.human_summary,
+                "sources": source_refs,
+                "source_ids_used": [source.source_id for source in result.work_item.sources],
+                "evidence": [
+                    source.supported_claim
+                    for source in result.work_item.sources
+                    if source.supported_claim
+                ],
+                "audit_notes": result.audit_notes,
+                "write_actions_performed": False,
+            }
+        )
+        return
+
     if result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
         research_artifact = next(
             (
@@ -3324,7 +3379,9 @@ def _finalize_manager_loop_result(
         current_artifact_types = {artifact.artifact_type for artifact in work_item.artifact_refs}
         current_result_needs_approval = (
             current_action == "review_outreach_draft"
+            or current_action == "review_email_style_profile"
             or "outreach_draft" in current_artifact_types
+            or "email_style_profile" in current_artifact_types
         )
         status = derive_case_status(work_item) if current_result_needs_approval else WorkItemStatus.DONE
         work_item = work_item.model_copy(update={"status": status}).touch()
@@ -3357,6 +3414,18 @@ def _finalize_manager_loop_result(
     human_summary = (
         _render_orchestrator_plan_summary(plan_summary) if plan_summary else result.human_summary
     )
+    if any(
+        blocker.code == "manager_loop_current_opportunity_evidence_missing"
+        for blocker in all_blockers
+    ):
+        human_summary = (
+            "*Answer:*\nNot enough verified current opportunity evidence yet.\n\n"
+            "*What is missing:*\nThe candidate surfaced by this run is fixture-only or "
+            "otherwise lacks a direct provider source. Verify the opportunity URL, "
+            "sponsor, active status or deadline, eligibility, and Keystone fit before "
+            "treating the job as complete.\n\n"
+            "No send, post, schedule, or external write was performed."
+        )
     result_route = WorkItemRoute.ORCHESTRATOR if plan_summary else result.route
     artifact_refs = ([plan_artifact] if plan_artifact is not None else []) or result.artifact_refs
     if feedback_callback is not None:
@@ -3942,6 +4011,13 @@ def _manager_loop_missing_stage_blockers(
                 ),
             )
         )
+    current_opportunity_blocker = _manager_loop_current_opportunity_evidence_blocker(
+        request_text=text,
+        result=result,
+        artifact_types=artifact_types,
+    )
+    if current_opportunity_blocker is not None:
+        blockers.append(current_opportunity_blocker)
     if looks_like_send_side_effect(text):
         blockers.append(
             WorkItemBlocker(
@@ -3977,6 +4053,77 @@ def _manager_loop_missing_stage_blockers(
             )
         )
     return blockers
+
+
+def _manager_loop_current_opportunity_evidence_blocker(
+    *,
+    request_text: str,
+    result: WorkflowRunResult,
+    artifact_types: set[str],
+) -> WorkItemBlocker | None:
+    """Reject fixture-only completion for current or active opportunity discovery."""
+
+    retained_opportunity = (
+        "opportunity" in artifact_types or "opportunity_record" in artifact_types
+    )
+    if not retained_opportunity:
+        return None
+    if re.search(
+        r"\b(?:use only|source-provided|supplied|provided|inline)\b[^.\n]{0,160}"
+        r"\b(?:context|evidence|sources?)\b|"
+        r"\b(?:do not|don't|dont|without|no)\b[^.\n]{0,100}"
+        r"\b(?:external|live)\s+(?:search|research)\b",
+        request_text,
+        flags=re.I,
+    ):
+        return None
+    external_context = result.work_item.target.metadata.get("external_context")
+    has_explicit_supplied_opportunity_bundle = bool(
+        isinstance(external_context, dict)
+        and external_context.get("schema") == "keystone.work_item.source_bundle.v1"
+        and external_context.get("supplied_material_only") is True
+        and any(
+            str(source.source_type or "").lower() == "supplied_opportunity"
+            and bool(
+                str(
+                    source.supported_claim
+                    or source.evidence_excerpt
+                    or " ".join(source.key_facts)
+                ).strip()
+            )
+            for source in result.work_item.sources
+        )
+    )
+    if has_explicit_supplied_opportunity_bundle:
+        return None
+    requires_current_provider_evidence = bool(
+        re.search(
+            r"\b(?:active|currently open|current|recent|latest|deadline|sponsor|"
+            r"eligibility|grant|rfp|request for proposals?|call for proposals?)\b",
+            request_text,
+            flags=re.I,
+        )
+    )
+    if not requires_current_provider_evidence:
+        return None
+
+    sources = list(result.work_item.sources)
+    has_real_direct_source = any(
+        str(source.url or "").lower().startswith(("http://", "https://"))
+        and str(source.provider or "").lower() not in {"", "fixture", "dry-run"}
+        and str(source.source_type or "").lower() not in {"fixture", "fixture_fallback"}
+        for source in sources
+    )
+    if has_real_direct_source:
+        return None
+    return WorkItemBlocker(
+        code="manager_loop_current_opportunity_evidence_missing",
+        message=(
+            "The request requires a current or active opportunity, but the completed "
+            "step has no direct non-fixture source. Verify the opportunity URL, sponsor, "
+            "active status or deadline, and eligibility before treating it as usable."
+        ),
+    )
 
 
 def _chief_source_brief_satisfies_research_request(result: WorkflowRunResult) -> bool:
@@ -4056,11 +4203,21 @@ def _manager_loop_requests_opportunity_record(normalized_text: str) -> bool:
 
 
 def _manager_loop_requests_opportunity_assessment(normalized_text: str) -> bool:
+    # A routing/classification question may name an opportunity lane without
+    # asking Opportunity Scout to assess an opportunity. Remove that meta-level
+    # enumeration before applying execution-stage detection.
+    scrubbed = re.sub(
+        r"\b(?:decide|determine|classify|choose)\s+whether\s+(?:this\s+)?request\s+is\b"
+        r"[^.\n;]{0,180}\b(?:work|task|route|lane)\b",
+        " ",
+        normalized_text,
+        flags=re.I,
+    )
     scrubbed = re.sub(
         r"\b(?:do not|don't|dont|never|no|without)\b[^.\n]{0,120}"
         r"\b(?:assess|evaluate|decide|determine)\b[^.\n]{0,160}\bopportunit",
         " ",
-        normalized_text,
+        scrubbed,
         flags=re.I,
     )
     return bool(
@@ -4254,7 +4411,10 @@ def _route_from_manual_plan(
         ) and (mentions_opportunity_scout or not _manager_loop_requests_research(normalized_text)):
             return WorkItemRoute.OPPORTUNITY_SCOUT
         return WorkItemRoute.BUSINESS_RESEARCH_ANALYST
-    if target_agent in _MANUAL_CONTEXT_AGENT_TARGETS:
+    if target_agent in _MANUAL_CONTEXT_AGENT_TARGETS and target_agent not in {
+        WorkItemRoute.RSS_CONTEXT_AGENT.value,
+        WorkItemRoute.PREPRINTS_CONTEXT_AGENT.value,
+    }:
         return WorkItemRoute.CHIEF_OF_STAFF
     try:
         return WorkItemRoute(target_agent)
@@ -4368,8 +4528,13 @@ def _chief_request_should_start_with_chief(request_text: str) -> bool:
         return False
     return bool(
         "agents-as-tools only" in normalized
+        or "agents-as-tools" in normalized
+        or "specialist support" in normalized
+        or "specialist tools" in normalized
         or "advisory specialist" in normalized
         or "advisory context" in normalized
+        or "advisory mode" in normalized
+        or "read/plan advisors" in normalized
         or "read-only advisors" in normalized
         or "read-only advisor" in normalized
         or "use only sanitized inline context" in normalized
@@ -4475,6 +4640,25 @@ def _maybe_synthesize_user_facing_response(
     sdk_session: Any | None,
     store: SQLiteStore | None = None,
 ) -> WorkflowRunResult:
+    if any(
+        blocker.code == "manager_loop_current_opportunity_evidence_missing"
+        for blocker in result.blockers
+    ):
+        return result.model_copy(
+            update={
+                "audit_notes": list(
+                    dict.fromkeys(
+                        [
+                            *result.audit_notes,
+                            (
+                                "Skipped user-facing synthesis because the deterministic "
+                                "current-opportunity evidence blocker is authoritative."
+                            ),
+                        ]
+                    )
+                )
+            }
+        )
     if "Deterministic source-link follow-up summary executed." in result.audit_notes:
         return result.model_copy(
             update={
@@ -5175,6 +5359,13 @@ def _chief_of_staff_artifact_user_facing_summary(
         request_text=request_text,
     )
     if operational_summary:
+        requested_specialist_review = _chief_agents_as_tools_requested_review_lines(
+            request_text
+        )
+        if requested_specialist_review:
+            return operational_summary + "\n\n*Requested specialist review:*\n" + "\n".join(
+                requested_specialist_review
+            )
         return operational_summary
     finance_receipt_write_summary = _chief_finance_tracker_receipt_write_summary(request_text)
     if finance_receipt_write_summary:
@@ -7480,6 +7671,12 @@ def _apply_external_context(
             context,
             context_file_path=context_file_path,
         )
+    if str(context.get("schema") or "") == "keystone.work_item.source_bundle.v1":
+        return _apply_work_item_source_bundle_context(
+            work_item,
+            context,
+            context_file_path=context_file_path,
+        )
     metadata = {
         **work_item.target.metadata,
         "external_context": _bounded_context_metadata(context),
@@ -7489,6 +7686,148 @@ def _apply_external_context(
     return work_item.model_copy(
         update={"target": work_item.target.model_copy(update={"metadata": metadata})}
     ).touch()
+
+
+def _apply_work_item_source_bundle_context(
+    work_item: WorkItem,
+    context: dict[str, Any],
+    *,
+    context_file_path: str,
+) -> WorkItem:
+    """Promote a bounded supplied-material packet into typed WorkItem state."""
+
+    target_payload = context.get("target") if isinstance(context.get("target"), dict) else {}
+    gmail_payload = (
+        context.get("gmail_context")
+        if isinstance(context.get("gmail_context"), dict)
+        else {}
+    )
+    sources = list(work_item.sources)
+    source_by_id = {source.source_id: source for source in sources if source.source_id}
+    raw_sources = context.get("sources")
+    for raw in raw_sources[:12] if isinstance(raw_sources, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        source_id = _compact_context_text(raw.get("source_id"), max_chars=160)
+        if not source_id or source_id in source_by_id:
+            continue
+        source = WorkItemSourceRef(
+            title=_compact_context_text(raw.get("title"), max_chars=240),
+            url=_compact_context_text(raw.get("url"), max_chars=800),
+            source_type=_compact_context_text(raw.get("source_type"), max_chars=80),
+            source_id=source_id,
+            supported_claim=_compact_context_text(raw.get("supported_claim"), max_chars=500),
+            provider=_compact_context_text(raw.get("provider"), max_chars=80),
+            extraction_status=_compact_context_text(
+                raw.get("extraction_status") or "supplied_material",
+                max_chars=80,
+            ),
+            source_quality=_compact_context_text(raw.get("source_quality"), max_chars=80),
+            retrieved_at=_compact_context_text(raw.get("retrieved_at"), max_chars=80),
+            key_facts=_context_string_list(raw.get("key_facts"), max_items=5, max_chars=500),
+            evidence_excerpt=_compact_context_text(raw.get("evidence_excerpt"), max_chars=1200),
+        )
+        sources.append(source)
+        source_by_id[source_id] = source
+
+    facts = list(work_item.facts)
+    existing_fact_keys = {fact.key for fact in facts}
+    raw_facts = context.get("facts")
+    for raw in raw_facts[:12] if isinstance(raw_facts, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        key = _compact_context_text(raw.get("key"), max_chars=120)
+        value = _compact_context_text(raw.get("value"), max_chars=800)
+        if not key or not value or key in existing_fact_keys:
+            continue
+        refs = [
+            source_by_id[source_id]
+            for source_id in _context_string_list(
+                raw.get("source_ids"), max_items=6, max_chars=160
+            )
+            if source_id in source_by_id
+        ]
+        confidence = raw.get("confidence", 0.0)
+        try:
+            confidence_value = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        facts.append(
+            WorkItemFact(
+                key=key,
+                value=value,
+                confidence=confidence_value,
+                source_refs=refs,
+                approval_state=_source_bundle_fact_approval_state(
+                    raw.get("approval_state")
+                ),
+            )
+        )
+        existing_fact_keys.add(key)
+
+    metadata = {
+        **work_item.target.metadata,
+        "external_context": {
+            "schema": "keystone.work_item.source_bundle.v1",
+            "source_count": len(sources),
+            "fact_count": len(facts),
+            "supplied_material_only": bool(context.get("supplied_material_only", True)),
+        },
+    }
+    for key, limit in (
+        ("thread_id", 160),
+        ("message_id", 160),
+        ("sender", 240),
+        ("thread_summary", 1200),
+        ("prior_reply_context", 1200),
+        ("reply_objective", 800),
+    ):
+        value = _compact_context_text(gmail_payload.get(key), max_chars=limit)
+        if value:
+            metadata[key] = value
+    if context_file_path:
+        metadata["external_context_file_path"] = context_file_path
+    target = work_item.target.model_copy(
+        update={
+            "name": _compact_context_text(target_payload.get("name"), max_chars=240)
+            or work_item.target.name,
+            "url": _compact_context_text(target_payload.get("url"), max_chars=800)
+            or work_item.target.url,
+            "email": _compact_context_text(target_payload.get("email"), max_chars=320)
+            or work_item.target.email,
+            "object_type": _compact_context_text(
+                target_payload.get("object_type"), max_chars=80
+            )
+            or work_item.target.object_type,
+            "external_id": _compact_context_text(
+                target_payload.get("external_id"), max_chars=160
+            )
+            or work_item.target.external_id,
+            "metadata": metadata,
+        }
+    )
+    note = (
+        f"Supplied-material context promoted into typed WorkItem state: "
+        f"{len(sources)} source(s), {len(facts)} fact(s); no provider write performed."
+    )
+    return work_item.model_copy(
+        update={
+            "target": target,
+            "sources": sources,
+            "facts": facts,
+            "audit_notes": [*work_item.audit_notes, note],
+        }
+    ).touch()
+
+
+def _source_bundle_fact_approval_state(value: object) -> str:
+    requested = _compact_context_text(value, max_chars=80)
+    allowed = {
+        ApprovalState.PENDING.value,
+        ApprovalState.APPROVED_FOR_RESEARCH.value,
+        ApprovalState.APPROVED_FOR_DRAFTING.value,
+    }
+    return requested if requested in allowed else ApprovalState.PENDING.value
 
 
 def _apply_slack_selected_context(
@@ -8117,7 +8456,9 @@ def _advance_gmail_triage(
 ) -> WorkflowRunResult:
     effective_request_text = _effective_work_item_request_text(request, work_item)
     gmail_plan = infer_gmail_execution_plan(effective_request_text, source="work_item")
-    inline_fixture = _inline_gmail_fixture_from_request(effective_request_text)
+    inline_fixture = _inline_gmail_fixture_from_request(
+        effective_request_text
+    ) or _gmail_fixture_from_work_item_context(work_item)
     metadata = {
         **work_item.target.metadata,
         "gmail_execution_plan": gmail_plan.model_dump(mode="json"),
@@ -8129,11 +8470,19 @@ def _advance_gmail_triage(
             "target": work_item.target.model_copy(update={"metadata": metadata}),
         }
     )
+    if gmail_plan.operation == "style_profile":
+        return _advance_gmail_style_profile_fixture(
+            work_item,
+            request=request,
+            store=store,
+            gmail_plan=gmail_plan,
+        )
     if inline_fixture is not None and _gmail_plan_allows_inline_read_only_triage(gmail_plan):
         triage = triage_email_fixture(inline_fixture)
         research_requested = _manager_loop_requests_research(effective_request_text)
         gmail_research_target = (
-            _gmail_sender_organization(triage.sender_name, triage.sender_email)
+            _source_bundle_company_target(work_item)
+            or _gmail_sender_organization(triage.sender_name, triage.sender_email)
             if research_requested
             else ""
         )
@@ -8555,8 +8904,664 @@ def _try_live_gmail_thread_retrieval(
         artifact_refs=[artifact],
         next_action=updated.next_action,
         human_summary=_format_gmail_thread_summary_work_item_summary(selected, query=query),
+            audit_notes=updated.audit_notes[-1:],
+        )
+
+
+def _advance_gmail_style_profile_fixture(
+    work_item: WorkItem,
+    *,
+    request: WorkflowRunRequest,
+    store: SQLiteStore | None,
+    gmail_plan: Any,
+) -> WorkflowRunResult:
+    if request.live_sdk:
+        blocker = WorkItemBlocker(
+            code="gmail_sent_style_live_read_requires_dedicated_execution",
+            message=(
+                "Live sent-mail style sampling must use the dedicated bounded Gmail SENT "
+                "reader so raw bodies remain transient and request receipts stay auditable."
+            ),
+        )
+        return _blocked_result(
+            work_item,
+            (blocker,),
+            WorkItemNextAction(
+                action="run_bounded_gmail_sent_style_profile",
+                agent=WorkItemRoute.GMAIL_TRIAGE,
+                description=(
+                    "Run the dedicated SENT sampler for at most the planned message count, "
+                    "then review the aggregate profile before drafting use."
+                ),
+            ),
+            store=store,
+            route=WorkItemRoute.GMAIL_TRIAGE,
+        )
+    if store is None:
+        blocker = WorkItemBlocker(
+            code="gmail_style_profile_requires_saved_work_item",
+            message="Email style profiles require saved local review and approval records.",
+        )
+        return _blocked_result(
+            work_item,
+            (blocker,),
+            WorkItemNextAction(
+                action="save_style_profile_work_item",
+                agent=WorkItemRoute.GMAIL_TRIAGE,
+                description="Enable local WorkItem storage, then rerun the style-profile task.",
+            ),
+            store=store,
+            route=WorkItemRoute.GMAIL_TRIAGE,
+        )
+
+    samples = load_sent_email_style_samples_fixture("sample_sent_email_style_messages")
+    samples = samples[: max(1, min(int(gmail_plan.max_messages), 5))]
+    profile_id = f"sent-style-{work_item.id}"
+    build_result = build_email_style_profile_from_samples(
+        samples,
+        profile_id=profile_id,
+        source="fixture",
+        source_id="fixture:sample_sent_email_style_messages",
+        source_url="fixture://sample_sent_email_style_messages.json",
+        approval_state=ApprovalState.PENDING,
+    )
+    profile_row_id = str(store.save_email_style_profile(build_result.profile))
+    approval_item = build_approval_queue_item(
+        build_result.profile,
+        context={
+            "object_type": "email_style_profile",
+            "object_id": profile_id,
+            "source_agent": WorkItemRoute.GMAIL_TRIAGE.value,
+            "scope": ApprovalScope.DRAFTING.value,
+            "decision": ApprovalState.PENDING.value,
+            "title": "Review aggregate sent-email style profile",
+            "summary": (
+                f"Review aggregate style inferred from {build_result.usable_sample_count} "
+                "safe synthetic sent-email samples before drafting use."
+            ),
+            "draft_text": "",
+        },
+    )
+    store.save_approval_item(approval_item)
+    artifact = WorkItemArtifactRef(
+        artifact_type="email_style_profile",
+        artifact_id=profile_row_id,
+        source_agent=WorkItemRoute.GMAIL_TRIAGE.value,
+        approval_state=ApprovalState.PENDING.value,
+        title="Aggregate sent-email style profile",
+        summary=(
+            f"{build_result.usable_sample_count} safe samples; approval required before use."
+        ),
+        selected=True,
+        metadata={
+            "profile_id": profile_id,
+            "approval_queue_id": approval_item.id,
+            "sample_count": build_result.sample_count,
+            "usable_sample_count": build_result.usable_sample_count,
+            "excluded_sample_count": build_result.excluded_sample_count,
+            "source_label": "SENT",
+            "raw_sent_email_bodies_included": False,
+            "send_enabled": False,
+            "external_write_performed": False,
+        },
+    )
+    updated = attach_artifact(work_item, artifact)
+    updated = updated.model_copy(
+        update={
+            "status": WorkItemStatus.NEEDS_APPROVAL,
+            "approval_gates": [
+                *updated.approval_gates,
+                WorkItemApprovalGate(
+                    scope=ApprovalScope.DRAFTING.value,
+                    state=ApprovalState.PENDING.value,
+                    required=True,
+                    rationale=(
+                        "Aggregate sent-email style profile requires human approval before "
+                        "it may influence Gmail or Outreach drafts."
+                    ),
+                    approval_id=approval_item.id,
+                ),
+            ],
+            "next_action": WorkItemNextAction(
+                action="review_email_style_profile",
+                agent=WorkItemRoute.GMAIL_TRIAGE,
+                description="Review and approve or reject the aggregate style profile.",
+                requires_approval=True,
+            ),
+            "audit_notes": [
+                *updated.audit_notes,
+                (
+                    "Built a pending aggregate email style profile from synthetic SENT "
+                    "samples; raw bodies were not persisted and no provider write occurred."
+                ),
+            ],
+        }
+    ).touch()
+    _persist_artifact_and_event(
+        updated,
+        artifact,
+        summary="Attached pending aggregate email style profile for human review.",
+        store=store,
+    )
+    return WorkflowRunResult(
+        work_item=updated,
+        route=WorkItemRoute.GMAIL_TRIAGE,
+        status=updated.status,
+        advanced=True,
+        artifact_refs=[artifact],
+        next_action=updated.next_action,
+        human_summary=(
+            "Built a redacted aggregate style profile from synthetic sent-email samples. "
+            "It remains pending and cannot influence drafts until human approval. No raw "
+            "sent bodies were stored and no email was sent or created."
+        ),
         audit_notes=updated.audit_notes[-1:],
     )
+
+
+def _advance_announcement_context_agent(
+    work_item: WorkItem,
+    *,
+    request: WorkflowRunRequest,
+    store: SQLiteStore | None,
+    route: WorkItemRoute,
+) -> WorkflowRunResult:
+    kind = "preprints" if route == WorkItemRoute.PREPRINTS_CONTEXT_AGENT else "rss"
+    load_settings(force_dotenv=True)
+    desired_count = min(_effective_max_results(request), 8)
+    retrieval = retrieve_announcement_feed_history_impl(
+        "",
+        kind=kind,
+        selected_only=None,
+        limit=min(25, max(desired_count * 5, 10)),
+        live_rss_slack=kind == "rss" and request.live_rss_slack_read,
+    )
+    items = [item for item in retrieval.get("items", []) if isinstance(item, dict)]
+    ranked = _rank_announcement_context_items(
+        items,
+        request_text=request.request_text or work_item.request_text,
+        kind=kind,
+    )[:desired_count]
+    if not ranked:
+        blocker = WorkItemBlocker(
+            code=f"{kind}_context_items_not_found",
+            message=(
+                f"No bounded {kind} context items matched the natural-language request. "
+                "No post, feed mutation, or external write occurred."
+            ),
+        )
+        return _blocked_result(
+            work_item,
+            (blocker,),
+            WorkItemNextAction(
+                action=f"refresh_{kind}_context_source",
+                agent=route,
+                description=f"Refresh or reconnect the read-only {kind} context source.",
+            ),
+            store=store,
+            route=route,
+            audit_notes=[f"Read-only {kind} context retrieval returned no usable items."],
+        )
+
+    articles = [_historical_feed_context_item(item, kind=kind) for item in ranked]
+    sources = [_announcement_work_item_source(item, kind=kind) for item in ranked]
+    context_sources = [
+        OperationalContextSource(
+            source_id=source.source_id,
+            title=source.title,
+            source_type=source.source_type,
+            location=source.url,
+            note=source.supported_claim,
+        )
+        for source in sources
+    ]
+    insights = _announcement_context_insights(articles, kind=kind)
+    result_type = PreprintsContextResult if kind == "preprints" else RssContextResult
+    context_result = result_type(
+        mode="deterministic",
+        summary=(
+            f"Retrieved and ranked {len(articles)} bounded {kind} items for the operator's "
+            "request. Items remain read-only and source-linked."
+        ),
+        query=request.request_text or work_item.request_text,
+        retrieved_item_ids=[article.feed_item_id for article in articles],
+        articles=articles,
+        frontier_summary=(
+            "Preprints are preliminary evidence and require item-level validation before "
+            "clinical or external use."
+            if kind == "preprints"
+            else "RSS items are monitoring signals and require source review before action."
+        ),
+        recurring_themes=_announcement_context_themes(articles),
+        research_frontiers=insights["research_frontiers"],
+        clinical_translation_signals=insights["clinical_translation_signals"],
+        market_or_partnership_signals=insights["market_or_partnership_signals"],
+        evidence_gaps=[
+            (
+                "Preprint ranking uses stored metadata and summaries; methods and findings "
+                "were not independently validated in this read-only pass."
+                if kind == "preprints"
+                else "RSS ranking uses stored announcement metadata; linked claims need review."
+            )
+        ],
+        opportunity_signals=insights["opportunity_signals"],
+        future_directions=insights["future_directions"],
+        monitoring_queries=insights["monitoring_queries"],
+        recommended_actions=[
+            "Review the linked sources before relying on factual claims.",
+            *insights["recommended_actions"],
+            "Keep this result read-only; no Slack post or source mutation is authorized.",
+        ],
+        approval_needs=["Separate approval is required before posting or creating artifacts."],
+        human_work_context=HumanWorkContext(
+            work_functions=["research monitoring", "evidence triage"],
+            human_owner_hint="Chief of Staff",
+            decision_needed="Select which source, if any, warrants deeper review.",
+            handoff_ready_context=["ranked item ids", "source URLs", "evidence caveats"],
+            missing_context=["full item-level validation"],
+            integration_surfaces=[kind],
+            follow_up_actions=["review selected source", "request deeper research if needed"],
+        ),
+        sources=context_sources,
+        diagnostics=[
+            OperationalContextEntry(key="provider_status", value=str(retrieval.get("status"))),
+            OperationalContextEntry(key="item_count", value=str(len(items))),
+            OperationalContextEntry(key="selected_count", value=str(len(articles))),
+            OperationalContextEntry(key="openai_requests", value="0"),
+        ],
+    )
+    output = context_result.model_dump(mode="json")
+    artifact_id = ""
+    if store is not None:
+        artifact_id = str(
+            store.save_agent_run(
+                agent_name=route.value,
+                input_payload={
+                    "request_text": request.request_text,
+                    "kind": kind,
+                    "desired_count": desired_count,
+                },
+                input_summary=(request.request_text or work_item.request_text)[:240],
+                output=output,
+                model="deterministic-provider-read",
+                dry_run=False,
+                status="success",
+            )
+        )
+    artifact = WorkItemArtifactRef(
+        artifact_type=f"{kind}_context",
+        artifact_id=artifact_id or f"unsaved:{work_item.id}:{kind}_context",
+        source_agent=route.value,
+        approval_state=ApprovalState.APPROVED_FOR_RESEARCH.value,
+        title=f"Ranked {kind} context",
+        summary=context_result.summary[:240],
+        selected=True,
+        metadata={
+            "output_type": type(context_result).__name__,
+            "item_count": len(articles),
+            "source_ids": context_result.retrieved_item_ids,
+            "source_urls": [article.url for article in articles if article.url],
+            "preliminary_evidence": kind == "preprints",
+            "recurring_themes": context_result.recurring_themes,
+            "opportunity_signals": context_result.opportunity_signals,
+            "research_frontiers": context_result.research_frontiers,
+            "downstream_handoffs": _announcement_context_handoffs(
+                context_result,
+                kind=kind,
+            ),
+            "send_enabled": False,
+            "slack_posted": False,
+            "external_write_performed": False,
+            "openai_requests": 0,
+        },
+    )
+    updated = attach_artifact(
+        work_item.model_copy(
+            update={
+                "status": WorkItemStatus.DONE,
+                "last_agent": route.value,
+                "sources": _merge_source_refs(work_item.sources, sources),
+                "next_action": WorkItemNextAction(
+                    action=f"review_ranked_{kind}",
+                    agent=route,
+                    description=f"Review the ranked {kind} sources and caveats.",
+                ),
+                "audit_notes": [
+                    *work_item.audit_notes,
+                    (
+                        f"{route.value} executed a bounded read-only provider/context read; "
+                        "zero OpenAI requests and no post or mutation occurred."
+                    ),
+                ],
+            }
+        ).touch(),
+        artifact,
+    )
+    _persist_artifact_and_event(
+        updated,
+        artifact,
+        summary=f"Attached ranked read-only {kind} context.",
+        store=store,
+    )
+    return WorkflowRunResult(
+        work_item=updated,
+        route=route,
+        status=updated.status,
+        advanced=True,
+        artifact_refs=[artifact],
+        next_action=updated.next_action,
+        human_summary=_announcement_context_human_summary(context_result, kind=kind),
+        audit_notes=updated.audit_notes[-1:],
+    )
+
+
+def _rank_announcement_context_items(
+    items: list[dict[str, Any]],
+    *,
+    request_text: str,
+    kind: str,
+) -> list[dict[str, Any]]:
+    stop = {
+        "and", "anything", "clearly", "each", "find", "from", "into", "link",
+        "modify", "post", "recent", "relevant", "source", "that", "them", "three",
+    }
+    terms = {
+        term
+        for term in re.findall(r"[a-z0-9]+", request_text.lower())
+        if len(term) >= 3 and term not in stop
+    }
+
+    def score(item: dict[str, Any]) -> tuple[int, int, str]:
+        searchable = " ".join(
+            str(item.get(key) or "") for key in ("title", "summary", "tags", "source")
+        ).lower()
+        overlap = sum(1 for term in terms if term in searchable)
+        domain_score = sum(
+            weight
+            for phrase, weight in _KEYSTONE_ANNOUNCEMENT_RELEVANCE_WEIGHTS.items()
+            if phrase in searchable
+        )
+        if kind == "preprints" and "psychiatr" in searchable:
+            domain_score += 3
+        return overlap + domain_score, domain_score, str(item.get("published_at") or "")
+
+    ranked = sorted(items, key=score, reverse=True)
+    deduplicated: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in ranked:
+        title_key = re.sub(r"[^a-z0-9]+", " ", str(item.get("title") or "").lower()).strip()
+        url_key = re.sub(
+            r"(?:/v\d+|[?&](?:version|revision)=\d+)(?:$|[&#/])",
+            "",
+            str(item.get("url") or "").lower().rstrip("/"),
+        )
+        identity = title_key or url_key or str(item.get("feed_item_id") or "")
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduplicated.append(item)
+    return deduplicated
+
+
+_KEYSTONE_ANNOUNCEMENT_RELEVANCE_WEIGHTS = {
+    "clinical ai": 8,
+    "healthcare ai": 7,
+    "mental healthcare": 7,
+    "behavioral health": 7,
+    "digital mental health": 7,
+    "software as a medical device": 6,
+    "artificial intelligence": 4,
+    "llm": 4,
+    "psychiatr": 4,
+    "addiction": 4,
+    "depression": 4,
+    "adhd": 4,
+    "implementation": 3,
+    "reliability": 3,
+    "governance": 3,
+    "funding": 2,
+    "clinical workflow": 2,
+}
+
+
+def _keystone_announcement_relevance_signals(item: dict[str, Any]) -> list[str]:
+    searchable = " ".join(
+        str(item.get(key) or "") for key in ("title", "summary", "tags", "source")
+    ).lower()
+    labels = {
+        "clinical AI": ("clinical ai", "healthcare ai", "artificial intelligence", "llm"),
+        "behavioral or mental health": (
+            "behavioral health",
+            "mental health",
+            "psychiatr",
+            "adhd",
+            "addiction",
+            "depression",
+        ),
+        "implementation or governance": ("implementation", "reliability", "governance"),
+        "funding or market activity": ("funding", "raises", "investment"),
+    }
+    return [label for label, phrases in labels.items() if any(p in searchable for p in phrases)]
+
+
+def _historical_feed_context_item(
+    item: dict[str, Any],
+    *,
+    kind: str,
+) -> HistoricalFeedContextItem:
+    summary = str(item.get("summary") or item.get("detailed_summary_seed") or "")
+    relevance_signals = _keystone_announcement_relevance_signals(item)
+    return HistoricalFeedContextItem(
+        feed_item_id=str(item.get("feed_item_id") or ""),
+        title=str(item.get("title") or ""),
+        url=str(item.get("url") or ""),
+        source=str(item.get("source") or ""),
+        feed=str(item.get("feed") or kind),
+        published_at=str(item.get("published_at") or ""),
+        tags=[str(value) for value in item.get("tags", []) if str(value).strip()],
+        selected=bool(item.get("selected")),
+        relevance_status=str(item.get("relevance_status") or "ranked"),
+        selection_reason=str(item.get("selection_reason") or "Ranked for request relevance."),
+        summary=summary,
+        detailed_summary=str(item.get("detailed_summary_seed") or summary),
+        source_basis=str(item.get("source_basis") or ""),
+        key_findings=[summary[:500]] if summary else [],
+        limitations=(
+            ["Preliminary preprint evidence; not peer-reviewed or independently validated here."]
+            if kind == "preprints"
+            else ["Announcement signal; linked claims were not independently validated here."]
+        ),
+        relevance_to_psychiatry=(
+            "Ranked against the operator's psychiatry or clinical-AI terms."
+            if kind == "preprints"
+            else ""
+        ),
+        relevance_to_keystone=(
+            f"Relevant to Keystone's {', '.join(relevance_signals)} work."
+            if relevance_signals
+            else "Candidate for Keystone evidence monitoring and deeper review."
+        ),
+        frontier_signal="Preliminary research signal." if kind == "preprints" else "Monitoring signal.",
+        evidence_status=str(item.get("evidence_status") or "metadata_only"),
+        publication_ids=[
+            str(value) for value in item.get("publication_ids", []) if str(value).strip()
+        ],
+        evidence_notes=[
+            str(value) for value in item.get("evidence_notes", []) if str(value).strip()
+        ],
+        slack_link=str(item.get("slack_link") or ""),
+    )
+
+
+def _announcement_work_item_source(item: dict[str, Any], *, kind: str) -> WorkItemSourceRef:
+    source_id = str(item.get("feed_item_id") or "")
+    return WorkItemSourceRef(
+        title=str(item.get("title") or ""),
+        url=str(item.get("url") or ""),
+        source_type=f"{kind}_context_item",
+        source_id=source_id,
+        supported_claim=(
+            "Stored preprint candidate supplied for preliminary evidence review."
+            if kind == "preprints"
+            else "Stored RSS announcement supplied as a monitoring signal."
+        ),
+        provider=str(item.get("source") or kind),
+        extraction_status=str(item.get("evidence_status") or "metadata_only"),
+        retrieved_at=utc_now_iso(),
+        key_facts=[str(item.get("summary") or "")[:500]] if item.get("summary") else [],
+    )
+
+
+def _merge_source_refs(
+    existing: list[WorkItemSourceRef],
+    additions: list[WorkItemSourceRef],
+) -> list[WorkItemSourceRef]:
+    merged = list(existing)
+    keys = {(source.source_id, source.url) for source in merged}
+    for source in additions:
+        key = (source.source_id, source.url)
+        if key not in keys:
+            merged.append(source)
+            keys.add(key)
+    return merged
+
+
+def _announcement_context_themes(articles: list[HistoricalFeedContextItem]) -> list[str]:
+    values = [tag for article in articles for tag in article.tags]
+    return list(dict.fromkeys(values))[:8]
+
+
+def _announcement_context_insights(
+    articles: list[HistoricalFeedContextItem],
+    *,
+    kind: str,
+) -> dict[str, list[str]]:
+    """Build source-linked decision context without inventing claims beyond records."""
+
+    themes = _announcement_context_themes(articles)
+    clinical = [
+        f"{article.title}: {article.relevance_to_keystone}"
+        for article in articles
+        if any(
+            marker in " ".join([article.title, article.summary, *article.tags]).lower()
+            for marker in ("clinical", "behavioral", "mental", "psychiatr", "implementation")
+        )
+    ][:5]
+    market = [
+        f"{article.title}: review as a bounded market or partnership signal."
+        for article in articles
+        if any(
+            marker in " ".join([article.title, article.summary, *article.tags]).lower()
+            for marker in ("funding", "partnership", "market", "implementation", "deployment")
+        )
+    ][:5]
+    opportunity = [
+        f"Review {article.title} for a Keystone research, evaluation, or advisory implication; "
+        f"retain source {article.feed_item_id} and validate the linked source first."
+        for article in articles[:3]
+    ]
+    research_frontiers = (
+        [
+            f"Validate methods, sample, comparison, and publication status for "
+            f"{article.title} before synthesis."
+            for article in articles[:3]
+        ]
+        if kind == "preprints"
+        else [
+            f"Determine whether {article.title} remains current using its linked source."
+            for article in articles[:3]
+        ]
+    )
+    future = [
+        f"Track {theme} across future {kind} records and compare changes against this source set."
+        for theme in themes[:4]
+    ] or [f"Refresh the bounded {kind} source set before the next decision cycle."]
+    monitoring = [f'"{theme}" clinical AI behavioral health' for theme in themes[:4]]
+    actions = [
+        "Pass the selected source IDs and caveats to Business Research for item-level validation.",
+        "Pass only validated implications to Opportunity Scout for fit and actionability review.",
+    ]
+    return {
+        "research_frontiers": research_frontiers,
+        "clinical_translation_signals": clinical,
+        "market_or_partnership_signals": market,
+        "opportunity_signals": opportunity,
+        "future_directions": future,
+        "monitoring_queries": monitoring,
+        "recommended_actions": actions,
+    }
+
+
+def _announcement_context_handoffs(context_result: Any, *, kind: str) -> list[dict[str, Any]]:
+    source_ids = list(context_result.retrieved_item_ids)
+    return [
+        {
+            "agent": WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+            "purpose": "Validate selected items and synthesize source-backed findings.",
+            "source_ids": source_ids,
+            "required_caveat": (
+                "Treat preprints as preliminary until methods and publication status are checked."
+                if kind == "preprints"
+                else "Treat RSS records as monitoring signals until linked claims are refreshed."
+            ),
+        },
+        {
+            "agent": WorkItemRoute.OPPORTUNITY_SCOUT.value,
+            "purpose": "Assess validated signals for Keystone fit and actionability.",
+            "source_ids": source_ids,
+            "required_caveat": "Do not convert unvalidated source summaries into opportunity facts.",
+        },
+    ]
+
+
+def _announcement_context_human_summary(context_result: Any, *, kind: str) -> str:
+    lines = [f"Ranked {kind} context", "", "*Answer:*"]
+    for index, article in enumerate(context_result.articles, start=1):
+        if kind == "preprints":
+            caveat = "Preliminary evidence. "
+        else:
+            published = f" Published: {article.published_at}." if article.published_at else ""
+            caveat = (
+                "Stored monitoring signal; current status is not independently verified."
+                f"{published} "
+            )
+        lines.append(
+            f"{index}. {article.title} - {caveat}{article.relevance_to_keystone} "
+            f"{article.url}".strip()
+        )
+    if context_result.recurring_themes:
+        lines.extend(
+            [
+                "",
+                "*Themes:*",
+                *[f"* {theme}" for theme in context_result.recurring_themes[:6]],
+            ]
+        )
+    if context_result.opportunity_signals:
+        lines.extend(
+            [
+                "",
+                "*Research and opportunity implications:*",
+                *[f"* {signal}" for signal in context_result.opportunity_signals[:3]],
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "*Downstream handoff:*",
+            "* Business Research: validate selected sources and synthesize item-level findings.",
+            "* Opportunity Scout: use only validated implications for fit and actionability.",
+        ]
+    )
+    lines.extend(
+        [
+            "",
+            "*Review notes:*",
+            "* Read-only provider/context retrieval; zero OpenAI requests.",
+            "* No Slack post, feed update, file creation, or external mutation occurred.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _gmail_thread_research_target(summary: GmailThreadSummaryResult) -> str:
@@ -8871,6 +9876,52 @@ def _inline_gmail_fixture_from_request(request_text: str) -> EmailFixture | None
         thread_id="inline-read-only-thread",
         snippet=body[:240],
     )
+
+
+def _gmail_fixture_from_work_item_context(work_item: WorkItem) -> EmailFixture | None:
+    """Adapt a typed supplied Gmail packet without requiring prompt duplication."""
+
+    metadata = work_item.target.metadata
+    external_context = metadata.get("external_context")
+    if not isinstance(external_context, dict) or external_context.get("schema") != (
+        "keystone.work_item.source_bundle.v1"
+    ):
+        return None
+    thread_summary = " ".join(str(metadata.get("thread_summary") or "").split())
+    sender = " ".join(str(metadata.get("sender") or "").split())
+    message_id = str(metadata.get("message_id") or "").strip()
+    thread_id = str(metadata.get("thread_id") or "").strip()
+    if not thread_summary or not sender or not message_id or not thread_id:
+        return None
+    prior_reply = " ".join(str(metadata.get("prior_reply_context") or "").split())
+    reply_objective = " ".join(str(metadata.get("reply_objective") or "").split())
+    body_parts = [thread_summary]
+    if prior_reply:
+        body_parts.append(f"Prior reply context: {prior_reply}")
+    if reply_objective:
+        body_parts.append(f"Reply objective: {reply_objective}")
+    body = " ".join(body_parts)
+    parsed_name, parsed_email = parseaddr(sender)
+    return EmailFixture(
+        subject=f"Supplied thread context: {work_item.target.name or 'selected sender'}",
+        body=body,
+        sender_name=(parsed_name or sender).strip(" .,:;"),
+        sender_email=(parsed_email or work_item.target.email).strip(),
+        message_id=message_id,
+        thread_id=thread_id,
+        snippet=thread_summary[:240],
+    )
+
+
+def _source_bundle_company_target(work_item: WorkItem) -> str:
+    external_context = work_item.target.metadata.get("external_context")
+    if not isinstance(external_context, dict) or external_context.get("schema") != (
+        "keystone.work_item.source_bundle.v1"
+    ):
+        return ""
+    if str(work_item.target.object_type or "").strip().lower() != "company":
+        return ""
+    return " ".join(str(work_item.target.name or "").split())
 
 
 def _extract_inline_email_field(
@@ -9362,7 +10413,9 @@ def _advance_chief_of_staff(
             description=("Review the Chief of Staff plan before any live internal write or post."),
             requires_approval=bool(
                 output.approval_required
+                and not _chief_request_should_start_with_chief(request_text)
                 and not _chief_context_agent_advisory_summary(request_text)
+                and not _chief_multi_source_portfolio_summary_request(request_text)
             ),
         )
     status = WorkItemStatus.IN_PROGRESS if delegated_agent else WorkItemStatus.DONE
@@ -10336,6 +11389,8 @@ def _chief_of_staff_delegated_next_agent(
     )
     if recommended_route is not None:
         return recommended_route
+    if _chief_multi_source_portfolio_summary_request(request_text):
+        return None
     if _chief_positive_gmail_intent(lower):
         return WorkItemRoute.GMAIL_TRIAGE
     if _chief_positive_business_research_intent(lower, request_text=request_text):
@@ -10376,6 +11431,28 @@ def _chief_positive_gmail_intent(lower: str) -> bool:
     return bool(re.search(r"\b(?:gmail|email|inbox)\b", lower) and re.search(
         r"\b(?:read|find|search|summarize|summary|draft|reply)\b", lower
     ))
+
+
+def _chief_multi_source_portfolio_summary_request(request_text: str) -> bool:
+    normalized = " ".join(str(request_text or "").lower().split())
+    if not re.search(
+        r"\b(?:weekly|daily|today(?:'s)?|portfolio|operations?|ops)\b",
+        normalized,
+    ):
+        return False
+    if not re.search(
+        r"\b(?:summary|brief|review|prioriti[sz]e|top\s+(?:three|3)|needs?\s+attention)\b",
+        normalized,
+    ):
+        return False
+    source_markers = (
+        r"\bslack\b",
+        r"\b(?:gmail|email|inbox)\b",
+        r"\bwork\s*items?\b",
+        r"\bairtable\b",
+        r"\bcalendar\b",
+    )
+    return sum(bool(re.search(pattern, normalized)) for pattern in source_markers) >= 2
 
 
 def _chief_positive_business_research_intent(lower: str, *, request_text: str) -> bool:
@@ -10675,6 +11752,18 @@ def _advance_research(
     if not ready.ready:
         return _blocked_result(work_item, ready.blockers, ready.next_action, store=store)
 
+    # Source-provided research owns interpretation of supplied excerpts and
+    # matrices. It must run before generic comparison/multi-target detection,
+    # which can otherwise mistake requested sections or inline entities for a
+    # discovery task and discard the supplied evidence contract.
+    if _is_source_provided_business_research_request(work_item, request_text):
+        return _source_provided_business_research_result(
+            work_item,
+            request=request,
+            target=target,
+            store=store,
+        )
+
     comparison_names = _comparison_company_names(request.request_text or work_item.request_text)
     if comparison_names is not None:
         return _advance_company_comparison_research(
@@ -10700,14 +11789,6 @@ def _advance_research(
             request=request,
             target=target,
             manual_plan=manual_plan,
-            store=store,
-        )
-
-    if _is_source_provided_business_research_request(work_item, request_text):
-        return _source_provided_business_research_result(
-            work_item,
-            request=request,
-            target=target,
             store=store,
         )
 
@@ -11012,7 +12093,7 @@ def _request_forbids_live_research(text: str) -> bool:
         re.search(
             r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\b"
             r"[^.;\n]{0,180}\b"
-            r"(?:web\s+search|live\s+web|external\s+(?:search|research|tools?)|"
+            r"(?:(?:web\s+)?search|live\s+web|external\s+(?:search|research|tools?)|"
             r"browser\s+automation|research\s+externally)\b",
             normalized,
         )
@@ -14584,14 +15665,14 @@ def _advance_outreach(
         except (KeyError, TypeError, ValueError):
             opportunity_record = None
 
-    draft, draft_audit_note = _compose_outreach_draft_for_work_item(
+    draft, draft_audit_note, sdk_usage_event = _compose_outreach_draft_for_work_item(
         company_profile=company_profile,
         opportunity_record=opportunity_record,
         request=request,
         work_item=work_item,
     )
     draft_audit_notes = [draft_audit_note]
-    if request.live_sdk:
+    if request.live_sdk and "live SDK draft created" in draft_audit_note:
         draft_audit_notes.append("Live user-facing response synthesis executed.")
     draft_id = str(store.save_outreach_draft(draft))
     approval_item = build_approval_queue_item(
@@ -14664,6 +15745,18 @@ def _advance_outreach(
         summary=f"Attached outreach draft for {company_profile.name}.",
         store=store,
     )
+    if sdk_usage_event is not None:
+        _record_workflow_sdk_cost_event(
+            work_item,
+            event_type="workflow_sdk_usage",
+            summary="Recorded Outreach Composer SDK usage.",
+            agent_name=WorkItemRoute.OUTREACH_COMPOSER.value,
+            usage=sdk_usage_event.get("usage"),
+            cost=sdk_usage_event.get("cost"),
+            request_cache=sdk_usage_event.get("request_cache"),
+            store=store,
+            run_stage="work_item_outreach_composer",
+        )
     return WorkflowRunResult(
         work_item=work_item,
         route=WorkItemRoute.OUTREACH_COMPOSER,
@@ -14810,7 +15903,9 @@ def _request_allows_thread_local_outreach_draft(
     """Allow local Slack-thread draft artifacts without external-use approval."""
 
     text = str(request.request_text or "")
-    if looks_like_thread_local_draft_request(text):
+    if looks_like_thread_local_draft_request(text) or _request_is_thread_local_outreach_revision(
+        text
+    ):
         return True
     if not _request_has_slack_context(request, store=store, work_item=work_item):
         return False
@@ -14830,6 +15925,22 @@ def _request_allows_thread_local_outreach_draft(
     if _request_demands_external_outreach_side_effect(normalized):
         return False
     return True
+
+
+def _request_is_thread_local_outreach_revision(text: str) -> bool:
+    """Recognize a bounded revision of operator-supplied draft text and facts."""
+
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized or "draft:" not in normalized:
+        return False
+    if not re.search(
+        r"\b(?:revise|rewrite|edit|shorten|shorter|warmer|friendlier|less\s+salesy)\b",
+        normalized,
+    ):
+        return False
+    if not re.search(r"\b(?:approved\s+facts?|source[- ]backed|same\s+facts)\b", normalized):
+        return False
+    return not _request_demands_external_outreach_side_effect(normalized)
 
 
 def _request_demands_external_outreach_side_effect(normalized: str) -> bool:
@@ -14943,6 +16054,34 @@ def _advance_thread_local_outreach_draft(
     boundary_summary = "Slack-thread-only draft; no Gmail draft created and no send performed."
     recipient_email = _gmail_thread_recipient_email_address(gmail_thread_context)
     draft_id = str(store.save_outreach_draft(draft))
+    gmail_draft_requested = _request_explicitly_requests_gmail_draft(request.request_text)
+    approval_item = None
+    if gmail_draft_requested and recipient_email:
+        approval_item = build_approval_queue_item(
+            draft,
+            context={
+                "object_type": "outreach_draft",
+                "object_id": draft_id,
+                "source_agent": WorkItemRoute.OUTREACH_COMPOSER.value,
+                "decision": ApprovalState.PENDING.value,
+                "scope": ApprovalScope.EXTERNAL_USE.value,
+                "title": f"Create Gmail draft: {draft.email_subject}",
+                "summary": "Review the thread-local copy before creating a Gmail draft.",
+                "draft_text": f"Subject: {draft.email_subject}\n\n{draft.email_body}",
+                "metadata": {
+                    "work_item_id": work_item.id,
+                    "outreach_channel": "email",
+                    "gmail_draft_ready": True,
+                    "slack_approval_allows_gmail_draft_creation": True,
+                    "gmail_draft_account": _configured_gmail_draft_account(),
+                    "approval_action_label": "save Gmail draft",
+                    "recipient_email": recipient_email,
+                    "email_subject": draft.email_subject,
+                    "send_enabled": False,
+                },
+            },
+        )
+        store.save_approval_item(approval_item)
     artifact = WorkItemArtifactRef(
         artifact_type="outreach_draft",
         artifact_id=draft_id,
@@ -14963,18 +16102,45 @@ def _advance_thread_local_outreach_draft(
             "gmail_draft_created": False,
             "send_enabled": False,
             "external_write_performed": False,
-            "approval_queue_created": False,
+            "approval_queue_created": approval_item is not None,
+            "approval_queue_id": approval_item.id if approval_item is not None else "",
             "style_profile_id": draft.style_profile_id,
             "drafting_mode": draft.drafting_mode,
+            "approved_context_used": draft.approved_context_used,
+            "source_ids_used": list(draft.source_ids_used),
+            "unsupported_claims_flagged": list(draft.unsupported_claims_flagged),
+            "revision_request": draft.revision_request,
             "sdk_synthesis_attempted": bool(request.live_sdk),
             "sdk_synthesis_used": request.live_sdk and draft.drafting_mode == "llm_constrained",
         },
     )
     work_item = attach_artifact(work_item, artifact)
+    approval_gates = list(work_item.approval_gates)
+    next_action = None
+    if approval_item is not None:
+        approval_gates.append(
+            WorkItemApprovalGate(
+                scope=ApprovalScope.EXTERNAL_USE.value,
+                state=ApprovalState.PENDING.value,
+                required=True,
+                rationale=(
+                    "Creating a Gmail provider draft requires the explicit thread-local "
+                    "draft approval action; sending remains disabled."
+                ),
+                approval_id=approval_item.id,
+            )
+        )
+        next_action = WorkItemNextAction(
+            action="review_gmail_draft_creation",
+            agent=WorkItemRoute.OUTREACH_COMPOSER,
+            description="Review and explicitly approve creation of the Gmail draft.",
+            requires_approval=True,
+        )
     work_item = work_item.model_copy(
         update={
             "last_agent": WorkItemRoute.OUTREACH_COMPOSER.value,
-            "next_action": None,
+            "approval_gates": approval_gates,
+            "next_action": next_action,
             "audit_notes": [
                 *work_item.audit_notes,
                 (
@@ -15022,6 +16188,28 @@ def _advance_thread_local_outreach_draft(
         human_summary=summary,
         audit_notes=work_item.audit_notes[-2:],
     )
+
+
+def _request_explicitly_requests_gmail_draft(request_text: str) -> bool:
+    text = " ".join(str(request_text or "").lower().split())
+    if "gmail draft" not in text:
+        return False
+    return bool(
+        re.search(r"\b(?:create|save|add|put|store)\b.{0,80}\bgmail draft\b", text)
+        or re.search(r"\bgmail draft\b.{0,80}\b(?:create|save|add|put|store)\b", text)
+    )
+
+
+def _configured_gmail_draft_account() -> str:
+    for key in (
+        "KEYSTONE_GMAIL_DRAFT_ACCOUNT",
+        "KNI_BUSINESS_AGENTS_GMAIL_DRAFT_ACCOUNT",
+        "GMAIL_ACCOUNT",
+    ):
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _compose_thread_local_outreach_draft_for_work_item(
@@ -15556,7 +16744,7 @@ def _thread_local_inline_context(request_text: str) -> str:
         return ""
     match = re.search(
         r"\b(?:using\s+this\s+context|use\s+this\s+context|provided\s+context|"
-        r"approved\s+context|context)\s*:\s*(.+?)(?:\b(?:write|draft|compose|"
+        r"approved\s+context|approved\s+facts?|context)\s*:\s*(.+?)(?:\b(?:write|draft|compose|"
         r"prepare|return)\b.{0,120}\b(?:slack[- ]thread|sample|reply|response|"
         r"outreach|email|message)|$)",
         text,
@@ -15570,6 +16758,8 @@ def _thread_local_inline_context(request_text: str) -> str:
 def _thread_local_source_context(work_item: WorkItem) -> str:
     snippets: list[str] = []
     for source in work_item.sources[:5]:
+        if _thread_local_source_is_request_echo(source):
+            continue
         for value in (
             source.supported_claim,
             source.evidence_excerpt,
@@ -15607,6 +16797,17 @@ def _thread_local_source_context(work_item: WorkItem) -> str:
         if len(deduped) >= 5:
             break
     return _compact_outreach_summary_text("; ".join(deduped))[:900]
+
+
+def _thread_local_source_is_request_echo(source: WorkItemSourceRef) -> bool:
+    """Reject a Slack prompt echo as substantive outreach drafting evidence."""
+
+    source_type = str(source.source_type or "").strip().lower()
+    title = " ".join(str(source.title or "").lower().split())
+    return source_type in {"slack", "slack_message"} and title in {
+        "selected slack message",
+        "slack request",
+    }
 
 
 def _thread_local_draft_target_from_inline_context(inline_context: str) -> str:
@@ -16329,7 +17530,7 @@ def _compose_outreach_draft_for_work_item(
     opportunity_record: OutreachOpportunityRecord | None,
     request: WorkflowRunRequest,
     work_item: WorkItem,
-) -> tuple[Any, str]:
+) -> tuple[Any, str, dict[str, Any] | None]:
     objective = _outreach_goal(request.request_text)
     if not request.live_sdk:
         return (
@@ -16339,6 +17540,7 @@ def _compose_outreach_draft_for_work_item(
                 outreach_goal=objective,
             ),
             "Draft-only outreach artifact created; no send or live side effects occurred.",
+            None,
         )
 
     try:
@@ -16416,6 +17618,11 @@ def _compose_outreach_draft_for_work_item(
         return (
             draft.model_copy(update={"drafting_mode": "llm_constrained"}),
             "Outreach Composer live SDK draft created; no send or live Gmail side effect occurred.",
+            {
+                "usage": dict(getattr(outcome, "usage", None) or {}),
+                "cost": dict(getattr(outcome, "cost", None) or {}),
+                "request_cache": dict(getattr(outcome, "request_cache", None) or {}),
+            },
         )
     except Exception as exc:
         return (
@@ -16428,6 +17635,7 @@ def _compose_outreach_draft_for_work_item(
                 "Outreach Composer live SDK drafting failed with "
                 f"{type(exc).__name__}; deterministic draft-only fallback created."
             ),
+            None,
         )
 
 
@@ -16695,6 +17903,7 @@ def _blocked_human_summary(
             for message in requirements
         )
         needs_reply_context = any("Recipient identity" in message for message in requirements)
+        calendar_context = any("calendar" in message.lower() for message in requirements)
         return "\n\n".join(
             [
                 "Gmail Triage needs email context",
@@ -16719,11 +17928,18 @@ def _blocked_human_summary(
                         if legal_or_contract
                         else ""
                     )
+                    + (
+                        "* Calendar boundary: staged event details require the selected email "
+                        "text; no calendar change can occur without exact event details and "
+                        "scoped approval.\n"
+                        if calendar_context
+                        else ""
+                    )
                     + "* Boundary: live Gmail retrieval, draft creation, labels, "
                     "archiving, scheduling, sending, or other mailbox changes require explicit "
                     "approval and an exact selected scope.\n"
-                    + "* Current status: no Gmail draft, label, archive, schedule, send, Slack "
-                    "post, CRM write, file write, or external action was taken."
+                    + "* Current status: no Gmail draft, label, archive, schedule, calendar "
+                    "change, send, Slack post, CRM write, file write, or external action was taken."
                 ),
                 (
                     "*Reply with:*\n"

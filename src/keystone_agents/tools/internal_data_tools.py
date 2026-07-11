@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+import zipfile
 from collections.abc import Mapping
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 from keystone_agents.config import parse_bool
 from keystone_agents.context_env import context_env_path, context_env_value
@@ -55,8 +64,14 @@ AIRTABLE_BASE_ALIAS_PREFIXES = {
     "ops": "AIRTABLE_KNI_OPS",
 }
 AIRTABLE_LIVE_READS_ENV = "KEYSTONE_AIRTABLE_LIVE_READS"
+AIRTABLE_TEST_RECORD_MARKER = "KBA_TEST_RECORD"
 GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
 GOOGLE_SHEET_MIME_TYPE = "application/vnd.google-apps.spreadsheet"
+GOOGLE_SLIDES_MIME_TYPE = "application/vnd.google-apps.presentation"
+POWERPOINT_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+)
 DEFAULT_GOOGLE_SHEET_TABS = [
     "Contacts",
     "Companies",
@@ -68,9 +83,15 @@ DEFAULT_GOOGLE_SHEET_TABS = [
 GOOGLE_WORKSPACE_TOOL_NAMES: tuple[str, ...] = (
     "google_doc_read",
     "google_doc_write",
+    "google_doc_trash",
     "google_drive_list_folder",
     "google_drive_search_files",
     "google_drive_get_file_metadata",
+    "google_slide_deck_read",
+    "presentation_search_local",
+    "presentation_read_local",
+    "presentation_extract_slide_copy_local",
+    "presentation_delete_test_artifact_local",
     "google_drive_create_folder",
     "google_drive_rename_folder",
     "google_drive_remove_folder",
@@ -102,9 +123,15 @@ def google_workspace_tools() -> list[Any]:
     return [
         google_doc_read,
         google_doc_write,
+        google_doc_trash,
         google_drive_list_folder,
         google_drive_search_files,
         google_drive_get_file_metadata,
+        google_slide_deck_read,
+        presentation_search_local,
+        presentation_read_local,
+        presentation_extract_slide_copy_local,
+        presentation_delete_test_artifact_local,
         google_drive_create_folder,
         google_drive_rename_folder,
         google_drive_remove_folder,
@@ -538,6 +565,7 @@ def airtable_write_record_impl(
     approval_reference: str = "",
     operation: str = "create",
     match_filter_formula: str = "",
+    validate_schema: bool = False,
     live: bool = False,
 ) -> dict[str, Any]:
     """Create or update Airtable records behind explicit approval and env gates."""
@@ -555,8 +583,55 @@ def airtable_write_record_impl(
     clean_record_id = record_id.strip()
     clean_operation = str(operation or "create").strip().lower()
     clean_match_filter = match_filter_formula.strip()
+    provider_fields = fields
     if clean_operation not in {"create", "update"}:
         raise ValueError("operation must be 'create' or 'update'.")
+    schema_validation: dict[str, Any] = {}
+    if validate_schema:
+        schema = airtable_get_base_schema_impl(
+            base_alias=config["base_alias"] or base_alias,
+            base_id=config["base_id"],
+            live=live or _airtable_live_reads_default(),
+        )
+        schema_fields = _airtable_schema_fields_for_table(schema, table_name)
+        if not schema_fields:
+            return {
+                "status": "blocked",
+                "reason": "Airtable schema fields were unavailable for typed write validation.",
+                "table": table_name,
+                "send_enabled": False,
+            }
+        fields, field_errors = _coerce_airtable_write_fields(schema_fields, fields)
+        schema_validation = {
+            "validated": not field_errors,
+            "field_types": {
+                str(field.get("name") or ""): str(field.get("field_type") or "")
+                for field in schema_fields
+                if str(field.get("name") or "") in fields
+            },
+            "errors": field_errors,
+        }
+        if field_errors:
+            return {
+                "status": "blocked",
+                "reason": "One or more Airtable fields failed schema-aware validation.",
+                "table": table_name,
+                "schema_validation": schema_validation,
+                "send_enabled": False,
+            }
+        fields_by_name = {
+            str(field.get("name") or ""): field
+            for field in schema_fields
+            if str(field.get("name") or "")
+        }
+        provider_fields = {
+            str(fields_by_name[field_name].get("field_id") or field_name): value
+            for field_name, value in fields.items()
+        }
+        schema_validation["provider_field_ids_used"] = any(
+            provider_key != field_name
+            for provider_key, field_name in zip(provider_fields, fields, strict=True)
+        )
     if clean_operation == "update" and not clean_record_id:
         if not clean_match_filter:
             return {
@@ -615,8 +690,12 @@ def airtable_write_record_impl(
         "method": method,
         "url": url,
         "table": table_name,
-        "params": {},
-        "payload": {"fields": fields},
+        "params": (
+            {"returnFieldsByFieldId": "true"}
+            if schema_validation.get("provider_field_ids_used")
+            else {}
+        ),
+        "payload": {"fields": provider_fields},
     }
     dry_run = not live or parse_bool(os.getenv("AIRTABLE_WRITE_DRY_RUN", "true"))
     if dry_run:
@@ -624,6 +703,7 @@ def airtable_write_record_impl(
             "status": "dry-run",
             "request": _safe_request_preview(request),
             "approval_reference": approval_reference.strip(),
+            "schema_validation": schema_validation,
             "send_enabled": False,
         }
     if not approval_reference.strip():
@@ -648,20 +728,45 @@ def airtable_write_record_impl(
             verified_records = [
                 record for record in raw_verified_records if isinstance(record, dict)
             ]
+    verified_record = verified_records[0] if verified_records else {}
+    verified_fields = verified_record.get("fields", {})
+    if not isinstance(verified_fields, dict):
+        verified_fields = {}
+    matched_fields: list[str] = []
+    for field_name, expected_value in fields.items():
+        field_found, observed_value = _airtable_verified_field_value(
+            verified_fields,
+            field_name,
+        )
+        if (field_found and observed_value == expected_value) or (
+            expected_value is False and not field_found
+        ):
+            matched_fields.append(field_name)
+    mismatched_fields = sorted(set(fields) - set(matched_fields))
+    verification = {
+        "status": "verified" if not mismatched_fields else "verification_failed",
+        "passed": bool(verified_record) and not mismatched_fields,
+        "record_id_match": str(verified_record.get("id") or "") == written_record_id,
+        "matched_fields": sorted(matched_fields),
+        "mismatched_fields": mismatched_fields,
+    }
     return {
         "status": "success",
+        "operation": "update" if clean_record_id else "create",
         "table": table_name,
         "record_id": written_record_id,
         "record": payload,
-        "verified_record": verified_records[0] if verified_records else {},
+        "verified_record": verified_record,
+        "verification": verification,
         "approval_reference": approval_reference.strip(),
+        "schema_validation": schema_validation,
         "send_enabled": False,
         "audit_notes": [
             "Airtable live write completed.",
             (
-                "Read-after-write verification returned the updated record."
-                if verified_records
-                else "Read-after-write verification returned no record."
+                "Read-after-write verification matched all requested fields."
+                if verification["passed"]
+                else "Read-after-write verification did not match all requested fields."
             ),
         ],
     }
@@ -677,6 +782,7 @@ def airtable_write_record(
     approval_reference: str = "",
     operation: str = "create",
     match_filter_formula: str = "",
+    validate_schema: bool = False,
     live: bool = False,
 ) -> str:
     """Create or update an approved Airtable record for internal review data."""
@@ -691,12 +797,175 @@ def airtable_write_record(
             approval_reference=approval_reference,
             operation=operation,
             match_filter_formula=match_filter_formula,
+            validate_schema=validate_schema,
             live=live,
         ),
         ensure_ascii=True,
         sort_keys=True,
         default=str,
     )
+
+
+def airtable_delete_test_record_impl(
+    record_id: str,
+    *,
+    table: str = "",
+    base_alias: str = "",
+    base_id: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Delete one provider-verified disposable Airtable test record."""
+
+    clean_record_id = record_id.strip()
+    if not clean_record_id:
+        raise ValueError("Airtable test-record deletion requires an exact record_id.")
+    config = _airtable_base_config(
+        base_alias=_infer_airtable_base_alias(
+            base_alias=base_alias,
+            base_id=base_id,
+            table=table,
+        ),
+        base_id=base_id,
+    )
+    table_name = _airtable_table(table, config=config)
+    request = {
+        "method": "DELETE",
+        "url": (
+            f"{_airtable_table_url(table_name, base_id=config['base_id'])}/"
+            f"{quote(clean_record_id, safe='')}"
+        ),
+        "table": table_name,
+        "params": {},
+    }
+    dry_run = not live or parse_bool(os.getenv("AIRTABLE_WRITE_DRY_RUN", "true"))
+    if dry_run:
+        return {
+            "status": "dry-run",
+            "operation": "delete_test_record",
+            "record_id": clean_record_id,
+            "request": _safe_request_preview(request),
+            "required_marker": AIRTABLE_TEST_RECORD_MARKER,
+            "approval_reference": approval_reference.strip(),
+            "verification": {"status": "preview", "passed": False},
+            "send_enabled": False,
+            "audit_notes": [
+                "No Airtable record was deleted.",
+                "Live deletion requires provider read-back of the disposable test marker.",
+            ],
+        }
+    if not approval_reference.strip():
+        raise RuntimeError("Airtable live test deletion requires a non-empty approval_reference.")
+    if not parse_bool(os.getenv("AIRTABLE_ALLOW_WRITES")):
+        raise RuntimeError("Airtable live writes are disabled. Set AIRTABLE_ALLOW_WRITES=true.")
+    if not parse_bool(os.getenv("AIRTABLE_ALLOW_TEST_DELETES")):
+        raise RuntimeError(
+            "Airtable test-record deletion is disabled. "
+            "Set AIRTABLE_ALLOW_TEST_DELETES=true for the approved cleanup window."
+        )
+    _require_airtable_credentials(base_id=config["base_id"], access_token=config["access_token"])
+
+    before_result = airtable_read_records_impl(
+        table_name,
+        base_alias=base_alias,
+        base_id=config["base_id"],
+        filter_formula=f"RECORD_ID()='{clean_record_id}'",
+        max_records=2,
+        live=True,
+    )
+    before_records = before_result.get("records", [])
+    if not isinstance(before_records, list) or len(before_records) != 1:
+        return {
+            "status": "blocked",
+            "operation": "delete_test_record",
+            "record_id": clean_record_id,
+            "reason": "Exact Airtable test record could not be resolved uniquely.",
+            "records_found": len(before_records) if isinstance(before_records, list) else 0,
+            "required_marker": AIRTABLE_TEST_RECORD_MARKER,
+            "send_enabled": False,
+        }
+    before_record = before_records[0]
+    before_fields = before_record.get("fields", {}) if isinstance(before_record, dict) else {}
+    if not _contains_airtable_test_marker(before_fields):
+        return {
+            "status": "blocked",
+            "operation": "delete_test_record",
+            "record_id": clean_record_id,
+            "reason": "Resolved Airtable record does not contain the required test marker.",
+            "required_marker": AIRTABLE_TEST_RECORD_MARKER,
+            "send_enabled": False,
+        }
+
+    payload = _airtable_send(request, access_token=config["access_token"])
+    after_result = airtable_read_records_impl(
+        table_name,
+        base_alias=base_alias,
+        base_id=config["base_id"],
+        filter_formula=f"RECORD_ID()='{clean_record_id}'",
+        max_records=1,
+        live=True,
+    )
+    after_records = after_result.get("records", [])
+    provider_deleted = bool(payload.get("deleted")) if isinstance(payload, dict) else False
+    absent_after = isinstance(after_records, list) and not after_records
+    passed = provider_deleted and absent_after
+    return {
+        "status": "success" if passed else "verification_failed",
+        "operation": "delete_test_record",
+        "table": table_name,
+        "record_id": clean_record_id,
+        "required_marker": AIRTABLE_TEST_RECORD_MARKER,
+        "approval_reference": approval_reference.strip(),
+        "verification": {
+            "status": "verified" if passed else "verification_failed",
+            "passed": passed,
+            "provider_deleted": provider_deleted,
+            "record_absent_after": absent_after,
+        },
+        "send_enabled": False,
+        "audit_notes": [
+            "Provider read-back proved the disposable test marker before deletion.",
+            (
+                "Provider read-back confirmed the test record was removed."
+                if passed
+                else "Provider read-back did not confirm complete test-record removal."
+            ),
+        ],
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def airtable_delete_test_record(
+    record_id: str,
+    table: str = "",
+    base_alias: str = "",
+    base_id: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Delete one approved Airtable record only when it contains KBA_TEST_RECORD."""
+
+    return json.dumps(
+        airtable_delete_test_record_impl(
+            record_id,
+            table=table,
+            base_alias=base_alias,
+            base_id=base_id,
+            approval_reference=approval_reference,
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _contains_airtable_test_marker(value: object) -> bool:
+    if isinstance(value, Mapping):
+        return any(_contains_airtable_test_marker(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_airtable_test_marker(item) for item in value)
+    return AIRTABLE_TEST_RECORD_MARKER.lower() in str(value or "").lower()
 
 
 def airtable_upload_attachment_impl(
@@ -791,17 +1060,87 @@ def airtable_upload_attachment_impl(
             "Airtable attachment uploads are disabled. Set AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true."
         )
     _require_airtable_credentials(base_id=config["base_id"], access_token=config["access_token"])
+    before = airtable_read_records_impl(
+        table_name,
+        base_alias=config["base_alias"] or base_alias,
+        base_id=config["base_id"],
+        filter_formula=f"RECORD_ID()='{clean_record_id}'",
+        max_records=1,
+        live=True,
+    )
+    before_records = before.get("records", [])
+    if not isinstance(before_records, list) or len(before_records) != 1:
+        return {
+            "status": "blocked",
+            "reason": "Exact Airtable record could not be resolved for attachment upload.",
+            "record_id": clean_record_id,
+            "send_enabled": False,
+        }
+    before_fields = before_records[0].get("fields", {})
+    before_attachments = (
+        before_fields.get(clean_field_name, [])
+        if isinstance(before_fields, Mapping) and clean_field_name
+        else []
+    )
+    before_count = len(before_attachments) if isinstance(before_attachments, list) else 0
     payload = _airtable_send(request, access_token=config["access_token"])
+    after = airtable_read_records_impl(
+        table_name,
+        base_alias=config["base_alias"] or base_alias,
+        base_id=config["base_id"],
+        filter_formula=f"RECORD_ID()='{clean_record_id}'",
+        max_records=1,
+        live=True,
+    )
+    after_records = after.get("records", [])
+    after_fields = (
+        after_records[0].get("fields", {})
+        if isinstance(after_records, list)
+        and len(after_records) == 1
+        and isinstance(after_records[0], Mapping)
+        else {}
+    )
+    after_attachments = (
+        after_fields.get(clean_field_name, [])
+        if isinstance(after_fields, Mapping) and clean_field_name
+        else []
+    )
+    matching = [
+        item
+        for item in after_attachments
+        if isinstance(item, Mapping)
+        and str(item.get("filename") or "") == local_file.filename
+        and int(item.get("size") or 0) == local_file.size_bytes
+    ] if isinstance(after_attachments, list) else []
+    after_count = len(after_attachments) if isinstance(after_attachments, list) else 0
+    verified = bool(
+        clean_field_name
+        and len(after_records) == 1
+        and after_count == before_count + 1
+        and len(matching) == 1
+    )
     return {
-        "status": "success",
+        "status": "success" if verified else "verification_failed",
         "table": table_name,
         "record_id": clean_record_id,
         "field_id": clean_field_id,
+        "field_name": clean_field_name,
         "filename": local_file.filename,
         "attachment": payload,
         "approval_reference": approval_reference.strip(),
+        "verification": {
+            "status": "verified" if verified else "verification_failed",
+            "passed": verified,
+            "attachment_count_before": before_count,
+            "attachment_count_after": after_count,
+            "filename_match": len(matching) == 1,
+            "size_match": len(matching) == 1,
+        },
         "send_enabled": False,
-        "audit_notes": ["Airtable attachment upload completed."],
+        "audit_notes": [
+            "Airtable attachment upload completed.",
+            "Provider read-back verified the exact filename, byte size, and attachment count.",
+        ],
     }
 
 
@@ -817,7 +1156,12 @@ def airtable_upload_attachment(
     approval_reference: str = "",
     live: bool = False,
 ) -> str:
-    """Upload an approved local PDF/image to an Airtable attachment field."""
+    """Upload a readable local filesystem PDF/image; never use this tool for a URL.
+
+    Use only when ``local_file_path`` is an actual local path supplied by the
+    operator. For any credential-free HTTPS receipt URL, call
+    ``airtable_link_attachment`` instead.
+    """
 
     return json.dumps(
         airtable_upload_attachment_impl(
@@ -828,6 +1172,207 @@ def airtable_upload_attachment(
             record_id=record_id,
             field_id=field_id,
             field_name=field_name,
+            approval_reference=approval_reference,
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def airtable_link_attachment_impl(
+    receipt_url: str,
+    *,
+    table: str = "",
+    base_alias: str = "",
+    base_id: str = "",
+    record_id: str = "",
+    field_name: str = "Attachments",
+    filename: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Append one HTTPS receipt link to an exact Airtable attachment field."""
+
+    clean_record_id = record_id.strip()
+    clean_url = receipt_url.strip()
+    parsed_url = urlparse(clean_url)
+    if not clean_record_id:
+        raise ValueError("Airtable linked attachments require an exact record_id.")
+    if parsed_url.scheme != "https" or not parsed_url.netloc or parsed_url.username:
+        raise ValueError("Airtable receipt links require a credential-free HTTPS URL.")
+    config = _airtable_base_config(
+        base_alias=_infer_airtable_base_alias(
+            base_alias=base_alias,
+            base_id=base_id,
+            table=table,
+        ),
+        base_id=base_id,
+    )
+    table_name = _airtable_table(table, config=config)
+    schema = airtable_get_base_schema_impl(
+        base_alias=config["base_alias"] or base_alias,
+        base_id=config["base_id"],
+        live=live or _airtable_live_reads_default(),
+    )
+    schema_fields = _airtable_schema_fields_for_table(schema, table_name)
+    attachment_field = next(
+        (
+            field
+            for field in schema_fields
+            if str(field.get("name") or "") == field_name
+            and str(field.get("field_type") or "") == "multipleAttachments"
+        ),
+        None,
+    )
+    dry_run = not live or parse_bool(os.getenv("AIRTABLE_WRITE_DRY_RUN", "true"))
+    if attachment_field is None:
+        if dry_run and not schema_fields:
+            return {
+                "status": "dry-run",
+                "operation": "link_attachment",
+                "table": table_name,
+                "record_id": clean_record_id,
+                "field_name": field_name,
+                "receipt_url_supplied": True,
+                "filename": filename.strip(),
+                "schema_validation": "pending_live_schema",
+                "approval_reference": approval_reference.strip(),
+                "send_enabled": False,
+            }
+        return {
+            "status": "blocked",
+            "reason": f"`{field_name}` is not a multipleAttachments field in {table_name}.",
+            "table": table_name,
+            "record_id": clean_record_id,
+            "send_enabled": False,
+        }
+    if dry_run:
+        return {
+            "status": "dry-run",
+            "operation": "link_attachment",
+            "table": table_name,
+            "record_id": clean_record_id,
+            "field_name": field_name,
+            "receipt_url_supplied": True,
+            "filename": filename.strip(),
+            "approval_reference": approval_reference.strip(),
+            "send_enabled": False,
+        }
+    if not approval_reference.strip():
+        raise RuntimeError("Airtable linked attachments require approval_reference.")
+    if not parse_bool(os.getenv("AIRTABLE_ALLOW_WRITES")):
+        raise RuntimeError("Airtable live writes are disabled. Set AIRTABLE_ALLOW_WRITES=true.")
+    if not parse_bool(os.getenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS")):
+        raise RuntimeError(
+            "Airtable attachment links are disabled. Set "
+            "AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true."
+        )
+    _require_airtable_credentials(base_id=config["base_id"], access_token=config["access_token"])
+    before = airtable_read_records_impl(
+        table_name,
+        base_alias=config["base_alias"] or base_alias,
+        base_id=config["base_id"],
+        filter_formula=f"RECORD_ID()='{clean_record_id}'",
+        max_records=1,
+        live=True,
+    )
+    records = before.get("records", [])
+    if not isinstance(records, list) or len(records) != 1:
+        return {
+            "status": "blocked",
+            "reason": "Exact Airtable record could not be resolved for attachment linking.",
+            "record_id": clean_record_id,
+            "send_enabled": False,
+        }
+    current = records[0].get("fields", {}).get(field_name, [])
+    current_attachments = current if isinstance(current, list) else []
+    preserved = [
+        {"id": str(item.get("id"))}
+        for item in current_attachments
+        if isinstance(item, Mapping) and str(item.get("id") or "")
+    ]
+    linked = {"url": clean_url}
+    if filename.strip():
+        linked["filename"] = filename.strip()
+    request = {
+        "method": "PATCH",
+        "url": (
+            f"{_airtable_table_url(table_name, base_id=config['base_id'])}/"
+            f"{quote(clean_record_id, safe='')}"
+        ),
+        "table": table_name,
+        "params": {},
+        "payload": {"fields": {field_name: [*preserved, linked]}},
+    }
+    payload = _airtable_send(request, access_token=config["access_token"])
+    after = airtable_read_records_impl(
+        table_name,
+        base_alias=config["base_alias"] or base_alias,
+        base_id=config["base_id"],
+        filter_formula=f"RECORD_ID()='{clean_record_id}'",
+        max_records=1,
+        live=True,
+    )
+    after_records = after.get("records", [])
+    after_attachments = (
+        after_records[0].get("fields", {}).get(field_name, [])
+        if isinstance(after_records, list) and len(after_records) == 1
+        else []
+    )
+    passed = isinstance(after_attachments, list) and len(after_attachments) > len(
+        current_attachments
+    )
+    return {
+        "status": "success" if passed else "verification_failed",
+        "operation": "link_attachment",
+        "table": table_name,
+        "record_id": clean_record_id,
+        "field_name": field_name,
+        "filename": filename.strip(),
+        "approval_reference": approval_reference.strip(),
+        "verification": {
+            "status": "verified" if passed else "verification_failed",
+            "passed": passed,
+            "attachment_count_before": len(current_attachments),
+            "attachment_count_after": len(after_attachments)
+            if isinstance(after_attachments, list)
+            else 0,
+        },
+        "provider_record_id": str(payload.get("id") or "") if isinstance(payload, Mapping) else "",
+        "send_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def airtable_link_attachment(
+    receipt_url: str,
+    table: str = "",
+    base_alias: str = "",
+    base_id: str = "",
+    record_id: str = "",
+    field_name: str = "Attachments",
+    filename: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Attach a credential-free HTTPS receipt URL; never treat it as a local file path.
+
+    Use this tool, not ``airtable_upload_attachment``, whenever the supplied
+    receipt begins with ``https://``. Airtable fetches the URL into the exact
+    attachment field and the tool verifies the attachment-count increase.
+    """
+
+    return json.dumps(
+        airtable_link_attachment_impl(
+            receipt_url,
+            table=table,
+            base_alias=base_alias,
+            base_id=base_id,
+            record_id=record_id,
+            field_name=field_name,
+            filename=filename,
             approval_reference=approval_reference,
             live=live,
         ),
@@ -1070,6 +1615,7 @@ def google_doc_read_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "read_doc",
             "document_id": document_id,
             "folder_path": target_folder_path,
             "max_chars": bounded_chars,
@@ -1084,9 +1630,11 @@ def google_doc_read_impl(
     text = _google_doc_text(document)[:bounded_chars]
     return {
         "status": "success",
+        "operation": "read_doc",
         "document_id": document_id,
         "title": title,
         "text": text,
+        "char_count": len(text),
         "truncated": len(_google_doc_text(document)) > bounded_chars,
         "send_enabled": False,
     }
@@ -1114,6 +1662,644 @@ def google_doc_read(
     )
 
 
+def google_slide_deck_read_impl(
+    presentation_id_or_url: str,
+    *,
+    folder_path: str = "",
+    max_slides: int = 40,
+    max_chars_per_slide: int = 4000,
+    include_speaker_notes: bool = True,
+    live: bool = False,
+) -> dict[str, Any]:
+    """Read slide text and notes without modifying or copying the parent deck."""
+
+    presentation_id = _google_drive_file_id(presentation_id_or_url)
+    if not presentation_id:
+        raise ValueError("presentation_id_or_url is required.")
+    target_folder_path = _google_docs_folder_path(folder_path)
+    bounded_slides = min(max(int(max_slides or 40), 1), 100)
+    bounded_chars = min(max(int(max_chars_per_slide or 4000), 500), 12000)
+    if not live:
+        return {
+            "status": "dry-run",
+            "operation": "read_slide_deck",
+            "presentation_id": presentation_id,
+            "folder_path": target_folder_path,
+            "max_slides": bounded_slides,
+            "max_chars_per_slide": bounded_chars,
+            "include_speaker_notes": bool(include_speaker_notes),
+            "parent_modified": False,
+            "send_enabled": False,
+        }
+
+    services = _google_workspace_services()
+    drive_service = services["drive"]
+    _assert_configured_google_account(drive_service)
+    _assert_drive_file_in_folder(drive_service, presentation_id, target_folder_path)
+    metadata = (
+        drive_service.files()
+        .get(
+            fileId=presentation_id,
+            fields="id,name,mimeType,modifiedTime,webViewLink,size,parents,trashed",
+        )
+        .execute()
+    )
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Google Drive returned no presentation metadata.")
+    mime_type = str(metadata.get("mimeType") or "")
+    if mime_type == GOOGLE_SLIDES_MIME_TYPE:
+        presentation = (
+            services["slides"].presentations().get(presentationId=presentation_id).execute()
+        )
+        artifacts = _google_slides_artifacts(
+            presentation,
+            presentation_id=presentation_id,
+            max_slides=bounded_slides,
+            max_chars=bounded_chars,
+            include_speaker_notes=include_speaker_notes,
+        )
+        identity_scope = "provider_slide_object_id"
+        extraction_method = "google_slides_api"
+        content_bytes = json.dumps(
+            presentation, ensure_ascii=True, sort_keys=True, default=str
+        ).encode("utf-8")
+    elif mime_type == POWERPOINT_MIME_TYPE:
+        size = int(metadata.get("size") or 0)
+        if size > 25_000_000:
+            raise RuntimeError("PowerPoint deck exceeds the 25 MB bounded read limit.")
+        content = drive_service.files().get_media(fileId=presentation_id).execute()
+        if not isinstance(content, bytes):
+            raise RuntimeError("PowerPoint download returned an unexpected payload.")
+        artifacts = _powerpoint_slide_artifacts(
+            content,
+            presentation_id=presentation_id,
+            max_slides=bounded_slides,
+            max_chars=bounded_chars,
+            include_speaker_notes=include_speaker_notes,
+        )
+        identity_scope = "snapshot_slide_position"
+        extraction_method = "powerpoint_open_xml"
+        content_bytes = content
+    else:
+        raise RuntimeError(
+            "The exact Workspace target is not a Google Slides or PowerPoint deck."
+        )
+
+    full_count = len(artifacts["all_slides"])
+    slides = artifacts["all_slides"][:bounded_slides]
+    return {
+        "status": "success",
+        "operation": "read_slide_deck",
+        "presentation_id": presentation_id,
+        "title": str(metadata.get("name") or ""),
+        "mime_type": mime_type,
+        "url": str(metadata.get("webViewLink") or ""),
+        "modified_time": str(metadata.get("modifiedTime") or ""),
+        "folder_path": target_folder_path,
+        "slide_count": full_count,
+        "returned_slide_count": len(slides),
+        "truncated": full_count > len(slides),
+        "slides": slides,
+        "identity_scope": identity_scope,
+        "extraction_method": extraction_method,
+        "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
+        "parent_modified": False,
+        "derived_copy_created": False,
+        "send_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def google_slide_deck_read(
+    presentation_id_or_url: str,
+    folder_path: str = "",
+    max_slides: int = 40,
+    max_chars_per_slide: int = 4000,
+    include_speaker_notes: bool = True,
+    live: bool = False,
+) -> str:
+    """Read bounded Google Slides or PowerPoint text/notes without modifying the deck."""
+
+    return json.dumps(
+        google_slide_deck_read_impl(
+            presentation_id_or_url,
+            folder_path=folder_path,
+            max_slides=max_slides,
+            max_chars_per_slide=max_chars_per_slide,
+            include_speaker_notes=include_speaker_notes,
+            live=live or _google_workspace_live_reads_default(),
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _presentation_library_root() -> Path:
+    raw = (
+        context_env_value("KEYSTONE_PRESENTATION_LIBRARY_ROOT").strip()
+        or context_env_value("KNI_CLINICAL_AI_SLIDES_ROOT").strip()
+    )
+    if not raw:
+        raise RuntimeError(
+            "Local presentation reads require KEYSTONE_PRESENTATION_LIBRARY_ROOT "
+            "or KNI_CLINICAL_AI_SLIDES_ROOT."
+        )
+    root = Path(raw).expanduser().resolve()
+    if not root.is_dir():
+        raise RuntimeError("The configured local presentation library root is unavailable.")
+    return root
+
+
+def presentation_search_local_impl(
+    query: str = "",
+    *,
+    max_items: int = 25,
+    live: bool = False,
+) -> dict[str, Any]:
+    """Search an allowlisted local PowerPoint library without reading deck content."""
+
+    clean_query = " ".join(str(query or "").split())
+    bounded_items = min(max(int(max_items or 25), 1), 100)
+    if not live:
+        return {
+            "status": "dry-run",
+            "operation": "search_local_presentations",
+            "query": clean_query,
+            "max_items": bounded_items,
+            "items": [],
+            "item_count": 0,
+            "parent_modified": False,
+            "send_enabled": False,
+        }
+    root = _presentation_library_root()
+    query_terms = [term.lower() for term in re.findall(r"[a-zA-Z0-9]+", clean_query)]
+    candidates: list[tuple[int, float, Path]] = []
+    scanned = 0
+    for path in root.rglob("*.pptx"):
+        if scanned >= 5000:
+            break
+        scanned += 1
+        relative = path.relative_to(root)
+        haystack = " ".join(relative.parts).lower()
+        score = sum(1 for term in query_terms if term in haystack)
+        if query_terms and score == 0:
+            continue
+        stat = path.stat()
+        candidates.append((score, stat.st_mtime, path))
+    candidates.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+    items = []
+    for score, _modified, path in candidates[:bounded_items]:
+        stat = path.stat()
+        items.append(
+            {
+                "relative_path": path.relative_to(root).as_posix(),
+                "name": path.name,
+                "mime_type": POWERPOINT_MIME_TYPE,
+                "size": stat.st_size,
+                "modified_time": datetime.fromtimestamp(
+                    stat.st_mtime, tz=UTC
+                ).isoformat(),
+                "query_term_matches": score,
+            }
+        )
+    return {
+        "status": "success",
+        "operation": "search_local_presentations",
+        "query": clean_query,
+        "items": items,
+        "item_count": len(items),
+        "scanned_count": scanned,
+        "scan_truncated": scanned >= 5000,
+        "parent_modified": False,
+        "send_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def presentation_search_local(
+    query: str = "",
+    max_items: int = 25,
+    live: bool = False,
+) -> str:
+    """Search the configured local presentation library by title or relative path."""
+
+    return json.dumps(
+        presentation_search_local_impl(
+            query,
+            max_items=max_items,
+            live=live or parse_bool(os.getenv("KEYSTONE_PRESENTATION_LIVE_READS")),
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def presentation_read_local_impl(
+    relative_path: str,
+    *,
+    max_slides: int = 40,
+    max_chars_per_slide: int = 4000,
+    include_speaker_notes: bool = True,
+    live: bool = False,
+) -> dict[str, Any]:
+    """Read one allowlisted local PowerPoint deck without modifying the parent."""
+
+    clean_relative = str(relative_path or "").strip()
+    if not clean_relative:
+        raise ValueError("relative_path is required.")
+    bounded_slides = min(max(int(max_slides or 40), 1), 100)
+    bounded_chars = min(max(int(max_chars_per_slide or 4000), 500), 12000)
+    if not live:
+        return {
+            "status": "dry-run",
+            "operation": "read_local_presentation",
+            "relative_path": clean_relative,
+            "max_slides": bounded_slides,
+            "max_chars_per_slide": bounded_chars,
+            "include_speaker_notes": bool(include_speaker_notes),
+            "parent_modified": False,
+            "send_enabled": False,
+        }
+    root = _presentation_library_root()
+    candidate = Path(clean_relative).expanduser()
+    target = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    if target != root and root not in target.parents:
+        raise RuntimeError("Presentation target must stay inside the configured library root.")
+    if not target.is_file() or target.suffix.lower() != ".pptx":
+        raise RuntimeError("The exact local presentation target is not an available .pptx file.")
+    if target.stat().st_size > 25_000_000:
+        raise RuntimeError("PowerPoint deck exceeds the 25 MB bounded read limit.")
+    content = target.read_bytes()
+    artifacts = _powerpoint_slide_artifacts(
+        content,
+        presentation_id=hashlib.sha256(
+            target.relative_to(root).as_posix().encode("utf-8")
+        ).hexdigest()[:16],
+        max_slides=bounded_slides,
+        max_chars=bounded_chars,
+        include_speaker_notes=include_speaker_notes,
+    )
+    all_slides = artifacts["all_slides"]
+    slides = all_slides[:bounded_slides]
+    stat = target.stat()
+    return {
+        "status": "success",
+        "operation": "read_local_presentation",
+        "relative_path": target.relative_to(root).as_posix(),
+        "title": target.name,
+        "mime_type": POWERPOINT_MIME_TYPE,
+        "modified_time": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+        "size": stat.st_size,
+        "slide_count": len(all_slides),
+        "returned_slide_count": len(slides),
+        "truncated": len(all_slides) > len(slides),
+        "slides": slides,
+        "identity_scope": "snapshot_slide_position",
+        "extraction_method": "powerpoint_open_xml",
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "parent_modified": False,
+        "derived_copy_created": False,
+        "send_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def presentation_read_local(
+    relative_path: str,
+    max_slides: int = 40,
+    max_chars_per_slide: int = 4000,
+    include_speaker_notes: bool = True,
+    live: bool = False,
+) -> str:
+    """Read one bounded local PowerPoint deck using allowlisted relative provenance."""
+
+    return json.dumps(
+        presentation_read_local_impl(
+            relative_path,
+            max_slides=max_slides,
+            max_chars_per_slide=max_chars_per_slide,
+            include_speaker_notes=include_speaker_notes,
+            live=live or parse_bool(os.getenv("KEYSTONE_PRESENTATION_LIVE_READS")),
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _presentation_derived_root() -> Path:
+    workspace = Path.cwd().resolve()
+    configured = context_env_value(
+        "KEYSTONE_PRESENTATION_DERIVED_ROOT", "artifacts/presentation-derived"
+    ).strip()
+    candidate = Path(configured).expanduser()
+    root = candidate.resolve() if candidate.is_absolute() else (workspace / candidate).resolve()
+    if root != workspace and workspace not in root.parents:
+        raise RuntimeError("Presentation derived artifacts must stay inside the workspace.")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _require_presentation_derived_write(approval_reference: str) -> None:
+    if not approval_reference.strip():
+        raise RuntimeError("Derived presentation writes require a non-empty approval_reference.")
+    if not parse_bool(os.getenv("KEYSTONE_PRESENTATION_ALLOW_DERIVED_WRITES")):
+        raise RuntimeError(
+            "Derived presentation writes are disabled. Set "
+            "KEYSTONE_PRESENTATION_ALLOW_DERIVED_WRITES=true for the approved window."
+        )
+
+
+def _safe_derived_slide_name(value: str, *, suffix: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip()).strip("-._")
+    if not cleaned:
+        cleaned = "derived-slide"
+    if not cleaned.lower().endswith(f".{suffix}"):
+        cleaned = f"{cleaned}.{suffix}"
+    return cleaned[:180]
+
+
+def presentation_extract_slide_copy_local_impl(
+    relative_path: str,
+    slide_number: int,
+    *,
+    output_format: str = "png",
+    output_name: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Render one slide to a derived PNG/PDF while proving the parent is unchanged."""
+
+    clean_relative = str(relative_path or "").strip()
+    if not clean_relative:
+        raise ValueError("relative_path is required.")
+    page = int(slide_number or 0)
+    if page <= 0:
+        raise ValueError("slide_number must be a positive integer.")
+    clean_format = str(output_format or "png").strip().lower()
+    if clean_format not in {"png", "pdf"}:
+        raise ValueError("output_format must be 'png' or 'pdf'.")
+    default_name = f"derived-slide-{page}"
+    filename = _safe_derived_slide_name(output_name or default_name, suffix=clean_format)
+    if not live:
+        return {
+            "status": "dry-run",
+            "operation": "extract_slide_copy",
+            "relative_path": clean_relative,
+            "slide_number": page,
+            "output_format": clean_format,
+            "output_name": filename,
+            "approval_reference": approval_reference.strip(),
+            "parent_modified": False,
+            "derived_copy_created": False,
+            "send_enabled": False,
+        }
+    _require_presentation_derived_write(approval_reference)
+    library_root = _presentation_library_root()
+    source_candidate = Path(clean_relative).expanduser()
+    source = (
+        source_candidate.resolve()
+        if source_candidate.is_absolute()
+        else (library_root / source_candidate).resolve()
+    )
+    if source != library_root and library_root not in source.parents:
+        raise RuntimeError("Presentation target must stay inside the configured library root.")
+    if not source.is_file() or source.suffix.lower() != ".pptx":
+        raise RuntimeError("The exact presentation source is not an available .pptx file.")
+    source_bytes = source.read_bytes()
+    source_hash_before = hashlib.sha256(source_bytes).hexdigest()
+    source_mtime_before = source.stat().st_mtime_ns
+    slide_count = len(
+        _powerpoint_slide_artifacts(
+            source_bytes,
+            presentation_id="validation",
+            max_slides=100,
+            max_chars=500,
+            include_speaker_notes=False,
+        )["all_slides"]
+    )
+    if page > slide_count:
+        raise RuntimeError(
+            f"slide_number {page} exceeds the deck's {slide_count} slides."
+        )
+    output_root = _presentation_derived_root()
+    target = (output_root / filename).resolve()
+    if target.parent != output_root:
+        raise RuntimeError("Derived presentation output must stay in the configured root.")
+    if target.exists():
+        raise RuntimeError("The exact derived presentation output already exists.")
+
+    soffice = shutil.which("soffice")
+    pdfseparate = shutil.which("pdfseparate")
+    pdftoppm = shutil.which("pdftoppm")
+    if not soffice or not pdfseparate or (clean_format == "png" and not pdftoppm):
+        raise RuntimeError("Required local presentation rendering tools are unavailable.")
+    with tempfile.TemporaryDirectory(prefix="kba-slide-render-") as temporary_dir:
+        temporary = Path(temporary_dir)
+        libreoffice_profile = temporary / "libreoffice-profile"
+        _run_bounded_command(
+            [
+                soffice,
+                f"-env:UserInstallation={libreoffice_profile.as_uri()}",
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(temporary),
+                str(source),
+            ],
+            timeout=120,
+        )
+        deck_pdf = temporary / f"{source.stem}.pdf"
+        if not deck_pdf.is_file():
+            raise RuntimeError("Presentation renderer did not produce the expected PDF.")
+        page_pattern = temporary / "slide-%d.pdf"
+        _run_bounded_command(
+            [
+                pdfseparate,
+                "-f",
+                str(page),
+                "-l",
+                str(page),
+                str(deck_pdf),
+                str(page_pattern),
+            ],
+            timeout=60,
+        )
+        page_pdf = temporary / f"slide-{page}.pdf"
+        if not page_pdf.is_file():
+            raise RuntimeError("PDF page extraction did not produce the requested slide.")
+        if clean_format == "pdf":
+            shutil.copyfile(page_pdf, target)
+        else:
+            png_stem = temporary / "slide"
+            _run_bounded_command(
+                [pdftoppm, "-png", "-singlefile", "-r", "150", str(page_pdf), str(png_stem)],
+                timeout=60,
+            )
+            rendered_png = temporary / "slide.png"
+            if not rendered_png.is_file():
+                raise RuntimeError("PNG rendering did not produce the requested slide.")
+            shutil.copyfile(rendered_png, target)
+
+    source_hash_after = hashlib.sha256(source.read_bytes()).hexdigest()
+    source_mtime_after = source.stat().st_mtime_ns
+    parent_unchanged = bool(
+        source_hash_after == source_hash_before and source_mtime_after == source_mtime_before
+    )
+    if not parent_unchanged:
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Parent deck changed during derived slide extraction.")
+    output_bytes = target.read_bytes()
+    magic_valid = (
+        output_bytes.startswith(b"%PDF")
+        if clean_format == "pdf"
+        else output_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    )
+    if not output_bytes or not magic_valid:
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Derived slide artifact failed file-signature verification.")
+    workspace = Path.cwd().resolve()
+    return {
+        "status": "success",
+        "operation": "extract_slide_copy",
+        "relative_path": source.relative_to(library_root).as_posix(),
+        "parent_title": source.name,
+        "parent_content_sha256": source_hash_before,
+        "slide_number": page,
+        "slide_identity_scope": "snapshot_slide_position",
+        "output_format": clean_format,
+        "artifact_path": target.relative_to(workspace).as_posix(),
+        "artifact_size": len(output_bytes),
+        "artifact_sha256": hashlib.sha256(output_bytes).hexdigest(),
+        "approval_reference": approval_reference.strip(),
+        "verification": {
+            "status": "verified",
+            "passed": True,
+            "artifact_exists": target.is_file(),
+            "file_signature_valid": magic_valid,
+            "parent_hash_match": source_hash_after == source_hash_before,
+            "parent_mtime_match": source_mtime_after == source_mtime_before,
+        },
+        "parent_modified": False,
+        "derived_copy_created": True,
+        "send_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def presentation_extract_slide_copy_local(
+    relative_path: str,
+    slide_number: int,
+    output_format: str = "png",
+    output_name: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Render one approved slide copy to PNG or PDF without modifying its parent deck."""
+
+    return json.dumps(
+        presentation_extract_slide_copy_local_impl(
+            relative_path,
+            slide_number,
+            output_format=output_format,
+            output_name=output_name,
+            approval_reference=approval_reference,
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def presentation_delete_test_artifact_local_impl(
+    artifact_path: str,
+    *,
+    approval_reference: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Delete one exact marked derived slide test artifact and verify absence."""
+
+    clean_path = str(artifact_path or "").strip()
+    if not clean_path:
+        raise ValueError("artifact_path is required.")
+    if "KBA_TEST_SLIDE" not in Path(clean_path).name:
+        raise ValueError("Test artifact cleanup requires KBA_TEST_SLIDE in the filename.")
+    if not live:
+        return {
+            "status": "dry-run",
+            "operation": "delete_test_slide_artifact",
+            "artifact_path": clean_path,
+            "approval_reference": approval_reference.strip(),
+            "verification": {"status": "preview", "passed": False},
+            "send_enabled": False,
+        }
+    _require_presentation_derived_write(approval_reference)
+    root = _presentation_derived_root()
+    workspace = Path.cwd().resolve()
+    candidate = Path(clean_path).expanduser()
+    target = candidate.resolve() if candidate.is_absolute() else (workspace / candidate).resolve()
+    if target.parent != root or target.suffix.lower() not in {".png", ".pdf"}:
+        raise RuntimeError("Test artifact cleanup is limited to the derived presentation root.")
+    if not target.is_file():
+        raise RuntimeError("The exact marked derived slide artifact does not exist.")
+    before_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+    target.unlink()
+    passed = not target.exists()
+    return {
+        "status": "success" if passed else "verification_failed",
+        "operation": "delete_test_slide_artifact",
+        "artifact_path": target.relative_to(workspace).as_posix(),
+        "artifact_sha256": before_hash,
+        "approval_reference": approval_reference.strip(),
+        "verification": {
+            "status": "verified" if passed else "verification_failed",
+            "passed": passed,
+            "artifact_absent_after": passed,
+        },
+        "send_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def presentation_delete_test_artifact_local(
+    artifact_path: str,
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Delete one approved marked KBA_TEST_SLIDE artifact and verify absence."""
+
+    return json.dumps(
+        presentation_delete_test_artifact_local_impl(
+            artifact_path,
+            approval_reference=approval_reference,
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _run_bounded_command(command: list[str], *, timeout: int) -> None:
+    result = subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = " ".join(result.stderr.split())[-700:]
+        raise RuntimeError(
+            f"Local presentation command failed with exit {result.returncode}"
+            + (f": {detail}" if detail else ".")
+        )
+
+
 def google_doc_write_impl(
     title: str,
     body_text: str,
@@ -1133,6 +2319,7 @@ def google_doc_write_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "write_doc",
             "title": cleaned_title,
             "document_id": document_id.strip(),
             "folder_path": target_folder_path,
@@ -1198,6 +2385,108 @@ def google_doc_write(
     )
 
 
+def google_doc_trash_impl(
+    document_id_or_url: str,
+    *,
+    folder_path: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Move one exact scoped Google Doc to Drive trash with provider read-back."""
+
+    document_id = _google_doc_id(document_id_or_url)
+    target_folder_path = _google_docs_folder_path(folder_path)
+    if not document_id:
+        raise ValueError("document_id_or_url is required.")
+    if not live:
+        return {
+            "status": "dry-run",
+            "operation": "trash_doc",
+            "document_id": document_id,
+            "folder_path": target_folder_path,
+            "approval_reference": approval_reference.strip(),
+            "send_enabled": False,
+        }
+    _require_google_workspace_write_approval(approval_reference)
+    services = _google_workspace_services()
+    drive_service = services["drive"]
+    _assert_configured_google_account(drive_service)
+    _assert_drive_file_in_folder(drive_service, document_id, target_folder_path)
+    existing = (
+        drive_service.files()
+        .get(fileId=document_id, fields="id,name,mimeType,trashed,webViewLink,parents")
+        .execute()
+    )
+    if not isinstance(existing, dict) or existing.get("mimeType") != GOOGLE_DOC_MIME_TYPE:
+        raise RuntimeError("The exact Workspace target is not a Google Doc.")
+    metadata = (
+        drive_service.files()
+        .update(
+            fileId=document_id,
+            body={"trashed": True},
+            fields="id,name,mimeType,trashed,webViewLink,parents",
+        )
+        .execute()
+    )
+    verified = (
+        drive_service.files()
+        .get(fileId=document_id, fields="id,name,mimeType,trashed,webViewLink,parents")
+        .execute()
+    )
+    verification = {
+        "status": "verified",
+        "passed": bool(
+            isinstance(verified, dict)
+            and str(verified.get("id", "")) == document_id
+            and verified.get("mimeType") == GOOGLE_DOC_MIME_TYPE
+            and verified.get("trashed") is True
+        ),
+        "document_id_match": bool(
+            isinstance(verified, dict) and str(verified.get("id", "")) == document_id
+        ),
+        "mime_type_match": bool(
+            isinstance(verified, dict) and verified.get("mimeType") == GOOGLE_DOC_MIME_TYPE
+        ),
+        "trashed": bool(verified.get("trashed")) if isinstance(verified, dict) else False,
+    }
+    if not verification["passed"]:
+        raise RuntimeError("Google Doc trash did not pass provider read-back verification.")
+    return {
+        "status": "success",
+        "operation": "trash_doc",
+        "document_id": document_id,
+        "title": metadata.get("name", "") if isinstance(metadata, dict) else "",
+        "trashed": bool(metadata.get("trashed")) if isinstance(metadata, dict) else True,
+        "verification": verification,
+        "url": metadata.get("webViewLink", "") if isinstance(metadata, dict) else "",
+        "folder_path": target_folder_path,
+        "approval_reference": approval_reference.strip(),
+        "send_enabled": False,
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def google_doc_trash(
+    document_id_or_url: str,
+    folder_path: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Move one exact approved Google Doc in KNIOps to Drive trash."""
+
+    return json.dumps(
+        google_doc_trash_impl(
+            document_id_or_url,
+            folder_path=folder_path,
+            approval_reference=approval_reference,
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
 def google_drive_list_folder_impl(
     folder_path: str = "",
     *,
@@ -1211,9 +2500,11 @@ def google_drive_list_folder_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "list_folder",
             "folder_path": target_folder_path,
             "max_items": bounded_items,
             "items": [],
+            "item_count": 0,
             "send_enabled": False,
         }
     services = _google_workspace_services()
@@ -1223,8 +2514,10 @@ def google_drive_list_folder_impl(
     if not folder_id:
         return {
             "status": "missing",
+            "operation": "list_folder",
             "folder_path": target_folder_path,
             "items": [],
+            "item_count": 0,
             "send_enabled": False,
         }
     payload = (
@@ -1241,9 +2534,11 @@ def google_drive_list_folder_impl(
     files = payload.get("files", []) if isinstance(payload, dict) else []
     return {
         "status": "success",
+        "operation": "list_folder",
         "folder_id": folder_id,
         "folder_path": target_folder_path,
         "items": [_safe_drive_item(item) for item in files if isinstance(item, dict)],
+        "item_count": len([item for item in files if isinstance(item, dict)]),
         "send_enabled": False,
     }
 
@@ -1285,11 +2580,13 @@ def google_drive_search_files_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "search_files",
             "query": clean_query,
             "mime_type": clean_mime_type,
             "folder_path": target_folder_path,
             "max_items": bounded_items,
             "items": [],
+            "item_count": 0,
             "send_enabled": False,
             "notes": [
                 "Use mime_type='image/' to discover image files by MIME prefix.",
@@ -1303,8 +2600,10 @@ def google_drive_search_files_impl(
     if not folder_id:
         return {
             "status": "missing",
+            "operation": "search_files",
             "folder_path": target_folder_path,
             "items": [],
+            "item_count": 0,
             "send_enabled": False,
         }
     filters = [f"'{folder_id}' in parents", "trashed = false"]
@@ -1330,11 +2629,13 @@ def google_drive_search_files_impl(
     files = payload.get("files", []) if isinstance(payload, dict) else []
     return {
         "status": "success",
+        "operation": "search_files",
         "folder_id": folder_id,
         "folder_path": target_folder_path,
         "query": clean_query,
         "mime_type": clean_mime_type,
         "items": [_safe_drive_item(item) for item in files if isinstance(item, dict)],
+        "item_count": len([item for item in files if isinstance(item, dict)]),
         "send_enabled": False,
     }
 
@@ -1378,6 +2679,7 @@ def google_drive_get_file_metadata_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "get_file_metadata",
             "file_id": file_id,
             "folder_path": target_folder_path,
             "send_enabled": False,
@@ -1404,6 +2706,7 @@ def google_drive_get_file_metadata_impl(
     if not folder_id:
         return {
             "status": "missing",
+            "operation": "get_file_metadata",
             "file_id": file_id,
             "folder_path": target_folder_path,
             "reason": "Allowed folder path was not found.",
@@ -1426,6 +2729,8 @@ def google_drive_get_file_metadata_impl(
     _assert_drive_file_under_folder(drive_service, file_id, folder_id)
     return {
         "status": "success",
+        "operation": "get_file_metadata",
+        "file_id": file_id,
         "folder_path": target_folder_path,
         "file": _safe_drive_item(metadata),
         "created_time": str(metadata.get("createdTime", "")),
@@ -1467,6 +2772,7 @@ def google_drive_create_folder_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "read_table",
             "folder_path": target_folder_path,
             "approval_reference": approval_reference.strip(),
             "send_enabled": False,
@@ -1734,6 +3040,7 @@ def google_sheet_create_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "create_sheet",
             "title": cleaned_title,
             "folder_path": target_folder_path,
             "tabs": tabs,
@@ -1750,16 +3057,28 @@ def google_sheet_create_impl(
         spreadsheet_body["sheets"] = [{"properties": {"title": tab_name}} for tab_name in tabs]
     created = sheets_service.spreadsheets().create(body=spreadsheet_body).execute()
     spreadsheet_id = str(created.get("spreadsheetId", ""))
+    if not spreadsheet_id:
+        raise RuntimeError("Google Sheets create returned no spreadsheet ID.")
     folder_id = _ensure_drive_folder_path(drive_service, target_folder_path)
     if folder_id:
         _move_drive_file_to_folder(drive_service, spreadsheet_id, folder_id)
+    verification = _verify_google_sheet_file(
+        drive_service,
+        spreadsheet_id,
+        expected_title=cleaned_title,
+        expected_trashed=False,
+    )
+    if not verification["passed"]:
+        raise RuntimeError("Google Sheet create did not pass provider read-back verification.")
     return {
         "status": "success",
+        "operation": "create_sheet",
         "spreadsheet_id": spreadsheet_id,
         "title": cleaned_title,
         "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
         "folder_path": target_folder_path,
         "tabs": tabs,
+        "verification": verification,
         "approval_reference": approval_reference.strip(),
         "send_enabled": False,
     }
@@ -1810,12 +3129,14 @@ def google_sheet_read_table_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "read_table",
             "spreadsheet_id": spreadsheet_id,
             "title": cleaned_title,
             "folder_path": target_folder_path,
             "sheet_name": cleaned_sheet_name,
             "range": read_range,
             "rows": [],
+            "row_count": 0,
             "send_enabled": False,
         }
     services = _google_workspace_services()
@@ -1828,9 +3149,11 @@ def google_sheet_read_table_impl(
     if not target_id:
         return {
             "status": "missing",
+            "operation": "read_table",
             "title": cleaned_title,
             "folder_path": target_folder_path,
             "rows": [],
+            "row_count": 0,
             "send_enabled": False,
         }
     _assert_google_sheet_under_kniops(drive_service, target_id)
@@ -1843,12 +3166,14 @@ def google_sheet_read_table_impl(
     rows = payload.get("values", []) if isinstance(payload, dict) else []
     return {
         "status": "success",
+        "operation": "read_table",
         "spreadsheet_id": target_id,
         "title": cleaned_title,
         "folder_path": target_folder_path,
         "sheet_name": cleaned_sheet_name,
         "range": read_range,
         "rows": rows[:bounded_rows],
+        "row_count": len(rows[:bounded_rows]),
         "send_enabled": False,
     }
 
@@ -1901,6 +3226,7 @@ def google_sheet_append_rows_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "append_rows",
             "spreadsheet_id": spreadsheet_id,
             "title": cleaned_title,
             "folder_path": target_folder_path,
@@ -1934,15 +3260,28 @@ def google_sheet_append_rows_impl(
         )
         .execute()
     )
+    updated_range = (
+        str(response.get("updates", {}).get("updatedRange", ""))
+        if isinstance(response, dict)
+        else ""
+    )
+    verification = _verify_google_sheet_range(
+        sheets_service,
+        target_id,
+        updated_range,
+        expected_values=values,
+    )
+    if not verification["passed"]:
+        raise RuntimeError("Google Sheet append did not pass provider read-back verification.")
     return {
         "status": "success",
+        "operation": "append_rows",
         "spreadsheet_id": target_id,
         "title": cleaned_title,
         "sheet_name": cleaned_sheet_name,
         "row_count": len(rows),
-        "updated_range": response.get("updates", {}).get("updatedRange", "")
-        if isinstance(response, dict)
-        else "",
+        "updated_range": updated_range,
+        "verification": verification,
         "approval_reference": approval_reference.strip(),
         "send_enabled": False,
     }
@@ -2000,6 +3339,7 @@ def google_sheet_update_row_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "update_row",
             "spreadsheet_id": spreadsheet_id,
             "title": cleaned_title,
             "folder_path": target_folder_path,
@@ -2039,14 +3379,26 @@ def google_sheet_update_row_impl(
         valueInputOption="USER_ENTERED",
         body={"values": values},
     ).execute()
+    verification = _verify_google_sheet_keyed_row(
+        sheets_service,
+        target_id,
+        cleaned_sheet_name,
+        key_column=key_column.strip(),
+        key_value=key_value.strip(),
+        expected_fields=fields,
+    )
+    if not verification["passed"]:
+        raise RuntimeError("Google Sheet update did not pass provider read-back verification.")
     return {
         "status": "success",
+        "operation": "update_row",
         "spreadsheet_id": target_id,
         "title": cleaned_title,
         "sheet_name": cleaned_sheet_name,
         "row_number": matched_row_number,
         "key_column": key_column.strip(),
         "key_value": key_value.strip(),
+        "verification": verification,
         "approval_reference": approval_reference.strip(),
         "send_enabled": False,
     }
@@ -2109,6 +3461,7 @@ def google_sheet_delete_rows_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "delete_rows",
             "spreadsheet_id": spreadsheet_id,
             "title": cleaned_title,
             "folder_path": target_folder_path,
@@ -2130,10 +3483,12 @@ def google_sheet_delete_rows_impl(
     if not target_id:
         raise RuntimeError("Target Google Sheet was not found.")
     _assert_google_sheet_under_kniops(drive_service, target_id)
+    table_before = _read_sheet_values(sheets_service, target_id, cleaned_sheet_name)
     target_row_index = row_index
     if not target_row_index:
-        table = _read_sheet_values(sheets_service, target_id, cleaned_sheet_name)
-        _, target_row_index, _ = _match_sheet_row(table, key_column.strip(), key_value.strip())
+        _, target_row_index, _ = _match_sheet_row(
+            table_before, key_column.strip(), key_value.strip()
+        )
     sheet_id = _google_sheet_tab_id(sheets_service, target_id, cleaned_sheet_name)
     sheets_service.spreadsheets().batchUpdate(
         spreadsheetId=target_id,
@@ -2152,12 +3507,24 @@ def google_sheet_delete_rows_impl(
             ]
         },
     ).execute()
+    table_after = _read_sheet_values(sheets_service, target_id, cleaned_sheet_name)
+    verification = _verify_google_sheet_deleted_row(
+        table_before,
+        table_after,
+        deleted_row_index=target_row_index,
+        key_column=key_column.strip(),
+        key_value=key_value.strip(),
+    )
+    if not verification["passed"]:
+        raise RuntimeError("Google Sheet row deletion did not pass provider read-back verification.")
     return {
         "status": "success",
+        "operation": "delete_rows",
         "spreadsheet_id": target_id,
         "title": cleaned_title,
         "sheet_name": cleaned_sheet_name,
         "deleted_row_index": target_row_index,
+        "verification": verification,
         "approval_reference": approval_reference.strip(),
         "send_enabled": False,
     }
@@ -2397,6 +3764,7 @@ def google_sheet_trash_impl(
     if not live:
         return {
             "status": "dry-run",
+            "operation": "trash_sheet",
             "spreadsheet_id": spreadsheet_id,
             "approval_reference": approval_reference.strip(),
             "send_enabled": False,
@@ -2415,11 +3783,21 @@ def google_sheet_trash_impl(
         )
         .execute()
     )
+    verification = _verify_google_sheet_file(
+        drive_service,
+        spreadsheet_id,
+        expected_title=str(metadata.get("name", "")) if isinstance(metadata, dict) else "",
+        expected_trashed=True,
+    )
+    if not verification["passed"]:
+        raise RuntimeError("Google Sheet trash did not pass provider read-back verification.")
     return {
         "status": "success",
+        "operation": "trash_sheet",
         "spreadsheet_id": spreadsheet_id,
         "name": metadata.get("name", "") if isinstance(metadata, dict) else "",
         "trashed": bool(metadata.get("trashed")) if isinstance(metadata, dict) else True,
+        "verification": verification,
         "url": metadata.get("webViewLink", "") if isinstance(metadata, dict) else "",
         "approval_reference": approval_reference.strip(),
         "send_enabled": False,
@@ -2640,12 +4018,7 @@ def _apply_schema_select_override(
     if not field:
         notes.append(f"`{field_name}` was requested but is not present in schema.")
         return
-    choices = [
-        str(choice).strip()
-        for choice in field.get("select_choices", [])
-        if str(choice).strip()
-    ]
-    selected = next((choice for choice in choices if choice.lower() == value.lower()), "")
+    selected = _schema_select_choice(field, value)
     if not selected:
         notes.append(f"`{field_name}` value `{value}` is not a configured Airtable option.")
         return
@@ -2692,6 +4065,61 @@ def _apply_model_schema_field_values(
 _UNSET_AIRTABLE_VALUE = object()
 
 
+def _coerce_airtable_write_fields(
+    schema_fields: list[Mapping[str, Any]],
+    requested_fields: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate and coerce general record fields against one live Airtable schema."""
+
+    fields_by_name = {
+        str(field.get("name") or ""): field
+        for field in schema_fields
+        if str(field.get("name") or "")
+    }
+    coerced: dict[str, Any] = {}
+    errors: list[str] = []
+    for raw_name, value in requested_fields.items():
+        field_name = str(raw_name or "").strip()
+        field = fields_by_name.get(field_name)
+        if field is None:
+            errors.append(f"Unknown Airtable field `{field_name}`.")
+            continue
+        field_type = str(field.get("field_type") or "")
+        if bool(field.get("is_computed")) or field_type in {"formula", "rollup", "lookup"}:
+            errors.append(f"Computed Airtable field `{field_name}` is read-only.")
+            continue
+        if field_type == "multipleAttachments":
+            errors.append(
+                f"Attachment field `{field_name}` requires the dedicated attachment tool."
+            )
+            continue
+        field_value = _coerce_airtable_schema_value(field, value)
+        if field_value is _UNSET_AIRTABLE_VALUE:
+            errors.append(f"Value for `{field_name}` is incompatible with {field_type}.")
+            continue
+        coerced[field_name] = field_value
+    return coerced, errors
+
+
+def _airtable_verified_field_value(
+    verified_fields: Mapping[str, Any],
+    requested_name: str,
+) -> tuple[bool, Any]:
+    """Resolve one read-back field without losing exact provider-name whitespace."""
+
+    if requested_name in verified_fields:
+        return True, verified_fields[requested_name]
+    normalized_name = requested_name.strip()
+    normalized_matches = [
+        value
+        for name, value in verified_fields.items()
+        if str(name).strip() == normalized_name
+    ]
+    if len(normalized_matches) == 1:
+        return True, normalized_matches[0]
+    return False, None
+
+
 def _coerce_airtable_schema_value(field: Mapping[str, Any], value: object) -> object:
     field_type = str(field.get("field_type") or "")
     if value in (None, ""):
@@ -2728,10 +4156,12 @@ def _coerce_airtable_schema_value(field: Mapping[str, Any], value: object) -> ob
 
 def _schema_select_choice(field: Mapping[str, Any], requested: str) -> str:
     value = str(requested or "").strip()
-    for choice in field.get("select_choices", []):
-        clean_choice = str(choice).strip()
+    choices = field.get("select_choices_exact") or field.get("select_choices", [])
+    for choice in choices:
+        exact_choice = str(choice)
+        clean_choice = exact_choice.strip()
         if clean_choice.lower() == value.lower():
-            return clean_choice
+            return exact_choice
     return ""
 
 
@@ -2881,8 +4311,27 @@ def _airtable_send(request: dict[str, Any], *, access_token: str = "") -> dict[s
     outbound.add_header("Content-Type", "application/json")
     outbound.add_header("Accept", "application/json")
     timeout_seconds = int(context_env_value("AIRTABLE_REQUEST_TIMEOUT_SECONDS", "20"))
-    with urlopen(outbound, timeout=timeout_seconds) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(outbound, timeout=timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raw_detail = exc.read().decode("utf-8", errors="replace")[:2000]
+        try:
+            parsed_detail = json.loads(raw_detail)
+        except json.JSONDecodeError:
+            parsed_detail = {}
+        error = parsed_detail.get("error") if isinstance(parsed_detail, Mapping) else {}
+        if isinstance(error, Mapping):
+            error_type = str(error.get("type") or "").strip()
+            message = str(error.get("message") or "").strip()
+        else:
+            error_type = str(error or "").strip()
+            message = ""
+        safe_detail = ": ".join(part for part in (error_type, message) if part)[:700]
+        raise RuntimeError(
+            f"Airtable API request failed with HTTP {exc.code}"
+            + (f": {safe_detail}" if safe_detail else ".")
+        ) from exc
 
 
 def _safe_request_preview(request: dict[str, Any]) -> dict[str, Any]:
@@ -2992,6 +4441,176 @@ def _google_drive_file_id(file_id_or_url: str) -> str:
     return value
 
 
+def _google_page_element_text(element: dict[str, Any]) -> str:
+    chunks: list[str] = []
+    shape = element.get("shape")
+    if isinstance(shape, dict):
+        text = shape.get("text")
+        if isinstance(text, dict):
+            for entry in text.get("textElements", []):
+                if not isinstance(entry, dict):
+                    continue
+                run = entry.get("textRun")
+                if isinstance(run, dict):
+                    chunks.append(str(run.get("content") or ""))
+    table = element.get("table")
+    if isinstance(table, dict):
+        for row in table.get("tableRows", []):
+            if not isinstance(row, dict):
+                continue
+            for cell in row.get("tableCells", []):
+                if not isinstance(cell, dict):
+                    continue
+                text = cell.get("text")
+                if not isinstance(text, dict):
+                    continue
+                for entry in text.get("textElements", []):
+                    run = entry.get("textRun") if isinstance(entry, dict) else None
+                    if isinstance(run, dict):
+                        chunks.append(str(run.get("content") or ""))
+    group = element.get("elementGroup")
+    if isinstance(group, dict):
+        for child in group.get("children", []):
+            if isinstance(child, dict):
+                chunks.append(_google_page_element_text(child))
+    return "".join(chunks)
+
+
+def _clean_slide_text(value: str, max_chars: int) -> tuple[str, bool]:
+    normalized = "\n".join(
+        line.strip() for line in str(value or "").splitlines() if line.strip()
+    )
+    return normalized[:max_chars], len(normalized) > max_chars
+
+
+def _google_slides_artifacts(
+    presentation: object,
+    *,
+    presentation_id: str,
+    max_slides: int,
+    max_chars: int,
+    include_speaker_notes: bool,
+) -> dict[str, Any]:
+    if not isinstance(presentation, dict):
+        raise RuntimeError("Google Slides API returned an unexpected payload.")
+    slides: list[dict[str, Any]] = []
+    for position, slide in enumerate(presentation.get("slides", []), start=1):
+        if not isinstance(slide, dict):
+            continue
+        page_elements = [
+            element for element in slide.get("pageElements", []) if isinstance(element, dict)
+        ]
+        text_raw = "\n".join(_google_page_element_text(element) for element in page_elements)
+        text, text_truncated = _clean_slide_text(text_raw, max_chars)
+        title = ""
+        for element in page_elements:
+            shape = element.get("shape")
+            placeholder = shape.get("placeholder") if isinstance(shape, dict) else None
+            if isinstance(placeholder, dict) and placeholder.get("type") in {
+                "TITLE",
+                "CENTERED_TITLE",
+            }:
+                title, _unused = _clean_slide_text(_google_page_element_text(element), 500)
+                break
+        if not title:
+            title = next((line for line in text.splitlines() if line), "")[:500]
+        notes = ""
+        notes_truncated = False
+        if include_speaker_notes:
+            notes_page = slide.get("slideProperties", {}).get("notesPage", {})
+            if isinstance(notes_page, dict):
+                notes_raw = "\n".join(
+                    _google_page_element_text(element)
+                    for element in notes_page.get("pageElements", [])
+                    if isinstance(element, dict)
+                )
+                notes, notes_truncated = _clean_slide_text(notes_raw, max_chars)
+        object_id = str(slide.get("objectId") or "")
+        slides.append(
+            {
+                "slide_number": position,
+                "slide_id": object_id or f"{presentation_id}:slide:{position}",
+                "title": title,
+                "text": text,
+                "speaker_notes": notes,
+                "text_truncated": text_truncated,
+                "speaker_notes_truncated": notes_truncated,
+            }
+        )
+    return {"all_slides": slides, "requested_max_slides": max_slides}
+
+
+def _powerpoint_part_number(name: str) -> int:
+    match = re.search(r"(\d+)\.xml$", name)
+    return int(match.group(1)) if match else 0
+
+
+def _powerpoint_xml_text(archive: zipfile.ZipFile, name: str) -> str:
+    info = archive.getinfo(name)
+    if info.file_size > 5_000_000:
+        raise RuntimeError("A PowerPoint XML part exceeds the bounded read limit.")
+    root = ElementTree.fromstring(archive.read(name))
+    return "\n".join(
+        str(node.text or "").strip()
+        for node in root.findall(".//{*}t")
+        if str(node.text or "").strip()
+    )
+
+
+def _powerpoint_slide_artifacts(
+    content: bytes,
+    *,
+    presentation_id: str,
+    max_slides: int,
+    max_chars: int,
+    include_speaker_notes: bool,
+) -> dict[str, Any]:
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError("PowerPoint content is not a valid Open XML deck.") from exc
+    with archive:
+        if sum(info.file_size for info in archive.infolist()) > 100_000_000:
+            raise RuntimeError("PowerPoint expanded content exceeds the bounded read limit.")
+        slide_names = sorted(
+            (
+                name
+                for name in archive.namelist()
+                if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+            ),
+            key=_powerpoint_part_number,
+        )
+        notes_names = {
+            _powerpoint_part_number(name): name
+            for name in archive.namelist()
+            if re.fullmatch(r"ppt/notesSlides/notesSlide\d+\.xml", name)
+        }
+        slides: list[dict[str, Any]] = []
+        for position, name in enumerate(slide_names, start=1):
+            text, text_truncated = _clean_slide_text(
+                _powerpoint_xml_text(archive, name), max_chars
+            )
+            notes = ""
+            notes_truncated = False
+            notes_name = notes_names.get(_powerpoint_part_number(name))
+            if include_speaker_notes and notes_name:
+                notes, notes_truncated = _clean_slide_text(
+                    _powerpoint_xml_text(archive, notes_name), max_chars
+                )
+            slides.append(
+                {
+                    "slide_number": position,
+                    "slide_id": f"{presentation_id}:snapshot-slide:{position}",
+                    "title": next((line for line in text.splitlines() if line), "")[:500],
+                    "text": text,
+                    "speaker_notes": notes,
+                    "text_truncated": text_truncated,
+                    "speaker_notes_truncated": notes_truncated,
+                }
+            )
+    return {"all_slides": slides, "requested_max_slides": max_slides}
+
+
 def _google_workspace_services() -> dict[str, Any]:
     try:
         from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -3002,10 +4621,7 @@ def _google_workspace_services() -> dict[str, Any]:
             "Install google-api-python-client and google-auth to use live Google Workspace tools."
         ) from exc
 
-    token_path = context_env_path(
-        "GOOGLE_WORKSPACE_OAUTH_TOKEN_PATH",
-        ".local/google-workspace-oauth-token.json",
-    )
+    token_path = _google_workspace_token_path()
     if not token_path.exists():
         raise RuntimeError(f"Google Workspace OAuth token is missing at {token_path}.")
     credentials = Credentials.from_authorized_user_file(str(token_path), GOOGLE_WORKSPACE_SCOPES)
@@ -3018,7 +4634,16 @@ def _google_workspace_services() -> dict[str, Any]:
         "docs": build("docs", "v1", credentials=credentials, cache_discovery=False),
         "drive": build("drive", "v3", credentials=credentials, cache_discovery=False),
         "sheets": build("sheets", "v4", credentials=credentials, cache_discovery=False),
+        "slides": build("slides", "v1", credentials=credentials, cache_discovery=False),
     }
+
+
+def _google_workspace_token_path() -> Path:
+    if context_env_value("GOOGLE_WORKSPACE_OAUTH_TOKEN_PATH").strip():
+        return context_env_path("GOOGLE_WORKSPACE_OAUTH_TOKEN_PATH")
+    if context_env_value("GOOGLE_TOKEN_FILE").strip():
+        return context_env_path("GOOGLE_TOKEN_FILE")
+    return Path(".local/google-workspace-oauth-token.json")
 
 
 def _google_docs_service() -> Any:
@@ -3313,6 +4938,167 @@ def _ordered_row_headers(rows: list[dict[str, Any]]) -> list[str]:
             if header and header not in headers:
                 headers.append(header)
     return headers
+
+
+def _sheet_verification_value(value: Any) -> str:
+    """Normalize scalar Sheet values for bounded provider read-back checks."""
+
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    return str(value)
+
+
+def _sheet_verification_row(row: list[Any]) -> list[str]:
+    normalized = [_sheet_verification_value(cell) for cell in row]
+    while normalized and normalized[-1] == "":
+        normalized.pop()
+    return normalized
+
+
+def _verify_google_sheet_file(
+    drive_service: Any,
+    spreadsheet_id: str,
+    *,
+    expected_title: str,
+    expected_trashed: bool,
+) -> dict[str, Any]:
+    metadata = (
+        drive_service.files()
+        .get(
+            fileId=spreadsheet_id,
+            fields="id,name,mimeType,trashed",
+            supportsAllDrives=False,
+        )
+        .execute()
+    )
+    actual_id = str(metadata.get("id", "")) if isinstance(metadata, dict) else ""
+    actual_title = str(metadata.get("name", "")) if isinstance(metadata, dict) else ""
+    actual_mime_type = str(metadata.get("mimeType", "")) if isinstance(metadata, dict) else ""
+    actual_trashed = bool(metadata.get("trashed")) if isinstance(metadata, dict) else False
+    spreadsheet_id_match = actual_id == spreadsheet_id
+    title_match = not expected_title or actual_title == expected_title
+    mime_type_match = actual_mime_type == GOOGLE_SHEET_MIME_TYPE
+    trashed_match = actual_trashed is expected_trashed
+    return {
+        "status": "verified"
+        if spreadsheet_id_match and title_match and mime_type_match and trashed_match
+        else "verification_failed",
+        "passed": spreadsheet_id_match and title_match and mime_type_match and trashed_match,
+        "spreadsheet_id_match": spreadsheet_id_match,
+        "title_match": title_match,
+        "mime_type_match": mime_type_match,
+        "trashed": actual_trashed,
+        "trashed_match": trashed_match,
+    }
+
+
+def _verify_google_sheet_range(
+    sheets_service: Any,
+    spreadsheet_id: str,
+    range_a1: str,
+    *,
+    expected_values: list[list[Any]],
+) -> dict[str, Any]:
+    if not range_a1:
+        return {
+            "status": "verification_failed",
+            "passed": False,
+            "row_count_match": False,
+            "values_match": False,
+        }
+    payload = (
+        sheets_service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=range_a1, majorDimension="ROWS")
+        .execute()
+    )
+    actual_values = payload.get("values", []) if isinstance(payload, dict) else []
+    normalized_actual = [
+        _sheet_verification_row(row) for row in actual_values if isinstance(row, list)
+    ]
+    normalized_expected = [_sheet_verification_row(row) for row in expected_values]
+    row_count_match = len(normalized_actual) == len(normalized_expected)
+    values_match = normalized_actual == normalized_expected
+    return {
+        "status": "verified" if row_count_match and values_match else "verification_failed",
+        "passed": row_count_match and values_match,
+        "row_count_match": row_count_match,
+        "values_match": values_match,
+        "verified_row_count": len(normalized_actual),
+    }
+
+
+def _verify_google_sheet_keyed_row(
+    sheets_service: Any,
+    spreadsheet_id: str,
+    sheet_name: str,
+    *,
+    key_column: str,
+    key_value: str,
+    expected_fields: dict[str, Any],
+) -> dict[str, Any]:
+    table = _read_sheet_values(sheets_service, spreadsheet_id, sheet_name)
+    try:
+        headers, row_number, row = _match_sheet_row(table, key_column, key_value)
+    except RuntimeError:
+        return {
+            "status": "verification_failed",
+            "passed": False,
+            "row_found": False,
+            "matched_fields": [],
+            "mismatched_fields": sorted(str(key) for key in expected_fields),
+        }
+    record = {
+        header: row[index] if index < len(row) else "" for index, header in enumerate(headers)
+    }
+    matched_fields = sorted(
+        str(key)
+        for key, value in expected_fields.items()
+        if _sheet_verification_value(record.get(str(key), ""))
+        == _sheet_verification_value(_sheet_cell_value(value))
+    )
+    mismatched_fields = sorted(str(key) for key in expected_fields if str(key) not in matched_fields)
+    passed = not mismatched_fields
+    return {
+        "status": "verified" if passed else "verification_failed",
+        "passed": passed,
+        "row_found": True,
+        "row_number": row_number,
+        "matched_fields": matched_fields,
+        "mismatched_fields": mismatched_fields,
+    }
+
+
+def _verify_google_sheet_deleted_row(
+    table_before: list[list[str]],
+    table_after: list[list[str]],
+    *,
+    deleted_row_index: int,
+    key_column: str,
+    key_value: str,
+) -> dict[str, Any]:
+    row_count_delta = len(table_before) - len(table_after)
+    row_absent = True
+    if key_column and key_value and table_after:
+        headers = [str(item).strip() for item in table_after[0]]
+        if key_column not in headers:
+            row_absent = False
+        else:
+            key_index = headers.index(key_column)
+            row_absent = all(
+                str(row[key_index] if key_index < len(row) else "") != key_value
+                for row in table_after[1:]
+            )
+    passed = row_count_delta == 1 and row_absent
+    return {
+        "status": "verified" if passed else "verification_failed",
+        "passed": passed,
+        "deleted_row_index": deleted_row_index,
+        "row_count_delta": row_count_delta,
+        "row_absent": row_absent,
+    }
 
 
 def _read_sheet_values(

@@ -84,8 +84,10 @@ inspectable state:
   require the relevant live flags and approval/reference metadata.
 - Use Airtable tools for table records, not browser automation. Writes must be
   scoped create/update operations with exact table/field mapping and approval
-  references; no deletes, schema changes, attachment uploads, or silent bulk
-  overwrites.
+  references. The sole delete exception is cleanup of one exact provider record
+  whose fields contain `KBA_TEST_RECORD`, through the dedicated test-delete tool
+  with a separate approval/live flag and read-after-delete verification. No
+  ordinary deletes, schema changes, attachment uploads, or silent bulk overwrites.
 - Use the KNI Finance Operations local app only as a read-only finance
   operations context source unless a separate write integration is approved.
   The canonical local app is
@@ -97,7 +99,21 @@ inspectable state:
   off-limits without a separately approved integration.
 - Use Gmail and Slack structured tools for messages, drafts, labels, thread
   context, and posting decisions. Browser tools should not replace provider
-  APIs for business-system reads or writes.
+  APIs for business-system reads or writes. Gmail draft deletion is limited to
+  one exact provider draft whose subject and body both contain
+  `KBA_TEST_DRAFT`, with an approved local review item, the dedicated
+  `KEYSTONE_GMAIL_ALLOW_TEST_DRAFT_DELETES` gate, account verification, and a
+  read-after-delete absence check. Ordinary draft deletion remains unsupported.
+- Use the dedicated Google Calendar tools for event create, modification, notes,
+  and deletion. Direct complete event asks should infer the next-occurrence year,
+  configured primary calendar, and `America/New_York` default without repeated
+  clarification. Writes require an exact event scope, approval reference,
+  `KEYSTONE_GOOGLE_CALENDAR_ALLOW_WRITES=true`, provider read-back, and exact-ID
+  update/delete verification. A normal operator modification/delete may identify
+  the event by title and optional date; resolve a unique active provider match
+  and keep the exact ID internal. Block zero or ambiguous matches rather than
+  requiring the operator to copy an ID. Gmail Triage participates only when
+  event details must first be extracted from selected email context.
 - Use extraction providers first for web content: Trafilatura/Firecrawl/Crawl4AI
   style extraction, source ranking, and claim extraction. Use Playwright only
   when static extraction is weak, a JS-rendered page must be inspected, or
@@ -429,9 +445,14 @@ Slack, create Gmail drafts, or write externally.
 
 ## Safety Rules
 
-- No external email may be sent automatically.
+- No ordinary external email may be sent automatically. The sole validation
+  exception is sending at most two exact provider drafts whose subject and body
+  both contain `KBA_TEST_EMAIL`, through the Gmail agent's dedicated test-send
+  tool with an exact configured recipient, matching authenticated sender,
+  separate approval/live gates, and sent-copy read-back verification.
 - Outbound email, LinkedIn, Slack, CRM, or other outbound copy defaults to draft-only behavior.
 - Human approval is required before outbound copy is sent, published, scheduled, or handed to a live integration.
+- An authenticated direct operator command is human approval for the exact supported operation and target it names. Do not require a second approval round trip for that same scoped action; still block ambiguous targets, inferred extra writes, bulk expansion, unsupported operations, or missing provider/live gates.
 - Do not process PHI or patient-specific information.
 - Flag legal, financial, security, and contractual content for human review.
 - Company, opportunity, local collection, and broader research must include source attribution.

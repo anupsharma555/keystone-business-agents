@@ -1,7 +1,7 @@
 ---
 skill_id: zotero_context_specialist_contracts
-skill_version: 2026-06-15.1
-skill_purpose: Resolve Zotero context, backend importer plans, and approved internal artifact writes.
+skill_version: 2026-07-11.1
+skill_purpose: Resolve Zotero context, backend importer plans, approved internal artifacts, and marked disposable note lifecycles.
 applies_to:
   - zotero_context_agent
 eval_datasets:
@@ -35,8 +35,20 @@ return importer-ready and artifact-ready handoff context only.
   still require full-text review or human validation.
 - Put proposed internal artifact work in `recommended_artifact_plan`.
 - Keep `zotero_write_supported=false`.
-- Keep native Zotero mutation unsupported; article imports go only through the
-  guarded backend importer tool.
+- Keep `zotero_test_note_write_supported=true` without implying general Zotero
+  write access.
+- Keep `zotero_test_library_write_supported=true` only for one exact marked
+  collection and webpage-item lifecycle.
+- Keep ordinary native Zotero mutation unsupported; article imports go only
+  through the guarded backend importer tool.
+- Use `zotero_write_test_note` and `zotero_delete_test_note` only for one exact
+  disposable note containing `KBA_TEST_NOTE`. Require direct selected-agent
+  execution, an approval reference, the test-write live gate, current provider
+  version, and read-back verification.
+- Use the dedicated test collection/item tools only when names/titles and tags
+  contain `KBA_TEST_COLLECTION` / `KBA_TEST_ITEM`, the provider identity is
+  exact, the separate library-write gate is enabled, and every mutation is
+  read back. Delete the item first and refuse collection deletion unless empty.
 - Keep `recommended_artifact_plan.live_write_allowed_for_specialist=false`.
 
 ## Flexible Behavior
@@ -52,9 +64,11 @@ return importer-ready and artifact-ready handoff context only.
 
 ## Boundaries
 
-- Do not mutate Zotero libraries, collections, notes, tags, attachments, or item
-  metadata except through the guarded backend importer when directly invoked
-  with approval.
+- Do not mutate Zotero libraries, ordinary collections, ordinary notes, tags,
+  attachments, or item metadata except through the guarded backend importer.
+  The sole native mutation exception is a provider-verified disposable note
+  containing `KBA_TEST_NOTE`, plus one exact marked collection/webpage-item
+  lifecycle through the dedicated test-library tools.
 - Do not call the backend importer when nested inside Chief of Staff.
 - Do not approve external claims or outbound use of article evidence.
 - Do not claim full article review unless full article content was available in
@@ -80,11 +94,18 @@ return importer-ready and artifact-ready handoff context only.
   URL, or title confirmation.
 - If the backend importer script is unavailable, report the configured path and
   return a manual import handoff.
+- Treat HTTP 412 as a version conflict: reread and request review rather than
+  silently retrying a stale update or delete.
+- Zotero may return a non-JSON body for an expected 404 after deletion; absence
+  verification must accept the status without requiring a JSON error body.
 - If full text is unavailable, mark conclusions as metadata/snippet based.
 
 ## Eval Criteria
 
-- Resolves Zotero collection and item context without native Zotero mutation.
+- Resolves Zotero collection and item context without ordinary native mutation.
+- Creates, modifies, verifies, and cleans up only marked disposable test notes.
+- Creates, modifies, verifies, and cleans up only one marked test collection
+  and marked webpage item, including tags and collection membership.
 - Keeps backend importer use direct, approved, and guarded.
 - Produces organized paper/context handoffs that Chief of Staff can use for
   writing.
@@ -108,6 +129,16 @@ return importer-ready and artifact-ready handoff context only.
 - Return a handoff when Chief of Staff needs organized research context.
 - Ask for clarification when article identity, collection identity, or approval
   scope is not defensible.
+
+## Operational Test
+
+- Preview: `.venv/bin/python scripts/run_zotero_test_note_lifecycle.py`
+- Approved live window:
+  `KEYSTONE_ZOTERO_ALLOW_TEST_NOTE_WRITES=true .venv/bin/python scripts/run_zotero_test_note_lifecycle.py --live-zotero --no-dry-run`
+- The runner creates one marked standalone note, reads it back, updates using
+  the current version, reads it back, deletes using the new version, and
+  verifies 404 absence. Its `finally` cleanup attempts deletion after any
+  post-create failure. Never run it without explicit disposable-note approval.
 
 ## Tie-Breakers
 

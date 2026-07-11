@@ -87,6 +87,7 @@ class GmailTriageSDKInput:
     attachment_metadata: list[dict[str, Any]] = field(default_factory=list)
     thread_summary: str = ""
     thread_context: str = ""
+    existing_draft: str = ""
     suspicious_signals: list[str] = field(default_factory=list)
     triage_limitations: list[str] = field(default_factory=list)
     email_style_profile: str = ""
@@ -144,6 +145,16 @@ class GmailTriageSDKInput:
                     self.thread_context or self.thread_summary,
                 ]
             )
+        if self.existing_draft:
+            lines.extend(
+                [
+                    "",
+                    "Existing draft artifact for this exact message/thread:",
+                    self.existing_draft,
+                    "Revise this text when the operator asks for a modification; do not "
+                    "report it missing or replace it with revision instructions.",
+                ]
+            )
         if self.extracted_links:
             lines.extend(["", "Extracted links:"])
             for link in self.extracted_links:
@@ -196,6 +207,7 @@ class GmailPriorityGroupingSDKInput:
 
     messages: list[GmailTriageSDKInput]
     request: str = DEFAULT_GMAIL_PRIORITY_GROUPING_REQUEST
+    operator_request: str = ""
     lookback_days: int = 3
     source_label: str = "UNREAD"
     draft_policy: str = (
@@ -209,6 +221,7 @@ class GmailPriorityGroupingSDKInput:
         envelopes: list[GmailMessageEnvelope],
         *,
         request: str | None = None,
+        operator_request: str = "",
         lookback_days: int = 3,
         source_label: str = "UNREAD",
         email_style_profile: str = "",
@@ -243,6 +256,7 @@ class GmailPriorityGroupingSDKInput:
         return cls(
             messages=messages,
             request=request or DEFAULT_GMAIL_PRIORITY_GROUPING_REQUEST,
+            operator_request=operator_request.strip(),
             lookback_days=lookback_days,
             source_label=source_label,
         )

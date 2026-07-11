@@ -11,6 +11,8 @@ GmailExecutionOperation = Literal[
     "thread_summary",
     "single_message_triage",
     "draft_reply",
+    "update_draft",
+    "style_profile",
     "clarification",
 ]
 
@@ -24,6 +26,8 @@ class GmailExecutionPlan(BaseModel):
     max_messages: int = Field(default=10, ge=1, le=50)
     gmail_query: str = ""
     source_label: str = "INBOX"
+    draft_subject_hint: str = ""
+    draft_recipient_hint: str = ""
     create_gmail_drafts: bool = False
     draft_replies_in_output: bool = False
     live_read_required: bool = False
@@ -37,6 +41,8 @@ class GmailExecutionPlan(BaseModel):
         "source",
         "gmail_query",
         "source_label",
+        "draft_subject_hint",
+        "draft_recipient_hint",
         "artifact_policy",
         "side_effect_policy",
         "rationale",

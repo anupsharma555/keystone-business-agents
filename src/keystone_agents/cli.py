@@ -34,9 +34,15 @@ from keystone_agents.automation_inventory import (
     ensure_default_automation_inventory,
     render_automation_inventory_markdown,
 )
+from keystone_agents.calendar_actions import CalendarActionPlan, infer_calendar_action_plan
 from keystone_agents.child_process import run_isolated_child_process
 from keystone_agents.cli_sdk import add_sdk_session_arguments
-from keystone_agents.config import cli_default_live_research, cli_default_live_sdk, load_settings
+from keystone_agents.config import (
+    cli_default_live_research,
+    cli_default_live_sdk,
+    load_settings,
+    with_cli_environment,
+)
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.costing import estimate_usage_cost
 from keystone_agents.eval_runtime_diagnostics import slack_eval_blocker_diagnostics
@@ -64,6 +70,7 @@ from keystone_agents.reporting import (
     render_work_item_result_text,
     sensitive_text_summary,
 )
+from keystone_agents.run import extract_sdk_usage
 from keystone_agents.schemas.approval import (
     ApprovalQueueItem,
     ApprovalQueueStatus,
@@ -92,6 +99,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemStatus,
 )
 from keystone_agents.sdk import run_typed_sdk_sync
+from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
 from keystone_agents.sdk_sessions import (
     SDKSessionSpec,
     build_sdk_session,
@@ -108,6 +116,13 @@ from keystone_agents.slack_action_contract import (
     business_agent_action_value,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
+from keystone_agents.tools.google_calendar_tool import (
+    GoogleCalendarError,
+    create_google_calendar_event_impl,
+    delete_google_calendar_event_impl,
+    resolve_google_calendar_event_impl,
+    update_google_calendar_event_impl,
+)
 from keystone_agents.tools.internal_data_tools import (
     AIRTABLE_LIVE_READS_ENV,
     GOOGLE_WORKSPACE_LIVE_READS_ENV,
@@ -197,8 +212,22 @@ def build_parser() -> argparse.ArgumentParser:
     add_sdk_session_arguments(ask)
     ask.add_argument(
         "--live-manual-plan",
-        action="store_true",
-        help="Use the SDK manual-request planner before direct agent execution.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use the SDK manual-request planner before agent execution. Live SDK mode "
+            "enables it by default; use --no-live-manual-plan for a bounded run that "
+            "must avoid the extra planner request."
+        ),
+    )
+    ask.add_argument(
+        "--max-openai-requests",
+        type=int,
+        default=None,
+        help=(
+            "Fail before any model call when the estimated planner, specialist, graph, "
+            "and final-synthesis requests exceed this per-command ceiling."
+        ),
     )
     ask.add_argument("--database-url", default=None, help="SQLite URL for WorkItem mode.")
     ask.add_argument(
@@ -207,6 +236,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional selected-context JSON file to attach to a WorkItem run.",
     )
     ask.add_argument("--live-search", action="store_true", help="Use live search in WorkItem mode.")
+    ask.add_argument(
+        "--live-rss-slack-read",
+        action="store_true",
+        help=(
+            "Allow a bounded read of RSS announcement history through Slack when the "
+            "separate process-level read gate is enabled. Never posts."
+        ),
+    )
     ask.add_argument("--max-results", type=int, default=3, help="Max WorkItem search results.")
     ask.add_argument(
         "--max-manager-steps",
@@ -328,6 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     work_items_advance.add_argument("--database-url", default=None)
     work_items_advance.add_argument("--live-search", action="store_true")
+    work_items_advance.add_argument("--live-rss-slack-read", action="store_true")
     work_items_advance.add_argument("--live-sdk", action="store_true")
     add_sdk_session_arguments(work_items_advance)
     work_items_advance.add_argument(
@@ -521,6 +559,150 @@ def _agent_display_name(route: str) -> str:
     return spec.agent_name if spec is not None else route
 
 
+def _run_direct_calendar_action(
+    input_text: str,
+    plan: CalendarActionPlan,
+    *,
+    live: bool,
+    json_output: bool,
+) -> int:
+    """Execute a complete single-step Calendar request without graph or model latency."""
+
+    if not plan.complete:
+        missing = ", ".join(plan.blockers)
+        payload = {
+            "status": "blocked",
+            "block_kind": "calendar_action_missing_required_field",
+            "message": f"Calendar action needs only: {missing}.",
+            "calendar_action": plan.__dict__,
+            "selected_agent": "chief_of_staff",
+            "openai_requests": 0,
+            "send_enabled": False,
+        }
+        return _print_direct_calendar_payload(payload, json_output=json_output)
+
+    approval_reference = (
+        "calendar-direct:" + hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:16]
+    )
+    resolved_event_id = plan.event_id
+    calendar_lookup: dict[str, Any] | None = None
+    try:
+        if plan.operation != "create" and not resolved_event_id:
+            calendar_lookup = resolve_google_calendar_event_impl(
+                plan.event_reference,
+                calendar_id=plan.calendar_id,
+                live=live,
+            )
+            if not live:
+                payload = {
+                    "status": "dry-run",
+                    "mode": "dry_run",
+                    "selected_agent": "chief_of_staff",
+                    "route": "chief_of_staff",
+                    "input": input_text,
+                    "calendar_action": plan.__dict__,
+                    "calendar_lookup": calendar_lookup,
+                    "openai_requests": 0,
+                    "send_enabled": False,
+                    "side_effects": {
+                        "calendar_write_performed": False,
+                        "email_sent": False,
+                        "slack_message_posted": False,
+                    },
+                }
+                return _print_direct_calendar_payload(payload, json_output=json_output)
+            lookup_status = str(calendar_lookup.get("status") or "")
+            if lookup_status == "not_found":
+                raise GoogleCalendarError(
+                    f'No active Calendar event matched "{plan.event_reference}". '
+                    "Name the event more specifically or include its date."
+                )
+            if lookup_status == "ambiguous":
+                raise GoogleCalendarError(
+                    f'More than one active Calendar event matched "{plan.event_reference}". '
+                    "Include the event date or a more specific title."
+                )
+            resolved_event_id = str(calendar_lookup.get("event_id") or "")
+            if not resolved_event_id:
+                raise GoogleCalendarError("Calendar event lookup returned no exact identity.")
+        if plan.operation == "create":
+            result = create_google_calendar_event_impl(
+                plan.title,
+                plan.start_date,
+                description=plan.description,
+                calendar_id=plan.calendar_id,
+                timezone=plan.timezone,
+                approval_reference=approval_reference,
+                live=live,
+            )
+        elif plan.operation == "update":
+            result = update_google_calendar_event_impl(
+                resolved_event_id,
+                title=plan.title,
+                start_date=plan.start_date,
+                description=plan.description,
+                calendar_id=plan.calendar_id,
+                timezone=plan.timezone,
+                approval_reference=approval_reference,
+                live=live,
+            )
+        else:
+            result = delete_google_calendar_event_impl(
+                resolved_event_id,
+                calendar_id=plan.calendar_id,
+                approval_reference=approval_reference,
+                live=live,
+            )
+    except (GoogleCalendarError, RuntimeError, ValueError) as exc:
+        payload = {
+            "status": "blocked",
+            "block_kind": "calendar_write_blocked",
+            "message": str(exc),
+            "calendar_action": plan.__dict__,
+            "selected_agent": "chief_of_staff",
+            "openai_requests": 0,
+            "send_enabled": False,
+        }
+        return _print_direct_calendar_payload(payload, json_output=json_output)
+
+    passed = bool((result.get("verification") or {}).get("passed"))
+    payload = {
+        "status": "done" if passed else str(result.get("status") or "failed"),
+        "mode": "live_calendar" if live else "dry_run",
+        "selected_agent": "chief_of_staff",
+        "route": "chief_of_staff",
+        "input": input_text,
+        "calendar_action": plan.__dict__,
+        "calendar_lookup": calendar_lookup,
+        "tool_receipt": result,
+        "openai_requests": 0,
+        "send_enabled": False,
+        "side_effects": {
+            "calendar_write_performed": bool(live and passed),
+            "email_sent": False,
+            "slack_message_posted": False,
+        },
+    }
+    return _print_direct_calendar_payload(payload, json_output=json_output)
+
+
+def _print_direct_calendar_payload(payload: dict[str, Any], *, json_output: bool) -> int:
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        receipt = payload.get("tool_receipt")
+        if isinstance(receipt, dict):
+            print(
+                f"Calendar event {receipt.get('operation', 'action')}: "
+                f"{receipt.get('title', '')} {receipt.get('start_date', '')}".strip()
+            )
+            if receipt.get("html_link"):
+                print(f"Event: {receipt['html_link']}")
+        else:
+            print(str(payload.get("message") or "Calendar action could not be completed."))
+    return 0 if payload.get("status") in {"done", "dry-run"} else 1
+
+
 def _route_with_manual_plan_advice(route: str, manual_plan: ManualRequestPlan) -> str:
     planned = str(manual_plan.target_agent or "").strip()
     if planned in {"", "orchestrator", "clarification"}:
@@ -531,6 +713,17 @@ def _route_with_manual_plan_advice(route: str, manual_plan: ManualRequestPlan) -
 
 
 def _run_ask(args: argparse.Namespace) -> int:
+    if args.live_sdk is True:
+        return _run_live_ask_with_environment(args)
+    return _run_ask_with_current_environment(args)
+
+
+@with_cli_environment(force_dotenv=True)
+def _run_live_ask_with_environment(args: argparse.Namespace) -> int:
+    return _run_ask_with_current_environment(args)
+
+
+def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     raw_input = _ask_input(args)
     mention = parse_agent_mention(raw_input, allow_bare_context_agents=True)
     input_text = raw_input if args.agent else mention.input_text
@@ -552,15 +745,45 @@ def _run_ask(args: argparse.Namespace) -> int:
             return _print_eval_status(eval_status, json_output=args.json)
     live_sdk = _ask_live_sdk_enabled(args)
     requested_route = args.agent or (mention.route if mention.explicit else None)
+    calendar_plan = infer_calendar_action_plan(input_text)
+    if calendar_plan is not None and requested_route in {
+        None,
+        "chief_of_staff",
+        "orchestrator",
+    }:
+        return _run_direct_calendar_action(
+            input_text,
+            calendar_plan,
+            live=live_sdk,
+            json_output=args.json,
+        )
     live_search = args.live_search or (live_sdk and cli_default_live_research())
-    if live_search and _request_forbids_live_research(input_text):
+    if live_search and (
+        _request_forbids_live_research(input_text)
+        or _context_file_is_work_item_source_bundle(args.context_file)
+    ):
         live_search = False
-    live_manual_plan = (args.live_manual_plan or live_sdk) and not (
+    live_manual_plan_requested = (
+        live_sdk if args.live_manual_plan is None else bool(args.live_manual_plan)
+    )
+    live_manual_plan = live_manual_plan_requested and not (
         live_sdk
         and _skip_live_manual_plan_for_request(input_text, requested_route=requested_route)
     )
-    if live_manual_plan:
-        load_settings(force_dotenv=True)
+    request_estimate = _estimate_ask_openai_requests(
+        args,
+        input_text=input_text,
+        live_sdk=live_sdk,
+        live_manual_plan=live_manual_plan,
+    )
+    if args.max_openai_requests is not None and (
+        args.max_openai_requests < 0 or request_estimate["max"] > args.max_openai_requests
+    ):
+        return _print_ask_request_budget_blocked(
+            json_output=args.json,
+            requested_limit=args.max_openai_requests,
+            estimate=request_estimate,
+        )
     orchestrator_preflight = run_orchestrator_preflight(
         input_text,
         requested_agent=requested_route,
@@ -647,6 +870,7 @@ def _run_ask(args: argparse.Namespace) -> int:
             database_url=args.database_url,
             live_search=live_search,
             live_sdk=live_sdk,
+            live_rss_slack_read=args.live_rss_slack_read,
             max_results=args.max_results,
             max_manager_steps=args.max_manager_steps,
             json_output=args.json,
@@ -661,6 +885,25 @@ def _run_ask(args: argparse.Namespace) -> int:
         )
     route = args.agent
     if route == "orchestrator":
+        if _context_file_is_work_item_source_bundle(args.context_file):
+            return _run_ask_work_item(
+                input_text,
+                database_url=args.database_url,
+                live_search=live_search,
+                live_sdk=live_sdk,
+                live_rss_slack_read=args.live_rss_slack_read,
+                max_results=args.max_results,
+                max_manager_steps=args.max_manager_steps,
+                json_output=args.json,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                context_file_path=args.context_file,
+                sdk_session_enabled=args.sdk_session,
+                sdk_session_id=args.sdk_session_id,
+                sdk_session_db_path=args.sdk_session_db,
+                sdk_session_history_limit=args.sdk_session_history_limit,
+                cost_tracking_requested=cost_directive.requested,
+            )
         return _run_ask_orchestrator(
             input_text,
             live_sdk=live_sdk,
@@ -1289,6 +1532,73 @@ def _ask_live_sdk_enabled(args: argparse.Namespace) -> bool:
     return cli_default_live_sdk()
 
 
+def _estimate_ask_openai_requests(
+    args: argparse.Namespace,
+    *,
+    input_text: str,
+    live_sdk: bool,
+    live_manual_plan: bool,
+) -> dict[str, Any]:
+    if not live_sdk:
+        return {"min": 0, "max": 0, "stages": []}
+    stages: list[str] = []
+    maximum = 0
+    if live_manual_plan:
+        stages.append("manual_request_planner")
+        maximum += 1
+    if _context_file_is_work_item_source_bundle(args.context_file):
+        stages.append("outreach_composer_synthesis")
+        maximum += 1
+    elif args.agent is not None:
+        stages.append(f"{args.agent}_sdk")
+        maximum += resolve_sdk_turn_policy(
+            args.agent,
+            request_text=input_text,
+            live_search=bool(args.live_search),
+        ).max_turns
+    else:
+        manager_steps = max(1, int(args.max_manager_steps or 1))
+        stages.extend(f"manager_specialist_step_{index}" for index in range(1, manager_steps + 1))
+        stages.append("final_response_synthesis")
+        maximum += manager_steps * 6 + 1
+    return {
+        "min": len(stages),
+        "max": maximum,
+        "stages": stages,
+        "note": "Maximum uses configured SDK turn limits; provider retries are a stop event.",
+        "request_text_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:12],
+    }
+
+
+def _print_ask_request_budget_blocked(
+    *,
+    json_output: bool,
+    requested_limit: int,
+    estimate: dict[str, Any],
+) -> int:
+    payload = {
+        "status": "blocked",
+        "block_kind": "openai_request_budget_exceeded",
+        "message": (
+            "The live command was blocked before any model call because its estimated "
+            "request count exceeds the declared per-command ceiling."
+        ),
+        "requested_limit": requested_limit,
+        "estimated_requests": estimate,
+        "openai_requests_made": 0,
+        "send_enabled": False,
+    }
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(payload["message"])
+        print(
+            f"Estimated requests: {estimate.get('min')}–{estimate.get('max')}; "
+            f"declared ceiling: {requested_limit}."
+        )
+    return 2
+
+
 def _skip_live_manual_plan_for_request(
     input_text: str,
     *,
@@ -1535,6 +1845,18 @@ def _context_file_is_slack_context(context_file_path: str) -> bool:
     return schema.startswith("keystone.slack.")
 
 
+def _context_file_is_work_item_source_bundle(context_file_path: str) -> bool:
+    if not context_file_path:
+        return False
+    try:
+        data = json.loads(Path(context_file_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and str(data.get("schema") or "").strip() == (
+        "keystone.work_item.source_bundle.v1"
+    )
+
+
 def _slack_context_metadata(context_file_path: str) -> dict[str, str]:
     metadata = {
         "channel_id": "C0BA17Y9C01",
@@ -1705,6 +2027,7 @@ def _run_ask_work_item(
     live_sdk: bool,
     max_results: int,
     json_output: bool,
+    live_rss_slack_read: bool = False,
     max_manager_steps: int = 3,
     manual_plan: ManualRequestPlan | None = None,
     orchestrator_preflight: OrchestratorPreflight | None = None,
@@ -1733,6 +2056,7 @@ def _run_ask_work_item(
             database_url=database_url,
             live_search=live_search,
             live_sdk=live_sdk,
+            live_rss_slack_read=live_rss_slack_read,
             max_results=max_results,
             manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
             orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
@@ -3487,14 +3811,26 @@ def _context_agent_blocker_messages(output: object) -> list[dict[str, str]]:
     return [{"message": str(item)} for item in output.get("blockers") or [] if str(item)]
 
 
-def _context_agent_blocked_write_attempts(output: object) -> list[str]:
+def _context_agent_blocked_write_attempts(
+    output: object,
+    *,
+    tool_receipts: list[dict[str, object]] | None = None,
+) -> list[str]:
     if not isinstance(output, dict):
         return []
     agent_name = str(output.get("agent_name") or "")
     blockers = [str(item) for item in output.get("blockers") or [] if str(item)]
     if blockers:
         return [f"{agent_name}: blocked write request pending exact target and approval"]
-    return [f"{agent_name}: no write attempted in dry-run"]
+    failed_receipts = [
+        receipt
+        for receipt in list(tool_receipts or [])
+        if str(receipt.get("status") or "").lower()
+        in {"blocked", "error", "failed", "verification_failed"}
+    ]
+    if failed_receipts:
+        return [f"{agent_name}: provider write or cleanup did not verify"]
+    return []
 
 
 def _context_agent_human_summary(output: object) -> str:
@@ -3839,6 +4175,11 @@ def _run_ask_context_agent_live(
         getattr(agent, "name", None),
         model_override=getattr(agent, "model", None),
     )
+    turn_policy = resolve_sdk_turn_policy(
+        route,
+        request_text=input_text,
+        live_search=False,
+    )
     output_type = spec.resolve_output_schema()
     live_read_env_names = {
         "airtable_context_agent": AIRTABLE_LIVE_READS_ENV,
@@ -3861,7 +4202,7 @@ def _run_ask_context_agent_live(
                 "entrypoint": "cli.ask",
                 "mode": "live_sdk",
             },
-            max_turns=8,
+            max_turns=turn_policy.max_turns,
         )
     finally:
         if live_read_env_name:
@@ -3870,11 +4211,31 @@ def _run_ask_context_agent_live(
             else:
                 os.environ[live_read_env_name] = previous_live_reads
     output_payload = output.model_dump(mode="json")
+    tool_receipts = _context_agent_tool_receipts(raw_result)
+    external_write_performed = _context_agent_external_write_performed(tool_receipts)
+    _reconcile_context_agent_executed_write_plan(output_payload, tool_receipts)
     review = review_specialist_output(
         agent_name=route,
         output=output_payload,
         request_summary=input_text,
         run_type="live_sdk",
+    )
+    review_payload = review.model_dump(mode="json")
+    review_payload["audit_notes"] = [
+        note
+        for note in list(review_payload.get("audit_notes") or [])
+        if not str(note).startswith("No model, network, email")
+    ]
+    review_payload["audit_notes"].append(
+        "The deterministic review made no additional model or provider calls; the "
+        "specialist execution is reported separately in model_execution and tool_receipts."
+    )
+    approval_references = list(
+        dict.fromkeys(
+            str(receipt.get("approval_reference") or "")
+            for receipt in tool_receipts
+            if str(receipt.get("approval_reference") or "").strip()
+        )
     )
     payload = {
         "mode": "live_sdk",
@@ -3890,8 +4251,9 @@ def _run_ask_context_agent_live(
         "sdk_session": sdk_session_spec.log_metadata() if sdk_session_spec else None,
         "cost_tracking_requested": cost_tracking_requested,
         "output_type": type(output).__name__,
-        "orchestrator_review": review.model_dump(mode="json"),
+        "orchestrator_review": review_payload,
         "output": output_payload,
+        "tool_receipts": tool_receipts,
         "human_summary": _context_agent_human_summary(output_payload),
         "blockers": _context_agent_blocker_messages(output_payload),
         "side_effects": {
@@ -3902,29 +4264,35 @@ def _run_ask_context_agent_live(
             "slack_message_posted": False,
             "crm_write_performed": False,
             "calendar_write_performed": False,
-            "external_file_write_performed": False,
-            "external_write_performed": False,
-            "blocked_write_attempts": _context_agent_blocked_write_attempts(output_payload),
-            "approval_ref": "",
+            "external_file_write_performed": bool(
+                route == "google_workspace_context_agent" and external_write_performed
+            ),
+            "external_write_performed": external_write_performed,
+            "blocked_write_attempts": _context_agent_blocked_write_attempts(
+                output_payload,
+                tool_receipts=tool_receipts,
+            ),
+            "approval_ref": ",".join(approval_references),
             "evidence_complete": True,
         },
     }
-    usage = getattr(raw_result, "usage", None)
-    if usage is not None:
-        payload["usage"] = getattr(usage, "model_dump", lambda **_: str(usage))(mode="json")
+    usage = extract_sdk_usage(raw_result)
+    if usage.get("available"):
+        payload["usage"] = usage
         payload["cost"] = estimate_usage_cost(
             provider=model_config.provider,
             model=model_config.model,
-            usage=payload["usage"] if isinstance(payload["usage"], dict) else {},
+            usage=usage,
         )
     payload["model_execution"] = {
         "provider": model_config.provider,
         "model": model_config.model,
         "run_mode": "live_sdk",
-        "usage_available": isinstance(payload.get("usage"), dict),
+        "usage_available": bool(usage.get("available")),
         "cost_available": isinstance(payload.get("cost"), dict),
         "base_url_configured": bool(model_config.base_url),
         "gateway_mode": bool(model_config.use_responses is False and model_config.base_url),
+        "sdk_turn_policy": turn_policy.metadata(),
     }
     try:
         run_id = SQLiteStore(database_url or database_url_from_env()).save_agent_run(
@@ -3940,6 +4308,167 @@ def _run_ask_context_agent_live(
     except Exception as exc:  # pragma: no cover - diagnostic metadata only
         payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
     return _print_ask_live_payload(payload, json_output=json_output)
+
+
+def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
+    """Return bounded, content-safe provider receipts from SDK tool outputs."""
+
+    receipts: list[dict[str, object]] = []
+    for item in list(getattr(raw_result, "new_items", []) or []):
+        if str(getattr(item, "type", "")) != "tool_call_output_item":
+            continue
+        raw_output = getattr(item, "output", "")
+        if isinstance(raw_output, str):
+            try:
+                parsed = json.loads(raw_output)
+            except json.JSONDecodeError:
+                continue
+        elif isinstance(raw_output, dict):
+            parsed = raw_output
+        else:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        verification = parsed.get("verification")
+        safe_verification = (
+            {
+                key: verification.get(key)
+                for key in (
+                    "status",
+                    "passed",
+                    "record_id_match",
+                    "matched_fields",
+                    "mismatched_fields",
+                    "provider_deleted",
+                    "record_absent_after",
+                    "item_key_match",
+                    "item_type_note",
+                    "marker_present",
+                    "note_match",
+                    "item_absent_after",
+                    "attachment_count_before",
+                    "attachment_count_after",
+                    "spreadsheet_id_match",
+                    "title_match",
+                    "mime_type_match",
+                    "trashed",
+                    "trashed_match",
+                    "row_count_match",
+                    "values_match",
+                    "verified_row_count",
+                    "row_found",
+                    "row_number",
+                    "row_count_delta",
+                    "row_absent",
+                    "artifact_exists",
+                    "file_signature_valid",
+                    "parent_hash_match",
+                    "parent_mtime_match",
+                    "artifact_absent_after",
+                )
+                if key in verification
+            }
+            if isinstance(verification, dict)
+            else {}
+        )
+        receipt = {
+            key: parsed.get(key)
+            for key in (
+                "status",
+                "operation",
+                "table",
+                "record_id",
+                "item_key",
+                "parent_item_key",
+                "document_id",
+                "file_id",
+                "spreadsheet_id",
+                "title",
+                "folder_path",
+                "sheet_name",
+                "row_count",
+                "row_number",
+                "key_column",
+                "key_value",
+                "deleted_row_index",
+                "updated_range",
+                "trashed",
+                "query",
+                "mime_type",
+                "item_count",
+                "char_count",
+                "truncated",
+                "slide_number",
+                "output_format",
+                "artifact_path",
+                "artifact_size",
+                "artifact_sha256",
+                "parent_content_sha256",
+                "parent_modified",
+                "derived_copy_created",
+                "approval_reference",
+                "required_marker",
+                "send_enabled",
+            )
+            if key in parsed
+        }
+        if safe_verification:
+            receipt["verification"] = safe_verification
+        if receipt:
+            receipts.append(receipt)
+    return receipts[:12]
+
+
+def _context_agent_external_write_performed(
+    tool_receipts: list[dict[str, object]],
+) -> bool:
+    """Classify successful typed context-agent provider mutations."""
+
+    write_operations = {
+        "create",
+        "update",
+        "delete",
+        "delete_test_record",
+        "delete_test_note",
+        "create_sheet",
+        "append_rows",
+        "update_row",
+        "delete_rows",
+        "trash_sheet",
+        "create_note",
+        "update_note",
+        "link_attachment",
+        "extract_slide_copy",
+        "delete_test_slide_artifact",
+    }
+    return any(
+        receipt.get("operation") in write_operations
+        and receipt.get("status") == "success"
+        for receipt in tool_receipts
+    )
+
+
+def _reconcile_context_agent_executed_write_plan(
+    output_payload: dict[str, object],
+    tool_receipts: list[dict[str, object]],
+) -> None:
+    """Align a direct-agent write plan with authoritative verified tool execution."""
+
+    verified_write = False
+    for receipt in tool_receipts:
+        verification = receipt.get("verification")
+        if (
+            receipt.get("status") == "success"
+            and isinstance(verification, dict)
+            and verification.get("passed") is True
+        ):
+            verified_write = True
+            break
+    write_plan = output_payload.get("write_plan")
+    if not verified_write or not isinstance(write_plan, dict):
+        return
+    write_plan["live_write_allowed_for_specialist"] = True
+    write_plan["approval_reference_needed"] = False
 
 
 def _run_ask_company_research_live(
@@ -4163,6 +4692,73 @@ def _run_ask_gmail_triage_live(
             sdk_session_history_limit=sdk_session_spec.history_limit if sdk_session_spec else None,
             cost_tracking_requested=cost_tracking_requested,
         )
+    if gmail_plan.operation == "update_draft":
+        if not (gmail_plan.draft_subject_hint or gmail_plan.draft_recipient_hint):
+            return _print_ask_clarification(
+                "gmail_triage",
+                input_text,
+                (
+                    "Name the Gmail draft by subject and/or recipient so exactly one "
+                    "provider draft can be resolved before modification."
+                ),
+                json_output=json_output,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                extra={
+                    "status": "clarification_required",
+                    "block_kind": "missing_gmail_draft_reference",
+                    "send_enabled": False,
+                    "agent_execution_plan": gmail_plan.model_dump(mode="json"),
+                },
+            )
+        expected_account = _configured_gmail_draft_account()
+        if not expected_account:
+            return _print_ask_clarification(
+                "gmail_triage",
+                input_text,
+                "Gmail draft modification requires a configured target Gmail account.",
+                json_output=json_output,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                extra={
+                    "status": "blocked",
+                    "block_kind": "missing_gmail_draft_account",
+                    "send_enabled": False,
+                    "agent_execution_plan": gmail_plan.model_dump(mode="json"),
+                },
+            )
+        command = [
+            sys.executable,
+            "scripts/run_gmail_triage.py",
+            "--live-gmail",
+            "--allow-inbox",
+            "--no-dry-run",
+            "--live-sdk",
+            "--json",
+            "--request",
+            input_text,
+            "--update-draft",
+            "--approval-reference",
+            _gmail_operator_approval_reference(input_text),
+            "--expected-account",
+            expected_account,
+        ]
+        if gmail_plan.draft_subject_hint:
+            command.extend(["--draft-subject-hint", gmail_plan.draft_subject_hint])
+        if gmail_plan.draft_recipient_hint:
+            command.extend(["--draft-recipient-hint", gmail_plan.draft_recipient_hint])
+        return _run_ask_script_live(
+            "gmail_triage",
+            input_text,
+            command,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_spec=sdk_session_spec,
+            agent_execution_plan=gmail_plan.model_dump(mode="json"),
+            cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
+        )
     if gmail_plan.operation == "priority_grouping" and gmail_plan.live_read_required:
         command = [
             sys.executable,
@@ -4181,6 +4777,65 @@ def _run_ask_gmail_triage_live(
         ]
         if gmail_plan.gmail_query:
             command.extend(["--gmail-query", gmail_plan.gmail_query])
+        return _run_ask_script_live(
+            "gmail_triage",
+            input_text,
+            command,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_spec=sdk_session_spec,
+            agent_execution_plan=gmail_plan.model_dump(mode="json"),
+            cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
+        )
+    if (
+        gmail_plan.operation == "draft_reply"
+        and explicit_fixture_path is None
+        and inline_fixture is None
+        and _gmail_query_has_specific_target(gmail_plan.gmail_query)
+    ):
+        command = [
+            sys.executable,
+            "scripts/run_gmail_triage.py",
+            "--live-gmail",
+            "--allow-inbox",
+            "--no-dry-run",
+            "--live-sdk",
+            "--json",
+            "--request",
+            input_text,
+            "--gmail-query",
+            gmail_plan.gmail_query,
+            "--max-messages",
+            "1",
+        ]
+        if gmail_plan.create_gmail_drafts:
+            expected_account = _configured_gmail_draft_account()
+            if not expected_account:
+                return _print_ask_clarification(
+                    "gmail_triage",
+                    input_text,
+                    "Gmail draft creation requires a configured target Gmail account.",
+                    json_output=json_output,
+                    manual_plan=manual_plan,
+                    orchestrator_preflight=orchestrator_preflight,
+                    extra={
+                        "status": "blocked",
+                        "block_kind": "missing_gmail_draft_account",
+                        "send_enabled": False,
+                        "agent_execution_plan": gmail_plan.model_dump(mode="json"),
+                    },
+                )
+            command.extend(
+                [
+                    "--create-draft",
+                    "--approval-reference",
+                    _gmail_operator_approval_reference(input_text),
+                    "--expected-account",
+                    expected_account,
+                ]
+            )
         return _run_ask_script_live(
             "gmail_triage",
             input_text,
@@ -4289,6 +4944,31 @@ def _run_ask_gmail_triage_live(
                 temp_path.unlink()
             except OSError:
                 pass
+
+
+def _gmail_query_has_specific_target(query: str) -> bool:
+    remainder = re.sub(
+        r"^(?:newer_than:\d+d|after:\d{4}/\d{2}/\d{2})\s*",
+        "",
+        str(query or "").strip(),
+    )
+    return bool(remainder.strip())
+
+
+def _configured_gmail_draft_account() -> str:
+    for key in (
+        "KEYSTONE_GMAIL_DRAFT_ACCOUNT",
+        "KNI_BUSINESS_AGENTS_GMAIL_DRAFT_ACCOUNT",
+    ):
+        value = str(os.getenv(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _gmail_operator_approval_reference(input_text: str) -> str:
+    digest = hashlib.sha256(str(input_text).strip().encode("utf-8")).hexdigest()[:16]
+    return f"operator-command:gmail-draft:{digest}"
 
 
 def _gmail_direct_fixture_path(input_text: str) -> Path | None:
@@ -5069,6 +5749,7 @@ def _run_work_items_advance(args: argparse.Namespace) -> int:
         database_url=args.database_url,
         live_search=args.live_search,
         live_sdk=args.live_sdk,
+        live_rss_slack_read=args.live_rss_slack_read,
         max_results=args.max_results,
         context_file_path=args.context_file,
         manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,

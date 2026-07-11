@@ -1324,7 +1324,26 @@ def compose_outreach_draft_llm_constrained(
     raw_source_ids = payload.get("source_ids_used")
     if not isinstance(raw_source_ids, list):
         raise ValueError("LLM draft must include source_ids_used as a list")
-    source_ids_used = list(dict.fromkeys(str(source_id) for source_id in raw_source_ids))
+    advisory_source_ids = {
+        str(context.email_style_profile.source_id)
+        if context.email_style_profile is not None
+        else "",
+        str(context.outreach_template.template_id)
+        if context.outreach_template is not None
+        else "",
+        *(
+            str(example.source_id)
+            for example in context.example_guidance
+            if example.source_id
+        ),
+    }
+    source_ids_used = list(
+        dict.fromkeys(
+            str(source_id)
+            for source_id in raw_source_ids
+            if str(source_id) not in advisory_source_ids
+        )
+    )
     facts_used = _facts_for_source_ids(source_ids_used, context)
     raw_text_fields = "\n".join(
         str(payload.get(key) or "")
@@ -1629,10 +1648,12 @@ def run_outreach_composer_sdk(
     session: Any | None = None,
     context_flags: Mapping[str, bool] | None = None,
     max_turns: int | None = None,
+    attach_tools: bool = True,
 ) -> TypedAgentRunResult[OutreachDraft]:
     """Run Outreach Composer through the typed SDK harness."""
 
-    include_tools = True
+    include_tools = attach_tools
+    provider_is_gemini = False
     if live and run_config is None:
         from keystone_agents.model_provider import (
             GEMINI_PROVIDER,
@@ -1640,8 +1661,10 @@ def run_outreach_composer_sdk(
         )
 
         model_config = get_runtime_agent_model_config("outreach_composer", model_override=model)
-        include_tools = model_config.provider != GEMINI_PROVIDER
-    if not include_tools:
+        provider_is_gemini = model_config.provider == GEMINI_PROVIDER
+        if provider_is_gemini:
+            include_tools = False
+    if provider_is_gemini:
         raise RuntimeError(
             "run_outreach_composer_sdk does not support compact Gemini conversion; "
             "use the Outreach Composer CLI SDK synthesis path."
@@ -1666,3 +1689,111 @@ def run_outreach_composer_sdk(
         session=session,
         max_turns=turn_policy.max_turns,
     )
+
+
+def run_outreach_composer_constrained_sdk(
+    typed_input: OutreachComposerSDKInput | str,
+    *,
+    approved_drafting_context: ApprovedOutreachDraftingContext | dict[str, Any],
+    evidence_output_path: str | Path | None = None,
+    run_config: Any | None = None,
+    live: bool = False,
+    model: str | None = None,
+    session: Any | None = None,
+    max_turns: int | None = None,
+    workflow_name: str | None = None,
+    trace_metadata: Mapping[str, Any] | None = None,
+) -> TypedAgentRunResult[OutreachDraft]:
+    """Run compact synthesis and optionally persist a bounded atomic evidence receipt."""
+
+    context = (
+        approved_drafting_context
+        if isinstance(approved_drafting_context, ApprovedOutreachDraftingContext)
+        else ApprovedOutreachDraftingContext.model_validate(approved_drafting_context)
+    )
+    turn_policy = resolve_sdk_turn_policy(
+        "outreach_composer",
+        request_text=skill_request_text(typed_input),
+        explicit_max_turns=max_turns,
+    )
+    compact_result = run_typed_sdk_agent(
+        agent=build_outreach_composer_compact_synthesis_agent(
+            model=model,
+            request_text=skill_request_text(typed_input),
+        ),
+        typed_input=typed_input,
+        output_type=OutreachLLMDraftPayload,
+        run_config=run_config,
+        live=live,
+        session=session,
+        max_turns=turn_policy.max_turns,
+        workflow_name=workflow_name,
+        trace_metadata=trace_metadata,
+    )
+    compact_payload = compact_result.output.model_dump(mode="json")
+    if isinstance(typed_input, OutreachComposerSDKInput):
+        if typed_input.contact_name and not compact_payload.get("contact_name"):
+            compact_payload["contact_name"] = typed_input.contact_name
+        if typed_input.contact_title and not compact_payload.get("contact_title"):
+            compact_payload["contact_title"] = typed_input.contact_title
+    if evidence_output_path is not None:
+        _write_constrained_outreach_evidence(
+            evidence_output_path,
+            {
+                "schema_version": "keystone.outreach.constrained_sdk_evidence.v1",
+                "status": "compact_received",
+                "agent_name": compact_result.agent_name,
+                "live": compact_result.live,
+                "compact_output": compact_payload,
+                "usage": compact_result.usage,
+                "cost": compact_result.cost,
+                "budget_guard": compact_result.budget_guard,
+                "request_cache": compact_result.request_cache,
+            },
+        )
+    draft = compose_outreach_draft_llm_constrained(
+        approved_context=context,
+        llm_draft_payload=compact_payload,
+        fallback_to_fixture=False,
+    )
+    result = TypedAgentRunResult(
+        agent_name=compact_result.agent_name,
+        output=draft,
+        raw_result=compact_result.raw_result,
+        live=compact_result.live,
+        usage=compact_result.usage,
+        cost=compact_result.cost,
+        budget_guard=compact_result.budget_guard,
+        request_cache=compact_result.request_cache,
+    )
+    if evidence_output_path is not None:
+        _write_constrained_outreach_evidence(
+            evidence_output_path,
+            {
+                "schema_version": "keystone.outreach.constrained_sdk_evidence.v1",
+                "status": "completed",
+                "agent_name": result.agent_name,
+                "live": result.live,
+                "compact_output": compact_payload,
+                "output": result.output.model_dump(mode="json"),
+                "usage": result.usage,
+                "cost": result.cost,
+                "budget_guard": result.budget_guard,
+                "request_cache": result.request_cache,
+            },
+        )
+    return result
+
+
+def _write_constrained_outreach_evidence(
+    output_path: str | Path,
+    payload: dict[str, Any],
+) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)

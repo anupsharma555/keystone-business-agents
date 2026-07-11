@@ -25,6 +25,9 @@ GOOGLE_WORKSPACE_READ_TOOL_NAMES = (
     "google_drive_list_folder",
     "google_drive_search_files",
     "google_drive_get_file_metadata",
+    "google_slide_deck_read",
+    "presentation_search_local",
+    "presentation_read_local",
     "google_sheet_list",
     "google_sheet_read_table",
 )
@@ -203,7 +206,10 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         tools=(
             "get_gmail_message",
             "apply_gmail_labels",
+            "modify_gmail_message_state",
+            "create_gmail_draft_with_attachment",
             "create_gmail_draft_reply",
+            "send_gmail_test_draft",
             "load_email_style_profile",
             "list_local_context_sources",
             "search_local_context",
@@ -221,12 +227,15 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         eval_datasets=("evals/static/gmail_triage_cases.json", "evals/local/gmail_triage.jsonl"),
         validation_paths=("tests/test_gmail_triage.py", "tests/test_sdk_execution.py"),
         handoff_description=(
-            "Classify inbound email, recommend labels, flag risk, and request drafts only."
+            "Classify inbound email, own exact scoped mailbox-state changes, flag risk, "
+            "and request drafts only."
         ),
         safety_notes=(
             "Draft-only replies",
+            "Derived PNG/PDF attachments require an exact recipient, approval, and dedicated gate",
             "No PHI processing",
             "Human approval required before outbound copy is used",
+            "Mailbox-state writes require exact message identity, scoped approval, a dedicated live gate, and provider read-back",
             "Google Workspace writes require live flags and approval references",
         ),
     ),
@@ -396,21 +405,27 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "airtable_read_records",
             "airtable_write_record",
             "airtable_upload_attachment",
+            "airtable_link_attachment",
             "airtable_create_expense_from_receipt",
+            "airtable_delete_test_record",
         ),
         live_flags_required=("--live-sdk",),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
         validation_paths=("tests/test_agent_registry.py", "tests/test_chief_of_staff.py"),
         handoff_description=(
             "Read Airtable base, table, field, and candidate record context, perform "
-            "direct approved create/update writes, or return nested reviewable "
+            "direct approved create/update writes, clean up provider-verified test "
+            "records, or return nested reviewable "
             "write-plan guidance for specialist/action-handler execution."
         ),
         safety_notes=(
             "Direct writes require live flags and approval references",
+            "Live record writes should validate values against schema field types",
+            "Receipt files or HTTPS links require the dedicated attachment tools",
             "No nested live writes",
             "Chief of Staff owns review and approval handoff when this agent is nested",
             "Return blockers when record identity or field mapping is ambiguous",
+            "Test deletion requires exact identity, approval, and KBA_TEST_RECORD proof",
         ),
         handoff_enabled=True,
     ),
@@ -435,9 +450,15 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         tools=(
             "google_doc_read",
             "google_doc_write",
+            "google_doc_trash",
             "google_drive_list_folder",
             "google_drive_search_files",
             "google_drive_get_file_metadata",
+            "google_slide_deck_read",
+            "presentation_search_local",
+            "presentation_read_local",
+            "presentation_extract_slide_copy_local",
+            "presentation_delete_test_artifact_local",
             "google_drive_create_folder",
             "google_drive_rename_folder",
             "google_drive_remove_folder",
@@ -504,12 +525,15 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         validation_paths=("tests/test_agent_registry.py", "tests/test_chief_of_staff.py"),
         handoff_description=(
             "Read local/API Zotero library, collection, item, article, importer, and "
-            "evidence context, perform direct approved Workspace artifact writes, "
+            "evidence context, perform direct approved Workspace artifact writes or "
+            "marked disposable note, collection, and webpage-item lifecycles, "
             "or return detailed reviewable artifact and follow-up guidance."
         ),
         safety_notes=(
             "Direct backend importer writes require live flags and approval references",
-            "No Zotero library mutation except through the guarded backend importer",
+            "Ordinary Zotero library mutation is unsupported",
+            "Native note mutation is limited to versioned KBA_TEST_NOTE lifecycle tools",
+            "Native collection/item mutation is limited to versioned KBA_TEST_COLLECTION and KBA_TEST_ITEM lifecycle tools",
             "Chief of Staff owns review and approval handoff when this agent is nested",
             "Return blockers when library, collection, article, or item identity is ambiguous",
         ),
@@ -608,7 +632,7 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
         "business_research_analyst_research_brief",
         "opportunity_scout_read_only",
     ),
-    live_flags_required=("--live-sdk",),
+    live_flags_required=("--live-sdk", "KEYSTONE_GOOGLE_CALENDAR_ALLOW_WRITES=true"),
     eval_datasets=("evals/local/orchestrator_routing.jsonl", "evals/local/safety_refusals.jsonl"),
     validation_paths=(
         "tests/test_orchestrator.py",
@@ -674,6 +698,10 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
             "search_web",
             "airtable_get_base_schema",
             "airtable_read_records",
+            "create_google_calendar_event",
+            "update_google_calendar_event",
+            "delete_google_calendar_event",
+            "read_google_calendar_window",
             *WEB_STRUCTURING_TOOL_NAMES,
         *PLAYWRIGHT_RESEARCH_TOOL_NAMES,
         *BROWSER_DIAGNOSTIC_TOOL_NAMES,
@@ -683,7 +711,7 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         "file_search",
         *(specialist_agent_tool_name(spec.route_name) for spec in SPECIALIST_AGENT_SPECS),
     ),
-    live_flags_required=("--live-sdk",),
+    live_flags_required=("--live-sdk", "KEYSTONE_GOOGLE_CALENDAR_ALLOW_WRITES=true"),
     eval_datasets=(),
     validation_paths=("tests/test_chief_of_staff.py",),
     handoff_description=(
@@ -695,12 +723,13 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         "Internal review writes only through typed tools",
         "Hosted file search attaches only with explicit vector store configuration",
         "No unscoped public Slack posts",
-        "No Gmail sends or calendar writes",
+        "No Gmail sends; Calendar writes require the dedicated exact-event tools and gate",
         "Human approval required before outbound Slack copy is used",
         "Keystone Slack repo access is read-only and secret-filtered",
         "Full article reading is default-off and enabled only by explicit natural-language request",
         "Airtable, Google Workspace, Gmail, and Zotero writes are executed by "
-        "the owning specialist or approved action handler, not by Chief direct tools",
+        "the owning specialist or approved action handler; Chief may directly execute "
+        "exact approved Calendar actions through its dedicated tools",
     ),
 )
 

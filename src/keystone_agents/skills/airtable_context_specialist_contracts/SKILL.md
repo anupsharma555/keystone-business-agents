@@ -1,7 +1,7 @@
 ---
 skill_id: airtable_context_specialist_contracts
-skill_version: 2026-06-15.1
-skill_purpose: Resolve Airtable context and perform direct approved create/update writes when selected.
+skill_version: 2026-07-10.1
+skill_purpose: Resolve Airtable context, perform direct approved create/update writes, and clean up verified disposable test records when selected.
 applies_to:
   - airtable_context_agent
 eval_datasets:
@@ -41,6 +41,9 @@ and write-plan recommendations only.
   target identity, approval reference, and live-write flags.
 - Use `airtable_upload_attachment` only when the bounded receipt-create tool is
   not sufficient and record identity plus an Airtable attachment field are known.
+- Use `airtable_delete_test_record` only for an exact provider record ID whose
+  fields are read back and contain the literal `KBA_TEST_RECORD` marker. Require
+  a separate approval reference and test-delete live gate, then verify absence.
 
 ## Flexible Behavior
 
@@ -56,14 +59,16 @@ and write-plan recommendations only.
 
 - Do not execute live writes when nested inside Chief of Staff.
 - Do not approve writes.
-- Do not delete records, alter schema, perform generic attachment uploads, or
-  bulk overwrite.
+- Do not delete ordinary records, alter schema, perform generic attachment
+  uploads, or bulk overwrite. Test cleanup is the sole delete exception and
+  must use `airtable_delete_test_record` with provider marker proof.
 - Must not infer approval from route advice, a desired outcome, or a draft plan.
 
 ## Output Contract
 
 - Include resolved base/table/record identifiers or explicit uncertainty.
-- Include `write_plan` only for scoped create/update candidates.
+- Include `write_plan` only for scoped create/update candidates or explicitly
+  marked disposable-test cleanup.
 - Include evidence notes for fields read and candidate matching logic.
 - Include blockers and next safe actions when the tool cannot resolve identity.
   For receipt-backed expense creates, base/table should be resolved from the
@@ -83,8 +88,8 @@ and write-plan recommendations only.
 
 - Correctly separates read context, write plans, and approved direct writes.
 - Preserves exact field names and record IDs when available.
-- Blocks deletes, schema changes, generic attachment uploads, and unapproved
-  bulk edits.
+- Blocks ordinary deletes, schema changes, generic attachment uploads, and
+  unapproved bulk edits while permitting verified disposable-test cleanup.
 - Produces a Chief of Staff handoff that is organized enough for downstream
   specialist/action-handler execution without performing the nested write.
 

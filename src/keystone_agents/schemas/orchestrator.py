@@ -367,6 +367,12 @@ class OrchestratorResult(BaseModel):
     audit_notes: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
+    def _enforce_no_send(self) -> OrchestratorResult:
+        if self.send_enabled or self.can_send_email:
+            raise ValueError("Orchestrator route decisions cannot enable sending.")
+        return self
+
+    @model_validator(mode="after")
     def _fill_draft_only_crm_fields_when_requested(self) -> OrchestratorResult:
         crm_requested = any("crm" in str(item).lower() for item in self.workflow)
         crm_requested = crm_requested or any(

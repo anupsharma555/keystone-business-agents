@@ -313,9 +313,13 @@ class ZoteroContextResult(BaseModel):
         )
     )
     zotero_write_supported: bool = False
+    zotero_test_note_write_supported: bool = True
+    zotero_test_library_write_supported: bool = True
     backend_importer_supported: bool = True
     direct_workspace_write_supported: bool = True
     executed_import_results: list[OperationalContextEntry] = Field(default_factory=list)
+    executed_note_results: list[OperationalContextEntry] = Field(default_factory=list)
+    executed_library_results: list[OperationalContextEntry] = Field(default_factory=list)
     executed_workspace_write_results: list[OperationalContextEntry] = Field(default_factory=list)
     recommended_actions: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
@@ -350,7 +354,13 @@ class ZoteroContextResult(BaseModel):
     def _clean_diagnostics(cls, value: object) -> list[OperationalContextEntry]:
         return _clean_entries(value)
 
-    @field_validator("executed_import_results", "executed_workspace_write_results", mode="before")
+    @field_validator(
+        "executed_import_results",
+        "executed_note_results",
+        "executed_library_results",
+        "executed_workspace_write_results",
+        mode="before",
+    )
     @classmethod
     def _clean_executed_results(cls, value: object) -> list[OperationalContextEntry]:
         return _clean_entries(value)
@@ -359,6 +369,8 @@ class ZoteroContextResult(BaseModel):
     def _force_agent_name_and_boundary(self) -> ZoteroContextResult:
         self.agent_name = "zotero_context_agent"
         self.zotero_write_supported = False
+        self.zotero_test_note_write_supported = True
+        self.zotero_test_library_write_supported = True
         self.recommended_artifact_plan.target_system = "google_workspace"
         self.recommended_artifact_plan.live_write_allowed_for_specialist = False
         return self

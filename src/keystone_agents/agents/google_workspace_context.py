@@ -12,6 +12,7 @@ from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.tools.internal_data_tools import (
     google_doc_read,
+    google_doc_trash,
     google_doc_write,
     google_drive_create_folder,
     google_drive_get_file_metadata,
@@ -29,6 +30,11 @@ from keystone_agents.tools.internal_data_tools import (
     google_sheet_trash,
     google_sheet_update_row,
     google_sheet_update_tab,
+    google_slide_deck_read,
+    presentation_delete_test_artifact_local,
+    presentation_extract_slide_copy_local,
+    presentation_read_local,
+    presentation_search_local,
 )
 
 
@@ -37,8 +43,14 @@ def _google_workspace_context_tools(*, tool_tier: str | int | None = None) -> li
         google_drive_list_folder,
         google_drive_search_files,
         google_drive_get_file_metadata,
+        google_slide_deck_read,
+        presentation_search_local,
+        presentation_read_local,
+        presentation_extract_slide_copy_local,
+        presentation_delete_test_artifact_local,
         google_doc_read,
         google_doc_write,
+        google_doc_trash,
         google_drive_create_folder,
         google_drive_rename_folder,
         google_drive_remove_folder,

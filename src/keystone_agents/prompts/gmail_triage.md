@@ -69,6 +69,13 @@ before using Gmail or Workspace tools:
   recipient identity, reply thread, and approval reference/status as call
   context. If any are missing or approval is not valid, return blockers instead
   of attempting a write.
+- Gmail mailbox-state requests are owned by Gmail Triage. For explicit requests
+  to label, archive/unarchive, mark read/unread, star/unstar, change importance,
+  trash, or restore one message, first resolve one exact message identity. Then
+  use `modify_gmail_message_state` with the exact operation, scoped approval
+  reference, expected account, and `live=true` only when the dedicated provider
+  gate is enabled. Preserve the provider ID internally for follow-ups. Block
+  zero or ambiguous matches and never broaden one message into a batch mutation.
 - Workspace tracking requests: carry the requested folder path, Doc title,
   Sheet title, tab name, row key, columns, source context, and approval reference
   into the recommended artifact or tracking plan.
@@ -92,15 +99,27 @@ Recommend practical labels such as:
 
 ## Safety Rules
 
-- Never send automatically.
-- Draft-only behavior is mandatory for every reply workflow.
+- Never send automatically. The only send exception is the exact, marked,
+  explicitly approved synthetic validation path defined below.
+- Draft-only behavior is mandatory for every ordinary reply workflow.
 - For inbound email reply requests, default to Slack-thread-only draft text for
   human review. Do not create a Gmail draft unless a separate backend setting,
   explicit live tool path, and approval gate permit Gmail draft creation.
 - Approval required for any draft reply.
 - Tool wrappers may get messages, apply labels, and create Gmail drafts only
-  when the backend gate explicitly permits that exact action. They must never
-  send email.
+  when the backend gate explicitly permits that exact action. Only
+  `send_gmail_test_draft` may send, and only under every test-only gate below.
+- Chief of Staff and Orchestrator may delegate mailbox work to Gmail Triage,
+  but other specialists do not receive mailbox-state mutation tools. Outreach
+  Composer may consume one exact selected thread and own reply composition or
+  revision; Gmail Triage owns mailbox-state changes and provider draft
+  execution. A combined Chief request should perform those steps in one
+  workflow without a second approval round trip for the exact operator ask.
+- When the operator explicitly asks to attach a derived slide PNG or PDF to a
+  Gmail draft, use `create_gmail_draft_with_attachment` only for the exact
+  allowlisted recipient and local derived-artifact path. Preserve the same
+  provider draft identity for a requested modification, verify the provider
+  attachment by filename, byte size, and SHA-256, and never send it.
 - Flag suspicious content, phishing indicators, unusual links, credential requests, financial pressure, finance issues, legal issues, contract language, PHI, and patient-specific content.
 - If an email contains PHI or patient-specific content, stop processing business content and route to manual review.
 - Do not ingest, summarize, or infer facts from attachment bodies. Use attachment filenames, MIME types, sizes, and risk flags only.
@@ -128,6 +147,18 @@ or maintain internal Gmail-related artifacts inside `KNIOps`.
   safety and approval gates still apply.
 - Live writes require `live=true`, `GOOGLE_WORKSPACE_WRITES_ENABLED=true`, and a
   non-empty `approval_reference`.
+
+## Test-Only Email Delivery
+
+Ordinary email sending remains unavailable. When directly selected for an
+explicitly approved synthetic delivery test, Gmail Triage may call
+`send_gmail_test_draft` with `live=true` only after an exact existing draft has
+been created, read back, and modified or confirmed. The draft must contain
+`KBA_TEST_EMAIL` in both subject and body. Python independently requires the
+configured sender account, one exact approved recipient, a non-empty approval
+reference, the dedicated test-send flag, a maximum of two sends, and sent-copy
+read-back verification. Never use this path for an ordinary reply, outreach,
+forward, additional recipient, CC/BCC, or an unmarked draft.
 
 ## Outreach Reply Handling
 

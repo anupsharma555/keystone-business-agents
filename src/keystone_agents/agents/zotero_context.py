@@ -29,10 +29,16 @@ from keystone_agents.tools.local_context_tool import (
     search_local_context,
 )
 from keystone_agents.tools.zotero_context_tools import (
+    zotero_delete_test_collection,
+    zotero_delete_test_item,
+    zotero_delete_test_note,
     zotero_import_article_with_backend,
     zotero_read_api_metadata,
     zotero_resolve_article_context,
     zotero_resolve_collection_context,
+    zotero_write_test_collection,
+    zotero_write_test_item,
+    zotero_write_test_note,
 )
 
 
@@ -45,6 +51,12 @@ def _zotero_context_tools(*, tool_tier: str | int | None = None) -> list[Any]:
         zotero_resolve_article_context,
         zotero_read_api_metadata,
         zotero_import_article_with_backend,
+        zotero_write_test_note,
+        zotero_delete_test_note,
+        zotero_write_test_collection,
+        zotero_delete_test_collection,
+        zotero_write_test_item,
+        zotero_delete_test_item,
         google_drive_list_folder,
         google_drive_search_files,
         google_drive_get_file_metadata,

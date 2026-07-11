@@ -2415,8 +2415,8 @@ def review_specialist_output(
             "Orchestrator review used deterministic Python checks only.",
             f"Run type: {run_type}.",
             (
-                "No model, network, email, Slack, CRM, LinkedIn, scheduling, or "
-                "publishing calls were made."
+                "This deterministic review step made no model, network, email, Slack, "
+                "CRM, LinkedIn, scheduling, or publishing calls."
             ),
         ],
     )
@@ -2933,7 +2933,18 @@ def _route_from_manual_plan(
             result = _missing_outreach_context_refusal(workflow_state=workflow_state)
             result.audit_notes = [*result.audit_notes, *audit_notes]
             return result
-    if route in {"orchestrator", "clarification"}:
+    if route == "clarification":
+        return _result(
+            route="clarification",
+            rationale=plan.objective or "The manual request plan requires clarification.",
+            stop_reason="uncertain_input",
+            clarification_request=(
+                "Please identify the exact item and requested change before any action."
+            ),
+            workflow_state=workflow_state,
+            audit_notes=audit_notes,
+        )
+    if route == "orchestrator":
         return None
     if route == "outreach_composer":
         thread_local_draft = _looks_like_thread_local_draft_request(request_text)

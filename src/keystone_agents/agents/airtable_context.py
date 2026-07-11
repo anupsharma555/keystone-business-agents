@@ -12,7 +12,9 @@ from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.tools.internal_data_tools import (
     airtable_create_expense_from_receipt,
+    airtable_delete_test_record,
     airtable_get_base_schema,
+    airtable_link_attachment,
     airtable_read_records,
     airtable_upload_attachment,
     airtable_write_record,
@@ -24,8 +26,10 @@ def _airtable_context_tools(*, tool_tier: str | int | None = None) -> list[Any]:
         airtable_get_base_schema,
         airtable_read_records,
         airtable_write_record,
+        airtable_link_attachment,
         airtable_upload_attachment,
         airtable_create_expense_from_receipt,
+        airtable_delete_test_record,
     ]
     if tool_tier is None:
         return tools
@@ -39,6 +43,7 @@ def build_airtable_context_agent(
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
+    attach_tools: bool = True,
 ) -> Agent:
     """Build the Airtable context specialist."""
 
@@ -58,7 +63,7 @@ def build_airtable_context_agent(
         name="airtable_context_agent",
         instructions=instructions,
         output_type=AirtableContextResult,
-        tools=_airtable_context_tools(tool_tier=tool_tier),
+        tools=_airtable_context_tools(tool_tier=tool_tier) if attach_tools else [],
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="airtable_context_agent",

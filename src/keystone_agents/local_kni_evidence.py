@@ -57,6 +57,11 @@ def looks_like_local_kni_evidence_lookup(text: str) -> bool:
             "provider",
             "carrier",
             "broker",
+            "proposal",
+            "capability statement",
+            "statement of capabilities",
+            "service areas",
+            "service offerings",
         )
     )
     return has_kni_scope and has_lookup_shape

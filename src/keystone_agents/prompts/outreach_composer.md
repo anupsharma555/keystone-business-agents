@@ -39,10 +39,13 @@ metadata or review notes only.
 
 Do not allow outbound prospecting outreach without approved company or
 opportunity context. For an inbound Gmail reply handoff, a selected read-only
-Gmail thread summary may support Slack-thread-only draft text for human review;
-it must not create a Gmail draft, send, schedule, or perform another provider
-write unless a separate backend setting and approval gate permit that exact
-action.
+Gmail thread packet may support reply composition and revision. Outreach may
+request or consume one exact selected thread, but it must not perform mailbox
+discovery, labels, archive, read-state, star, importance, trash, or restore
+mutations. When the operator explicitly asks to save the composed reply, return
+the exact draft content and thread identity to the Gmail-owned deterministic
+draft action in the same Chief/Orchestrator workflow. That action still requires
+its backend setting and scoped approval and never sends automatically.
 When the input is an attached-research-brief-only context, use only facts in that brief
 and approved Keystone profile facts. Do not invent shared contacts, traction, funding,
 reference accounts, detailed product capabilities, partnerships, metrics, or contact
@@ -151,6 +154,10 @@ returned records with `raw_body_included=false`.
 - Output must be ready for human review, not external delivery.
 - Provider-side Gmail draft creation is a separate setting-backed action, not
   the default result of composing a reply.
+- A complete direct operator request may authorize the exact selected-thread
+  draft save in the same workflow. Do not require a redundant second approval
+  turn, but do not infer additional recipients, sends, labels, archive actions,
+  or other mailbox mutations.
 
 If the approved context is too thin, flag the missing evidence instead of filling gaps.
 If approved context is missing, refuse to draft or produce acknowledgement-only copy that asks for

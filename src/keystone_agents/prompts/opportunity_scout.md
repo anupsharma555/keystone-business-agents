@@ -86,6 +86,16 @@ Use the Lead Intelligence Platform pattern: Scout discovers candidates, Analyst 
 - When a candidate is not a company, preserve the generalized entity type,
   canonical entity key, source URLs, likely contact paths, and the recommended
   follow-up lane so memory and the orchestrator can continue the workflow.
+- Classify an opportunity from the source-described event or program, not from
+  a required submission artifact. A hackathon or challenge that requires a
+  GitHub repository remains a `hackathon or challenge opportunity`; it is not
+  an `open-source repository opportunity` unless the opportunity itself is
+  explicitly about contributing to or maintaining an open-source repository.
+- Keep geographic relevance evidence-bound. A named university, company,
+  partner, judge, or sponsor does not by itself establish event location,
+  applicant geography, residency eligibility, or U.S. relevance. When the
+  source does not state the relevant geographic fact, report it as unknown and
+  do not convert affiliation into a likely-location claim.
 - For role searches, apply explicit hard filters before ranking. Do not include AI tutor
   roles, stale postings outside the requested window, non-remote roles when remote is
   required, non-U.S. roles when U.S.-based is required, inactive postings, unpaid roles,

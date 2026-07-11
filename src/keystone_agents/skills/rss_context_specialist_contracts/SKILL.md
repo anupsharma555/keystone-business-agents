@@ -1,6 +1,6 @@
 ---
 skill_id: rss_context_specialist_contracts
-skill_version: 2026-06-20.2
+skill_version: 2026-07-10.1
 skill_purpose: Resolve historical RSS/#announcements context for Chief of Staff decisions.
 applies_to:
   - rss_context_agent
@@ -24,7 +24,9 @@ future direction planning.
 ## Required Behavior
 
 - Retrieve historical records through the canonical announcement feed history
-  tool.
+  tool. Prefer local application rows; when they are empty, an explicitly
+  live-gated `live=true` call may read bounded configured `#announcements`
+  digests through Slack `conversations.history`.
 - Preserve feed item IDs, URLs, dates, source names, evidence notes, and Slack
   links when available.
 - Convert retrieved records into recurring themes, opportunity signals, future
@@ -50,8 +52,9 @@ future direction planning.
 
 ## Boundaries
 
-- Do not scrape Slack, post messages, publish summaries, write records, or mutate
-  local feed history.
+- Do not scrape Slack through a browser, post messages, publish summaries, write
+  records, or mutate local feed history. The structured Slack fallback is
+  read-only and requires `KEYSTONE_RSS_CONTEXT_LIVE_SLACK_READ_ENABLED=true`.
 - Do not claim current facts from historical RSS context alone.
 - Do not treat search snippets as full article reads.
 - Do not hide missing provenance; missing IDs, URLs, or dates are blockers or
@@ -75,7 +78,8 @@ future direction planning.
 ## Failure Modes
 
 - If the feed history tool returns no matches, return a blocker and suggest a
-  narrower query or a live research pass.
+  narrower query, an explicitly live-gated Slack history read, or a live
+  research pass.
 - If records lack usable URLs, dates, or source titles, mark the evidence as
   incomplete rather than inventing provenance.
 - If historical RSS records conflict with current-source context, preserve both
@@ -86,7 +90,8 @@ future direction planning.
 
 ## Eval Criteria
 
-- Uses canonical RSS history only.
+- Uses canonical local RSS history or the explicit structured Slack history
+  fallback only.
 - Separates source evidence, interpretation, and next actions.
 - Blocks unsupported current claims.
 - Produces Chief of Staff handoff context without side effects.

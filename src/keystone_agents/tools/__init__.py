@@ -28,6 +28,7 @@ from keystone_agents.tools.gmail_tool import (
     get_gmail_message,
     get_thread,
     list_threads_by_label_filter,
+    modify_gmail_message_state,
 )
 from keystone_agents.tools.html_review_tool import (
     HtmlReviewResult,
@@ -95,6 +96,7 @@ __all__ = [
     "get_gmail_message",
     "get_thread",
     "list_threads_by_label_filter",
+    "modify_gmail_message_state",
     "HtmlReviewResult",
     "extract_research_claims_from_html",
     "retrieve_rss_announcement_history",

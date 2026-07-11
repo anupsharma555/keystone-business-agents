@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
+from keystone_agents.context_env import (
+    context_env_path,
+    context_env_value,
+    linked_context_repo_path,
+)
 from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
 from keystone_agents.sdk import function_tool
 
@@ -25,6 +30,9 @@ KNI_DOC_CONTENT_SCAN_MODE_ENV = "KEYSTONE_KNI_DOC_CONTENT_SCAN_MODE"
 KNI_DOC_AUTO_REFRESH_ENV = "KEYSTONE_KNI_DOC_AUTO_REFRESH"
 KNI_DOC_REFRESH_TIMEOUT_ENV = "KEYSTONE_KNI_DOC_REFRESH_TIMEOUT_SECONDS"
 KNI_DOC_MODEL_CONTEXT_ALLOWED_ENV = "KEYSTONE_KNI_DOC_MODEL_CONTEXT_ALLOWED"
+LEGACY_KNI_DOC_SEARCH_ENABLED_ENV = "KNI_DOCS_ENABLED"
+LEGACY_KNI_DOC_ROOT_PATH_ENV = "KNI_DOC_ROOT_PATH"
+LEGACY_KNI_DOC_INDEX_PATH_ENV = "KNI_DOC_INDEX_PATH"
 
 DEFAULT_KNI_DOC_ROOT_PATH = ""
 DEFAULT_KNI_DOC_INDEX_PATH = ""
@@ -179,10 +187,43 @@ def _positive_int(value: str | None, *, default: int) -> int:
 
 def kni_document_config(env: dict[str, str] | None = None) -> KNIDocumentConfig:
     env_map = os.environ if env is None else env
+    linked_root = ""
+    linked_index = ""
+    linked_enabled = ""
+    if env is None:
+        linked_root = context_env_value(LEGACY_KNI_DOC_ROOT_PATH_ENV).strip()
+        linked_index = context_env_value(LEGACY_KNI_DOC_INDEX_PATH_ENV).strip()
+        linked_enabled = context_env_value(LEGACY_KNI_DOC_SEARCH_ENABLED_ENV).strip()
+    else:
+        linked_root = str(env_map.get(LEGACY_KNI_DOC_ROOT_PATH_ENV) or "").strip()
+        linked_index = str(env_map.get(LEGACY_KNI_DOC_INDEX_PATH_ENV) or "").strip()
+        linked_enabled = str(env_map.get(LEGACY_KNI_DOC_SEARCH_ENABLED_ENV) or "").strip()
+
+    root_value = str(env_map.get(KNI_DOC_ROOT_PATH_ENV) or "").strip()
+    if root_value:
+        root_path = Path(root_value).expanduser()
+    elif env is None and linked_root:
+        root_path = context_env_path(LEGACY_KNI_DOC_ROOT_PATH_ENV)
+    else:
+        root_path = Path(linked_root or DEFAULT_KNI_DOC_ROOT_PATH).expanduser()
+
+    index_value = str(env_map.get(KNI_DOC_INDEX_PATH_ENV) or "").strip()
+    if index_value:
+        index_path = Path(index_value).expanduser()
+    elif env is None and linked_index:
+        index_path = context_env_path(LEGACY_KNI_DOC_INDEX_PATH_ENV)
+    elif env is None and linked_root and str(linked_context_repo_path()):
+        index_path = linked_context_repo_path() / ".local" / "kni-docs.sqlite"
+    else:
+        index_path = Path(linked_index or DEFAULT_KNI_DOC_INDEX_PATH).expanduser()
+
+    enabled_value = str(env_map.get(KNI_DOC_SEARCH_ENABLED_ENV) or "").strip()
+    if not enabled_value:
+        enabled_value = linked_enabled or ("true" if linked_root and index_path else "")
     return KNIDocumentConfig(
-        enabled=_truthy(env_map.get(KNI_DOC_SEARCH_ENABLED_ENV), default=False),
-        root_path=Path(env_map.get(KNI_DOC_ROOT_PATH_ENV, DEFAULT_KNI_DOC_ROOT_PATH)).expanduser(),
-        index_path=Path(env_map.get(KNI_DOC_INDEX_PATH_ENV, DEFAULT_KNI_DOC_INDEX_PATH)).expanduser(),
+        enabled=_truthy(enabled_value, default=False),
+        root_path=root_path,
+        index_path=index_path,
         pdf_text_command=env_map.get(KNI_DOC_PDF_TEXT_COMMAND_ENV, DEFAULT_PDF_TEXT_COMMAND),
         content_scan_mode=env_map.get(KNI_DOC_CONTENT_SCAN_MODE_ENV, "block").strip().lower()
         or "block",

@@ -294,7 +294,7 @@ def render_svg(*, generated_date: str) -> str:
         card_x += 166
     lines.append('<text class="body" x="1010" y="610">Each run receives raw request + Orchestrator memo + typed context pack.</text>')
     lines.append('<text class="small" x="1010" y="638">Graph-worthy workflows use backend-selected LangGraph nodes; simple runs stay single-step.</text>')
-    lines.append('<text class="small" x="1010" y="660">Edges include Chief/Gmail/context -> Research -> Opportunity/Outreach checkpoints.</text>')
+    lines.append('<text class="small" x="1010" y="660">Direct actions (continue, more research, find contact, revise) reuse this selected path.</text>')
 
     _rect(lines, "context", 70, 430, 310, 285)
     lines.append('<text class="section" x="95" y="466">Read / Context Specialists</text>')
@@ -320,13 +320,14 @@ def render_svg(*, generated_date: str) -> str:
             "Python gates: approvals, source sufficiency, record identity, live flags, provider budgets",
             "Typed checks: schema reads, arithmetic, deduplication, context-pack readiness",
             "Tool policy: core reads, web search, deep retrieval, diagnostics, owned writes",
+            "Negated constraints do not steer routes: 'do not scout opportunities' blocks that route",
         ),
         x=95,
         y=805,
         max_chars=112,
         line_height=25,
     )
-    lines.append('<text class="small" x="95" y="914">No send, Gmail draft, post, provider write, file write, or library mutation is automatic.</text>')
+    lines.append('<text class="small" x="95" y="924">Approval checkpoints and no-send/no-write gates remain Python-authoritative after graph steps.</text>')
 
     _rect(lines, "context", 870, 735, 805, 195)
     lines.append('<text class="section" x="895" y="771">Evidence, Retrieval, and Integrations</text>')
@@ -344,6 +345,10 @@ def render_svg(*, generated_date: str) -> str:
         line_height=25,
     )
     lines.append('<text class="small" x="895" y="914">Graph-produced sources can satisfy downstream offline evidence gates.</text>')
+
+    lines.append('<text class="tiny" x="1010" y="695">gmail_triage -> business_research_analyst -> outreach_composer -> approval_checkpoint</text>')
+    lines.append('<text class="tiny" x="1010" y="713">chief_of_staff -> airtable/google_workspace context -> approval_checkpoint</text>')
+    lines.append('<text class="tiny" x="95" y="708">rss/preprints/zotero context -> business research/opportunity specialist</text>')
 
     _rect(lines, "render", 70, 980, 520, 210)
     lines.append('<text class="section" x="95" y="1016">Reviewed Output and Renderers</text>')

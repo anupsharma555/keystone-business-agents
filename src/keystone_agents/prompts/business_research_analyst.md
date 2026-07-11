@@ -160,6 +160,11 @@ The brief must:
   contact. Include name, title, profile/source URL, source IDs, and email only
   when the email appears in approved source context. If no source-backed email is
   present, leave email blank and mark the candidate as needing confirmation.
+- For a public contact-discovery ask, use `discover_public_company_contacts`
+  with the official leadership/about page and official contact page. Prefer a
+  current first-party commercial, growth, or partnerships role, use Exa only as
+  bounded corroboration, never infer a personal email, and stop without drafting
+  when the operator asks only for a contact.
 - Include compact source citations with title, URL or fixture ID, type, and source ID.
 - Avoid inventing facts, customers, funding, team size, outcomes, or leadership.
 - Avoid repetitive provenance phrasing such as "approved sources indicate",
@@ -184,6 +189,7 @@ Use only the explicit research tools:
 - `load_crm_account_context`
 - `search_web`
 - `fetch_company_page`
+- `discover_public_company_contacts`
 - `fetch_linkedin_or_profile_placeholder`
 - `extract_company_signals`
 - `dedupe_and_rank_sources`

@@ -1,14 +1,16 @@
 """Gmail API integration boundary.
 
-Live Gmail support is limited to reading messages, applying labels, and creating drafts.
-There is intentionally no send implementation.
+Live Gmail support includes reads, labels, drafts, and a separately gated exact
+test-draft send path. Ordinary agent email sending remains unavailable.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import json
+import mimetypes
 import os
 import re
 from collections.abc import Mapping
@@ -23,6 +25,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from keystone_agents.context_env import context_env_value
 from keystone_agents.guardrails import (
     enforce_tool_input_guardrails,
     enforce_tool_output_guardrails,
@@ -43,8 +46,46 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_GOOGLE_CREDENTIALS_FILE = "credentials.json"
 DEFAULT_GOOGLE_TOKEN_FILE = "token.json"
-GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.modify",)
-GMAIL_LIVE_OPERATIONS = ("read", "label", "create_draft")
+GMAIL_SCOPES = (
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/calendar.events",
+)
+GMAIL_LIVE_OPERATIONS = (
+    "read",
+    "label",
+    "mailbox_state",
+    "create_draft",
+    "update_draft",
+    "send_test_draft",
+)
+GmailMailboxStateOperation = Literal[
+    "add_label",
+    "remove_label",
+    "archive",
+    "unarchive",
+    "mark_read",
+    "mark_unread",
+    "star",
+    "unstar",
+    "mark_important",
+    "mark_not_important",
+    "trash",
+    "restore",
+]
+GMAIL_MAILBOX_STATE_OPERATIONS = (
+    "add_label",
+    "remove_label",
+    "archive",
+    "unarchive",
+    "mark_read",
+    "mark_unread",
+    "star",
+    "unstar",
+    "mark_important",
+    "mark_not_important",
+    "trash",
+    "restore",
+)
 GmailOAuthReadiness = Literal["disabled", "ready", "misconfigured"]
 GMAIL_OAUTH_REAUTH_COMMAND = ".venv/bin/python scripts/gmail_oauth_login.py --force"
 GMAIL_SYSTEM_LABEL_IDS = {
@@ -305,12 +346,58 @@ def _attachment_metadata(part: dict[str, Any]) -> GmailAttachmentMetadata | None
     )
 
 
+def _gmail_draft_attachment_file(path_value: str) -> tuple[Path, bytes, str]:
+    workspace = Path.cwd().resolve()
+    configured = context_env_value(
+        "KEYSTONE_PRESENTATION_DERIVED_ROOT", "artifacts/presentation-derived"
+    ).strip()
+    configured_path = Path(configured).expanduser()
+    root = (
+        configured_path.resolve()
+        if configured_path.is_absolute()
+        else (workspace / configured_path).resolve()
+    )
+    candidate = Path(str(path_value or "").strip()).expanduser()
+    target = candidate.resolve() if candidate.is_absolute() else (workspace / candidate).resolve()
+    if target.parent != root:
+        raise RuntimeError("Gmail draft attachments are limited to the derived-artifact root.")
+    if not target.is_file() or target.suffix.lower() not in {".png", ".pdf"}:
+        raise RuntimeError("The exact Gmail draft attachment must be an available PNG or PDF.")
+    content = target.read_bytes()
+    if not content or len(content) > 10_000_000:
+        raise RuntimeError("Gmail draft attachment must be between 1 byte and 10 MB.")
+    mime_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    return target, content, mime_type
+
+
 def _walk_payload_parts(part: dict[str, Any]) -> list[dict[str, Any]]:
     parts = [part]
     for child in part.get("parts", []) or []:
         if isinstance(child, dict):
             parts.extend(_walk_payload_parts(child))
     return parts
+
+
+def _draft_attachment_refs(message: Mapping[str, Any]) -> list[dict[str, Any]]:
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    refs: list[dict[str, Any]] = []
+    for part in _walk_payload_parts(payload):
+        body = part.get("body") if isinstance(part.get("body"), dict) else {}
+        attachment_id = str(body.get("attachmentId") or "").strip()
+        filename = str(part.get("filename") or "").strip()
+        if not attachment_id or not filename:
+            continue
+        refs.append(
+            {
+                "attachment_id": attachment_id,
+                "filename": filename,
+                "mime_type": str(part.get("mimeType") or ""),
+                "size": int(body.get("size") or 0),
+            }
+        )
+    return refs
 
 
 def _strip_quoted_reply(text: str) -> tuple[str, bool]:
@@ -986,7 +1073,15 @@ class GmailTool:
         self.access_token = self._refresh_access_token(token_data)
         return self.access_token
 
-    def _request(self, method: str, path: str, *, operation: str, **kwargs: Any) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        operation: str,
+        allow_not_found: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         if not self.live:
             raise GmailConfigurationError("Live Gmail mode is disabled.")
 
@@ -1025,6 +1120,8 @@ class GmailTool:
             headers["Authorization"] = f"Bearer {refreshed_token}"
 
         if getattr(response, "status_code", 0) >= 400:
+            if getattr(response, "status_code", 0) == 404 and allow_not_found:
+                return {"_not_found": True}
             if getattr(response, "status_code", 0) == 401:
                 raise GmailConfigurationError(
                     f"Gmail API returned HTTP 401 during {operation} even after refreshing "
@@ -1417,6 +1514,156 @@ class GmailTool:
         }
         return enforce_tool_output_guardrails("gmail_apply_labels", output)
 
+    def modify_message_state(
+        self,
+        message_id: str,
+        operation: GmailMailboxStateOperation,
+        *,
+        label: str = "",
+        expected_account: str = "",
+        approval_reference: str = "",
+    ) -> dict[str, Any]:
+        """Apply one exact Gmail mailbox-state change and verify provider state."""
+
+        clean_id = str(message_id or "").strip()
+        clean_label = str(label or "").strip()
+        expected = str(expected_account or "").strip()
+        approval = str(approval_reference or "").strip()
+        enforce_tool_input_guardrails(
+            "gmail_modify_message_state",
+            {
+                "message_id": clean_id,
+                "operation": operation,
+                "label": clean_label,
+                "expected_account": expected,
+                "approval_reference": approval,
+                "live": self.live,
+            },
+        )
+        if not clean_id:
+            raise ValueError("An exact Gmail message_id is required for mailbox modification.")
+        if operation not in GMAIL_MAILBOX_STATE_OPERATIONS:
+            raise ValueError(f"Unsupported Gmail mailbox-state operation: {operation}.")
+        if operation in {"add_label", "remove_label"} and not clean_label:
+            raise ValueError(f"A label is required for Gmail operation '{operation}'.")
+        if operation not in {"add_label", "remove_label"} and clean_label:
+            raise ValueError(f"Gmail operation '{operation}' does not accept a label.")
+
+        if not self.live:
+            return enforce_tool_output_guardrails(
+                "gmail_modify_message_state",
+                {
+                    "status": "dry-run",
+                    "message_id": clean_id,
+                    "operation": operation,
+                    "label": clean_label,
+                    "approval_reference_present": bool(approval),
+                    "provider_write": False,
+                    "verification": {"passed": False, "reason": "live mode disabled"},
+                    "send_enabled": False,
+                    "sent": False,
+                },
+            )
+
+        if os.getenv("KEYSTONE_GMAIL_ALLOW_MAILBOX_WRITES", "").strip().lower() != "true":
+            raise GmailConfigurationError(
+                "Live Gmail mailbox-state writes require "
+                "KEYSTONE_GMAIL_ALLOW_MAILBOX_WRITES=true."
+            )
+        if not approval:
+            raise ValueError("A non-empty approval_reference is required for Gmail modification.")
+        if expected:
+            current_account = self.current_account_email()
+            if current_account.lower() != expected.lower():
+                raise GmailConfigurationError(
+                    "Live Gmail modification is configured for "
+                    f"{expected}, but OAuth is authenticated as {current_account}."
+                )
+
+        before = self.get_message(clean_id)
+        before_labels = list(before.get("labelIds") or [])
+        target_label = ""
+        add_ids: list[str] = []
+        remove_ids: list[str] = []
+        add_by_operation = {
+            "unarchive": "INBOX",
+            "mark_unread": "UNREAD",
+            "star": "STARRED",
+            "mark_important": "IMPORTANT",
+        }
+        remove_by_operation = {
+            "archive": "INBOX",
+            "mark_read": "UNREAD",
+            "unstar": "STARRED",
+            "mark_not_important": "IMPORTANT",
+        }
+        if operation == "add_label":
+            target_label = self._label_id_for(clean_label)
+            add_ids = [target_label]
+        elif operation == "remove_label":
+            target_label = self._existing_label_id_for(clean_label)
+            remove_ids = [target_label]
+        elif operation in add_by_operation:
+            target_label = add_by_operation[operation]
+            add_ids = [target_label]
+        elif operation in remove_by_operation:
+            target_label = remove_by_operation[operation]
+            remove_ids = [target_label]
+
+        if operation == "trash":
+            self._request(
+                "POST", f"messages/{clean_id}/trash", operation="trash exact message", json={}
+            )
+            target_label = "TRASH"
+        elif operation == "restore":
+            self._request(
+                "POST", f"messages/{clean_id}/untrash", operation="restore exact message", json={}
+            )
+            target_label = "TRASH"
+        else:
+            self._request(
+                "POST",
+                f"messages/{clean_id}/modify",
+                operation=f"modify exact message state: {operation}",
+                json={"addLabelIds": add_ids, "removeLabelIds": remove_ids},
+            )
+
+        after = self.get_message(clean_id)
+        after_labels = list(after.get("labelIds") or [])
+        expected_present = operation in {
+            "add_label",
+            "unarchive",
+            "mark_unread",
+            "star",
+            "mark_important",
+            "trash",
+        }
+        passed = (target_label in after_labels) is expected_present
+        output = {
+            "status": "message_state_modified" if passed else "verification_failed",
+            "message_id": clean_id,
+            "thread_id": str(after.get("threadId") or before.get("threadId") or ""),
+            "operation": operation,
+            "label": clean_label,
+            "before_label_ids": before_labels,
+            "after_label_ids": after_labels,
+            "approval_reference_present": True,
+            "provider_write": True,
+            "verification": {
+                "passed": passed,
+                "target_label_id": target_label,
+                "expected_present": expected_present,
+            },
+            "send_enabled": False,
+            "sent": False,
+        }
+        if not passed:
+            raise GmailAPIError(
+                f"Gmail provider read-back did not verify operation '{operation}' "
+                f"for message '{clean_id}'."
+            )
+        return enforce_tool_output_guardrails("gmail_modify_message_state", output)
+
     def _refresh_label_cache(self) -> None:
         data = self._request("GET", "labels", operation="list labels")
         self._label_name_to_id.clear()
@@ -1427,6 +1674,19 @@ class GmailTool:
             label_id = str(label.get("id") or "")
             if name and label_id:
                 self._label_name_to_id[name] = label_id
+
+    def _existing_label_id_for(self, label: str) -> str:
+        cleaned = label.strip()
+        if not cleaned:
+            raise ValueError("Gmail label cannot be empty.")
+        if cleaned in GMAIL_SYSTEM_LABEL_IDS or cleaned.startswith("Label_"):
+            return cleaned
+        if not self._label_name_to_id:
+            self._refresh_label_cache()
+        label_id = self._label_name_to_id.get(cleaned)
+        if not label_id:
+            raise GmailAPIError(f"Gmail label '{cleaned}' does not exist.")
+        return label_id
 
     def _label_id_for(self, label: str) -> str:
         cleaned = label.strip()
@@ -1600,10 +1860,412 @@ class GmailTool:
         }
         return enforce_tool_output_guardrails("gmail_create_draft", output)
 
-    def send_email(self, to: str, subject: str, body: str) -> dict[str, Any]:
-        """Sending external email is intentionally unavailable."""
+    def create_draft_with_attachment(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        attachment_path: str,
+        *,
+        expected_account: str | None = None,
+    ) -> dict[str, Any]:
+        """Create one no-send Gmail draft with one bounded local attachment."""
 
-        raise NotImplementedError("External email sending is not implemented.")
+        return self._write_draft_with_attachment(
+            "",
+            to,
+            subject,
+            body,
+            attachment_path,
+            expected_account=expected_account,
+        )
+
+    def update_draft_with_attachment(
+        self,
+        draft_id: str,
+        to: str,
+        subject: str,
+        body: str,
+        attachment_path: str,
+        *,
+        expected_account: str | None = None,
+    ) -> dict[str, Any]:
+        """Replace one no-send Gmail draft while retaining one exact attachment."""
+
+        return self._write_draft_with_attachment(
+            draft_id,
+            to,
+            subject,
+            body,
+            attachment_path,
+            expected_account=expected_account,
+        )
+
+    def _write_draft_with_attachment(
+        self,
+        draft_id: str,
+        to: str,
+        subject: str,
+        body: str,
+        attachment_path: str,
+        *,
+        expected_account: str | None,
+    ) -> dict[str, Any]:
+        clean_draft_id = draft_id.strip()
+        to_address = to.strip()
+        if not to_address:
+            raise ValueError("Gmail draft recipient cannot be empty.")
+        expected = (expected_account or "").strip()
+        if not self.live:
+            return {
+                "status": "dry-run",
+                "draft_id": clean_draft_id,
+                "message_id": "",
+                "to": to_address,
+                "subject": subject.strip(),
+                "body_preview": body.strip()[:120],
+                "attachment_path": str(attachment_path or "").strip(),
+                "gmail_account": expected,
+                "sent": False,
+                "approval_required": True,
+            }
+        current_account = ""
+        if expected:
+            current_account = self.current_account_email()
+            if current_account.casefold() != expected.casefold():
+                raise GmailConfigurationError(
+                    "Live Gmail attachment draft is configured for a different account."
+                )
+        target, content, mime_type = _gmail_draft_attachment_file(attachment_path)
+        maintype, subtype = mime_type.split("/", maxsplit=1)
+        message = EmailMessage()
+        message["To"] = to_address
+        message["Subject"] = subject.strip()
+        message.set_content(body.strip())
+        message.add_attachment(
+            content,
+            maintype=maintype,
+            subtype=subtype,
+            filename=target.name,
+        )
+        encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        method = "PUT" if clean_draft_id else "POST"
+        endpoint = f"drafts/{clean_draft_id}" if clean_draft_id else "drafts"
+        request_payload: dict[str, Any] = {"message": {"raw": encoded_message}}
+        if clean_draft_id:
+            request_payload["id"] = clean_draft_id
+        data = self._request(
+            method,
+            endpoint,
+            operation=(
+                "update Gmail draft with attachment"
+                if clean_draft_id
+                else "create Gmail draft with attachment"
+            ),
+            json=request_payload,
+        )
+        created_message = data.get("message", {})
+        if not isinstance(created_message, Mapping):
+            created_message = {}
+        return {
+            "status": "draft_updated" if clean_draft_id else "draft_created",
+            "draft_id": str(data.get("id") or clean_draft_id),
+            "message_id": str(created_message.get("id") or ""),
+            "to": to_address,
+            "subject": subject.strip(),
+            "body_preview": body.strip()[:120],
+            "attachment_filename": target.name,
+            "attachment_size": len(content),
+            "attachment_sha256": hashlib.sha256(content).hexdigest(),
+            "gmail_account": current_account or expected,
+            "sent": False,
+            "approval_required": True,
+        }
+
+    def get_draft(self, draft_id: str) -> dict[str, Any]:
+        """Read one Gmail draft for bounded verification without sending it."""
+
+        clean_draft_id = draft_id.strip()
+        if not clean_draft_id:
+            raise ValueError("Gmail draft id cannot be empty.")
+        if not self.live:
+            return {
+                "status": "dry-run",
+                "draft_id": clean_draft_id,
+                "message_id": "",
+                "to": "",
+                "subject": "",
+                "body": "",
+                "attachments": [],
+                "attachment_count": 0,
+                "sent": False,
+            }
+        data = self._request(
+            "GET",
+            f"drafts/{clean_draft_id}",
+            operation="get Gmail draft",
+            params={"format": "full"},
+        )
+        message = data.get("message", {})
+        if not isinstance(message, Mapping):
+            message = {}
+        envelope = gmail_message_envelope_from_api(message)
+        attachments = _draft_attachment_refs(message)
+        return {
+            "status": "success",
+            "draft_id": str(data.get("id") or clean_draft_id),
+            "message_id": envelope.message_id,
+            "to": envelope.to,
+            "subject": envelope.subject,
+            "body": envelope.normalized_body,
+            "attachments": attachments,
+            "attachment_count": len(attachments),
+            "sent": False,
+        }
+
+    def get_draft_attachment(self, draft_id: str, filename: str) -> dict[str, Any]:
+        """Read and hash one exact draft attachment without returning its bytes."""
+
+        clean_draft_id = draft_id.strip()
+        clean_filename = filename.strip()
+        if not clean_draft_id or not clean_filename:
+            raise ValueError("Gmail draft attachment reads require draft_id and filename.")
+        if not self.live:
+            return {
+                "status": "dry-run",
+                "draft_id": clean_draft_id,
+                "filename": clean_filename,
+                "size": 0,
+                "sha256": "",
+            }
+        data = self._request(
+            "GET",
+            f"drafts/{clean_draft_id}",
+            operation="get Gmail draft attachment metadata",
+            params={"format": "full"},
+        )
+        message = data.get("message", {})
+        if not isinstance(message, Mapping):
+            raise GmailAPIError("Gmail draft response did not contain a message.")
+        matches = [
+            ref for ref in _draft_attachment_refs(message) if ref["filename"] == clean_filename
+        ]
+        if len(matches) != 1:
+            raise GmailAPIError("Gmail draft attachment target was missing or ambiguous.")
+        message_id = str(message.get("id") or "").strip()
+        attachment_id = str(matches[0]["attachment_id"])
+        attachment = self._request(
+            "GET",
+            f"messages/{message_id}/attachments/{attachment_id}",
+            operation="get Gmail draft attachment bytes",
+        )
+        encoded = str(attachment.get("data") or "")
+        padded = encoded + "=" * (-len(encoded) % 4)
+        content = base64.urlsafe_b64decode(padded.encode("utf-8"))
+        return {
+            "status": "success",
+            "draft_id": clean_draft_id,
+            "message_id": message_id,
+            "filename": clean_filename,
+            "mime_type": str(matches[0]["mime_type"]),
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+
+    def list_recent_drafts(self, *, max_results: int = 20) -> list[dict[str, Any]]:
+        """Return bounded draft metadata for deterministic natural-reference resolution."""
+
+        bounded_max = max(1, min(50, int(max_results)))
+        if not self.live:
+            return []
+        data = self._request(
+            "GET",
+            "drafts",
+            operation="list Gmail drafts",
+            params={"maxResults": bounded_max},
+        )
+        refs = data.get("drafts", [])
+        if not isinstance(refs, list):
+            return []
+        drafts: list[dict[str, Any]] = []
+        for ref in refs[:bounded_max]:
+            if not isinstance(ref, Mapping):
+                continue
+            draft_id = str(ref.get("id") or "").strip()
+            if not draft_id:
+                continue
+            drafts.append(self.get_draft(draft_id))
+        return drafts
+
+    def update_draft(
+        self,
+        draft_id: str,
+        to: str,
+        subject: str,
+        body: str,
+        *,
+        expected_account: str | None = None,
+    ) -> dict[str, Any]:
+        """Replace one existing Gmail draft while preserving the no-send boundary."""
+
+        clean_draft_id = draft_id.strip()
+        to_address = to.strip()
+        if not clean_draft_id:
+            raise ValueError("Gmail draft id cannot be empty.")
+        if not to_address:
+            raise ValueError("Gmail draft recipient cannot be empty.")
+        expected = (expected_account or "").strip()
+        if not self.live:
+            return {
+                "status": "dry-run",
+                "draft_id": clean_draft_id,
+                "message_id": "",
+                "to": to_address,
+                "subject": subject.strip(),
+                "body_preview": body.strip()[:120],
+                "gmail_account": expected,
+                "sent": False,
+                "approval_required": True,
+            }
+        current_account = ""
+        if expected:
+            current_account = self.current_account_email()
+            if current_account.lower() != expected.lower():
+                raise GmailConfigurationError(
+                    "Live Gmail draft update is configured for "
+                    f"{expected}, but OAuth is authenticated as {current_account}."
+                )
+
+        message = EmailMessage()
+        message["To"] = to_address
+        message["Subject"] = subject.strip()
+        message.set_content(body.strip())
+        encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        data = self._request(
+            "PUT",
+            f"drafts/{clean_draft_id}",
+            operation="update Gmail draft",
+            json={"id": clean_draft_id, "message": {"raw": encoded_message}},
+        )
+        created_message = data.get("message", {})
+        if not isinstance(created_message, Mapping):
+            created_message = {}
+        return {
+            "status": "draft_updated",
+            "draft_id": str(data.get("id") or clean_draft_id),
+            "message_id": str(created_message.get("id") or ""),
+            "to": to_address,
+            "subject": subject.strip(),
+            "body_preview": body.strip()[:120],
+            "gmail_account": current_account or expected,
+            "sent": False,
+            "approval_required": True,
+        }
+
+    def delete_draft(
+        self,
+        draft_id: str,
+        *,
+        expected_account: str | None = None,
+    ) -> dict[str, Any]:
+        """Delete one exact Gmail draft; callers own test-marker and approval gates."""
+
+        clean_draft_id = draft_id.strip()
+        if not clean_draft_id:
+            raise ValueError("Gmail draft id cannot be empty.")
+        expected = (expected_account or "").strip()
+        if not self.live:
+            return {
+                "status": "dry-run",
+                "draft_id": clean_draft_id,
+                "gmail_account": expected,
+                "sent": False,
+            }
+        current_account = ""
+        if expected:
+            current_account = self.current_account_email()
+            if current_account.lower() != expected.lower():
+                raise GmailConfigurationError(
+                    "Live Gmail draft deletion is configured for "
+                    f"{expected}, but OAuth is authenticated as {current_account}."
+                )
+        self._request(
+            "DELETE",
+            f"drafts/{clean_draft_id}",
+            operation="delete Gmail test draft",
+        )
+        return {
+            "status": "draft_deleted",
+            "draft_id": clean_draft_id,
+            "gmail_account": current_account or expected,
+            "sent": False,
+        }
+
+    def draft_exists(self, draft_id: str) -> bool:
+        """Return whether one exact Gmail draft still exists."""
+
+        clean_draft_id = draft_id.strip()
+        if not clean_draft_id:
+            raise ValueError("Gmail draft id cannot be empty.")
+        if not self.live:
+            return False
+        data = self._request(
+            "GET",
+            f"drafts/{clean_draft_id}",
+            operation="verify Gmail draft absence",
+            params={"format": "minimal"},
+            allow_not_found=True,
+        )
+        return not bool(data.get("_not_found"))
+
+    def send_draft(
+        self,
+        draft_id: str,
+        *,
+        expected_account: str,
+    ) -> dict[str, Any]:
+        """Send one exact existing draft; higher-level code owns all test-send gates."""
+
+        clean_draft_id = draft_id.strip()
+        expected = expected_account.strip()
+        if not clean_draft_id:
+            raise ValueError("Gmail draft send requires an exact draft_id.")
+        if not expected:
+            raise ValueError("Gmail draft send requires expected_account.")
+        if not self.live:
+            return {
+                "status": "dry-run",
+                "draft_id": clean_draft_id,
+                "message_id": "",
+                "thread_id": "",
+                "gmail_account": expected,
+                "sent": False,
+            }
+        current_account = self.current_account_email()
+        if current_account.lower() != expected.lower():
+            raise GmailConfigurationError(
+                "Live Gmail draft send is configured for "
+                f"{expected}, but OAuth is authenticated as {current_account}."
+            )
+        data = self._request(
+            "POST",
+            "drafts/send",
+            operation="send approved Gmail test draft",
+            json={"id": clean_draft_id},
+        )
+        return {
+            "status": "sent",
+            "draft_id": clean_draft_id,
+            "message_id": str(data.get("id") or ""),
+            "thread_id": str(data.get("threadId") or ""),
+            "gmail_account": current_account,
+            "sent": True,
+        }
+
+    def send_email(self, to: str, subject: str, body: str) -> dict[str, Any]:
+        """Free-form external email sending remains intentionally unavailable."""
+
+        raise NotImplementedError("Free-form external email sending is not implemented.")
 
 
 def list_recent_messages(
@@ -1698,6 +2360,33 @@ def apply_gmail_labels(message_id: str, labels: list[str]) -> str:
 
 
 @function_tool(**keystone_tool_guardrail_kwargs())
+def modify_gmail_message_state(
+    message_id: str,
+    operation: GmailMailboxStateOperation,
+    expected_account: str,
+    approval_reference: str,
+    label: str = "",
+    live: bool = False,
+) -> str:
+    """Modify one exact Gmail message and verify the requested provider state.
+
+    Supported operations are label add/remove, archive/unarchive, read/unread,
+    star/unstar, important/not-important, trash, and restore. This tool never
+    sends email and requires a dedicated live gate plus scoped approval.
+    """
+
+    return _json(
+        GmailTool(live=live).modify_message_state(
+            message_id,
+            operation,
+            label=label,
+            expected_account=expected_account,
+            approval_reference=approval_reference,
+        )
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
 def create_gmail_draft_reply(message_id: str, body: str) -> str:
     """Create a dry-run Gmail reply draft. This tool never sends email."""
 
@@ -1705,5 +2394,67 @@ def create_gmail_draft_reply(message_id: str, body: str) -> str:
         GmailTool(live=False).create_draft_reply(
             message_id=message_id,
             body=body,
+        )
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def create_gmail_draft_with_attachment(
+    to: str,
+    subject: str,
+    body: str,
+    attachment_path: str,
+    expected_account: str,
+    approval_reference: str,
+    draft_id: str = "",
+    live: bool = False,
+) -> str:
+    """Create or update one approved no-send Gmail draft with one derived artifact."""
+
+    from keystone_agents.gmail_triage.draft_actions import (
+        execute_approved_gmail_draft_attachment_action,
+    )
+
+    return _json(
+        execute_approved_gmail_draft_attachment_action(
+            GmailTool(live=live),
+            to=to,
+            subject=subject,
+            body=body,
+            attachment_path=attachment_path,
+            expected_account=expected_account,
+            approval_reference=approval_reference,
+            draft_id=draft_id,
+        )
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def send_gmail_test_draft(
+    draft_id: str,
+    expected_account: str,
+    approval_reference: str,
+    send_number: int = 1,
+    live: bool = False,
+) -> str:
+    """Send one exact marked validation draft through the dedicated test-only gates.
+
+    This is not a general email send tool. The existing draft must already match
+    the configured recipient and contain ``KBA_TEST_EMAIL`` in both subject and
+    body. Python independently enforces sender account, recipient, approval,
+    maximum send count, provider read-back, and SENT verification.
+    """
+
+    from keystone_agents.gmail_triage.draft_actions import (
+        send_approved_gmail_test_draft,
+    )
+
+    return _json(
+        send_approved_gmail_test_draft(
+            GmailTool(live=live),
+            draft_id=draft_id,
+            expected_account=expected_account,
+            approval_reference=approval_reference,
+            send_number=send_number,
         )
     )

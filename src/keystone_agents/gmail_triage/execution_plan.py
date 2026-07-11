@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from keystone_agents.schemas.gmail_execution_plan import GmailExecutionPlan
 
@@ -18,7 +20,7 @@ def infer_gmail_execution_plan(
     lowered = text.lower()
     lookback_days = _lookback_days(lowered) or 3
     query_terms = _query_terms(lowered)
-    query = f"newer_than:{lookback_days}d"
+    query = _date_scope_query(lowered, lookback_days)
     if query_terms:
         query = f"{query} {query_terms}"
 
@@ -40,8 +42,36 @@ def infer_gmail_execution_plan(
             ),
         )
 
+    if _style_profile_request(lowered):
+        return GmailExecutionPlan(
+            source=source,
+            operation="style_profile",
+            lookback_days=lookback_days,
+            max_messages=min(_requested_count(lowered) or 5, 25),
+            gmail_query="",
+            source_label="SENT",
+            create_gmail_drafts=False,
+            draft_replies_in_output=_draft_requested(lowered),
+            live_read_required=True,
+            candidate_helpers=[
+                "gmail_sent_message_sample",
+                "aggregate_email_style_profile_build",
+                "email_style_profile_human_approval",
+                "gmail_triage_sdk",
+            ],
+            rationale=(
+                "Request asks Gmail Triage to learn bounded aggregate drafting style from "
+                "sent mail, then use only an approved redacted profile for draft guidance."
+            ),
+            planner_warnings=[
+                "Raw sent bodies stay in memory only and must not be stored in profiles, "
+                "traces, fixtures, or reports.",
+                "Generated profiles require human approval before drafting use.",
+            ],
+        )
+
     if _priority_grouping_request(lowered):
-        priority_query = f"newer_than:{lookback_days}d"
+        priority_query = _date_scope_query(lowered, lookback_days)
         return GmailExecutionPlan(
             source=source,
             operation="priority_grouping",
@@ -78,7 +108,40 @@ def infer_gmail_execution_plan(
             rationale="Request asks for read-only Gmail thread summarization.",
         )
 
+    if _draft_update_request(lowered):
+        draft_subject_hint = _draft_subject_hint(text)
+        draft_recipient_hint = _draft_recipient_hint(text)
+        return GmailExecutionPlan(
+            source=source,
+            operation="update_draft",
+            lookback_days=lookback_days,
+            max_messages=1,
+            gmail_query="",
+            source_label="DRAFT",
+            draft_subject_hint=draft_subject_hint,
+            draft_recipient_hint=draft_recipient_hint,
+            create_gmail_drafts=True,
+            draft_replies_in_output=True,
+            live_read_required=True,
+            candidate_helpers=["gmail_draft_read", "gmail_draft_update"],
+            artifact_policy="update_verified_gmail_draft",
+            side_effect_policy="scoped_gmail_draft_write_no_send",
+            rationale=(
+                "Request asks to revise an existing Gmail draft; resolve the exact draft, "
+                "read it before editing, update the same draft, and verify the result."
+            ),
+            planner_warnings=(
+                []
+                if draft_subject_hint or draft_recipient_hint
+                else [
+                    "An unambiguous selected draft or natural subject/recipient reference "
+                    "is required before update."
+                ]
+            ),
+        )
+
     if _draft_requested(lowered):
+        create_provider_draft = _provider_draft_write_requested(lowered)
         return GmailExecutionPlan(
             source=source,
             operation="draft_reply",
@@ -86,10 +149,28 @@ def infer_gmail_execution_plan(
             max_messages=1,
             gmail_query=query,
             source_label="INBOX",
-            create_gmail_drafts=False,
+            create_gmail_drafts=create_provider_draft,
             draft_replies_in_output=True,
             live_read_required=True,
-            candidate_helpers=["gmail_single_message_read", "gmail_triage_sdk"],
+            candidate_helpers=[
+                "gmail_single_message_read",
+                "gmail_triage_sdk",
+                *(
+                    ["gmail_verified_reply_draft_create"]
+                    if create_provider_draft
+                    else []
+                ),
+            ],
+            artifact_policy=(
+                "create_verified_gmail_draft"
+                if create_provider_draft
+                else "draft_text_in_output"
+            ),
+            side_effect_policy=(
+                "scoped_gmail_draft_write_no_send"
+                if create_provider_draft
+                else "read_only_or_draft_only"
+            ),
             rationale=(
                 "Request asks for reply drafting; keep draft text in output unless "
                 "explicitly approved."
@@ -110,9 +191,34 @@ def infer_gmail_execution_plan(
 
 
 def _priority_grouping_request(lowered: str) -> bool:
-    return any(marker in lowered for marker in ("top ", "top 3", "priority", "actionable")) or (
-        "recent" in lowered and ("threads" in lowered or "messages" in lowered)
+    if any(marker in lowered for marker in ("top ", "top 3", "priority", "actionable")):
+        return True
+    if "recent" in lowered and ("threads" in lowered or "messages" in lowered):
+        return True
+    return bool(
+        re.search(r"\b(?:summarize|summary|review|recap)\b", lowered)
+        and re.search(r"\b(?:emails|messages|inbox)\b", lowered)
+        and re.search(r"\b(?:today|this\s+morning|this\s+afternoon)\b", lowered)
     )
+
+
+def _style_profile_request(lowered: str) -> bool:
+    has_mail_context = bool(
+        re.search(r"\b(?:gmail|emails?|sent\s+(?:mail|emails?|messages?))\b", lowered)
+    )
+    explicit_style_learning = bool(
+        re.search(
+            r"\b(?:learn|infer|derive|review|analy[sz]e)\b.{0,50}"
+            r"\b(?:style|tone|voice|wording|phrasing)\b|"
+            r"\b(?:write\s+like|similar\s+style|mimic|match\s+my\s+(?:style|tone|voice))\b",
+            lowered,
+        )
+    )
+    sent_style_context = bool(
+        re.search(r"\bsent\s+(?:mail|emails?|messages?)\b", lowered)
+        and re.search(r"\b(?:style|tone|voice|wording|phrasing)\b", lowered)
+    )
+    return has_mail_context and (explicit_style_learning or sent_style_context)
 
 
 def _inline_context_request(lowered: str) -> bool:
@@ -135,7 +241,47 @@ def _draft_requested(lowered: str) -> bool:
     return any(marker in lowered for marker in ("draft", "reply", "respond"))
 
 
+def _provider_draft_write_requested(lowered: str) -> bool:
+    if re.search(r"\b(?:do not|don't|dont)\s+(?:create|save|write)\b", lowered):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:create|save|write|add)\b.{0,30}\b(?:gmail\s+)?draft\b",
+            lowered,
+        )
+        or re.search(r"\b(?:save|put)\b.{0,25}\b(?:in|to)\s+gmail\b", lowered)
+    )
+
+
+def _draft_update_request(lowered: str) -> bool:
+    return bool(
+        re.search(r"\b(?:existing|current|selected|this)\s+(?:gmail\s+)?draft\b", lowered)
+        and re.search(
+            r"\b(?:update|edit|revise|rewrite|shorter|warmer|longer|change|modify)\b",
+            lowered,
+        )
+    )
+
+
+def _draft_subject_hint(text: str) -> str:
+    for pattern in (
+        r"\b(?:subject|titled|called)\s+[\"'](?P<value>[^\"']{2,160})[\"']",
+        r"\bsubject\s+(?P<value>[^,.;]{2,160})(?=\s+(?:for|to)\b|[,.;]|$)",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return " ".join(match.group("value").split()).strip()
+    return ""
+
+
+def _draft_recipient_hint(text: str) -> str:
+    match = re.search(r"\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b", text, flags=re.IGNORECASE)
+    return match.group(0).strip() if match else ""
+
+
 def _lookback_days(lowered: str) -> int | None:
+    if re.search(r"\b(?:today|this\s+morning|this\s+afternoon)\b", lowered):
+        return 1
     match = re.search(r"\b(?:last|past|recent)\s+(\d{1,3})\s+days?\b", lowered)
     if not match:
         return None
@@ -163,4 +309,29 @@ def _query_terms(lowered: str) -> str:
         terms.append("opportunity")
     if "follow-up" in lowered or "follow up" in lowered or "followup" in lowered:
         terms.append('"follow up"')
+    sender_hint = _email_sender_hint(lowered)
+    if sender_hint:
+        terms.append(f'"{sender_hint}"')
     return " ".join(dict.fromkeys(terms))
+
+
+def _date_scope_query(lowered: str, lookback_days: int) -> str:
+    if re.search(r"\b(?:today|this\s+morning|this\s+afternoon)\b", lowered):
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        return f"after:{today.strftime('%Y/%m/%d')}"
+    return f"newer_than:{lookback_days}d"
+
+
+def _email_sender_hint(lowered: str) -> str:
+    match = re.search(
+        r"\b(?:email|message|thread)s?\s+from\s+"
+        r"(?P<sender>[a-z0-9][a-z0-9&.' -]{1,80}?)"
+        r"(?=\s+(?:and|that|about|with|then|to)\b|[,.?]|$)",
+        lowered,
+    )
+    if not match:
+        return ""
+    sender = " ".join(match.group("sender").split()).strip()
+    if re.fullmatch(r"(?:today|yesterday|the\s+(?:last|past)\s+\d+\s+days?)", sender):
+        return ""
+    return sender

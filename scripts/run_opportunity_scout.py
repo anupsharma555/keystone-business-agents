@@ -171,6 +171,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     parser.add_argument("--markdown", action="store_true", help="Print markdown output.")
     parser.add_argument(
+        "--result-output",
+        type=Path,
+        default=None,
+        help=(
+            "Atomically persist the complete bounded result before console rendering. "
+            "Recommended for live SDK validation so output truncation cannot erase evidence."
+        ),
+    )
+    parser.add_argument(
         "--retrieval-hint-json",
         default=None,
         help=(
@@ -721,6 +730,21 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def _write_result_output_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _persist_requested_result(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    if args.result_output is not None:
+        _write_result_output_atomic(args.result_output, payload)
+
+
 @with_cli_environment()
 def main() -> int:
     args = apply_orchestrator_preflight_to_args(
@@ -754,6 +778,7 @@ def main() -> int:
             payload = _run_sdk_synthesis(args)
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
+        _persist_requested_result(args, payload)
         if args.markdown and not args.json:
             lines = [
                 "# Opportunity Scout SDK Synthesis",
@@ -880,12 +905,14 @@ def main() -> int:
                 saved = storage.save_memory_item(item.model_dump(mode="json"))
                 payload["storage"]["retrieval_tool_performance_memory_id"] = saved["id"]
     if args.markdown and not args.json:
+        _persist_requested_result(args, payload)
         report = render_opportunity_scout_report(result)
         review_markdown = render_orchestrator_output_review(payload.get("orchestrator_review"))
         print("\n\n".join(item for item in (report, review_markdown) if item))
         if args.save:
             print(f"\nSaved: {payload['storage']}")
     else:
+        _persist_requested_result(args, payload)
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     return 0
 
