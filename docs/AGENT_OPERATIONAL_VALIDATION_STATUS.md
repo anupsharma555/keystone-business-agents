@@ -69,6 +69,13 @@ evidence, but the manager-to-provider join is not yet proven; they remain the
 only candidates for a bounded live delegation batch. This 2/5 joined result is
 intentional evidence separation, not a partial pass disguised as completion.
 
+The remaining Slack goal now has an exact two-probe readiness registry. The
+direct Business Research and connector-backed Gmail→Research→Outreach graph
+pre-live evidence both pass, but live Slack evidence remains 0/2. The scorecard
+requires permalinks, local run/WorkItem IDs, answer-first copy, visible sources
+or source-limit language, one final response, trace/usage/cost evidence, and no
+unintended side effects. No fixture result can mark these live rows complete.
+
 - ANU-221 Gmail mailbox-state execution now passes on one real marked provider
   message. A zero-model lifecycle verified label add/remove, unread/read,
   star/unstar, important/not-important, archive/unarchive, trash/restore, and
@@ -102,7 +109,7 @@ intentional evidence separation, not a partial pass disguised as completion.
   scoring, and unsupported-claim validation respectively. Gmail, Chief, and
   the five context agents already had executable typed-tool proof; Orchestrator
   remains a control-plane routing/review contract rather than a provider owner.
-- `npm run test:ai-agents-workflow:no-live`: 600 workflow and current-context
+- `npm run test:ai-agents-workflow:no-live`: 604 workflow and current-context
   contract tests, seven
   LangGraph scenarios, 36/36 Slack routes, and ANU-60 preflight; zero live
   model/search/connector calls.

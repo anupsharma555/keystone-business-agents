@@ -34,6 +34,8 @@ Start here when changing or operating the repository.
 - `docs/ANU223_LIVE_DELEGATION_PLAN.md`: proposed serial request/cost ceilings,
   exact provider scopes, evidence requirements, and stop conditions for the
   three remaining manager-to-provider joins.
+- `docs/SLACK_ENTRYPOINT_LIVE_PLAN.md`: exact direct and connector-backed graph
+  Slack probes, combined budget, visible evidence, and stop conditions.
 - `docs/INITIAL_OPERATIONAL_MODEL_VALIDATION.md`: plan-only first paid batch,
   fresh billing-baseline requirement, exact request estimate, and hard stops.
 - `docs/AI_AGENTS_WORKFLOW_NO_LIVE_VALIDATION.md`: current pre-live proof gate
