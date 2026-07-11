@@ -565,7 +565,7 @@ def test_compare_langgraph_quality_script_runs_gmail_research_outreach_scenario(
     assert output["scenario"] == "gmail-research-outreach"
     assert output["control"]["quality_markers"]["route"] == "outreach_composer"
     assert graph_markers["route"] == "outreach_composer"
-    assert graph_markers["status"] == "blocked"
+    assert graph_markers["status"] == "needs_approval"
     assert graph_markers["checkpoint_required"] is True
     assert graph_markers["stage_statuses"]["gmail_triage"] == "completed"
     assert graph_markers["stage_statuses"]["business_research"] == "completed"

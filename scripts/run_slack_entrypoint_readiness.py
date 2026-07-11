@@ -41,9 +41,10 @@ def main(argv: list[str] | None = None) -> int:
             return completed.returncode
 
     _write(args.json_output, rows, passed=True)
+    live_count = sum(case.live_slack_evidence_proven for case in SLACK_ENTRYPOINT_READINESS_CASES)
     print(
-        "\nSlack entrypoint pre-live readiness passed; live Slack evidence: 0/2; "
-        "OpenAI API requests: 0."
+        "\nSlack entrypoint pre-live readiness passed; live Slack evidence: "
+        f"{live_count}/{len(SLACK_ENTRYPOINT_READINESS_CASES)}; OpenAI API requests: 0."
     )
     return 0
 

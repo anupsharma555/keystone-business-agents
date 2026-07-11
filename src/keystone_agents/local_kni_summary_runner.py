@@ -208,9 +208,12 @@ def _candidate_documents(packet: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _packet_is_ready(packet: dict[str, Any]) -> bool:
     candidates = _candidate_documents(packet)
+    diagnostics = packet.get("retrieval_diagnostics") or {}
     return bool(
         packet.get("local_only") is True
         and packet.get("send_enabled") is False
+        and isinstance(diagnostics, dict)
+        and diagnostics.get("candidate_selection_valid") is True
         and candidates
         and all(
             doc.get("content_excerpt") and doc.get("model_context_allowed")

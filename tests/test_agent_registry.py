@@ -51,7 +51,7 @@ STATIC_PREFIX_FINGERPRINTS = {
         "output_schema_sha256": "519be6127e040ff904066e7dd8efe671ce88a3c4c527bdcb730a6e5f131d3345",
     },
     "business_research_analyst": {
-        "instructions_sha256": "2bd54c0e7ecfa3c99fadc9cad796e0958153c0bcdb8ac2ef0d22a8ab7430f85d",
+        "instructions_sha256": "5df1682344565f30f7f93c73ee96af46484d3bab6867affe9d2e0a3e87a01c71",
         "tool_names_sha256": "a9f26c0e0237174742fdc53f1c4e7ce5c8936f492b353f5ef6e3adfb4c34a35e",
         "output_schema_sha256": "b8218a333d85d2f3850203f5ee48b7ec535a6f924a8851c513f1f2b2afeef6e0",
     },
@@ -61,13 +61,13 @@ STATIC_PREFIX_FINGERPRINTS = {
         "output_schema_sha256": "eea0e07dc95ce476794bae691207f241c160ab5e5e22c18036030f137ce907fc",
     },
     "outreach_composer": {
-        "instructions_sha256": "e29a5225329606c349098a07e40851e3e01a4cef4dedb660f788792f4bf2721c",
+        "instructions_sha256": "38e1bc1aa0ae303d5f18a61c054226aa84cc518851c0a4568a2ce73a2e6c6d66",
         "tool_names_sha256": "6092ed57d03b82170c380457199725a537ab0d16cf199a5393920a1b096815fe",
         "output_schema_sha256": "167da45f0bb07c0a255c4115b52e9510272a22cc1c479abe9e97c88693d44b34",
     },
     "airtable_context_agent": {
-        "instructions_sha256": "a46dfe73c2b54ef4cd8a06c46763cf8ad2d67d6d194eb02e4eeff814fd51321a",
-        "tool_names_sha256": "a8c8a3ab49d0b43ca7951b505b6cbd82caeafd3109e68980d5a04cbab0631bf6",
+        "instructions_sha256": "c111ee36dbcf0dffe496def016046b2d1b2eabc15e911dbec19e48b555583c5a",
+        "tool_names_sha256": "ed16e9723a4e18dfc9651d0320d9cd10e9056b06dce5c60a9c5f0044ab36b998",
         "output_schema_sha256": "7d4017a4e6833b52f2c408fe16352594a5fa2b393e740433a25b77b2934c4984",
     },
     "google_workspace_context_agent": {
@@ -76,8 +76,8 @@ STATIC_PREFIX_FINGERPRINTS = {
         "output_schema_sha256": "1b82a4db79f4e9f017351bafb57dbad7399b5c05e6e7ba528d97abbe7f1be506",
     },
     "zotero_context_agent": {
-        "instructions_sha256": "a4db65421dde330f6fa6b2e0e1277c410aa805509cff17cf9aa253bda8356a06",
-        "tool_names_sha256": "de566ff29be6b21118fabaa010dd7dba99a681a9eb7f414bc467cec6907c95d4",
+        "instructions_sha256": "e111db03587d6d74f3b12a5ab47d67bab65195c4fdf0bd5fbd10da6be1614a07",
+        "tool_names_sha256": "a75e6b6a2d3991af1d02b9d4ffc7af2ba89e240791382ca696117959176455c4",
         "output_schema_sha256": "efa1b731da05cfd915b319d730cf84019d76dd22d0a5f199818546deedac5bb8",
     },
     "rss_context_agent": {
@@ -267,6 +267,7 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     assert "airtable_link_attachment" in airtable_tool_names
     assert "airtable_create_expense_from_receipt" in airtable_tool_names
     assert "airtable_delete_test_record" in airtable_tool_names
+    assert "airtable_test_record_lifecycle" in airtable_tool_names
     assert workspace_tool_names == {
         "google_doc_read",
         "google_doc_write",
@@ -303,6 +304,7 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
         "zotero_import_article_with_backend",
         "zotero_write_test_note",
         "zotero_delete_test_note",
+        "zotero_test_note_lifecycle",
         "zotero_write_test_collection",
         "zotero_delete_test_collection",
         "zotero_write_test_item",
@@ -333,6 +335,7 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     assert tool_tier_for_name("airtable_upload_attachment") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("airtable_create_expense_from_receipt") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("airtable_delete_test_record") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("airtable_test_record_lifecycle") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("send_gmail_test_draft") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("create_gmail_draft_with_attachment") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("create_google_calendar_event") == ToolTier.INTERNAL_WRITE
@@ -345,6 +348,7 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     assert tool_tier_for_name("zotero_import_article_with_backend") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("zotero_write_test_note") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("zotero_delete_test_note") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("zotero_test_note_lifecycle") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("zotero_write_test_collection") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("zotero_delete_test_collection") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("zotero_write_test_item") == ToolTier.INTERNAL_WRITE

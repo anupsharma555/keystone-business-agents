@@ -78,6 +78,36 @@ def test_chief_scoped_airtable_lifecycle_is_not_misclassified_as_send() -> None:
     assert plan.planner_warnings == []
 
 
+def test_workspace_lifecycle_ignores_negated_outbound_actions() -> None:
+    request = (
+        "Create one temporary Sheet named KBA_TEST_SHEET pair-control in KNIOps, "
+        "add a marked KBA_TEST_ROW, read it back, update the same row, verify it, "
+        "delete the marked row, move the same test Sheet to trash, and confirm "
+        "cleanup. Do not share, send, post, or modify any unrelated file."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="orchestrator")
+
+    assert plan.target_agent == "google_workspace_context_agent"
+    assert plan.intent == "business_system_write"
+    assert plan.task_objective == "business_system_write"
+    assert plan.expected_artifact_type == "business_system_write_plan"
+    assert plan.side_effect_policy == "internal_write_approval_required"
+    assert plan.planner_warnings == []
+
+
+def test_workspace_save_plan_stays_read_only_until_execution_is_requested() -> None:
+    plan = infer_manual_request_plan(
+        "Prepare a save plan for the NeuroFlow research brief in Google Drive. "
+        "Do not create the file.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "google_workspace_context_agent"
+    assert plan.intent == "context_lookup"
+    assert plan.side_effect_policy == "draft_or_read_only"
+
+
 def test_context_agent_negated_side_effect_constraints_remain_read_only_context() -> None:
     plan = infer_manual_request_plan(
         "@KNI rss context agent: inspect announcement history. Do not post to Slack "
@@ -184,6 +214,30 @@ def test_manual_plan_routes_zotero_note_lifecycle_to_context_owner() -> None:
     assert plan.task_objective == "business_system_write"
     assert plan.expected_artifact_type == "business_system_write_plan"
     assert plan.side_effect_policy == "internal_write_approval_required"
+
+
+def test_chief_delegates_complete_zotero_note_lifecycle_to_context_owner() -> None:
+    plan = infer_manual_request_plan(
+        "Create one marked standalone Zotero test note, verify it, revise the same "
+        "note to be clearer, verify it again, and remove only that test note.",
+        requested_agent="chief_of_staff",
+    )
+
+    assert plan.target_agent == "zotero_context_agent"
+    assert plan.intent == "business_system_write"
+    assert plan.side_effect_policy == "internal_write_approval_required"
+
+
+def test_research_diligence_note_is_not_misclassified_as_provider_write() -> None:
+    plan = infer_manual_request_plan(
+        "@KNI business research analyst write a concise diligence note for CareNav AI "
+        "with labeled fields for "
+        "product, buyer, evidence, risk, and Keystone fit.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent != "blocked_send"
 
 
 @pytest.mark.parametrize(
@@ -1489,6 +1543,18 @@ def test_gmail_execution_plan_keeps_inline_email_context_off_live_gmail() -> Non
     assert plan.source_label == "inline_context"
     assert plan.gmail_query == ""
     assert "inline_email_context_triage" in plan.candidate_helpers
+
+
+def test_gmail_execution_plan_distinguishes_latest_thread_from_latest_email() -> None:
+    thread_plan = infer_gmail_execution_plan(
+        "Read the latest Gmail thread from the configured sender and suggest a reply."
+    )
+    email_plan = infer_gmail_execution_plan(
+        "Read the latest Gmail email from the configured sender and suggest a reply."
+    )
+
+    assert thread_plan.read_scope == "thread"
+    assert email_plan.read_scope == "message"
 
 
 def test_outreach_execution_plan_keeps_drafts_gated_and_tracks_replies() -> None:

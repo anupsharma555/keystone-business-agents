@@ -7,8 +7,8 @@ from pathlib import Path
 STAGE_PLAN = Path("artifacts/test-pack/next-live-serial-validation-stage.json")
 
 
-def test_next_live_stage_is_serial_bounded_and_freshly_gated() -> None:
-    plan = json.loads(STAGE_PLAN.read_text(encoding="utf-8"))
+def test_next_live_stage_is_serial_bounded_and_freshly_gated(require_local_evidence) -> None:
+    plan = json.loads(require_local_evidence(STAGE_PLAN).read_text(encoding="utf-8"))
 
     assert plan["approval_status"] == "fresh_ceiling_required"
     assert plan["execution_ready"] is False
@@ -35,8 +35,10 @@ def test_next_live_stage_is_serial_bounded_and_freshly_gated() -> None:
     assert all(plan["offline_preflight"]["credential_presence"].values())
 
 
-def test_next_live_stage_stops_on_first_failure_retry_or_missing_evidence() -> None:
-    plan = json.loads(STAGE_PLAN.read_text(encoding="utf-8"))
+def test_next_live_stage_stops_on_first_failure_retry_or_missing_evidence(
+    require_local_evidence,
+) -> None:
+    plan = json.loads(require_local_evidence(STAGE_PLAN).read_text(encoding="utf-8"))
     stop_text = " ".join(plan["stage_stop_conditions"]).lower()
 
     for required in (

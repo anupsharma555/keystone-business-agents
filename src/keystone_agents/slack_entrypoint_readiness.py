@@ -46,17 +46,20 @@ SLACK_ENTRYPOINT_READINESS_CASES: tuple[SlackEntrypointReadinessCase, ...] = (
         ),
         max_openai_requests=3,
         max_cost_usd=0.10,
+        live_slack_evidence_proven=True,
     ),
     SlackEntrypointReadinessCase(
         probe_id="SLACK-GRAPH-01",
-        title="Connector-backed Gmail research draft graph proof",
+        title="Connector-backed Gmail collaboration review graph proof",
         backend="langgraph",
         prompt=(
-            "@KNI read the latest Gmail thread from the configured exact test sender, "
-            "research the sender organization using only the selected thread context, "
-            "and return a formatted review summary with the thread's main point, "
-            "organization context, a suggested reply, supporting evidence, and the "
-            "approval status."
+            "@KNI review the latest Gmail thread from the configured exact test sender, "
+            "including all messages and the original inquiry. Identify the current "
+            "conversation state, recommend the most useful KNI-specific collaboration "
+            "next step using only that thread and approved KNI context, and include a "
+            "reply only if replying now would move the relationship forward. Return a "
+            "concise summary, supporting evidence, and any approval status that actually "
+            "applies."
         ),
         proof_nodeids=(
             "tests/test_workflow_runner.py::"
@@ -71,13 +74,14 @@ SLACK_ENTRYPOINT_READINESS_CASES: tuple[SlackEntrypointReadinessCase, ...] = (
             "work_item_id",
             "selected_gmail_identity_without_raw_body",
             "gmail_research_outreach_node_path",
-            "answer_first_review_only_draft",
-            "approval_checkpoint",
+            "answer_first_review_or_recommendation",
+            "correct_approval_or_no_approval_state",
             "one_final_response",
             "usage_trace_and_cost_receipt",
             "no_search_draft_send_or_external_write",
         ),
         max_openai_requests=8,
         max_cost_usd=0.50,
+        live_slack_evidence_proven=True,
     ),
 )

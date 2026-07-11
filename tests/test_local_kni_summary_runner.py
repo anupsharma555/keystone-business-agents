@@ -14,6 +14,7 @@ def _packet() -> dict[str, object]:
     return {
         "local_only": True,
         "send_enabled": False,
+        "retrieval_diagnostics": {"candidate_selection_valid": True},
         "candidate_documents": [
             {
                 "relative_path": "07_Marketing/Capability_Statement.md",
@@ -159,3 +160,15 @@ def test_live_summary_rejects_broader_limits(monkeypatch) -> None:
             "summarize local KNI capabilities",
             max_cost_usd=Decimal("0.06"),
         )
+
+
+def test_offline_plan_rejects_semantically_invalid_candidate_selection(monkeypatch) -> None:
+    packet = _packet()
+    packet["retrieval_diagnostics"] = {"candidate_selection_valid": False}
+    monkeypatch.setattr(
+        "keystone_agents.local_kni_summary_runner.build_local_kni_evidence_packet_for_query",
+        lambda _query: packet,
+    )
+
+    with pytest.raises(ValueError, match="not synthesis-ready"):
+        run_local_kni_capability_summary("summarize local KNI capabilities")

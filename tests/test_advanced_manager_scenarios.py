@@ -4,6 +4,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 from keystone_agents.advanced_manager_scenarios import (
+    ADVANCED_MANAGER_GLOBAL_INVARIANTS,
     ADVANCED_MANAGER_SCENARIOS,
     get_advanced_manager_scenario,
 )
@@ -48,6 +49,15 @@ def test_advanced_manager_scenarios_preserve_safety_and_low_friction() -> None:
     assert "stale_write_cannot_execute" in rendered
     assert "completed_provider_action_not_duplicated" in rendered
     assert "promptfoo" not in rendered.lower()
+    assert set(ADVANCED_MANAGER_GLOBAL_INVARIANTS) == {
+        "raw_operator_request_preserved_or_hashed",
+        "approval_state_preserved",
+        "selected_specialist_and_stop_condition_visible",
+        "source_and_artifact_identity_preserved",
+        "no_send_or_unapproved_write",
+        "no_stale_or_duplicate_provider_action",
+        "trace_and_receipt_sanitized",
+    }
 
 
 def test_advanced_manager_scenario_proof_nodeids_exist() -> None:

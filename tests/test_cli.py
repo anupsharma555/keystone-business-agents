@@ -15,6 +15,7 @@ from keystone_agents.orchestrator.preflight_context import (
     ORCHESTRATOR_PREFLIGHT_ENV,
     ORCHESTRATOR_ROUTE_RESULT_ENV,
 )
+from keystone_agents.schemas.operational_context import ZoteroContextResult
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
@@ -2616,6 +2617,9 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
                 "output_type": output_type.__name__,
                 "live": kwargs.get("live"),
                 "live_reads_env": os.environ.get(cli.AIRTABLE_LIVE_READS_ENV),
+                "operator_approval": os.environ.get(
+                    "KEYSTONE_AIRTABLE_OPERATOR_APPROVAL_REFERENCE"
+                ),
                 "max_turns": kwargs.get("max_turns"),
             }
         )
@@ -2706,15 +2710,104 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
             "output_type": "AirtableContextResult",
             "live": True,
             "live_reads_env": "true",
+            "operator_approval": None,
             "max_turns": 6,
         }
     ]
     assert os.environ.get(cli.AIRTABLE_LIVE_READS_ENV) is None
+    assert os.environ.get("KEYSTONE_AIRTABLE_OPERATOR_APPROVAL_REFERENCE") is None
     records = SQLiteStore(database_url).fetch_all("agent_runs")
     assert len(records) == 1
     assert records[0]["agent_name"] == "airtable_context_agent"
     assert records[0]["dry_run"] == 0
     assert records[0]["model"] == "sdk-live:gpt-5.4-mini"
+
+
+def test_marked_airtable_lifecycle_receives_process_local_operator_approval(
+    monkeypatch,
+    capsys,
+) -> None:
+    captured: dict[str, object] = {}
+    request = (
+        "Using Airtable context, create one marked KBA test expense in the Business "
+        "Expenses table, verify it, update the same record description, verify it "
+        "again, and remove only that test record."
+    )
+
+    def fake_run_typed_sdk_sync(_agent, _prompt, _output_type, **_kwargs):
+        captured["approval"] = os.environ.get(
+            "KEYSTONE_AIRTABLE_OPERATOR_APPROVAL_REFERENCE"
+        )
+        return (
+            SimpleNamespace(final_output=None, usage=None, new_items=[]),
+            cli.AirtableContextResult(
+                mode="llm",
+                summary="Prepared the bounded marked-record lifecycle.",
+                base_alias="finance_tax_tracker",
+                relevant_tables=["Business Expenses"],
+            ),
+        )
+
+    monkeypatch.delenv(
+        "KEYSTONE_AIRTABLE_OPERATOR_APPROVAL_REFERENCE",
+        raising=False,
+    )
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
+
+    exit_code = cli._run_ask_context_agent_live(
+        "airtable_context_agent",
+        request,
+        json_output=True,
+    )
+
+    assert exit_code == 0
+    json.loads(capsys.readouterr().out)
+    assert str(captured["approval"]).startswith("airtable-direct:")
+    assert os.environ.get("KEYSTONE_AIRTABLE_OPERATOR_APPROVAL_REFERENCE") is None
+
+
+def test_marked_zotero_lifecycle_receives_process_local_operator_approval(
+    monkeypatch,
+    capsys,
+) -> None:
+    captured: dict[str, object] = {}
+    request = (
+        "Create one marked standalone Zotero test note, verify it, revise the same "
+        "note to be clearer, verify it again, and remove only that test note."
+    )
+    manual_plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    def fake_run_typed_sdk_sync(_agent, prompt, _output_type, **_kwargs):
+        captured["approval"] = os.environ.get(
+            "KEYSTONE_ZOTERO_OPERATOR_APPROVAL_REFERENCE"
+        )
+        captured["prompt"] = prompt
+        return (
+            SimpleNamespace(final_output=None, usage=None, new_items=[]),
+            ZoteroContextResult(summary="Prepared the bounded marked-note lifecycle."),
+        )
+
+    monkeypatch.delenv(
+        "KEYSTONE_ZOTERO_OPERATOR_APPROVAL_REFERENCE",
+        raising=False,
+    )
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
+
+    exit_code = cli._run_ask_context_agent_live(
+        "zotero_context_agent",
+        request,
+        json_output=True,
+        manual_plan=manual_plan,
+    )
+
+    assert exit_code == 0
+    json.loads(capsys.readouterr().out)
+    assert str(captured["approval"]).startswith("zotero-direct:")
+    assert str(captured["prompt"]).startswith(request)
+    assert "Call the matching typed tool with live=true" in str(captured["prompt"])
+    assert os.environ.get("KEYSTONE_ZOTERO_OPERATOR_APPROVAL_REFERENCE") is None
 
 
 def test_context_agent_tool_receipts_are_bounded_and_report_verified_writes() -> None:
@@ -2784,6 +2877,126 @@ def test_context_agent_blocked_read_is_not_reported_as_blocked_write() -> None:
     ) == []
     assert cli._context_agent_external_write_performed(receipts) is True
     assert "private_field" not in json.dumps(receipts)
+
+
+def test_context_agent_lifecycle_receipt_keeps_bounded_verification() -> None:
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(
+                type="tool_call_output_item",
+                output=json.dumps(
+                    {
+                        "status": "success",
+                        "operation": "test_record_lifecycle",
+                        "table": "Business Expenses",
+                        "record_id": "recInternalOnly",
+                        "approval_reference": "airtable-direct:requesthash",
+                        "required_marker": "KBA_TEST_RECORD",
+                        "verification": {
+                            "passed": True,
+                            "create_read_back": True,
+                            "same_record_update_read_back": True,
+                            "record_absent_after_cleanup": True,
+                        },
+                        "create": {"record": {"private": "discard"}},
+                        "send_enabled": False,
+                    }
+                ),
+            )
+        ]
+    )
+
+    receipts = cli._context_agent_tool_receipts(raw_result)
+
+    assert receipts[0]["operation"] == "test_record_lifecycle"
+    assert receipts[0]["verification"] == {
+        "passed": True,
+        "create_read_back": True,
+        "same_record_update_read_back": True,
+        "record_absent_after_cleanup": True,
+    }
+    assert "create" not in receipts[0]
+    assert cli._context_agent_external_write_performed(receipts) is True
+
+
+def test_airtable_lifecycle_public_payload_removes_provider_identity() -> None:
+    provider_id = "recProviderInternal123"
+    output = {
+        "base_id": "appProviderInternal123",
+        "candidate_record_ids": [provider_id],
+        "recommended_record_identity": f"Airtable record {provider_id} was removed.",
+        "record_summaries": [
+            {
+                "key": provider_id,
+                "value": "Lifecycle passed.",
+                "note": f"Updated {provider_id} before cleanup.",
+            }
+        ],
+        "executed_write_results": [
+            {"key": "create", "value": "success", "note": f"Created {provider_id}."}
+        ],
+        "write_plan": {
+            "field_mapping": [
+                {"key": "required_marker", "value": "KBA_TEST_RECORD"},
+                {"key": "record_id", "value": provider_id},
+            ]
+        },
+    }
+    receipts = [
+        {
+            "status": "success",
+            "operation": "test_record_lifecycle",
+            "record_id": provider_id,
+            "verification": {"passed": True},
+        }
+    ]
+
+    public_output, public_receipts = cli._context_agent_public_payload(
+        "airtable_context_agent",
+        output,
+        receipts,
+    )
+
+    rendered = json.dumps({"output": public_output, "receipts": public_receipts})
+    assert provider_id not in rendered
+    assert "appProviderInternal123" not in rendered
+    assert public_output["candidate_record_ids"] == []
+    assert public_output["base_id"] == ""
+    assert public_output["write_plan"]["field_mapping"] == [
+        {"key": "required_marker", "value": "KBA_TEST_RECORD"}
+    ]
+    assert "record_id" not in public_receipts[0]
+
+
+def test_zotero_lifecycle_public_payload_removes_provider_identity() -> None:
+    provider_id = "NOTEINTERNAL"
+    output = {
+        "zotero_item_keys": [provider_id],
+        "relevant_evidence": [f"Updated {provider_id} and verified it."],
+        "executed_note_results": [
+            {"key": provider_id, "value": "success", "note": "Cleanup passed."}
+        ],
+    }
+    receipts = [
+        {
+            "status": "success",
+            "operation": "test_note_lifecycle",
+            "item_key": provider_id,
+            "verification": {"passed": True},
+        }
+    ]
+
+    public_output, public_receipts = cli._context_agent_public_payload(
+        "zotero_context_agent",
+        output,
+        receipts,
+    )
+
+    rendered = json.dumps({"output": public_output, "receipts": public_receipts})
+    assert provider_id not in rendered
+    assert public_output["zotero_item_keys"] == []
+    assert "the marked test note" in rendered
+    assert "item_key" not in public_receipts[0]
 
 
 def test_context_agent_tool_receipts_report_zotero_delete_and_absence() -> None:
@@ -4412,12 +4625,56 @@ def test_cli_connector_backed_gmail_graph_budget_blocks_before_preflight(
     assert payload["block_kind"] == "openai_request_budget_exceeded"
     assert payload["estimated_requests"]["min"] == 4
     assert payload["estimated_requests"]["stages"] == [
-        "manager_specialist_step_1",
-        "manager_specialist_step_2",
-        "manager_specialist_step_3",
+        "gmail_provider_read",
+        "business_research_sdk",
+        "outreach_composer_sdk",
         "final_response_synthesis",
     ]
+    assert payload["estimated_requests"]["max"] == 7
     assert payload["openai_requests_made"] == 0
+
+
+def test_bounded_connector_graph_fits_eight_request_ceiling_and_disables_web_search() -> None:
+    request = (
+        "Read the latest Gmail thread from the configured exact test sender, research "
+        "the sender organization using only the selected thread context, and return "
+        "a suggested reply with supporting evidence and the approval status."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=True,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+    )
+
+    assert estimate["max"] == 8
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "gmail_provider_read",
+        "business_research_sdk",
+        "outreach_composer_sdk",
+        "final_response_synthesis",
+    ]
+
+
+def test_bounded_connector_graph_accepts_state_and_collaboration_wording() -> None:
+    request = (
+        "Review the latest Gmail thread from the configured exact test sender, including "
+        "all messages and the original inquiry. Identify the current conversation state, "
+        "recommend the most useful KNI-specific collaboration next step using only that "
+        "thread and approved KNI context, and include a reply only if replying now would "
+        "move the relationship forward."
+    )
+
+    assert cli._is_bounded_gmail_research_reply_graph(request, manager_steps=3) is True
+    assert cli._request_forbids_live_research(request) is True
 
 
 def test_cli_explicit_chief_budget_uses_delegated_context_owner_turn_limit(

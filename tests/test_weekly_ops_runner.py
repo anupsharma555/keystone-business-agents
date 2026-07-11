@@ -50,6 +50,33 @@ def _payload() -> WeeklyOpsAssemblyInput:
     )
 
 
+def _packet_summary() -> str:
+    return "\n".join(
+        [
+            "Executive focus areas",
+            "One focus area.",
+            "Workstreams and decisions",
+            "One decision.",
+            "Completed runs and outcomes",
+            "One completed run.",
+            "Carry forward",
+            "One carry-forward.",
+            "One-time Calendar focus",
+            "One event.",
+            "Recurring Calendar cadence",
+            "One cadence.",
+            "Next actions",
+            "One action.",
+            "Source basis",
+            "Slack, Gmail, completed runs, and Calendar.",
+            "Operational health",
+            "No exception.",
+            "Packet metadata",
+            "One request; internal review destination.",
+        ]
+    )
+
+
 def test_weekly_runner_defaults_to_offline_validation() -> None:
     result = run_weekly_ops_packet_synthesis(_payload())
 
@@ -77,7 +104,7 @@ def test_weekly_runner_live_path_is_one_turn_without_tools() -> None:
             agent_name="chief_of_staff",
             output=ChiefOfStaffResult(
                 mode="llm",
-                summary="Review-only weekly packet.",
+                summary=_packet_summary(),
                 recommended_route=ChiefOfStaffRouteRecommendation(
                     workflow_type="portfolio-review",
                     target_channel="#ops-finance",
@@ -109,6 +136,8 @@ def test_weekly_runner_live_path_is_one_turn_without_tools() -> None:
     assert "source_id" not in str(external_bundle)
     assert result["usage"]["requests"] == 1
     assert result["provider_writes"] is False
+    assert result["data_handling"]["response_store"] is False
+    assert "2026-07-04 through 2026-07-11" in captured["input"]["request"]
 
 
 def test_weekly_runner_rejects_missing_usage_or_cost_receipt() -> None:
@@ -117,7 +146,7 @@ def test_weekly_runner_rejects_missing_usage_or_cost_receipt() -> None:
             agent_name="chief_of_staff",
             output=ChiefOfStaffResult(
                 mode="llm",
-                summary="Packet without a receipt.",
+                summary=_packet_summary(),
                 recommended_route=ChiefOfStaffRouteRecommendation(
                     workflow_type="portfolio-review"
                 ),
@@ -141,7 +170,7 @@ def test_weekly_runner_rejects_cost_over_ceiling() -> None:
             agent_name="chief_of_staff",
             output=ChiefOfStaffResult(
                 mode="llm",
-                summary="Expensive packet.",
+                summary=_packet_summary(),
                 recommended_route=ChiefOfStaffRouteRecommendation(
                     workflow_type="portfolio-review"
                 ),
@@ -167,7 +196,7 @@ def test_weekly_runner_rejects_slack_or_write_requests() -> None:
             agent_name="chief_of_staff",
             output=ChiefOfStaffResult(
                 mode="llm",
-                summary="Unsafe packet.",
+                summary=_packet_summary(),
                 recommended_route=ChiefOfStaffRouteRecommendation(
                     workflow_type="portfolio-review",
                     target_channel="#ops-finance",
@@ -190,6 +219,26 @@ def test_weekly_runner_rejects_slack_or_write_requests() -> None:
         )
 
     with pytest.raises(RuntimeError, match="side-effect request"):
+        run_weekly_ops_packet_synthesis(
+            _payload(),
+            live_sdk=True,
+            approved_external_business_synthesis=True,
+            runner=fake_runner,
+        )
+
+
+def test_weekly_runner_rejects_missing_required_sections() -> None:
+    def fake_runner(_typed_input: object, **_kwargs: object) -> TypedAgentRunResult:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(mode="llm", summary="A generic weekly summary."),
+            raw_result=None,
+            live=True,
+            usage={"requests": 1},
+            cost={"estimated_usd": 0.01},
+        )
+
+    with pytest.raises(RuntimeError, match="required sections"):
         run_weekly_ops_packet_synthesis(
             _payload(),
             live_sdk=True,

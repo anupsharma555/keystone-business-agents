@@ -73,6 +73,38 @@ from keystone_agents.work_items import (
 from keystone_agents.workflow_runner import advance_work_item, advance_work_item_manager_loop
 
 
+def test_workspace_lifecycle_plan_preserves_provider_write_contract(tmp_path: Path) -> None:
+    request_text = (
+        "Create one temporary Sheet named KBA_TEST_SHEET pair-contract in KNIOps, "
+        "add a marked KBA_TEST_ROW, read it back, update the same row, verify it, "
+        "delete the marked row, move the same test Sheet to trash, and confirm cleanup. "
+        "Do not share, send, post, or modify any unrelated file."
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=False,
+            manual_request_plan=infer_manual_request_plan(request_text).model_dump(mode="json"),
+        ),
+        max_steps=2,
+    )
+
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    artifact = next(
+        item for item in result.artifact_refs if item.artifact_type == "chief_of_staff_plan"
+    )
+    assert artifact.metadata["source_refs"] == []
+    assert len(artifact.metadata["write_requests"]) == 1
+    write_request = artifact.metadata["write_requests"][0]
+    assert write_request["title"] == "KBA_TEST_SHEET pair-contract"
+    assert write_request["metadata"]["owner_agent"] == "google_workspace_context_agent"
+    assert write_request["metadata"]["requires_provider_readback"] is True
+    assert write_request["metadata"]["requires_cleanup_verification"] is True
+
+
 def test_chief_workflow_allows_explicit_business_expense_receipt_airtable_write() -> None:
     request = (
         "chief of staff add a business expense to the airtable business expenses "
@@ -265,7 +297,6 @@ def test_live_gmail_retrieval_promotes_selected_thread_without_raw_body(
     assert calls[1] == ("get", "thread-1")
     persisted = (tmp_path / "workflow_runner.db").read_bytes()
     assert raw_private_body.encode() not in persisted
-
     selected = set_next_action(
         result.work_item,
         WorkItemNextAction(
@@ -305,6 +336,121 @@ def test_live_gmail_retrieval_promotes_selected_thread_without_raw_body(
     assert approvals[0].metadata["slack_approval_allows_gmail_draft_creation"] is True
     assert approvals[0].metadata["recipient_email"] == "alex@example.test"
     assert raw_private_body.encode() not in (tmp_path / "workflow_runner.db").read_bytes()
+
+
+def test_configured_test_sender_alias_resolves_to_internal_exact_sender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_GMAIL_TEST_SENDER", "test-sender@example.test")
+    request = (
+        "Read the latest Gmail thread from the configured exact test sender, "
+        "research the sender organization using only the selected thread context, "
+        "and return a suggested reply with the approval status."
+    )
+
+    query = workflow_runner._gmail_retrieval_query_from_request(
+        request,
+        {"gmail_query": '"the configured exact test sender"'},
+    )
+
+    assert query == "newer_than:30d from:test-sender@example.test"
+    assert "configured exact test sender" not in query
+
+
+def test_gmail_public_summary_hides_query_participants_and_provider_identity() -> None:
+    summary = workflow_runner.GmailThreadSummaryResult(
+        thread_id="thread-private-1",
+        message_count=2,
+        subject="Private subject",
+        summary="Confirmed by sender@example.test for the selected review.",
+        thread_context="Bounded selected context.",
+        latest_received_at="2026-07-11T15:28:16Z",
+        participants=["Sender <sender@example.test>", "Recipient <recipient@example.test>"],
+        action_items=["Reply to sender@example.test", "Reply to sender@example.test"],
+        open_questions=["Would a brief conversation help?"],
+        messages=[],
+        send_enabled=False,
+        draft_created=False,
+        labels_modified=False,
+    )
+
+    rendered = workflow_runner._format_gmail_thread_summary_work_item_summary(
+        summary,
+        query="newer_than:30d from:sender@example.test",
+    )
+
+    assert rendered.startswith("*Answer:*")
+    assert "provider identity internal" in rendered
+    assert "Query:" not in rendered
+    assert "Participants:" not in rendered
+    assert "thread-private-1" not in rendered
+    assert "sender@example.test" not in rendered
+    assert "recipient@example.test" not in rendered
+    assert rendered.count("Reply to [selected sender]") == 1
+    assert workflow_runner._request_forbids_live_research(
+        "Research the sender using only the selected thread context."
+    ) is True
+
+
+def test_suggested_reply_counts_as_outreach_stage_and_manager_continuation() -> None:
+    request = (
+        "Read the latest Gmail thread, research the sender organization using only "
+        "the selected thread context, and return a suggested reply with supporting "
+        "evidence and the approval status."
+    )
+
+    assert workflow_runner._manager_loop_requests_outreach_draft(request) is True
+    assert workflow_runner._operator_requested_manager_continuation(
+        request,
+        next_action_agent=WorkItemRoute.OUTREACH_COMPOSER,
+    ) is True
+
+
+def test_collaboration_review_wording_continues_gmail_to_research_and_outreach() -> None:
+    request = (
+        "Review the latest Gmail thread, including all messages and the original inquiry. "
+        "Identify the current conversation state, recommend the most useful KNI-specific "
+        "collaboration next step using only that thread and approved KNI context, and include "
+        "a reply only if replying now would move the relationship forward."
+    )
+
+    assert workflow_runner._manager_loop_requests_research(request) is True
+    assert workflow_runner._manager_loop_requests_outreach_draft(request) is True
+    assert workflow_runner._operator_requested_manager_continuation(
+        request,
+        next_action_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+    ) is True
+
+
+def test_gmail_public_summary_hides_resolved_questions_after_courtesy_close() -> None:
+    summary = workflow_runner.GmailThreadSummaryResult(
+        thread_id="thread-neuroblu",
+        summary="Latest status: Thanks for your time. Reach out if opportunities arise.",
+        message_count=4,
+        action_items=["Please share a few times for a brief conversation."],
+        open_questions=["Can you share a few times?"],
+        messages=[
+            workflow_runner.GmailThreadSummaryMessage(
+                sender_name="Eze",
+                sender_email="eze@example.test",
+                summary="Can you share a few times?",
+            ),
+            workflow_runner.GmailThreadSummaryMessage(
+                sender_name="Eze",
+                sender_email="eze@example.test",
+                summary="Thanks for your time. Reach out if collaboration opportunities arise.",
+            ),
+        ],
+    )
+
+    rendered = workflow_runner._format_gmail_thread_summary_work_item_summary(
+        summary,
+        query="from:eze@example.test",
+    )
+
+    assert "earlier scheduling questions are historical" in rendered
+    assert "*Action items:*" not in rendered
+    assert "*Open questions:*" not in rendered
 
 
 def test_normalize_target_text_strips_named_agent_prefixes() -> None:
@@ -5486,6 +5632,111 @@ def test_source_bundle_context_promotes_typed_sources_facts_and_gmail_identity()
         "fact_count": 3,
         "supplied_material_only": True,
     }
+
+
+def test_source_bundle_target_mismatch_blocks_before_promoting_evidence() -> None:
+    fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
+    context = json.loads(fixture_path.read_text(encoding="utf-8"))
+    work_item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="NeuroFlow opportunity assessment",
+        request_text="Research NeuroFlow, then assess the opportunity.",
+        target=WorkItemTarget(
+            name="NeuroFlow",
+            object_type="topic",
+            metadata={
+                "manual_request_plan": {
+                    "target_agent": "opportunity_scout",
+                    "primary_target": "NeuroFlow",
+                    "target_type": "topic",
+                }
+            },
+        ),
+    )
+
+    updated = workflow_runner._apply_external_context(
+        work_item,
+        context,
+        context_file_path=str(fixture_path),
+    )
+
+    assert updated.target.name == "NeuroFlow"
+    assert updated.sources == []
+    assert updated.facts == []
+    assert updated.target.metadata["external_context"]["target_status"] == "mismatch"
+    assert updated.target.metadata["external_context"]["bundle_target"] == (
+        "Northstar Behavioral Analytics"
+    )
+    assert {blocker.code for blocker in updated.blockers} == {
+        "source_bundle_target_mismatch"
+    }
+
+
+def test_source_provided_opportunity_target_prefers_typed_specific_target() -> None:
+    request = (
+        "Research NeuroFlow as a behavioral-health AI opportunity, then have Opportunity "
+        "Scout assess whether this is a real KNI advisory opportunity."
+    )
+
+    assert workflow_runner._source_provided_opportunity_target("NeuroFlow", request) == (
+        "NeuroFlow"
+    )
+
+
+def test_source_bundle_target_mismatch_is_case_independent() -> None:
+    assert workflow_runner._source_bundle_target_conflicts(
+        planned_target="neuroflow",
+        bundle_target="Northstar Behavioral Analytics",
+        bundle_target_type="company",
+    ) is True
+    assert workflow_runner._source_bundle_target_conflicts(
+        planned_target="recent behavioral health companies",
+        bundle_target="Northstar Behavioral Analytics",
+        bundle_target_type="company",
+    ) is False
+
+
+def test_manager_loop_blocks_mismatched_source_bundle_before_specialists(
+    tmp_path: Path,
+) -> None:
+    fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
+    request_text = (
+        "Research NeuroFlow as a behavioral-health AI opportunity with payer partnership "
+        "and outcomes-evidence signals, then have Opportunity Scout assess whether this is "
+        "a real KNI advisory/research opportunity. Stop before outreach."
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=request_text,
+            context_file_path=str(fixture_path),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=False,
+            live_search=False,
+            manual_request_plan={
+                "source": "test",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": "NeuroFlow",
+                "target_type": "topic",
+                "task_objective": "opportunity_discovery",
+            },
+        ),
+        max_steps=3,
+    )
+
+    assert result.work_item.target.name == "NeuroFlow"
+    assert result.work_item.sources == []
+    assert result.work_item.facts == []
+    assert result.advanced is False
+    assert "source_bundle_target_mismatch" in {
+        blocker.code for blocker in result.blockers
+    }
+    assert any(
+        "stopped before using a source bundle for a different target" in note
+        for note in result.audit_notes
+    )
 
 
 def test_source_bundle_context_cannot_self_approve_external_use_or_send() -> None:
@@ -10924,6 +11175,66 @@ def test_gmail_triage_live_retrieval_reads_recent_matching_threads(
     assert result.artifact_refs[0].metadata["matched_thread_count"] == 2
 
 
+def test_gmail_triage_latest_email_reads_one_message_without_expanding_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class FakeGmailTool:
+        def __init__(self, *, live: bool) -> None:
+            assert live is True
+
+        def list_recent_messages(self, **_kwargs: object) -> list[dict[str, str]]:
+            return [{"id": "msg-latest", "threadId": "thread-with-two-messages"}]
+
+        def get_message(self, message_id: str) -> dict[str, object]:
+            calls.append(("message", message_id))
+            return {
+                "id": message_id,
+                "threadId": "thread-with-two-messages",
+                "from": "Alex <alex@example.test>",
+                "subject": "Latest note",
+                "snippet": "This message alone should be used.",
+                "thread_summary": "The latest message asks for a short review.",
+                "received_at": "2026-07-11T15:00:00Z",
+                "prior_labels": ["INBOX"],
+            }
+
+        def get_thread(self, thread_id: str) -> dict[str, object]:
+            raise AssertionError(f"latest email must not expand sibling messages: {thread_id}")
+
+    monkeypatch.setattr(workflow_runner, "GmailTool", FakeGmailTool)
+    monkeypatch.setattr(workflow_runner, "cli_default_live_gmail", lambda: True)
+    store = SQLiteStore(_database_url(tmp_path))
+    work_item = WorkItem(
+        id="wi_latest_email_only",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Latest email only",
+        request_text="Read the latest Gmail email from Alex and summarize it.",
+        current_route=WorkItemRoute.GMAIL_TRIAGE,
+        target=WorkItemTarget(name="Alex", object_type="contact"),
+    )
+    store.save_work_item(work_item)
+
+    result = workflow_runner._try_live_gmail_thread_retrieval(
+        work_item,
+        request=WorkflowRunRequest(
+            request_text=work_item.request_text,
+            live_sdk=True,
+            manual_request_plan={"gmail_query": "from:alex@example.test"},
+        ),
+        store=store,
+        gmail_plan=workflow_runner.infer_gmail_execution_plan(work_item.request_text),
+    )
+
+    assert result is not None
+    assert calls == [("message", "msg-latest")]
+    artifact = result.artifact_refs[0]
+    assert artifact.metadata["gmail_read_scope"] == "message"
+    assert artifact.metadata["message_count"] == 1
+
+
 def test_chief_of_staff_email_reply_workflow_delegates_to_gmail_then_outreach(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11948,6 +12259,121 @@ def test_thread_local_gmail_draft_uses_safe_concrete_detail_when_available() -> 
 
     assert "Halo's partner listings and active requests" in draft.email_body
     assert "Start by creating" not in draft.email_body
+
+
+def test_gmail_reply_focus_uses_latest_external_message_over_resolved_question() -> None:
+    summary = workflow_runner.GmailThreadSummaryResult(
+        thread_id="thread-neuroblu",
+        subject="Re: NeuroBlu discussion",
+        summary="Latest status: Thanks for your time and reach out if opportunities arise.",
+        action_items=["Please share a few times for a brief conversation."],
+        open_questions=["Can you share a few times in the near term?"],
+        prior_context=[
+            "Original interest: Neuropsychiatry data analytics solution",
+            "Original message: What does the dataset contain and is it available via license?",
+        ],
+        messages=[
+            workflow_runner.GmailThreadSummaryMessage(
+                sender_name="Eze",
+                sender_email="eze@example.test",
+                summary="Can you share a few times in the near term?",
+                snippet="Can you share a few times in the near term?",
+            ),
+            workflow_runner.GmailThreadSummaryMessage(
+                sender_name="Anup",
+                sender_email="operator@example.test",
+                summary="Would Thursday between 1 and 3 PM work?",
+                snippet="Would Thursday between 1 and 3 PM work?",
+            ),
+            workflow_runner.GmailThreadSummaryMessage(
+                sender_name="Anup",
+                sender_email="operator@example.test",
+                summary="Thank you for the discussion. I will keep the platform in mind.",
+                snippet="Thank you for the discussion. I will keep the platform in mind.",
+            ),
+            workflow_runner.GmailThreadSummaryMessage(
+                sender_name="Eze",
+                sender_email="eze@example.test",
+                summary="Thanks for your time. Reach out if collaboration opportunities arise.",
+                snippet="Thanks for your time. Reach out if collaboration opportunities arise.",
+            ),
+        ],
+    )
+
+    focus = workflow_runner._gmail_thread_reply_focus(summary)
+    chronology = workflow_runner._gmail_thread_chronology_lines(summary)
+
+    assert focus.startswith("Thanks for your time")
+    assert "share a few times" not in focus.lower()
+    assert len(chronology) == 4
+    assert "share a few times" in chronology[0].lower()
+    assert "Thursday" in chronology[1]
+    assert "Thank you for the discussion" in chronology[2]
+    assert "collaboration opportunities" in chronology[3]
+    assert workflow_runner._gmail_thread_reply_state(summary) == (
+        "courtesy_close_with_future_collaboration_invitation"
+    )
+
+    draft = workflow_runner._thread_local_outreach_draft(
+        "suggest a reply",
+        gmail_thread_context=summary,
+    ).model_copy(
+        update={
+            "email_body": (
+                "Hi Eze,\n\nThanks for following up.\n\n"
+                "Would a brief exploratory conversation be useful?\n\nSincerely,\nAnup"
+            )
+        }
+    )
+    recommendation = {
+        "reply_recommended": False,
+        "recommended_next_step": "Assess a concrete data-licensing collaboration hypothesis.",
+        "additional_information_needed": ["Dataset contents and licensing terms."],
+        "collaboration_ideas": ["A bounded KNI dataset-fit assessment."],
+        "deferral_reason": "The thread is closed until the collaboration concept is concrete.",
+    }
+    mismatches = workflow_runner._gmail_thread_recommendation_mismatches(
+        draft,
+        recommendation=recommendation,
+        gmail_thread_context=summary,
+    )
+    assert any("adds a new question" in item for item in mismatches)
+    valid_draft = draft.model_copy(
+        update={
+            "email_body": (
+                "Hi Eze,\n\nThanks for following up. I will outline a focused KNI "
+                "dataset-fit use case and follow up if the fit is strong.\n\nSincerely,\nAnup"
+            )
+        }
+    )
+    assert workflow_runner._gmail_thread_recommendation_mismatches(
+        valid_draft,
+        recommendation=recommendation,
+        gmail_thread_context=summary,
+    ) == []
+    assert "Root context:" in workflow_runner._gmail_thread_chronology_context(summary)
+
+
+def test_gmail_chronology_sanitizes_quoted_headers_and_contact_details() -> None:
+    summary = workflow_runner.GmailThreadSummaryResult(
+        messages=[
+            workflow_runner.GmailThreadSummaryMessage(
+                sender_name="Sender",
+                sender_email="sender@example.test",
+                summary=(
+                    "Thanks for your time. Best Sender T: +1 (617) 555-0100 "
+                    "E: sender@example.test On Fri, Jul 10, 2026 at 10:05 AM, "
+                    "Operator <operator@example.test> wrote: earlier content"
+                ),
+            )
+        ]
+    )
+
+    rendered = " ".join(workflow_runner._gmail_thread_chronology_lines(summary))
+
+    assert "555-0100" not in rendered
+    assert "sender@example.test" not in rendered
+    assert "earlier content" not in rendered
 
 
 def test_thread_local_gmail_summary_keeps_email_fields_in_main_body() -> None:

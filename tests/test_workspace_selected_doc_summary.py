@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from pathlib import Path
 from types import SimpleNamespace
 
 from keystone_agents.execution_identity import create_validation_execution_identity
@@ -173,11 +172,13 @@ def test_saved_receipt_can_be_revalidated_without_model_or_provider_call(tmp_pat
     assert initial_status == "pass"
 
 
-def test_persisted_live_plan_requires_fresh_approval_with_current_billing_refresh() -> None:
+def test_persisted_live_plan_requires_fresh_approval_with_current_billing_refresh(
+    require_local_evidence,
+) -> None:
     plan = json.loads(
-        Path("artifacts/test-pack/next-live-workspace-selected-doc-plan.json").read_text(
-            encoding="utf-8"
-        )
+        require_local_evidence(
+            "artifacts/test-pack/next-live-workspace-selected-doc-plan.json"
+        ).read_text(encoding="utf-8")
     )
 
     assert plan["approval_status"] == "completed_within_eight_sequential_run_allowance"

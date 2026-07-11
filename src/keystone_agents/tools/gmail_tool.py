@@ -424,6 +424,79 @@ def _normalize_body(text: str) -> tuple[str, bool]:
     return normalized.replace("\u2014", "-"), quote_stripped
 
 
+def _payload_raw_text(payload: dict[str, Any] | None) -> str:
+    if not payload:
+        return ""
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    for part in _walk_payload_parts(payload):
+        mime_type = str(part.get("mimeType") or "").lower()
+        body = part.get("body", {}) if isinstance(part.get("body"), dict) else {}
+        body_data = body.get("data")
+        if not body_data:
+            continue
+        decoded = _decode_base64_url(str(body_data)).strip()
+        if not decoded:
+            continue
+        if mime_type == "text/plain":
+            plain_parts.append(decoded)
+        elif mime_type == "text/html":
+            html_parts.append(decoded)
+        elif not part.get("parts") and mime_type.startswith("text/"):
+            plain_parts.append(decoded)
+    if plain_parts:
+        return "\n".join(plain_parts).strip()
+    return "\n".join(_html_to_text(part) for part in html_parts).strip()
+
+
+def _labeled_quoted_context(raw_text: str) -> list[str]:
+    lines = [line.strip() for line in raw_text.replace("\r", "").splitlines()]
+    quote_index = next(
+        (index for index, line in enumerate(lines) if QUOTE_DELIMITER_RE.match(line)),
+        None,
+    )
+    if quote_index is None:
+        return []
+    quoted = lines[quote_index + 1 :]
+    labels = {
+        "i'm interested in": "Original interest",
+        "i’m interested in": "Original interest",
+        "message": "Original message",
+    }
+    stop_labels = {
+        "view submission in hubspot",
+        "this email was sent to",
+        "do you want to stop receiving these emails?",
+        "hubspot, inc.",
+    }
+    extracted: list[str] = []
+    for index, line in enumerate(quoted):
+        label = labels.get(line.lower())
+        if label is None:
+            continue
+        values: list[str] = []
+        for candidate in quoted[index + 1 :]:
+            lowered = candidate.lower()
+            if lowered in labels or any(lowered.startswith(stop) for stop in stop_labels):
+                break
+            if candidate:
+                values.append(candidate)
+            if len(" ".join(values)) >= 500:
+                break
+        value = _normalize_summary_text(" ".join(values))
+        if value:
+            extracted.append(f"{label}: {value[:500]}")
+    return _unique_nonempty(extracted, limit=4)
+
+
+def _thread_prior_context(raw_messages: list[Mapping[str, Any]]) -> list[str]:
+    context: list[str] = []
+    for message in raw_messages:
+        payload = message.get("payload") if isinstance(message.get("payload"), dict) else None
+        context.extend(_labeled_quoted_context(_payload_raw_text(payload)))
+    return _unique_nonempty(context, limit=6)
+
+
 def _payload_text_links_and_attachments(
     payload: dict[str, Any] | None,
 ) -> tuple[str, list[GmailLinkRecord], list[GmailAttachmentMetadata], bool]:
@@ -587,6 +660,20 @@ def _thread_open_questions(envelopes: list[GmailMessageEnvelope]) -> list[str]:
     return _unique_nonempty(questions, limit=5)
 
 
+def _latest_message_closes_exchange(envelopes: list[GmailMessageEnvelope]) -> bool:
+    if not envelopes:
+        return False
+    latest = " ".join(
+        [envelopes[-1].normalized_body, envelopes[-1].snippet]
+    ).lower()
+    return bool(
+        re.search(r"\b(?:thank|thanks|many thanks|appreciate)\b", latest)
+        and re.search(r"\b(?:reach out|keep in touch|stay in touch)\b", latest)
+        and re.search(r"\b(?:collaborat|opportunit|future)\w*\b", latest)
+        and "?" not in latest
+    )
+
+
 def _thread_level_limitations(envelopes: list[GmailMessageEnvelope]) -> list[str]:
     limitations = [
         "Read-only thread summary used sanitized Gmail message bodies from the selected thread."
@@ -627,6 +714,9 @@ def _thread_overview(
     action_items = _thread_action_items(envelopes)
     deadlines = _thread_deadlines(envelopes)
     open_questions = _thread_open_questions(envelopes)
+    if _latest_message_closes_exchange(envelopes):
+        action_items = []
+        open_questions = []
     latest = envelopes[-1]
     subject = latest.subject or next((item.subject for item in envelopes if item.subject), "")
     recent_points = _unique_nonempty(
@@ -635,14 +725,16 @@ def _thread_overview(
         limit=2,
     )
     fragments: list[str] = []
+    if recent_points:
+        fragments.append(f"Latest status: {recent_points[0]}")
+        if len(recent_points) > 1:
+            fragments.append(f"Initial context: {recent_points[1]}")
+    elif latest.thread_summary:
+        fragments.append(f"Latest status: {latest.thread_summary}")
     if subject:
         fragments.append(f"Thread about {subject}.")
     if participants:
         fragments.append(f"Participants: {', '.join(participants[:3])}.")
-    if recent_points:
-        fragments.append(f"Recent context: {' '.join(recent_points)}")
-    elif latest.thread_summary:
-        fragments.append(latest.thread_summary)
     summary = _thread_summary("", " ".join(fragments))
     return summary, participants, action_items, deadlines, open_questions
 
@@ -1330,6 +1422,7 @@ class GmailTool:
                 "deadlines": [],
                 "open_questions": [],
                 "triage_limitations": ["Live Gmail thread retrieval is disabled in dry-run mode."],
+                "prior_context": [],
                 "messages": [],
                 "send_enabled": False,
                 "draft_created": False,
@@ -1346,9 +1439,11 @@ class GmailTool:
         envelopes = [gmail_message_envelope_from_api(message) for message in raw_messages]
         message_count = len(envelopes)
         summary, participants, action_items, deadlines, open_questions = _thread_overview(envelopes)
+        prior_context = _thread_prior_context(raw_messages)
+        newest_first = list(reversed(envelopes))
         thread_context = _thread_summary(
-            " ".join(envelope.snippet for envelope in envelopes),
-            " ".join(envelope.thread_summary for envelope in envelopes),
+            " ".join(envelope.snippet for envelope in newest_first),
+            " ".join(envelope.thread_summary for envelope in newest_first),
         )
         triage_limitations = _thread_level_limitations(envelopes)
         latest_received_at = envelopes[-1].received_at if envelopes else ""
@@ -1409,6 +1504,7 @@ class GmailTool:
             "deadlines": deadlines,
             "open_questions": open_questions,
             "triage_limitations": triage_limitations,
+            "prior_context": prior_context,
             "messages": messages,
             "send_enabled": False,
             "draft_created": False,

@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
+from keystone_agents.schemas.research import ResearchBrief
 from keystone_agents.tools.internal_data_tools import (
     google_doc_read_impl,
     google_doc_trash_impl,
@@ -144,6 +145,19 @@ def build_research_doc_content(
             raise ValueError(
                 "Focused Business Research result lacks source-backed summary content."
             )
+    elif output_type == "ResearchBrief":
+        brief = ResearchBrief.model_validate(raw_output)
+        company = brief.target_name
+        sections = [
+            ("Executive summary", brief.summary),
+            ("Key findings", "\n".join(f"- {item}" for item in brief.key_findings[:8])),
+            ("Interpretation", "\n".join(f"- {item}" for item in brief.inferences[:6])),
+            ("Limitations", "\n".join(f"- {item}" for item in brief.limitations[:6])),
+            ("Next steps", "\n".join(f"- {item}" for item in brief.next_steps[:6])),
+        ]
+        sources = [(source.title, source.url) for source in brief.sources]
+        if not brief.sources or not brief.summary or not brief.key_findings:
+            raise ValueError("Research brief lacks source-backed summary content.")
     elif output_type in {"", "CompanyProfile"}:
         profile = CompanyProfile.model_validate(raw_output)
         company = profile.name

@@ -2807,11 +2807,13 @@ def test_cli_result_output_option_persists_before_rendering(
     assert json.loads(output.read_text(encoding="utf-8")) == payload
 
 
-def test_next_normalization_plan_uses_exact_recovered_source_packet() -> None:
+def test_next_normalization_plan_uses_exact_recovered_source_packet(
+    require_local_evidence,
+) -> None:
     plan = json.loads(
-        Path("artifacts/test-pack/next-live-opportunity-normalization-plan.json").read_text(
-            encoding="utf-8"
-        )
+        require_local_evidence(
+            "artifacts/test-pack/next-live-opportunity-normalization-plan.json"
+        ).read_text(encoding="utf-8")
     )
 
     assert plan["execution_ready"] is False

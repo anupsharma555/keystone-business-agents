@@ -8,6 +8,7 @@ import pytest
 from keystone_agents.tools import zotero_context_tools
 from keystone_agents.tools.zotero_context_tools import (
     zotero_delete_test_note_impl,
+    zotero_test_note_lifecycle_impl,
     zotero_write_test_note_impl,
 )
 
@@ -71,6 +72,84 @@ def test_zotero_test_note_create_reads_back_without_returning_content(
     assert "note" not in result["after"]
     assert result["after"]["note_sha256"]
     assert [method for method, _path in calls] == ["POST", "GET"]
+
+
+def test_zotero_test_note_reuses_process_local_operator_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approvals: list[str] = []
+
+    def fake_config(**kwargs: object) -> tuple[str, str]:
+        approvals.append(str(kwargs["approval_reference"]))
+        return "test-api-key", "12345"
+
+    def fake_request(method: str, _path: str, **_: object):
+        if method == "POST":
+            return 200, {"successful": {"0": {"key": "NOTE1234"}}}, {}
+        return 200, _item("NOTE1234", 1, "<p>KBA_TEST_NOTE created</p>"), {}
+
+    monkeypatch.setenv(
+        "KEYSTONE_ZOTERO_OPERATOR_APPROVAL_REFERENCE",
+        "zotero-direct:requesthash",
+    )
+    monkeypatch.setattr(zotero_context_tools, "_zotero_live_write_config", fake_config)
+    monkeypatch.setattr(zotero_context_tools, "_zotero_http_request", fake_request)
+
+    result = zotero_write_test_note_impl(
+        "<p>KBA_TEST_NOTE created</p>",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["approval_reference"] == "zotero-direct:requesthash"
+    assert approvals == ["zotero-direct:requesthash"]
+
+
+def test_zotero_test_note_lifecycle_updates_same_note_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[dict[str, object]] = []
+    deleted: list[str] = []
+
+    def fake_write(note_html: str, **kwargs: object) -> dict[str, object]:
+        writes.append({"note_html": note_html, **kwargs})
+        return {
+            "status": "success",
+            "operation": kwargs["operation"],
+            "item_key": "NOTE_INTERNAL",
+            "verification": {"passed": True},
+            "send_enabled": False,
+        }
+
+    def fake_delete(item_key: str, **_kwargs: object) -> dict[str, object]:
+        deleted.append(item_key)
+        return {
+            "status": "success",
+            "operation": "delete_test_note",
+            "item_key": item_key,
+            "verification": {"passed": True, "item_absent_after": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(zotero_context_tools, "zotero_write_test_note_impl", fake_write)
+    monkeypatch.setattr(zotero_context_tools, "zotero_delete_test_note_impl", fake_delete)
+
+    result = zotero_test_note_lifecycle_impl(
+        approval_reference="zotero-direct:requesthash",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["verification"] == {
+        "passed": True,
+        "create_read_back": True,
+        "same_note_update_read_back": True,
+        "note_absent_after_cleanup": True,
+    }
+    assert len(writes) == 2
+    assert writes[1]["item_key"] == "NOTE_INTERNAL"
+    assert writes[1]["operation"] == "update"
+    assert deleted == ["NOTE_INTERNAL"]
 
 
 def test_zotero_test_note_update_uses_version_and_verifies(

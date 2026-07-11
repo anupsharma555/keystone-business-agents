@@ -3,6 +3,11 @@ from __future__ import annotations
 import pytest
 
 import keystone_agents.research_doc_lifecycle as lifecycle
+from keystone_agents.schemas.research import (
+    ResearchBrief,
+    ResearchBriefFact,
+    ResearchSourceCitation,
+)
 
 
 def _focused_result() -> dict[str, object]:
@@ -174,3 +179,34 @@ def test_research_doc_cleanup_runs_after_update_failure(monkeypatch) -> None:
     assert "update failed" in result["failure"]
     assert trashed == ["doc-1"]
     assert result["receipts"]["trash_readback"]["passed"] is True
+
+
+def test_research_doc_content_supports_general_source_backed_brief() -> None:
+    brief = ResearchBrief(
+        target_name="Selected research note",
+        summary="A concise summary of the selected internal research note.",
+        key_findings=["The note identifies one evidence-quality priority."],
+        facts=[
+            ResearchBriefFact(
+                text="The note identifies an evidence-quality priority.",
+                source_ids=["google-doc:doc-1"],
+                confidence=0.9,
+            )
+        ],
+        sources=[
+            ResearchSourceCitation(
+                source_id="google-doc:doc-1",
+                title="Selected research note",
+                url="https://docs.google.com/document/d/doc-1/edit",
+                source_type="google_workspace_document",
+            )
+        ],
+    )
+    content = lifecycle.build_research_doc_content(
+        {"output_type": "ResearchBrief", "output": brief.model_dump(mode="json")},
+        suffix="abc",
+    )
+
+    assert content["title"].startswith("KBA_TEST_DOC_abc_")
+    assert "## Executive summary" in content["original_body"]
+    assert "## Sources" in content["original_body"]

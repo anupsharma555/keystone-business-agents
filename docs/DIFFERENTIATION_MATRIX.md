@@ -32,3 +32,33 @@ follow-through.
    operator approval plus live-test budget or stop condition exists.
 
 The live probe is evidence for delivery, not a substitute for offline tests.
+
+## Selected Near-Term Commitments
+
+ANU-175 now narrows the broader matrix to five measurable commitments:
+
+1. Slack-native, answer-first execution with one final receipt.
+2. Reduced context re-entry through persistent WorkItem and same-object state.
+3. Source-visible specialist judgment rather than generic unsupported prose.
+4. Durable exact-scope approvals and audit without duplicate approval friction.
+5. Operational follow-through into a reviewed artifact or next safe action.
+
+Generic reasoning, generic coding, and connector breadth are explicitly not KBA
+differentiators. The representative proof workflows are research-to-internal-
+Doc, selected Gmail-thread follow-up, current opportunity assessment, and a
+weekly/project brief.
+
+`DifferentiationObservation` is the comparison contract. KBA and the clean
+Codex/ChatGPT-style baseline must receive the same natural ask, identified by
+the same SHA-256 hash, and each observation must retain direct evidence refs.
+The comparison records useful result, route correctness, visible sources,
+follow-up continuity, context fields re-entered, manual provider IDs, approval
+round trips, unintended writes, duplicate artifacts, developer intervention,
+latency, and estimated cost. Missing or mismatched baseline evidence never
+implies a KBA win.
+
+An individual KBA observation is safe and useful only when it returns a useful
+correctly routed result with zero unintended writes, zero duplicate artifacts,
+and no developer intervention. A comparative claim is supported only when the
+matched KBA observation is safe and useful, improves at least one committed
+operator metric, and introduces no recorded capability or safety regression.

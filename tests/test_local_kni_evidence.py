@@ -294,6 +294,75 @@ def test_local_kni_evidence_packet_filters_formation_candidates(
     assert all("BoardRoom-Memos" not in path for path in paths)
 
 
+def test_local_kni_evidence_packet_prefers_current_commercial_material(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matches = [
+        {
+            "relative_path": "00_Admin/Internal_Policies/BoardRoom-Memos/positioning.md",
+            "title": "Positioning",
+            "extension": "md",
+            "modified_at": "2026-07-01T00:00:00+00:00",
+            "snippet": "KNI services and positioning",
+        },
+        {
+            "relative_path": "06_Archive/Template_Sources_To_Adapt/proposal.md",
+            "title": "External proposal template",
+            "extension": "md",
+            "modified_at": "2026-07-02T00:00:00+00:00",
+            "snippet": "Generic proposal",
+        },
+        {
+            "relative_path": "04_Projects/Latest_Client_Docs/01_KNI_Proposal_Pack.docx",
+            "title": "KNI Proposal Pack",
+            "extension": "docx",
+            "modified_at": "2026-06-04T00:00:00+00:00",
+            "snippet": "Current KNI service areas",
+        },
+        {
+            "relative_path": "04_Projects/Latest_Client_Docs/13_KNI_Capabilities.pptx",
+            "title": "KNI Capabilities",
+            "extension": "pptx",
+            "modified_at": "2026-06-03T00:00:00+00:00",
+            "snippet": "Capabilities deck",
+        },
+        {
+            "relative_path": "04_Projects/Latest_Client_Docs/06_KNI_Master_Agreement.docx",
+            "title": "KNI Master Agreement",
+            "extension": "docx",
+            "modified_at": "2026-06-05T00:00:00+00:00",
+            "snippet": "Client services agreement",
+        },
+    ]
+    for match in matches:
+        match.update(
+            sensitivity_status="allowed",
+            review_required=False,
+            review_reasons=[],
+        )
+
+    monkeypatch.setattr(
+        local_kni_evidence,
+        "search_kni_documents_impl",
+        lambda _query, *, max_results=8: {"status": "ready", "matches": matches},
+    )
+    monkeypatch.setattr(
+        local_kni_evidence,
+        "read_kni_document_file_impl",
+        lambda relative_path, *, max_chars=4_000: _fake_read_payload(relative_path),
+    )
+
+    packet = local_kni_evidence.build_local_kni_evidence_packet_for_query(
+        "Find the latest client proposal or capability statement and summarize service areas."
+    )
+
+    paths = [doc["relative_path"] for doc in packet["candidate_documents"]]
+    assert paths == ["04_Projects/Latest_Client_Docs/01_KNI_Proposal_Pack.docx"]
+    assert packet["candidate_documents"][0]["modified_at"].startswith("2026-06-04")
+    assert packet["retrieval_diagnostics"]["effective_lookup_kind"] == "commercial_material"
+    assert packet["retrieval_diagnostics"]["candidate_selection_valid"] is True
+
+
 @pytest.mark.parametrize(
     "query_text",
     [

@@ -388,7 +388,7 @@ def infer_manual_request_plan(
         )
     if intent == "blocked_send" or looks_like_send_side_effect(text):
         plan.planner_warnings.append(
-            "Send request blocked; external sends and posts remain draft/read-only."
+            "Send request blocked; external send/write requests remain draft/read-only."
         )
     return plan
 
@@ -933,6 +933,12 @@ def _looks_like_external_write_side_effect(text: str) -> bool:
     write_verb = (
         r"(?:create|update|delete|modify|write|save|attach|export|move|share|schedule|publish|post|send|deliver)"
     )
+    if "zotero" in lower and re.search(
+        r"\b(?:create|update|delete|modify|write|remove|revise)\b[\s\S]{0,100}\bnotes?\b"
+        r"|\bnotes?\b[\s\S]{0,100}\b(?:create|update|delete|modify|write|remove|revise)\b",
+        lower,
+    ):
+        return True
     target_object = (
         r"(?:record|row|table|tracker|field|file|doc|document|sheet|folder|attachment|"
         r"airtable|drive|workspace|gmail\s+draft|slack|crm|calendar|meeting|event|"
@@ -949,10 +955,44 @@ def _looks_like_external_write_side_effect(text: str) -> bool:
 
 
 def _looks_like_internal_business_system_mutation(text: str) -> bool:
-    lower = " ".join(str(text or "").lower().split())
+    if _looks_like_write_plan_only_request(text):
+        return False
+    actionable_text = _without_negated_route_action_clauses(str(text or ""))
+    actionable_text = re.sub(
+        r"(?:^|(?<=[.!?;]))\s*(?:do\s+not|don't|dont|never)\b[^.!?;]*[.!?;]?",
+        " ",
+        actionable_text,
+        flags=re.I,
+    )
+    actionable_text = re.sub(
+        r"\b(?:but|and)\s+(?:do\s+not|don't|dont|never)\b[^.!?;]*",
+        " ",
+        actionable_text,
+        flags=re.I,
+    )
+    lower = " ".join(actionable_text.lower().split())
     if re.search(r"\b(?:send|post|publish|share|deliver)\b", lower):
         return False
-    return _looks_like_external_write_side_effect(text)
+    return _looks_like_external_write_side_effect(actionable_text)
+
+
+def _looks_like_write_plan_only_request(text: str) -> bool:
+    normalized = " ".join(str(text or "").casefold().split())
+    asks_for_plan = bool(
+        re.search(
+            r"\b(?:save|write|create|creation|update|delete|migration)\s+plan\b"
+            r"|\bplan\s+(?:for|to)\s+(?:save|write|create|update|delete|move)\b",
+            normalized,
+        )
+    )
+    requests_execution = bool(
+        re.search(
+            r"\b(?:execute|perform|apply|carry\s+out|go\s+ahead\s+and|"
+            r"create\s+it\s+now|do\s+it\s+now)\b",
+            normalized,
+        )
+    )
+    return asks_for_plan and not requests_execution
 
 
 def _looks_like_reference_capture_request(lower: str) -> bool:

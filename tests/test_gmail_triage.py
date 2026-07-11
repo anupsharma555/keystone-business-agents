@@ -626,10 +626,87 @@ def test_gmail_get_thread_returns_summary_fields() -> None:
     )
     assert any("next Tuesday" in item for item in thread["deadlines"])
     assert any(item.endswith("?") for item in thread["open_questions"])
+    assert thread["thread_context"].startswith("What timeline are you targeting?")
+    assert thread["summary"].startswith("Latest status: We can review the scope this week.")
     assert any(
         "Read-only thread summary used sanitized Gmail message bodies" in item
         for item in thread["triage_limitations"]
     )
+
+
+def test_thread_overview_leads_with_latest_status_after_completed_scheduling() -> None:
+    envelopes = [
+        GmailMessageEnvelope(
+            sender_name="Eze",
+            sender_email="eze@example.test",
+            subject="NeuroBlu discussion",
+            snippet="Please share a few times for a brief conversation.",
+            normalized_body="Please share a few times for a brief conversation.",
+            prior_labels=["INBOX"],
+        ),
+        GmailMessageEnvelope(
+            sender_name="Anup",
+            sender_email="operator@example.test",
+            subject="Re: NeuroBlu discussion",
+            snippet="Would Thursday between 1 and 3 PM work?",
+            normalized_body="Would Thursday between 1 and 3 PM work?",
+            prior_labels=["SENT"],
+        ),
+        GmailMessageEnvelope(
+            sender_name="Anup",
+            sender_email="operator@example.test",
+            subject="Re: NeuroBlu discussion",
+            snippet="Thank you for the discussion. I will keep the platform in mind.",
+            normalized_body="Thank you for the discussion. I will keep the platform in mind.",
+            prior_labels=["SENT"],
+        ),
+        GmailMessageEnvelope(
+            sender_name="Eze",
+            sender_email="eze@example.test",
+            subject="Re: NeuroBlu discussion",
+            snippet="Thanks for your time. Reach out if collaboration opportunities arise.",
+            normalized_body=(
+                "Thanks for your time. Reach out if collaboration opportunities arise."
+            ),
+            prior_labels=["INBOX"],
+        ),
+    ]
+
+    summary, _participants, actions, _deadlines, questions = gmail_tool._thread_overview(
+        envelopes
+    )
+
+    assert summary.startswith("Latest status: Thanks for your time.")
+    assert "Please share a few times" not in summary
+    assert actions == []
+    assert questions == []
+
+
+def test_labeled_quoted_context_preserves_original_interest_and_message() -> None:
+    raw = """Hi Anup, thanks for reaching out.
+
+On Sun, Jul 5, 2026 at 4:44 PM, Forms <forms@example.test> wrote:
+I'm interested in
+
+Neuropsychiatry data analytics solution
+
+Message
+
+What does the dataset contain and is it available via license? I want to assess fit.
+
+View submission in HubSpot
+This email was sent to the form owner.
+"""
+
+    context = gmail_tool._labeled_quoted_context(raw)
+
+    assert context == [
+        "Original interest: Neuropsychiatry data analytics solution",
+        (
+            "Original message: What does the dataset contain and is it available via "
+            "license? I want to assess fit."
+        ),
+    ]
 
 
 def test_gmail_get_thread_does_not_promote_onboarding_ctas_to_action_items() -> None:

@@ -17,6 +17,16 @@ ManagerScenarioFamily = Literal[
     "output_receipt",
 ]
 
+ADVANCED_MANAGER_GLOBAL_INVARIANTS: tuple[str, ...] = (
+    "raw_operator_request_preserved_or_hashed",
+    "approval_state_preserved",
+    "selected_specialist_and_stop_condition_visible",
+    "source_and_artifact_identity_preserved",
+    "no_send_or_unapproved_write",
+    "no_stale_or_duplicate_provider_action",
+    "trace_and_receipt_sanitized",
+)
+
 
 @dataclass(frozen=True)
 class AdvancedManagerScenario:

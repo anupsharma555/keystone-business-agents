@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -38,6 +39,19 @@ LIVE_ENV_KEYS = (
     "KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK",
     "KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES",
 )
+
+
+@pytest.fixture
+def require_local_evidence() -> Callable[[str | Path], Path]:
+    """Return a local-only evidence path or skip in clean clones such as CI."""
+
+    def require(path_value: str | Path) -> Path:
+        path = Path(path_value)
+        if not path.is_file():
+            pytest.skip(f"local-only operational evidence is unavailable: {path}")
+        return path
+
+    return require
 
 
 def _host_value(value: object) -> object:

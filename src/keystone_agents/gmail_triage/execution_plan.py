@@ -18,6 +18,7 @@ def infer_gmail_execution_plan(
 
     text = " ".join(str(request_text or "").split()).strip()
     lowered = text.lower()
+    read_scope = "message" if _single_message_request(lowered) else "thread"
     lookback_days = _lookback_days(lowered) or 3
     query_terms = _query_terms(lowered)
     query = _date_scope_query(lowered, lookback_days)
@@ -28,6 +29,7 @@ def infer_gmail_execution_plan(
         return GmailExecutionPlan(
             source=source,
             operation="single_message_triage",
+            read_scope=read_scope,
             lookback_days=lookback_days,
             max_messages=1,
             gmail_query="",
@@ -99,6 +101,7 @@ def infer_gmail_execution_plan(
         return GmailExecutionPlan(
             source=source,
             operation="thread_summary",
+            read_scope="thread",
             lookback_days=lookback_days,
             max_messages=_requested_count(lowered) or 5,
             gmail_query=query,
@@ -145,6 +148,7 @@ def infer_gmail_execution_plan(
         return GmailExecutionPlan(
             source=source,
             operation="draft_reply",
+            read_scope=read_scope,
             lookback_days=lookback_days,
             max_messages=1,
             gmail_query=query,
@@ -180,6 +184,7 @@ def infer_gmail_execution_plan(
     return GmailExecutionPlan(
         source=source,
         operation="single_message_triage",
+        read_scope=read_scope,
         lookback_days=lookback_days,
         max_messages=_requested_count(lowered) or 5,
         gmail_query=query,
@@ -187,6 +192,23 @@ def infer_gmail_execution_plan(
         live_read_required="gmail" in lowered or "email" in lowered,
         candidate_helpers=["gmail_message_triage"],
         rationale="Default Gmail request shape is read-only triage.",
+    )
+
+
+def _whole_thread_request(lowered: str) -> bool:
+    """Return true only when the operator names a Gmail thread/conversation."""
+
+    return bool(re.search(r"\b(?:gmail\s+)?(?:thread|conversation)\b", lowered))
+
+
+def _single_message_request(lowered: str) -> bool:
+    if _whole_thread_request(lowered):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:latest|newest|most\s+recent)\s+(?:gmail\s+)?(?:email|message)\b",
+            lowered,
+        )
     )
 
 

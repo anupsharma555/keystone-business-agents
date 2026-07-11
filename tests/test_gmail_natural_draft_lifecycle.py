@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -245,9 +244,11 @@ def test_safe_receipt_omits_recipient_subject_and_body() -> None:
     assert "private body" not in encoded
 
 
-def test_persisted_plan_requires_fresh_approval_and_no_search() -> None:
+def test_persisted_plan_requires_fresh_approval_and_no_search(require_local_evidence) -> None:
     plan = json.loads(
-        Path("artifacts/test-pack/next-live-gmail-natural-draft-lifecycle-plan.json").read_text()
+        require_local_evidence(
+            "artifacts/test-pack/next-live-gmail-natural-draft-lifecycle-plan.json"
+        ).read_text()
     )
 
     assert plan["approval_status"] == (

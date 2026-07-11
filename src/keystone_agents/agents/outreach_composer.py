@@ -1569,11 +1569,24 @@ def build_outreach_composer_compact_synthesis_agent(
             instructions,
             (
                 "Compact synthesis mode: return only company_name, email_subject, "
-                "email_body, linkedin_note, personalization_rationale, and "
-                "source_ids_used. Choose source_ids_used only from the approved "
-                "source IDs in the prompt. Do not include send, approval, context, "
-                "facts_used, or other workflow fields; Python will validate and "
+                "email_body, linkedin_note, personalization_rationale, source_ids_used, "
+                "reply_recommended, recommended_next_step, additional_information_needed, "
+                "collaboration_ideas, and deferral_reason. Choose source_ids_used only "
+                "from the approved source IDs in the prompt. Do not include send, approval, "
+                "context, facts_used, or other workflow fields; Python will validate and "
                 "wrap the compact payload into the full OutreachDraft schema."
+            ),
+            (
+                "Inbound thread-state priority: the supplied chronological conversation state "
+                "takes precedence over style-profile CTA preferences. If the latest state is a "
+                "courtesy close or future-collaboration invitation, set reply_recommended=false "
+                "unless the evidence supports a concrete immediate reply. Return a model-judged "
+                "next step, useful missing information, provisional collaboration ideas, and a "
+                "deferral reason. Any optional future reply must contain zero questions and must "
+                "not reopen scheduling, another call, or a generic compare-notes exchange."
+                " Write any optional reply as normal correspondence; avoid workflow narration "
+                "such as 'based on our thread,' 'the selected context,' or 'if it would be "
+                "helpful.' State a concrete point plainly."
             ),
         ]
     )

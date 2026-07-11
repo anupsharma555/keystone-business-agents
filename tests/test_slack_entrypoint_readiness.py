@@ -12,7 +12,10 @@ def test_slack_entrypoint_readiness_has_exact_direct_and_graph_probes() -> None:
         "direct_specialist",
         "langgraph",
     ]
-    assert all(not case.live_slack_evidence_proven for case in SLACK_ENTRYPOINT_READINESS_CASES)
+    assert [case.live_slack_evidence_proven for case in SLACK_ENTRYPOINT_READINESS_CASES] == [
+        True,
+        True,
+    ]
 
 
 def test_slack_entrypoint_readiness_requires_visible_answer_trace_and_safety_evidence() -> None:
@@ -41,9 +44,10 @@ def test_graph_probe_asks_for_output_shape_without_repeating_safety_boilerplate(
         case for case in SLACK_ENTRYPOINT_READINESS_CASES if case.probe_id == "SLACK-GRAPH-01"
     )
     normalized = graph.prompt.lower()
-    assert "formatted review summary" in normalized
-    assert "suggested reply" in normalized
-    assert "approval status" in normalized
+    assert "current conversation state" in normalized
+    assert "kni-specific collaboration next step" in normalized
+    assert "reply only if" in normalized
+    assert "approval status that actually applies" in normalized
     for redundant_phrase in (
         "do not send",
         "without sending",
@@ -83,3 +87,9 @@ def test_package_exposes_slack_entrypoint_no_live_gate() -> None:
     package = Path("package.json").read_text(encoding="utf-8")
     assert '"test:slack-entrypoints:no-live"' in package
     assert "scripts/run_slack_entrypoint_readiness.py" in package
+
+
+def test_slack_entrypoint_runner_reports_live_count_from_case_state() -> None:
+    script = Path("scripts/run_slack_entrypoint_readiness.py").read_text()
+    assert "live_count = sum(case.live_slack_evidence_proven" in script
+    assert "{live_count}/{len(SLACK_ENTRYPOINT_READINESS_CASES)}" in script

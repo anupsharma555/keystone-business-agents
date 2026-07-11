@@ -110,6 +110,8 @@ def _bool_or_none_for_test(value: object) -> bool | None:
 
 
 def test_eval_slack_readiness_script_json(capsys, monkeypatch) -> None:
+    if not readiness.DEFAULT_SLACK_REPO.is_dir():
+        pytest.skip("sibling keystone-slack checkout is unavailable in clean CI")
     monkeypatch.setattr("sys.argv", ["check_eval_slack_readiness.py", "--json"])
 
     assert readiness.main() == 0
