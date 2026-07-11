@@ -792,6 +792,11 @@ def _graph_completion_review(
     ]
     requested_stages = _graph_requested_stage_review(
         request_text=original_request.request_text,
+        manual_intent=str(
+            (original_request.manual_request_plan or {}).get("intent")
+            if isinstance(original_request.manual_request_plan, dict)
+            else ""
+        ),
         node_path=node_path,
         loop_steps=loop_steps,
         artifact_types=artifact_types,
@@ -841,6 +846,7 @@ def _graph_completion_review(
 def _graph_requested_stage_review(
     *,
     request_text: str,
+    manual_intent: str = "",
     node_path: list[str],
     loop_steps: list[dict[str, Any]],
     artifact_types: list[str],
@@ -904,7 +910,11 @@ def _graph_requested_stage_review(
     add_stage(
         "business_research",
         requested=bool(
-            re.search(r"\b(?:research|source-backed|evidence|company profile)\b", normalized)
+            re.search(r"\b(?:research|source-backed|company profile)\b", normalized)
+            or (
+                manual_intent != "business_system_write"
+                and re.search(r"\bevidence\b", normalized)
+            )
             or "run_business_research" in node_path
         ),
         node="run_business_research",

@@ -153,6 +153,43 @@ def test_cli_ask_routes_unmentioned_input_through_work_item(tmp_path: Path, caps
     assert "Artifacts: company_profile:" in output
 
 
+def test_cli_ask_json_reports_actual_execution_and_graph_metadata(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'ask-execution.db'}"
+    monkeypatch.setenv("KEYSTONE_WORKITEM_LANGGRAPH", "true")
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "--live-sdk",
+            "--max-openai-requests",
+            "0",
+            "--database-url",
+            database_url,
+            (
+                "Create a temporary Sheet named KBA_TEST_SHEET execution-metadata "
+                "in KNIOps and prepare its cleanup plan. Run deterministically with "
+                "no live SDK or model calls."
+            ),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["_execution"] == {
+        "langgraph": True,
+        "live_sdk": False,
+        "live_search": False,
+        "openai_requests": 0,
+    }
+    assert payload["_langgraph"]["runtime"] == "langgraph"
+    assert "run_chief_of_staff" in payload["_langgraph"]["node_path"]
+
+
 def test_cli_ask_eval_score_template_returns_prompted_rubric_json(capsys) -> None:
     exit_code = main(
         [
@@ -682,6 +719,34 @@ def test_cli_ask_natural_eval_status_infers_case_from_slack_thread_context(
     assert payload["dashboard_path"] == str((tmp_path / "dashboard.html").resolve())
     assert payload["dashboard_case_url"].endswith("?case=slack_behavioral_health_rfp_001")
     assert payload["scorecard_request"] == "@KNI can you give me a scorecard for this eval?"
+
+
+def test_hidden_eval_case_does_not_hijack_business_cleanup_status_request(
+    tmp_path: Path,
+) -> None:
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C0BA17Y9C01",
+                "channel_name": "evals",
+                "thread_ts": "1783811494.407029",
+                "read_context": "Hidden eval case slack_create_one_temporary_001",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = cli._eval_status_payload(
+        (
+            "Create one temporary Sheet, verify provider operations, and return "
+            "the cleanup status and graph evidence."
+        ),
+        context_file_path=str(context_file),
+    )
+
+    assert payload is None
 
 
 def test_cli_ask_agent_override_ignores_eval_context_without_eval_request(
@@ -5012,6 +5077,19 @@ def test_cli_ask_no_live_sdk_opt_out_keeps_work_item_in_live_mode(
     output = capsys.readouterr().out
     assert "WorkItem:" in output
     assert "Route: business_research_analyst" in output
+
+
+def test_operator_no_live_sdk_wording_overrides_live_cli_flag() -> None:
+    args = SimpleNamespace(live_sdk=True)
+
+    assert (
+        cli._ask_live_sdk_enabled(
+            args,
+            input_text="Run deterministically with no live SDK or model calls.",
+        )
+        is False
+    )
+    assert cli._ask_live_sdk_enabled(args, input_text="Return the OpenAI request count.") is True
 
 
 def test_cli_agents_list_prints_registry_cards(capsys) -> None:

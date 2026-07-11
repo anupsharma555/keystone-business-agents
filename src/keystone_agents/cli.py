@@ -745,7 +745,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         eval_status = _eval_status_payload(input_text, context_file_path=args.context_file)
         if eval_status is not None:
             return _print_eval_status(eval_status, json_output=args.json)
-    live_sdk = _ask_live_sdk_enabled(args)
+    live_sdk = _ask_live_sdk_enabled(args, input_text=input_text)
     requested_route = args.agent or (mention.route if mention.explicit else None)
     calendar_plan = infer_calendar_action_plan(input_text)
     if calendar_plan is not None and requested_route in {
@@ -1227,7 +1227,7 @@ def _eval_status_payload(
             lowered,
         )
     )
-    if not explicit_eval_status and not inferred.get("case_id"):
+    if not explicit_eval_status:
         return None
     if not re.search(r"\b(?:status|summary|show|list|doing|progress)\b", lowered):
         return None
@@ -1527,11 +1527,26 @@ def _eval_slack_actions_for_thread(
     return actions
 
 
-def _ask_live_sdk_enabled(args: argparse.Namespace) -> bool:
+def _ask_live_sdk_enabled(args: argparse.Namespace, *, input_text: str = "") -> bool:
+    if _request_forbids_live_sdk(input_text):
+        return False
     explicit = getattr(args, "live_sdk", None)
     if explicit is not None:
         return bool(explicit)
     return cli_default_live_sdk()
+
+
+def _request_forbids_live_sdk(text: str) -> bool:
+    compact = " ".join(str(text or "").lower().split())
+    return bool(
+        re.search(
+            r"\b(?:no|without|disable|do\s+not\s+(?:use|run|call))\s+"
+            r"(?:live\s+sdk|model\s+calls?|openai\s+(?:api\s+)?calls?)\b"
+            r"|\b(?:zero|0)\s+openai\s+(?:api\s+)?(?:calls?|requests?)\b"
+            r"|\brun\s+deterministically\b",
+            compact,
+        )
+    )
 
 
 def _estimate_ask_openai_requests(
@@ -2145,7 +2160,56 @@ def _run_ask_work_item(
             context_file_path=context_file_path,
             result=result,
         )
-    return _print_work_item_result(result, json_output=json_output, eval_record=eval_record)
+    graph_metadata = _stored_work_item_langgraph_metadata(store, result.work_item.id)
+    return _print_work_item_result(
+        result,
+        json_output=json_output,
+        graph_metadata=graph_metadata,
+        eval_record=eval_record,
+        execution_metadata={
+            "live_sdk": live_sdk,
+            "live_search": live_search,
+            "langgraph": graph_metadata is not None,
+            "openai_requests": _stored_work_item_openai_requests(
+                store,
+                result.work_item.id,
+            ),
+        },
+    )
+
+
+def _stored_work_item_langgraph_metadata(
+    store: SQLiteStore,
+    work_item_id: str,
+) -> dict[str, object] | None:
+    for event in reversed(store.list_work_item_events(work_item_id)):
+        if event.event_type != "langgraph_orchestration":
+            continue
+        return {
+            "runtime": str(event.metadata.get("runtime") or "langgraph"),
+            "node_path": list(event.metadata.get("node_path") or []),
+            "checkpoint_required": bool(event.metadata.get("checkpoint_required")),
+            "checkpoint_reason": str(event.metadata.get("checkpoint_reason") or ""),
+            "graph_completion_review": dict(
+                event.metadata.get("graph_completion_review") or {}
+            ),
+        }
+    return None
+
+
+def _stored_work_item_openai_requests(store: SQLiteStore, work_item_id: str) -> int:
+    requests = 0
+    for event in store.list_work_item_events(work_item_id):
+        if event.event_type != "workflow_sdk_usage":
+            continue
+        usage = event.metadata.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        try:
+            requests += int(usage.get("requests") or 0)
+        except (TypeError, ValueError):
+            continue
+    return requests
 
 
 def _promptfoo_agent_eval_mode() -> bool:
@@ -6005,7 +6069,20 @@ def _run_work_items_advance(args: argparse.Namespace) -> int:
             max_steps=args.max_manager_steps,
             feedback_callback=None if args.json else _print_manager_loop_feedback,
         )
-    return _print_work_item_result(result, json_output=args.json, graph_metadata=graph_metadata)
+    return _print_work_item_result(
+        result,
+        json_output=args.json,
+        graph_metadata=graph_metadata,
+        execution_metadata={
+            "live_sdk": bool(args.live_sdk),
+            "live_search": bool(args.live_search),
+            "langgraph": graph_metadata is not None,
+            "openai_requests": _stored_work_item_openai_requests(
+                store,
+                result.work_item.id,
+            ),
+        },
+    )
 
 
 def _work_item_preflight_requested_agent(work_item: WorkItem | None) -> str | None:
@@ -6267,11 +6344,14 @@ def _print_work_item_result(
     json_output: bool,
     graph_metadata: dict | None = None,
     eval_record: dict[str, object] | None = None,
+    execution_metadata: dict[str, object] | None = None,
 ) -> int:
     if json_output:
         payload = result.model_dump(mode="json")
         if graph_metadata is not None:
             payload["_langgraph"] = graph_metadata
+        if execution_metadata is not None:
+            payload["_execution"] = execution_metadata
         if eval_record is not None:
             payload["_eval_record"] = eval_record
             payload["human_summary"] = _append_eval_thread_guidance_to_summary(
