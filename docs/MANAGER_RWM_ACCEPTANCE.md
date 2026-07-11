@@ -78,3 +78,20 @@ time and stops on the first failure. Its scorecard records pass/fail, failure
 category, next fix, proof node IDs, zero OpenAI requests, no live connectors,
 and no external side effects. This gate must pass before proposing the bounded
 live ANU-222 batch.
+
+## ANU-223 delegation readiness gate
+
+`src/keystone_agents/manager_delegation_readiness.py` keeps manager-entry proof,
+provider-owner lifecycle proof, and joined manager-to-provider proof as
+separate fields for Calendar, Gmail, Airtable, Google Workspace, and Zotero.
+Run it with:
+
+```bash
+npm run test:manager-delegation:no-live -- \
+  --json-output artifacts/test-pack/manager-delegation-readiness.json
+```
+
+The gate must not mark ANU-223 complete merely because both layers pass in
+isolation. Its scorecard names which joins are proven and the next exact live
+proof for each missing join. Already-proven Calendar and Gmail paths are not
+rerun; the remaining serial candidates are Airtable, Workspace, and Zotero.

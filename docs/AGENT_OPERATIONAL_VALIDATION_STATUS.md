@@ -61,6 +61,14 @@ Airtable write gating, stale-write reversal, typed context handoffs, and useful
 completion review without false blocking. Live model comparison remains a later
 bounded quality proof, not a prerequisite for these deterministic invariants.
 
+ANU-223 now has a separate five-provider pre-live delegation registry and
+scorecard. Calendar and Gmail have joined manager-entry plus provider-operation
+proof and should be reused. Airtable, Google Workspace, and Zotero each have
+green manager-owner selection and green provider lifecycle/identity/cleanup
+evidence, but the manager-to-provider join is not yet proven; they remain the
+only candidates for a bounded live delegation batch. This 2/5 joined result is
+intentional evidence separation, not a partial pass disguised as completion.
+
 - ANU-221 Gmail mailbox-state execution now passes on one real marked provider
   message. A zero-model lifecycle verified label add/remove, unread/read,
   star/unstar, important/not-important, archive/unarchive, trash/restore, and
@@ -94,7 +102,7 @@ bounded quality proof, not a prerequisite for these deterministic invariants.
   scoring, and unsupported-claim validation respectively. Gmail, Chief, and
   the five context agents already had executable typed-tool proof; Orchestrator
   remains a control-plane routing/review contract rather than a provider owner.
-- `npm run test:ai-agents-workflow:no-live`: 596 workflow and current-context
+- `npm run test:ai-agents-workflow:no-live`: 600 workflow and current-context
   contract tests, seven
   LangGraph scenarios, 36/36 Slack routes, and ANU-60 preflight; zero live
   model/search/connector calls.

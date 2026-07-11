@@ -24,6 +24,7 @@ FOCUSED_TESTS = (
     "tests/test_announcement_context_tools.py",
     "tests/test_announcement_context_read_validation.py",
     "tests/test_manual_request_plan.py",
+    "tests/test_manager_delegation_readiness.py",
     "tests/test_workflow_runner.py",
     "tests/test_langgraph_workflow.py",
     "tests/test_langgraph_quality.py",
@@ -50,6 +51,10 @@ def gate_commands(
         [
             sys.executable,
             "scripts/run_advanced_manager_acceptance.py",
+        ],
+        [
+            sys.executable,
+            "scripts/run_manager_delegation_readiness.py",
         ],
     ]
     if include_anu60:

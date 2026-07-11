@@ -29,6 +29,11 @@ Start here when changing or operating the repository.
 - `docs/AGENT_OPERATIONAL_VALIDATION_STATUS.md`: evidence-backed status for
   every agent family across interpretation, tool/provider execution, reasoning,
   lifecycle, safety, continuation, and next proof.
+- `docs/MANAGER_RWM_ACCEPTANCE.md`: low-friction manager review plus ANU-222
+  advanced-scenario and ANU-223 delegation-readiness gates.
+- `docs/ANU223_LIVE_DELEGATION_PLAN.md`: proposed serial request/cost ceilings,
+  exact provider scopes, evidence requirements, and stop conditions for the
+  three remaining manager-to-provider joins.
 - `docs/INITIAL_OPERATIONAL_MODEL_VALIDATION.md`: plan-only first paid batch,
   fresh billing-baseline requirement, exact request estimate, and hard stops.
 - `docs/AI_AGENTS_WORKFLOW_NO_LIVE_VALIDATION.md`: current pre-live proof gate
