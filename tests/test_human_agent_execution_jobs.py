@@ -135,6 +135,14 @@ def test_advanced_human_jobs_select_the_graph_backend() -> None:
         assert should_use_langgraph_for_work_item(request, manager_loop=True), row["id"]
 
 
+def test_representative_zotero_proof_keeps_provider_identity_internal() -> None:
+    zotero = next(row for row in _job_rows() if row["id"] == "HJ-022")
+    proof = zotero["proof"].lower()
+    assert "no provider id was required" in proof
+    assert "internally retained key" in proof
+    assert "version-aware verification" in proof
+
+
 def test_human_job_contract_requires_reasoning_execution_verification_and_cleanup() -> None:
     text = " ".join(JOBS_DOC.read_text(encoding="utf-8").split())
 

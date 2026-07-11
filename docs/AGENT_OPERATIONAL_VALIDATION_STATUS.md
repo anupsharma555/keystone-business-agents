@@ -51,6 +51,15 @@ delegated provider execution through the manager entrypoint, and one direct plus
 one connector-backed graph-worthy Slack proof. Existing provider primitives
 should be reused rather than rerun.
 
+For this scorecard, "without developer intervention" means the passing path did
+not require code edits, manually injected provider IDs, direct state repair, or
+manual artifact cleanup between its successful natural-request steps. Normal
+operator follow-ups in the same retained session are part of the natural ask,
+not developer intervention. HJ-015 and HJ-016 are single natural reads; HJ-022
+and HJ-023 retain same-object identity in their sessions; HJ-026 resolves the
+event from a natural Slack reference. Their recorded passing paths meet this
+definition, while the remaining manager and Slack rows stay explicitly open.
+
 ANU-222 now has a separate executable 12-scenario manager gate. The first
 2026-07-11 run passed all scenarios with zero OpenAI requests, live connectors,
 or external side effects. It proves low-friction direct ownership, broad-goal
@@ -198,9 +207,9 @@ unintended side effects. No fixture result can mark these live rows complete.
   this stage reached 11 requests, beyond the 10-request stop.
 - HJ-022 now passes as a three-checkpoint natural Zotero lifecycle in one local
   SDK session. `gpt-5.4-mini` created one uniquely marked standalone note,
-  returned item key `7J2GESI9` at version 3520, updated the same key to version
-  3521 without duplication, then selected exact-key deletion and verified
-  provider absence. An independent provider GET returned 404. The three runs
+  retained its provider key and version internally, updated the same item with
+  version-aware verification and no duplication, then selected exact-key
+  deletion and verified provider absence with an independent provider read. The three runs
   used six requests, 194,688 total tokens, and a maintained local estimate of
   `$0.04717935`; the Chrome credit balance moved from `$3.31` to `$3.27`.
   Search, import, Workspace writes, sends, posts, and unrelated mutations were

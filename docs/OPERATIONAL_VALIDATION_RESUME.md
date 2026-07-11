@@ -145,8 +145,8 @@ intermediate step in Linear.
   and no other recipient.
 - HJ-022 Zotero now passes live-model execution end to end. Three serial
   two-request checkpoints in one SDK session created one uniquely marked note,
-  updated the exact same item from provider version 3520 to 3521, deleted it,
-  and verified absence; an independent exact-key read returned HTTP 404. Total
+  retained its key and version internally across the same-item update, deleted
+  it, and verified absence with an independent exact-key read. Total
   usage was six requests and 194,688 tokens, with a maintained local estimate
   of `$0.04717935`. Chrome billing moved from `$3.31` before the lifecycle to
   `$3.27` after it. No search, import, Workspace write, send, post, or unrelated
