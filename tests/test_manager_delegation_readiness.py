@@ -23,7 +23,7 @@ def test_manager_delegation_readiness_separates_joined_from_layered_proof() -> N
         for case in MANAGER_DELEGATION_READINESS_CASES
         if case.manager_provider_join_proven
     }
-    assert joined == {"calendar", "gmail"}
+    assert joined == {"calendar", "gmail", "airtable", "zotero"}
     assert all(
         case.next_live_proof.startswith("Reuse")
         for case in MANAGER_DELEGATION_READINESS_CASES

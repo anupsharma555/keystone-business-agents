@@ -25,6 +25,7 @@ from keystone_agents.tools.internal_data_tools import GOOGLE_WORKSPACE_TOOL_NAME
 AIRTABLE_READ_TOOL_NAMES = {"airtable_get_base_schema", "airtable_read_records"}
 AIRTABLE_WRITE_TOOL_NAMES = {"airtable_write_record"}
 AIRTABLE_TEST_CLEANUP_TOOL_NAMES = {"airtable_delete_test_record"}
+AIRTABLE_TEST_LIFECYCLE_TOOL_NAMES = {"airtable_test_record_lifecycle"}
 WEB_STRUCTURING_TOOL_NAMES = {"structure_web_data_for_schema"}
 WEB_SEARCH_TOOL_NAMES = {"search_web"}
 PLAYWRIGHT_TOOL_NAMES = {"render_page"}
@@ -239,6 +240,9 @@ def test_only_airtable_context_agent_exposes_test_record_cleanup() -> None:
     from keystone_agents.agents.airtable_context import build_airtable_context_agent
 
     assert AIRTABLE_TEST_CLEANUP_TOOL_NAMES <= _tool_names(build_airtable_context_agent())
+    assert AIRTABLE_TEST_LIFECYCLE_TOOL_NAMES <= _tool_names(
+        build_airtable_context_agent()
+    )
     other_agents = [
         build_gmail_triage_agent(),
         build_business_research_analyst_agent(),

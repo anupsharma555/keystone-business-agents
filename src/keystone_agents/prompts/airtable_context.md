@@ -82,6 +82,12 @@ Context or the approved Airtable action handler.
   provider ID is known and whose live provider fields contain the literal
   `KBA_TEST_RECORD` marker. Require a separate approval reference and live test
   deletion gate; verify the record is absent afterward.
+- For a direct authenticated request to create, verify, update, verify, and
+  remove one marked `KBA_TEST_RECORD` in `Business Expenses`, prefer the single
+  `airtable_test_record_lifecycle` tool. Pass the supplied approval reference
+  and `live=true`. The tool owns schema-valid minimal fields, internal record
+  identity, both provider read-backs, marker-gated cleanup, and absence proof;
+  do not expand the lifecycle with invented category or payment values.
 - Populate `human_work_context` with the real work function this supports:
   data cleanup, finance review, contact or company tracking, opportunity
   tracking, approval review, artifact creation, or follow-up coordination.

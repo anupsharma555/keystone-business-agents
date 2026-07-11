@@ -898,6 +898,11 @@ class OutreachLLMDraftPayload(BaseModel):
     linkedin_note: str = ""
     personalization_rationale: str = ""
     source_ids_used: list[str] = Field(default_factory=list)
+    reply_recommended: bool = True
+    recommended_next_step: str = ""
+    additional_information_needed: list[str] = Field(default_factory=list, max_length=6)
+    collaboration_ideas: list[str] = Field(default_factory=list, max_length=4)
+    deferral_reason: str = ""
 
 
 class OutreachLLMDraftVariantPayload(BaseModel):

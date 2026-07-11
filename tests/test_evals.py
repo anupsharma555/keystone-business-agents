@@ -92,7 +92,7 @@ def test_eval_report_renders() -> None:
     assert "Skill labels" in report
     assert "Average score" in report
     assert "Prompt versions" in report
-    assert "outreach_composer@2026-05-20.1" in report
+    assert "outreach_composer@2026-07-11.1" in report
 
 
 def test_eval_cli_json_output(capsys) -> None:

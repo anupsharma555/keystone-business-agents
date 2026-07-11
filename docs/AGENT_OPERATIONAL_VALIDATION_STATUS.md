@@ -18,7 +18,7 @@ Status vocabulary:
 
 | Agent family | Interpretation / route | Typed tool / provider | Useful reasoning | Lifecycle or read proof | Safety / continuation | Current boundary and next proof |
 |---|---|---|---|---|---|---|
-| Orchestrator | Proven across direct and graph entrypoints; the corrected source-bundle CLI selected deterministic preflight plus the WorkItem/LangGraph path live | N/A control plane | Proven for bounded supplied-material orchestration into one specialist SDK synthesis | N/A | Target/source identity, typed handoffs, approval checkpoint, one-request ceiling, usage receipt, and no-write boundary passed. Connector preparation now proves bounded Gmail selection promotes exact thread identity without persisting raw bodies, and its request guard blocks before preflight/provider access | Fixed-source graph proof passes. The prepared connector-backed Gmail graph requires fresh approval for 4-6 expected requests, hard ceiling 8, and $0.50; after that, validate the same graph entry from Slack without broadening writes. |
+| Orchestrator | Proven across direct and graph entrypoints; the corrected source-bundle CLI selected deterministic preflight plus the WorkItem/LangGraph path live | N/A control plane | Proven for bounded supplied-material orchestration into one specialist SDK synthesis | N/A | Target/source identity, typed handoffs, conditional approval, request ceiling, usage receipt, and no-write boundary pass offline and live. The real Slack graph completes Gmail → Research → Outreach with provider IDs internal and one updated-in-place reply | Direct and connector-backed Slack acceptance pass. The final Gmail graph reviewed four messages, recognized the courtesy close, returned KNI-specific collaboration ideas, withheld unnecessary reply copy and approval, and recorded a no-write recommendation artifact. Live Slack readiness is 2/2. |
 | Chief of Staff | Proven offline for manager ownership and structured handoffs; complete Calendar CRUD asks use a direct deterministic fast path | Partial: typed context lanes and agents-as-tools are covered with fakes; live Calendar CRUD and joined Gmail→Calendar execution are proven without graph/model overhead | Calendar execution intentionally needs no model. The joined Gmail path locally selected and extracted one unique future deadline with time while blocking multiple-date ambiguity | Proven live: dedicated KBA OAuth plus all-day and timed create/update/delete contracts; joined Gmail selection created/read back/deleted one marked timed event and verified absence; natural title-based modification works without an event ID in the ask | Joined run inspected one bounded Gmail candidate, retained only hashed source/participant identities, preserved July 24 at 23:59 in `America/New_York`, sent no invitations, modified no Gmail state, and used zero OpenAI requests | Reuse Calendar and joined Gmail evidence. Private weekly-packet synthesis remains outside the Codex launch path until a trusted operator/MAM/ZDR/local-model boundary is available. |
 | Gmail Triage | Proven live for selected-thread interpretation, today-only grouping, same-session revision, sent-style comparison, and exact natural create/update wording | Model reasoning over bounded batches/thread is proven; connector reads, reversible drafts, bounded `SENT`, draft resolution, derived-slide attachment selection, and the dedicated synthetic send tool pass | Selected-thread, batch, continuation, style, and joined create/revision quality pass. The joined runs retain exact synthetic identity, approved facts, approval state, concise copy, and `Sincerely, Anup` | Live provider lifecycles cover marked draft CRUD, derived-slide attachment CRUD, one authorized synthetic send, natural model create/update cleanup, and a selected provider thread → Outreach → verified Gmail draft → exact cleanup handoff | The ANU-192 joined pass used one successful `gpt-5.4-mini` request, 34,034 input/166 output tokens, no retry, and a `$0.0262725` estimate. Exact draft read-back and absence verification passed; no send occurred and the sanitized receipt omits recipient/body content | Primary Gmail R/W/M and the selected-thread Outreach provider-draft bridge are complete. Reuse existing evidence; no second test send, style comparison, or joined lifecycle is needed. |
 | Business Research Analyst | Proven for single, comparison, research-to-Doc, public-contact, and current-funding asks; supplied-material graph routing passes live | Agent-selected source deduplication/ranking is proven with a fake SDK model. Public contact combines first-party reads with bounded Exa corroboration; funding validation combines one Exa discovery request with deterministic entity/date filtering before one no-tool synthesis | Latest-article synthesis, Zotero-to-NeuroFlow relevance, three-company comparison, NeuroFlow research-to-Doc, current commercial-contact selection, and Headway funding relevance all pass | Direct official-source extraction covers NeuroFlow, Headway, and Spring Health plus Zotero/Crossref metadata. Headway funding retained five correct-company sources and rejected unrelated Headway entities | Headway pass used one model request, 33,491 input/1,473 output tokens, zero retries/tools, and `$0.03174675` estimate. It correctly treated the July 2024 round as 718-day-old background, not fresh opportunity evidence. Source-publication dates now override Exa crawl dates. No draft/send/write occurred | Direct, fixed-source graph, comparison, research-to-Doc, public-contact, and freshness-sensitive funding proofs pass. Reuse them; new live search needs a materially different freshness question and new API allowance if model synthesis is required. |
@@ -71,25 +71,58 @@ completion review without false blocking. Live model comparison remains a later
 bounded quality proof, not a prerequisite for these deterministic invariants.
 
 ANU-223 now has a separate five-provider pre-live delegation registry and
-scorecard. Calendar and Gmail have joined manager-entry plus provider-operation
-proof and should be reused. Airtable, Google Workspace, and Zotero each have
-green manager-owner selection and green provider lifecycle/identity/cleanup
-evidence, but the manager-to-provider join is not yet proven; they remain the
-only candidates for a bounded live delegation batch. This 2/5 joined result is
-intentional evidence separation, not a partial pass disguised as completion.
+scorecard. Calendar, Gmail, and Airtable have joined manager-entry plus
+provider-operation proof and should be reused. Google Workspace and Zotero each
+have green manager-owner selection and green provider lifecycle/identity/
+cleanup evidence, but their manager-to-provider join is not yet proven. This
+3/5 joined result intentionally separates manager-entry proof from provider
+primitives.
 
-The 2026-07-11 Airtable Stage A run adds partial joined evidence: a natural
+The initial 2026-07-11 Airtable Stage A run added partial joined evidence: a natural
 Chief request selected Airtable and completed one exact marked create/update/
 delete lifecycle with provider read-back and confirmed absence. It is not yet a
 joined pass because execution used six model requests after the CLI accepted a
 four-request ceiling, and the original receipt exposed provider IDs. The
-delegated-route budget estimator and provider-ID-free renderer are now fixed
-offline. Airtable remains pending one separately approved capped rerun; Workspace
-and Zotero remain unrun.
+delegated-route budget estimator and provider-ID-free renderer were then fixed
+offline. Those initial control-plane gaps are superseded by the passing capped
+rerun below; Workspace and Zotero remain unrun.
+
+The first capped four-request Airtable rerun remained partial. It honored
+the owner limit and stayed below the `$0.10` stage ceiling at an estimated
+`$0.06577095`, but schema-aware validation rejected the model's invented
+`Categories=Other` value before any provider write. No record or orphan was
+created. A new bounded lifecycle tool now keeps minimal schema-safe fields,
+same-record identity, read-backs, cleanup, and absence verification in Python;
+the direct CLI supplies a request-scoped authenticated-operator approval
+reference and removes it after the run. The affected offline suite passes, but
+the repair then passed live in a second capped run: two requests, an estimated
+`$0.0290406`, exact create/read-back/same-record update/read-back/delete/absence,
+and no unrelated write, duplicate, or orphan. Saved run `2869` re-renders with
+the provider identity absent from public output, receipt, and human summary.
+Airtable is now a joined PASS and should not be rerun.
+
+The first Zotero manager-join run was partial. A complete standalone-note
+ask initially exposed a routing gap (`note` was missing from the generic
+internal-write object class), which is fixed offline. The corrected live run
+used four requests and an estimated `$0.0575301`, but the agent silently called
+the test-note writer with `live=false` twice. Both calls were previews; no note,
+key, mutation, or orphan existed. Zotero Context now has one bounded marked-note
+lifecycle tool with Python-owned version/read-back/finally-cleanup behavior,
+explicit direct `live=true` execution context, process-local operator approval,
+and provider-key-free public rendering. The second capped run below supersedes
+this partial result.
+
+The second capped Zotero run passed: two requests, an estimated `$0.0307848`,
+exact marked-note create/read-back, same-note version-aware update/read-back,
+marker-gated delete, and confirmed absence. No retry, duplicate, orphan, import,
+Workspace write, or unrelated action occurred. Deterministic public rendering
+removes the provider key from output and receipts. Manager/provider readiness is
+now 4/5 joined (Calendar, Gmail, Airtable, Zotero); Workspace remains the sole
+unjoined row and is not required for the current additional-provider goal.
 
 The remaining Slack goal now has an exact two-probe readiness registry. The
 direct Business Research and connector-backed Gmail→Research→Outreach graph
-pre-live evidence both pass, but live Slack evidence remains 0/2. The scorecard
+pre-live evidence passes; live Slack readiness is 2/2. The scorecard
 requires permalinks, local run/WorkItem IDs, answer-first copy, visible sources
 or source-limit language, one final response, trace/usage/cost evidence, and no
 unintended side effects. No fixture result can mark these live rows complete.
@@ -127,10 +160,25 @@ unintended side effects. No fixture result can mark these live rows complete.
   scoring, and unsupported-claim validation respectively. Gmail, Chief, and
   the five context agents already had executable typed-tool proof; Orchestrator
   remains a control-plane routing/review contract rather than a provider owner.
-- `npm run test:ai-agents-workflow:no-live`: 609 workflow and current-context
+- `npm run test:ai-agents-workflow:no-live`: 619 workflow and current-context
   contract tests, seven
   LangGraph scenarios, 36/36 Slack routes, and ANU-60 preflight; zero live
   model/search/connector calls.
+- Direct ANU-60 Slack acceptance now passes through the real KNI app. The Suki
+  ask produced one answer-first reply updated in place, visible source URLs,
+  no metadata-first preview, no side effect, Slack receipt
+  `sbar_613ad9e3000b4ef39b0323bf836685b4`, and KBA run `456`. One specialist
+  request plus two capped hosted-search requests cost an estimated `$0.054459`.
+- The connector-backed Gmail graph passes with WorkItem
+  `wi_b8a3b23a97ed41a5804f4c56c7b3f852` and Slack permalink
+  `https://as-xkn6329.slack.com/archives/C0ASJ6QU1FX/p1783802711400939`.
+  It completed Gmail -> Research -> Outreach over four messages, kept provider
+  identity internal, treated resolved scheduling as historical, and returned a
+  model-judged KNI collaboration recommendation. Because no immediate reply was
+  useful, it presented no reply copy, created no approval item, and attached an
+  `outreach_recommendation` with `approval_state=not_required`. Two OpenAI
+  requests cost an estimated `$0.044811`; no search, Gmail draft/send, post,
+  schedule, file write, or external provider mutation occurred.
 - The 2026-07-11 baseline also proves the low-friction manager contract: a
   complete explicitly named read-only context-agent ask routes directly to its
   owner rather than receiving an unnecessary Chief-of-Staff wrapper. Missing
@@ -256,9 +304,8 @@ unintended side effects. No fixture result can mark these live rows complete.
 
 ## Priority Order
 
-1. The latest eight-request sequential ceiling is fully consumed by the passing
-   Google Workspace natural Sheet lifecycle. Do not make another OpenAI call
-   until a new ceiling is approved and the logged-in billing page is refreshed.
+1. Direct and connector-backed Slack acceptance pass. Complete the final
+   requirement audit and single end-of-day push.
 2. Extend the new fixture-only current-opportunity completion gate to reject
    contradictory provider-status claims and weak generic portal pages in live
    traces.

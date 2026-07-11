@@ -35,6 +35,7 @@ ZOTERO_IMPORT_TOOL_NAMES: tuple[str, ...] = (
 ZOTERO_TEST_NOTE_TOOL_NAMES: tuple[str, ...] = (
     "zotero_write_test_note",
     "zotero_delete_test_note",
+    "zotero_test_note_lifecycle",
 )
 ZOTERO_TEST_LIBRARY_TOOL_NAMES: tuple[str, ...] = (
     "zotero_write_test_collection",
@@ -49,6 +50,7 @@ ZOTERO_CONTEXT_TOOL_NAMES: tuple[str, ...] = (
     *ZOTERO_TEST_LIBRARY_TOOL_NAMES,
 )
 ZOTERO_TEST_NOTE_MARKER = "KBA_TEST_NOTE"
+ZOTERO_OPERATOR_APPROVAL_ENV = "KEYSTONE_ZOTERO_OPERATOR_APPROVAL_REFERENCE"
 ZOTERO_TEST_COLLECTION_MARKER = "KBA_TEST_COLLECTION"
 ZOTERO_TEST_ITEM_MARKER = "KBA_TEST_ITEM"
 DEFAULT_ZOTERO_IMPORTER_SCRIPT = Path(
@@ -281,6 +283,9 @@ def zotero_write_test_note_impl(
     """Create or update one provider-verified disposable Zotero note."""
 
     clean_note = str(note_html or "").strip()
+    clean_approval = str(
+        approval_reference or os.getenv(ZOTERO_OPERATOR_APPROVAL_ENV, "")
+    ).strip()
     clean_operation = str(operation or "create").strip().lower()
     clean_item_key = str(item_key or "").strip()
     if clean_operation not in {"create", "update"}:
@@ -305,7 +310,7 @@ def zotero_write_test_note_impl(
             "item_key": clean_item_key,
             "parent_item_key": parent_item_key.strip(),
             "required_marker": ZOTERO_TEST_NOTE_MARKER,
-            "approval_reference": approval_reference.strip(),
+            "approval_reference": clean_approval,
             "verification": {"status": "preview", "passed": False},
             "send_enabled": False,
             "zotero_test_note_write_supported": True,
@@ -313,7 +318,7 @@ def zotero_write_test_note_impl(
 
     api_key, resolved_library_id = _zotero_live_write_config(
         library_id=library_id,
-        approval_reference=approval_reference,
+        approval_reference=clean_approval,
     )
     before_receipt: dict[str, Any] = {}
     if clean_operation == "update":
@@ -387,7 +392,7 @@ def zotero_write_test_note_impl(
         "item_key": resolved_item_key,
         "parent_item_key": str(after_data.get("parentItem") or ""),
         "required_marker": ZOTERO_TEST_NOTE_MARKER,
-        "approval_reference": approval_reference.strip(),
+        "approval_reference": clean_approval,
         "before": before_receipt,
         "after": _zotero_note_receipt(after),
         "verification": verification,
@@ -434,6 +439,9 @@ def zotero_delete_test_note_impl(
     """Delete one exact provider-verified disposable Zotero note."""
 
     clean_item_key = str(item_key or "").strip()
+    clean_approval = str(
+        approval_reference or os.getenv(ZOTERO_OPERATOR_APPROVAL_ENV, "")
+    ).strip()
     if not clean_item_key:
         raise ValueError("Zotero test-note deletion requires an exact item_key.")
     planned_path = _zotero_items_path(
@@ -448,7 +456,7 @@ def zotero_delete_test_note_impl(
             "planned_path": planned_path,
             "item_key": clean_item_key,
             "required_marker": ZOTERO_TEST_NOTE_MARKER,
-            "approval_reference": approval_reference.strip(),
+            "approval_reference": clean_approval,
             "verification": {"status": "preview", "passed": False},
             "send_enabled": False,
             "zotero_test_note_write_supported": True,
@@ -456,7 +464,7 @@ def zotero_delete_test_note_impl(
 
     api_key, resolved_library_id = _zotero_live_write_config(
         library_id=library_id,
-        approval_reference=approval_reference,
+        approval_reference=clean_approval,
     )
     before = _zotero_get_item(
         item_key=clean_item_key,
@@ -490,7 +498,7 @@ def zotero_delete_test_note_impl(
         "operation": "delete_test_note",
         "item_key": clean_item_key,
         "required_marker": ZOTERO_TEST_NOTE_MARKER,
-        "approval_reference": approval_reference.strip(),
+        "approval_reference": clean_approval,
         "before": _zotero_note_receipt(before),
         "verification": {
             "status": "verified" if passed else "verification_failed",
@@ -518,6 +526,148 @@ def zotero_delete_test_note(
             library_id=library_id,
             library_type=library_type,
             approval_reference=approval_reference,
+            live=live,
+        )
+    )
+
+
+def zotero_test_note_lifecycle_impl(
+    *,
+    approval_reference: str = "",
+    library_id: str = "",
+    library_type: str = "user",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Create, verify, revise, verify, and remove one marked standalone note."""
+
+    clean_approval = str(
+        approval_reference or os.getenv(ZOTERO_OPERATOR_APPROVAL_ENV, "")
+    ).strip()
+    if live and not clean_approval:
+        raise RuntimeError(
+            "The Zotero test-note lifecycle requires a non-empty approval_reference."
+        )
+    suffix = uuid4().hex[:10]
+    created_html = f"<p>{ZOTERO_TEST_NOTE_MARKER} {suffix} created for validation</p>"
+    updated_html = f"<p>{ZOTERO_TEST_NOTE_MARKER} {suffix} revised and verified</p>"
+    create_result: dict[str, Any] = {}
+    update_result: dict[str, Any] = {}
+    delete_result: dict[str, Any] = {}
+    item_key = ""
+    failure = ""
+    try:
+        create_result = zotero_write_test_note_impl(
+            created_html,
+            library_id=library_id,
+            library_type=library_type,
+            approval_reference=f"{clean_approval}:create" if clean_approval else "",
+            operation="create",
+            live=live,
+        )
+        item_key = str(create_result.get("item_key") or "").strip()
+        if not live:
+            return {
+                "status": "dry-run",
+                "operation": "test_note_lifecycle",
+                "required_marker": ZOTERO_TEST_NOTE_MARKER,
+                "approval_reference": clean_approval,
+                "create": _zotero_lifecycle_step_receipt(create_result),
+                "send_enabled": False,
+            }
+        if not item_key or not _zotero_verification_passed(create_result):
+            failure = "Zotero test-note create did not pass provider read-back verification."
+        else:
+            update_result = zotero_write_test_note_impl(
+                updated_html,
+                item_key=item_key,
+                library_id=library_id,
+                library_type=library_type,
+                approval_reference=f"{clean_approval}:update",
+                operation="update",
+                live=True,
+            )
+            if not _zotero_verification_passed(update_result):
+                failure = "Zotero test-note update did not pass provider read-back verification."
+    except Exception as exc:  # preserve a bounded failure while still cleaning up
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        if live and item_key:
+            try:
+                delete_result = zotero_delete_test_note_impl(
+                    item_key,
+                    library_id=library_id,
+                    library_type=library_type,
+                    approval_reference=f"{clean_approval}:delete",
+                    live=True,
+                )
+            except Exception as exc:
+                delete_result = {
+                    "status": "failed",
+                    "operation": "delete_test_note",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "verification": {"passed": False},
+                    "send_enabled": False,
+                }
+    create_passed = _zotero_verification_passed(create_result)
+    update_passed = _zotero_verification_passed(update_result)
+    cleanup_passed = _zotero_verification_passed(delete_result)
+    passed = create_passed and update_passed and cleanup_passed and not failure
+    return {
+        "status": "success" if passed else "failed",
+        "operation": "test_note_lifecycle",
+        "item_key": item_key,
+        "required_marker": ZOTERO_TEST_NOTE_MARKER,
+        "approval_reference": clean_approval,
+        "create": _zotero_lifecycle_step_receipt(create_result),
+        "update": _zotero_lifecycle_step_receipt(update_result),
+        "delete": _zotero_lifecycle_step_receipt(delete_result),
+        "verification": {
+            "passed": passed,
+            "create_read_back": create_passed,
+            "same_note_update_read_back": update_passed,
+            "note_absent_after_cleanup": cleanup_passed,
+        },
+        "failure": failure,
+        "send_enabled": False,
+    }
+
+
+def _zotero_verification_passed(result: dict[str, Any]) -> bool:
+    verification = result.get("verification")
+    return bool(isinstance(verification, dict) and verification.get("passed"))
+
+
+def _zotero_lifecycle_step_receipt(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: result.get(key)
+        for key in (
+            "status",
+            "operation",
+            "item_key",
+            "required_marker",
+            "approval_reference",
+            "verification",
+            "send_enabled",
+            "reason",
+        )
+        if key in result
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def zotero_test_note_lifecycle(
+    approval_reference: str = "",
+    library_id: str = "",
+    library_type: str = "user",
+    live: bool = False,
+) -> str:
+    """Run one approved KBA_TEST_NOTE lifecycle with versioned read-backs and cleanup."""
+
+    return _json_payload(
+        zotero_test_note_lifecycle_impl(
+            approval_reference=approval_reference,
+            library_id=library_id,
+            library_type=library_type,
             live=live,
         )
     )

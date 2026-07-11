@@ -16,6 +16,7 @@ from keystone_agents.tools.internal_data_tools import (
     airtable_get_base_schema,
     airtable_link_attachment,
     airtable_read_records,
+    airtable_test_record_lifecycle,
     airtable_upload_attachment,
     airtable_write_record,
 )
@@ -30,6 +31,7 @@ def _airtable_context_tools(*, tool_tier: str | int | None = None) -> list[Any]:
         airtable_upload_attachment,
         airtable_create_expense_from_receipt,
         airtable_delete_test_record,
+        airtable_test_record_lifecycle,
     ]
     if tool_tier is None:
         return tools

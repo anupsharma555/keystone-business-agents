@@ -377,6 +377,7 @@ class GmailThreadSummaryResult(BaseModel):
     deadlines: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
     triage_limitations: list[str] = Field(default_factory=list)
+    prior_context: list[str] = Field(default_factory=list)
     messages: list[GmailThreadSummaryMessage] = Field(default_factory=list)
     send_enabled: bool = False
     draft_created: bool = False
@@ -403,6 +404,7 @@ class GmailThreadSummaryResult(BaseModel):
         "deadlines",
         "open_questions",
         "triage_limitations",
+        "prior_context",
     )
     @classmethod
     def normalize_string_lists(cls, values: list[str]) -> list[str]:

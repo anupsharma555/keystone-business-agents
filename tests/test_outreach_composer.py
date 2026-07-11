@@ -65,11 +65,18 @@ def test_compact_llm_draft_payload_ignores_harmless_extra_fields() -> None:
             "linkedin_note": "Happy to compare notes if useful.",
             "personalization_rationale": "Used only approved thread-local context.",
             "source_ids_used": ["user_provided:thread_local_request"],
+            "reply_recommended": False,
+            "recommended_next_step": "Assess the collaboration hypothesis before replying.",
+            "additional_information_needed": ["Licensing terms"],
+            "collaboration_ideas": ["Dataset-fit assessment"],
+            "deferral_reason": "The thread is closed and the idea needs more evidence.",
             "recipient": "Review thread",
         }
     )
 
     assert payload.company_name == "NeuroFlow"
+    assert payload.reply_recommended is False
+    assert payload.collaboration_ideas == ["Dataset-fit assessment"]
     assert not hasattr(payload, "recipient")
 
 

@@ -22,6 +22,7 @@ class GmailExecutionPlan(BaseModel):
 
     source: str = "heuristic"
     operation: GmailExecutionOperation = "single_message_triage"
+    read_scope: Literal["message", "thread"] = "thread"
     lookback_days: int = Field(default=3, ge=1, le=365)
     max_messages: int = Field(default=10, ge=1, le=50)
     gmail_query: str = ""

@@ -72,6 +72,7 @@ from keystone_agents.tools.internal_data_tools import (
     airtable_delete_test_record_impl,
     airtable_get_base_schema_impl,
     airtable_read_records_impl,
+    airtable_test_record_lifecycle_impl,
     airtable_upload_attachment_impl,
     airtable_write_record_impl,
     explicit_full_article_read_requested,
@@ -4296,6 +4297,116 @@ def test_airtable_delete_test_record_reads_deletes_and_verifies_absence(
     }
     assert [request["method"] for request in requests] == ["GET", "DELETE", "GET"]
     assert "fields" not in result
+
+
+def test_airtable_test_record_lifecycle_uses_minimal_schema_safe_fields_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[dict[str, object]] = []
+    deletes: list[dict[str, object]] = []
+
+    def fake_write(fields_json: str, **kwargs: object) -> dict[str, object]:
+        fields = json.loads(fields_json)
+        writes.append({"fields": fields, **kwargs})
+        return {
+            "status": "success",
+            "operation": kwargs["operation"],
+            "table": kwargs["table"],
+            "record_id": "rec_internal_test",
+            "verification": {"passed": True},
+            "send_enabled": False,
+        }
+
+    def fake_delete(record_id: str, **kwargs: object) -> dict[str, object]:
+        deletes.append({"record_id": record_id, **kwargs})
+        return {
+            "status": "success",
+            "operation": "delete_test_record",
+            "table": kwargs["table"],
+            "record_id": record_id,
+            "verification": {"passed": True, "record_absent_after": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(internal_data_tools, "airtable_write_record_impl", fake_write)
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_delete_test_record_impl",
+        fake_delete,
+    )
+
+    result = airtable_test_record_lifecycle_impl(
+        approval_reference="authenticated-operator-stage-a",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["verification"] == {
+        "passed": True,
+        "create_read_back": True,
+        "same_record_update_read_back": True,
+        "record_absent_after_cleanup": True,
+    }
+    assert len(writes) == 2
+    assert set(writes[0]["fields"]) == {"Item", "Description"}
+    assert "Categories" not in writes[0]["fields"]
+    assert writes[0]["validate_schema"] is True
+    assert writes[1]["record_id"] == "rec_internal_test"
+    assert writes[1]["validate_schema"] is True
+    assert deletes == [
+        {
+            "record_id": "rec_internal_test",
+            "table": "Business Expenses",
+            "base_alias": "finance_tax_tracker",
+            "approval_reference": "authenticated-operator-stage-a:delete",
+            "live": True,
+        }
+    ]
+
+
+def test_airtable_test_record_lifecycle_cleans_created_record_after_update_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_count = 0
+    deleted: list[str] = []
+
+    def fake_write(_fields_json: str, **kwargs: object) -> dict[str, object]:
+        nonlocal write_count
+        write_count += 1
+        return {
+            "status": "success" if write_count == 1 else "verification_failed",
+            "operation": kwargs["operation"],
+            "record_id": "rec_internal_test",
+            "verification": {"passed": write_count == 1},
+            "send_enabled": False,
+        }
+
+    def fake_delete(record_id: str, **_kwargs: object) -> dict[str, object]:
+        deleted.append(record_id)
+        return {
+            "status": "success",
+            "operation": "delete_test_record",
+            "record_id": record_id,
+            "verification": {"passed": True, "record_absent_after": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(internal_data_tools, "airtable_write_record_impl", fake_write)
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_delete_test_record_impl",
+        fake_delete,
+    )
+
+    result = airtable_test_record_lifecycle_impl(
+        approval_reference="authenticated-operator-stage-a",
+        live=True,
+    )
+
+    assert result["status"] == "failed"
+    assert result["verification"]["same_record_update_read_back"] is False
+    assert result["verification"]["record_absent_after_cleanup"] is True
+    assert deleted == ["rec_internal_test"]
 
 
 def test_airtable_delete_test_record_is_dry_run_by_default(

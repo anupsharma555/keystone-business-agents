@@ -803,7 +803,8 @@ def test_backend_selected_manager_loop_uses_graph_for_gmail_research_outreach_ch
         WorkflowRunRequest(
             request_text=(
                 "gmail triage this sanitized inbound email from Mindful Care, "
-                "research Mindful Care, and prepare draft-only outreach. Email: "
+                "research Mindful Care, and return a suggested reply with supporting "
+                "evidence and the approval status. Email: "
                 "From: Jordan Lee, Operations at Mindful Care. Subject: Follow-up "
                 "on measurement support. Body: Hi Jordan, our team is reviewing "
                 "measurement-based care workflows and may need advisory help on "
@@ -843,12 +844,12 @@ def test_backend_selected_manager_loop_uses_graph_for_gmail_research_outreach_ch
     source_refs = result.context_pack.get("source_refs", [])
 
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
-    assert result.status == WorkItemStatus.BLOCKED
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
     assert graph_event.metadata["checkpoint_required"] is True
     assert checkpoint_payload["schema"] == "keystone.langgraph.approval_checkpoint.v1"
     assert checkpoint_payload["work_item_id"] == result.work_item.id
     assert checkpoint_payload["route"] == WorkItemRoute.OUTREACH_COMPOSER.value
-    assert checkpoint_payload["status"] == WorkItemStatus.BLOCKED.value
+    assert checkpoint_payload["status"] == WorkItemStatus.NEEDS_APPROVAL.value
     assert checkpoint_payload["target"]["name"] == "Mindful Care"
     assert checkpoint_payload["target"]["metadata"]["gmail_research_target"] == "Mindful Care"
     assert checkpoint_payload["send_enabled"] is False
@@ -867,6 +868,7 @@ def test_backend_selected_manager_loop_uses_graph_for_gmail_research_outreach_ch
     assert triage_artifact.metadata["draft_created"] is False
     assert triage_artifact.metadata["labels_modified"] is False
     assert company_artifact.metadata["source_refs"]
+    assert company_artifact.approval_state == ApprovalState.APPROVED_FOR_DRAFTING.value
     assert any(str(item.get("url") or "").startswith("fixture://") for item in source_refs)
     assert all(
         artifact.metadata.get("send_enabled") is not True
@@ -876,12 +878,12 @@ def test_backend_selected_manager_loop_uses_graph_for_gmail_research_outreach_ch
         artifact.metadata.get("external_writes_enabled") is not True
         for artifact in result.work_item.artifact_refs
     )
-    assert [blocker.code for blocker in result.blockers] == [
-        "outreach_requires_approved_context"
-    ]
-    assert [blocker["code"] for blocker in checkpoint_payload["blockers"]] == [
-        "outreach_requires_approved_context"
-    ]
+    assert result.blockers == []
+    assert checkpoint_payload["blockers"] == []
+    assert "*Answer:*" in result.human_summary
+    assert "*Organization context:*" in result.human_summary
+    assert "*Suggested reply:*" in result.human_summary
+    assert "*Supporting evidence and approval status:*" in result.human_summary
     assert {"gmail_triage_report", "company_profile"} <= {
         artifact["artifact_type"] for artifact in checkpoint_payload["artifact_refs"]
     }
@@ -2708,7 +2710,7 @@ def test_langgraph_manager_loop_routes_gmail_to_research_to_outreach_gate(
     completion_review = completed_payload["graph_completion_review"]
 
     assert outcome.result.route == WorkItemRoute.OUTREACH_COMPOSER
-    assert outcome.result.status == WorkItemStatus.BLOCKED
+    assert outcome.result.status == WorkItemStatus.NEEDS_APPROVAL
     assert outcome.checkpoint_required is True
     assert [event_type for event_type, _payload in feedback_events] == [
         "manager_loop_graph_started",
@@ -2756,9 +2758,7 @@ def test_langgraph_manager_loop_routes_gmail_to_research_to_outreach_gate(
     assert outcome.result.work_item.target.name == "Mindful Care"
     assert outcome.result.work_item.target.metadata["gmail_research_target"] == "Mindful Care"
     assert {"gmail_triage_report", "company_profile"} <= artifact_types
-    assert [blocker.code for blocker in outcome.result.blockers] == [
-        "outreach_requires_approved_context"
-    ]
+    assert outcome.result.blockers == []
     assert not graph_completion
 
 
@@ -2885,7 +2885,7 @@ def test_langgraph_storage_events_render_final_run_report(
     assert "Artifacts:" in report
     assert "gmail_triage_report" in report
     assert "company_profile" in report
-    assert "outreach_requires_approved_context" in report
+    assert "outreach_requires_approved_context" not in report
     assert "Sources:" in report
     assert "fixture://" in report
     assert "send enabled: no" in report

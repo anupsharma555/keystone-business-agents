@@ -388,7 +388,7 @@ def infer_manual_request_plan(
         )
     if intent == "blocked_send" or looks_like_send_side_effect(text):
         plan.planner_warnings.append(
-            "Send request blocked; external sends and posts remain draft/read-only."
+            "Send request blocked; external send/write requests remain draft/read-only."
         )
     return plan
 
@@ -933,6 +933,12 @@ def _looks_like_external_write_side_effect(text: str) -> bool:
     write_verb = (
         r"(?:create|update|delete|modify|write|save|attach|export|move|share|schedule|publish|post|send|deliver)"
     )
+    if "zotero" in lower and re.search(
+        r"\b(?:create|update|delete|modify|write|remove|revise)\b[\s\S]{0,100}\bnotes?\b"
+        r"|\bnotes?\b[\s\S]{0,100}\b(?:create|update|delete|modify|write|remove|revise)\b",
+        lower,
+    ):
+        return True
     target_object = (
         r"(?:record|row|table|tracker|field|file|doc|document|sheet|folder|attachment|"
         r"airtable|drive|workspace|gmail\s+draft|slack|crm|calendar|meeting|event|"

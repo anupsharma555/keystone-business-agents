@@ -116,7 +116,7 @@ Manual ANU-60 probe. This is not a committed Promptfoo case.
 4. Connector-backed graph-worthy review.
 
 ```text
-@KNI read the latest Gmail thread from the configured exact test sender, research the sender organization using only the selected thread context, and return a formatted review summary with the thread's main point, organization context, a suggested reply, supporting evidence, and the approval status.
+@KNI review the latest Gmail thread from the configured exact test sender, including all messages and the original inquiry. Identify the current conversation state, recommend the most useful KNI-specific collaboration next step using only that thread and approved KNI context, and include a reply only if replying now would move the relationship forward. Return a concise summary, supporting evidence, and any approval status that actually applies.
 ```
 
 This must invoke the KNI Slack app, select the LangGraph path, keep the selected
@@ -178,7 +178,7 @@ fixture-backed evidence must cover every row.
 | Acceptance item | Required proof |
 | --- | --- |
 | Direct Business Research Slack probes render the KBA answer first without provider metadata leading the message. | Direct Suki probe passes with Slack permalink, local run id, answer-first `human_summary`, visible source URLs or source-limit language, and no provider/model/timing metadata before the answer. |
-| Connector-backed graph ask invokes the KNI app and returns one review result without requiring safety boilerplate in the ask. | Gmail graph probe passes with Slack permalink, WorkItem id, selected-thread identity kept internal, Gmail -> Research -> Outreach review path, suggested reply text, approval state, one final response, usage/cost trace, and no provider draft/send/post/file write. |
+| Connector-backed graph ask invokes the KNI app and returns one review result without requiring safety boilerplate in the ask. | Gmail graph probe passes with Slack permalink, WorkItem id, selected-thread identity kept internal, Gmail -> Research -> Outreach review path, a model-judged recommendation, reply copy only when useful, the correct approval-or-no-approval state, one final response, usage/cost trace, and no provider draft/send/post/file write. |
 | Conversational Business Research Slack probes render the KBA answer first and reach KBA planning. | Conversational Nabla probe passes with Slack permalink, local run id, bridge-accepted conversational wording, route/output type, answer-first `human_summary`, and no metadata-first body. |
 | RSS context-agent Slack probes display `RssContextResult` summaries instead of generic WorkItem completion text. | RSS context probe passes with Slack permalink, local run id or WorkItem id, `rss_context_agent` route, `RssContextResult` output type, answer-first body, and no generic `WorkItem Ready` or `WorkItem command completed` body. |
 | Preprints context-agent Slack probes display `PreprintsContextResult` summaries instead of generic WorkItem completion text. | Preprints context probe passes with Slack permalink, local run id or WorkItem id, `preprints_context_agent` route, `PreprintsContextResult` output type, answer-first body, and no generic `WorkItem Ready` or `WorkItem command completed` body. |

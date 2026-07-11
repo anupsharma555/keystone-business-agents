@@ -42,6 +42,7 @@ AIRTABLE_WRITE_ALLOWED_TOOLS = frozenset(
     }
 )
 AIRTABLE_TEST_CLEANUP_TOOLS = frozenset({"airtable_delete_test_record"})
+AIRTABLE_TEST_LIFECYCLE_TOOLS = frozenset({"airtable_test_record_lifecycle"})
 CALENDAR_READ_TOOL_NAMES = frozenset({"read_google_calendar_window"})
 WEB_STRUCTURING_ALLOWED_TOOLS = frozenset({"structure_web_data_for_schema"})
 PLAYWRIGHT_RESEARCH_ALLOWED_TOOLS = frozenset({"render_page"})
@@ -251,6 +252,7 @@ CALENDAR_WRITE_TOOL_NAMES = frozenset(
 INTERNAL_WRITE_TOOL_NAMES = (
     AIRTABLE_WRITE_ALLOWED_TOOLS
     | AIRTABLE_TEST_CLEANUP_TOOLS
+    | AIRTABLE_TEST_LIFECYCLE_TOOLS
     | GOOGLE_WORKSPACE_WRITE_TOOLS
     | CONTACT_CONTEXT_TOOL_NAMES
     | CALENDAR_WRITE_TOOL_NAMES
@@ -459,6 +461,7 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
             AIRTABLE_READ_ALLOWED_TOOLS
             | AIRTABLE_WRITE_ALLOWED_TOOLS
             | AIRTABLE_TEST_CLEANUP_TOOLS
+            | AIRTABLE_TEST_LIFECYCLE_TOOLS
         ),
         rationale=(
             "The Airtable context agent reads schema and capped records, may perform "

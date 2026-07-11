@@ -84,6 +84,10 @@ MANAGER_DELEGATION_READINESS_CASES: tuple[ManagerDelegationReadinessCase, ...] =
         ),
         provider_lifecycle_nodeids=(
             "tests/test_chief_of_staff.py::"
+            "test_airtable_test_record_lifecycle_uses_minimal_schema_safe_fields_and_cleans_up",
+            "tests/test_chief_of_staff.py::"
+            "test_airtable_test_record_lifecycle_cleans_created_record_after_update_failure",
+            "tests/test_chief_of_staff.py::"
             "test_airtable_delete_test_record_reads_deletes_and_verifies_absence",
         ),
         required_invariants=(
@@ -93,11 +97,9 @@ MANAGER_DELEGATION_READINESS_CASES: tuple[ManagerDelegationReadinessCase, ...] =
             "read_back_required",
             "marker_restricted_cleanup",
         ),
-        manager_provider_join_proven=False,
+        manager_provider_join_proven=True,
         next_live_proof=(
-            "One manager-entry rerun with the delegated Airtable turn limit capped at "
-            "four and the sanitized provider-ID-free receipt; reuse the verified "
-            "create/update/delete mechanics."
+            "Reuse the capped two-request joined lifecycle PASS; do not rerun."
         ),
     ),
     ManagerDelegationReadinessCase(
@@ -139,6 +141,8 @@ MANAGER_DELEGATION_READINESS_CASES: tuple[ManagerDelegationReadinessCase, ...] =
             "test_chief_structured_handoff_keeps_nested_specialist_advisory",
         ),
         provider_lifecycle_nodeids=(
+            "tests/test_zotero_test_note_actions.py::"
+            "test_zotero_test_note_lifecycle_updates_same_note_and_cleans_up",
             "tests/test_sdk_execution.py::"
             "test_structured_context_agent_session_followup_preserves_identity_and_updates",
             "tests/test_zotero_test_note_actions.py::"
@@ -151,9 +155,9 @@ MANAGER_DELEGATION_READINESS_CASES: tuple[ManagerDelegationReadinessCase, ...] =
             "version_aware_update",
             "absence_verified",
         ),
-        manager_provider_join_proven=False,
+        manager_provider_join_proven=True,
         next_live_proof=(
-            "One manager-entry marked note lifecycle using the existing versioned owner proof."
+            "Reuse the capped two-request joined lifecycle PASS; do not rerun."
         ),
     ),
 )

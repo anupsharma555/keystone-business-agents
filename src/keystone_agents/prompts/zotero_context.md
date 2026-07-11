@@ -88,6 +88,11 @@ that Chief of Staff can execute through its own typed tools.
   actually performed.
 - Populate `executed_note_results` when a direct test-note create, update,
   delete, or dry-run preview was actually performed.
+- For a direct authenticated request to create, verify, revise, verify, and
+  remove one marked standalone test note, prefer `zotero_test_note_lifecycle`.
+  Call it with `live=true`; do not silently downgrade the requested execution
+  to a preview. The tool owns the internal item key, provider versions, both
+  read-backs, marker-gated cleanup, and absence proof.
 - Populate `executed_library_results` when a direct marked collection/item
   create, update, delete, or dry-run preview was actually performed.
 - Mark `recommended_artifact_plan.live_write_allowed_for_specialist=false`.

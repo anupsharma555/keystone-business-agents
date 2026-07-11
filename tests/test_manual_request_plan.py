@@ -186,6 +186,30 @@ def test_manual_plan_routes_zotero_note_lifecycle_to_context_owner() -> None:
     assert plan.side_effect_policy == "internal_write_approval_required"
 
 
+def test_chief_delegates_complete_zotero_note_lifecycle_to_context_owner() -> None:
+    plan = infer_manual_request_plan(
+        "Create one marked standalone Zotero test note, verify it, revise the same "
+        "note to be clearer, verify it again, and remove only that test note.",
+        requested_agent="chief_of_staff",
+    )
+
+    assert plan.target_agent == "zotero_context_agent"
+    assert plan.intent == "business_system_write"
+    assert plan.side_effect_policy == "internal_write_approval_required"
+
+
+def test_research_diligence_note_is_not_misclassified_as_provider_write() -> None:
+    plan = infer_manual_request_plan(
+        "@KNI business research analyst write a concise diligence note for CareNav AI "
+        "with labeled fields for "
+        "product, buyer, evidence, risk, and Keystone fit.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent != "blocked_send"
+
+
 @pytest.mark.parametrize(
     ("prompt", "target_agent", "intent"),
     [
@@ -1489,6 +1513,18 @@ def test_gmail_execution_plan_keeps_inline_email_context_off_live_gmail() -> Non
     assert plan.source_label == "inline_context"
     assert plan.gmail_query == ""
     assert "inline_email_context_triage" in plan.candidate_helpers
+
+
+def test_gmail_execution_plan_distinguishes_latest_thread_from_latest_email() -> None:
+    thread_plan = infer_gmail_execution_plan(
+        "Read the latest Gmail thread from the configured sender and suggest a reply."
+    )
+    email_plan = infer_gmail_execution_plan(
+        "Read the latest Gmail email from the configured sender and suggest a reply."
+    )
+
+    assert thread_plan.read_scope == "thread"
+    assert email_plan.read_scope == "message"
 
 
 def test_outreach_execution_plan_keeps_drafts_gated_and_tracks_replies() -> None:

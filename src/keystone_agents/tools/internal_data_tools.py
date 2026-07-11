@@ -21,6 +21,7 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
+from uuid import uuid4
 from xml.etree import ElementTree
 
 from keystone_agents.config import parse_bool
@@ -64,6 +65,7 @@ AIRTABLE_BASE_ALIAS_PREFIXES = {
     "ops": "AIRTABLE_KNI_OPS",
 }
 AIRTABLE_LIVE_READS_ENV = "KEYSTONE_AIRTABLE_LIVE_READS"
+AIRTABLE_OPERATOR_APPROVAL_ENV = "KEYSTONE_AIRTABLE_OPERATOR_APPROVAL_REFERENCE"
 AIRTABLE_TEST_RECORD_MARKER = "KBA_TEST_RECORD"
 GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
@@ -951,6 +953,169 @@ def airtable_delete_test_record(
             table=table,
             base_alias=base_alias,
             base_id=base_id,
+            approval_reference=approval_reference,
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def airtable_test_record_lifecycle_impl(
+    *,
+    table: str = "Business Expenses",
+    base_alias: str = "finance_tax_tracker",
+    approval_reference: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Create, verify, update, verify, and remove one marked test record."""
+
+    clean_table = " ".join(str(table or "").split())
+    if clean_table != "Business Expenses":
+        raise ValueError(
+            "The bounded Airtable test lifecycle supports only Business Expenses."
+        )
+    clean_approval = str(
+        approval_reference or os.getenv(AIRTABLE_OPERATOR_APPROVAL_ENV, "")
+    ).strip()
+    if live and not clean_approval:
+        raise RuntimeError(
+            "The Airtable test lifecycle requires a non-empty approval_reference."
+        )
+
+    marker = f"{AIRTABLE_TEST_RECORD_MARKER} {uuid4().hex[:10]}"
+    create_fields = {
+        "Item": marker,
+        "Description": f"{marker} created for delegated lifecycle validation",
+    }
+    update_fields = {
+        "Description": f"{marker} updated and ready for verified cleanup",
+    }
+    create_result: dict[str, Any] = {}
+    update_result: dict[str, Any] = {}
+    delete_result: dict[str, Any] = {}
+    record_id = ""
+    failure = ""
+
+    try:
+        create_result = airtable_write_record_impl(
+            json.dumps(create_fields),
+            table=clean_table,
+            base_alias=base_alias,
+            approval_reference=f"{clean_approval}:create" if clean_approval else "",
+            operation="create",
+            validate_schema=live,
+            live=live,
+        )
+        record_id = str(create_result.get("record_id") or "").strip()
+        if not live:
+            return {
+                "status": "dry-run",
+                "operation": "test_record_lifecycle",
+                "table": clean_table,
+                "required_marker": AIRTABLE_TEST_RECORD_MARKER,
+                "approval_reference": clean_approval,
+                "create": _airtable_lifecycle_step_receipt(create_result),
+                "send_enabled": False,
+            }
+        if not record_id or not _airtable_verification_passed(create_result):
+            failure = "Airtable test create did not pass provider read-back verification."
+        else:
+            update_result = airtable_write_record_impl(
+                json.dumps(update_fields),
+                table=clean_table,
+                base_alias=base_alias,
+                record_id=record_id,
+                approval_reference=f"{clean_approval}:update",
+                operation="update",
+                validate_schema=True,
+                live=True,
+            )
+            if not _airtable_verification_passed(update_result):
+                failure = "Airtable test update did not pass provider read-back verification."
+    except Exception as exc:  # cleanup is more important than propagating provider detail
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        if live and record_id:
+            try:
+                delete_result = airtable_delete_test_record_impl(
+                    record_id,
+                    table=clean_table,
+                    base_alias=base_alias,
+                    approval_reference=f"{clean_approval}:delete",
+                    live=True,
+                )
+            except Exception as exc:  # preserve cleanup failure in the bounded receipt
+                delete_result = {
+                    "status": "failed",
+                    "operation": "delete_test_record",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "verification": {"passed": False},
+                    "send_enabled": False,
+                }
+
+    create_passed = _airtable_verification_passed(create_result)
+    update_passed = _airtable_verification_passed(update_result)
+    cleanup_passed = _airtable_verification_passed(delete_result)
+    passed = create_passed and update_passed and cleanup_passed and not failure
+    return {
+        "status": "success" if passed else "failed",
+        "operation": "test_record_lifecycle",
+        "table": clean_table,
+        "record_id": record_id,
+        "required_marker": AIRTABLE_TEST_RECORD_MARKER,
+        "approval_reference": clean_approval,
+        "create": _airtable_lifecycle_step_receipt(create_result),
+        "update": _airtable_lifecycle_step_receipt(update_result),
+        "delete": _airtable_lifecycle_step_receipt(delete_result),
+        "verification": {
+            "passed": passed,
+            "create_read_back": create_passed,
+            "same_record_update_read_back": update_passed,
+            "record_absent_after_cleanup": cleanup_passed,
+        },
+        "failure": failure,
+        "send_enabled": False,
+    }
+
+
+def _airtable_verification_passed(result: Mapping[str, Any]) -> bool:
+    verification = result.get("verification")
+    return bool(isinstance(verification, Mapping) and verification.get("passed"))
+
+
+def _airtable_lifecycle_step_receipt(result: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: result.get(key)
+        for key in (
+            "status",
+            "operation",
+            "table",
+            "record_id",
+            "required_marker",
+            "verification",
+            "send_enabled",
+            "audit_notes",
+            "reason",
+        )
+        if key in result
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def airtable_test_record_lifecycle(
+    table: str = "Business Expenses",
+    base_alias: str = "finance_tax_tracker",
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Run one approved KBA_TEST_RECORD create/update/delete lifecycle with read-backs."""
+
+    return json.dumps(
+        airtable_test_record_lifecycle_impl(
+            table=table,
+            base_alias=base_alias,
             approval_reference=approval_reference,
             live=live,
         ),

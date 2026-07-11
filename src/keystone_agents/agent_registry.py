@@ -408,6 +408,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "airtable_link_attachment",
             "airtable_create_expense_from_receipt",
             "airtable_delete_test_record",
+            "airtable_test_record_lifecycle",
         ),
         live_flags_required=("--live-sdk",),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),

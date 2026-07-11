@@ -2619,6 +2619,11 @@ def test_outreach_compact_sdk_keeps_approval_objects_deterministic(
         **compact_payload,
         "contact_name": "Dr. Example",
         "contact_title": "Clinical Operations Lead",
+        "reply_recommended": True,
+        "recommended_next_step": "",
+        "additional_information_needed": [],
+        "collaboration_ideas": [],
+        "deferral_reason": "",
     }
     assert evidence["output"] == result.output.model_dump(mode="json")
     assert evidence["usage"] == result.usage
@@ -3728,6 +3733,34 @@ def test_workspace_context_fake_model_searches_then_reads_local_powerpoint(
         ),
         (
             build_airtable_context_agent,
+            "airtable_test_record_lifecycle",
+            {
+                "table": "Business Expenses",
+                "base_alias": "finance_tax_tracker",
+                "approval_reference": "approval-sdk-preview",
+                "live": False,
+            },
+            (
+                "Create one marked Airtable test expense, verify it, update the same "
+                "record, verify it again, and remove only that test record. Preview "
+                "the bounded lifecycle for now."
+            ),
+            AirtableContextResult,
+            "KBA_TEST_RECORD",
+            "executed_write_results",
+            _airtable_context_payload(
+                summary="Prepared the bounded marked-record lifecycle preview.",
+                executed_write_results=[
+                    {
+                        "key": "operation",
+                        "value": "test_record_lifecycle",
+                        "note": "dry-run",
+                    }
+                ],
+            ),
+        ),
+        (
+            build_airtable_context_agent,
             "airtable_link_attachment",
             {
                 "receipt_url": "https://example.test/receipt.pdf",
@@ -3900,6 +3933,33 @@ def test_workspace_context_fake_model_searches_then_reads_local_powerpoint(
                 recommended_target="folderKBA1",
                 executed_write_results=[
                     {"key": "operation", "value": "remove_folder", "note": "dry-run"}
+                ],
+            ),
+        ),
+        (
+            build_zotero_context_agent,
+            "zotero_test_note_lifecycle",
+            {
+                "approval_reference": "approval-sdk-preview",
+                "library_type": "user",
+                "live": False,
+            },
+            (
+                "Create one marked standalone Zotero test note, verify it, revise the "
+                "same note, verify it again, and remove only that note. Preview the "
+                "bounded lifecycle for now."
+            ),
+            ZoteroContextResult,
+            "KBA_TEST_NOTE",
+            "executed_note_results",
+            _zotero_context_payload(
+                summary="Prepared the bounded marked-note lifecycle preview.",
+                executed_note_results=[
+                    {
+                        "key": "operation",
+                        "value": "test_note_lifecycle",
+                        "note": "dry-run",
+                    }
                 ],
             ),
         ),
