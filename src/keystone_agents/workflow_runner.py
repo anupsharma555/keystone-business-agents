@@ -940,6 +940,33 @@ def run_prepared_work_item_specialist(prepared: PreparedWorkItemStep) -> Workflo
     sdk_session_spec = _sdk_session_spec_for_work_item(request, work_item)
     sdk_session = build_sdk_session(sdk_session_spec) if request.live_sdk else None
 
+    source_bundle_mismatch = next(
+        (
+            blocker
+            for blocker in work_item.blockers
+            if blocker.code == "source_bundle_target_mismatch" and not blocker.resolved
+        ),
+        None,
+    )
+    if source_bundle_mismatch is not None:
+        return _blocked_result(
+            work_item,
+            (source_bundle_mismatch,),
+            WorkItemNextAction(
+                action="provide_matching_source_bundle",
+                agent=route,
+                description=(
+                    "Provide a source bundle for the requested target, or change the request "
+                    "to name the target declared by the attached bundle."
+                ),
+            ),
+            store=store,
+            route=route,
+            audit_notes=[
+                "Specialist execution stopped before using a source bundle for a different target."
+            ],
+        )
+
     source_link_followup = (
         _chief_source_link_followup_result(
             work_item,
@@ -4501,10 +4528,14 @@ def _apply_manual_request_plan(work_item: WorkItem, plan: dict | None) -> WorkIt
     business_research_plan = (
         target_agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value and bool(primary_target)
     )
+    specialist_entity_plan = target_agent in {
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        WorkItemRoute.OPPORTUNITY_SCOUT.value,
+    }
     if primary_target and (
         not target.name
         or (
-            business_research_plan
+            specialist_entity_plan
             and _looks_like_diagnostic_or_instruction_target(target.name)
         )
     ):
@@ -7726,6 +7757,52 @@ def _apply_work_item_source_bundle_context(
     """Promote a bounded supplied-material packet into typed WorkItem state."""
 
     target_payload = context.get("target") if isinstance(context.get("target"), dict) else {}
+    planned_target = _manual_primary_target(work_item)
+    bundle_target = _compact_context_text(target_payload.get("name"), max_chars=240)
+    bundle_target_type = _compact_context_text(
+        target_payload.get("object_type"), max_chars=80
+    )
+    if _source_bundle_target_conflicts(
+        planned_target=planned_target,
+        bundle_target=bundle_target,
+        bundle_target_type=bundle_target_type,
+    ):
+        metadata = {
+            **work_item.target.metadata,
+            "external_context": {
+                "schema": "keystone.work_item.source_bundle.v1",
+                "source_count": 0,
+                "fact_count": 0,
+                "supplied_material_only": bool(context.get("supplied_material_only", True)),
+                "target_status": "mismatch",
+                "bundle_target": bundle_target,
+                "planned_target": planned_target,
+            },
+        }
+        if context_file_path:
+            metadata["external_context_file_path"] = context_file_path
+        blocked = work_item.model_copy(
+            update={"target": work_item.target.model_copy(update={"metadata": metadata})}
+        ).touch()
+        blocked = add_blocker(
+            blocked,
+            WorkItemBlocker(
+                code="source_bundle_target_mismatch",
+                message=(
+                    f'The attached source bundle is for "{bundle_target}", but the current '
+                    f'request targets "{planned_target}".'
+                ),
+            ),
+        )
+        return blocked.model_copy(
+            update={
+                "audit_notes": [
+                    *blocked.audit_notes,
+                    "Source-bundle target mismatch blocked before sources or facts were promoted.",
+                ]
+            }
+        ).touch()
+
     gmail_payload = (
         context.get("gmail_context")
         if isinstance(context.get("gmail_context"), dict)
@@ -7847,6 +7924,53 @@ def _apply_work_item_source_bundle_context(
             "audit_notes": [*work_item.audit_notes, note],
         }
     ).touch()
+
+
+def _source_bundle_target_conflicts(
+    *,
+    planned_target: str,
+    bundle_target: str,
+    bundle_target_type: str,
+) -> bool:
+    planned = " ".join(str(planned_target or "").split()).strip()
+    bundled = " ".join(str(bundle_target or "").split()).strip()
+    if str(bundle_target_type or "").strip().casefold() != "company":
+        return False
+    if not planned or not bundled:
+        return False
+    if _normalized_entity_label(planned) == _normalized_entity_label(bundled):
+        return False
+    return _looks_like_specific_entity_label(planned)
+
+
+def _normalized_entity_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def _looks_like_specific_entity_label(value: str) -> bool:
+    words = re.findall(r"[A-Za-z0-9&.'-]+", str(value or ""))
+    if not words or len(words) > 8:
+        return False
+    generic_words = {
+        "advisory",
+        "ai",
+        "behavioral",
+        "business",
+        "clinical",
+        "companies",
+        "company",
+        "health",
+        "latest",
+        "opportunities",
+        "opportunity",
+        "recent",
+        "research",
+        "signals",
+        "three",
+        "topic",
+        "top",
+    }
+    return any(word.casefold() not in generic_words for word in words)
 
 
 def _source_bundle_fact_approval_state(value: object) -> str:
@@ -10540,6 +10664,13 @@ def _advance_chief_of_staff(
             ),
             "context_handoffs": [
                 handoff.model_dump(mode="json") for handoff in output.context_handoffs
+            ],
+            "write_requests": [
+                {
+                    **write_request.model_dump(mode="json"),
+                    "metadata": json.loads(write_request.metadata or "{}"),
+                }
+                for write_request in output.write_requests
             ],
             "retrieval_diagnostics": output.retrieval_diagnostics,
             "source_refs": [ref.model_dump(mode="json") for ref in source_refs],
@@ -15076,6 +15207,9 @@ def _source_provided_opportunity_context_signal(request_text: str) -> str:
 
 
 def _source_provided_opportunity_target(topic: str, request_text: str) -> str:
+    explicit_topic = _clean_source_provided_opportunity_target_name(topic)
+    if _looks_like_specific_entity_label(explicit_topic):
+        return explicit_topic
     for candidate in (request_text, topic):
         candidate_text = _source_provided_opportunity_target_text(candidate or "")
         possessive_match = re.search(
@@ -15084,24 +15218,42 @@ def _source_provided_opportunity_target(topic: str, request_text: str) -> str:
             candidate_text,
         )
         if possessive_match:
-            return _clean_source_provided_opportunity_target_name(
+            resolved = _clean_source_provided_opportunity_target_name(
                 possessive_match.group("name")
             )
+            if not _looks_like_agent_instruction_target(resolved):
+                return resolved
         match = re.search(
             r"\b([A-Z][A-Za-z0-9&.' -]{2,80}?)\s+"
             r"(?:is|asked|wants|needs|could|has|plans|considering)\b",
             candidate_text,
         )
         if match:
-            return _clean_source_provided_opportunity_target_name(match.group(1))
+            resolved = _clean_source_provided_opportunity_target_name(match.group(1))
+            if not _looks_like_agent_instruction_target(resolved):
+                return resolved
         label_match = re.search(
             r"\b(?:target|company|organization|org|clinic|contact)\s*:\s*([^.\n;]{2,80})",
             candidate_text,
             flags=re.IGNORECASE,
         )
         if label_match:
-            return _clean_source_provided_opportunity_target_name(label_match.group(1))
+            resolved = _clean_source_provided_opportunity_target_name(label_match.group(1))
+            if not _looks_like_agent_instruction_target(resolved):
+                return resolved
     return _truncate_text(topic or "Source-provided opportunity", 80)
+
+
+def _looks_like_agent_instruction_target(value: str) -> bool:
+    normalized = " ".join(str(value or "").casefold().split())
+    return bool(
+        re.search(
+            r"\b(?:opportunity scout|business research analyst|outreach composer|"
+            r"gmail triage|chief of staff)\b",
+            normalized,
+        )
+        or re.search(r"\b(?:assess|evaluate|review|research|determine)\s+whether\b", normalized)
+    )
 
 
 def _clean_source_provided_opportunity_target_name(value: str) -> str:

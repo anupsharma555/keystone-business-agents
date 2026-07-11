@@ -2833,6 +2833,51 @@ def test_langgraph_supplied_material_packet_survives_research_to_draft_handoffs(
     )
 
 
+def test_langgraph_blocks_mismatched_source_bundle_before_specialists(
+    tmp_path: Path,
+) -> None:
+    fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
+    request_text = (
+        "Research NeuroFlow as a behavioral-health AI opportunity with payer partnership "
+        "and outcomes-evidence signals, then have Opportunity Scout assess whether this is "
+        "a real KNI advisory/research opportunity. Stop before outreach."
+    )
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text=request_text,
+            context_file_path=str(fixture_path),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=False,
+            live_search=False,
+            manual_request_plan={
+                "source": "test",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": "NeuroFlow",
+                "target_type": "topic",
+                "task_objective": "opportunity_discovery",
+            },
+        ),
+        manager_loop=True,
+        max_manager_steps=3,
+    )
+
+    work_item = outcome.result.work_item
+    assert work_item.target.name == "NeuroFlow"
+    assert work_item.sources == []
+    assert work_item.facts == []
+    assert outcome.result.advanced is False
+    assert "source_bundle_target_mismatch" in {
+        blocker.code for blocker in outcome.result.blockers
+    }
+    assert any(
+        "stopped before using a source bundle for a different target" in note
+        for note in outcome.result.audit_notes
+    )
+
+
 def test_langgraph_storage_events_render_final_run_report(
     tmp_path: Path,
 ) -> None:

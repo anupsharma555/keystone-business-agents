@@ -5477,6 +5477,33 @@ def test_google_sheets_management_routes_to_structured_data_plan() -> None:
     assert any("Trash" in action or "trash" in action for action in result.recommended_actions)
 
 
+def test_google_sheets_lifecycle_retains_exact_identity_and_provider_owner() -> None:
+    result = plan_chief_of_staff_request(
+        "Create one temporary Sheet named KBA_TEST_SHEET pair-control in KNIOps, "
+        "add a marked KBA_TEST_ROW, read it back, update the same row, verify it, "
+        "delete the marked row, move the same test Sheet to trash, and confirm cleanup. "
+        "Do not share, send, post, or modify any unrelated file."
+    )
+
+    assert result.sources == []
+    assert len(result.write_requests) == 1
+    write_request = result.write_requests[0]
+    assert write_request.title == "KBA_TEST_SHEET pair-control"
+    metadata = json.loads(write_request.metadata)
+    assert metadata["owner_agent"] == "google_workspace_context_agent"
+    assert metadata["requested_title"] == "KBA_TEST_SHEET pair-control"
+    assert metadata["requested_operations"] == [
+        "create",
+        "append_row",
+        "read_back",
+        "update_row",
+        "delete_row",
+        "trash_sheet",
+    ]
+    assert metadata["requires_provider_readback"] is True
+    assert metadata["requires_cleanup_verification"] is True
+
+
 def test_project_context_request_routes_to_flexible_context_review() -> None:
     result = plan_chief_of_staff_request(
         "chief of staff obtain context on the adolescent depression measurement project"

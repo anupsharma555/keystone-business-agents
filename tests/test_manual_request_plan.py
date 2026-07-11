@@ -78,6 +78,36 @@ def test_chief_scoped_airtable_lifecycle_is_not_misclassified_as_send() -> None:
     assert plan.planner_warnings == []
 
 
+def test_workspace_lifecycle_ignores_negated_outbound_actions() -> None:
+    request = (
+        "Create one temporary Sheet named KBA_TEST_SHEET pair-control in KNIOps, "
+        "add a marked KBA_TEST_ROW, read it back, update the same row, verify it, "
+        "delete the marked row, move the same test Sheet to trash, and confirm "
+        "cleanup. Do not share, send, post, or modify any unrelated file."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="orchestrator")
+
+    assert plan.target_agent == "google_workspace_context_agent"
+    assert plan.intent == "business_system_write"
+    assert plan.task_objective == "business_system_write"
+    assert plan.expected_artifact_type == "business_system_write_plan"
+    assert plan.side_effect_policy == "internal_write_approval_required"
+    assert plan.planner_warnings == []
+
+
+def test_workspace_save_plan_stays_read_only_until_execution_is_requested() -> None:
+    plan = infer_manual_request_plan(
+        "Prepare a save plan for the NeuroFlow research brief in Google Drive. "
+        "Do not create the file.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "google_workspace_context_agent"
+    assert plan.intent == "context_lookup"
+    assert plan.side_effect_policy == "draft_or_read_only"
+
+
 def test_context_agent_negated_side_effect_constraints_remain_read_only_context() -> None:
     plan = infer_manual_request_plan(
         "@KNI rss context agent: inspect announcement history. Do not post to Slack "

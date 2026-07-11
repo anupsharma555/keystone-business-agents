@@ -9,7 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from keystone_agents.advanced_manager_scenarios import ADVANCED_MANAGER_SCENARIOS
+from keystone_agents.advanced_manager_scenarios import (
+    ADVANCED_MANAGER_GLOBAL_INVARIANTS,
+    ADVANCED_MANAGER_SCENARIOS,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,6 +37,11 @@ def main(argv: list[str] | None = None) -> int:
             "scenario_id": scenario.scenario_id,
             "title": scenario.title,
             "family": scenario.family,
+            "expected_entry_owner": scenario.expected_entry_owner,
+            "expected_outcome": scenario.expected_outcome,
+            "required_invariants": list(scenario.required_invariants),
+            "live_model_required": scenario.live_model_required,
+            "external_side_effects_allowed": scenario.external_side_effects_allowed,
             "status": "pass" if completed.returncode == 0 else "fail",
             "failure_category": "" if completed.returncode == 0 else "offline_regression",
             "next_fix": (
@@ -69,6 +77,7 @@ def _write_scorecard(path_value: str, rows: list[dict[str, object]], *, passed: 
                 "live_connectors": False,
                 "external_side_effects": False,
                 "legacy_promptfoo_included": False,
+                "global_invariants": list(ADVANCED_MANAGER_GLOBAL_INVARIANTS),
                 "scenarios": rows,
             },
             indent=2,

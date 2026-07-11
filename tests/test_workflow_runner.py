@@ -73,6 +73,38 @@ from keystone_agents.work_items import (
 from keystone_agents.workflow_runner import advance_work_item, advance_work_item_manager_loop
 
 
+def test_workspace_lifecycle_plan_preserves_provider_write_contract(tmp_path: Path) -> None:
+    request_text = (
+        "Create one temporary Sheet named KBA_TEST_SHEET pair-contract in KNIOps, "
+        "add a marked KBA_TEST_ROW, read it back, update the same row, verify it, "
+        "delete the marked row, move the same test Sheet to trash, and confirm cleanup. "
+        "Do not share, send, post, or modify any unrelated file."
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=False,
+            manual_request_plan=infer_manual_request_plan(request_text).model_dump(mode="json"),
+        ),
+        max_steps=2,
+    )
+
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    artifact = next(
+        item for item in result.artifact_refs if item.artifact_type == "chief_of_staff_plan"
+    )
+    assert artifact.metadata["source_refs"] == []
+    assert len(artifact.metadata["write_requests"]) == 1
+    write_request = artifact.metadata["write_requests"][0]
+    assert write_request["title"] == "KBA_TEST_SHEET pair-contract"
+    assert write_request["metadata"]["owner_agent"] == "google_workspace_context_agent"
+    assert write_request["metadata"]["requires_provider_readback"] is True
+    assert write_request["metadata"]["requires_cleanup_verification"] is True
+
+
 def test_chief_workflow_allows_explicit_business_expense_receipt_airtable_write() -> None:
     request = (
         "chief of staff add a business expense to the airtable business expenses "
@@ -5600,6 +5632,111 @@ def test_source_bundle_context_promotes_typed_sources_facts_and_gmail_identity()
         "fact_count": 3,
         "supplied_material_only": True,
     }
+
+
+def test_source_bundle_target_mismatch_blocks_before_promoting_evidence() -> None:
+    fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
+    context = json.loads(fixture_path.read_text(encoding="utf-8"))
+    work_item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="NeuroFlow opportunity assessment",
+        request_text="Research NeuroFlow, then assess the opportunity.",
+        target=WorkItemTarget(
+            name="NeuroFlow",
+            object_type="topic",
+            metadata={
+                "manual_request_plan": {
+                    "target_agent": "opportunity_scout",
+                    "primary_target": "NeuroFlow",
+                    "target_type": "topic",
+                }
+            },
+        ),
+    )
+
+    updated = workflow_runner._apply_external_context(
+        work_item,
+        context,
+        context_file_path=str(fixture_path),
+    )
+
+    assert updated.target.name == "NeuroFlow"
+    assert updated.sources == []
+    assert updated.facts == []
+    assert updated.target.metadata["external_context"]["target_status"] == "mismatch"
+    assert updated.target.metadata["external_context"]["bundle_target"] == (
+        "Northstar Behavioral Analytics"
+    )
+    assert {blocker.code for blocker in updated.blockers} == {
+        "source_bundle_target_mismatch"
+    }
+
+
+def test_source_provided_opportunity_target_prefers_typed_specific_target() -> None:
+    request = (
+        "Research NeuroFlow as a behavioral-health AI opportunity, then have Opportunity "
+        "Scout assess whether this is a real KNI advisory opportunity."
+    )
+
+    assert workflow_runner._source_provided_opportunity_target("NeuroFlow", request) == (
+        "NeuroFlow"
+    )
+
+
+def test_source_bundle_target_mismatch_is_case_independent() -> None:
+    assert workflow_runner._source_bundle_target_conflicts(
+        planned_target="neuroflow",
+        bundle_target="Northstar Behavioral Analytics",
+        bundle_target_type="company",
+    ) is True
+    assert workflow_runner._source_bundle_target_conflicts(
+        planned_target="recent behavioral health companies",
+        bundle_target="Northstar Behavioral Analytics",
+        bundle_target_type="company",
+    ) is False
+
+
+def test_manager_loop_blocks_mismatched_source_bundle_before_specialists(
+    tmp_path: Path,
+) -> None:
+    fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
+    request_text = (
+        "Research NeuroFlow as a behavioral-health AI opportunity with payer partnership "
+        "and outcomes-evidence signals, then have Opportunity Scout assess whether this is "
+        "a real KNI advisory/research opportunity. Stop before outreach."
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=request_text,
+            context_file_path=str(fixture_path),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=False,
+            live_search=False,
+            manual_request_plan={
+                "source": "test",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": "NeuroFlow",
+                "target_type": "topic",
+                "task_objective": "opportunity_discovery",
+            },
+        ),
+        max_steps=3,
+    )
+
+    assert result.work_item.target.name == "NeuroFlow"
+    assert result.work_item.sources == []
+    assert result.work_item.facts == []
+    assert result.advanced is False
+    assert "source_bundle_target_mismatch" in {
+        blocker.code for blocker in result.blockers
+    }
+    assert any(
+        "stopped before using a source bundle for a different target" in note
+        for note in result.audit_notes
+    )
 
 
 def test_source_bundle_context_cannot_self_approve_external_use_or_send() -> None:

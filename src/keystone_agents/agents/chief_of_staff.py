@@ -4755,6 +4755,28 @@ def _looks_like_google_sheets_management_request(text: str) -> bool:
 
 def _plan_google_sheets_management_request(text: str) -> ChiefOfStaffResult:
     lowered = text.lower()
+    title_match = re.search(
+        r"\b(?:sheet|spreadsheet)\s+named\s+([\w][\w ._-]{0,120}?)(?=\s+in\s+|[,.;]|$)",
+        text,
+        flags=re.I,
+    )
+    requested_title = (
+        " ".join(title_match.group(1).split())
+        if title_match is not None
+        else "KNIOps Structured Data"
+    )
+    requested_operations = [
+        operation
+        for operation, markers in (
+            ("create", ("create",)),
+            ("append_row", ("append", "add row", "add a marked")),
+            ("read_back", ("read", "verify", "confirm")),
+            ("update_row", ("update", "modify")),
+            ("delete_row", ("delete", "remove row")),
+            ("trash_sheet", ("trash", "move the same test sheet to trash")),
+        )
+        if any(marker in lowered for marker in markers)
+    ]
     write_requests: list[ChiefOfStaffWriteRequest] = []
     if any(
         marker in lowered
@@ -4763,7 +4785,7 @@ def _plan_google_sheets_management_request(text: str) -> ChiefOfStaffResult:
         write_requests.append(
             ChiefOfStaffWriteRequest(
                 destination=AutomationWriteDestination.GOOGLE_SHEET,
-                title="KNIOps Structured Data",
+                title=requested_title,
                 summary=(
                     "Manage structured Google Sheets data only within the configured "
                     "KNIOps Google Drive boundary."
@@ -4771,8 +4793,13 @@ def _plan_google_sheets_management_request(text: str) -> ChiefOfStaffResult:
                 approval_required=True,
                 live_required=True,
                 metadata={
+                    "owner_agent": "google_workspace_context_agent",
                     "scope": "KNIOps",
                     "default_workbook": "KNIOps Structured Data",
+                    "requested_title": requested_title,
+                    "requested_operations": requested_operations,
+                    "requires_provider_readback": True,
+                    "requires_cleanup_verification": "trash_sheet" in requested_operations,
                     "delete_policy": "trash spreadsheet files or remove explicit rows/tabs only",
                 },
             )
@@ -4781,9 +4808,9 @@ def _plan_google_sheets_management_request(text: str) -> ChiefOfStaffResult:
         mode="deterministic",
         intent=text,
         summary=(
-            "Use Google Sheets as a scoped structured-data surface under KNIOps. "
-            "Prefer the KNIOps Structured Data workbook for routine tables unless "
-            "a separate spreadsheet is explicitly requested."
+            f"Prepare an approval-gated Google Workspace lifecycle for '{requested_title}' "
+            "under KNIOps, retaining the exact Sheet identity through provider read-back "
+            "and requested cleanup."
         ),
         time_window=_extract_time_window(text),
         target_channels=_extract_target_channels(text, _extract_target_channel(text, "docs")),
@@ -4812,7 +4839,7 @@ def _plan_google_sheets_management_request(text: str) -> ChiefOfStaffResult:
         human_review_required=True,
         send_enabled=False,
         slack_post_allowed=False,
-        sources=_docs_for_topic(text),
+        sources=[],
         context_sources_considered=[
             "operator_and_agent_policy",
             "keystone_slack_runtime_repo",
