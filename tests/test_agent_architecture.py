@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+from keystone_agents.agent_registry import AGENT_REGISTRY
+from keystone_agents.agent_tool_policy import INTERNAL_WRITE_TOOL_NAMES
 from keystone_agents.agents.business_research_analyst import build_business_research_analyst_agent
 from keystone_agents.agents.chief_of_staff import build_chief_of_staff_agent
 from keystone_agents.agents.gmail_triage import build_gmail_triage_agent
@@ -22,6 +24,7 @@ from keystone_agents.tools.internal_data_tools import GOOGLE_WORKSPACE_TOOL_NAME
 
 AIRTABLE_READ_TOOL_NAMES = {"airtable_get_base_schema", "airtable_read_records"}
 AIRTABLE_WRITE_TOOL_NAMES = {"airtable_write_record"}
+AIRTABLE_TEST_CLEANUP_TOOL_NAMES = {"airtable_delete_test_record"}
 WEB_STRUCTURING_TOOL_NAMES = {"structure_web_data_for_schema"}
 WEB_SEARCH_TOOL_NAMES = {"search_web"}
 PLAYWRIGHT_TOOL_NAMES = {"render_page"}
@@ -29,6 +32,12 @@ BROWSER_DIAGNOSTIC_TOOL_NAMES = {
     "capture_browser_diagnostics",
     "summarize_rendered_page_diagnostics",
 }
+CALENDAR_WRITE_TOOL_NAMES = {
+    "create_google_calendar_event",
+    "update_google_calendar_event",
+    "delete_google_calendar_event",
+}
+CALENDAR_READ_TOOL_NAMES = {"read_google_calendar_window"}
 
 MODEL_ENV_VARS = (
     "KEYSTONE_OPENAI_MODEL",
@@ -126,9 +135,9 @@ def test_all_builders_return_sdk_agents_with_prompts_and_guardrails() -> None:
         assert agent.output_guardrails
 
 
-def test_no_agent_exposes_send_tool() -> None:
-    agents = [
-        build_gmail_triage_agent(),
+def test_only_gmail_agent_exposes_exact_test_send_tool() -> None:
+    gmail_agent = build_gmail_triage_agent()
+    other_agents = [
         build_business_research_analyst_agent(),
         build_opportunity_scout_agent(),
         build_outreach_composer_agent(),
@@ -136,11 +145,32 @@ def test_no_agent_exposes_send_tool() -> None:
         build_chief_of_staff_agent(),
     ]
 
-    tool_names = {name for agent in agents for name in _tool_names(agent)}
-    assert not any(name.startswith("send") or "send_email" in name for name in tool_names)
-    assert "create_gmail_draft_reply" in tool_names
-    assert "create_approval_queue_item" in tool_names
-    assert "create_approval_request_placeholder" in tool_names
+    assert "send_gmail_test_draft" in _tool_names(gmail_agent)
+    assert "create_gmail_draft_with_attachment" in _tool_names(gmail_agent)
+    assert all("send_gmail_test_draft" not in _tool_names(agent) for agent in other_agents)
+    all_tool_names = {
+        name for agent in [gmail_agent, *other_agents] for name in _tool_names(agent)
+    }
+    assert "send_email" not in all_tool_names
+    assert "create_gmail_draft_reply" in all_tool_names
+    assert "create_approval_queue_item" in all_tool_names
+    assert "create_approval_request_placeholder" in all_tool_names
+
+
+def test_only_chief_exposes_direct_calendar_crud_tools() -> None:
+    chief = build_chief_of_staff_agent()
+    others = [
+        build_gmail_triage_agent(),
+        build_business_research_analyst_agent(),
+        build_opportunity_scout_agent(),
+        build_outreach_composer_agent(),
+        build_orchestrator_agent(),
+    ]
+
+    assert CALENDAR_WRITE_TOOL_NAMES <= _tool_names(chief)
+    assert all(not (CALENDAR_WRITE_TOOL_NAMES & _tool_names(agent)) for agent in others)
+    assert CALENDAR_READ_TOOL_NAMES <= _tool_names(chief)
+    assert all(not (CALENDAR_READ_TOOL_NAMES & _tool_names(agent)) for agent in others)
 
 
 def test_main_agents_expose_allowlisted_local_context_tools() -> None:
@@ -203,6 +233,72 @@ def test_main_agents_expose_scoped_airtable_write_tools() -> None:
 
     for agent in agents:
         assert AIRTABLE_WRITE_TOOL_NAMES <= _tool_names(agent)
+
+
+def test_only_airtable_context_agent_exposes_test_record_cleanup() -> None:
+    from keystone_agents.agents.airtable_context import build_airtable_context_agent
+
+    assert AIRTABLE_TEST_CLEANUP_TOOL_NAMES <= _tool_names(build_airtable_context_agent())
+    other_agents = [
+        build_gmail_triage_agent(),
+        build_business_research_analyst_agent(),
+        build_opportunity_scout_agent(),
+        build_outreach_composer_agent(),
+        build_orchestrator_agent(),
+        build_chief_of_staff_agent(),
+    ]
+    for agent in other_agents:
+        assert not (AIRTABLE_TEST_CLEANUP_TOOL_NAMES & _tool_names(agent))
+
+
+def test_airtable_context_direct_execution_uses_authoritative_live_tool_gates() -> None:
+    from keystone_agents.agents.airtable_context import build_airtable_context_agent
+
+    instructions = str(build_airtable_context_agent().instructions)
+
+    assert "precisely scoped write with non-empty approval references" in instructions
+    assert "with `live=true`" in instructions
+    assert "Do not silently downgrade an execution request to `live=false`" in instructions
+    assert "gates are authoritative for whether the operator-approved live action" in instructions
+
+
+def test_airtable_attachment_tools_distinguish_https_urls_from_local_paths() -> None:
+    from keystone_agents.agents.airtable_context import build_airtable_context_agent
+
+    agent = build_airtable_context_agent()
+    tools = {tool.name: tool for tool in agent.tools}
+
+    link_description = str(tools["airtable_link_attachment"].description)
+    upload_description = str(tools["airtable_upload_attachment"].description)
+    assert "not ``airtable_upload_attachment``" in link_description
+    assert "``https://``" in link_description
+    assert "never use this tool for a URL" in upload_description
+
+
+def test_every_write_capable_agent_receives_shared_direct_execution_contract() -> None:
+    checked: set[str] = set()
+    for route, spec in AGENT_REGISTRY.items():
+        agent = spec.build_agent()
+        if not (_tool_names(agent) & set(INTERNAL_WRITE_TOOL_NAMES)):
+            continue
+        instructions = str(agent.instructions)
+        assert "## Direct Write Execution Semantics" in instructions, route
+        assert "call the relevant typed write tool with `live=true`" in instructions, route
+        assert "Do not silently turn an approved" in instructions, route
+        assert "nested context agent or agent-as-tool" in instructions, route
+        checked.add(route)
+
+    assert {
+        "gmail_triage",
+        "business_research_analyst",
+        "opportunity_scout",
+        "outreach_composer",
+        "orchestrator",
+        "chief_of_staff",
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+    } <= checked
 
 
 def test_main_agents_expose_web_data_structuring_helper() -> None:

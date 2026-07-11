@@ -40,6 +40,20 @@ def _coverage_rows() -> set[str]:
     return ids
 
 
+def _coverage_text_by_id() -> dict[str, str]:
+    rows: dict[str, str] = {}
+    in_coverage_map = False
+    for line in SMOKE_DOC.read_text(encoding="utf-8").splitlines():
+        if line == "## Coverage Map":
+            in_coverage_map = True
+            continue
+        if in_coverage_map and line.startswith("## "):
+            break
+        if in_coverage_map and line.startswith("| SMK-"):
+            rows[line.split("|")[1].strip()] = line
+    return rows
+
+
 def test_basic_smoke_doc_has_twenty_natural_prompts_and_coverage_rows() -> None:
     rows = _smoke_rows()
 
@@ -62,6 +76,22 @@ def test_basic_smoke_doc_has_twenty_natural_prompts_and_coverage_rows() -> None:
 
     assert "Measurement-based care AI evaluation" in rows["SMK-16"]["prompt"]
     assert "KNI Collections - Behavioral Health AI Validation" in rows["SMK-16"]["prompt"]
+
+
+def test_previously_missing_no_live_cases_are_recorded_in_coverage_map() -> None:
+    rows = _coverage_text_by_id()
+
+    for smoke_id in {
+        "SMK-01",
+        "SMK-02",
+        "SMK-04",
+        "SMK-08",
+        "SMK-11",
+        "SMK-15",
+        "SMK-17",
+        "SMK-20",
+    }:
+        assert "recorded no-live" in rows[smoke_id].lower()
 
 
 def test_basic_smoke_doc_preserves_no_write_boundaries() -> None:

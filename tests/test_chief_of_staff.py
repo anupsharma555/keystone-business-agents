@@ -3,8 +3,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -65,13 +67,16 @@ from keystone_agents.tools.chief_of_staff_tool import (
     summarize_slack_runtime_config,
 )
 from keystone_agents.tools.internal_data_tools import (
+    _google_workspace_token_path,
     airtable_create_expense_from_receipt_impl,
+    airtable_delete_test_record_impl,
     airtable_get_base_schema_impl,
     airtable_read_records_impl,
     airtable_upload_attachment_impl,
     airtable_write_record_impl,
     explicit_full_article_read_requested,
     google_doc_read_impl,
+    google_doc_trash_impl,
     google_doc_write_impl,
     google_drive_create_folder_impl,
     google_drive_get_file_metadata_impl,
@@ -147,6 +152,16 @@ def test_chief_of_staff_builder_matches_schema_and_policy() -> None:
     policy = tool_policy_for_agent("chief_of_staff")
     assert policy is not None
     assert "search_official_operations_docs" in policy.allowed_tool_names
+
+
+def test_chief_of_staff_builder_can_structurally_disable_all_tools() -> None:
+    agent = build_chief_of_staff_agent(
+        request_text="Synthesize only the supplied weekly packet.",
+        include_specialist_tools=False,
+        attach_tools=False,
+    )
+
+    assert list(agent.tools or []) == []
 
 
 def test_chief_of_staff_result_can_carry_structured_durable_handoff() -> None:
@@ -529,6 +544,7 @@ def test_operational_context_results_include_human_work_context_without_nested_w
     assert workspace.executed_write_results == []
     assert workspace.write_plan.live_write_allowed_for_specialist is False
     assert zotero.zotero_write_supported is False
+    assert zotero.zotero_test_note_write_supported is True
     assert zotero.backend_importer_supported is True
     assert zotero.direct_workspace_write_supported is True
     assert zotero.executed_import_results == []
@@ -649,11 +665,20 @@ def test_chief_of_staff_local_kni_document_request_skips_hosted_file_search(
             "Who formally organized Keystone Neuroinformatics LLC in Pennsylvania?"
         )
     )
+    local_kni_capability_statement = build_chief_of_staff_agent(
+        request_text=(
+            "Search local KNI documents for the latest client proposal or capability "
+            "statement and summarize the key service areas."
+        )
+    )
 
     generic_tool_names = {getattr(tool, "name", "") for tool in generic.tools}
     local_kni_tool_names = {getattr(tool, "name", "") for tool in local_kni.tools}
     formation_role_tool_names = {
         getattr(tool, "name", "") for tool in local_kni_formation_role.tools
+    }
+    capability_statement_tool_names = {
+        getattr(tool, "name", "") for tool in local_kni_capability_statement.tools
     }
 
     assert "file_search" in generic_tool_names
@@ -663,6 +688,9 @@ def test_chief_of_staff_local_kni_document_request_skips_hosted_file_search(
     assert "read_kni_document_file" in local_kni_tool_names
     assert "search_kni_documents" in formation_role_tool_names
     assert "read_kni_document_file" in formation_role_tool_names
+    assert "file_search" not in capability_statement_tool_names
+    assert "search_kni_documents" in capability_statement_tool_names
+    assert "read_kni_document_file" in capability_statement_tool_names
 
 
 def test_chief_of_staff_local_kni_document_fallback_returns_evidence_packet(
@@ -2639,6 +2667,94 @@ def test_chief_of_staff_finance_tracker_totals_income_and_expenses_by_quarter(
     )
 
 
+def test_chief_of_staff_summarizes_current_finance_quarter_with_category_gaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_quarter = chief_of_staff_module._current_estimated_tax_period()
+    current_year = datetime.now(ZoneInfo("America/New_York")).year
+    other_quarter = 1 if current_quarter != 1 else 2
+    requested_tables: list[str] = []
+
+    def fake_schema(**_: object) -> dict[str, object]:
+        return {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Business Income",
+                        "fields": [
+                            {"name": "Amount"},
+                            {"name": "Estimated Tax Periods"},
+                            {"name": "Pay Date"},
+                        ],
+                    },
+                    {
+                        "name": "Business Expenses",
+                        "fields": [
+                            {"name": "Total Expenses"},
+                            {"name": "Estimated Tax Periods"},
+                            {"name": "Date of Expense"},
+                            {"name": "Categories"},
+                        ],
+                    },
+                ],
+            },
+        }
+
+    def fake_read_records(table: str = "", **_: object) -> dict[str, object]:
+        requested_tables.append(table)
+        records_by_table = {
+            "Business Income": [
+                {
+                    "fields": {
+                        "Amount": 250,
+                        "Estimated Tax Periods": current_quarter,
+                        "Pay Date": f"{current_year}-07-01",
+                    }
+                },
+                {
+                    "fields": {
+                        "Amount": 999,
+                        "Estimated Tax Periods": other_quarter,
+                    }
+                },
+            ],
+            "Business Expenses": [
+                {
+                    "fields": {
+                        "Total Expenses": 40,
+                        "Estimated Tax Periods": current_quarter,
+                        "Categories": "Software",
+                    }
+                },
+                {
+                    "fields": {
+                        "Total Expenses": 10,
+                        "Estimated Tax Periods": current_quarter,
+                    }
+                },
+            ],
+        }
+        return {"status": "success", "records": records_by_table[table]}
+
+    monkeypatch.setattr(chief_of_staff_module, "airtable_get_base_schema_impl", fake_schema)
+    monkeypatch.setattr(chief_of_staff_module, "airtable_read_records_impl", fake_read_records)
+
+    result = run_chief_of_staff_sdk(
+        "Chief of Staff: read the Airtable financial tracker and summarize the current quarter.",
+        live=True,
+    )
+
+    assert requested_tables == ["Business Income", "Business Expenses"]
+    assert f"Q{current_quarter} {current_year}" in result.output.summary
+    assert "* Total income: $250.00" in result.output.summary
+    assert "* Total expenses: $50.00" in result.output.summary
+    assert "Expense categories" in result.output.summary
+    assert "* Software: $40.00" in result.output.summary
+    assert "* Uncategorized gap: 1 matching expense record." in result.output.summary
+    assert "$999.00" not in result.output.summary
+
+
 def test_chief_of_staff_finance_tracker_finds_top_business_expense(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3447,8 +3563,18 @@ def test_internal_data_tools_dry_run_are_gated(monkeypatch: pytest.MonkeyPatch) 
 
     doc_write = google_doc_write_impl("Company Note", "Source-backed note.")
     assert doc_write["status"] == "dry-run"
+    assert doc_write["operation"] == "write_doc"
     assert doc_write["title"] == "Company Note"
     assert doc_write["folder_path"] == "KNIOps"
+
+    doc_trash = google_doc_trash_impl(
+        "https://docs.google.com/document/d/doc123/edit",
+        folder_path="Research",
+    )
+    assert doc_trash["status"] == "dry-run"
+    assert doc_trash["operation"] == "trash_doc"
+    assert doc_trash["document_id"] == "doc123"
+    assert doc_trash["folder_path"] == "KNIOps / Research"
 
     folder_list = google_drive_list_folder_impl("Research")
     assert folder_list["status"] == "dry-run"
@@ -3687,6 +3813,22 @@ def test_airtable_allowed_tables_and_update_matching_are_guarded(
     assert sheet_trash["spreadsheet_id"] == "sheet123"
 
 
+def test_google_workspace_token_path_prefers_new_key_then_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    legacy = tmp_path / "legacy-token.json"
+    preferred = tmp_path / "workspace-token.json"
+    monkeypatch.setenv("GOOGLE_TOKEN_FILE", str(legacy))
+    monkeypatch.delenv("GOOGLE_WORKSPACE_OAUTH_TOKEN_PATH", raising=False)
+
+    assert _google_workspace_token_path() == legacy
+
+    monkeypatch.setenv("GOOGLE_WORKSPACE_OAUTH_TOKEN_PATH", str(preferred))
+
+    assert _google_workspace_token_path() == preferred
+
+
 def test_airtable_live_write_returns_read_after_write_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3725,11 +3867,453 @@ def test_airtable_live_write_returns_read_after_write_verification(
     )
 
     assert result["status"] == "success"
+    assert result["operation"] == "update"
     assert result["record_id"] == "rec_verified"
     assert result["verified_record"]["fields"]["Total Expenses"] == 1304.88
+    assert result["verification"] == {
+        "status": "verified",
+        "passed": True,
+        "record_id_match": True,
+        "matched_fields": ["Amount", "Total Expenses"],
+        "mismatched_fields": [],
+    }
     assert requests[0]["method"] == "PATCH"
     assert requests[1]["method"] == "GET"
     assert "RECORD_ID()" in requests[1]["params"]["filterByFormula"]
+
+
+def test_airtable_live_write_reports_field_verification_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Personal Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+
+    def fake_send(request: dict[str, object], **_: object) -> dict[str, object]:
+        if request["method"] == "PATCH":
+            return {"id": "rec_verified", "fields": {"Review Status": "Test"}}
+        return {
+            "records": [
+                {
+                    "id": "rec_verified",
+                    "fields": {"Review Status": "Different value"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", fake_send)
+
+    result = airtable_write_record_impl(
+        '{"Review Status": "Test"}',
+        table="Personal Expenses",
+        record_id="rec_verified",
+        approval_reference="airtable-lifecycle-test",
+        operation="update",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["verification"] == {
+        "status": "verification_failed",
+        "passed": False,
+        "record_id_match": True,
+        "matched_fields": [],
+        "mismatched_fields": ["Review Status"],
+    }
+
+
+def test_airtable_verification_treats_omitted_unchecked_checkbox_as_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+
+    def fake_send(request: dict[str, object], **_: object) -> dict[str, object]:
+        if request["method"] == "POST":
+            return {"id": "rec_checkbox", "fields": {}}
+        return {"records": [{"id": "rec_checkbox", "fields": {}}]}
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", fake_send)
+    result = airtable_write_record_impl(
+        '{"Receipt Available": false}',
+        table="Business Expenses",
+        approval_reference="approval:checkbox",
+        live=True,
+    )
+
+    assert result["verification"]["passed"] is True
+    assert result["verification"]["matched_fields"] == ["Receipt Available"]
+
+
+def test_airtable_verification_matches_unique_provider_name_with_trailing_space(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+
+    def fake_send(request: dict[str, object], **_: object) -> dict[str, object]:
+        if request["method"] == "PATCH":
+            return {"id": "rec_checkbox", "fields": {"Receipt Available ": True}}
+        return {
+            "records": [
+                {"id": "rec_checkbox", "fields": {"Receipt Available ": True}}
+            ]
+        }
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", fake_send)
+    result = airtable_write_record_impl(
+        '{"Receipt Available": true}',
+        table="Business Expenses",
+        record_id="rec_checkbox",
+        approval_reference="approval:checkbox",
+        operation="update",
+        live=True,
+    )
+
+    assert result["verification"]["passed"] is True
+    assert result["verification"]["matched_fields"] == ["Receipt Available"]
+
+
+def test_airtable_schema_aware_field_coercion_covers_configured_finance_types() -> None:
+    schema_fields = [
+        {"name": "Item", "field_type": "multilineText"},
+        {"name": "Date of Expense", "field_type": "date"},
+        {
+            "name": "Categories",
+            "field_type": "singleSelect",
+            "select_choices": ["Software", "Travel"],
+        },
+        {"name": "Amount", "field_type": "currency"},
+        {"name": "Receipt Available", "field_type": "checkbox"},
+        {
+            "name": "Payment Method",
+            "field_type": "multipleSelects",
+            "select_choices": ["Card", "ACH"],
+        },
+        {"name": "Notes", "field_type": "richText"},
+        {"name": "Investment Income", "field_type": "formula", "is_computed": True},
+        {"name": "Attachments", "field_type": "multipleAttachments"},
+    ]
+
+    fields, errors = internal_data_tools._coerce_airtable_write_fields(
+        schema_fields,
+        {
+            "Item": "KBA_TEST_RECORD typed expense",
+            "Date of Expense": "2026-07-10",
+            "Categories": "software",
+            "Amount": "19.99",
+            "Receipt Available": "yes",
+            "Payment Method": ["card", "ACH"],
+            "Notes": "Synthetic receipt lifecycle",
+            "Investment Income": 5,
+            "Attachments": [{"url": "https://example.test/receipt.pdf"}],
+        },
+    )
+
+    assert fields == {
+        "Item": "KBA_TEST_RECORD typed expense",
+        "Date of Expense": "2026-07-10",
+        "Categories": "Software",
+        "Amount": 19.99,
+        "Receipt Available": True,
+        "Payment Method": ["Card", "ACH"],
+        "Notes": "Synthetic receipt lifecycle",
+    }
+    assert errors == [
+        "Computed Airtable field `Investment Income` is read-only.",
+        "Attachment field `Attachments` requires the dedicated attachment tool.",
+    ]
+
+
+def test_airtable_live_write_can_enforce_schema_aware_finance_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Business Expenses",
+                        "fields": [
+                            {"name": "Item", "field_type": "multilineText"},
+                            {"name": "Date of Expense", "field_type": "date"},
+                            {"name": "Amount", "field_type": "currency"},
+                            {"name": "Receipt Available", "field_type": "checkbox"},
+                            {
+                                "name": "Payment Method",
+                                "field_type": "multipleSelects",
+                                "select_choices": ["Card", "ACH"],
+                            },
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    requests: list[dict[str, object]] = []
+
+    def fake_send(request: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        requests.append(request)
+        fields = request.get("payload", {}).get("fields", {})
+        if request["method"] == "POST":
+            return {"id": "recTyped", "fields": fields}
+        return {"records": [{"id": "recTyped", "fields": requests[0]["payload"]["fields"]}]}
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", fake_send)
+    result = airtable_write_record_impl(
+        json.dumps(
+            {
+                "Item": "KBA_TEST_RECORD typed expense",
+                "Date of Expense": "2026-07-10",
+                "Amount": "19.99",
+                "Receipt Available": "yes",
+                "Payment Method": ["card"],
+            }
+        ),
+        table="Business Expenses",
+        approval_reference="approval:typed-create",
+        validate_schema=True,
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["schema_validation"] == {
+        "validated": True,
+        "field_types": {
+            "Item": "multilineText",
+            "Date of Expense": "date",
+            "Amount": "currency",
+            "Receipt Available": "checkbox",
+            "Payment Method": "multipleSelects",
+        },
+        "errors": [],
+        "provider_field_ids_used": False,
+    }
+    assert requests[0]["payload"]["fields"] == {
+        "Item": "KBA_TEST_RECORD typed expense",
+        "Date of Expense": "2026-07-10",
+        "Amount": 19.99,
+        "Receipt Available": True,
+        "Payment Method": ["Card"],
+    }
+    assert result["verification"]["passed"] is True
+
+
+def test_airtable_link_attachment_appends_and_verifies_https_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Business Expenses",
+                        "fields": [
+                            {
+                                "name": "Attachments",
+                                "field_type": "multipleAttachments",
+                                "field_id": "fldAttachment",
+                            }
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    read_count = 0
+
+    def fake_read(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal read_count
+        read_count += 1
+        attachments = [] if read_count == 1 else [{"id": "attReceipt", "filename": "receipt.pdf"}]
+        return {
+            "status": "success",
+            "records": [
+                {"id": "recExpense", "fields": {"Attachments": attachments}}
+            ],
+        }
+
+    requests: list[dict[str, object]] = []
+    monkeypatch.setattr(internal_data_tools, "airtable_read_records_impl", fake_read)
+    monkeypatch.setattr(
+        internal_data_tools,
+        "_airtable_send",
+        lambda request, **_kwargs: requests.append(request) or {"id": "recExpense"},
+    )
+
+    result = internal_data_tools.airtable_link_attachment_impl(
+        "https://example.test/receipt.pdf",
+        table="Business Expenses",
+        record_id="recExpense",
+        filename="receipt.pdf",
+        approval_reference="approval:receipt-link",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["verification"] == {
+        "status": "verified",
+        "passed": True,
+        "attachment_count_before": 0,
+        "attachment_count_after": 1,
+    }
+    assert requests[0]["payload"] == {
+        "fields": {
+            "Attachments": [
+                {"url": "https://example.test/receipt.pdf", "filename": "receipt.pdf"}
+            ]
+        }
+    }
+
+
+def test_airtable_link_attachment_rejects_non_https_receipt() -> None:
+    with pytest.raises(ValueError, match="credential-free HTTPS URL"):
+        internal_data_tools.airtable_link_attachment_impl(
+            "file:///tmp/receipt.pdf",
+            table="Business Expenses",
+            record_id="recExpense",
+        )
+
+
+def test_airtable_link_attachment_dry_run_defers_missing_live_schema() -> None:
+    result = internal_data_tools.airtable_link_attachment_impl(
+        "https://example.test/receipt.pdf",
+        table="Business Expenses",
+        record_id="recExpense",
+        field_name="Attachments",
+        filename="receipt.pdf",
+        approval_reference="approval:receipt-link-preview",
+        live=False,
+    )
+
+    assert result["status"] == "dry-run"
+    assert result["operation"] == "link_attachment"
+    assert result["record_id"] == "recExpense"
+    assert result["receipt_url_supplied"] is True
+    assert result["schema_validation"] == "pending_live_schema"
+
+
+def test_airtable_delete_test_record_requires_provider_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_ALLOW_TEST_DELETES", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+    requests: list[dict[str, object]] = []
+
+    def fake_send(request: dict[str, object], **_: object) -> dict[str, object]:
+        requests.append(request)
+        return {
+            "records": [
+                {"id": "rec_business", "fields": {"Description": "Normal record"}}
+            ]
+        }
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", fake_send)
+
+    result = airtable_delete_test_record_impl(
+        "rec_business",
+        table="Business Expenses",
+        approval_reference="approved-test-cleanup",
+        live=True,
+    )
+
+    assert result["status"] == "blocked"
+    assert "required test marker" in result["reason"]
+    assert [request["method"] for request in requests] == ["GET"]
+
+
+def test_airtable_delete_test_record_reads_deletes_and_verifies_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_ALLOW_TEST_DELETES", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+    requests: list[dict[str, object]] = []
+
+    def fake_send(request: dict[str, object], **_: object) -> dict[str, object]:
+        requests.append(request)
+        if request["method"] == "DELETE":
+            return {"id": "rec_test", "deleted": True}
+        if len(requests) == 1:
+            return {
+                "records": [
+                    {
+                        "id": "rec_test",
+                        "fields": {"Description": "KBA_TEST_RECORD lifecycle probe"},
+                    }
+                ]
+            }
+        return {"records": []}
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", fake_send)
+
+    result = airtable_delete_test_record_impl(
+        "rec_test",
+        table="Business Expenses",
+        approval_reference="approved-test-cleanup",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["operation"] == "delete_test_record"
+    assert result["verification"] == {
+        "status": "verified",
+        "passed": True,
+        "provider_deleted": True,
+        "record_absent_after": True,
+    }
+    assert [request["method"] for request in requests] == ["GET", "DELETE", "GET"]
+    assert "fields" not in result
+
+
+def test_airtable_delete_test_record_is_dry_run_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+
+    result = airtable_delete_test_record_impl(
+        "rec_test",
+        table="Business Expenses",
+        approval_reference="approved-test-cleanup",
+    )
+
+    assert result["status"] == "dry-run"
+    assert result["request"]["method"] == "DELETE"
+    assert result["required_marker"] == "KBA_TEST_RECORD"
+    assert result["verification"] == {"status": "preview", "passed": False}
 
 
 def test_airtable_upload_attachment_dry_run_redacts_local_file(

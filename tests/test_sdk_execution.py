@@ -14,6 +14,8 @@ import keystone_agents.agents.business_research_analyst as business_research_mod
 import keystone_agents.agents.gmail_triage as gmail_triage_module
 import keystone_agents.agents.opportunity_scout as opportunity_scout_module
 import keystone_agents.agents.outreach_composer as outreach_composer_module
+import keystone_agents.tools.internal_data_tools as internal_data_tools
+from keystone_agents.agents.airtable_context import build_airtable_context_agent
 
 try:
     from agents.exceptions import (
@@ -43,9 +45,13 @@ from keystone_agents.agents.chief_of_staff import (
     run_chief_of_staff_sdk,
 )
 from keystone_agents.agents.gmail_triage import (
+    build_gmail_priority_grouping_agent,
     build_gmail_triage_agent,
     run_gmail_priority_grouping_sdk,
     run_gmail_triage_sdk,
+)
+from keystone_agents.agents.google_workspace_context import (
+    build_google_workspace_context_agent,
 )
 from keystone_agents.agents.opportunity_scout import (
     build_opportunity_scout_agent,
@@ -56,9 +62,18 @@ from keystone_agents.agents.orchestrator import (
     run_orchestrator_sdk,
 )
 from keystone_agents.agents.outreach_composer import (
+    build_approved_outreach_drafting_context,
     build_outreach_composer_agent,
+    load_company_profile,
+    load_contact_context,
+    load_crm_account_context,
+    load_opportunity_record,
+    run_outreach_composer_constrained_sdk,
     run_outreach_composer_sdk,
 )
+from keystone_agents.agents.preprints_context import build_preprints_context_agent
+from keystone_agents.agents.rss_context import build_rss_context_agent
+from keystone_agents.agents.zotero_context import build_zotero_context_agent
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.costing import AgentRunBudgetExceededError
 from keystone_agents.evals import score_output_against_expected
@@ -82,13 +97,22 @@ from keystone_agents.run import (
     run_retrieved_sdk_synthesis,
     run_typed_sdk_agent,
 )
+from keystone_agents.schemas.announcement_feed import AnnouncementFeedItem
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult, ChiefSpecialistToolInput
 from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
 from keystone_agents.schemas.email_triage import EmailTriageResult, GmailPriorityGroupingResult
+from keystone_agents.schemas.operational_context import (
+    AirtableContextResult,
+    GoogleWorkspaceContextResult,
+    PreprintsContextResult,
+    RssContextResult,
+    ZoteroContextResult,
+)
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.orchestrator import OrchestratorOutputReview, OrchestratorResult
 from keystone_agents.schemas.outreach import OutreachDraft
-from keystone_agents.sdk import Runner, build_local_run_config
+from keystone_agents.sdk import Runner, build_local_run_config, build_sqlite_session
+from keystone_agents.storage.sqlite_store import SQLiteStore
 from promptfoo.eval_database import list_eval_trace_events
 
 RUNTIME_MODEL_ENV_VARS = (
@@ -186,7 +210,7 @@ def _priority_grouping_item(
         "recommended_labels": ["Keystone/Triage"],
         "risk_flags": [],
         "draft_reply": draft_reply,
-        "draft_created": draft_reply is not None,
+        "draft_created": False,
         "approval_required": draft_reply is not None,
         "requires_human_review": True,
         "send_enabled": False,
@@ -975,18 +999,20 @@ def _run_with_fake_model(
     agent: Any,
     model: FakeModel,
     prompt: str = "Subject: Potential consulting project\nBody: We need advisory help.",
+    *,
+    session: Any | None = None,
 ) -> Any:
     provider = FakeProvider(model)
-    return Runner.run_sync(
-        agent,
-        prompt,
-        run_config=build_local_run_config(provider),
-    )
+    kwargs: dict[str, Any] = {"run_config": build_local_run_config(provider)}
+    if session is not None:
+        kwargs["session"] = session
+    return Runner.run_sync(agent, prompt, **kwargs)
 
 
 def test_run_typed_sdk_agent_retries_live_rate_limit_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("KEYSTONE_SDK_RATE_LIMIT_MAX_RETRIES", "1")
     calls = 0
     sleeps: list[float] = []
 
@@ -1762,6 +1788,13 @@ def test_gmail_gt1_priority_grouping_uses_llm_batch_context(
     monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     typed_input = GmailPriorityGroupingSDKInput(
+        request=(
+            "Operator request plus internal execution guidance. Group into urgent, "
+            "important, can wait, and ignore. Draft replies only for urgent items."
+        ),
+        operator_request="Summarize my important emails from today.",
+        lookback_days=1,
+        source_label="TODAY",
         messages=[
             GmailTriageSDKInput(
                 message_id="urgent-1",
@@ -1810,9 +1843,43 @@ def test_gmail_gt1_priority_grouping_uses_llm_batch_context(
     assert result.final_output.send_enabled is False
     assert result.final_output.sent is False
     assert result.final_output.live_side_effects_enabled is False
+    assert result.final_output.request_summary == "Summarize my important emails from today."
+    assert result.final_output.lookback_days == 1
+    assert result.final_output.source_label == "TODAY"
     assert "Group into urgent, important, can wait, and ignore" in prompt
     assert "Draft replies only for urgent items" in prompt
     assert "Source message count: 4" in prompt
+    instructions = str(build_gmail_priority_grouping_agent().instructions)
+    assert "routine notification does not become urgent" in instructions
+    assert "require a concrete security concern" in instructions
+    assert "generic promotional asks" in instructions
+    assert "not important merely because it offers" in instructions
+    assert "Do not infer urgency from relevance" in instructions
+    assert "source-visible deadline or short time window" in instructions
+    assert "in `important`, not `urgent`" in instructions
+
+
+def test_gmail_priority_grouping_rejects_bucket_priority_mismatch() -> None:
+    with pytest.raises(ValueError, match="inconsistent with Gmail bucket"):
+        GmailPriorityGroupingResult.model_validate(
+            {
+                "source_message_count": 1,
+                "urgent": [
+                    _priority_grouping_item(
+                        message_id="follow-up-1",
+                        bucket="urgent",
+                        subject="Warm collaboration follow-up",
+                        category="collaboration_opportunity",
+                        priority="normal",
+                        needs_reply=False,
+                        draft_reply=None,
+                    )
+                ],
+                "important": [],
+                "can_wait": [],
+                "ignore": [],
+            }
+        )
 
 
 def test_gmail_gt1_priority_grouping_rejects_non_urgent_draft(
@@ -2451,6 +2518,7 @@ def test_outreach_constrained_sdk_style_sources_and_eval_contract(
     result = run_outreach_composer_sdk(
         typed_input,
         run_config=build_local_run_config(provider),
+        attach_tools=False,
     )
     score = score_output_against_expected(
         result.output.model_dump(mode="json"),
@@ -2486,7 +2554,279 @@ def test_outreach_constrained_sdk_style_sources_and_eval_contract(
     input_text = _model_input_text(model.calls[0]["input"])
     assert "Approved source-backed context" in input_text
     assert "Optional approved aggregate email style profile" in input_text
+    assert model.calls[0]["tool_names"] == []
     assert score.passed is True
+
+
+def test_outreach_compact_sdk_keeps_approval_objects_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    approved_context = build_approved_outreach_drafting_context(
+        company_profile=load_company_profile("sample_company_curebase"),
+        opportunity_record=load_opportunity_record("sample_lead_curebase"),
+        contact_context=load_contact_context("sample_contact_curebase_approved"),
+        crm_context=load_crm_account_context("sample_crm_context_curebase"),
+        objective="compare notes on clinical AI evaluation support",
+        revision_request="Make the existing draft shorter and warmer without adding facts.",
+    )
+    typed_input = OutreachComposerSDKInput(
+        company_name="Curebase",
+        contact_name="Dr. Example",
+        contact_title="Clinical Operations Lead",
+        outreach_goal=approved_context.objective,
+        approved_context=(
+            "Approved source-backed context and existing draft. Revise it to be shorter "
+            "and warmer without adding facts."
+        ),
+    )
+    compact_payload = {
+        "company_name": "Curebase",
+        "email_subject": "Compare notes",
+        "email_body": (
+            "Hi Dr. Example,\n\nWould a brief conversation be useful?\n\n"
+            "Sincerely,\nAnup"
+        ),
+        "linkedin_note": "",
+        "personalization_rationale": "Shortened the approved draft without adding facts.",
+        "source_ids_used": ["fixture:curebase_company", "keystone_profile"],
+    }
+    model = FakeModel(outputs=[[_structured_message(compact_payload)]])
+
+    result = run_outreach_composer_constrained_sdk(
+        typed_input,
+        approved_drafting_context=approved_context,
+        evidence_output_path=tmp_path / "outreach-evidence.json",
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    assert result.output.drafting_mode == "llm_constrained"
+    assert result.output.revision_request == (
+        "Make the existing draft shorter and warmer without adding facts."
+    )
+    assert result.output.approval_required is True
+    assert result.output.approval_scope == "external_use"
+    assert result.output.send_enabled is False
+    assert result.output.sent is False
+    assert result.output.outreach_context.approval_state == "pending"
+    assert model.calls[0]["tool_names"] == []
+    evidence = json.loads((tmp_path / "outreach-evidence.json").read_text(encoding="utf-8"))
+    assert evidence["schema_version"] == "keystone.outreach.constrained_sdk_evidence.v1"
+    assert evidence["status"] == "completed"
+    assert evidence["compact_output"] == {
+        **compact_payload,
+        "contact_name": "Dr. Example",
+        "contact_title": "Clinical Operations Lead",
+    }
+    assert evidence["output"] == result.output.model_dump(mode="json")
+    assert evidence["usage"] == result.usage
+    assert evidence["cost"] == result.cost
+    assert not (tmp_path / "outreach-evidence.json.tmp").exists()
+
+
+def test_gmail_sdk_joined_natural_create_executes_verified_provider_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.run_gmail_triage as cli
+
+    class FakeGmail:
+        live = True
+
+        def __init__(self) -> None:
+            self.draft: dict[str, Any] = {}
+
+        def list_recent_messages(self, **_kwargs: object) -> list[dict[str, str]]:
+            return [{"id": "message-source-1", "threadId": "thread-source-1"}]
+
+        def get_message(self, message_id: str) -> dict[str, Any]:
+            return {
+                "id": message_id,
+                "threadId": "thread-source-1",
+                "from": "Alex <alex@example.com>",
+                "subject": "Project follow-up",
+                "body": "Could Keystone send a short response?",
+            }
+
+        def get_thread(self, _thread_id: str) -> dict[str, Any]:
+            return {}
+
+        def current_account_email(self) -> str:
+            return "operator@example.com"
+
+        def create_draft_reply(self, message_id: str, body: str) -> dict[str, Any]:
+            self.draft = {
+                "draft_id": "draft-provider-1",
+                "message_id": "message-draft-1",
+                "to": "alex@example.com",
+                "subject": "Re: Project follow-up",
+                "body": body,
+                "sent": False,
+            }
+            return {
+                "status": "draft_created",
+                "draft_id": "draft-provider-1",
+                "message_id": message_id,
+                "sent": False,
+            }
+
+        def get_draft(self, draft_id: str) -> dict[str, Any]:
+            assert draft_id == "draft-provider-1"
+            return dict(self.draft)
+
+    draft_text = "Hi Alex, thanks for the note. I will review this and follow up."
+    model = FakeModel(
+        outputs=[
+            [
+                _structured_message(
+                    _email_triage_payload(
+                        message_id="message-source-1",
+                        subject="Project follow-up",
+                        draft_reply=draft_text,
+                    )
+                )
+            ]
+        ]
+    )
+    gmail = FakeGmail()
+    monkeypatch.setattr(cli, "GmailTool", lambda *, live: gmail)
+    monkeypatch.setattr(
+        cli,
+        "resolve_sdk_execution",
+        lambda *_args, **_kwargs: (build_local_run_config(FakeProvider(model)), True),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_gmail_triage.py",
+            "--run-sdk",
+            "--live-gmail",
+            "--allow-inbox",
+            "--no-dry-run",
+            "--gmail-query",
+            '"Example Health"',
+            "--create-draft",
+            "--approval-reference",
+            "operator-command:gmail-draft:abc123",
+            "--expected-account",
+            "operator@example.com",
+            "--json",
+        ],
+    )
+
+    assert cli.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["gmail_draft_result"]["draft_id"] == "draft-provider-1"
+    assert payload["gmail_draft_result"]["verification"]["passed"] is True
+    assert payload["side_effects"]["gmail_draft_created"] is True
+    assert payload["side_effects"]["email_sent"] is False
+    assert payload["side_effects"]["send_enabled"] is False
+    assert model.calls[0]["tool_names"] == []
+
+
+def test_gmail_sdk_joined_natural_update_reuses_uniquely_resolved_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.run_gmail_triage as cli
+
+    class FakeGmail:
+        live = True
+
+        def __init__(self) -> None:
+            self.draft = {
+                "draft_id": "draft-provider-1",
+                "message_id": "message-draft-1",
+                "to": "reviewer@example.com",
+                "subject": "Re: Project follow-up",
+                "body": "Hi, this is the longer existing draft for review.",
+                "sent": False,
+            }
+
+        def list_recent_drafts(self, *, max_results: int = 20) -> list[dict[str, Any]]:
+            assert max_results == 20
+            return [dict(self.draft)]
+
+        def get_draft(self, draft_id: str) -> dict[str, Any]:
+            assert draft_id == "draft-provider-1"
+            return dict(self.draft)
+
+        def update_draft(
+            self,
+            draft_id: str,
+            to: str,
+            subject: str,
+            body: str,
+            *,
+            expected_account: str | None = None,
+        ) -> dict[str, Any]:
+            assert draft_id == "draft-provider-1"
+            assert expected_account == "operator@example.com"
+            self.draft.update({"to": to, "subject": subject, "body": body})
+            return {
+                "status": "draft_updated",
+                "draft_id": draft_id,
+                "gmail_account": expected_account,
+                "sent": False,
+            }
+
+    revised_text = "Hi, thanks for the note. I will follow up next week."
+    model = FakeModel(
+        outputs=[
+            [
+                _structured_message(
+                    _email_triage_payload(
+                        message_id="message-draft-1",
+                        subject="Re: Project follow-up",
+                        draft_reply=revised_text,
+                    )
+                )
+            ]
+        ]
+    )
+    gmail = FakeGmail()
+    monkeypatch.setattr(cli, "GmailTool", lambda *, live: gmail)
+    monkeypatch.setattr(
+        cli,
+        "resolve_sdk_execution",
+        lambda *_args, **_kwargs: (build_local_run_config(FakeProvider(model)), True),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_gmail_triage.py",
+            "--run-sdk",
+            "--live-gmail",
+            "--allow-inbox",
+            "--no-dry-run",
+            "--update-draft",
+            "--draft-subject-hint",
+            "Project follow-up",
+            "--draft-recipient-hint",
+            "reviewer@example.com",
+            "--approval-reference",
+            "operator-command:gmail-draft:update123",
+            "--expected-account",
+            "operator@example.com",
+            "--json",
+        ],
+    )
+
+    assert cli.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["gmail_draft_result"]["draft_id"] == "draft-provider-1"
+    assert payload["gmail_draft_result"]["operation"] == "update"
+    assert payload["gmail_draft_result"]["verification"]["passed"] is True
+    assert payload["side_effects"]["gmail_draft_updated"] is True
+    assert payload["side_effects"]["email_sent"] is False
+    assert gmail.draft["body"] == revised_text
+    assert model.calls[0]["tool_names"] == []
 
 
 def test_outreach_constrained_sdk_receives_template_and_example_context(
@@ -2766,6 +3106,1244 @@ def test_fake_model_tool_call_executes_fixture_tool(monkeypatch: pytest.MonkeyPa
     tool_outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
     assert tool_outputs
     assert "dry-run" in str(tool_outputs[0].output)
+
+
+def test_gmail_fake_model_selects_attachment_draft_tool_for_explicit_ask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    model = FakeModel(
+        outputs=[
+            [
+                _tool_call(
+                    "create_gmail_draft_with_attachment",
+                    {
+                        "to": "reviewer@example.com",
+                        "subject": "KBA_TEST_DRAFT Clinical AI slide",
+                        "body": "KBA_TEST_DRAFT Attached is the requested slide copy.",
+                        "attachment_path": (
+                            "artifacts/presentation-derived/"
+                            "KBA_TEST_SLIDE-sdk-preview.png"
+                        ),
+                        "expected_account": "operator@example.com",
+                        "approval_reference": "operator-command:slide-attachment",
+                        "draft_id": "",
+                        "live": False,
+                    },
+                )
+            ],
+            [_structured_message(_email_triage_payload())],
+        ]
+    )
+
+    result = _run_with_fake_model(
+        build_gmail_triage_agent(),
+        model,
+        (
+            "Attach the exact derived Clinical AI slide PNG to a Gmail draft for the "
+            "specified recipient. Create the draft for review and do not send it."
+        ),
+    )
+
+    assert isinstance(result.final_output, EmailTriageResult)
+    assert "create_gmail_draft_with_attachment" in model.calls[0]["tool_names"]
+    tool_outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert len(tool_outputs) == 1
+    assert "create_draft_attachment" in str(tool_outputs[0].output)
+    assert '"sent": false' in str(tool_outputs[0].output).lower()
+
+
+def test_airtable_fake_model_selects_local_upload_for_derived_slide(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_test")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    attachment = tmp_path / "KBA_TEST_SLIDE-sdk-preview.png"
+    attachment.write_bytes(b"\x89PNG\r\n\x1a\nslide")
+    model = FakeModel(
+        outputs=[
+            [
+                _tool_call(
+                    "airtable_upload_attachment",
+                    {
+                        "local_file_path": str(attachment),
+                        "table": "Business Expenses",
+                        "base_alias": "finance_tax_tracker",
+                        "record_id": "recKBA1",
+                        "field_id": "fldAttachment",
+                        "field_name": "Attachments",
+                        "approval_reference": "operator-command:slide-attachment",
+                        "live": False,
+                    },
+                )
+            ],
+            [
+                _structured_message(
+                    _airtable_context_payload(
+                        summary="Prepared the exact local slide upload preview.",
+                        recommended_record_identity="recKBA1",
+                        executed_write_results=[
+                            {
+                                "key": "operation",
+                                "value": "upload_attachment",
+                                "note": "dry-run",
+                            }
+                        ],
+                    )
+                )
+            ],
+        ]
+    )
+
+    result = _run_with_fake_model(
+        build_airtable_context_agent(),
+        model,
+        (
+            "Attach this exact local derived slide PNG to the existing Airtable record. "
+            "It is a local file, not an HTTPS URL; preview the approved action only."
+        ),
+    )
+
+    assert isinstance(result.final_output, AirtableContextResult)
+    assert "airtable_upload_attachment" in model.calls[0]["tool_names"]
+    tool_outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert len(tool_outputs) == 1
+    assert "uploadAttachment" in str(tool_outputs[0].output)
+    assert "<base64" in str(tool_outputs[0].output)
+
+
+def test_gmail_fake_model_session_followup_preserves_message_and_prior_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    original_draft = (
+        "Hi Alex, thanks for the detailed note. I can review the project context and "
+        "follow up with a scoped recommendation after internal approval."
+    )
+    revised_draft = "Hi Alex, thanks for the note. I will review it and follow up after approval."
+    model = FakeModel(
+        outputs=[
+            [
+                _structured_message(
+                    _email_triage_payload(
+                        message_id="gmail-message-identity-1",
+                        subject="Example Health advisory request",
+                        draft_reply=original_draft,
+                    )
+                )
+            ],
+            [
+                _structured_message(
+                    _email_triage_payload(
+                        message_id="gmail-message-identity-1",
+                        subject="Example Health advisory request",
+                        draft_reply=revised_draft,
+                        reasoning=(
+                            "Revised the existing draft from session context without changing "
+                            "the selected message identity."
+                        ),
+                    )
+                )
+            ],
+        ]
+    )
+    session = build_sqlite_session(
+        "gmail-continuation-test",
+        str(tmp_path / "gmail-session.sqlite3"),
+        session_history_limit=12,
+    )
+    agent = build_gmail_triage_agent()
+
+    first = _run_with_fake_model(
+        agent,
+        model,
+        (
+            "Find the selected Example Health email and draft a reply for review. "
+            "Do not send it."
+        ),
+        session=session,
+    )
+    second = _run_with_fake_model(
+        agent,
+        model,
+        "Make the existing draft shorter and warmer. Keep the facts and do not send it.",
+        session=session,
+    )
+
+    assert first.final_output.message_id == "gmail-message-identity-1"
+    assert second.final_output.message_id == first.final_output.message_id
+    assert second.final_output.draft_reply == revised_draft
+    assert second.final_output.draft_reply != original_draft
+    assert second.final_output.approval_required is True
+    assert "send_email" not in model.calls[1]["tool_names"]
+    followup_input = _model_input_text(model.calls[1]["input"])
+    assert "gmail-message-identity-1" in followup_input
+    assert original_draft in followup_input
+    assert "existing draft shorter and warmer" in followup_input.lower()
+
+
+@pytest.mark.parametrize(
+    ("builder", "tool_name", "result_type", "feed", "source", "title"),
+    [
+        (
+            build_rss_context_agent,
+            "retrieve_rss_announcement_history",
+            RssContextResult,
+            "rss",
+            "synthetic-rss",
+            "Behavioral health implementation update",
+        ),
+        (
+            build_preprints_context_agent,
+            "retrieve_preprint_announcement_history",
+            PreprintsContextResult,
+            "preprints",
+            "medRxiv",
+            "Psychiatry AI workflow preprint",
+        ),
+    ],
+)
+def test_context_agent_fake_model_selects_and_executes_typed_history_tool(
+    builder: Any,
+    tool_name: str,
+    result_type: type[Any],
+    feed: str,
+    source: str,
+    title: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'context-agent-sdk.db'}"
+    SQLiteStore(database_url).save_announcement_feed_item(
+        AnnouncementFeedItem(
+            title=title,
+            url="https://example.test/source-item",
+            source=source,
+            feed=feed,
+            tags=["psychiatry", "AI"],
+            selected=True,
+            summary="Synthetic bounded evidence for fake-model tool execution.",
+        )
+    )
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    payload = {
+        "mode": "llm",
+        "summary": f"Used typed {feed} history for a bounded context answer.",
+        "query": "psychiatry AI",
+        "retrieved_item_ids": ["synthetic-item"],
+        "articles": [],
+        "frontier_summary": "Synthetic evidence supports a cautious internal review.",
+        "blockers": [],
+    }
+    arguments: dict[str, Any] = {
+        "query": "psychiatry AI",
+        "selected_only": True,
+        "limit": 3,
+    }
+    if feed == "rss":
+        arguments["live"] = False
+    model = FakeModel(
+        outputs=[
+            [_tool_call(tool_name, arguments)],
+            [_structured_message(payload)],
+        ]
+    )
+
+    result = _run_with_fake_model(builder(), model, "Find relevant psychiatry AI context.")
+
+    assert isinstance(result.final_output, result_type)
+    assert len(model.calls) == 2
+    assert tool_name in model.calls[0]["tool_names"]
+    outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert outputs
+    assert title in str(outputs[0].output)
+
+
+@pytest.mark.parametrize(
+    ("builder", "tool_name", "arguments", "prompt", "result_type", "output_marker", "payload"),
+    [
+        (
+            build_airtable_context_agent,
+            "airtable_get_base_schema",
+            {"base_alias": "finance_tax_tracker", "live": False},
+            (
+                "Inspect the Finance & Tax Tracker schema and tell me which table and "
+                "fields should hold a test business expense. Do not write yet."
+            ),
+            AirtableContextResult,
+            "2026 Finance & Tax Tracker",
+            _airtable_context_payload(
+                summary="Inspected the finance tracker schema before proposing a write.",
+                base_alias="finance_tax_tracker",
+                relevant_tables=["Business Expenses"],
+                relevant_fields=["Item", "Description"],
+            ),
+        ),
+        (
+            build_google_workspace_context_agent,
+            "google_drive_search_files",
+            {
+                "query": "tax receipt",
+                "folder_path": "KNIOps",
+                "max_items": 5,
+                "live": False,
+            },
+            (
+                "Find the tax receipt file in KNIOps and explain which selected file you "
+                "would summarize. Do not modify Drive."
+            ),
+            GoogleWorkspaceContextResult,
+            "tax receipt",
+            _google_workspace_context_payload(
+                summary="Searched scoped KNIOps metadata for the requested tax receipt.",
+                relevant_folders=["KNIOps"],
+                relevant_files=[],
+                blockers=["No live Drive read was enabled for this fake-model proof."],
+            ),
+        ),
+        (
+            build_zotero_context_agent,
+            "zotero_read_api_metadata",
+            {"query": "measurement-based care", "limit": 5, "live": False},
+            (
+                "Find Zotero items about measurement-based care, preserve their identity, "
+                "and tell me what evidence should be handed to research. Do not edit Zotero."
+            ),
+            ZoteroContextResult,
+            "measurement-based care",
+            _zotero_context_payload(
+                summary="Queried bounded Zotero item metadata for measurement-based care.",
+                collection_hints=["measurement-based care"],
+                blockers=["Live Zotero metadata was not enabled for this fake-model proof."],
+            ),
+        ),
+    ],
+)
+def test_structured_context_agent_fake_model_selects_and_executes_typed_read_tool(
+    builder: Any,
+    tool_name: str,
+    arguments: dict[str, Any],
+    prompt: str,
+    result_type: type[Any],
+    output_marker: str,
+    payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    model = FakeModel(
+        outputs=[
+            [_tool_call(tool_name, arguments)],
+            [_structured_message(payload)],
+        ]
+    )
+
+    result = _run_with_fake_model(
+        builder(request_text=prompt),
+        model,
+        prompt,
+    )
+
+    assert isinstance(result.final_output, result_type)
+    assert len(model.calls) == 2
+    assert tool_name in model.calls[0]["tool_names"]
+    outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert outputs
+    assert output_marker in str(outputs[0].output)
+    assert output_marker in _model_input_text(model.calls[1]["input"])
+    assert result.final_output.summary == payload["summary"]
+
+
+def test_workspace_context_fake_model_searches_then_reads_exact_doc_before_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def fake_search_impl(*_: object, **__: object) -> dict[str, object]:
+        return {
+            "status": "success",
+            "operation": "search_files",
+            "folder_path": "KNIOps",
+            "query": "README.doc",
+            "mime_type": "application/vnd.google-apps.document",
+            "item_count": 1,
+            "items": [
+                {
+                    "id": "doc-readme-1",
+                    "name": "README.doc",
+                    "mimeType": "application/vnd.google-apps.document",
+                }
+            ],
+            "send_enabled": False,
+        }
+
+    def fake_doc_impl(*_: object, **__: object) -> dict[str, object]:
+        return {
+            "status": "success",
+            "operation": "read_doc",
+            "document_id": "doc-readme-1",
+            "title": "README.doc",
+            "text": (
+                "KNIOps organizes operating folders, uses source-visible handoffs, "
+                "and keeps external writes behind explicit safety boundaries."
+            ),
+            "char_count": 129,
+            "truncated": False,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(
+        internal_data_tools,
+        "google_drive_search_files_impl",
+        fake_search_impl,
+    )
+    monkeypatch.setattr(internal_data_tools, "google_doc_read_impl", fake_doc_impl)
+
+    prompt = (
+        "Find README.doc in KNIOps, read it, and summarize its purpose, folder roles, "
+        "operating model, and safety boundaries without modifying anything."
+    )
+    payload = _google_workspace_context_payload(
+        summary=(
+            "README.doc explains the KNIOps folder roles, source-visible operating "
+            "handoffs, and explicit safety boundaries."
+        ),
+        relevant_folders=["KNIOps"],
+        relevant_files=["README.doc"],
+        relevant_docs=["README.doc"],
+        recommended_target="KNIOps / README.doc",
+        blockers=[],
+        approval_needs=[],
+    )
+    model = FakeModel(
+        outputs=[
+            [
+                _tool_call(
+                    "google_drive_search_files",
+                    {
+                        "query": "README.doc",
+                        "folder_path": "KNIOps",
+                        "mime_type": "application/vnd.google-apps.document",
+                        "max_items": 5,
+                        "live": False,
+                    },
+                )
+            ],
+            [
+                _tool_call(
+                    "google_doc_read",
+                    {
+                        "document_id_or_url": "doc-readme-1",
+                        "folder_path": "KNIOps",
+                        "max_chars": 6000,
+                        "live": False,
+                    },
+                )
+            ],
+            [_structured_message(payload)],
+        ]
+    )
+
+    result = _run_with_fake_model(
+        build_google_workspace_context_agent(request_text=prompt),
+        model,
+        prompt,
+    )
+
+    assert isinstance(result.final_output, GoogleWorkspaceContextResult)
+    assert len(model.calls) == 3
+    assert "README.doc" in _model_input_text(model.calls[1]["input"])
+    assert "doc-readme-1" in _model_input_text(model.calls[1]["input"])
+    assert "source-visible handoffs" in _model_input_text(model.calls[2]["input"])
+    outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert len(outputs) == 2
+    assert result.final_output.blockers == []
+
+
+def test_workspace_context_fake_model_searches_then_reads_local_powerpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def fake_search_impl(*_: object, **__: object) -> dict[str, object]:
+        return {
+            "status": "success",
+            "operation": "search_local_presentations",
+            "query": "clinical workflow 1058",
+            "item_count": 1,
+            "items": [
+                {
+                    "relative_path": "Clinical AI/clinical-workflow-1058.pptx",
+                    "name": "clinical-workflow-1058.pptx",
+                    "query_term_matches": 3,
+                }
+            ],
+            "parent_modified": False,
+            "send_enabled": False,
+        }
+
+    def fake_read_impl(*_: object, **__: object) -> dict[str, object]:
+        return {
+            "status": "success",
+            "operation": "read_local_presentation",
+            "relative_path": "Clinical AI/clinical-workflow-1058.pptx",
+            "title": "clinical-workflow-1058.pptx",
+            "slide_count": 16,
+            "returned_slide_count": 2,
+            "slides": [
+                {
+                    "slide_number": 1,
+                    "slide_id": "snapshot:1",
+                    "title": "Workflow AI Must Fit Real Clinical Work",
+                    "text": "Workflow fit, adoption, and implementation dependencies.",
+                    "speaker_notes": "Section marker; no source claims.",
+                },
+                {
+                    "slide_number": 2,
+                    "slide_id": "snapshot:2",
+                    "title": "Clinicians Remain Central",
+                    "text": "AI alongside clinicians, not simple replacement.",
+                    "speaker_notes": "Preserve source provenance.",
+                },
+            ],
+            "content_sha256": "a" * 64,
+            "parent_modified": False,
+            "derived_copy_created": False,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(
+        internal_data_tools,
+        "presentation_search_local_impl",
+        fake_search_impl,
+    )
+    monkeypatch.setattr(
+        internal_data_tools,
+        "presentation_read_local_impl",
+        fake_read_impl,
+    )
+
+    prompt = (
+        "Find the latest reviewed Clinical Workflow AI PowerPoint, read its first "
+        "two slides and speaker notes, and explain the key message without changing it."
+    )
+    payload = _google_workspace_context_payload(
+        summary=(
+            "The deck frames workflow fit and clinician-centered AI as the opening "
+            "message, with source provenance retained in notes."
+        ),
+        relevant_files=["clinical-workflow-1058.pptx"],
+        recommended_target="Clinical AI/clinical-workflow-1058.pptx",
+        blockers=[],
+        approval_needs=[],
+    )
+    model = FakeModel(
+        outputs=[
+            [
+                _tool_call(
+                    "presentation_search_local",
+                    {"query": "clinical workflow 1058", "max_items": 5, "live": False},
+                )
+            ],
+            [
+                _tool_call(
+                    "presentation_read_local",
+                    {
+                        "relative_path": "Clinical AI/clinical-workflow-1058.pptx",
+                        "max_slides": 2,
+                        "max_chars_per_slide": 4000,
+                        "include_speaker_notes": True,
+                        "live": False,
+                    },
+                )
+            ],
+            [_structured_message(payload)],
+        ]
+    )
+
+    result = _run_with_fake_model(
+        build_google_workspace_context_agent(request_text=prompt),
+        model,
+        prompt,
+    )
+
+    assert isinstance(result.final_output, GoogleWorkspaceContextResult)
+    assert len(model.calls) == 3
+    assert "clinical-workflow-1058.pptx" in _model_input_text(model.calls[1]["input"])
+    assert "Clinicians Remain Central" in _model_input_text(model.calls[2]["input"])
+    assert "parent_modified" in _model_input_text(model.calls[2]["input"])
+    assert result.final_output.blockers == []
+
+
+@pytest.mark.parametrize(
+    (
+        "builder",
+        "tool_name",
+        "arguments",
+        "prompt",
+        "result_type",
+        "output_marker",
+        "executed_field",
+        "payload",
+    ),
+    [
+        (
+            build_airtable_context_agent,
+            "airtable_write_record",
+            {
+                "fields_json": (
+                    '{"Item":"KBA_TEST_RECORD sdk-preview",'
+                    '"Description":"agent-selected dry-run preview"}'
+                ),
+                "table": "Business Expenses",
+                "base_alias": "finance_tax_tracker",
+                "approval_reference": "approval-sdk-preview",
+                "operation": "create",
+                "live": False,
+            },
+            (
+                "Create a clearly marked sample Business Expenses record using this approved "
+                "text, show me the exact write preview, and do not execute it live."
+            ),
+            AirtableContextResult,
+            "KBA_TEST_RECORD sdk-preview",
+            "executed_write_results",
+            _airtable_context_payload(
+                summary="Prepared the exact approved Airtable test-record write preview.",
+                executed_write_results=[
+                    {"key": "operation", "value": "create", "note": "dry-run"}
+                ],
+            ),
+        ),
+        (
+            build_airtable_context_agent,
+            "airtable_link_attachment",
+            {
+                "receipt_url": "https://example.test/receipt.pdf",
+                "table": "Business Expenses",
+                "base_alias": "finance_tax_tracker",
+                "record_id": "recKBAReceipt1",
+                "field_name": "Attachments",
+                "filename": "receipt.pdf",
+                "approval_reference": "approval-sdk-preview",
+                "live": False,
+            },
+            (
+                "Attach the receipt at https://example.test/receipt.pdf to the existing "
+                "Business Expenses record recKBAReceipt1 in the Attachments field. This is "
+                "an HTTPS link, not a local file; preview the exact action only."
+            ),
+            AirtableContextResult,
+            "recKBAReceipt1",
+            "executed_write_results",
+            _airtable_context_payload(
+                summary="Prepared the exact HTTPS receipt-link attachment preview.",
+                recommended_record_identity="recKBAReceipt1",
+                executed_write_results=[
+                    {"key": "operation", "value": "link_attachment", "note": "dry-run"}
+                ],
+            ),
+        ),
+        (
+            build_google_workspace_context_agent,
+            "google_sheet_create",
+            {
+                "title": "KBA_TEST_SHEET sdk-preview",
+                "folder_path": "KNIOps",
+                "tabs_json": '["Validation"]',
+                "approval_reference": "approval-sdk-preview",
+                "live": False,
+            },
+            (
+                "Create a temporary Sheet named KBA_TEST_SHEET sdk-preview in KNIOps using "
+                "the approved scope, but only preview the provider action for now."
+            ),
+            GoogleWorkspaceContextResult,
+            "KBA_TEST_SHEET sdk-preview",
+            "executed_write_results",
+            _google_workspace_context_payload(
+                summary="Prepared the exact approved temporary Sheet create preview.",
+                executed_write_results=[
+                    {"key": "operation", "value": "create_sheet", "note": "dry-run"}
+                ],
+            ),
+        ),
+        (
+            build_google_workspace_context_agent,
+            "google_doc_write",
+            {
+                "title": "KBA_TEST_DOC sdk-preview",
+                "body_text": "KBA_TEST_DOC approved source-backed test content.",
+                "document_id": "",
+                "folder_path": "KNIOps",
+                "approval_reference": "approval-sdk-preview",
+                "live": False,
+            },
+            (
+                "Create a temporary Google Doc named KBA_TEST_DOC sdk-preview in KNIOps "
+                "with this approved source-backed test text, but only preview the provider "
+                "action for now."
+            ),
+            GoogleWorkspaceContextResult,
+            "KBA_TEST_DOC sdk-preview",
+            "executed_write_results",
+            _google_workspace_context_payload(
+                summary="Prepared the exact approved temporary Google Doc create preview.",
+                recommended_target="KNIOps / KBA_TEST_DOC sdk-preview",
+                executed_write_results=[
+                    {"key": "operation", "value": "write_doc", "note": "dry-run"}
+                ],
+            ),
+        ),
+        (
+            build_google_workspace_context_agent,
+            "google_doc_trash",
+            {
+                "document_id_or_url": "docKBA1",
+                "folder_path": "KNIOps",
+                "approval_reference": "approval-sdk-preview",
+                "live": False,
+            },
+            (
+                "Move the exact disposable KBA_TEST_DOC with provider identity docKBA1 to "
+                "Drive trash, but only preview the provider action for now."
+            ),
+            GoogleWorkspaceContextResult,
+            "docKBA1",
+            "executed_write_results",
+            _google_workspace_context_payload(
+                summary="Prepared the exact approved temporary Google Doc trash preview.",
+                recommended_target="docKBA1",
+                executed_write_results=[
+                    {"key": "operation", "value": "trash_doc", "note": "dry-run"}
+                ],
+            ),
+        ),
+        (
+            build_google_workspace_context_agent,
+            "presentation_extract_slide_copy_local",
+            {
+                "relative_path": "Clinical AI/reviewed-deck.pptx",
+                "slide_number": 2,
+                "output_format": "png",
+                "output_name": "KBA_TEST_SLIDE-sdk-preview.png",
+                "approval_reference": "approval-sdk-preview",
+                "live": False,
+            },
+            (
+                "From the exact reviewed deck at Clinical AI/reviewed-deck.pptx, create "
+                "a PNG copy of slide 2 for later reuse. Do not modify the parent or attach "
+                "it anywhere; preview the exact extraction action only."
+            ),
+            GoogleWorkspaceContextResult,
+            "KBA_TEST_SLIDE-sdk-preview.png",
+            "executed_write_results",
+            _google_workspace_context_payload(
+                summary="Prepared the exact approved non-destructive slide-copy preview.",
+                recommended_target="Clinical AI/reviewed-deck.pptx / slide 2",
+                executed_write_results=[
+                    {"key": "operation", "value": "extract_slide_copy", "note": "dry-run"}
+                ],
+            ),
+        ),
+        (
+            build_google_workspace_context_agent,
+            "google_drive_create_folder",
+            {
+                "folder_path": "KNIOps / KBA_TEST_FOLDER sdk-preview",
+                "approval_reference": "approval-sdk-preview",
+                "live": False,
+            },
+            (
+                "Create an empty folder named KBA_TEST_FOLDER sdk-preview under KNIOps, "
+                "but only preview the exact provider action for now."
+            ),
+            GoogleWorkspaceContextResult,
+            "KBA_TEST_FOLDER sdk-preview",
+            "executed_write_results",
+            _google_workspace_context_payload(
+                summary="Prepared the exact approved test-folder create preview.",
+                recommended_target="KNIOps / KBA_TEST_FOLDER sdk-preview",
+                executed_write_results=[
+                    {"key": "operation", "value": "create_folder", "note": "dry-run"}
+                ],
+            ),
+        ),
+        (
+            build_google_workspace_context_agent,
+            "google_drive_remove_folder",
+            {
+                "folder_path_or_id": "folderKBA1",
+                "approval_reference": "approval-sdk-preview",
+                "live": False,
+            },
+            (
+                "Move the exact empty KBA_TEST_FOLDER with provider identity folderKBA1 to "
+                "Drive trash, but only preview the provider action for now."
+            ),
+            GoogleWorkspaceContextResult,
+            "folderKBA1",
+            "executed_write_results",
+            _google_workspace_context_payload(
+                summary="Prepared the exact approved empty test-folder trash preview.",
+                recommended_target="folderKBA1",
+                executed_write_results=[
+                    {"key": "operation", "value": "remove_folder", "note": "dry-run"}
+                ],
+            ),
+        ),
+        (
+            build_zotero_context_agent,
+            "zotero_write_test_note",
+            {
+                "note_html": "<p>KBA_TEST_NOTE sdk-preview</p>",
+                "approval_reference": "approval-sdk-preview",
+                "operation": "create",
+                "live": False,
+            },
+            (
+                "Create a temporary Zotero note marked KBA_TEST_NOTE sdk-preview from the "
+                "approved text, but only preview the provider action for now."
+            ),
+            ZoteroContextResult,
+            "KBA_TEST_NOTE",
+            "executed_note_results",
+            _zotero_context_payload(
+                summary="Prepared the exact approved Zotero test-note create preview.",
+                executed_note_results=[
+                    {"key": "operation", "value": "create_note", "note": "dry-run"}
+                ],
+            ),
+        ),
+    ],
+)
+def test_structured_context_agent_fake_model_selects_guarded_write_preview_tool(
+    builder: Any,
+    tool_name: str,
+    arguments: dict[str, Any],
+    prompt: str,
+    result_type: type[Any],
+    output_marker: str,
+    executed_field: str,
+    payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    model = FakeModel(
+        outputs=[
+            [_tool_call(tool_name, arguments)],
+            [_structured_message(payload)],
+        ]
+    )
+
+    result = _run_with_fake_model(builder(request_text=prompt), model, prompt)
+
+    assert isinstance(result.final_output, result_type)
+    assert len(model.calls) == 2
+    assert tool_name in model.calls[0]["tool_names"]
+    outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert outputs
+    tool_output = str(outputs[0].output)
+    assert '"status": "dry-run"' in tool_output
+    assert "approval-sdk-preview" in tool_output
+    assert output_marker in tool_output
+    assert output_marker in _model_input_text(model.calls[1]["input"])
+    assert getattr(result.final_output, executed_field)
+
+
+@pytest.mark.parametrize(
+    (
+        "builder",
+        "result_type",
+        "first_prompt",
+        "followup_prompt",
+        "identity",
+        "identity_field",
+        "update_tool",
+        "update_arguments",
+        "first_payload",
+        "second_payload",
+        "executed_field",
+    ),
+    [
+        (
+            build_airtable_context_agent,
+            AirtableContextResult,
+            "Prepare an approved preview for one marked sample Business Expenses record.",
+            "Update the existing sample record description. Do not create a duplicate.",
+            "recKBA1",
+            "recommended_record_identity",
+            "airtable_write_record",
+            {
+                "fields_json": '{"Description":"KBA_TEST_RECORD revised"}',
+                "table": "Business Expenses",
+                "base_alias": "finance_tax_tracker",
+                "record_id": "recKBA1",
+                "approval_reference": "approval-sdk-followup",
+                "operation": "update",
+                "live": False,
+            },
+            _airtable_context_payload(
+                summary="Prepared the original marked-record preview.",
+                recommended_record_identity="recKBA1",
+            ),
+            _airtable_context_payload(
+                summary="Updated the existing marked-record preview without duplication.",
+                recommended_record_identity="recKBA1",
+                executed_write_results=[
+                    {"key": "operation", "value": "update", "note": "dry-run"}
+                ],
+            ),
+            "executed_write_results",
+        ),
+        (
+            build_google_workspace_context_agent,
+            GoogleWorkspaceContextResult,
+            "Prepare an approved temporary Sheet and marked validation row preview in KNIOps.",
+            "Update the existing marked row status. Do not create another Sheet or row.",
+            "sheetKBA1",
+            "recommended_target",
+            "google_sheet_update_row",
+            {
+                "fields_json": '{"status":"revised"}',
+                "spreadsheet_id_or_url": "sheetKBA1",
+                "title": "KBA_TEST_SHEET sdk-followup",
+                "folder_path": "KNIOps",
+                "sheet_name": "Validation",
+                "key_column": "record_key",
+                "key_value": "KBA_TEST_ROW_1",
+                "approval_reference": "approval-sdk-followup",
+                "live": False,
+            },
+            _google_workspace_context_payload(
+                summary="Prepared the original marked Sheet-row preview.",
+                recommended_target="sheetKBA1",
+            ),
+            _google_workspace_context_payload(
+                summary="Updated the existing marked row preview without duplication.",
+                recommended_target="sheetKBA1",
+                executed_write_results=[
+                    {"key": "operation", "value": "update_row", "note": "dry-run"}
+                ],
+            ),
+            "executed_write_results",
+        ),
+        (
+            build_google_workspace_context_agent,
+            GoogleWorkspaceContextResult,
+            "Prepare an approved empty test folder preview in KNIOps.",
+            "Rename the existing folder. Do not create another folder.",
+            "folderKBA1",
+            "recommended_target",
+            "google_drive_rename_folder",
+            {
+                "folder_path_or_id": "folderKBA1",
+                "new_name": "KBA_TEST_FOLDER sdk-followup renamed",
+                "approval_reference": "approval-sdk-followup",
+                "live": False,
+            },
+            _google_workspace_context_payload(
+                summary="Prepared the original marked Drive folder preview.",
+                recommended_target="folderKBA1",
+            ),
+            _google_workspace_context_payload(
+                summary="Renamed the existing marked Drive folder without duplication.",
+                recommended_target="folderKBA1",
+                executed_write_results=[
+                    {"key": "operation", "value": "rename_folder", "note": "dry-run"}
+                ],
+            ),
+            "executed_write_results",
+        ),
+        (
+            build_google_workspace_context_agent,
+            GoogleWorkspaceContextResult,
+            "Prepare an approved temporary Google Doc preview in KNIOps.",
+            "Replace the existing Doc body with the revised text. Do not create another Doc.",
+            "docKBA1",
+            "recommended_target",
+            "google_doc_write",
+            {
+                "title": "KBA_TEST_DOC sdk-followup",
+                "body_text": "KBA_TEST_DOC revised body.",
+                "document_id": "docKBA1",
+                "folder_path": "KNIOps",
+                "approval_reference": "approval-sdk-followup",
+                "live": False,
+            },
+            _google_workspace_context_payload(
+                summary="Prepared the original marked Google Doc preview.",
+                recommended_target="docKBA1",
+            ),
+            _google_workspace_context_payload(
+                summary="Updated the existing marked Google Doc preview without duplication.",
+                recommended_target="docKBA1",
+                executed_write_results=[
+                    {"key": "operation", "value": "write_doc", "note": "dry-run"}
+                ],
+            ),
+            "executed_write_results",
+        ),
+        (
+            build_zotero_context_agent,
+            ZoteroContextResult,
+            "Prepare an approved temporary marked Zotero note preview for this item.",
+            "Revise the existing temporary note. Do not create a second note.",
+            "NOTEKBA1",
+            "zotero_item_keys",
+            "zotero_write_test_note",
+            {
+                "note_html": "<p>KBA_TEST_NOTE revised</p>",
+                "item_key": "NOTEKBA1",
+                "approval_reference": "approval-sdk-followup",
+                "operation": "update",
+                "live": False,
+            },
+            _zotero_context_payload(
+                summary="Prepared the original marked note preview.",
+                zotero_item_keys=["NOTEKBA1"],
+            ),
+            _zotero_context_payload(
+                summary="Updated the existing marked note preview without duplication.",
+                zotero_item_keys=["NOTEKBA1"],
+                executed_note_results=[
+                    {"key": "operation", "value": "update", "note": "dry-run"}
+                ],
+            ),
+            "executed_note_results",
+        ),
+    ],
+)
+def test_structured_context_agent_session_followup_preserves_identity_and_updates(
+    builder: Any,
+    result_type: type[Any],
+    first_prompt: str,
+    followup_prompt: str,
+    identity: str,
+    identity_field: str,
+    update_tool: str,
+    update_arguments: dict[str, Any],
+    first_payload: dict[str, Any],
+    second_payload: dict[str, Any],
+    executed_field: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    model = FakeModel(
+        outputs=[
+            [_structured_message(first_payload)],
+            [_tool_call(update_tool, update_arguments)],
+            [_structured_message(second_payload)],
+        ]
+    )
+    session = build_sqlite_session(
+        f"{builder.__name__}-continuation-test",
+        str(tmp_path / f"{builder.__name__}-session.sqlite3"),
+        session_history_limit=12,
+    )
+    agent = builder(request_text=f"{first_prompt} {followup_prompt}")
+
+    first = _run_with_fake_model(agent, model, first_prompt, session=session)
+    second = _run_with_fake_model(agent, model, followup_prompt, session=session)
+
+    assert isinstance(first.final_output, result_type)
+    assert isinstance(second.final_output, result_type)
+    prior_identity = getattr(first.final_output, identity_field)
+    current_identity = getattr(second.final_output, identity_field)
+    if isinstance(prior_identity, list):
+        assert identity in prior_identity
+    else:
+        assert prior_identity == identity
+    assert current_identity == prior_identity
+    followup_input = _model_input_text(model.calls[1]["input"])
+    assert identity in followup_input
+    assert "do not create" in followup_input.lower()
+    assert update_tool in model.calls[1]["tool_names"]
+    tool_outputs = [item for item in second.new_items if item.type == "tool_call_output_item"]
+    assert tool_outputs
+    assert identity in str(tool_outputs[0].output)
+    assert '"status": "dry-run"' in str(tool_outputs[0].output)
+    assert identity in _model_input_text(model.calls[2]["input"])
+    assert getattr(second.final_output, executed_field)
+
+
+@pytest.mark.parametrize(
+    ("builder", "tool_name", "arguments", "prompt", "result_type", "marker", "payload"),
+    [
+        (
+            build_business_research_analyst_agent,
+            "dedupe_and_rank_sources",
+            {
+                "source_payloads": [
+                    {
+                            "source_id": "source:example-health-primary",
+                            "title": "Example Health official overview",
+                            "url": "https://example.test/company",
+                            "source_type": "company_site",
+                            "snippet": "Example Health provides behavioral health workflow tools.",
+                            "supported_claims": [
+                                "Example Health provides behavioral health workflow tools."
+                            ],
+                            "confidence": 0.8,
+                    },
+                    {
+                            "source_id": "source:example-health-duplicate",
+                            "title": "Example Health duplicate overview",
+                            "url": "https://example.test/company",
+                            "source_type": "company_site",
+                            "snippet": "Duplicate source that should not be counted twice.",
+                            "supported_claims": [
+                                "Example Health provides behavioral health workflow tools."
+                            ],
+                            "confidence": 0.7,
+                    },
+                ],
+                "company_name": "Example Health",
+                "company_url": "https://example.test/company",
+                "max_sources": 5,
+            },
+            (
+                "Research Example Health from this supplied source packet, deduplicate the "
+                "sources, and explain the evidence limits."
+            ),
+            CompanyProfile,
+            "source:example-health-primary",
+            _company_profile_payload(
+                name="Example Health",
+                website="https://example.test/company",
+                description="Behavioral health workflow tools from the supplied packet.",
+                sources=[
+                        {
+                            "source_id": "source:example-health-primary",
+                            "title": "Example Health official overview",
+                            "url": "https://example.test/company",
+                            "source_type": "company_site",
+                            "supported_claims": [
+                                "Example Health provides behavioral health workflow tools."
+                            ],
+                            "confidence": 0.8,
+                        }
+                ],
+                evidence=["Supplied official overview was retained after deduplication."],
+                missing_information=["Independent corroboration was not supplied."],
+            ),
+        ),
+        (
+            build_opportunity_scout_agent,
+            "score_opportunity",
+            {
+                "company_name": "Example Health",
+                "opportunity_type": "grant",
+                "signals": ["active RFP", "behavioral health"],
+            },
+            (
+                "Review this supplied active behavioral-health grant signal, score its fit "
+                "for Keystone, and recommend only a next review step."
+            ),
+            OpportunityScoutResult,
+            "Priority 50/100",
+            _opportunity_scout_payload(
+                topic="active behavioral-health grant",
+                records=[
+                    {
+                        "company_name": "Example Health",
+                        "opportunity_type": "grant or collaboration opportunity",
+                        "priority_score": 50,
+                        "why_now_signal": "Active RFP for behavioral health work.",
+                        "recommended_next_step": "Verify primary eligibility before action.",
+                        "sources": [
+                            {
+                                "source_id": "source:example-health-grant",
+                                "title": "Example Health grant notice",
+                                "url": "https://example.test/grant",
+                                "source_type": "government",
+                                "supported_signal": "Active behavioral health RFP.",
+                            }
+                        ],
+                        "source_signals": ["active RFP", "behavioral health"],
+                        "keystone_fit_reason": "Potential behavioral health advisory fit.",
+                        "outside_consulting_likelihood": 60,
+                        "handoff_to_business_research_analyst": False,
+                        "outreach_draft": None,
+                        "approval_required_before_outreach": True,
+                    }
+                ],
+                audit_notes=["Scored supplied signals; primary source verification pending."],
+            ),
+        ),
+        (
+            build_outreach_composer_agent,
+            "check_unsupported_claims",
+            {
+                "text": (
+                    "Keystone has helped companies reduce enrollment delays. "
+                    "Would you be open to compare notes?"
+                ),
+                "allowed_claims": ["Keystone provides clinical AI evaluation consulting."],
+            },
+            (
+                "Draft outreach using only the approved consulting fact, validate unsupported "
+                "claims, and keep the result draft-only."
+            ),
+            OutreachDraft,
+            "unsupported outreach claim",
+            _outreach_draft_payload(
+                company_name="Example Health",
+                email_subject="Clinical AI evaluation discussion",
+                email_body=(
+                    "Hi Dr. Example,\n\nKeystone provides clinical AI evaluation consulting. "
+                    "Would you be open to compare notes?"
+                ),
+                unsupported_claims_flagged=[
+                    "unsupported outreach claim: helped companies reduce enrollment delays"
+                ],
+                source_ids_used=["approved:consulting-fact"],
+            ),
+        ),
+    ],
+)
+def test_operating_specialist_fake_model_selects_and_consumes_domain_tool(
+    builder: Any,
+    tool_name: str,
+    arguments: dict[str, Any],
+    prompt: str,
+    result_type: type[Any],
+    marker: str,
+    payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    model = FakeModel(
+        outputs=[
+            [_tool_call(tool_name, arguments)],
+            [_structured_message(payload)],
+        ]
+    )
+
+    result = _run_with_fake_model(builder(request_text=prompt), model, prompt)
+
+    assert isinstance(result.final_output, result_type)
+    assert len(model.calls) == 2
+    assert tool_name in model.calls[0]["tool_names"]
+    outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert outputs
+    assert marker in str(outputs[0].output)
+    assert marker in _model_input_text(model.calls[1]["input"])
 
 
 def test_chief_fake_model_cannot_call_receipt_create_tool_directly(

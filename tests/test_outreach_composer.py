@@ -369,6 +369,59 @@ def test_llm_constrained_draft_accepts_source_backed_payload() -> None:
     assert draft.unsupported_claims_flagged == []
 
 
+def test_llm_constrained_draft_does_not_treat_style_profile_as_factual_source() -> None:
+    context = _approved_llm_context(style=True)
+    assert context.email_style_profile is not None
+    payload = {
+        "email_subject": "Curebase clinical operations follow-up",
+        "email_body": (
+            "Hello Dr. Priya Shah,\n\n"
+            "I saw Curebase's decentralized clinical trial operations and thought "
+            "Keystone's evaluation focus could be relevant.\n\n"
+            "Would a brief conversation be useful?"
+        ),
+        "linkedin_note": "Open to compare notes?",
+        "personalization_rationale": "Used approved facts and drafting style.",
+        "source_ids_used": [
+            *context.allowed_source_ids,
+            context.email_style_profile.source_id,
+        ],
+    }
+
+    draft = compose_outreach_draft_llm_constrained(
+        approved_context=context,
+        llm_draft_payload=payload,
+    )
+
+    assert context.email_style_profile.source_id not in draft.source_ids_used
+    assert set(draft.source_ids_used) <= set(context.allowed_source_ids)
+
+
+def test_llm_constrained_draft_still_rejects_unknown_factual_source() -> None:
+    context = _approved_llm_context(style=True)
+    payload = {
+        "email_subject": "Curebase clinical operations follow-up",
+        "email_body": (
+            "Hello Dr. Priya Shah,\n\n"
+            "I saw Curebase's decentralized clinical trial operations.\n\n"
+            "Would a brief conversation be useful?"
+        ),
+        "linkedin_note": "Open to compare notes?",
+        "personalization_rationale": "Used approved facts.",
+        "source_ids_used": [*context.allowed_source_ids, "unknown:factual-source"],
+    }
+
+    try:
+        compose_outreach_draft_llm_constrained(
+            approved_context=context,
+            llm_draft_payload=payload,
+        )
+    except ValueError as exc:
+        assert "unapproved source_ids" in str(exc)
+    else:
+        raise AssertionError("Unknown factual sources must remain rejected")
+
+
 def test_llm_constrained_draft_rejects_blocked_fact() -> None:
     context = _approved_llm_context(blocked_facts=["major hospital contract"])
     payload = {

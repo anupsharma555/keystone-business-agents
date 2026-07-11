@@ -362,6 +362,42 @@ def test_zotero_context_read_tools_return_collection_and_api_handoff_context(
     assert api["zotero_write_supported"] is False
 
 
+def test_zotero_api_metadata_can_plan_latest_top_level_item_read() -> None:
+    api = _loads(
+        zotero_read_api_metadata(
+            library_id="12345",
+            library_type="user",
+            limit=5,
+            sort="dateAdded",
+            direction="desc",
+            top_level_only=True,
+            item_type="journalArticle",
+            live=False,
+        )
+    )
+
+    assert api["status"] == "dry-run"
+    assert api["planned_path"] == "/users/12345/items/top"
+    assert api["params"] == {
+        "limit": 5,
+        "sort": "dateAdded",
+        "direction": "desc",
+        "itemType": "journalArticle",
+    }
+    assert api["send_enabled"] is False
+
+
+def test_zotero_api_metadata_rejects_unbounded_sort_controls() -> None:
+    with pytest.raises(ValueError, match="sort must be one of"):
+        zotero_read_api_metadata(library_id="12345", sort="arbitrary", live=False)
+
+    with pytest.raises(ValueError, match="direction requires"):
+        zotero_read_api_metadata(library_id="12345", direction="desc", live=False)
+
+    with pytest.raises(ValueError, match="item_type must be one of"):
+        zotero_read_api_metadata(library_id="12345", item_type="attachment", live=False)
+
+
 def test_zotero_context_can_resolve_kni_cache_from_linked_slack_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

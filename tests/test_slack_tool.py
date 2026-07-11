@@ -682,6 +682,79 @@ def test_slack_interactive_duplicate_gmail_draft_approval_is_idempotent(
     assert item.metadata["gmail_draft_duplicate_ignored"] is True
 
 
+def test_slack_approved_revision_updates_existing_gmail_draft_instead_of_creating(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'slack.db'}"
+    SQLiteStore(database_url).save_approval_item(
+        ApprovalQueueItem(
+            id="approval-slack-email-draft-update",
+            object_type="outreach_draft",
+            object_id="1",
+            title="Revised email draft",
+            summary="Revised email draft",
+            draft_text="Subject: Updated subject\n\nShorter and warmer body.",
+            source_agent="outreach_composer",
+            metadata={
+                "outreach_channel": "email",
+                "recipient_email": "reviewer@example.com",
+                "email_subject": "Updated subject",
+                "slack_approval_allows_gmail_draft_creation": True,
+                "gmail_draft_account": "operator@example.com",
+                "gmail_draft_result": {
+                    "status": "draft_created",
+                    "draft_id": "draft-existing",
+                },
+            },
+        )
+    )
+    calls: list[str] = []
+
+    class FakeGmail:
+        live = False
+
+        def update_draft(self, draft_id, to, subject, body, *, expected_account=None):
+            calls.append(f"update:{draft_id}:{subject}")
+            return {
+                "status": "dry-run",
+                "draft_id": draft_id,
+                "gmail_account": expected_account,
+                "sent": False,
+            }
+
+        def create_draft(self, *args, **kwargs):
+            raise AssertionError("existing provider draft must be updated, not recreated")
+
+        def get_draft(self, draft_id):
+            raise AssertionError("dry-run update must not read the provider")
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.GmailTool",
+        lambda **kwargs: FakeGmail(),
+    )
+    result = handle_slack_approval_interaction(
+        {
+            "user": {"username": "anup"},
+            "actions": [
+                {
+                    "action_id": "keystone_approval_yes",
+                    "value": "approval-slack-email-draft-update",
+                }
+            ],
+        },
+        database_url=database_url,
+        create_email_draft=True,
+        live_gmail=False,
+    )
+
+    assert result.gmail_draft_result is not None
+    assert result.gmail_draft_result["operation"] == "update"
+    assert result.gmail_draft_result["draft_id"] == "draft-existing"
+    assert result.gmail_draft_result["sent"] is False
+    assert calls == ["update:draft-existing:Updated subject"]
+
+
 def test_slack_interactive_yes_approval_does_not_depend_on_recipient_for_gate_only(
     tmp_path,
 ) -> None:
@@ -1939,3 +2012,148 @@ def test_slack_interactive_no_requests_rejection_feedback(tmp_path) -> None:
     assert "why this approval was rejected" in result.feedback_prompt
     assert item is not None
     assert item.metadata["rejection_feedback_required"] is True
+
+
+def test_slack_read_thread_is_bounded_and_read_only(monkeypatch) -> None:
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_request(method, endpoint, *, token, params=None, payload=None):
+        calls.append((method, endpoint, dict(params or {})))
+        assert token == "test-token"
+        assert payload is None
+        return {
+            "ok": True,
+            "messages": [
+                {"ts": "1.0", "text": "Root decision", "user": "U1"},
+                {"ts": "1.1", "text": "Next action", "bot_id": "B1"},
+            ],
+        }
+
+    monkeypatch.setattr("keystone_agents.tools.slack_tool._slack_api_request", fake_request)
+    slack = SlackTool(live=True, bot_token="test-token")
+
+    result = slack.read_thread("C123", "1.0", limit=2)
+
+    assert result["status"] == "success"
+    assert result["message_count"] == 2
+    assert result["post_enabled"] is False
+    assert calls == [
+        ("GET", "conversations.replies", {"channel": "C123", "ts": "1.0", "limit": 2})
+    ]
+
+
+def test_slack_thread_root_discovery_paginates_without_returning_text(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_request(method, endpoint, *, token, params=None, payload=None):
+        calls.append(dict(params or {}))
+        assert (method, endpoint, token, payload) == (
+            "GET",
+            "conversations.history",
+            "test-token",
+            None,
+        )
+        if len(calls) == 1:
+            return {
+                "messages": [
+                    {"ts": "3.0", "text": "standalone"},
+                    {"ts": "2.0", "text": "thread root", "reply_count": 2},
+                ],
+                "response_metadata": {"next_cursor": "page-2"},
+            }
+        return {
+            "messages": [{"ts": "1.0", "text": "older root", "reply_count": 1}],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    monkeypatch.setattr("keystone_agents.tools.slack_tool._slack_api_request", fake_request)
+    slack = SlackTool(live=True, bot_token="test-token")
+
+    roots = slack.list_recent_thread_roots("C123", limit=200)
+
+    assert calls == [
+        {"channel": "C123", "limit": 100},
+        {"channel": "C123", "limit": 100, "cursor": "page-2"},
+    ]
+    assert roots == [
+        {"channel": "C123", "thread_ts": "3.0", "reply_count": 0},
+        {"channel": "C123", "thread_ts": "2.0", "reply_count": 2},
+        {"channel": "C123", "thread_ts": "1.0", "reply_count": 1},
+    ]
+    assert all("text" not in root for root in roots)
+
+
+def test_slack_latest_thread_falls_back_to_bounded_replies_probe(monkeypatch) -> None:
+    replies_calls: list[str] = []
+    slack = SlackTool(live=True, bot_token="test-token")
+    monkeypatch.setattr(
+        SlackTool,
+        "list_recent_thread_roots",
+        lambda *_args, **_kwargs: [
+            {"channel": "C123", "thread_ts": "3.0", "reply_count": 0},
+            {"channel": "C123", "thread_ts": "2.0", "reply_count": 0},
+        ],
+    )
+
+    def fake_request(method, endpoint, *, token, params=None, payload=None):
+        assert (method, endpoint, token, payload) == (
+            "GET",
+            "conversations.replies",
+            "test-token",
+            None,
+        )
+        thread_ts = str((params or {}).get("ts") or "")
+        replies_calls.append(thread_ts)
+        return {
+            "messages": (
+                [{"ts": thread_ts}]
+                if thread_ts == "3.0"
+                else [{"ts": thread_ts}, {"ts": "2.1"}]
+            )
+        }
+
+    monkeypatch.setattr("keystone_agents.tools.slack_tool._slack_api_request", fake_request)
+
+    latest = slack.resolve_latest_thread_root("C123", scan_limit=20)
+
+    assert replies_calls == ["3.0", "2.0"]
+    assert latest == {
+        "channel": "C123",
+        "thread_ts": "2.0",
+        "reply_count": 1,
+        "resolution": "bounded_replies_probe",
+    }
+
+
+def test_slack_latest_kni_request_returns_only_selected_user_message(monkeypatch) -> None:
+    def fake_request(method, endpoint, *, token, params=None, payload=None):
+        assert (method, endpoint, token, payload) == (
+            "GET",
+            "conversations.history",
+            "test-token",
+            None,
+        )
+        return {
+            "messages": [
+                {"ts": "3.0", "text": "Business Agents Run Completed", "bot_id": "B1"},
+                {"ts": "2.0", "text": "ordinary user chatter", "user": "U1"},
+                {
+                    "ts": "1.0",
+                    "text": "<@U123> chief of staff summarize today's priorities",
+                    "user": "U1",
+                },
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    monkeypatch.setattr("keystone_agents.tools.slack_tool._slack_api_request", fake_request)
+    slack = SlackTool(live=True, bot_token="test-token")
+
+    selected = slack.find_latest_kni_request("C123", scan_limit=200)
+
+    assert selected == {
+        "channel": "C123",
+        "ts": "1.0",
+        "text": "<@U123> chief of staff summarize today's priorities",
+        "user_present": True,
+    }

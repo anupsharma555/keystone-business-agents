@@ -46,58 +46,58 @@ SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "59d95e35183fef3596ef1baa59780dac62548de906fad81f0c92138417fc7bc6",
-        "tool_names_sha256": "5666cdbfcc42bfd14f3dcd75c544302d6fa9aa7f76697b1d24fdb87a5880dd76",
+        "instructions_sha256": "89486fa423c7635bf00d80387ad5b207e2e9da7d5427af2effe938c8946cd4e9",
+        "tool_names_sha256": "b97b3dda055d85e98d851db73b3015000dca0c65fb172be0e1f60fa6e2b14e42",
         "output_schema_sha256": "519be6127e040ff904066e7dd8efe671ce88a3c4c527bdcb730a6e5f131d3345",
     },
     "business_research_analyst": {
-        "instructions_sha256": "acc5c794e92c0dee962c6f8a3de4fab3c1580bd42a27d7995ac1985987848dae",
-        "tool_names_sha256": "8c128ab9eee684363954e52c9b1b8a29e27df6b1509647f4b39479f37ddf1bc1",
+        "instructions_sha256": "2bd54c0e7ecfa3c99fadc9cad796e0958153c0bcdb8ac2ef0d22a8ab7430f85d",
+        "tool_names_sha256": "a9f26c0e0237174742fdc53f1c4e7ce5c8936f492b353f5ef6e3adfb4c34a35e",
         "output_schema_sha256": "b8218a333d85d2f3850203f5ee48b7ec535a6f924a8851c513f1f2b2afeef6e0",
     },
     "opportunity_scout": {
-        "instructions_sha256": "80aced00765bf7d0facb33fbdbbba2291698cb401a079d59b0010339ef489d34",
-        "tool_names_sha256": "38c690f9feef3bcb9699511283538d4448fe33a4e1f82d68acab135f51e4d51b",
-        "output_schema_sha256": "2e91674be427e59361cfb5a9c275a048bf4166fbcd9f88f6e06405a235ab59e8",
+        "instructions_sha256": "f87f46790d41cd896e056d98877b0b0dd188b7374dbe798ee7094a82bacb8567",
+        "tool_names_sha256": "ace37ad8d7eef4c988ac31f6848c03a502b9dfb1efe502400c1720e9cc194ce1",
+        "output_schema_sha256": "eea0e07dc95ce476794bae691207f241c160ab5e5e22c18036030f137ce907fc",
     },
     "outreach_composer": {
-        "instructions_sha256": "5f8028fac3f3002dcd9e4dcaf4135bc572683ac62840fcd8b867d5da1f9bd0c4",
-        "tool_names_sha256": "b86270338a35685eb23e446ca5ec82e4ff7849e71356129b7920ca33c454de68",
+        "instructions_sha256": "e29a5225329606c349098a07e40851e3e01a4cef4dedb660f788792f4bf2721c",
+        "tool_names_sha256": "6092ed57d03b82170c380457199725a537ab0d16cf199a5393920a1b096815fe",
         "output_schema_sha256": "167da45f0bb07c0a255c4115b52e9510272a22cc1c479abe9e97c88693d44b34",
     },
     "airtable_context_agent": {
-        "instructions_sha256": "2dca545fc5698d9a0adabe29b3e7eae3113047416012f4bea85422e22b7f194c",
-        "tool_names_sha256": "64846cdbb1e51dbae23640c4756dfd3c7cfab9d0ef889044ddba79d57bbdfdc6",
+        "instructions_sha256": "a46dfe73c2b54ef4cd8a06c46763cf8ad2d67d6d194eb02e4eeff814fd51321a",
+        "tool_names_sha256": "a8c8a3ab49d0b43ca7951b505b6cbd82caeafd3109e68980d5a04cbab0631bf6",
         "output_schema_sha256": "7d4017a4e6833b52f2c408fe16352594a5fa2b393e740433a25b77b2934c4984",
     },
     "google_workspace_context_agent": {
-        "instructions_sha256": "5e44990da2c1f1c274276f2243e694d8077945ea855209eaebad6056453d29d3",
-        "tool_names_sha256": "a20b54ebe4e23acf72fbab3fcba4d67150a81fefc03d00d16c5b94ce9f56c760",
+        "instructions_sha256": "d1955f30061601e2c4a21f138041f62328892f18b49ebc02e7746050e53a2631",
+        "tool_names_sha256": "37563d600dab82f4c57154b5a74f90272db02e509bba9f0e117659d0149a8aae",
         "output_schema_sha256": "1b82a4db79f4e9f017351bafb57dbad7399b5c05e6e7ba528d97abbe7f1be506",
     },
     "zotero_context_agent": {
-        "instructions_sha256": "05c33fd5bed93b457f4c10a6aacb0bbc8aed2823664f7a6087bd128a9a4bc335",
-        "tool_names_sha256": "4b5242fa381337a43a5dbb560a8c99a956ebe2540d011369aa5238236f402b96",
-        "output_schema_sha256": "af5ce4abdb61216c64350e2e2e7d2ed262e947cfe84929ce98e2e43d960c75dc",
+        "instructions_sha256": "a4db65421dde330f6fa6b2e0e1277c410aa805509cff17cf9aa253bda8356a06",
+        "tool_names_sha256": "de566ff29be6b21118fabaa010dd7dba99a681a9eb7f414bc467cec6907c95d4",
+        "output_schema_sha256": "efa1b731da05cfd915b319d730cf84019d76dd22d0a5f199818546deedac5bb8",
     },
     "rss_context_agent": {
-        "instructions_sha256": "b417fcfa2119ee2e89ae014711e4d305ed9ce4553c21c9b305ccd7e71375179c",
+        "instructions_sha256": "b7763763edeb1ca0ac72358383cba19a67e1d363a00d6af2411657fba029d41c",
         "tool_names_sha256": "f31fcf99ce67500ab85ceb6130f6c81c8fdeea9668c82ffd10eaf4862b47a55f",
         "output_schema_sha256": "c81421b84589b67baca97d6ae5bc0a8468adbe9bd3b10d1c13639a3148d68936",
     },
     "preprints_context_agent": {
-        "instructions_sha256": "da5c3bb30e91ca5e24101e3616028bef377e5c352dcbf05fefcf57cf8a098dea",
+        "instructions_sha256": "09202172bff8e756ae3549a4455d20ee58a036396284bd28faae6a9df1de9eee",
         "tool_names_sha256": "985bb3e5f395ac4fdab0e2243e450e60eaeab20c34646431415a94dbbb9bef08",
         "output_schema_sha256": "0c360ba87ef900bd5c658029374a445b6c14c22b9067207d8b7ad083c4b1d702",
     },
     "orchestrator": {
-        "instructions_sha256": "4f58ec2b8a3b67ddad76e766a1b2f92b379b46d0567e58d0055d6b5ad50952dc",
-        "tool_names_sha256": "2f52fbbbd1568235c0fb761130b8fa96d5c506ca88e4a62ce4dea8dd1e90189b",
+        "instructions_sha256": "f8fc7e4111c8fe465b76b08ec81e128c9ab4e9a4ba757ec9c46e5d5994e54cbf",
+        "tool_names_sha256": "d1452b1d9a45ccd89c167d726fc4d4cdf612b8834f6616f7e08524efa4ae0817",
         "output_schema_sha256": "98f0e154658a465df86c498fbf9b1a6c84028fbd02eedef97d1549ef5b5887e7",
     },
     "chief_of_staff": {
-        "instructions_sha256": "34ce05ac4e4f4fcc917ba02e062d6803b5f2b8fc99cdfdc7d15d6898b57a5c67",
-        "tool_names_sha256": "7f7c9b6f6ba96d98ccc94274a904a72beb72d64491ca59daf5f0965e89381da1",
+        "instructions_sha256": "e3dd7024462febc3d5249e9ce273900169e3ad81fd7e5f635ca71e7c528de86a",
+        "tool_names_sha256": "14da0b9409bea65a6f818443cdd9bcf614762fd04bb19ece257563b897de5594",
         "output_schema_sha256": "c9fefe2f478448b975a510c132b2b2dce5b00aedd13b5d1f25c0915ca778ef42",
     },
 }
@@ -264,13 +264,21 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     assert {"airtable_get_base_schema", "airtable_read_records"} <= airtable_tool_names
     assert "airtable_write_record" in airtable_tool_names
     assert "airtable_upload_attachment" in airtable_tool_names
+    assert "airtable_link_attachment" in airtable_tool_names
     assert "airtable_create_expense_from_receipt" in airtable_tool_names
+    assert "airtable_delete_test_record" in airtable_tool_names
     assert workspace_tool_names == {
         "google_doc_read",
         "google_doc_write",
+        "google_doc_trash",
         "google_drive_list_folder",
         "google_drive_search_files",
         "google_drive_get_file_metadata",
+        "google_slide_deck_read",
+        "presentation_search_local",
+        "presentation_read_local",
+        "presentation_extract_slide_copy_local",
+        "presentation_delete_test_artifact_local",
         "google_drive_create_folder",
         "google_drive_rename_folder",
         "google_drive_remove_folder",
@@ -293,6 +301,12 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
         "zotero_resolve_article_context",
         "zotero_read_api_metadata",
         "zotero_import_article_with_backend",
+        "zotero_write_test_note",
+        "zotero_delete_test_note",
+        "zotero_write_test_collection",
+        "zotero_delete_test_collection",
+        "zotero_write_test_item",
+        "zotero_delete_test_item",
         "google_drive_list_folder",
         "google_drive_search_files",
         "google_drive_get_file_metadata",
@@ -318,8 +332,23 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     assert tool_tier_for_name("airtable_write_record") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("airtable_upload_attachment") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("airtable_create_expense_from_receipt") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("airtable_delete_test_record") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("send_gmail_test_draft") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("create_gmail_draft_with_attachment") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("create_google_calendar_event") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("update_google_calendar_event") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("delete_google_calendar_event") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("google_doc_write") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("google_doc_trash") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("presentation_extract_slide_copy_local") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("presentation_delete_test_artifact_local") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("zotero_import_article_with_backend") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("zotero_write_test_note") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("zotero_delete_test_note") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("zotero_write_test_collection") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("zotero_delete_test_collection") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("zotero_write_test_item") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("zotero_delete_test_item") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("retrieve_rss_announcement_history") == ToolTier.CORE_READ
     assert tool_tier_for_name("retrieve_preprint_announcement_history") == ToolTier.CORE_READ
 
@@ -350,6 +379,7 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     assert "airtable_create_expense_from_receipt" not in nested_tool_names
     assert "google_drive_get_file_metadata" in nested_tool_names
     assert "google_doc_write" not in nested_tool_names
+    assert "google_doc_trash" not in nested_tool_names
     assert "google_sheet_append_rows" not in nested_tool_names
     assert "zotero_import_article_with_backend" not in nested_tool_names
     assert "retrieve_rss_announcement_history" in nested_tool_names

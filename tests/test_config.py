@@ -13,6 +13,7 @@ from keystone_agents.config import (
     default_database_url,
     load_settings,
     runtime_state_dir,
+    with_cli_environment,
 )
 from keystone_agents.storage.sqlite_store import database_url_from_env, sqlite_path_from_url
 from keystone_agents.tools.search_provider import SerperConfigurationError, SerperSearchProvider
@@ -296,3 +297,27 @@ def test_cli_defaults_enable_live_test_stage_when_explicitly_configured() -> Non
     assert cli_default_live_research(env) is True
     assert cli_default_live_gmail(env) is True
     assert cli_default_live_sdk(env) is True
+
+
+def test_cli_environment_force_loads_then_restores_dotenv(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "KEYSTONE_OPENAI_API_KEY=temporary-keystone-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
+    observed: list[bool] = []
+
+    @with_cli_environment(env_file, force_dotenv=True)
+    def command() -> None:
+        import os
+
+        observed.append(bool(os.getenv("KEYSTONE_OPENAI_API_KEY")))
+
+    command()
+
+    assert observed == [True]
+    assert "KEYSTONE_OPENAI_API_KEY" not in __import__("os").environ

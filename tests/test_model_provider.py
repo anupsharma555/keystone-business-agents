@@ -632,6 +632,44 @@ def test_live_run_config_sets_safe_trace_defaults_without_model_calls(
     assert run_config.trace_include_sensitive_data is False
 
 
+def test_private_context_profile_forces_nonpersistent_model_and_trace_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_model_env(monkeypatch)
+    config = get_model_config()
+    config = config.__class__(model=config.model, api_key="unit-test-openai-key")
+
+    with sdk.private_context_sdk_profile():
+        model_settings = sdk.build_model_settings()
+        run_config = build_live_run_config(
+            config,
+            tracing_disabled=False,
+            trace_include_sensitive_data=True,
+        )
+
+    assert model_settings.store is False
+    assert model_settings.prompt_cache_retention == "in_memory"
+    assert run_config.tracing_disabled is True
+    assert run_config.trace_include_sensitive_data is False
+    assert sdk.active_sdk_data_handling_profile() is None
+
+
+def test_live_run_config_uses_keystone_key_for_enabled_trace_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_model_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "wrong-project-key")
+    config = get_model_config()
+    config = config.__class__(model=config.model, api_key="unit-test-keystone-key")
+    exported_keys: list[str] = []
+    monkeypatch.setattr(sdk, "set_tracing_export_api_key", exported_keys.append)
+
+    run_config = build_live_run_config(config, tracing_disabled=False)
+
+    assert run_config.tracing_disabled is False
+    assert exported_keys == ["unit-test-keystone-key"]
+
+
 def test_live_run_config_exposes_safe_trace_metadata_without_model_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -662,8 +700,8 @@ def test_live_run_config_exposes_safe_trace_metadata_without_model_calls(
     assert run_config.trace_metadata == {
         "agent_name": "gmail_triage",
         "run_type": "live_review",
-        "attempt": 1,
-        "dry_run": False,
+        "attempt": "1",
+        "dry_run": "false",
     }
     assert run_config.tracing_disabled is True
     assert run_config.trace_include_sensitive_data is True

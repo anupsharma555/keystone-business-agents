@@ -169,7 +169,7 @@ def test_gmail_priority_grouping_test_pack_report_includes_human_draft_output() 
                     "recommended_action": "Draft for approval.",
                     "recommended_labels": ["Keystone/Triage"],
                     "draft_reply": "Full draft text should appear in the test report.",
-                    "draft_created": True,
+                    "draft_created": False,
                     "approval_required": True,
                 }
             ],
@@ -259,7 +259,7 @@ def test_gmail_priority_grouping_test_pack_report_includes_human_draft_output() 
     )
     markdown = render_gmail_priority_grouping_test_pack_report(payload)
 
-    assert payload["status"] == "partial"
+    assert payload["status"] == "pass"
     assert payload["safety"]["send_enabled"] is False
     assert payload["orchestrator_review"]["status"] == "pass"
     assert payload["draft_outputs"][0]["draft_reply"] == (
@@ -272,6 +272,59 @@ def test_gmail_priority_grouping_test_pack_report_includes_human_draft_output() 
     assert "Gemini free-tier request context" in markdown
     assert "Drafts only urgent items" in markdown
     assert "Orchestrator Review" in markdown
+
+
+def test_gmail_priority_grouping_report_allows_empty_unused_buckets_and_no_drafts() -> None:
+    payload = build_gmail_priority_grouping_test_pack_payload(
+        {
+            "source_message_count": 2,
+            "urgent": [],
+            "important": [
+                {
+                    "message_id": "msg-1",
+                    "bucket": "important",
+                    "needs_reply": False,
+                    "draft_created": False,
+                }
+            ],
+            "can_wait": [
+                {
+                    "message_id": "msg-2",
+                    "bucket": "can_wait",
+                    "needs_reply": False,
+                    "draft_created": False,
+                }
+            ],
+            "ignore": [],
+        },
+        run_type="local SDK",
+        model="test-model",
+        input_summary="Summarize today's email.",
+        input_source="Fixtures.",
+    )
+
+    assert payload["status"] == "pass"
+    assert payload["checks"]["Drafts only urgent items"] == "pass"
+    assert payload["checks"]["Does not create unnecessary drafts"] == "pass"
+
+
+def test_gmail_priority_grouping_report_flags_incomplete_grouping() -> None:
+    payload = build_gmail_priority_grouping_test_pack_payload(
+        {
+            "source_message_count": 3,
+            "urgent": [],
+            "important": [{"message_id": "msg-1", "bucket": "important"}],
+            "can_wait": [{"message_id": "msg-2", "bucket": "can_wait"}],
+            "ignore": [],
+        },
+        run_type="local SDK",
+        model="test-model",
+        input_summary="Summarize today's email.",
+        input_source="Fixtures.",
+    )
+
+    assert payload["status"] == "partial"
+    assert any("source message count" in gap for gap in payload["observed_gaps"])
 
 
 def test_usage_cost_report_surfaces_components_actual_comparison_and_cache_note() -> None:

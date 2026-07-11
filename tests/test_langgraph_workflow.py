@@ -35,6 +35,7 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
 )
+from keystone_agents.schemas.weekly_ops import WeeklyOpsAssemblyInput
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
@@ -45,6 +46,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemStatus,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore
+from keystone_agents.weekly_ops_packet import build_weekly_ops_source_bundle
 from keystone_agents.work_items import (
     apply_slack_approval_to_work_item_gate,
     approve_artifact_context,
@@ -163,6 +165,7 @@ def test_langgraph_manager_loop_runs_distinct_next_specialist_edge(tmp_path: Pat
     )
 
     assert outcome.result.route == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert outcome.result.status == WorkItemStatus.DONE
     assert outcome.node_path == [
         "normalize_request",
         "orchestrator_preflight",
@@ -2759,6 +2762,77 @@ def test_langgraph_manager_loop_routes_gmail_to_research_to_outreach_gate(
     assert not graph_completion
 
 
+def test_langgraph_supplied_material_packet_survives_research_to_draft_handoffs(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text=(
+                "Gmail triage the supplied inbound request, research Northstar Behavioral "
+                "Analytics using only the provided source bundle, and prepare a draft-only "
+                "reply for review. Do not use live search. Do not send, create a Gmail "
+                "draft, post, schedule, or write externally."
+            ),
+            context_file_path=str(fixture_path),
+            database_url=database_url,
+            save=True,
+            live_sdk=False,
+            live_search=False,
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "orchestrator",
+                "target_agent": "gmail_triage",
+                "intent": "gmail_triage",
+                "primary_target": "Northstar Behavioral Analytics",
+                "target_type": "gmail_thread",
+                "task_objective": "gmail_triage",
+            },
+        ),
+        manager_loop=True,
+        max_manager_steps=3,
+    )
+
+    work_item = outcome.result.work_item
+    source_ids = {source.source_id for source in work_item.sources}
+    approved_fact_keys = {
+        fact.key for fact in work_item.facts if fact.approval_state == "approved_for_drafting"
+    }
+    artifact_types = {artifact.artifact_type for artifact in work_item.artifact_refs}
+
+    assert outcome.result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert outcome.checkpoint_required is True
+    assert outcome.node_path[-1] == "approval_checkpoint"
+    assert outcome.node_path.index("run_gmail_triage") < outcome.node_path.index(
+        "run_business_research"
+    )
+    assert outcome.node_path.index("run_business_research") < outcome.node_path.index(
+        "run_outreach_composer"
+    )
+    assert {
+        "fixture:graph-source:company-brief",
+        "fixture:graph-source:inbound-email",
+    } <= source_ids
+    assert {"company_product_focus", "inbound_request"} <= approved_fact_keys
+    assert work_item.target.metadata["thread_id"] == "thread-northstar-001"
+    assert work_item.target.metadata["message_id"] == "message-northstar-001"
+    assert work_item.target.name == "Northstar Behavioral Analytics"
+    assert work_item.target.metadata["gmail_research_target"] == (
+        "Northstar Behavioral Analytics"
+    )
+    assert "fixture:example" not in source_ids
+    assert {"gmail_triage_report", "company_profile"} <= artifact_types
+    assert outcome.checkpoint_payload["send_enabled"] is False
+    assert outcome.checkpoint_payload["external_writes_enabled"] is False
+    assert all(
+        artifact.metadata.get("send_enabled") is not True
+        and artifact.metadata.get("external_writes_enabled") is not True
+        for artifact in work_item.artifact_refs
+    )
+
+
 def test_langgraph_storage_events_render_final_run_report(
     tmp_path: Path,
 ) -> None:
@@ -4031,6 +4105,159 @@ def test_langgraph_stages_multiple_read_only_context_lanes_before_specialist(
     assert graph_completion.metadata["send_enabled"] is False
 
 
+def test_langgraph_preserves_weekly_slack_gmail_completed_run_packet_for_chief(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    weekly_packet = build_weekly_ops_source_bundle(
+        WeeklyOpsAssemblyInput.model_validate(
+            {
+                "window": {
+                    "time_min": "2026-07-04T00:00:00-04:00",
+                    "time_max": "2026-07-11T00:00:00-04:00",
+                    "packet_date": "2026-07-10",
+                },
+                "slack": [
+                    {
+                        "message_ts": "100.1",
+                        "summary": "The weekly packet contract is ready for review.",
+                    }
+                ],
+                "gmail": [
+                    {
+                        "thread_id": "thread-1",
+                        "subject": "Packet follow-up",
+                        "summary": "An internal decision is pending.",
+                    }
+                ],
+                "completed_runs": [
+                    {
+                        "run_id": "run-1",
+                        "agent_name": "chief_of_staff",
+                        "completed_at": "2026-07-10T21:58:00-04:00",
+                        "outcome_summary": "Weekly packet contract validation completed.",
+                        "packet_role": "primary",
+                        "relevance_reason": "Directly supports the requested packet.",
+                    }
+                ],
+                "calendar": [
+                    {
+                        "event_id": "event-focus",
+                        "title": "Client review",
+                        "start": "2026-07-06T10:00:00-04:00",
+                    },
+                    {
+                        "event_id": "event-recurring",
+                        "title": "Weekly operations sync",
+                        "start": "2026-07-08T09:00:00-04:00",
+                        "is_recurring": True,
+                        "recurring_event_id": "series-1",
+                    },
+                ],
+            }
+        )
+    )
+    source_ids = {source["source_id"] for source in weekly_packet["sources"]}
+
+    chief_output = ChiefOfStaffResult(
+        mode="llm",
+        summary=(
+            "Weekly operations summary: Slack and Gmail activity are available; "
+            "the relevant completed Chief run is the primary operational evidence. "
+            "One-time calendar events are focus areas; recurring events are noted "
+            "briefly. Source message bodies remain private."
+        ),
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="portfolio-review",
+            target_channel="current thread",
+        ),
+        recommended_actions=[
+            "Carry forward the action explicitly linked to the completed run.",
+            "Use selected Slack or Gmail threads for any deeper follow-up.",
+        ],
+        approval_required=True,
+        audit_notes=["No post, send, or external write was requested."],
+    )
+
+    def fake_run_chief_of_staff_sdk(
+        _sdk_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=chief_output,
+            raw_result=None,
+            live=True,
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_chief_of_staff_sdk",
+        fake_run_chief_of_staff_sdk,
+    )
+    monkeypatch.setattr(
+        workflow_runner,
+        "plan_chief_of_staff_request",
+        lambda *_args, **_kwargs: chief_output,
+    )
+    monkeypatch.setattr(
+        workflow_runner,
+        "_maybe_synthesize_user_facing_response",
+        lambda result, **_kwargs: result,
+    )
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text=(
+                "Chief of Staff: prepare a weekly ops summary from the supplied seven-day "
+                "Slack and Gmail activity plus relevant completed agent runs and Calendar. "
+                "Identify focus areas, workstreams, and next actions. Keep operational "
+                "health and metadata succinct. Do not post, send, or write."
+            ),
+            database_url=database_url,
+            save=True,
+            live_sdk=True,
+            live_search=False,
+            external_context=weekly_packet,
+            manual_request_plan={
+                "source": "test",
+                "target_agent": "chief_of_staff",
+                "intent": "portfolio_review",
+                "primary_target": "Weekly operations review",
+                "task_objective": "portfolio_summary",
+            },
+        ),
+        manager_loop=True,
+        max_manager_steps=2,
+    )
+
+    final_source_ids = {source.source_id for source in outcome.result.work_item.sources}
+    context_source_ids = {
+        str(source.get("source_id") or "")
+        for source in outcome.result.context_pack.get("source_refs", [])
+    }
+
+    assert outcome.node_path == [
+        "normalize_request",
+        "orchestrator_preflight",
+        "state_followup",
+        "prepare_work_item",
+        "run_chief_of_staff",
+        "finalize_step",
+        "manager_loop_finalize",
+    ]
+    assert outcome.result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert outcome.result.status == WorkItemStatus.DONE
+    assert source_ids <= final_source_ids
+    assert source_ids <= context_source_ids
+    assert "relevant completed Chief run" in outcome.result.human_summary
+    assert "One-time calendar events are focus areas" in outcome.result.human_summary
+    assert "recurring events are noted briefly" in outcome.result.human_summary
+    assert outcome.checkpoint_required is False
+    assert not outcome.result.blockers
+
+
 @pytest.mark.parametrize(
     (
         "context_request",
@@ -4196,6 +4423,160 @@ def test_langgraph_runs_chief_selected_business_context_before_opportunity_scout
         WorkItemRoute.OPPORTUNITY_SCOUT.value,
     ]
     assert graph_completion.metadata["send_enabled"] is False
+
+
+def test_langgraph_stages_concrete_quarterly_finance_context_before_bd_priority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    finance_source_id = "airtable:finance_tax_tracker:Q3-2026"
+
+    def fake_run_chief_of_staff_sdk(
+        _sdk_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary=(
+                    "Chief of Staff reviewed the supplied current-quarter finance "
+                    "guardrails and selected Opportunity Scout as the next owner to "
+                    "rank the two supplied business-development options."
+                ),
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="research-direction-review",
+                    target_channel="current thread",
+                ),
+                approval_required=True,
+                audit_notes=[],
+            ),
+            raw_result=None,
+            live=True,
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_chief_of_staff_sdk",
+        fake_run_chief_of_staff_sdk,
+    )
+    monkeypatch.setattr(
+        workflow_runner,
+        "_maybe_synthesize_user_facing_response",
+        lambda result, **_kwargs: result,
+    )
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text=(
+                "Chief of Staff: use Airtable Context agent current-quarter finance "
+                "evidence before choosing our next business-development priority from "
+                "Option Alpha and Option Beta. Have Opportunity Scout rank the supplied "
+                "options. Read-only; do not search, write, send, post, or publish."
+            ),
+            database_url=database_url,
+            save=True,
+            live_sdk=True,
+            live_search=False,
+            external_context={
+                "schema": "keystone.work_item.source_bundle.v1",
+                "source": "bounded_finance_and_opportunity_packet",
+                "supplied_material_only": True,
+                "target": {
+                    "name": "Option Alpha vs Option Beta",
+                    "object_type": "opportunity_comparison",
+                },
+                "sources": [
+                    {
+                        "source_id": finance_source_id,
+                        "title": "Current-quarter finance guardrails",
+                        "source_type": "live_airtable_aggregate",
+                        "provider": "airtable_context_agent",
+                        "extraction_status": "aggregated",
+                        "source_quality": "provider_aggregate",
+                        "supported_claim": (
+                            "The current quarter supports one bounded BD experiment; "
+                            "avoid a high fixed-cost commitment."
+                        ),
+                        "key_facts": [
+                            "Current-quarter income and expense tables were read.",
+                            "One uncategorized expense requires human review.",
+                        ],
+                    },
+                    {
+                        "source_id": "supplied:option-alpha",
+                        "title": "Option Alpha",
+                        "source_type": "supplied_opportunity",
+                        "provider": "operator",
+                        "supported_claim": "Low fixed cost and fast validation cycle.",
+                    },
+                    {
+                        "source_id": "supplied:option-beta",
+                        "title": "Option Beta",
+                        "source_type": "supplied_opportunity",
+                        "provider": "operator",
+                        "supported_claim": "Higher fixed cost and longer validation cycle.",
+                    },
+                ],
+            },
+            manual_request_plan={
+                "source": "test",
+                "target_agent": "chief_of_staff",
+                "intent": "internal_review_handoff",
+                "primary_target": "Option Alpha vs Option Beta",
+            },
+        ),
+        manager_loop=True,
+        max_manager_steps=4,
+    )
+
+    finance_source = next(
+        source
+        for source in outcome.result.work_item.sources
+        if source.source_id == finance_source_id
+    )
+    assert any(
+        artifact.artifact_type == "airtable_context_summary"
+        for artifact in outcome.result.work_item.artifact_refs
+    ), {
+        "node_path": outcome.node_path,
+        "route": outcome.result.route.value,
+        "status": outcome.result.status.value,
+        "artifact_types": [
+            artifact.artifact_type for artifact in outcome.result.work_item.artifact_refs
+        ],
+    }
+    airtable_artifact = next(
+        artifact
+        for artifact in outcome.result.work_item.artifact_refs
+        if artifact.artifact_type == "airtable_context_summary"
+    )
+    context_source_ids = {
+        str(source.get("source_id") or "")
+        for source in outcome.result.context_pack.get("source_refs", [])
+    }
+
+    assert outcome.node_path.index("run_chief_of_staff") < outcome.node_path.index(
+        "stage_airtable_context"
+    )
+    assert outcome.node_path.index("stage_airtable_context") < outcome.node_path.index(
+        "run_opportunity_scout"
+    )
+    assert outcome.result.route == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert outcome.result.status == WorkItemStatus.DONE, {
+        "blockers": [blocker.code for blocker in outcome.result.blockers],
+        "next_action": (
+            outcome.result.next_action.action if outcome.result.next_action else ""
+        ),
+    }
+    assert finance_source.provider == "airtable_context_agent"
+    assert airtable_artifact.metadata["mode"] == "provider_source_handoff"
+    assert airtable_artifact.metadata["provider_evidence"] is True
+    assert airtable_artifact.metadata["live_reads_enabled"] is True
+    assert finance_source_id in context_source_ids
+    assert {"supplied:option-alpha", "supplied:option-beta"} <= context_source_ids
+    assert airtable_artifact.metadata["external_writes_enabled"] is False
 
 
 def test_langgraph_slack_airtable_read_only_smoke_does_not_stage_write_plan(
@@ -4818,6 +5199,85 @@ def test_langgraph_stages_zotero_context_before_business_research(
         for artifact in outcome.result.work_item.artifact_refs
         if artifact.source_agent == "zotero_context_agent"
     )
+
+
+def test_langgraph_preserves_concrete_zotero_item_before_business_research(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    item_key = "ITEM-LATEST-1"
+    source_id = f"zotero:item:{item_key}"
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text=(
+                "Use Zotero context agent to stage the latest Zotero article before "
+                "Business Research summarizes "
+                "NeuroFlow, and explain which takeaways changed or stayed unchanged. "
+                "Do not write, send, publish, or search the web."
+            ),
+            database_url=database_url,
+            save=True,
+            external_context={
+                "schema": "keystone.work_item.source_bundle.v1",
+                "source": "live_zotero_read",
+                "supplied_material_only": True,
+                "target": {"name": "NeuroFlow", "object_type": "company"},
+                "sources": [
+                    {
+                        "source_id": source_id,
+                        "title": "Recent health-data interoperability article",
+                        "url": "https://example.org/article",
+                        "source_type": "live_zotero:journalArticle",
+                        "provider": "zotero_context_agent",
+                        "extraction_status": "metadata_only",
+                        "source_quality": "provider_metadata",
+                        "supported_claim": (
+                            "The explicitly sorted Zotero read selected this exact item."
+                        ),
+                        "key_facts": [
+                            "The item was the newest journalArticle by dateAdded descending.",
+                            "No abstract was available; company claims cannot be inferred from it.",
+                        ],
+                    }
+                ],
+            },
+            manual_request_plan={
+                "source": "heuristic",
+                "requested_agent": "orchestrator",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "NeuroFlow",
+                "target_type": "company",
+                "task_objective": "source_research",
+            },
+        ),
+        manager_loop=True,
+        max_manager_steps=2,
+    )
+
+    zotero_artifact = next(
+        artifact
+        for artifact in outcome.result.work_item.artifact_refs
+        if artifact.artifact_type == "zotero_context_summary"
+    )
+    source_ids = {source.source_id for source in outcome.result.work_item.sources}
+
+    assert outcome.node_path.index("stage_zotero_context") < outcome.node_path.index(
+        "run_business_research"
+    )
+    assert source_id in source_ids
+    assert zotero_artifact.metadata["mode"] == "provider_source_handoff"
+    assert zotero_artifact.metadata["provider_evidence"] is True
+    assert zotero_artifact.metadata["live_reads_enabled"] is True
+    assert zotero_artifact.metadata["source_refs"][0]["source_id"] == source_id
+    assert (
+        outcome.result.work_item.target.metadata["zotero_context_handoff"][
+            "provider_evidence"
+        ]
+        is True
+    )
+    assert not zotero_artifact.metadata["external_writes_enabled"]
 
 
 def test_langgraph_stripped_chief_advisory_context_stays_chief_owned(

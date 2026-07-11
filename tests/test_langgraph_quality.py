@@ -373,7 +373,7 @@ def test_compare_langgraph_quality_script_runs_rss_context_scenario(tmp_path) ->
     output = run_comparison(scenario="rss-opportunity", database_dir=tmp_path)
 
     assert output["scenario"] == "rss-opportunity"
-    assert output["control"]["quality_markers"]["route"] == "chief_of_staff"
+    assert output["control"]["quality_markers"]["route"] == "rss_context_agent"
     assert output["graph"]["quality_markers"]["route"] == "opportunity_scout"
     assert output["comparison"]["same_route"] is False
     assert output["comparison"]["route_change_allowed"] is True

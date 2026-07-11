@@ -170,7 +170,7 @@ def _priority_grouping_item(
         "recommended_labels": ["Keystone/Triage"],
         "risk_flags": [],
         "draft_reply": draft_reply,
-        "draft_created": draft_reply is not None,
+        "draft_created": False,
         "approval_required": draft_reply is not None,
         "requires_human_review": True,
         "send_enabled": False,
@@ -1104,6 +1104,9 @@ def test_gmail_gt1_priority_grouping_cli_uses_llm_batch_pipeline(
     assert report_payload["draft_outputs"][0]["draft_reply"]
     assert report_payload["status"] == "pass"
     assert report_payload["safety"]["send_enabled"] is False
+    assert report_payload["input_summary"] == (
+        "Prioritize emails for partnership follow-up and ignore vendor newsletters."
+    )
     assert report_payload["orchestrator_review"]["status"] == "pass"
     assert report_payload["orchestrator_review"]["review_mode"] == "llm"
 

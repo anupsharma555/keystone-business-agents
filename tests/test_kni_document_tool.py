@@ -118,6 +118,40 @@ def test_kni_document_sources_report_index_status(tmp_path: Path) -> None:
     assert payload["send_enabled"] is False
 
 
+def test_kni_document_sources_use_linked_legacy_context_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    context_repo = tmp_path / "keystone-slack"
+    root = tmp_path / "KNI"
+    index = context_repo / ".local" / "kni-docs.sqlite"
+    context_repo.mkdir()
+    root.mkdir()
+    index.parent.mkdir()
+    _init_index(
+        index,
+        [
+            {
+                "relative_path": "07_Marketing_&_Presence/Capability_Statement.md",
+                "preview_text": "KNI capability statement and service areas",
+            }
+        ],
+    )
+    (context_repo / ".env").write_text(f"KNI_DOC_ROOT_PATH={root}\n")
+    monkeypatch.setenv("KEYSTONE_CONTEXT_CONFIG_REPO", str(context_repo))
+    monkeypatch.delenv(KNI_DOC_SEARCH_ENABLED_ENV, raising=False)
+    monkeypatch.delenv(KNI_DOC_ROOT_PATH_ENV, raising=False)
+    monkeypatch.delenv(KNI_DOC_INDEX_PATH_ENV, raising=False)
+
+    payload = list_kni_document_sources_impl()
+
+    assert payload["status"] == "ready"
+    assert payload["indexed_count"] == 1
+    assert payload["root_path"] == str(root)
+    assert payload["index_path"] == str(index)
+    assert payload["local_only"] is True
+    assert payload["send_enabled"] is False
+
+
 def test_kni_document_search_filters_blocked_sensitive_paths(tmp_path: Path) -> None:
     root = tmp_path / "KNI"
     root.mkdir()

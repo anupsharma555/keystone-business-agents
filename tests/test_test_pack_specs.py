@@ -13,7 +13,7 @@ from keystone_agents.test_pack_specs import (
 
 def test_replacement_test_pack_has_five_specs_per_agent() -> None:
     specs = list_test_pack_specs()
-    assert len(specs) == 25
+    assert len(specs) == 30
 
     expected_ids = {
         *(f"GT-{index}" for index in range(1, 6)),
@@ -21,6 +21,7 @@ def test_replacement_test_pack_has_five_specs_per_agent() -> None:
         *(f"OS-{index}" for index in range(1, 6)),
         *(f"OC-{index}" for index in range(1, 6)),
         *(f"OR-{index}" for index in range(1, 6)),
+        *(f"COS-{index}" for index in range(1, 6)),
     }
     assert {spec.spec_id for spec in specs} == expected_ids
 
@@ -31,6 +32,7 @@ def test_replacement_test_pack_has_five_specs_per_agent() -> None:
         "opportunity_scout",
         "outreach_composer",
         "orchestrator",
+        "chief_of_staff",
     }
     assert all(len(agent_specs) == 5 for agent_specs in grouped.values())
 
@@ -61,6 +63,35 @@ def test_orchestrator_uses_generic_feedback_object_type() -> None:
     assert spec.feedback_object_type == "other"
     assert "human_feedback" in spec.learning_memory_types
     assert "approval_decision" in spec.learning_memory_types
+
+
+def test_chief_specs_are_no_live_and_exclude_private_or_outbound_memory() -> None:
+    specs = specs_by_agent()["chief_of_staff"]
+
+    assert tuple(spec.spec_id for spec in specs) == tuple(f"COS-{index}" for index in range(1, 6))
+    assert all(spec.feedback_object_type == "other" for spec in specs)
+    assert all(spec.fixture_requirements for spec in specs)
+    assert all("chief_of_staff_dry_run_harness" in spec.run_requirements for spec in specs)
+    assert all(spec.external_side_effects_allowed is False for spec in specs)
+    for spec in specs:
+        criteria = " ".join(spec.pass_criteria).lower()
+        retention = " ".join(spec.learning_retention_notes).lower()
+        assert any(
+            boundary in criteria
+            for boundary in (
+                "does not post",
+                "does not continue",
+                "does not enable",
+                "does not create",
+            )
+        )
+        for prohibited in (
+            "raw private slack text",
+            "phi",
+            "secrets",
+            "unapproved outbound copy",
+        ):
+            assert prohibited in retention
 
 
 def test_report_spec_includes_learning_policy_without_polluting_prompt() -> None:

@@ -26,8 +26,16 @@ from keystone_agents.agents.opportunity_scout import (
     search_opportunity_sources_placeholder_impl,
 )
 from keystone_agents.live_retrieval import run_opportunity_scout_live
-from keystone_agents.schemas.opportunity import Opportunity, OpportunityScoutResult
+from keystone_agents.schemas.opportunity import (
+    ExistingOpportunityState,
+    Opportunity,
+    OpportunityRecord,
+    OpportunityScoutResult,
+    OpportunitySource,
+    OpportunitySourceBundle,
+)
 from keystone_agents.sdk import ToolGuardrailViolation, load_prompt
+from keystone_agents.source_quality import SourceQualityScore, SourceQualitySummary
 from keystone_agents.tools.html_review_tool import HtmlReviewResult
 from keystone_agents.tools.search_provider import (
     DryRunSearchProvider,
@@ -698,6 +706,163 @@ def test_build_opportunity_scout_agent() -> None:
         "handoff_to_business_research_analyst_placeholder",
         "save_opportunity_placeholder",
     } <= {getattr(tool, "name", "") for tool in agent.tools}
+
+
+def test_build_opportunity_scout_agent_can_detach_tools() -> None:
+    agent = build_opportunity_scout_agent(attach_tools=False)
+
+    assert agent.tools == []
+
+
+def test_opportunity_prompt_keeps_event_type_and_geography_source_bound() -> None:
+    instructions = build_opportunity_scout_agent(attach_tools=False).instructions
+    normalized = " ".join(str(instructions).split())
+
+    assert "hackathon or challenge opportunity" in normalized
+    assert "requires a GitHub repository remains" in normalized
+    assert "does not by itself establish event location" in normalized
+    assert "report it as unknown" in normalized
+
+
+def test_opportunity_schema_represents_hackathons_without_repository_misclassification() -> None:
+    state = ExistingOpportunityState(
+        company_name="Synthetic health challenge",
+        status="candidate",
+        opportunity_type="hackathon or challenge opportunity",
+    )
+
+    assert state.opportunity_type == "hackathon or challenge opportunity"
+
+
+def test_opportunity_record_dedupes_bundles_and_counts_independent_domains() -> None:
+    sources = [
+        OpportunitySource(
+            source_id=source_id,
+            title="Synthetic challenge",
+            url=url,
+            source_type="conference",
+            supported_signal="Official challenge evidence.",
+            source_quality=SourceQualityScore(
+                url=url,
+                title="Synthetic challenge",
+                source_type="conference",
+                credibility_score=95,
+                domain_credibility_score=95,
+                recency_score=95,
+                relevance_score=95,
+                overall_score=95,
+                rationale="Official source.",
+            ),
+        )
+        for source_id, url in (
+            ("source1", "https://challenge.example/details"),
+            ("source2", "https://challenge.example/dates"),
+        )
+    ]
+    quality = SourceQualitySummary(
+        source_count=2,
+        independent_source_count=2,
+        average_credibility_score=95,
+        average_domain_credibility_score=95,
+        average_recency_score=95,
+        average_relevance_score=95,
+        overall_score=95,
+        high_quality_source_count=2,
+        low_quality_source_count=0,
+        rationale="Model-provided summary.",
+    )
+    bundle = OpportunitySourceBundle(
+        bundle_id="bundle1",
+        company_name="Synthetic challenge",
+        source_category="conference",
+        summary="Official challenge evidence.",
+        sources=sources,
+        source_quality_summary=quality.model_copy(deep=True),
+    )
+
+    record = OpportunityRecord(
+        company_name="Synthetic challenge",
+        entity_kind="hackathon",
+        opportunity_type="hackathon or challenge opportunity",
+        priority_score=60,
+        why_now_signal="Upcoming submission window.",
+        recommended_next_step="Review before opening.",
+        sources=sources,
+        source_quality_summary=quality,
+        source_bundles=[bundle, bundle.model_copy(deep=True)],
+        keystone_fit_reason="Conditional prototype fit.",
+        outside_consulting_likelihood=10,
+        handoff_to_business_research_analyst=False,
+    )
+
+    assert len(record.source_bundles) == 1
+    assert record.source_quality_summary is not None
+    assert record.source_quality_summary.independent_source_count == 1
+    assert record.source_bundles[0].source_quality_summary is not None
+    assert record.source_bundles[0].source_quality_summary.independent_source_count == 1
+
+
+def test_opportunity_result_normalizes_no_search_and_top_level_source_independence() -> None:
+    source_urls = (
+        "https://challenge.example/details",
+        "https://challenge.example/dates",
+    )
+    sources = [
+        OpportunitySource(
+            source_id=f"source{index}",
+            title="Synthetic challenge",
+            url=url,
+            source_type="conference",
+            supported_signal="Official challenge evidence.",
+            source_quality=SourceQualityScore(
+                url=url,
+                title="Synthetic challenge",
+                source_type="conference",
+                credibility_score=95,
+                domain_credibility_score=95,
+                recency_score=95,
+                relevance_score=95,
+                overall_score=95,
+                rationale="Official source.",
+            ),
+        )
+        for index, url in enumerate(source_urls, start=1)
+    ]
+    quality = SourceQualitySummary(
+        source_count=2,
+        independent_source_count=2,
+        average_credibility_score=95,
+        average_domain_credibility_score=95,
+        average_recency_score=95,
+        average_relevance_score=95,
+        overall_score=95,
+        high_quality_source_count=2,
+        low_quality_source_count=0,
+        rationale="Model-provided summary.",
+    )
+    bundle = OpportunitySourceBundle(
+        bundle_id="bundle1",
+        company_name="Synthetic challenge",
+        source_category="conference",
+        summary="Official challenge evidence.",
+        sources=sources,
+        source_quality_summary=quality.model_copy(deep=True),
+    )
+
+    result = OpportunityScoutResult(
+        search_provider="none",
+        search_queries=["planned but unexecuted query"],
+        raw_search_result_count=0,
+        source_bundles=[bundle, bundle.model_copy(deep=True)],
+        source_quality_summary=quality,
+    )
+
+    assert result.search_queries == []
+    assert len(result.source_bundles) == 1
+    assert result.source_quality_summary is not None
+    assert result.source_quality_summary.independent_source_count == 1
+    assert result.source_bundles[0].source_quality_summary is not None
+    assert result.source_bundles[0].source_quality_summary.independent_source_count == 1
 
 
 def test_source_verification_can_use_agent_html_review(
@@ -2604,6 +2769,68 @@ def test_live_search_tests_do_not_require_network(monkeypatch: pytest.MonkeyPatc
     result = scout_opportunities_live_search(max_results=2, serper_tool=FakeSerperTool())
 
     assert len(result.records) <= 2
+
+
+def test_cli_result_output_is_atomic_and_preserves_complete_payload(tmp_path: Path) -> None:
+    import scripts.run_opportunity_scout as cli
+
+    output = tmp_path / "opportunity-result.json"
+    payload = {
+        "status": "partial",
+        "usage": {"requests": 1},
+        "output": {
+            "search_provider": "none",
+            "search_queries": [],
+            "source_quality_summary": {"independent_source_count": 1},
+        },
+    }
+
+    cli._write_result_output_atomic(output, payload)
+
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+    assert not output.with_suffix(".json.tmp").exists()
+
+
+def test_cli_result_output_option_persists_before_rendering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_opportunity_scout as cli
+
+    output = tmp_path / "opportunity-result.json"
+    monkeypatch.setattr(sys, "argv", ["run_opportunity_scout.py", "--result-output", str(output)])
+    args = cli.build_parser().parse_args()
+    payload = {"status": "pass", "usage": {"requests": 1}}
+
+    cli._persist_requested_result(args, payload)
+
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+def test_next_normalization_plan_uses_exact_recovered_source_packet() -> None:
+    plan = json.loads(
+        Path("artifacts/test-pack/next-live-opportunity-normalization-plan.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert plan["execution_ready"] is False
+    assert plan["approval_status"] == "completed_within_eight_sequential_run_allowance"
+    assert plan["result"]["status"] == "pass"
+    assert plan["result"]["openai_requests"] == 1
+    assert plan["model"] == "gpt-5.4-mini"
+    assert plan["expected_openai_requests"] == 1
+    assert plan["budget_usd"] == 0.05
+    assert plan["live_search"] is False
+    assert plan["provider_reads"] == 0
+    assert plan["provider_writes"] == 0
+    assert plan["source_packet"]["status"] == "recovered_and_verified"
+    assert plan["source_packet"]["source_pages"] == 2
+    assert plan["source_packet"]["independent_source_domains"] == 1
+    assert set(plan["source_packet"]["urls"]) == {
+        "https://hack-for-humanity-summer-26.devpost.com/",
+        "https://hack-for-humanity-summer-26.devpost.com/details/dates",
+    }
 
 
 def test_cli_live_search_blocks_disabled_serper_before_network(

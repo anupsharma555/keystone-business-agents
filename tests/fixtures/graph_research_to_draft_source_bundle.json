@@ -1,0 +1,72 @@
+{
+  "schema": "keystone.work_item.source_bundle.v1",
+  "supplied_material_only": true,
+  "target": {
+    "name": "Northstar Behavioral Analytics",
+    "email": "jordan@example.test",
+    "object_type": "company",
+    "external_id": "thread-northstar-001"
+  },
+  "gmail_context": {
+    "thread_id": "thread-northstar-001",
+    "message_id": "message-northstar-001",
+    "sender": "Jordan Lee <jordan@example.test>",
+    "thread_summary": "Jordan asked whether Keystone could advise on evaluation design for a behavioral-health workflow analytics product.",
+    "prior_reply_context": "No prior Keystone reply is present in the supplied packet.",
+    "reply_objective": "Acknowledge the request and propose a short exploratory discussion without making unsupported claims."
+  },
+  "sources": [
+    {
+      "source_id": "fixture:graph-source:company-brief",
+      "title": "Northstar supplied company brief",
+      "url": "fixture://graph-source/company-brief",
+      "source_type": "supplied_company_brief",
+      "provider": "fixture",
+      "extraction_status": "supplied_material",
+      "source_quality": "operator_supplied",
+      "supported_claim": "Northstar provides workflow analytics for behavioral-health clinics.",
+      "key_facts": [
+        "Northstar provides workflow analytics for behavioral-health clinics.",
+        "The packet contains no outcomes, ROI, customer, or deployment claims."
+      ],
+      "evidence_excerpt": "Product focus: workflow analytics for behavioral-health clinics. No outcomes or customer claims are included."
+    },
+    {
+      "source_id": "fixture:graph-source:inbound-email",
+      "title": "Sanitized inbound email",
+      "url": "fixture://graph-source/inbound-email",
+      "source_type": "gmail_thread_packet",
+      "provider": "fixture",
+      "extraction_status": "supplied_material",
+      "source_quality": "operator_supplied",
+      "supported_claim": "Jordan asked whether a short advisory discussion on evaluation design could help.",
+      "key_facts": [
+        "Jordan asked whether a short advisory discussion on evaluation design could help."
+      ],
+      "evidence_excerpt": "Could Keystone help us think through evaluation design? I would be glad to discuss briefly."
+    }
+  ],
+  "facts": [
+    {
+      "key": "company_product_focus",
+      "value": "Northstar provides workflow analytics for behavioral-health clinics.",
+      "confidence": 0.95,
+      "approval_state": "approved_for_drafting",
+      "source_ids": ["fixture:graph-source:company-brief"]
+    },
+    {
+      "key": "inbound_request",
+      "value": "Jordan asked whether a short advisory discussion on evaluation design could help.",
+      "confidence": 0.95,
+      "approval_state": "approved_for_drafting",
+      "source_ids": ["fixture:graph-source:inbound-email"]
+    },
+    {
+      "key": "unsupported_claim_boundary",
+      "value": "The supplied packet contains no outcomes, ROI, customer, or deployment claims.",
+      "confidence": 1.0,
+      "approval_state": "approved_for_research",
+      "source_ids": ["fixture:graph-source:company-brief"]
+    }
+  ]
+}

@@ -96,6 +96,59 @@ def test_sent_email_style_profile_excludes_sensitive_samples_and_subjects() -> N
     assert "token=" not in encoded
 
 
+def test_sent_email_style_profile_excludes_long_or_forwarded_samples() -> None:
+    result = build_email_style_profile_from_samples(
+        [
+            SentEmailStyleSample(
+                source_id="fixture:safe",
+                source_url="fixture://style#safe",
+                subject="Re: Follow up",
+                body="Hi Jordan,\n\nHappy to compare notes if useful.\n\nBest,\nAnup",
+            ),
+            SentEmailStyleSample(
+                source_id="fixture:long",
+                source_url="fixture://style#long",
+                subject="Long article",
+                body=" ".join(["article"] * 230),
+            ),
+            SentEmailStyleSample(
+                source_id="fixture:forwarded",
+                source_url="fixture://style#forwarded",
+                subject="Fwd: Newsletter",
+                body="---------- Forwarded message ----------\nFrom: publisher@example.com",
+            ),
+        ],
+        profile_id="quality-filtered-style",
+    )
+
+    assert result.sample_count == 3
+    assert result.usable_sample_count == 1
+    assert result.excluded_sample_count == 2
+    assert "long_or_forwarded_content" in result.sample_summaries[1].sensitive_flags
+    assert result.sample_summaries[1].used_for_profile is False
+    assert "quoted_or_forwarded_content" in result.sample_summaries[2].sensitive_flags
+    assert result.sample_summaries[2].used_for_profile is False
+
+
+def test_sent_email_style_profile_recognizes_inline_sincerely_signoff() -> None:
+    result = build_email_style_profile_from_samples(
+        [
+            SentEmailStyleSample(
+                source_id="fixture:inline-signoff",
+                source_url="fixture://style#inline-signoff",
+                subject="Re: Follow up",
+                body=(
+                    "Hi Jordan, Thank you for the update. A short discussion would be useful. "
+                    "Sincerely, Anup"
+                ),
+            )
+        ],
+        profile_id="inline-sincerely-style",
+    )
+
+    assert result.profile.signoffs == ["Sincerely,"]
+
+
 def test_pending_style_profile_is_not_loaded_until_approved(tmp_path: Path) -> None:
     database_url = _database_url(tmp_path)
     store = SQLiteStore(database_url)

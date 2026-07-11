@@ -6,6 +6,7 @@ import json
 import sys
 from email import message_from_bytes
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -356,7 +357,7 @@ def test_priority_grouping_output_normalizes_em_dash_text() -> None:
                     "needs_reply": True,
                     "recommended_action": "Acknowledge receipt.",
                     "draft_reply": "Hi Andy,\n\nReceived — thanks.\n\nBest,\nAnup",
-                    "draft_created": True,
+                    "draft_created": False,
                     "approval_required": True,
                     "send_enabled": False,
                     "sent": False,
@@ -382,7 +383,12 @@ def test_build_gmail_triage_agent_returns_sdk_agent_like_object() -> None:
     assert agent.output_type is EmailTriageResult
     assert "Gmail Triage Agent" in str(agent.instructions)
     assert "Keystone Profile" in str(agent.instructions)
-    assert {"get_gmail_message", "apply_gmail_labels", "create_gmail_draft_reply"} <= tool_names
+    assert {
+        "get_gmail_message",
+        "apply_gmail_labels",
+        "create_gmail_draft_reply",
+        "create_gmail_draft_with_attachment",
+    } <= tool_names
 
 
 def test_build_gmail_triage_agent_can_disable_tools_for_llm_only_synthesis() -> None:
@@ -417,7 +423,9 @@ def test_no_send_tool_is_exposed() -> None:
     agent = build_gmail_triage_agent()
     tool_names = {getattr(tool, "name", "") for tool in agent.tools}
 
-    assert not any(name.startswith("send") or "send_email" in name for name in tool_names)
+    assert {name for name in tool_names if name.startswith("send") or "send_email" in name} == {
+        "send_gmail_test_draft"
+    }
     assert "send_email" in function_names
     assert "create_gmail_draft_reply" in function_names
 
@@ -828,6 +836,103 @@ def test_gmail_sdk_payload_repairs_mixed_script_recommendation_noise() -> None:
         "mixed-script noise" in item
         for item in repaired["output"]["triage_limitations"]
     )
+
+
+def test_sdk_reply_draft_execution_uses_operator_approval_and_message_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_gmail_triage as cli
+
+    captured: dict[str, object] = {}
+    fake_gmail = object()
+
+    monkeypatch.setattr(cli, "GmailTool", lambda *, live: fake_gmail if live else None)
+
+    def fake_execute(gmail, **kwargs):
+        captured["gmail"] = gmail
+        captured.update(kwargs)
+        return {
+            "status": "draft_created",
+            "draft_id": "draft-provider-1",
+            "verification": {"passed": True},
+            "sent": False,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "execute_approved_gmail_draft_reply_action", fake_execute)
+    outcome = SimpleNamespace(
+        raw_context=GmailMessageEnvelope(
+            message_id="message-source-1",
+            thread_id="thread-source-1",
+            sender_name="Example Sender",
+            sender_email="sender@example.com",
+            subject="Project follow-up",
+            normalized_body="Could you send a brief response?",
+        ),
+        final_output=SimpleNamespace(
+            draft_reply="Thanks for the note. I will review this and follow up."
+        ),
+    )
+    args = SimpleNamespace(
+        expected_account="operator@example.com",
+        approval_reference="operator-command:gmail-draft:abc123",
+    )
+
+    result = cli._create_verified_sdk_reply_draft(args, outcome)
+
+    assert result["verification"]["passed"] is True
+    assert captured["gmail"] is fake_gmail
+    assert captured["message_id"] == "message-source-1"
+    assert captured["expected_to"] == "sender@example.com"
+    assert captured["expected_subject"] == "Re: Project follow-up"
+    assert captured["expected_account"] == "operator@example.com"
+    assert captured["approval_reference"] == "operator-command:gmail-draft:abc123"
+
+
+def test_sdk_draft_update_reuses_internally_resolved_provider_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_gmail_triage as cli
+
+    captured: dict[str, object] = {}
+    fake_gmail = object()
+    monkeypatch.setattr(cli, "GmailTool", lambda *, live: fake_gmail if live else None)
+
+    def fake_execute(gmail, **kwargs):
+        captured["gmail"] = gmail
+        captured.update(kwargs)
+        return {
+            "status": "draft_updated",
+            "draft_id": kwargs["draft_id"],
+            "verification": {"passed": True},
+            "sent": False,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "execute_approved_gmail_draft_action", fake_execute)
+    outcome = SimpleNamespace(
+        final_output=SimpleNamespace(
+            draft_reply="Thanks for the note. I will follow up next week."
+        )
+    )
+    args = SimpleNamespace(
+        expected_account="operator@example.com",
+        approval_reference="operator-command:gmail-draft:update123",
+    )
+    resolved_draft = {
+        "draft_id": "draft-provider-1",
+        "to": "reviewer@example.com",
+        "subject": "Re: Project follow-up",
+    }
+
+    result = cli._update_verified_sdk_draft(args, outcome, resolved_draft)
+
+    assert result["verification"]["passed"] is True
+    assert captured["gmail"] is fake_gmail
+    assert captured["draft_id"] == "draft-provider-1"
+    assert captured["to"] == "reviewer@example.com"
+    assert captured["subject"] == "Re: Project follow-up"
+    assert captured["approval_reference"] == "operator-command:gmail-draft:update123"
 
     clean_payload = {
         "output_type": "EmailTriageResult",
@@ -1588,7 +1693,14 @@ def test_gmail_oauth_readiness_live_validates_files_without_network(tmp_path: Pa
     assert readiness["readiness"] == "ready"
     assert readiness["configured"] is True
     assert readiness["token_has_refresh_token"] is True
-    assert readiness["allowed_live_operations"] == ["read", "label", "create_draft"]
+    assert readiness["allowed_live_operations"] == [
+        "read",
+        "label",
+        "mailbox_state",
+        "create_draft",
+        "update_draft",
+        "send_test_draft",
+    ]
     assert readiness["send_supported"] is False
 
 

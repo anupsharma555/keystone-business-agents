@@ -191,3 +191,71 @@ def test_source_triage_retains_extracted_source_for_deep_synthesis() -> None:
     assert result.deepen_source_ids == []
     assert result.needs_broaden_or_deepen is False
     assert "extracted/read evidence" in result.decisions[0].rationale
+
+
+def test_source_triage_comparison_separates_retained_deepen_and_rejected_sources() -> None:
+    result = triage_source_candidates(
+        agent_name="business_research_analyst",
+        request_text=(
+            "Compare NeuroFlow and Headway using a detailed source-backed company "
+            "comparison with evidence caveats."
+        ),
+        candidates=[
+            {
+                "source_id": "official:neuroflow",
+                "title": "NeuroFlow behavioral health platform",
+                "url": "https://www.neuroflow.com/",
+                "source": "official",
+                "source_type": "company",
+                "extraction_status": "article_read",
+                "evidence_excerpt": (
+                    "NeuroFlow describes behavioral-health workflow and risk "
+                    "identification capabilities for healthcare organizations."
+                ),
+                "supported_claims": ["NeuroFlow describes its platform capabilities."],
+            },
+            {
+                "source_id": "search:headway",
+                "title": "Headway mental health provider network",
+                "url": "https://example.org/headway-summary",
+                "snippet": "Headway supports a mental health provider network.",
+                "source": "searxng",
+                "extraction_status": "snippet_only",
+            },
+            {
+                "source_id": "unrelated:language",
+                "title": "English language learning app",
+                "url": "https://example.org/language-learning",
+                "snippet": "Vocabulary and language-learning exercises.",
+                "source": "searxng",
+            },
+        ],
+    )
+
+    assert result.retained_source_ids == ["official:neuroflow"]
+    assert result.deepen_source_ids == ["search:headway"]
+    assert result.rejected_source_ids == ["unrelated:language"]
+    assert set(result.retained_source_ids).isdisjoint(result.rejected_source_ids)
+    assert result.needs_broaden_or_deepen is True
+
+
+def test_source_triage_thin_company_research_requires_more_evidence() -> None:
+    result = triage_source_candidates(
+        agent_name="business_research_analyst",
+        request_text="Create a detailed source-backed company brief for ThinData Health.",
+        candidates=[
+            {
+                "source_id": "thin:homepage",
+                "title": "ThinData Health",
+                "url": "https://example.org/thindata",
+                "snippet": "Healthcare AI solutions.",
+                "source": "searxng",
+                "extraction_status": "snippet_only",
+            }
+        ],
+    )
+
+    assert result.retained_source_ids == []
+    assert result.deepen_source_ids == ["thin:homepage"]
+    assert result.needs_broaden_or_deepen is True
+    assert result.recommended_action == "broaden_or_deepen_before_final_synthesis"

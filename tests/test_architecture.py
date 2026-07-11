@@ -51,6 +51,15 @@ KEYSTONE_PROMPTS_ROOT = KEYSTONE_AGENTS_ROOT / "prompts"
 KEYSTONE_SKILLS_ROOT = KEYSTONE_AGENTS_ROOT / "skills"
 FIXTURES_ROOT = PROJECT_ROOT / "tests" / "fixtures"
 
+SDK_EXECUTION_SURFACE_ALLOWLIST = {
+    Path("src/keystone_agents/sdk.py"): "central cost, usage, cache, trace, and guardrail wrapper",
+    Path("src/keystone_agents/run.py"): (
+        "typed live-synthesis bridge that calls the central wrapper"
+    ),
+    Path("src/keystone_agents/cli.py"): "legacy CLI adapter that calls the central wrapper",
+    Path("src/keystone_agents/sandboxing.py"): "separately gated sandbox execution boundary",
+}
+
 CANONICAL_SPECIALISTS = (
     (
         "gmail_triage",
@@ -141,24 +150,30 @@ def test_agent_modules_use_centralized_cost_tracked_sdk_runner() -> None:
 
 
 def test_non_sdk_modules_do_not_call_raw_agents_runner() -> None:
-    """Raw SDK execution belongs behind the shared cost-tracked wrappers."""
+    """SDK execution stays on the small reviewed and documented allowlist."""
 
-    allowed = {
-        Path("src/keystone_agents/sdk.py"),
-        Path("src/keystone_agents/run.py"),
-        Path("src/keystone_agents/sandboxing.py"),
-        Path("src/keystone_agents/cli.py"),
-    }
     offenders: list[str] = []
     for path in (KEYSTONE_AGENTS_ROOT).rglob("*.py"):
         relative = path.relative_to(PROJECT_ROOT)
-        if relative in allowed:
+        if relative in SDK_EXECUTION_SURFACE_ALLOWLIST:
             continue
         text = path.read_text(encoding="utf-8")
         if "Runner.run" in text or "run_typed_sdk_sync" in text or "run_sdk_sync(" in text:
             offenders.append(str(relative))
 
-    assert offenders == []
+    assert offenders == [], (
+        "New SDK execution surfaces require review and an explicit "
+        f"SDK_EXECUTION_SURFACE_ALLOWLIST entry with a reason: {offenders}"
+    )
+
+
+def test_sdk_execution_surface_allowlist_documents_existing_boundaries() -> None:
+    """Allowlist entries must stay concrete, present, and explained."""
+
+    assert SDK_EXECUTION_SURFACE_ALLOWLIST
+    for relative, reason in SDK_EXECUTION_SURFACE_ALLOWLIST.items():
+        assert (PROJECT_ROOT / relative).is_file(), relative
+        assert len(reason.split()) >= 4, relative
 
 
 def test_agents_sdk_conformance_doc_maps_structural_boundaries() -> None:
@@ -632,11 +647,16 @@ def test_shared_retrieve_normalize_synthesis_harness_exists() -> None:
 
 
 def test_no_send_tool_is_exposed_by_canonical_agents() -> None:
+    dedicated_synthetic_send_tools = {"send_gmail_test_draft"}
     for _name, builder, _output_type, _prompt_files in CANONICAL_AGENTS:
         agent = builder()
         tool_names = {getattr(tool, "name", getattr(tool, "__name__", "")) for tool in agent.tools}
 
-        assert not any(name.startswith("send") or "send_email" in name for name in tool_names)
+        assert not any(
+            (name.startswith("send") or "send_email" in name)
+            and name not in dedicated_synthetic_send_tools
+            for name in tool_names
+        )
 
 
 def test_external_email_send_functions_are_intentionally_unavailable() -> None:

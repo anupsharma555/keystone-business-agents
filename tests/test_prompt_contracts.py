@@ -463,10 +463,16 @@ def test_shared_agent_operating_architecture_covers_schemas_tools_helpers() -> N
     assert "`airtable_write_record`" in text
     assert "`airtable_upload_attachment`" in text
     assert (
-        "No deletes, schema changes, generic attachment uploads, bulk overwrites, "
-        "or silent mutations"
+        "No ordinary deletes, schema changes, generic attachment uploads, bulk "
+        "overwrites, or silent mutations"
         in text
     )
+    assert "## Direct Write Execution Semantics" in text
+    assert "authenticated operator\ncommand as approval" in text
+    assert "Operator approval is operation-specific, not global" in text
+    assert "call the relevant typed write tool with `live=true`" in text
+    assert "nested context agent or agent-as-tool" in text
+    assert "`airtable_link_attachment` for credential-free HTTPS receipt URLs" in text
     assert "use Playwright only as a read-only backend/headless diagnostic rendering helper" in text
     assert "`render_page`" in text
     assert "`capture_browser_diagnostics`" in text
@@ -508,6 +514,15 @@ def test_context_agent_prompts_require_live_read_tools_for_live_read_only_invoca
     assert "KNI 00 - Foundational Texts & Reviews" in zotero
     assert "zotero_resolve_collection_context" in zotero
     assert "Do not import or mutate Zotero" in zotero
+
+
+def test_workspace_prompt_uses_direct_scoped_write_authority() -> None:
+    text = _read_prompt("google_workspace_context.md")
+
+    assert "authenticated operator command" in text
+    assert "scoped approval for only that" in text
+    assert "action. Call the matching typed tool with `live=true`" in text
+    assert "Nested/advisory calls" in text
 
 
 def test_agents_guide_contains_tool_use_decision_rules() -> None:

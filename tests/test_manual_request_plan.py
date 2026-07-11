@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -33,20 +35,29 @@ def test_manual_plan_routes_conference_search_to_opportunity_scout() -> None:
     assert plan.requires_live_search is True
 
 
-@pytest.mark.parametrize(
-    "prompt",
-    [
+def test_context_agent_external_send_request_is_blocked() -> None:
+    plan = infer_manual_request_plan(
         "@KNI rss context agent: send the announcement summary to Slack",
-        "@KNI airtable context agent: update the tracker row for this case",
-    ],
-)
-def test_context_agent_affirmative_side_effect_requests_are_blocked(prompt: str) -> None:
-    plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
+        requested_agent="orchestrator",
+    )
 
     assert plan.intent == "blocked_send"
-    assert plan.target_agent in {"rss_context_agent", "airtable_context_agent"}
+    assert plan.target_agent == "rss_context_agent"
     assert plan.task_objective == "blocked_side_effect"
     assert plan.planner_warnings
+
+
+def test_context_agent_internal_update_routes_to_owner_for_approval_gating() -> None:
+    plan = infer_manual_request_plan(
+        "@KNI airtable context agent: update the tracker row for this case",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "airtable_context_agent"
+    assert plan.intent == "business_system_write"
+    assert plan.task_objective == "business_system_write"
+    assert plan.expected_artifact_type == "business_system_write_plan"
+    assert plan.side_effect_policy == "internal_write_approval_required"
 
 
 def test_context_agent_negated_side_effect_constraints_remain_read_only_context() -> None:
@@ -108,6 +119,21 @@ def test_manual_plan_routes_company_comparison_to_business_research() -> None:
     assert plan.primary_target == "Lindus Health vs Holmusk"
 
 
+def test_manual_plan_routes_public_contact_discovery_without_outreach() -> None:
+    plan = infer_manual_request_plan(
+        "Find a public business-development contact for NeuroFlow, but do not draft outreach.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.primary_target == "NeuroFlow"
+    assert plan.target_type == "company"
+    assert plan.task_objective == "contact_discovery"
+    assert plan.expected_artifact_type == "contact_candidates"
+    assert plan.side_effect_policy == "draft_or_read_only"
+
+
 def test_manual_plan_preserves_business_research_smoke_with_context_edges() -> None:
     plan = infer_manual_request_plan(
         "LangGraph smoke 1: use preprints context agent history and Zotero context "
@@ -126,6 +152,20 @@ def test_manual_plan_preserves_business_research_smoke_with_context_edges() -> N
     assert plan.task_objective == "source_research"
     assert plan.expected_artifact_type == "source_summary"
     assert plan.requires_live_search is False
+
+
+def test_manual_plan_routes_zotero_note_lifecycle_to_context_owner() -> None:
+    plan = infer_manual_request_plan(
+        "Create a temporary Zotero note for this research item, revise it to be clearer, "
+        "verify the change, and remove the temporary note.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "zotero_context_agent"
+    assert plan.intent == "business_system_write"
+    assert plan.task_objective == "business_system_write"
+    assert plan.expected_artifact_type == "business_system_write_plan"
+    assert plan.side_effect_policy == "internal_write_approval_required"
 
 
 @pytest.mark.parametrize(
@@ -394,6 +434,33 @@ def test_manual_plan_preserves_workflow_when_llm_candidate_misreads_company() ->
     assert merged.target_agent == "opportunity_scout"
     assert merged.primary_target == "behavioral health AI"
     assert any("Ignored planner override" in warning for warning in merged.planner_warnings)
+
+
+def test_manual_plan_merge_preserves_explicit_user_scope_over_llm_candidate() -> None:
+    fallback = infer_manual_request_plan(
+        "Summarize my top three unread emails from today and do not draft replies.",
+        requested_agent="orchestrator",
+    )
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="orchestrator",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        desired_count=8,
+        gmail_query="newer_than:7d",
+        lookback_days=7,
+        draft_policy="draft_only_for_urgent",
+        constraints=["model-added grouping suggestion"],
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.target_agent == "gmail_triage"
+    assert merged.desired_count == 3
+    assert merged.lookback_days == 1
+    assert merged.gmail_query.startswith("is:unread after:")
+    assert merged.draft_policy == "no_drafts_requested"
+    assert "model-added grouping suggestion" in merged.constraints
 
 
 def test_manual_plan_specific_agent_call_stays_on_requested_agent() -> None:
@@ -1090,6 +1157,33 @@ def test_manual_plan_extracts_gmail_scope_hints() -> None:
     assert plan.draft_policy == "draft_only_for_urgent"
 
 
+def test_manual_plan_routes_sent_mail_style_learning_to_gmail() -> None:
+    request = (
+        "Review a small sample of my sent emails and draft replies in a similar style "
+        "without copying them exactly."
+    )
+
+    manual = infer_manual_request_plan(request, requested_agent="orchestrator")
+    execution = infer_gmail_execution_plan(request)
+
+    assert manual.target_agent == "gmail_triage"
+    assert manual.intent == "gmail_triage"
+    assert execution.operation == "style_profile"
+    assert execution.source_label == "SENT"
+    assert execution.live_read_required is True
+    assert execution.create_gmail_drafts is False
+    assert "aggregate_email_style_profile_build" in execution.candidate_helpers
+
+
+def test_gmail_tone_instruction_does_not_become_sent_style_learning() -> None:
+    execution = infer_gmail_execution_plan(
+        "Find the recent insurance email and draft a reply. Keep the tone natural and professional."
+    )
+
+    assert execution.operation == "draft_reply"
+    assert execution.source_label != "SENT"
+
+
 @pytest.mark.parametrize(
     "spec_id",
     ["GT-1", "GT-2", "GT-3", "GT-4", "GT-5"],
@@ -1286,6 +1380,84 @@ def test_gmail_execution_plan_maps_recent_actionable_threads_to_priority_groupin
     assert "gmail_priority_grouping_sdk" in plan.candidate_helpers
 
 
+def test_natural_today_email_summary_preserves_calendar_scope_and_batch_shape() -> None:
+    request = "Can you summarize my emails from today?"
+    manual = infer_manual_request_plan(request, requested_agent="orchestrator")
+    execution = infer_gmail_execution_plan(request)
+    today = datetime.now(ZoneInfo("America/New_York")).date().strftime("%Y/%m/%d")
+
+    assert manual.target_agent == "gmail_triage"
+    assert manual.lookback_days == 1
+    assert manual.gmail_query == f"after:{today}"
+    assert execution.operation == "priority_grouping"
+    assert execution.lookback_days == 1
+    assert execution.gmail_query == f"after:{today}"
+    assert execution.max_messages == 10
+
+
+def test_natural_find_email_and_draft_preserves_sender_search_hint() -> None:
+    request = (
+        "Can you find the latest email from Example Health and draft a reply for me? "
+        "Do not send it."
+    )
+    manual = infer_manual_request_plan(request, requested_agent="orchestrator")
+    execution = infer_gmail_execution_plan(request)
+
+    assert manual.target_agent == "gmail_triage"
+    assert manual.gmail_query == '"Example Health"'
+    assert execution.operation == "draft_reply"
+    assert execution.gmail_query == 'newer_than:3d "example health"'
+    assert execution.create_gmail_drafts is False
+    assert execution.draft_replies_in_output is True
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_agent"),
+    [
+        (
+            "Find the latest Zotero paper about clinical AI and summarize it.",
+            "business_research_analyst",
+        ),
+        ("What recent RSS announcements matter to Keystone?", "rss_context_agent"),
+        ("Find three recent psychiatry AI preprints worth reading.", "preprints_context_agent"),
+        (
+            "Act as my chief of staff and tell me what needs my attention today.",
+            "chief_of_staff",
+        ),
+    ],
+)
+def test_natural_human_context_and_manager_asks_keep_expected_owner(
+    request_text: str,
+    expected_agent: str,
+) -> None:
+    plan = infer_manual_request_plan(request_text, requested_agent="orchestrator")
+
+    assert plan.target_agent == expected_agent
+    assert plan.intent != "clarification"
+
+
+def test_natural_three_company_comparison_routes_to_business_research() -> None:
+    plan = infer_manual_request_plan(
+        "Compare NeuroFlow, Headway, and Spring Health and explain the important differences.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.primary_target == "NeuroFlow vs Headway vs Spring Health"
+
+
+def test_natural_multistep_opportunity_workflow_owns_airtable_context_handoff() -> None:
+    plan = infer_manual_request_plan(
+        "Find the best opportunity, research it, create an Airtable record plan, and draft "
+        "outreach for review without sending.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.intent == "opportunity_to_outreach_loop"
+
+
 def test_gmail_execution_plan_keeps_inline_email_context_off_live_gmail() -> None:
     plan = infer_gmail_execution_plan(
         "Use only this inline, non-sensitive email context: Subject: Partnership follow-up "
@@ -1426,3 +1598,19 @@ def test_cli_live_outreach_backend_fixture_request_stops_at_preflight(monkeypatc
     assert output["requires_approved_context"] is True
     assert output["send_enabled"] is False
     assert captured == {}
+def test_internal_ai_agents_workflow_message_mutation_routes_to_chief() -> None:
+    plan = infer_manual_request_plan(
+        "Post a marked test update in ai-agents-workflow, edit the same message, then delete it.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "chief_of_staff"
+
+
+def test_external_outreach_message_still_routes_to_outreach() -> None:
+    plan = infer_manual_request_plan(
+        "Draft an outreach message to the NeuroFlow partnerships lead for review.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "outreach_composer"

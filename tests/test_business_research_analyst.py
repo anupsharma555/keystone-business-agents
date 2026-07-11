@@ -159,6 +159,12 @@ def test_build_business_research_analyst_research_brief_agent() -> None:
     } <= {getattr(tool, "name", "") for tool in agent.tools}
 
 
+def test_build_business_research_analyst_research_brief_agent_can_detach_tools() -> None:
+    agent = build_business_research_analyst_research_brief_agent(attach_tools=False)
+
+    assert agent.tools == []
+
+
 def test_research_sdk_input_describes_zotero_collection_contract() -> None:
     prompt = ResearchSDKInput(
         target_name="Ketamine depression Zotero collection",
@@ -761,6 +767,31 @@ def test_page_text_enrichment_extracts_clean_source_claims() -> None:
     assert "supports research operations" in page_source.evidence_excerpt
 
 
+def test_website_input_does_not_gain_a_synthetic_fixture_source() -> None:
+    profile = research_account_from_search_results(
+        company_name="DirectSource Trial",
+        company_url="https://www.directsource.example",
+        website_inputs=[
+            {
+                "source_id": "direct:official-company-page",
+                "url": "https://www.directsource.example",
+                "title": "DirectSource Trial",
+                "source_type": "company_site",
+                "claims": [
+                    "DirectSource Trial provides behavioral health analytics to providers."
+                ],
+            }
+        ],
+    )
+
+    assert [source.source_id for source in profile.sources] == [
+        "direct:official-company-page"
+    ]
+    assert {claim.source_id for claim in profile.claims} == {
+        "direct:official-company-page"
+    }
+
+
 def test_business_research_analyst_adds_approved_local_contact_and_crm_context() -> None:
     profile = research_account_from_search_results(
         company_name="Curebase",
@@ -985,7 +1016,8 @@ def test_multi_source_research_aggregation_scores_high_confidence() -> None:
     assert profile.source_quality_summary.independent_source_count >= 3
     assert profile.consulting_fit_score >= 70
     assert len([point for point in profile.research_data_points if point.completed]) >= 6
-    assert len(profile.sources) >= 4
+    assert len(profile.sources) >= 3
+    assert not any(source.source_id.startswith("fixture:") for source in profile.sources)
     source_ids = {source.source_id for source in profile.sources}
     assert all(claim.source_id in source_ids for claim in profile.claims)
 

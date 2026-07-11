@@ -1651,6 +1651,178 @@ def test_cli_airtable_context_infers_finance_expense_receipt_target(
     assert payload["side_effects"]["external_write_performed"] is False
 
 
+def test_airtable_context_dry_run_keeps_named_tracker_expense_target() -> None:
+    output = cli._context_agent_dry_run_output(
+        "airtable_context_agent",
+        (
+            "Create one synthetic Business Expenses record in the configured Finance & "
+            "Tax Tracker and link the receipt https://example.test/receipt.pdf. Then "
+            "update and remove only that marked test record."
+        ),
+        None,
+    )
+
+    assert output is not None
+    payload = output.model_dump(mode="json")
+    assert payload["base_alias"] == "finance_tax_tracker"
+    assert payload["relevant_tables"] == ["Business Expenses"]
+    assert payload["write_plan"]["target"] == (
+        "finance_tax_tracker / Business Expenses"
+    )
+    assert "Tax Payments" not in payload["summary"]
+
+
+def test_chief_calendar_fast_path_infers_defaults_without_model_or_graph(
+    capsys,
+) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--no-live-sdk",
+            "--json",
+            "on November 4th add an all day calendar event that Frontiers in Human "
+            "Dynamics paper Due Date with note submit the final paper",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_agent"] == "chief_of_staff"
+    assert payload["calendar_action"]["start_date"].endswith("-11-04")
+    assert payload["calendar_action"]["calendar_id"] == "primary"
+    assert payload["calendar_action"]["timezone"] == "America/New_York"
+    assert payload["calendar_action"]["description"] == "submit the final paper"
+    assert payload["tool_receipt"]["status"] == "dry-run"
+    assert payload["openai_requests"] == 0
+    assert "manual_request_plan" not in payload
+
+
+def test_chief_calendar_fast_path_executes_complete_live_write_immediately(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_create(title: str, start_date: str, **kwargs: object) -> dict[str, object]:
+        captured.update({"title": title, "start_date": start_date, **kwargs})
+        return {
+            "status": "success",
+            "operation": "create_calendar_event",
+            "event_id": "kba-calendar-event",
+            "title": title,
+            "start_date": start_date,
+            "html_link": "https://calendar.test/event",
+            "verification": {"status": "verified", "passed": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "create_google_calendar_event_impl", fake_create)
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--live-sdk",
+            "--json",
+            "on November 4th add an all day calendar event that Frontiers in Human "
+            "Dynamics paper Due Date",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "done"
+    assert payload["openai_requests"] == 0
+    assert payload["side_effects"]["calendar_write_performed"] is True
+    assert captured["live"] is True
+    assert str(captured["approval_reference"]).startswith("calendar-direct:")
+
+
+def test_chief_calendar_fast_path_resolves_natural_update_reference(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_resolve(event_reference: str, **kwargs: object) -> dict[str, object]:
+        captured.update({"event_reference": event_reference, "lookup": kwargs})
+        return {
+            "status": "success",
+            "operation": "resolve_calendar_event",
+            "event_reference": event_reference,
+            "event_id": "kba-calendar-event",
+            "title": "Frontiers in Human Dynamics paper Due Date",
+            "start_date": "2026-11-04",
+            "match_count": 1,
+        }
+
+    def fake_update(event_id: str, **kwargs: object) -> dict[str, object]:
+        captured.update({"event_id": event_id, "update": kwargs})
+        return {
+            "status": "success",
+            "operation": "update_calendar_event",
+            "event_id": event_id,
+            "title": "Frontiers in Human Dynamics paper Due Date",
+            "start_date": "2026-11-04",
+            "description_present": True,
+            "verification": {"status": "verified", "passed": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
+    monkeypatch.setattr(cli, "update_google_calendar_event_impl", fake_update)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--live-sdk",
+            "--json",
+            "change the note on the Frontiers in Human Dynamics paper Due Date event ",
+            "to submit the final paper",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "done"
+    assert payload["openai_requests"] == 0
+    assert payload["calendar_action"]["event_id"] == ""
+    assert payload["calendar_action"]["event_reference"] == (
+        "Frontiers in Human Dynamics paper Due Date"
+    )
+    assert payload["calendar_lookup"]["match_count"] == 1
+    assert captured["event_id"] == "kba-calendar-event"
+    assert captured["update"]["description"] == "submit the final paper"
+    assert captured["update"]["live"] is True
+
+
+def test_chief_calendar_natural_update_dry_run_previews_lookup_without_write(
+    capsys,
+) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--no-live-sdk",
+            "--json",
+            "change the note on the Frontiers paper due date event to submit the final paper",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "dry-run"
+    assert payload["calendar_lookup"]["status"] == "dry-run"
+    assert payload["calendar_lookup"]["event_reference"] == "Frontiers paper due date"
+    assert payload["side_effects"]["calendar_write_performed"] is False
+    assert payload["openai_requests"] == 0
+
+
 def test_cli_no_live_chief_receipt_command_returns_bounded_write_plan(
     capsys,
     monkeypatch,
@@ -2444,10 +2616,25 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
                 "output_type": output_type.__name__,
                 "live": kwargs.get("live"),
                 "live_reads_env": os.environ.get(cli.AIRTABLE_LIVE_READS_ENV),
+                "max_turns": kwargs.get("max_turns"),
             }
         )
         return (
-            SimpleNamespace(final_output=None, usage=None),
+            SimpleNamespace(
+                final_output=None,
+                usage=None,
+                context_wrapper=SimpleNamespace(
+                    usage=SimpleNamespace(
+                        requests=2,
+                        input_tokens=1000,
+                        output_tokens=100,
+                        total_tokens=1100,
+                        input_tokens_details=SimpleNamespace(cached_tokens=200),
+                        output_tokens_details=SimpleNamespace(reasoning_tokens=20),
+                    )
+                ),
+                new_items=[],
+            ),
             cli.AirtableContextResult(
                 mode="llm",
                 summary="Schema available for Finance & Tax Tracker.",
@@ -2488,11 +2675,29 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
         "provider": "openai",
         "model": "gpt-5.4-mini",
         "run_mode": "live_sdk",
-        "usage_available": False,
-        "cost_available": False,
+        "usage_available": True,
+        "cost_available": True,
         "base_url_configured": False,
         "gateway_mode": False,
+        "sdk_turn_policy": {
+            "agent_name": "airtable_context_agent",
+            "max_turns": 6,
+            "source": "fixed_default",
+        },
     }
+    assert payload["usage"] == {
+        "available": True,
+        "requests": 2,
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "total_tokens": 1100,
+        "cached_input_tokens": 200,
+        "reasoning_output_tokens": 20,
+        "cache_hit_rate": 0.2,
+            "prompt_cache_key_present": False,
+            "prompt_cache_key_hash": "",
+    }
+    assert payload["cost"]["estimated_usd"] > 0
     assert isinstance(payload["agent_run_id"], int)
     assert calls == [
         {
@@ -2501,6 +2706,7 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
             "output_type": "AirtableContextResult",
             "live": True,
             "live_reads_env": "true",
+            "max_turns": 6,
         }
     ]
     assert os.environ.get(cli.AIRTABLE_LIVE_READS_ENV) is None
@@ -2509,6 +2715,343 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
     assert records[0]["agent_name"] == "airtable_context_agent"
     assert records[0]["dry_run"] == 0
     assert records[0]["model"] == "sdk-live:gpt-5.4-mini"
+
+
+def test_context_agent_tool_receipts_are_bounded_and_report_verified_writes() -> None:
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(
+                type="tool_call_output_item",
+                output=json.dumps(
+                    {
+                        "status": "success",
+                        "operation": "update",
+                        "table": "Business Expenses",
+                        "record_id": "recSynthetic",
+                        "approval_reference": "approval:test:update",
+                        "record": {"private_field": "must not enter receipt"},
+                        "verification": {
+                            "status": "verified",
+                            "passed": True,
+                            "record_id_match": True,
+                            "matched_fields": ["Description"],
+                            "mismatched_fields": [],
+                        },
+                        "send_enabled": False,
+                    }
+                ),
+            )
+        ]
+    )
+
+    receipts = cli._context_agent_tool_receipts(raw_result)
+
+    assert receipts == [
+        {
+            "status": "success",
+            "operation": "update",
+            "table": "Business Expenses",
+            "record_id": "recSynthetic",
+            "approval_reference": "approval:test:update",
+            "send_enabled": False,
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "record_id_match": True,
+                "matched_fields": ["Description"],
+                "mismatched_fields": [],
+            },
+        }
+    ]
+    assert "private_field" not in json.dumps(receipts)
+
+
+def test_context_agent_tool_receipts_report_zotero_delete_and_absence() -> None:
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(
+                type="tool_call_output_item",
+                output=json.dumps(
+                    {
+                        "status": "success",
+                        "operation": "delete_test_note",
+                        "item_key": "NOTEKBA1",
+                        "approval_reference": "approval:test:delete",
+                        "before": {"note_sha256": "private-content-hash"},
+                        "verification": {
+                            "status": "verified",
+                            "passed": True,
+                            "item_absent_after": True,
+                        },
+                        "send_enabled": False,
+                    }
+                ),
+            )
+        ]
+    )
+
+    receipts = cli._context_agent_tool_receipts(raw_result)
+
+    assert receipts == [
+        {
+            "status": "success",
+            "operation": "delete_test_note",
+            "item_key": "NOTEKBA1",
+            "approval_reference": "approval:test:delete",
+            "send_enabled": False,
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "item_absent_after": True,
+            },
+        }
+    ]
+    assert cli._context_agent_external_write_performed(receipts) is True
+    assert "private-content-hash" not in json.dumps(receipts)
+
+
+def test_context_agent_tool_receipts_classify_workspace_sheet_lifecycle() -> None:
+    outputs = [
+        {
+            "status": "success",
+            "operation": "create_sheet",
+            "spreadsheet_id": "sheetKBA1",
+            "title": "KBA_TEST_SHEET sdk-live",
+            "folder_path": "KNIOps",
+            "approval_reference": "approval:create",
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "spreadsheet_id_match": True,
+                "title_match": True,
+                "mime_type_match": True,
+                "trashed": False,
+                "trashed_match": True,
+            },
+            "send_enabled": False,
+        },
+        {
+            "status": "success",
+            "operation": "append_rows",
+            "spreadsheet_id": "sheetKBA1",
+            "sheet_name": "Validation",
+            "row_count": 1,
+            "updated_range": "Validation!A2:C2",
+            "approval_reference": "approval:append",
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "row_count_match": True,
+                "values_match": True,
+                "verified_row_count": 1,
+            },
+            "rows": [["private", "row", "content"]],
+            "send_enabled": False,
+        },
+        {
+            "status": "success",
+            "operation": "update_row",
+            "spreadsheet_id": "sheetKBA1",
+            "sheet_name": "Validation",
+            "row_number": 2,
+            "key_column": "record_key",
+            "key_value": "KBA_TEST_ROW_1",
+            "approval_reference": "approval:update",
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "row_found": True,
+                "row_number": 2,
+                "matched_fields": ["note", "status"],
+                "mismatched_fields": [],
+            },
+            "send_enabled": False,
+        },
+        {
+            "status": "success",
+            "operation": "trash_sheet",
+            "spreadsheet_id": "sheetKBA1",
+            "trashed": True,
+            "approval_reference": "approval:trash",
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "spreadsheet_id_match": True,
+                "title_match": True,
+                "mime_type_match": True,
+                "trashed": True,
+                "trashed_match": True,
+            },
+            "send_enabled": False,
+        },
+    ]
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(type="tool_call_output_item", output=json.dumps(output))
+            for output in outputs
+        ]
+    )
+
+    receipts = cli._context_agent_tool_receipts(raw_result)
+
+    assert [receipt["operation"] for receipt in receipts] == [
+        "create_sheet",
+        "append_rows",
+        "update_row",
+        "trash_sheet",
+    ]
+    assert all(receipt["spreadsheet_id"] == "sheetKBA1" for receipt in receipts)
+    assert receipts[1]["row_count"] == 1
+    assert receipts[1]["verification"]["values_match"] is True
+    assert receipts[2]["key_value"] == "KBA_TEST_ROW_1"
+    assert receipts[2]["verification"]["matched_fields"] == ["note", "status"]
+    assert receipts[3]["trashed"] is True
+    assert receipts[3]["verification"]["trashed_match"] is True
+    assert cli._context_agent_external_write_performed(receipts) is True
+    assert "private" not in json.dumps(receipts)
+
+
+def test_context_agent_verified_write_reconciles_direct_write_plan() -> None:
+    output_payload: dict[str, object] = {
+        "write_plan": {
+            "approval_required": True,
+            "approval_reference_needed": True,
+            "live_write_allowed_for_specialist": False,
+        }
+    }
+    receipts = [
+        {
+            "status": "success",
+            "operation": "create_sheet",
+            "verification": {"status": "verified", "passed": True},
+        }
+    ]
+
+    cli._reconcile_context_agent_executed_write_plan(output_payload, receipts)
+
+    write_plan = output_payload["write_plan"]
+    assert isinstance(write_plan, dict)
+    assert write_plan["approval_required"] is True
+    assert write_plan["approval_reference_needed"] is False
+    assert write_plan["live_write_allowed_for_specialist"] is True
+
+
+def test_context_agent_slide_copy_receipts_preserve_provenance_and_classify_write() -> None:
+    outputs = [
+        {
+            "status": "success",
+            "operation": "extract_slide_copy",
+            "slide_number": 2,
+            "output_format": "png",
+            "artifact_path": "artifacts/presentation-derived/KBA_TEST_SLIDE-2.png",
+            "artifact_size": 1234,
+            "artifact_sha256": "a" * 64,
+            "parent_content_sha256": "b" * 64,
+            "parent_modified": False,
+            "derived_copy_created": True,
+            "approval_reference": "approved:slide-copy",
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "artifact_exists": True,
+                "file_signature_valid": True,
+                "parent_hash_match": True,
+                "parent_mtime_match": True,
+            },
+            "send_enabled": False,
+        }
+    ]
+
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(type="tool_call_output_item", output=json.dumps(outputs[0]))
+        ]
+    )
+    receipts = cli._context_agent_tool_receipts(raw_result)
+
+    assert receipts[0]["slide_number"] == 2
+    assert receipts[0]["artifact_path"].endswith("KBA_TEST_SLIDE-2.png")
+    assert receipts[0]["verification"]["parent_hash_match"] is True
+    assert cli._context_agent_external_write_performed(receipts) is True
+
+
+def test_context_agent_unverified_write_does_not_relax_write_plan() -> None:
+    output_payload: dict[str, object] = {
+        "write_plan": {
+            "approval_reference_needed": True,
+            "live_write_allowed_for_specialist": False,
+        }
+    }
+    receipts = [
+        {
+            "status": "success",
+            "operation": "create_sheet",
+            "verification": {"status": "verification_failed", "passed": False},
+        }
+    ]
+
+    cli._reconcile_context_agent_executed_write_plan(output_payload, receipts)
+
+    write_plan = output_payload["write_plan"]
+    assert isinstance(write_plan, dict)
+    assert write_plan["approval_reference_needed"] is True
+    assert write_plan["live_write_allowed_for_specialist"] is False
+
+
+def test_context_agent_workspace_read_receipts_keep_identity_without_content() -> None:
+    outputs = [
+        {
+            "status": "success",
+            "operation": "search_files",
+            "query": "proposal",
+            "mime_type": "application/vnd.google-apps.document",
+            "folder_path": "KNIOps",
+            "item_count": 1,
+            "items": [{"id": "private-file-id", "name": "private file name"}],
+            "send_enabled": False,
+        },
+        {
+            "status": "success",
+            "operation": "read_doc",
+            "document_id": "docKBA1",
+            "title": "Selected internal document",
+            "char_count": 412,
+            "truncated": False,
+            "text": "private document body must not enter the receipt",
+            "send_enabled": False,
+        },
+    ]
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(type="tool_call_output_item", output=json.dumps(output))
+            for output in outputs
+        ]
+    )
+
+    receipts = cli._context_agent_tool_receipts(raw_result)
+
+    assert receipts == [
+        {
+            "status": "success",
+            "operation": "search_files",
+            "folder_path": "KNIOps",
+            "query": "proposal",
+            "mime_type": "application/vnd.google-apps.document",
+            "item_count": 1,
+            "send_enabled": False,
+        },
+        {
+            "status": "success",
+            "operation": "read_doc",
+            "document_id": "docKBA1",
+            "title": "Selected internal document",
+            "char_count": 412,
+            "truncated": False,
+            "send_enabled": False,
+        },
+    ]
+    assert "private-file-id" not in json.dumps(receipts)
+    assert "private document body" not in json.dumps(receipts)
 
 
 @pytest.mark.parametrize(
@@ -3520,6 +4063,85 @@ def test_cli_ask_gmail_reply_without_thread_context_is_blocked(
     assert calls == []
 
 
+def test_cli_exact_operator_gmail_draft_write_propagates_scoped_approval(
+    monkeypatch,
+    capsys,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    prompt = (
+        "Find the latest email from Example Health and create a Gmail draft reply. "
+        "Do not send it."
+    )
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_GMAIL_DRAFT_ACCOUNT", "operator@example.com")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+
+    exit_code = main(["ask", "--agent", "gmail_triage", "--live-sdk", "--json", prompt])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_agent"] == "gmail_triage"
+    assert len(calls) == 1
+    command = calls[0]
+    assert "--live-gmail" in command
+    assert "--live-sdk" in command
+    assert "--create-draft" in command
+    assert "--no-dry-run" in command
+    assert command[command.index("--expected-account") + 1] == "operator@example.com"
+    approval_reference = command[command.index("--approval-reference") + 1]
+    assert approval_reference.startswith("operator-command:gmail-draft:")
+    assert prompt not in approval_reference
+    assert command[command.index("--gmail-query") + 1].endswith('"example health"')
+    assert payload["agent_execution_plan"]["create_gmail_drafts"] is True
+    assert payload["send_enabled"] is False
+
+
+def test_cli_natural_gmail_draft_update_resolves_without_operator_id(
+    monkeypatch,
+    capsys,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    prompt = (
+        "Update the existing Gmail draft with subject 'Project follow-up' for "
+        "reviewer@example.com to be shorter and warmer. Do not send."
+    )
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_GMAIL_DRAFT_ACCOUNT", "operator@example.com")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+
+    exit_code = main(["ask", "--agent", "gmail_triage", "--live-sdk", "--json", prompt])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(calls) == 1
+    command = calls[0]
+    assert "--update-draft" in command
+    assert "--create-draft" not in command
+    assert command[command.index("--draft-subject-hint") + 1] == "Project follow-up"
+    assert command[command.index("--draft-recipient-hint") + 1] == (
+        "reviewer@example.com"
+    )
+    assert "--approval-reference" in command
+    assert "--expected-account" in command
+    assert payload["agent_execution_plan"]["operation"] == "update_draft"
+    assert payload["agent_execution_plan"]["draft_subject_hint"] == "Project follow-up"
+    assert payload["send_enabled"] is False
+
+
 def test_cli_ask_gmail_triage_live_promotes_inline_email_workflow_to_work_item(
     monkeypatch,
     capsys,
@@ -3559,6 +4181,187 @@ def test_cli_ask_gmail_triage_live_promotes_inline_email_workflow_to_work_item(
     assert call["max_manager_steps"] == 3
     assert call["manual_plan"] is not None
     assert call["orchestrator_preflight"] is not None
+
+
+def test_cli_explicit_orchestrator_source_bundle_uses_work_item_graph(
+    monkeypatch,
+    capsys,
+) -> None:
+    work_item_calls: list[dict[str, object]] = []
+    fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
+
+    def fake_work_item(input_text, **kwargs):
+        work_item_calls.append({"input_text": input_text, **kwargs})
+        return 0
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_work_item)
+    monkeypatch.setattr(
+        cli,
+        "_run_ask_orchestrator",
+        lambda *_args, **_kwargs: pytest.fail("direct Orchestrator path must not run"),
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "orchestrator",
+            "--live-sdk",
+            "--context-file",
+            str(fixture_path),
+            "--json",
+            "Research the supplied packet and prepare a draft-only reply.",
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == ""
+    assert len(work_item_calls) == 1
+    call = work_item_calls[0]
+    assert call["context_file_path"] == str(fixture_path)
+    assert call["live_sdk"] is True
+    assert call["live_search"] is False
+    assert call["max_manager_steps"] == 3
+
+
+def test_cli_source_bundle_request_budget_blocks_before_preflight_model_call(
+    monkeypatch,
+    capsys,
+) -> None:
+    fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
+    preflight_calls: list[str] = []
+
+    def unexpected_preflight(request_text, **_kwargs):
+        preflight_calls.append(request_text)
+        pytest.fail("request budget must block before preflight")
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", unexpected_preflight)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "orchestrator",
+            "--live-sdk",
+            "--context-file",
+            str(fixture_path),
+            "--max-openai-requests",
+            "1",
+            "--json",
+            "Research the supplied packet and prepare a draft-only reply.",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert preflight_calls == []
+    assert payload["block_kind"] == "openai_request_budget_exceeded"
+    assert payload["estimated_requests"]["max"] == 2
+    assert payload["estimated_requests"]["stages"] == [
+        "manual_request_planner",
+        "outreach_composer_synthesis",
+    ]
+    assert payload["openai_requests_made"] == 0
+
+
+def test_cli_source_bundle_no_live_manual_plan_fits_one_request_ceiling(
+    monkeypatch,
+    capsys,
+) -> None:
+    fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
+    work_item_calls: list[dict[str, object]] = []
+    preflight_live_plan_values: list[bool] = []
+
+    def fake_preflight(request_text, *, live_manual_plan, **kwargs):
+        preflight_live_plan_values.append(live_manual_plan)
+        return _fake_orchestrator_preflight(
+            request_text,
+            live_manual_plan=live_manual_plan,
+            **kwargs,
+        )
+
+    def fake_work_item(input_text, **kwargs):
+        work_item_calls.append({"input_text": input_text, **kwargs})
+        return 0
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_work_item)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "orchestrator",
+            "--live-sdk",
+            "--no-live-manual-plan",
+            "--context-file",
+            str(fixture_path),
+            "--max-openai-requests",
+            "1",
+            "--json",
+            "Research the supplied packet and prepare a draft-only reply.",
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == ""
+    assert preflight_live_plan_values == [False]
+    assert len(work_item_calls) == 1
+
+
+def test_cli_connector_backed_gmail_graph_budget_blocks_before_preflight(
+    monkeypatch,
+    capsys,
+) -> None:
+    preflight_calls: list[str] = []
+    request = (
+        "Read the latest Gmail thread from alex@example.test, research Example Health "
+        "using only the selected thread context, and prepare a draft reply for review "
+        "without sending, creating a Gmail draft, searching the web, posting, or "
+        "writing externally."
+    )
+
+    def unexpected_preflight(request_text, **_kwargs):
+        preflight_calls.append(request_text)
+        pytest.fail("connector graph budget must block before preflight or Gmail")
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", unexpected_preflight)
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--no-live-manual-plan",
+            "--max-openai-requests",
+            "0",
+            "--max-manager-steps",
+            "3",
+            "--json",
+            request,
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert preflight_calls == []
+    assert payload["block_kind"] == "openai_request_budget_exceeded"
+    assert payload["estimated_requests"]["min"] == 4
+    assert payload["estimated_requests"]["stages"] == [
+        "manager_specialist_step_1",
+        "manager_specialist_step_2",
+        "manager_specialist_step_3",
+        "final_response_synthesis",
+    ]
+    assert payload["openai_requests_made"] == 0
 
 
 def test_cli_ask_gmail_triage_live_accepts_simple_inline_sanitized_email_fixture(

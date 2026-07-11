@@ -37,6 +37,10 @@ def test_local_kni_evidence_lookup_detection_handles_short_insurance_followups()
     assert local_kni_evidence.looks_like_local_kni_evidence_lookup(
         "which registered agent appears in the Keystone Neuroinformatics filing?"
     )
+    assert local_kni_evidence.looks_like_local_kni_evidence_lookup(
+        "Search local KNI documents for the latest client proposal or capability "
+        "statement and summarize the key service areas."
+    )
     assert not local_kni_evidence.looks_like_local_kni_evidence_lookup(
         "summarize the Slack thread follow ups"
     )

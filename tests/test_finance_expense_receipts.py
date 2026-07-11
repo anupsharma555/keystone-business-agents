@@ -52,6 +52,17 @@ def test_infer_personal_expense_receipt_target_from_airtable_ask() -> None:
     assert target.receipt_local_path == "/tmp/receipt.png"
 
 
+def test_infer_expense_receipt_target_from_named_finance_tracker() -> None:
+    target = infer_finance_expense_receipt_target(
+        "Create one Business Expenses record in the configured Finance & Tax Tracker "
+        "and link this receipt: https://example.test/receipt.pdf"
+    )
+
+    assert target is not None
+    assert target.base_alias == "finance_tax_tracker"
+    assert target.table == "Business Expenses"
+
+
 def test_finance_receipt_target_requires_airtable_expense_and_evidence() -> None:
     assert infer_finance_expense_receipt_target("add a business expense from lunch") is None
     assert infer_finance_expense_receipt_target("read airtable business expenses") is None
