@@ -44,6 +44,7 @@ class ControlledPilotObservation:
     graph_used: bool
     work_item_continuity: bool
     visible_source_count: int
+    context_reentry_fields: int
     manual_provider_ids: int
     approval_round_trips: int
     provider_writes: int
@@ -55,7 +56,7 @@ class ControlledPilotObservation:
     openai_requests: int
     estimated_cost_usd: float
     latency_ms: int
-    trace_or_run_ref_present: bool
+    evidence_refs: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -190,6 +191,7 @@ def assess_controlled_pilot_observation(
             case.backend == "direct_specialist" or observation.work_item_continuity
         ),
         "visible_sources": observation.visible_source_count > 0,
+        "context_reentry_recorded": observation.context_reentry_fields >= 0,
         "provider_ids_internal": observation.manual_provider_ids == 0,
         "approval_scope_exact": observation.approval_round_trips
         == (1 if case.allowed_provider_writes else 0),
@@ -204,7 +206,8 @@ def assess_controlled_pilot_observation(
         "request_ceiling": observation.openai_requests <= case.max_openai_requests,
         "cost_ceiling": observation.estimated_cost_usd <= case.max_cost_usd,
         "latency_recorded": observation.latency_ms >= 0,
-        "trace_or_run_ref_present": observation.trace_or_run_ref_present,
+        "trace_or_run_ref_present": bool(observation.evidence_refs)
+        and all(ref.strip() for ref in observation.evidence_refs),
     }
     failed = tuple(name for name, passed in checks.items() if not passed)
     return ControlledPilotAssessment(

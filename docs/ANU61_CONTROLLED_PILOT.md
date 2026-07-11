@@ -31,3 +31,18 @@ more than one final response, the wrong backend, or missing trace/cost/source
 evidence. A passing KBA observation can then be paired with a matched clean
 Codex/ChatGPT-style observation through the ANU-175 comparison contract; the
 pilot must not infer a comparative win from missing baseline data.
+
+Build the combined ANU-61/ANU-125 scorecard from sanitized saved observations:
+
+```bash
+npm run score:controlled-pilot -- \
+  --input artifacts/test-pack/controlled-pilot-observations.json \
+  --output artifacts/test-pack/controlled-pilot-scorecard.json
+```
+
+The input object has `trusted_runtime_rows`, `observations`, and optional
+`baseline_observations`. Duplicate observations are rejected rather than
+cherry-picked. Missing trusted rows, pilot cases, or baselines stay visibly
+pending. A full pilot PASS requires all four trusted rows plus all four passing
+KBA observations. Comparative claims are counted separately and only after a
+matched baseline observation passes the ANU-175 comparison contract.

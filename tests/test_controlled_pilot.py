@@ -24,6 +24,7 @@ def _observation(case_id: str, **overrides: object) -> ControlledPilotObservatio
         "graph_used": case.backend == "langgraph",
         "work_item_continuity": True,
         "visible_source_count": 2,
+        "context_reentry_fields": 0,
         "manual_provider_ids": 0,
         "approval_round_trips": 1 if case.allowed_provider_writes else 0,
         "provider_writes": case.allowed_provider_writes,
@@ -35,7 +36,7 @@ def _observation(case_id: str, **overrides: object) -> ControlledPilotObservatio
         "openai_requests": case.max_openai_requests,
         "estimated_cost_usd": case.max_cost_usd,
         "latency_ms": 1_000,
-        "trace_or_run_ref_present": True,
+        "evidence_refs": ("slack:permalink", "trace:run-1"),
     }
     values.update(overrides)
     return ControlledPilotObservation(**values)
