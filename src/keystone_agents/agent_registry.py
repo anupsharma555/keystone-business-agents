@@ -650,6 +650,7 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
         "tests/test_orchestrator.py",
         "tests/test_handoff_contracts.py",
         "tests/test_orchestrator_preflight_context.py",
+        "tests/test_advanced_manager_live_validation.py",
         "tests/test_workflow_runner.py",
         "tests/test_slack_action_contract.py",
         "tests/test_slack_agent_actions.py",

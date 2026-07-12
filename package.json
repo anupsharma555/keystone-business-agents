@@ -3,6 +3,7 @@
     "test:ai-agents-workflow:no-live": ".venv/bin/python scripts/run_ai_agents_workflow_no_live_gate.py",
     "test:agent-execution-tiers": ".venv/bin/python scripts/run_agent_execution_tier_gate.py",
     "test:advanced-manager:no-live": ".venv/bin/python scripts/run_advanced_manager_acceptance.py",
+    "test:advanced-manager:live-correction": ".venv/bin/python scripts/run_advanced_manager_live_correction.py",
     "test:manager-delegation:no-live": ".venv/bin/python scripts/run_manager_delegation_readiness.py",
     "test:differentiation:no-live": ".venv/bin/python scripts/run_anu175_no_live_smoke.py",
     "run:opportunity-assessment:compact": ".venv/bin/python scripts/run_compact_opportunity_assessment.py",
