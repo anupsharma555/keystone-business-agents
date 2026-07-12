@@ -69,6 +69,12 @@ resume without repeated specialists, contradictory-source review, scoped
 Airtable write gating, stale-write reversal, typed context handoffs, and useful
 completion review without false blocking. Live model comparison remains a later
 bounded quality proof, not a prerequisite for these deterministic invariants.
+That live quality boundary now also passes: one two-turn local SDK session kept
+the initial cross-agent research/opportunity/outreach request Chief-owned, then
+applied an exact correction to Business Research while rejecting stale scouting
+and outreach. All 13 checks passed in two `gpt-5.4-mini` requests at a maintained
+`$0.00573` estimate, with no tools, provider reads/writes, side effects, retry,
+or persisted session.
 
 ANU-61 now has reusable exact-ask live reasoning proofs below the Slack
 acceptance layer. The compact Opportunity assessment passed offline

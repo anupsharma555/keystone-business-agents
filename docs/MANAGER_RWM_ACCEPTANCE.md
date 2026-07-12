@@ -79,6 +79,21 @@ category, next fix, proof node IDs, zero OpenAI requests, no live connectors,
 and no external side effects. This gate must pass before proposing the bounded
 live ANU-222 batch.
 
+Repeat the bounded live correction proof with:
+
+```bash
+npm run test:advanced-manager:live-correction -- \
+  --max-openai-requests 2 \
+  --max-total-cost-usd 0.10 \
+  --output artifacts/test-pack/advanced-manager-live-correction.json
+```
+
+It uses one local SDK session across exactly two model requests, attaches no
+tools, performs no provider reads or writes, and removes the temporary session
+afterward. Acceptance requires the first compound request to remain Chief-owned
+and the correction to supersede stale opportunity and outreach direction while
+retaining explicit evidence that prior direction was considered.
+
 ## ANU-223 delegation readiness gate
 
 `src/keystone_agents/manager_delegation_readiness.py` keeps manager-entry proof,
