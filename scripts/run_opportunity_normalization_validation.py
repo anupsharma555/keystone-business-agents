@@ -23,7 +23,7 @@ EXPECTED_MODEL = "gpt-5.4-mini"
 EXPECTED_REQUESTS = 1
 MAX_BUDGET_USD = 0.10
 SOURCE_PACKET = Path(
-    "artifacts/test-pack/opportunity-hack-for-humanity-source-packet.json"
+    "tests/fixtures/opportunity-hack-for-humanity-source-packet.json"
 )
 EXPECTED_URLS = {
     "https://hack-for-humanity-summer-26.devpost.com/",

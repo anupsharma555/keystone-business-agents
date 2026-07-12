@@ -13,6 +13,15 @@ from keystone_agents.tools.internal_data_tools import (
     presentation_read_local_impl,
     presentation_search_local_impl,
 )
+from keystone_agents.workflow_vocabulary import (
+    ControlledTagSet,
+    EvidenceTag,
+    ObjectTag,
+    SafetyTag,
+    StorageTag,
+    WorkflowTag,
+    attach_controlled_tags,
+)
 
 
 def refresh_presentation_index(
@@ -160,17 +169,26 @@ def presentation_hits_to_artifact_refs(
                 ),
                 summary=str(hit.get("evidence_excerpt") or ""),
                 selected=True,
-                metadata={
-                    "relative_path": relative_path,
-                    "slide_number": slide_number,
-                    "slide_id": str(hit.get("slide_id") or ""),
-                    "deck_sha256": deck_sha256,
-                    "modified_time": str(hit.get("modified_time") or ""),
-                    "lexical_score": int(hit.get("lexical_score") or 0),
-                    "snapshot": True,
-                    "parent_modified": False,
-                    "send_enabled": False,
-                },
+                metadata=attach_controlled_tags(
+                    {
+                        "relative_path": relative_path,
+                        "slide_number": slide_number,
+                        "slide_id": str(hit.get("slide_id") or ""),
+                        "deck_sha256": deck_sha256,
+                        "modified_time": str(hit.get("modified_time") or ""),
+                        "lexical_score": int(hit.get("lexical_score") or 0),
+                        "snapshot": True,
+                        "parent_modified": False,
+                        "send_enabled": False,
+                    },
+                    ControlledTagSet(
+                        object=ObjectTag.PRESENTATION_SLIDE,
+                        workflow={WorkflowTag.RESEARCH, WorkflowTag.VERIFICATION},
+                        safety={SafetyTag.READ_ONLY, SafetyTag.NO_SEND, SafetyTag.NO_POST},
+                        evidence={EvidenceTag.EXTRACTED, EvidenceTag.PROVIDER_VERIFIED},
+                        storage={StorageTag.ARTIFACT_FILE, StorageTag.SQLITE},
+                    ),
+                ),
             )
         )
     return refs

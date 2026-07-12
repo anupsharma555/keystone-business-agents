@@ -54,6 +54,11 @@ def test_index_searches_slide_text_and_notes_then_promotes_typed_refs(
     assert refs[0].metadata["snapshot"] is True
     assert refs[0].metadata["parent_modified"] is False
     assert refs[0].metadata["send_enabled"] is False
+    assert refs[0].metadata["controlled_vocabulary_version"] == (
+        "keystone.workflow_vocabulary.v1"
+    )
+    assert "kba:object:presentation_slide" in refs[0].metadata["controlled_tags"]
+    assert "kba:safety:read_only" in refs[0].metadata["controlled_tags"]
 
 
 def test_index_dry_run_and_missing_query_are_side_effect_free(tmp_path: Path) -> None:

@@ -89,6 +89,14 @@ relative provenance, slide identity, deck checksum, snapshot status, and
 explicit no-send/no-parent-modification metadata. The final slice used zero
 OpenAI requests and zero provider writes.
 
+ANU-216's controlled workflow vocabulary is implemented and exercised on that
+same typed handoff. Canonical `kba:<dimension>:<value>` labels cover object,
+workflow, safety, evidence, and storage state; aliases are bounded, unknown tags
+fail closed, and deterministic gates reject approval-less external effects,
+sensitive hosted storage, read-only/write contradictions, and slides without
+file/SQLite provenance. This adds interoperable context without granting
+permissions or replacing typed identity/source fields.
+
 ANU-174 is now 20/20. L174-14 passed with one privacy-minimized Chief request:
 45,559 input tokens including 45,312 cached, 783 output tokens, and a maintained
 `$0.00710715` estimate. The answer cited the sanitized source identity,
