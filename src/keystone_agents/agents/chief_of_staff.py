@@ -33,6 +33,7 @@ from keystone_agents.memory import (
     chief_of_staff_memory_item,
     operator_reference_memory_item,
 )
+from keystone_agents.model_provider import get_runtime_agent_model
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.quality_budget import (
     AgentQualityBudget,
@@ -366,7 +367,7 @@ def build_chief_slack_command_resolver_agent(
         instructions=load_prompt("chief_slack_command_resolver.md").strip(),
         output_type=ChiefSlackCommandResolution,
         tools=[],
-        model=model or "gpt-5.4-mini",
+        model=get_runtime_agent_model("chief_of_staff", model_override=model),
         model_settings=build_model_settings(
             reasoning_effort="low",
             verbosity="low",

@@ -18864,6 +18864,7 @@ def _compose_outreach_draft_for_work_item(
         outcome = run_retrieved_sdk_synthesis(
             agent=build_outreach_composer_compact_synthesis_agent(
                 request_text=request.request_text,
+                include_tools_policy=True,
             ),
             output_type=OutreachLLMDraftPayload,
             retrieve=retrieve,

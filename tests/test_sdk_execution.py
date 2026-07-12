@@ -3122,9 +3122,27 @@ def test_fake_model_tool_call_executes_fixture_tool(monkeypatch: pytest.MonkeyPa
 
 def test_chief_fake_model_selects_and_validates_native_slack_command(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    slack_repo = tmp_path / "keystone-slack"
+    runner_source = slack_repo / "kni_integrations" / "workflow_runner.py"
+    runner_source.parent.mkdir(parents=True)
+    runner_source.write_text(
+        'COMMANDS = {"/kni-preprints-digest": "knowledge"}\n',
+        encoding="utf-8",
+    )
+    manifest = slack_repo / "slack" / "kni-app-manifest.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "features:\n"
+        "  slash_commands:\n"
+        "    - command: /kni-preprints-digest\n"
+        "      description: Gather recent medRxiv preprints\n"
+        "      usage_hint: digital biomarkers\n",
+        encoding="utf-8",
+    )
     command_text = "/kni-preprints-digest depression digital biomarkers"
     payload = _chief_of_staff_payload(
         intent="run a preprints digest for depression digital biomarkers",
@@ -3140,8 +3158,18 @@ def test_chief_fake_model_selects_and_validates_native_slack_command(
     )
     model = FakeModel(
         outputs=[
-            [_tool_call("list_slack_slash_commands", {})],
-            [_tool_call("validate_slack_slash_command", {"command_text": command_text})],
+            [
+                _tool_call(
+                    "list_slack_slash_commands",
+                    {"repo_path": str(slack_repo)},
+                )
+            ],
+            [
+                _tool_call(
+                    "validate_slack_slash_command",
+                    {"command_text": command_text, "repo_path": str(slack_repo)},
+                )
+            ],
             [_structured_message(payload)],
         ]
     )

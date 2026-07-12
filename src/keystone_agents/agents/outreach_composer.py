@@ -1550,13 +1550,16 @@ def build_outreach_composer_compact_synthesis_agent(
     *,
     request_text: str = "",
     include_all_skills: bool = False,
+    include_tools_policy: bool = False,
 ) -> Agent:
     """Build a compact structured-output outreach agent for constrained providers."""
 
+    prompt_files = ["keystone_profile.md", "safety_policy.md"]
+    if include_tools_policy:
+        prompt_files.append("tools.md")
+    prompt_files.append("outreach_composer.md")
     instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "outreach_composer.md",
+        *prompt_files,
         skill_files=(
             select_agent_skill_names(
                 "outreach_composer",

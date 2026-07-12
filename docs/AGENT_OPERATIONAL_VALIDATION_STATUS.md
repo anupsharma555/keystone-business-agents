@@ -81,6 +81,14 @@ and staged an approval-gated `KNIOps` plan without a Workspace write. Neither is
 misclassified as a full pilot PASS because the Slack permalink/entry layer was
 not exercised.
 
+ANU-213's finite presentation residual now passes. A repo-local SQLite index
+scanned 12 allowlisted reviewed decks and 116 slides, searched title/path/slide
+text/speaker notes with all-term lexical matching, and returned bounded evidence
+excerpts. Matches promote into typed `presentation_slide_evidence` refs with
+relative provenance, slide identity, deck checksum, snapshot status, and
+explicit no-send/no-parent-modification metadata. The final slice used zero
+OpenAI requests and zero provider writes.
+
 ANU-174 is now 20/20. L174-14 passed with one privacy-minimized Chief request:
 45,559 input tokens including 45,312 cached, 783 output tokens, and a maintained
 `$0.00710715` estimate. The answer cited the sanitized source identity,
