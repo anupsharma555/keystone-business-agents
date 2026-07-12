@@ -49,6 +49,10 @@ MAX_WALK_FILES = 2_000
 MAX_SEARCH_RESULTS = 25
 MAX_SEARCH_FILE_BYTES = 500_000
 MAX_READ_CHARS = 12_000
+SLACK_COMMAND_SOURCE = "kni_integrations/workflow_runner.py"
+SLACK_MANIFEST_SOURCE = "slack/kni-app-manifest.yaml"
+_SLASH_COMMAND_RE = re.compile(r'["\'](?P<command>/kni(?:-[a-z0-9-]+)?)["\']\s*:')
+_MANIFEST_COMMAND_RE = re.compile(r"^\s*- command:\s*(?P<command>/kni(?:-[a-z0-9-]+)?)\s*$")
 
 
 @dataclass(frozen=True)
@@ -663,6 +667,109 @@ def lookup_slack_workflow_capability(topic: str) -> str:
             "send_enabled": False,
             "slack_post_allowed": False,
             "capability": capability,
+        }
+    )
+
+
+def _registered_slack_commands(*, repo_path: str | None = None) -> list[str]:
+    """Read the native WorkflowRunner command map without importing the Slack runtime."""
+
+    root = _slack_repo_root(repo_path)
+    source = root / SLACK_COMMAND_SOURCE
+    if not source.is_file():
+        return []
+    text = source.read_text(encoding="utf-8", errors="ignore")
+    return sorted(
+        {"/kni", *(match.group("command") for match in _SLASH_COMMAND_RE.finditer(text))}
+    )
+
+
+def _configured_slack_command_details(
+    *, repo_path: str | None = None
+) -> list[dict[str, str]]:
+    """Read configured command semantics from the Slack app manifest."""
+
+    manifest = _slack_repo_root(repo_path) / SLACK_MANIFEST_SOURCE
+    if not manifest.is_file():
+        return []
+    details: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for raw_line in manifest.read_text(encoding="utf-8", errors="ignore").splitlines():
+        match = _MANIFEST_COMMAND_RE.match(raw_line)
+        if match:
+            current = {
+                "command": match.group("command"),
+                "description": "",
+                "usage_hint": "",
+            }
+            details.append(current)
+            continue
+        if current is None:
+            continue
+        stripped = raw_line.strip()
+        if stripped.startswith("description:"):
+            current["description"] = stripped.partition(":")[2].strip()
+        elif stripped.startswith("usage_hint:"):
+            current["usage_hint"] = stripped.partition(":")[2].strip()
+    return details
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def list_slack_slash_commands(repo_path: str | None = None) -> str:
+    """List slash commands registered by the local Keystone Slack WorkflowRunner."""
+
+    registered_commands = _registered_slack_commands(repo_path=repo_path)
+    command_details = _configured_slack_command_details(repo_path=repo_path)
+    configured_commands = [item["command"] for item in command_details]
+    commands = configured_commands or registered_commands
+    return _json_payload(
+        {
+            "mode": "slack_slash_command_catalog",
+            "repo_present": _slack_repo_root(repo_path).is_dir(),
+            "source": SLACK_MANIFEST_SOURCE if command_details else SLACK_COMMAND_SOURCE,
+            "commands": commands,
+            "command_count": len(commands),
+            "command_details": command_details,
+            "backend_registered_commands": registered_commands,
+            "backend_only_aliases": sorted(set(registered_commands) - set(commands)),
+            "execution_owner": "keystone-slack WorkflowRunner",
+            "notes": [
+                "Chief of Staff may select any command in this catalog.",
+                "Return the exact slash command and arguments; Keystone Slack executes it.",
+                (
+                    "Native approval, publish, write, credential, and live-provider "
+                    "gates remain authoritative."
+                ),
+            ],
+        }
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def validate_slack_slash_command(
+    command_text: str,
+    repo_path: str | None = None,
+) -> str:
+    """Validate an exact Chief of Staff command against the native Slack command map."""
+
+    normalized = " ".join(str(command_text or "").strip().split())
+    command_name = normalized.split(" ", 1)[0].lower() if normalized else ""
+    commands = _registered_slack_commands(repo_path=repo_path)
+    configured_commands = {
+        item["command"] for item in _configured_slack_command_details(repo_path=repo_path)
+    }
+    supported = command_name in commands
+    return _json_payload(
+        {
+            "mode": "slack_slash_command_validation",
+            "command_text": normalized,
+            "command_name": command_name,
+            "supported": supported,
+            "configured_in_slack": command_name in configured_commands,
+            "execution_owner": "keystone-slack WorkflowRunner",
+            "send_enabled": False,
+            "execute_in_tool": False,
+            "blocker": "" if supported else "Command is not registered by Keystone Slack.",
         }
     )
 

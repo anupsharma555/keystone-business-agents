@@ -33,6 +33,7 @@ ChiefOfStaffWorkflowType = Literal[
     "slack-article-review",
     "slack-follow-up-review",
     "slack-docs-review",
+    "slack-command",
     "project-context-review",
     "research-direction-review",
     "budget-resource-review",
@@ -61,6 +62,28 @@ ChiefContextHandoffStage = Literal[
     "before_durable_handoff",
     "after_durable_handoff",
 ]
+
+
+class ChiefSlackCommandResolution(BaseModel):
+    """Compact Chief decision for routing one natural-language ask to KS."""
+
+    status: Literal["matched", "no_match", "clarification"] = "no_match"
+    command_text: str = ""
+    rationale: str = ""
+    confidence: Literal["high", "medium", "low"] = "low"
+
+    @field_validator("command_text", "rationale", mode="before")
+    @classmethod
+    def _clean_resolution_fields(cls, value: object) -> str:
+        return _clean_text(value)
+
+    @model_validator(mode="after")
+    def _validate_matched_command(self) -> ChiefSlackCommandResolution:
+        if self.status == "matched" and not self.command_text.startswith("/kni"):
+            raise ValueError("Matched Chief Slack commands must start with /kni.")
+        if self.status != "matched" and self.command_text:
+            raise ValueError("Only matched resolutions may include command_text.")
+        return self
 
 
 def _clean_text(value: object) -> str:
