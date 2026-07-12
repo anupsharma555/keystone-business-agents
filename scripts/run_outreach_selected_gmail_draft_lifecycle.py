@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--budget-usd", type=float, default=MAX_BUDGET_USD)
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument(
+        "--source-bundle-output",
+        type=Path,
+        help=(
+            "Optional local-only path for a sanitized WorkItem source bundle built "
+            "from the selected synthetic thread."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path(
@@ -75,17 +84,22 @@ def _hash(value: object, *, length: int = 16) -> str:
 
 
 def _select_synthetic_thread(provider: Any) -> dict[str, Any]:
+    configured_recipient = os.getenv("KEYSTONE_GMAIL_TEST_SEND_RECIPIENT", "").strip()
+    if configured_recipient and not re.fullmatch(
+        r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", configured_recipient
+    ):
+        raise RuntimeError("configured_test_recipient_invalid")
+    recipient_filter = f' to:"{configured_recipient}"' if configured_recipient else ""
     refs = provider.list_recent_messages(
         label="SENT",
         max_results=10,
-        query=f'subject:"{GMAIL_TEST_EMAIL_MARKER}"',
+        query=f'subject:"{GMAIL_TEST_EMAIL_MARKER}"{recipient_filter}',
     )
-    if len(refs) != 1:
-        raise RuntimeError(
-            "synthetic_gmail_thread_not_unique"
-            if refs
-            else "synthetic_gmail_thread_not_found"
-        )
+    if not refs:
+        raise RuntimeError("synthetic_gmail_thread_not_found")
+    # Gmail returns message searches newest-first. Validation history is expected to
+    # accumulate, so resolve the latest exact marked candidate and retain its provider
+    # identity instead of requiring the marker to be globally unique forever.
     thread_id = str(refs[0].get("threadId") or refs[0].get("thread_id") or "")
     if not thread_id:
         raise RuntimeError("synthetic_gmail_thread_id_missing")
@@ -93,12 +107,25 @@ def _select_synthetic_thread(provider: Any) -> dict[str, Any]:
     messages = list(thread.get("messages") or [])
     if not messages:
         raise RuntimeError("synthetic_gmail_thread_empty")
-    latest = messages[-1]
-    subject = str(thread.get("subject") or latest.get("subject") or "")
-    body = str(latest.get("normalized_body") or latest.get("body") or "")
-    if GMAIL_TEST_EMAIL_MARKER not in subject or GMAIL_TEST_EMAIL_MARKER not in body:
+    marked_messages = [
+        message
+        for message in messages
+        if GMAIL_TEST_EMAIL_MARKER
+        in str(thread.get("subject") or message.get("subject") or "")
+        and GMAIL_TEST_EMAIL_MARKER
+        in str(message.get("normalized_body") or message.get("body") or "")
+    ]
+    if not marked_messages:
         raise RuntimeError("synthetic_gmail_thread_marker_missing")
-    raw_recipients = latest.get("to") or []
+    selected_message = marked_messages[-1]
+    selected_message_id = str(selected_message.get("id") or "").strip()
+    if not selected_message_id:
+        raise RuntimeError("synthetic_gmail_message_id_missing")
+    subject = str(thread.get("subject") or selected_message.get("subject") or "")
+    body = str(
+        selected_message.get("normalized_body") or selected_message.get("body") or ""
+    )
+    raw_recipients = selected_message.get("to") or []
     recipients = (
         [str(item).strip() for item in raw_recipients if str(item).strip()]
         if isinstance(raw_recipients, list)
@@ -108,13 +135,18 @@ def _select_synthetic_thread(provider: Any) -> dict[str, Any]:
     )
     if len(recipients) != 1:
         raise RuntimeError("synthetic_gmail_thread_recipient_not_unique")
+    if configured_recipient and recipients[0].casefold() != configured_recipient.casefold():
+        raise RuntimeError("configured_test_recipient_mismatch")
     return {
         "thread_id": thread_id,
-        "message_id": str(latest.get("id") or ""),
+        "message_id": selected_message_id,
         "subject": subject,
         "body": body,
         "message_count": len(messages),
+        "marked_message_count": len(marked_messages),
         "recipient": recipients[0],
+        "candidate_count": len(refs),
+        "selection_policy": "newest_exact_marked_thread",
     }
 
 
@@ -151,6 +183,91 @@ def _approved_context(selected: dict[str, Any]) -> Any:
     )
 
 
+def build_graph_source_bundle(selected: dict[str, Any]) -> dict[str, Any]:
+    """Build a sanitized supplied-material packet without recipient or raw body text."""
+
+    thread_ref = _hash(selected["thread_id"])
+    message_ref = _hash(selected["message_id"])
+    source_id = f"gmail:selected-thread:{thread_ref}"
+    return {
+        "schema": "keystone.work_item.source_bundle.v1",
+        "supplied_material_only": True,
+        "target": {
+            "name": "Keystone Business Agents validation",
+            "email": "reviewer@example.test",
+            "object_type": "gmail_thread",
+            "external_id": f"gmail-thread:{thread_ref}",
+        },
+        "gmail_context": {
+            "thread_id": f"gmail-thread:{thread_ref}",
+            "message_id": f"gmail-message:{message_ref}",
+            "sender": "Synthetic KBA validation correspondent",
+            "thread_summary": (
+                "A marked synthetic validation message requested a concise confirmation "
+                "reply for review; no send is authorized."
+            ),
+            "prior_reply_context": (
+                "The bounded thread may contain later acknowledgement context; use only "
+                "the approved synthetic validation facts below."
+            ),
+            "reply_objective": (
+                "Prepare a short review-only confirmation reply with one clear question "
+                "and no unsupported relationship claims."
+            ),
+        },
+        "sources": [
+            {
+                "source_id": source_id,
+                "title": "Selected synthetic Gmail validation thread",
+                "url": "gmail://selected-synthetic-validation-thread",
+                "source_type": "gmail_thread_packet",
+                "provider": "gmail",
+                "extraction_status": "provider_selected_sanitized",
+                "source_quality": "operator_approved_synthetic",
+                "supported_claim": (
+                    "The selected thread is a marked synthetic KBA validation thread."
+                ),
+                "key_facts": [
+                    "The selected thread is synthetic validation correspondence.",
+                    "The requested result is a review-only reply and no send is authorized.",
+                ],
+                "evidence_excerpt": (
+                    "Synthetic validation correspondence selected by exact bounded Gmail "
+                    "identity; raw message text omitted."
+                ),
+            }
+        ],
+        "facts": [
+            {
+                "key": "synthetic_validation_scope",
+                "value": "The selected correspondence is synthetic KBA validation material.",
+                "confidence": 1.0,
+                "approval_state": "approved_for_drafting",
+                "source_ids": [source_id],
+            },
+            {
+                "key": "reply_objective",
+                "value": (
+                    "Prepare a concise confirmation reply for review with one question; "
+                    "do not send."
+                ),
+                "confidence": 1.0,
+                "approval_state": "approved_for_drafting",
+                "source_ids": [source_id],
+            },
+            {
+                "key": "unsupported_claim_boundary",
+                "value": (
+                    "Do not claim a real client, prior engagement, or completed relationship."
+                ),
+                "confidence": 1.0,
+                "approval_state": "approved_for_research",
+                "source_ids": [source_id],
+            },
+        ],
+    }
+
+
 def _typed_input(selected: dict[str, Any], context: Any) -> OutreachComposerSDKInput:
     approved_packet = {
         "selected_thread": {
@@ -159,6 +276,8 @@ def _typed_input(selected: dict[str, Any], context: Any) -> OutreachComposerSDKI
             "message_count": selected["message_count"],
             "subject_marker_verified": True,
             "body_marker_verified": True,
+            "candidate_count": selected["candidate_count"],
+            "selection_policy": selected["selection_policy"],
             "synthetic_context": selected["body"][:1200],
         },
         "allowed_facts": [fact.model_dump(mode="json") for fact in context.allowed_facts],
@@ -358,6 +477,8 @@ def main() -> int:
     provider = GmailTool(live=True)
     if args.preflight_only:
         selected = _select_synthetic_thread(provider)
+        if args.source_bundle_output:
+            _write_atomic(args.source_bundle_output, build_graph_source_bundle(selected))
         result = {
             "status": "pass",
             "scenario": "outreach_selected_gmail_thread_preflight",
@@ -367,10 +488,13 @@ def main() -> int:
                 "message_count": selected["message_count"],
                 "subject_marker_verified": True,
                 "body_marker_verified": True,
+                "candidate_count": selected["candidate_count"],
+                "selection_policy": selected["selection_policy"],
             },
             "openai_requests": 0,
             "gmail_writes": 0,
             "email_sent": False,
+            "source_bundle_written": bool(args.source_bundle_output),
         }
         _write_atomic(args.output, result)
         print(json.dumps(result, indent=2, sort_keys=True))

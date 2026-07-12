@@ -357,6 +357,101 @@ def test_configured_test_sender_alias_resolves_to_internal_exact_sender(
     assert "configured exact test sender" not in query
 
 
+def test_configured_test_recipient_alias_resolves_to_internal_exact_recipient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "KEYSTONE_GMAIL_TEST_SEND_RECIPIENT", "test-recipient@example.test"
+    )
+    request = (
+        "Read the latest Gmail email for the configured exact test recipient with "
+        'subject containing "KBA_TEST_EMAIL", summarize it, and prepare a reply for review.'
+    )
+
+    query = workflow_runner._gmail_retrieval_query_from_request(
+        request,
+        {"gmail_query": 'newer_than:3d "the configured exact test recipient"'},
+    )
+
+    assert query == "newer_than:3d to:test-recipient@example.test KBA_TEST_EMAIL"
+    assert "configured exact test recipient" not in query
+
+
+def test_configured_test_recipient_alias_fails_closed_without_safe_recipient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_GMAIL_TEST_SEND_RECIPIENT", raising=False)
+
+    query = workflow_runner._gmail_retrieval_query_from_request(
+        "Read the latest email for the configured exact test recipient.",
+        None,
+    )
+
+    assert query == ""
+
+
+def test_supplied_gmail_reply_objective_hands_off_to_outreach(
+    tmp_path: Path,
+) -> None:
+    source_bundle = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=(
+                "Have Gmail Triage review only the supplied Northstar Behavioral "
+                "Analytics Gmail packet, then have Outreach Composer prepare one concise "
+                "reply for review. Do not send, create a provider draft, search, post, "
+                "schedule, share, or write externally."
+            ),
+            database_url=_database_url(tmp_path),
+            context_file_path=str(source_bundle),
+            requested_route=WorkItemRoute.GMAIL_TRIAGE,
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "orchestrator",
+                "target_agent": "gmail_triage",
+                "intent": "gmail_triage",
+                "primary_target": "Northstar Behavioral Analytics",
+                "target_type": "gmail_thread",
+                "task_objective": "gmail_triage",
+            },
+            live_sdk=False,
+            save=True,
+        ),
+        max_steps=3,
+    )
+
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status in {WorkItemStatus.DONE, WorkItemStatus.NEEDS_APPROVAL}
+    draft = next(
+        artifact
+        for artifact in result.work_item.artifact_refs
+        if artifact.artifact_type == "outreach_draft"
+    )
+    assert draft.metadata["thread_local_slack_draft"] is True
+    assert draft.metadata["gmail_draft_created"] is False
+    assert draft.metadata["send_enabled"] is False
+    events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(
+        result.work_item.id
+    )
+    assert any(
+        event.event_type == "artifact_attached"
+        and event.metadata.get("artifact", {}).get("artifact_type")
+        == "gmail_triage_report"
+        for event in events
+    )
+    latest_review = next(
+        event.metadata
+        for event in reversed(events)
+        if event.event_type == "manager_loop_review"
+    )
+    assert latest_review["route"] == "outreach_composer"
+    assert latest_review["review_status"] == "pass"
+    assert latest_review["overall_score"] >= 85
+    assert "Include copy, rationale, facts used, source ids, and approval fields." not in (
+        latest_review["observed_gaps"]
+    )
+
+
 def test_gmail_public_summary_hides_query_participants_and_provider_identity() -> None:
     summary = workflow_runner.GmailThreadSummaryResult(
         thread_id="thread-private-1",

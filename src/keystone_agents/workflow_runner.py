@@ -2433,6 +2433,47 @@ def _attach_route_specific_review_fields(
         )
         return
 
+    if result.route == WorkItemRoute.OUTREACH_COMPOSER:
+        outreach_artifact = next(
+            (
+                artifact
+                for artifact in result.artifact_refs
+                if artifact.artifact_type == "outreach_draft"
+            ),
+            None,
+        )
+        if outreach_artifact is None:
+            return
+        metadata = outreach_artifact.metadata
+        source_ids = [
+            str(item or "").strip()
+            for item in metadata.get("source_ids_used") or []
+            if str(item or "").strip()
+        ]
+        facts_used = [
+            fact.value
+            for fact in result.work_item.facts
+            if fact.approval_state == ApprovalState.APPROVED_FOR_DRAFTING
+            and str(fact.value or "").strip()
+        ]
+        review_payload.update(
+            {
+                "summary": outreach_artifact.summary or result.human_summary,
+                "email_subject": metadata.get("email_subject") or outreach_artifact.title,
+                "email_body": result.human_summary,
+                "linkedin_note": "Not requested for this email-only review draft.",
+                "personalization_rationale": outreach_artifact.summary,
+                "facts_used": facts_used,
+                "source_ids_used": source_ids,
+                "approval_required": True,
+                "send_enabled": False,
+                "unsupported_claims_flagged": list(
+                    metadata.get("unsupported_claims_flagged") or []
+                ),
+            }
+        )
+        return
+
     if result.route != WorkItemRoute.GMAIL_TRIAGE:
         return
     triage_artifact = next(
@@ -4279,18 +4320,20 @@ def _manager_loop_requests_opportunity_assessment(normalized_text: str) -> bool:
 
 
 def _manager_loop_requests_outreach_draft(normalized_text: str) -> bool:
-    if re.search(
-        r"\b(?:do not|don't|no|without)\b[^.\n]{0,80}\b(?:draft|write|compose|prepare)\b"
-        r"[^.\n]{0,80}\b(?:outreach|email|linkedin|message|note|reply|response)\b",
+    scrubbed_text = re.sub(
+        r"\b(?:do not|don't|dont|never|no|without)\b"
+        r"(?=[^.;\n]{0,240}\b(?:draft\s+(?:outreach|email|linkedin|message|note|reply|response)"
+        r"|(?:create|save|write|add)\b[^.;\n]{0,60}\b(?:gmail\s+)?draft)\b)"
+        r"[^.;\n]{0,240}",
+        " ",
         normalized_text,
         flags=re.I,
-    ):
-        return False
+    )
     scrubbed_text = re.sub(
         r"\b(?:do not|don't|dont|never|no|without)\b[^.\n]{0,80}\bsend\b"
         r"[^.\n]{0,80}\b(?:outreach|email|linkedin|message|note|reply|response)\b",
         " ",
-        normalized_text,
+        scrubbed_text,
         flags=re.I,
     )
     if re.search(
@@ -4347,6 +4390,14 @@ def _manager_loop_requests_outreach_draft(normalized_text: str) -> bool:
                 )
             )
         )
+    )
+
+
+def _gmail_triage_requests_outreach_handoff(normalized_text: str) -> bool:
+    """Keep simple Gmail reply help direct unless the operator names a handoff."""
+
+    return _manager_loop_requests_outreach_draft(normalized_text) and bool(
+        re.search(r"\boutreach\s+composer\b", normalized_text, flags=re.I)
     )
 
 
@@ -8707,6 +8758,12 @@ def _advance_gmail_triage(
     if inline_fixture is not None and _gmail_plan_allows_inline_read_only_triage(gmail_plan):
         triage = triage_email_fixture(inline_fixture)
         research_requested = _manager_loop_requests_research(effective_request_text)
+        outreach_handoff_requested = _gmail_triage_requests_outreach_handoff(
+            effective_request_text
+        )
+        approved_reply_objective = str(
+            work_item.target.metadata.get("reply_objective") or ""
+        ).strip()
         gmail_research_target = (
             _source_bundle_company_target(work_item)
             or _gmail_sender_organization(triage.sender_name, triage.sender_email)
@@ -8738,6 +8795,17 @@ def _advance_gmail_triage(
                 requires_approval=False,
             )
             if research_requested and gmail_research_target
+            else WorkItemNextAction(
+                action="draft_thread_local_reply",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+                description=(
+                    "Use the approved supplied Gmail context and reply objective to "
+                    "prepare review-only copy. Do not create a Gmail draft or send."
+                ),
+                requires_approval=False,
+            )
+            if outreach_handoff_requested
+            and (triage.needs_reply or approved_reply_objective)
             else WorkItemNextAction(
                 action="review_gmail_triage",
                 agent=WorkItemRoute.GMAIL_TRIAGE,
@@ -9866,13 +9934,20 @@ def _gmail_retrieval_query_from_request(
     parts: list[str] = []
     configured_sender_alias = _configured_gmail_sender_alias_requested(request_text)
     configured_sender = _configured_gmail_sender() if configured_sender_alias else ""
+    configured_recipient_alias = _configured_gmail_recipient_alias_requested(request_text)
+    configured_recipient = (
+        _configured_gmail_recipient() if configured_recipient_alias else ""
+    )
     if configured_sender_alias and not configured_sender:
+        return ""
+    if configured_recipient_alias and not configured_recipient:
         return ""
     if isinstance(manual_request_plan, dict):
         planned_query = str(manual_request_plan.get("gmail_query") or "").strip()
-        if configured_sender_alias:
+        if configured_sender_alias or configured_recipient_alias:
             planned_query = re.sub(
-                r"[\"']?the\s+configured\s+exact\s+test\s+sender[\"']?",
+                r"[\"']?(?:the\s+)?configured\s+exact\s+test\s+"
+                r"(?:sender|recipient)[\"']?",
                 "",
                 planned_query,
                 flags=re.I,
@@ -9889,12 +9964,18 @@ def _gmail_retrieval_query_from_request(
     sender_email = configured_sender or _email_address_from_text(request_text)
     if sender_email:
         parts.append(f"from:{sender_email}")
+    if configured_recipient:
+        parts.append(f"to:{configured_recipient}")
     terms = _gmail_search_terms_from_request(request_text)
-    if configured_sender_alias:
+    if configured_sender_alias or configured_recipient_alias:
         terms = [
             term
             for term in terms
-            if "configured exact test sender" not in term.lower()
+            if not re.search(
+                r"configured\s+exact\s+test\s+(?:sender|recipient)",
+                term,
+                flags=re.I,
+            )
         ]
     parts.extend(_quote_gmail_query_term(term) for term in terms[:4])
     return " ".join(list(dict.fromkeys(part for part in parts if part))).strip()
@@ -9916,6 +9997,21 @@ def _configured_gmail_sender() -> str:
         or os.getenv("GMAIL_USERNAME")
         or ""
     ).strip().lower()
+    return candidate if re.fullmatch(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", candidate) else ""
+
+
+def _configured_gmail_recipient_alias_requested(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:the\s+)?configured\s+exact\s+test\s+recipient\b",
+            str(text or ""),
+            flags=re.I,
+        )
+    )
+
+
+def _configured_gmail_recipient() -> str:
+    candidate = str(os.getenv("KEYSTONE_GMAIL_TEST_SEND_RECIPIENT") or "").strip().lower()
     return candidate if re.fullmatch(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", candidate) else ""
 
 

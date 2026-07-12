@@ -18,6 +18,22 @@ three use LangGraph because they require dependent stages or manager-owned
 cross-source synthesis. Chief of Staff is not a default wrapper around the
 direct specialist case.
 
+Gmail selection must preserve the operator's requested object. "Latest email"
+means resolve one newest matching message by internal provider identity and
+then read every message in its containing thread so chronology and current
+state are available. "Latest thread" means select the newest matching
+conversation directly and read that complete thread. These are separate asks;
+neither may be silently substituted for the other.
+
+The Gmail graph-pair preflight resolves accumulated synthetic validation
+history newest-first and keeps provider identities internal. The current
+provider-only proof selected one three-message thread from two marked
+candidates, wrote a sanitized hashed source bundle, and made zero OpenAI
+requests or Gmail writes. Its natural operator ask names the exact marked draft
+lifecycle and therefore supplies approval for that scope; it does not require a
+duplicate approval round trip or a long list of prohibited actions. Send and
+unrelated-write boundaries remain authoritative system gates.
+
 Each saved observation must reference the exact natural ask by SHA-256 and
 record the Slack permalink, answer-first state, final-response count, route,
 actual backend, WorkItem continuity, visible sources, provider-ID re-entry,
