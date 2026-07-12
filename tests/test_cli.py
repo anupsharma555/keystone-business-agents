@@ -4342,13 +4342,14 @@ def test_cli_ask_preflight_blocked_omits_raw_workflow_state(
 ) -> None:
     def fake_preflight_with_slack_state(*args, **kwargs):
         preflight = _fake_orchestrator_preflight(*args, **kwargs)
-        preflight.route_result = preflight.route_result.model_copy(
-            update={
-                "workflow_state_summary": {
-                    "recent_slack_thread": [{"summary": "private Slack refusal context"}],
-                    "prior_agent_runs": [{"summary": "prior operator correction"}],
-                }
+        workflow_state_summary = preflight.route_result.workflow_state_summary.__class__.model_validate(
+            {
+                "recent_slack_thread": [{"summary": "private Slack refusal context"}],
+                "prior_agent_runs": [{"summary": "prior operator correction"}],
             }
+        )
+        preflight.route_result = preflight.route_result.model_copy(
+            update={"workflow_state_summary": workflow_state_summary}
         )
         return preflight
 

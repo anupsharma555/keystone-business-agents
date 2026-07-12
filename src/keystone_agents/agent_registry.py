@@ -336,6 +336,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         validation_paths=(
             "tests/test_opportunity_scout.py",
             "tests/test_compact_opportunity_assessment.py",
+            "tests/test_compact_opportunity_baseline.py",
         ),
         handoff_description=(
             "Find and score opportunities, leads, grants, partners, and companies."

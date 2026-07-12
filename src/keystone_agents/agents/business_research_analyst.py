@@ -548,18 +548,31 @@ def build_business_research_analyst_focused_brief_agent(
 ) -> Agent:
     """Build Business Research Analyst for BR-1 focused brief synthesis."""
 
-    instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "tools.md",
-        "local_context.md",
-        "business_research_analyst.md",
-        skill_files=select_agent_skill_names(
-            "business_research_analyst",
-            request_text=request_text,
-            include_all=include_all_skills,
-        ),
-    )
+    if attach_tools:
+        instructions = compose_instructions(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "local_context.md",
+            "business_research_analyst.md",
+            skill_files=select_agent_skill_names(
+                "business_research_analyst",
+                request_text=request_text,
+                include_all=include_all_skills,
+            ),
+        )
+    else:
+        instructions = compose_instructions(
+            "safety_policy.md",
+            "business_research_focused_brief_compact.md",
+            skill_files=(
+                "evidence_attribution_and_claim_mapping",
+                "context_permission_gating",
+                "action_boundary_enforcement",
+                "unsupported_claim_and_gap_handling",
+            ),
+            shared_prompt_files=("memory_policy.md", "writing_style.md"),
+        )
     return build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,

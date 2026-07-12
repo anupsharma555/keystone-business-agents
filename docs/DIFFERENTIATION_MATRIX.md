@@ -74,3 +74,29 @@ The receipt records zero OpenAI requests, connectors, provider writes, and
 external side effects. It proves that matched observations can support a claim
 and that missing or mismatched baseline evidence cannot. It does not fabricate
 or replace the later real matched operator baseline observation.
+
+## First Matched Live Comparison
+
+The first real matched observation uses the exact compact current-opportunity
+ask, the same two-page supplied packet, the same output schema, `gpt-5.4-mini`,
+and no tools/search/provider actions for both systems. Both KBA and the generic
+baseline passed every factual and safety check. The comparison is therefore
+honestly `not_supported`: the baseline cost estimate was `$0.005883`, while the
+optimized KBA estimate was `$0.01107525`.
+
+This does not show that KBA is worse as an operating system. It shows that a
+simple one-turn supplied-packet answer is not itself a KBA differentiator. KBA
+claims should be tested where its product contract is relevant: persistent
+WorkItem state, Slack-native continuation, approved Keystone context, durable
+approval/audit, typed cross-agent handoffs, and operational follow-through.
+
+The comparison still produced a concrete product improvement: KBA's compact
+Opportunity prompt was reduced from 119,733 to 31,503 characters, cutting live
+input from 26,167 to 8,029 tokens and the maintained estimate from `$0.02411625`
+to `$0.01107525` with every factual and safety check preserved. The generic
+baseline remains cheaper, so the result stays `not_supported` rather than being
+reframed as a win.
+
+The comparison also repaired the measurement contract: cost and latency fields
+now participate in improvement/regression decisions instead of being recorded
+but ignored.

@@ -6,6 +6,8 @@
     "test:manager-delegation:no-live": ".venv/bin/python scripts/run_manager_delegation_readiness.py",
     "test:differentiation:no-live": ".venv/bin/python scripts/run_anu175_no_live_smoke.py",
     "run:opportunity-assessment:compact": ".venv/bin/python scripts/run_compact_opportunity_assessment.py",
+    "run:opportunity-assessment:baseline": ".venv/bin/python scripts/run_compact_opportunity_baseline.py",
+    "compare:opportunity-assessment:baseline": ".venv/bin/python scripts/compare_compact_opportunity_baseline.py",
     "test:presentation-index:local": ".venv/bin/python scripts/run_presentation_index_validation.py",
     "test:slack-entrypoints:no-live": ".venv/bin/python scripts/run_slack_entrypoint_readiness.py",
     "run:chief-prior-week-packet": ".venv/bin/python scripts/run_chief_prior_week_packet.py",

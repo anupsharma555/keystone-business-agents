@@ -873,7 +873,11 @@ def skill_version_references(skill_names: Sequence[str]) -> list[str]:
     return [metadata.reference for metadata in list_skill_metadata(skill_names)]
 
 
-def compose_instructions(*prompt_files: str, skill_files: Sequence[str] = ()) -> str:
+def compose_instructions(
+    *prompt_files: str,
+    skill_files: Sequence[str] = (),
+    shared_prompt_files: Sequence[str] | None = None,
+) -> str:
     """Concatenate project, memory, and prompt context with clear boundaries."""
 
     sections = []
@@ -881,7 +885,10 @@ def compose_instructions(*prompt_files: str, skill_files: Sequence[str] = ()) ->
     if repo_profile:
         sections.append(f"<!-- {repo_profile_name} -->\n{repo_profile}")
     requested_files = {_prompt_filename(prompt_file) for prompt_file in prompt_files}
-    for shared_prompt in SHARED_PRE_RUN_PROMPTS:
+    shared_prompts = (
+        SHARED_PRE_RUN_PROMPTS if shared_prompt_files is None else shared_prompt_files
+    )
+    for shared_prompt in shared_prompts:
         filename = _prompt_filename(shared_prompt)
         if filename not in requested_files:
             sections.append(f"<!-- {filename} -->\n{load_prompt(filename).strip()}")

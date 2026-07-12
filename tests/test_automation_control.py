@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import scripts.run_keystone_automation as automation
+from keystone_agents.automation_inventory import automation_spec_for_command
 from keystone_agents.schemas.approval import ApprovalQueueItem
 from keystone_agents.storage.sqlite_store import SQLiteStore
 
@@ -17,6 +18,14 @@ class _Completed:
         self.stdout = stdout
         self.stderr = stderr
         self.returncode = returncode
+
+
+def test_automation_command_metadata_is_serialized_at_model_copy_boundary() -> None:
+    spec = automation_spec_for_command("weekly-opportunity", stage="dry-run")
+
+    assert isinstance(spec.metadata, str)
+    assert json.loads(spec.metadata) == {"last_stage": "dry-run"}
+    assert spec.model_dump(mode="json")["metadata"] == spec.metadata
 
 
 def _db_url(path: Path) -> str:

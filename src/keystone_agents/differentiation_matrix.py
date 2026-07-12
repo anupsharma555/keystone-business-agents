@@ -593,6 +593,12 @@ def compare_differentiation_observations(
     ):
         if kba_value and not baseline_value:
             improvements.append(name)
+    for name, kba_value, baseline_value in (
+        ("latency_ms", kba.latency_ms, baseline.latency_ms),
+        ("estimated_cost_usd", kba.estimated_cost_usd, baseline.estimated_cost_usd),
+    ):
+        if kba_value is not None and baseline_value is not None and kba_value < baseline_value:
+            improvements.append(name)
 
     regressions = []
     for name, kba_value, baseline_value in (
@@ -609,6 +615,12 @@ def compare_differentiation_observations(
         regressions.append("duplicate_artifacts")
     if kba.developer_intervention and not baseline.developer_intervention:
         regressions.append("developer_intervention")
+    for name, kba_value, baseline_value in (
+        ("latency_ms", kba.latency_ms, baseline.latency_ms),
+        ("estimated_cost_usd", kba.estimated_cost_usd, baseline.estimated_cost_usd),
+    ):
+        if kba_value is not None and baseline_value is not None and kba_value > baseline_value:
+            regressions.append(name)
 
     safe_and_useful = observation_is_safe_and_useful(kba)
     status: Literal["supported", "not_supported"] = (
