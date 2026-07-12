@@ -841,8 +841,8 @@ again.
 ### P1 - ASK-SHAPE-001: Agent input contracts do not yet preserve diverse ask shape
 
 - Found: 2026-06-18 14:08 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-07-12
+- Status: complete
 - Area: `src/keystone_agents/schemas/manual_request_plan.py`,
   `src/keystone_agents/models.py`,
   `src/keystone_agents/schemas/context_pack.py`, manual CLI, Slack,
@@ -878,6 +878,14 @@ again.
   `prior_context_dependency`, `permission_state`, `cost_mode`, and
   `stop_condition`. Add focused tests for exact-match/no-broaden,
   quick-triage, table-format, selected-thread, and staged-workflow asks.
+- Resolution: `AskShapePolicy` is a backward-compatible nested
+  `ManualRequestPlan` contract for breadth, evidence depth, source preference,
+  strict filtering, output form, prior-context dependency, permission state,
+  cost mode, and stop condition. The deterministic planner extracts explicit
+  generic cues; local constraints survive weaker LLM plan overrides; every
+  specialist context pack receives the typed policy; and final synthesis sees
+  it through the existing manual-plan payload. The policy never grants
+  approval. Focused planner, preflight, context-pack, and synthesis tests pass.
 
 ### P1 - ASK-SHAPE-002: Specialist outputs do not consistently report request coverage or stop-condition status
 

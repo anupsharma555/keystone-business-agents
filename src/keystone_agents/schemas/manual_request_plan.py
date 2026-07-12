@@ -89,6 +89,47 @@ ManualTargetType = Literal[
     "unknown",
 ]
 
+AskBreadth = Literal["unspecified", "narrow", "bounded", "broad"]
+EvidenceDepth = Literal["unspecified", "quick", "standard", "deep"]
+StrictFilterMode = Literal["unspecified", "exact", "strict", "flexible"]
+OutputForm = Literal["unspecified", "brief", "bullets", "table", "plan", "draft"]
+PriorContextDependency = Literal["unspecified", "none", "selected_context", "required"]
+PermissionState = Literal["unspecified", "read_only", "draft_only", "approval_required"]
+CostMode = Literal["unspecified", "minimize", "balanced", "quality"]
+
+
+class AskShapePolicy(BaseModel):
+    """Orthogonal operator constraints that must survive routing and handoffs."""
+
+    ask_breadth: AskBreadth = "unspecified"
+    evidence_depth: EvidenceDepth = "unspecified"
+    source_type_preference: list[str] = Field(default_factory=list)
+    strict_filter_mode: StrictFilterMode = "unspecified"
+    output_form: OutputForm = "unspecified"
+    prior_context_dependency: PriorContextDependency = "unspecified"
+    permission_state: PermissionState = "unspecified"
+    cost_mode: CostMode = "unspecified"
+    stop_condition: str = ""
+
+    @field_validator("source_type_preference", mode="before")
+    @classmethod
+    def _clean_source_types(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list | tuple | set) else [value]
+        return list(
+            dict.fromkeys(
+                str(item).replace("\u2014", "-").strip().lower()
+                for item in values
+                if str(item or "").strip()
+            )
+        )
+
+    @field_validator("stop_condition", mode="before")
+    @classmethod
+    def _clean_stop_condition(cls, value: object) -> str:
+        return str(value or "").replace("\u2014", "-").strip()
+
 
 class ManualRequestPlan(BaseModel):
     """Pre-execution semantic plan for manual CLI and Slack agent calls."""
@@ -104,6 +145,7 @@ class ManualRequestPlan(BaseModel):
     expected_artifact_type: ManualExpectedArtifactType = "none"
     desired_count: int = Field(default=1, ge=1, le=10)
     constraints: list[str] = Field(default_factory=list)
+    ask_shape: AskShapePolicy = Field(default_factory=AskShapePolicy)
     required_entities: list[str] = Field(default_factory=list)
     required_terms: list[str] = Field(default_factory=list)
     gmail_query: str = ""

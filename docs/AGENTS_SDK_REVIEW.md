@@ -298,7 +298,7 @@ Recommended architecture changes:
 
 1. **Add ask-shape dimensions without adding a broad intent taxonomy.** Extend
    the manual/orchestrator plan or specialist brief with compact fields such as
-   `ask_breadth`, `evidence_depth`, `source_type_preference`,
+   Implemented in `AskShapePolicy`: `ask_breadth`, `evidence_depth`, `source_type_preference`,
    `strict_filter_mode`, `output_form`, `prior_context_dependency`,
    `permission_state`, `cost_mode`, and `stop_condition`. These are orthogonal
    dimensions, not new route enums.

@@ -32,6 +32,39 @@ def _database_url(tmp_path) -> str:
     return f"sqlite:///{tmp_path / 'context-packs.db'}"
 
 
+def test_context_packs_preserve_manual_plan_ask_shape() -> None:
+    work_item = WorkItem(
+        id="wi_ask_shape",
+        title="Selected source review",
+        request_text="Use only the selected source and return a table.",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        target=WorkItemTarget(
+            metadata={
+                "manual_request_plan": {
+                    "ask_shape": {
+                        "ask_breadth": "narrow",
+                        "source_type_preference": ["selected"],
+                        "strict_filter_mode": "exact",
+                        "output_form": "table",
+                        "prior_context_dependency": "selected_context",
+                        "permission_state": "read_only",
+                        "stop_condition": "return_zero_without_broadening_if_no_exact_match",
+                    }
+                }
+            }
+        ),
+    )
+
+    context = build_context_pack_for_route(
+        work_item, WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    )
+
+    assert context.ask_shape.output_form == "table"
+    assert context.ask_shape.source_type_preference == ["selected"]
+    assert context.ask_shape.stop_condition == "return_zero_without_broadening_if_no_exact_match"
+
+
 def _save_memory(store: SQLiteStore, **overrides) -> int:
     item = MemoryItem(
         memory_type=overrides.pop("memory_type", "company_fact"),

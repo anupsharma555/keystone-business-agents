@@ -40,6 +40,7 @@ git status --short
 Run the publish gate:
 
 ```bash
+.venv/bin/python scripts/check_staged_publish_files.py
 .venv/bin/python scripts/scan_repo_secrets.py
 git diff --cached --check
 .venv/bin/python -m ruff check .
@@ -85,6 +86,7 @@ git status --short
 4. Run the secret and diff hygiene checks.
 
 ```bash
+.venv/bin/python scripts/check_staged_publish_files.py
 .venv/bin/python scripts/scan_repo_secrets.py
 git diff --cached --check
 git diff --cached --stat
@@ -121,6 +123,9 @@ untracked local scratch files, if any.
   GitHub first. It answers whether GitHub is behind, ahead, or diverged.
 - Use `git diff --cached --name-only` as the final staged-file manifest. It is
   faster and less noisy than reviewing the full patch late in the process.
+- The staged-file guard rejects browser captures, test-pack artifacts, output
+  folders, and root dashboard screenshots even if they were force-added. Move
+  an intentionally public image under `docs/` before staging it.
 - Run `scripts/scan_repo_secrets.py` after staging, not only before staging, so
   the check reflects exactly what would be committed.
 - If Ruff fails on import order or formatting, run `ruff check . --fix` and
