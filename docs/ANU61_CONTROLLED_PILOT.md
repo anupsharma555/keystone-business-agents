@@ -24,15 +24,27 @@ It returns one `OpportunityAssessmentBrief` with confirmed source-linked facts,
 interpretation, KNI fit, timing, geography uncertainty, missing evidence, one
 next safe action, and one retained source list. A live exact-ask run reduced
 output from 6,234 to 998 tokens and the maintained estimate from `$0.0309867`
-to `$0.02411625` while retaining all acceptance facts and performing no tool,
-search, outreach, or write. This is reusable direct-specialist evidence; the
-case still needs Slack-entry/permalink evidence before it is a full pilot PASS.
+to `$0.02411625`. A second prompt-efficiency pass kept the same acceptance
+contract while reducing the composed instruction payload from 119,733 to 31,503
+characters; the live result used 8,029 input and 1,123 output tokens at a
+maintained `$0.01107525`, with every quality/safety check passing. The matched
+generic baseline also passed at `$0.005883`, so this one-turn case does not
+support a KBA differentiation claim. It remains reusable direct-specialist
+evidence; the case still needs Slack-entry/permalink evidence before it is a
+full pilot PASS.
 
 The research-to-Doc reasoning layer also passes outside Slack. One live
 official-page run used one request at a maintained `$0.027426`, preserved ten
 extracted claims and the exact source URL, and returned a reviewed `KNIOps`
 Doc plan without entering Workspace writes. Reuse this model/plan proof; do not
 repeat it when collecting the remaining Slack-entry evidence.
+
+The no-tool Business Research prompt was then reduced from 141,342 to 31,530
+characters while retaining the full prompt for tool-enabled discovery runs.
+The matched live rerun preserved the same ten claims, exact official source,
+645-token focused brief, and no-write plan while reducing input from 32,764 to
+9,279 tokens and the maintained estimate from `$0.027426` to `$0.00986175`.
+This optimized receipt supersedes the earlier cost/usage baseline.
 
 The initial pilot is read-only at the provider boundary. All four cases require
 `provider_writes=0`; provider mutation capability is reused from ANU-174 and

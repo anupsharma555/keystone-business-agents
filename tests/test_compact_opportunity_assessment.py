@@ -45,9 +45,17 @@ def _brief() -> OpportunityAssessmentBrief:
 
 def test_compact_agent_has_no_tools_and_compact_output_schema() -> None:
     agent = build_opportunity_assessment_agent(request_text=pilot_ask())
+    instructions = str(agent.instructions)
 
     assert agent.output_type is OpportunityAssessmentBrief
     assert agent.tools == []
+    assert "<!-- opportunity_assessment_compact.md -->" in instructions
+    assert "<!-- opportunity_scout.md -->" not in instructions
+    assert "<!-- agent-operating-architecture.md -->" not in instructions
+    assert "<!-- slack-posting-rules.md -->" not in instructions
+    assert "<!-- memory_policy.md -->" in instructions
+    assert "<!-- writing_style.md -->" in instructions
+    assert len(instructions) < 40_000
 
 
 def test_compact_input_uses_exact_pilot_ask_and_supplied_packet() -> None:

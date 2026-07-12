@@ -6841,13 +6841,15 @@ def build_opportunity_assessment_agent(
     """Build a no-tool Scout variant for one compact supplied-source assessment."""
 
     instructions = compose_instructions(
-        "keystone_profile.md",
         "safety_policy.md",
-        "opportunity_scout.md",
-        skill_files=select_agent_skill_names(
-            "opportunity_scout",
-            request_text=request_text,
+        "opportunity_assessment_compact.md",
+        skill_files=(
+            "evidence_attribution_and_claim_mapping",
+            "context_permission_gating",
+            "action_boundary_enforcement",
+            "unsupported_claim_and_gap_handling",
         ),
+        shared_prompt_files=("memory_policy.md", "writing_style.md"),
     )
     return build_sdk_agent(
         name="opportunity_scout",

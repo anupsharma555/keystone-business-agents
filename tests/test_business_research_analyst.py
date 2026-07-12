@@ -252,6 +252,22 @@ def test_build_business_research_analyst_focused_brief_agent() -> None:
     } <= {getattr(tool, "name", "") for tool in agent.tools}
 
 
+def test_no_tool_focused_brief_agent_uses_compact_source_bound_prompt() -> None:
+    agent = build_business_research_analyst_focused_brief_agent(
+        request_text="Prepare a source-backed internal brief without writing a document.",
+        attach_tools=False,
+    )
+    instructions = str(agent.instructions)
+
+    assert agent.tools == []
+    assert "<!-- business_research_focused_brief_compact.md -->" in instructions
+    assert "<!-- business_research_analyst.md -->" not in instructions
+    assert "<!-- tools.md -->" not in instructions
+    assert "<!-- memory_policy.md -->" in instructions
+    assert "<!-- writing_style.md -->" in instructions
+    assert len(instructions) < 40_000
+
+
 def test_build_business_research_analyst_comparison_agent() -> None:
     agent = build_business_research_analyst_comparison_agent()
 

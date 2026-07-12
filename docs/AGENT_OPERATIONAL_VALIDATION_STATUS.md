@@ -70,7 +70,7 @@ Airtable write gating, stale-write reversal, typed context handoffs, and useful
 completion review without false blocking. Live model comparison remains a later
 bounded quality proof, not a prerequisite for these deterministic invariants.
 
-ANU-61 now has two reusable exact-ask live reasoning proofs below the Slack
+ANU-61 now has reusable exact-ask live reasoning proofs below the Slack
 acceptance layer. The compact Opportunity assessment passed offline
 revalidation with one request, 26,167 input and 998 output tokens, a maintained
 `$0.02411625` estimate, both supplied URLs retained once, explicit fact versus
@@ -79,7 +79,21 @@ tools/search/outreach/writes. The research-to-Doc plan used one request at a
 maintained `$0.027426`, preserved ten official-page claims and the exact source,
 and staged an approval-gated `KNIOps` plan without a Workspace write. Neither is
 misclassified as a full pilot PASS because the Slack permalink/entry layer was
-not exercised.
+not exercised. The compact Opportunity prompt was subsequently reduced from
+119,733 to 31,503 characters while preserving shared memory/writing policy,
+safety, and the four relevant evidence/action skills. Its live usage fell to
+8,029 input and 1,123 output tokens at a maintained `$0.01107525`; all checks
+passed. A matched no-tool generic baseline passed at `$0.005883`, so ANU-175
+correctly records `not_supported` plus an estimated-cost regression for this
+simple one-turn case rather than inventing a KBA advantage.
+
+The no-tool Business Research focused-brief prompt received the same bounded
+optimization while tool-enabled discovery retained its full contract. The
+composed prompt fell from 141,342 to 31,530 characters; a matched NeuroFlow
+official-page rerun passed with 9,279 input and 645 output tokens at a maintained
+`$0.00986175`, versus 32,764 input tokens and `$0.027426` before. Ten extracted
+claims, exact source identity, no-search/no-tool safety, and the approval-gated
+no-write `KNIOps` plan all remained intact.
 
 ANU-213's finite presentation residual now passes. A repo-local SQLite index
 scanned 12 allowlisted reviewed decks and 116 slides, searched title/path/slide

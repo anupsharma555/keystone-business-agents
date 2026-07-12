@@ -195,3 +195,27 @@ def test_comparison_does_not_support_unsafe_or_regressive_kba_result() -> None:
     assert comparison.status == "not_supported"
     assert comparison.kba_safe_and_useful is False
     assert set(comparison.regressions) == {"sources_visible", "unintended_writes"}
+
+
+def test_comparison_exposes_cost_and_latency_improvements_or_regressions() -> None:
+    faster_cheaper = compare_differentiation_observations(
+        _observation("kba", latency_ms=500, estimated_cost_usd=0.01),
+        _observation(
+            "codex_chatgpt_baseline",
+            latency_ms=900,
+            estimated_cost_usd=0.02,
+            evidence_refs=("baseline:controlled_run",),
+        ),
+    )
+    slower_costlier = compare_differentiation_observations(
+        _observation("kba", latency_ms=900, estimated_cost_usd=0.02),
+        _observation(
+            "codex_chatgpt_baseline",
+            latency_ms=500,
+            estimated_cost_usd=0.01,
+            evidence_refs=("baseline:controlled_run",),
+        ),
+    )
+
+    assert {"latency_ms", "estimated_cost_usd"} <= set(faster_cheaper.improvements)
+    assert {"latency_ms", "estimated_cost_usd"} <= set(slower_costlier.regressions)

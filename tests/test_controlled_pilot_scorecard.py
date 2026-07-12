@@ -61,8 +61,8 @@ def _baseline(case_id: str) -> DifferentiationObservation:
         unintended_writes=0,
         duplicate_artifacts=0,
         developer_intervention=False,
-        latency_ms=900,
-        estimated_cost_usd=0.01,
+        latency_ms=1_000,
+        estimated_cost_usd=case.max_cost_usd,
         evidence_refs=(f"baseline:{case_id}",),
     )
 
