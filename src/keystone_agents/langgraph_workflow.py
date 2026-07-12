@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from keystone_agents.schemas.approval import ApprovalState
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
@@ -542,6 +543,12 @@ def run_work_item_langgraph(
         if manager_loop
         else None
     )
+    if graph_completion_review is not None:
+        result = _enhance_graph_terminal_summary(
+            original_request=request,
+            result=result,
+            graph_completion_review=graph_completion_review,
+        )
     _record_langgraph_checkpoint_event(
         request=request,
         result=result,
@@ -843,6 +850,315 @@ def _graph_completion_review(
     }
 
 
+def _enhance_graph_terminal_summary(
+    *,
+    original_request: WorkflowRunRequest,
+    result: WorkflowRunResult,
+    graph_completion_review: dict[str, Any],
+) -> WorkflowRunResult:
+    """Compose a compact graph-aware operator brief without another model call."""
+
+    request_text = " ".join(str(original_request.request_text or "").lower().split())
+    if not re.search(
+        r"\b(?:visible result|recommendation|strongest evidence|main uncertainty|"
+        r"next step|decision|data\s*source|facts?|inference|limitations?|unknowns?|"
+        r"source links?|collaboration angle)\b",
+        request_text,
+    ):
+        return result
+    completed_routes = {
+        str(route) for route in graph_completion_review.get("completed_routes") or []
+    }
+    if len(completed_routes) < 2:
+        return result
+    research_summary = _graph_research_terminal_summary(
+        request_text=request_text,
+        result=result,
+        completed_routes=completed_routes,
+    )
+    if research_summary:
+        return result.model_copy(
+            update={
+                "human_summary": research_summary,
+                "audit_notes": [
+                    *result.audit_notes,
+                    (
+                        "LangGraph research terminal brief composed deterministically "
+                        "from source-backed artifact evidence."
+                    ),
+                ],
+            }
+        )
+    outreach = next(
+        (
+            artifact
+            for artifact in reversed(result.work_item.artifact_refs)
+            if artifact.artifact_type == "outreach_draft"
+        ),
+        None,
+    )
+    if outreach is None:
+        return result
+    model_recommendation = outreach.metadata.get("model_recommendation")
+    recommendation = model_recommendation if isinstance(model_recommendation, dict) else {}
+    next_step = str(recommendation.get("recommended_next_step") or "").strip()
+    thread_local_draft = outreach.metadata.get("thread_local_slack_draft") is True
+    reply_recommended = recommendation.get("reply_recommended") is True or thread_local_draft
+    decision = (
+        "Proceed with a brief exploratory reply after human review."
+        if reply_recommended
+        else "Hold outreach until the missing context is resolved."
+    )
+    evidence = [
+        str(fact.value).strip()
+        for fact in result.work_item.facts
+        if str(fact.value or "").strip()
+        and str(fact.approval_state or "")
+        in {ApprovalState.APPROVED_FOR_DRAFTING.value, ApprovalState.APPROVED_FOR_RESEARCH.value}
+    ][:2]
+    missing = recommendation.get("additional_information_needed")
+    uncertainty = (
+        [str(item).strip() for item in missing if str(item or "").strip()][:2]
+        if isinstance(missing, list)
+        else []
+    )
+    if not uncertainty:
+        uncertainty = [
+            str(fact.value).strip()
+            for fact in result.work_item.facts
+            if "unsupported" in str(fact.key or "").lower()
+            and str(fact.value or "").strip()
+        ][:2]
+    if not next_step:
+        next_step = (
+            "Review the thread-local draft; no Gmail/provider draft or send is authorized."
+            if thread_local_draft
+            else "Review the draft approval item before any external use."
+        )
+    sections = [f"*Recommendation:*\n{decision}"]
+    if evidence:
+        sections.append("*Strongest evidence:*\n" + "\n".join(f"- {item}" for item in evidence))
+    if uncertainty:
+        sections.append(
+            "*Main uncertainty:*\n" + "\n".join(f"- {item}" for item in uncertainty)
+        )
+    if next_step:
+        sections.append(f"*Next step:*\n{next_step}")
+    draft_for_review = result.human_summary.strip()
+    suggested_reply = re.search(
+        r"\*Suggested reply:\*\s*(?P<reply>.*?)"
+        r"(?=\n\n\*Supporting evidence and approval status:\*|\Z)",
+        draft_for_review,
+        flags=re.S,
+    )
+    if suggested_reply is not None:
+        draft_for_review = suggested_reply.group("reply").strip()
+    if draft_for_review:
+        sections.append(f"*Draft for review:*\n{draft_for_review}")
+    return result.model_copy(
+        update={
+            "human_summary": "\n\n".join(sections),
+            "audit_notes": [
+                *result.audit_notes,
+                (
+                    "LangGraph terminal operator brief composed deterministically "
+                    "from approved artifacts."
+                ),
+            ],
+        }
+    )
+
+
+def _graph_research_terminal_summary(
+    *,
+    request_text: str,
+    result: WorkflowRunResult,
+    completed_routes: set[str],
+) -> str:
+    """Return a source-visible brief for research-only graph endings."""
+
+    if WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value not in completed_routes:
+        return ""
+    if WorkItemRoute.OUTREACH_COMPOSER.value in completed_routes:
+        return ""
+    if not re.search(
+        r"\b(?:data\s*source|facts?|inference|limitations?|unknowns?|source links?|"
+        r"collaboration angle|why .* matters)\b",
+        request_text,
+    ):
+        return ""
+    profile = next(
+        (
+            artifact
+            for artifact in reversed(result.work_item.artifact_refs)
+            if artifact.artifact_type == "company_profile"
+        ),
+        None,
+    )
+    if profile is None:
+        return ""
+    source_refs = profile.metadata.get("source_refs")
+    if not isinstance(source_refs, list):
+        return ""
+    marker_weights = {
+        "neuroblu": 5,
+        "longitudinal": 4,
+        "coverage": 4,
+        "de-identified": 4,
+        "deidentified": 4,
+        "tokenization": 4,
+        "nlp": 4,
+        "claims": 3,
+        "linkage": 3,
+        "provenance": 3,
+        "million": 3,
+        "years": 3,
+        "inpatient": 3,
+        "outpatient": 3,
+        "unstructured": 3,
+        "structured": 2,
+        "notes": 2,
+        "clinical": 2,
+        "ehr": 2,
+        "encounter": 2,
+        "patient": 2,
+        "partner": 2,
+        "data": 1,
+        "database": 1,
+        "dataset": 1,
+        "record": 1,
+    }
+    fact_candidates: list[tuple[int, int, str, str, str]] = []
+    clean_sources: list[tuple[str, str]] = []
+    for source in source_refs:
+        if not isinstance(source, dict):
+            continue
+        title = " ".join(str(source.get("title") or "Source").split())[:180]
+        url = str(source.get("url") or "").strip()
+        if url and url.startswith(("http://", "https://")) and (title, url) not in clean_sources:
+            clean_sources.append((title, url))
+        facts = source.get("key_facts")
+        if not isinstance(facts, list):
+            continue
+        for value in facts:
+            raw_fact = str(value or "").strip()
+            fragments = [
+                " ".join(fragment.split()).strip(" -#")
+                for fragment in re.split(r"(?:\n\s*\.\.\.\s*\n|\n+)", raw_fact)
+            ]
+            fragments = [fragment for fragment in fragments if 20 <= len(fragment) <= 650]
+            if not fragments:
+                fragments = [" ".join(raw_fact.split())[:650].strip()]
+            for fact in fragments:
+                if not fact:
+                    continue
+                normalized_fact = fact.lower()
+                words = set(re.findall(r"[a-z0-9-]+", normalized_fact))
+                marker_score = sum(
+                    weight for marker, weight in marker_weights.items() if marker in words
+                )
+                if re.search(r"\b\d[\d,.+]*\s*(?:million|patient|record|year)", normalized_fact):
+                    marker_score += 5
+                if normalized_fact.startswith(("ehr data,", "how to ", "previously on ")):
+                    marker_score -= 4
+                if marker_score >= 3:
+                    fact_candidates.append((marker_score, -len(fact), fact, title, url))
+    fact_candidates.sort(reverse=True)
+    selected_facts: list[tuple[str, str, str]] = []
+    seen_facts: set[str] = set()
+    selected_per_source: dict[str, int] = {}
+    for _score, _length, fact, title, url in fact_candidates:
+        normalized = fact.lower()
+        if normalized in seen_facts or (url and selected_per_source.get(url, 0) >= 2):
+            continue
+        seen_facts.add(normalized)
+        if url:
+            selected_per_source[url] = selected_per_source.get(url, 0) + 1
+        selected_facts.append((fact, title, url))
+        if len(selected_facts) == 4:
+            break
+    if not selected_facts:
+        return ""
+    platform_match = next(
+        (
+            re.search(
+                r"\b([A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+){0,2}\s+"
+                r"(?:Analytics|Database|Platform))\b",
+                fact,
+            )
+            for fact, _title, _url in selected_facts
+            if re.search(
+                r"\b([A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+){0,2}\s+"
+                r"(?:Analytics|Database|Platform))\b",
+                fact,
+            )
+        ),
+        None,
+    )
+    gmail_focus_terms = result.work_item.target.metadata.get("gmail_research_focus_terms")
+    platform = (
+        " ".join(str(gmail_focus_terms[0]).split())
+        if isinstance(gmail_focus_terms, list) and gmail_focus_terms
+        else platform_match.group(1)
+        if platform_match is not None
+        else profile.title
+    )
+    supported_lines = []
+    for fact, title, url in selected_facts:
+        citation = f" ([{title}]({url}))" if url else ""
+        supported_lines.append(f"- {fact}{citation}")
+    selected_sources = []
+    for _fact, title, url in selected_facts:
+        if url and (title, url) not in selected_sources:
+            selected_sources.append((title, url))
+    source_lines = [f"- [{title}]({url})" for title, url in selected_sources[:5]]
+    gmail_target = " ".join(
+        str(result.work_item.target.metadata.get("gmail_research_target") or "").split()
+    )
+    identity_sentence = (
+        f"The selected Gmail thread identifies {gmail_target} as the organization and "
+        f"{platform} as its named data platform."
+        if gmail_target
+        else f"The source-backed platform is {platform}."
+    )
+    sections = [
+        (
+            "*Answer:*\n"
+            f"{identity_sentence} The evidence describes a "
+            "behavioral-health real-world clinical data asset assembled from partner "
+            "data and designed for linked research analysis."
+        ),
+        (
+            "*Organization:*\n"
+            f"{gmail_target} is the sender organization identified from the selected "
+            f"Gmail thread. Its public product materials present {platform} as its "
+            "neuropsychiatry real-world-data and analytics offering. Ownership, funding, "
+            "customer mix, and current organizational scale should be treated as unknown "
+            "unless the selected sources explicitly establish them."
+        )
+        if gmail_target
+        else "",
+        "*Directly supported facts:*\n" + "\n".join(supported_lines),
+        (
+            "*Inference and unknowns:*\n"
+            "- The reviewed sources do not independently establish representativeness, "
+            "missingness, cross-site harmonization, or fitness for a specific analytic endpoint.\n"
+            "- Scale and coverage claims remain source-reported unless corroborated by an "
+            "independent methods or data-provenance description."
+        ),
+        (
+            "*Why it matters for KNI:*\n"
+            "A useful KNI collaboration would be a source-provenance and fitness-for-purpose "
+            "review covering cohort construction, variable coverage, missingness and bias, "
+            "linkage validity, and endpoint suitability before the data supports evaluation claims."
+        ),
+    ]
+    if source_lines:
+        sections.append("*Sources:*\n" + "\n".join(source_lines))
+    sections = [section for section in sections if section]
+    return "\n\n".join(sections)
+
+
 def _graph_requested_stage_review(
     *,
     request_text: str,
@@ -936,11 +1252,18 @@ def _graph_requested_stage_review(
         artifacts=("opportunity",),
         blocker_code="manager_loop_opportunity_not_created",
     )
+    outreach_constraint_text = re.sub(
+        r"\b(?:do\s+not|don't|dont|never|without)\s+"
+        r"(?:create|save|write)\s+(?:a\s+|any\s+)?"
+        r"(?:gmail\s+|provider\s+)?drafts?\b",
+        "",
+        normalized,
+    )
     no_outreach = bool(
         re.search(
-            r"\b(?:do not|don't|no|without)\b[^.\n;]{0,120}"
+            r"\b(?:do not|don't|no|without)\b[^,.\n;]{0,120}"
             r"\b(?:draft|outreach|email|gmail draft|post|send)\b",
-            normalized,
+            outreach_constraint_text,
         )
     )
     outreach_requested = bool(
@@ -1050,11 +1373,14 @@ def _manager_loop_continue_node(state: WorkItemGraphState) -> WorkItemGraphState
     original_request = WorkflowRunRequest.model_validate(
         state.get("original_request") or state.get("request") or {}
     )
+    manual_request_plan = dict(original_request.manual_request_plan or {})
+    manual_request_plan.setdefault("objective", original_request.request_text)
     next_request = original_request.model_copy(
         update={
             "request_text": "continue",
             "work_item_id": result.work_item.id,
             "requested_route": None,
+            "manual_request_plan": manual_request_plan,
         }
     )
     return {

@@ -707,6 +707,11 @@ def _print_direct_calendar_payload(payload: dict[str, Any], *, json_output: bool
 
 def _route_with_manual_plan_advice(route: str, manual_plan: ManualRequestPlan) -> str:
     planned = str(manual_plan.target_agent or "").strip()
+    if (
+        str(manual_plan.requested_agent or "").strip() == "gmail_triage"
+        and str(manual_plan.intent or "").strip() == "gmail_triage"
+    ):
+        return "gmail_triage"
     if planned in {"", "orchestrator", "clarification"}:
         return route
     if planned not in AGENT_REGISTRY:
@@ -1585,12 +1590,33 @@ def _estimate_ask_openai_requests(
         ).max_turns
     else:
         manager_steps = max(1, int(args.max_manager_steps or 1))
-        if _is_bounded_gmail_research_reply_graph(input_text, manager_steps=manager_steps):
+        if _is_bounded_gmail_recommendation_graph(
+            input_text,
+            manager_steps=manager_steps,
+        ):
+            stages.append("outreach_composer_sdk")
+            maximum += 1
+        elif _is_bounded_gmail_research_reply_graph(
+            input_text,
+            manager_steps=manager_steps,
+        ):
             stages.extend(
                 (
                     "gmail_provider_read",
                     "business_research_sdk",
                     "outreach_composer_sdk",
+                    "final_response_synthesis",
+                )
+            )
+            maximum += 7
+        elif _is_bounded_gmail_research_summary_graph(
+            input_text,
+            manager_steps=manager_steps,
+        ):
+            stages.extend(
+                (
+                    "gmail_provider_read",
+                    "business_research_sdk",
                     "final_response_synthesis",
                 )
             )
@@ -1630,6 +1656,54 @@ def _is_bounded_gmail_research_reply_graph(text: str, *, manager_steps: int) -> 
         )
         and re.search(r"\b(?:reply|response|draft)\b", normalized)
         and bounded_thread_context
+    )
+
+
+def _is_bounded_gmail_recommendation_graph(text: str, *, manager_steps: int) -> bool:
+    """Recognize the read-only ANU-61 thread-to-next-step workflow."""
+
+    normalized = " ".join(str(text or "").lower().split())
+    return bool(
+        manager_steps == 3
+        and re.search(r"\b(?:gmail|email)\s+thread\b", normalized)
+        and re.search(r"\b(?:read|review|latest|recent)\b", normalized)
+        and re.search(r"\b(?:original inquiry|all messages|complete thread)\b", normalized)
+        and re.search(r"\b(?:current conversation state|current state)\b", normalized)
+        and re.search(r"\b(?:recommend|identify)\b.{0,120}\bnext step\b", normalized)
+        and re.search(r"\breply\b.{0,80}\bonly if\b", normalized)
+        and re.search(r"\breturn\b.{0,100}\bhere\b.{0,40}\breview\b", normalized)
+        and re.search(r"\b(?:using|use)\s+only\b", normalized)
+    )
+
+
+def _is_bounded_gmail_research_summary_graph(text: str, *, manager_steps: int) -> bool:
+    """Recognize read->research->summary asks with an explicit no-write boundary."""
+
+    normalized = " ".join(str(text or "").lower().split())
+    research_output = bool(
+        re.search(r"\bresearch\b", normalized)
+        and re.search(
+            r"\b(?:summarize|summary|determine|understand|explain|identify)\b",
+            normalized,
+        )
+        and re.search(
+            r"\b(?:public sources?|source links?|current sources?|visible sources?)\b",
+            normalized,
+        )
+    )
+    no_outreach = bool(
+        re.search(
+            r"\b(?:do not|don't|dont|without|no)\b[^.;\n]{0,180}"
+            r"\b(?:draft|reply|response|send|gmail draft|post|schedule|share|write)\b",
+            normalized,
+        )
+    )
+    return bool(
+        manager_steps == 3
+        and re.search(r"\b(?:gmail|email|thread)\b", normalized)
+        and re.search(r"\b(?:read|find|review|latest|recent)\b", normalized)
+        and research_output
+        and no_outreach
     )
 
 

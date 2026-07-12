@@ -239,6 +239,75 @@ def test_company_live_retrieval_defaults_to_searxng_with_hosted_parallel_lane(
     assert ladder["browserless"]["use_frequency"] == "eval_only"
 
 
+def test_company_live_retrieval_uses_shared_exa_cap_across_expanded_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    calls: list[tuple[str, str]] = []
+
+    class Provider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append((self.provider_name, query))
+            if self.provider_name == "searxng":
+                return []
+            return [
+                SearchResult(
+                    title="Exa company evidence",
+                    link=f"https://evidence.example.test/{len(calls)}",
+                    snippet="Company research evidence from an independent source.",
+                    source="exa",
+                )
+            ]
+
+    monkeypatch.setenv("KEYSTONE_ENABLE_WEBSITE_EXTRACTION", "false")
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN", "2")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_COMPANY_SEARCH_CONCURRENCY", "3")
+
+    _profile, metadata = live_retrieval.retrieve_company_profile_live(
+        company="Mentavi",
+        request_text="Research Mentavi leadership, partnerships, and clinical evidence",
+        max_results=3,
+        settings_loader=lambda: SimpleNamespace(
+            search_provider="searxng",
+            serper_enabled=False,
+            website_extractor="trafilatura",
+        ),
+        query_builder=lambda *_args: [
+            "Mentavi leadership",
+            "Mentavi partnerships",
+            "Mentavi clinical evidence",
+        ],
+        search_provider_builder=lambda provider=None, *, live=False: Provider(str(provider)),
+        profile_builder=lambda **_kwargs: CompanyProfile(
+            name="Mentavi",
+            description="Source-backed company profile.",
+        ),
+    )
+
+    exa_calls = [query for provider, query in calls if provider == "exa"]
+    assert len(exa_calls) == 2
+    assert all("related organizations primary sources" in query for query in exa_calls)
+    assert metadata["provider_usage"]["exa"]["requests_attempted"] == 2
+    assert metadata["provider_usage"]["exa"]["requests_succeeded"] == 2
+    assert len(metadata["provider_queries"]["exa"]) == 2
+    assert all(
+        "related organizations primary sources" in query
+        for query in metadata["retrieval_diagnostics"]["provider_queries"]["exa"]
+    )
+    assert metadata["search_providers_used"] == ["searxng", "exa"]
+    assert any(
+        error["provider"] == "exa" and error["error_type"] == "ProviderRequestCapExceeded"
+        for error in metadata["search_provider_errors"]
+    )
+
+
 def test_retrieval_diagnostics_keeps_partial_provider_errors_backend_only() -> None:
     import keystone_agents.live_retrieval as live_retrieval
 
@@ -1018,6 +1087,38 @@ def test_opportunity_search_provider_can_enable_tavily_deepening(
 
     assert provider.provider_sequence == ("searxng", "agents-web-search")
     assert provider.deepening_provider_sequence == ("tavily",)
+    assert provider._provider_request_budget.limit_for("tavily") == 2
+
+
+def test_opportunity_search_provider_honors_tavily_per_run_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN", "1")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: SimpleNamespace(
+            provider_name=provider,
+            dry_run=False,
+            validate_configuration=lambda: None,
+            search_web=lambda query, num_results=5: [],
+        ),
+    )
+
+    provider = live_retrieval.build_opportunity_search_provider(
+        topic="precision psychiatry collaborations",
+        desired_results=5,
+    )
+
+    assert provider._provider_request_budget.limit_for("tavily") == 1
 
 
 def test_opportunity_search_provider_can_enable_exa_deepening_with_cap(
@@ -1051,6 +1152,38 @@ def test_opportunity_search_provider_can_enable_exa_deepening_with_cap(
     assert provider.provider_sequence == ("searxng", "agents-web-search")
     assert provider.deepening_provider_sequence == ("exa",)
     assert provider._provider_request_budget.limit_for("exa") == 1
+
+
+def test_opportunity_search_provider_prefers_exa_before_tavily_when_both_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "true")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(search_provider="searxng"),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: SimpleNamespace(
+            provider_name=provider,
+            dry_run=False,
+            validate_configuration=lambda: None,
+            search_web=lambda query, num_results=5: [],
+        ),
+    )
+
+    provider = live_retrieval.build_opportunity_search_provider(
+        topic="precision psychiatry collaborations",
+        desired_results=5,
+    )
+
+    assert provider.deepening_provider_sequence == ("exa", "tavily")
 
 
 def test_formal_opportunity_search_provider_uses_configured_tavily_deepening(

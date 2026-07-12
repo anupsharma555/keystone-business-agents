@@ -39,8 +39,16 @@ def build_controlled_pilot_scorecard(
             case_rows.append(
                 {
                     "case_id": case.case_id,
+                    "title": case.title,
                     "status": "missing",
                     "failed_checks": ["observation_missing"],
+                    "backend": case.backend,
+                    "entry_owner": case.expected_entry_owner,
+                    "context_sources": list(case.context_sources),
+                    "expected_artifact": case.expected_artifact,
+                    "allowed_provider_writes": case.allowed_provider_writes,
+                    "max_openai_requests": case.max_openai_requests,
+                    "max_cost_usd": case.max_cost_usd,
                     "comparison_status": "pending_kba_observation",
                 }
             )
@@ -65,10 +73,16 @@ def build_controlled_pilot_scorecard(
         case_rows.append(
             {
                 "case_id": case.case_id,
+                "title": case.title,
                 "status": assessment.status,
                 "failed_checks": list(assessment.failed_checks),
                 "backend": case.backend,
                 "entry_owner": case.expected_entry_owner,
+                "context_sources": list(case.context_sources),
+                "expected_artifact": case.expected_artifact,
+                "allowed_provider_writes": case.allowed_provider_writes,
+                "max_openai_requests": case.max_openai_requests,
+                "max_cost_usd": case.max_cost_usd,
                 "openai_requests": observation.openai_requests,
                 "estimated_cost_usd": observation.estimated_cost_usd,
                 "latency_ms": observation.latency_ms,
@@ -109,6 +123,17 @@ def build_controlled_pilot_scorecard(
             "openai_requests": observed_requests,
             "estimated_cost_usd": round(observed_cost, 8),
             "latency_ms": observed_latency,
+        },
+        "planned_ceiling": {
+            "openai_requests": sum(
+                case.max_openai_requests for case in controlled_pilot_cases()
+            ),
+            "estimated_cost_usd": round(
+                sum(case.max_cost_usd for case in controlled_pilot_cases()), 8
+            ),
+            "provider_writes": sum(
+                case.allowed_provider_writes for case in controlled_pilot_cases()
+            ),
         },
         "cases": case_rows,
         "baseline_observation_count": len(baseline_by_case),

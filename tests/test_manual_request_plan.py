@@ -535,6 +535,27 @@ def test_manual_plan_merge_preserves_explicit_user_scope_over_llm_candidate() ->
     assert "model-added grouping suggestion" in merged.constraints
 
 
+def test_manual_plan_distinguishes_review_copy_from_provider_draft() -> None:
+    plan = infer_manual_request_plan(
+        "Review the supplied Gmail thread and prepare one concise reply for review. "
+        "Do not send, create a provider draft, search, post, schedule, share, or "
+        "write externally.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "gmail_triage"
+    assert plan.draft_policy == "draft_only_when_reply_needed"
+
+
+def test_manual_plan_direct_no_reply_instruction_remains_authoritative() -> None:
+    plan = infer_manual_request_plan(
+        "Summarize the selected Gmail thread and do not draft replies.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.draft_policy == "no_drafts_requested"
+
+
 def test_manual_plan_specific_agent_call_stays_on_requested_agent() -> None:
     plan = infer_manual_request_plan(
         "run one opportunity-to-outreach loop for behavioral health AI. Top 1 only.",

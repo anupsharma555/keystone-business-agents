@@ -21,6 +21,7 @@ from keystone_agents.browser_extraction_eval import (
     score_rendered_page,
     write_browser_extraction_artifacts,
 )
+from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResult
 
 
 def test_load_browser_extraction_cases_jsonl(tmp_path: Path) -> None:
@@ -217,6 +218,37 @@ def test_browser_provider_diagnostic_specs_keep_firecrawl_explicit() -> None:
     assert "every selected-page extraction comparison" in specs["trafilatura"].next_validation
     assert "console/page-error/request-failure" in specs["playwright"].benchmark_focus
     assert "diagnostics" in specs["playwright"].readiness
+    assert specs["crawl4ai"].promotion_status == "experimental_eval"
+    assert "implemented optional adapter" in specs["crawl4ai"].readiness
+
+
+def test_crawl4ai_provider_builds_as_live_extraction_adapter(monkeypatch) -> None:
+    def fake_extract(url, *, company_name, provider, live, guardrail_context="default"):
+        assert company_name == "example.com"
+        assert provider == "crawl4ai"
+        assert live is True
+        assert guardrail_context == "default"
+        return WebsiteExtractionResult(
+            url=url,
+            title="Example",
+            provider="crawl4ai",
+            status="success",
+            text_or_markdown="Example research and clinical trial evidence.",
+            claims=["Example supports clinical trial research."],
+            metadata={"final_url": f"{url}/final", "status_code": 200},
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.browser_extraction_eval.extract_website_content",
+        fake_extract,
+    )
+    provider = build_rendered_page_provider("crawl4ai", live=True)
+    page = provider.render("https://example.com", 10)
+
+    assert page.provider == "crawl4ai"
+    assert page.status == "success"
+    assert page.final_url == "https://example.com/final"
+    assert page.metadata["status_code"] == 200
 
 
 def test_browser_provider_normalizer_accepts_current_and_future_boundaries() -> None:

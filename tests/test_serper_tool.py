@@ -252,11 +252,12 @@ def test_search_web_default_live_policy_can_include_exa_deepening_lane(
 
     results = search_web("Curebase", num_results=2)
 
-    assert {
-        "searxng:Curebase:2",
-        "agents-web-search:Curebase:2",
-        "exa:Curebase:2",
-    } <= set(calls)
+    assert "searxng:Curebase:2" in calls
+    assert "agents-web-search:Curebase:2" in calls
+    assert any(
+        call.startswith("exa:Curebase related organizations primary sources ")
+        for call in calls
+    )
     assert [result.source for result in results] == [
         "searxng",
         "agents-web-search",
@@ -304,11 +305,9 @@ def test_search_web_default_live_policy_can_include_tavily_deepening_lane(
 
     results = search_web("Curebase", num_results=2)
 
-    assert {
-        "searxng:Curebase:2",
-        "agents-web-search:Curebase:2",
-        "tavily:Curebase:2",
-    } <= set(calls)
+    assert "searxng:Curebase:2" in calls
+    assert "agents-web-search:Curebase:2" in calls
+    assert any(call.startswith("tavily:Curebase official primary sources ") for call in calls)
     assert [result.source for result in results] == [
         "searxng",
         "agents-web-search",

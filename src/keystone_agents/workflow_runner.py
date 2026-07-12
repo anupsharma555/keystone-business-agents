@@ -2433,6 +2433,47 @@ def _attach_route_specific_review_fields(
         )
         return
 
+    if result.route == WorkItemRoute.OUTREACH_COMPOSER:
+        outreach_artifact = next(
+            (
+                artifact
+                for artifact in result.artifact_refs
+                if artifact.artifact_type == "outreach_draft"
+            ),
+            None,
+        )
+        if outreach_artifact is None:
+            return
+        metadata = outreach_artifact.metadata
+        source_ids = [
+            str(item or "").strip()
+            for item in metadata.get("source_ids_used") or []
+            if str(item or "").strip()
+        ]
+        facts_used = [
+            fact.value
+            for fact in result.work_item.facts
+            if fact.approval_state == ApprovalState.APPROVED_FOR_DRAFTING
+            and str(fact.value or "").strip()
+        ]
+        review_payload.update(
+            {
+                "summary": outreach_artifact.summary or result.human_summary,
+                "email_subject": metadata.get("email_subject") or outreach_artifact.title,
+                "email_body": result.human_summary,
+                "linkedin_note": "Not requested for this email-only review draft.",
+                "personalization_rationale": outreach_artifact.summary,
+                "facts_used": facts_used,
+                "source_ids_used": source_ids,
+                "approval_required": True,
+                "send_enabled": False,
+                "unsupported_claims_flagged": list(
+                    metadata.get("unsupported_claims_flagged") or []
+                ),
+            }
+        )
+        return
+
     if result.route != WorkItemRoute.GMAIL_TRIAGE:
         return
     triage_artifact = next(
@@ -3653,10 +3694,10 @@ def _manager_loop_request_is_planning_only(
     )
     if re.search(r"\bplan\s+the\s+safest\s+workflow\b", text):
         return True
-    if requested_agent == WorkItemRoute.ORCHESTRATOR.value:
-        return bool(re.search(planning_pattern, text))
     if _manager_loop_requests_outreach_draft(text):
         return False
+    if requested_agent == WorkItemRoute.ORCHESTRATOR.value:
+        return bool(re.search(planning_pattern, text))
     if re.search(planning_pattern, text) and not re.search(
         r"\b(?:run|execute|continue|advance)\b[^.\n]{0,80}\b(?:workflow|agents?|specialists?)\b",
         text,
@@ -4279,18 +4320,20 @@ def _manager_loop_requests_opportunity_assessment(normalized_text: str) -> bool:
 
 
 def _manager_loop_requests_outreach_draft(normalized_text: str) -> bool:
-    if re.search(
-        r"\b(?:do not|don't|no|without)\b[^.\n]{0,80}\b(?:draft|write|compose|prepare)\b"
-        r"[^.\n]{0,80}\b(?:outreach|email|linkedin|message|note|reply|response)\b",
+    scrubbed_text = re.sub(
+        r"\b(?:do not|don't|dont|never|no|without)\b"
+        r"(?=[^.;\n]{0,240}\b(?:draft\s+(?:outreach|email|linkedin|message|note|reply|response)"
+        r"|(?:create|save|write|add)\b[^.;\n]{0,60}\b(?:gmail\s+)?draft)\b)"
+        r"[^.;\n]{0,240}",
+        " ",
         normalized_text,
         flags=re.I,
-    ):
-        return False
+    )
     scrubbed_text = re.sub(
         r"\b(?:do not|don't|dont|never|no|without)\b[^.\n]{0,80}\bsend\b"
         r"[^.\n]{0,80}\b(?:outreach|email|linkedin|message|note|reply|response)\b",
         " ",
-        normalized_text,
+        scrubbed_text,
         flags=re.I,
     )
     if re.search(
@@ -4346,6 +4389,18 @@ def _manager_loop_requests_outreach_draft(normalized_text: str) -> bool:
                     flags=re.I,
                 )
             )
+        )
+    )
+
+
+def _gmail_triage_requests_outreach_handoff(normalized_text: str) -> bool:
+    """Keep simple Gmail reply help direct unless the operator names a handoff."""
+
+    return _manager_loop_requests_outreach_draft(normalized_text) and bool(
+        re.search(
+            r"\b(?:outreach\s+composer|draft(?:ing)?\s+specialist)\b",
+            normalized_text,
+            flags=re.I,
         )
     )
 
@@ -4449,6 +4504,9 @@ def _route_from_manual_plan(
         return None
     target_agent = str(plan.get("target_agent") or "").strip()
     intent = str(plan.get("intent") or "").strip()
+    requested_agent = str(plan.get("requested_agent") or "").strip()
+    if requested_agent == WorkItemRoute.GMAIL_TRIAGE.value and intent == "gmail_triage":
+        return WorkItemRoute.GMAIL_TRIAGE
     if intent == "blocked_send":
         if target_agent == WorkItemRoute.OUTREACH_COMPOSER.value:
             return WorkItemRoute.OUTREACH_COMPOSER
@@ -7283,6 +7341,13 @@ def _manual_task_objective(work_item: WorkItem) -> str:
     return ""
 
 
+def _manual_request_objective(work_item: WorkItem) -> str:
+    plan = work_item.target.metadata.get("manual_request_plan")
+    if not isinstance(plan, dict):
+        return ""
+    return str(plan.get("objective") or "").strip()
+
+
 def _manual_required_terms(work_item: WorkItem) -> list[str]:
     raw = work_item.target.metadata.get("manual_required_terms")
     if not raw:
@@ -8707,6 +8772,12 @@ def _advance_gmail_triage(
     if inline_fixture is not None and _gmail_plan_allows_inline_read_only_triage(gmail_plan):
         triage = triage_email_fixture(inline_fixture)
         research_requested = _manager_loop_requests_research(effective_request_text)
+        outreach_handoff_requested = _gmail_triage_requests_outreach_handoff(
+            effective_request_text
+        )
+        approved_reply_objective = str(
+            work_item.target.metadata.get("reply_objective") or ""
+        ).strip()
         gmail_research_target = (
             _source_bundle_company_target(work_item)
             or _gmail_sender_organization(triage.sender_name, triage.sender_email)
@@ -8738,6 +8809,17 @@ def _advance_gmail_triage(
                 requires_approval=False,
             )
             if research_requested and gmail_research_target
+            else WorkItemNextAction(
+                action="draft_thread_local_reply",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+                description=(
+                    "Use the approved supplied Gmail context and reply objective to "
+                    "prepare review-only copy. Do not create a Gmail draft or send."
+                ),
+                requires_approval=False,
+            )
+            if outreach_handoff_requested
+            and (triage.needs_reply or approved_reply_objective)
             else WorkItemNextAction(
                 action="review_gmail_triage",
                 agent=WorkItemRoute.GMAIL_TRIAGE,
@@ -9013,6 +9095,14 @@ def _try_live_gmail_thread_retrieval(
     gmail_research_target = (
         _gmail_thread_research_target(selected) if research_requested else ""
     )
+    gmail_research_focus_terms = (
+        _gmail_thread_research_focus_terms(
+            selected,
+            organization=gmail_research_target,
+        )
+        if research_requested
+        else []
+    )
     output_payload = {
         "mode": f"live-gmail-{read_scope}-summary",
         "query": query,
@@ -9060,6 +9150,7 @@ def _try_live_gmail_thread_retrieval(
             "latest_received_at": selected.latest_received_at,
             "thread_summary": selected.summary,
             "gmail_research_target": gmail_research_target,
+            "gmail_research_focus_terms": gmail_research_focus_terms,
             "send_enabled": False,
             "draft_created": False,
             "labels_modified": False,
@@ -9107,10 +9198,13 @@ def _try_live_gmail_thread_retrieval(
                         update={
                             "name": gmail_research_target,
                             "object_type": "company",
-                            "metadata": _metadata_with_manual_primary_target(
-                                work_item.target.metadata,
-                                gmail_research_target,
-                            ),
+                            "metadata": {
+                                **_metadata_with_manual_primary_target(
+                                    work_item.target.metadata,
+                                    gmail_research_target,
+                                ),
+                                "gmail_research_focus_terms": gmail_research_focus_terms,
+                            },
                         }
                     )
                     if gmail_research_target
@@ -9820,6 +9914,38 @@ def _gmail_thread_research_target(summary: GmailThreadSummaryResult) -> str:
     return ""
 
 
+def _gmail_thread_research_focus_terms(
+    summary: GmailThreadSummaryResult,
+    *,
+    organization: str = "",
+) -> list[str]:
+    """Extract product/platform names from selected Gmail context for research handoff."""
+
+    text = str(summary.subject or "").replace("_", " ")
+    organization_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9-]+", organization)
+    }
+    excluded = {
+        "external",
+        "form",
+        "gmail",
+        "hubspot",
+        "inquiry",
+        "message",
+        "original",
+        "submission",
+        "thread",
+    }
+    terms: list[str] = []
+    for candidate in re.findall(r"\b[A-Z][A-Za-z0-9]{3,}\b", text):
+        lowered = candidate.lower()
+        if lowered in excluded or lowered in organization_tokens or lowered.isdigit():
+            continue
+        terms.append(candidate)
+    return list(dict.fromkeys(terms))[:4]
+
+
 def _effective_work_item_request_text(request: WorkflowRunRequest, work_item: WorkItem) -> str:
     request_text = str(request.request_text or "").strip()
     if request_text.lower() in {"", "continue", "resume"}:
@@ -9864,40 +9990,87 @@ def _gmail_retrieval_query_from_request(
     manual_request_plan: dict[str, Any] | None,
 ) -> str:
     parts: list[str] = []
+    broad_inbox_scan = _gmail_request_is_broad_inbox_scan(request_text)
     configured_sender_alias = _configured_gmail_sender_alias_requested(request_text)
     configured_sender = _configured_gmail_sender() if configured_sender_alias else ""
+    configured_recipient_alias = _configured_gmail_recipient_alias_requested(request_text)
+    configured_recipient = (
+        _configured_gmail_recipient() if configured_recipient_alias else ""
+    )
     if configured_sender_alias and not configured_sender:
+        return ""
+    if configured_recipient_alias and not configured_recipient:
         return ""
     if isinstance(manual_request_plan, dict):
         planned_query = str(manual_request_plan.get("gmail_query") or "").strip()
-        if configured_sender_alias:
+        if configured_sender_alias or configured_recipient_alias:
             planned_query = re.sub(
-                r"[\"']?the\s+configured\s+exact\s+test\s+sender[\"']?",
+                r"[\"']?(?:the\s+)?configured\s+exact\s+test\s+"
+                r"(?:sender|recipient)[\"']?",
                 "",
                 planned_query,
                 flags=re.I,
             ).strip()
         if planned_query:
             parts.extend(planned_query.split())
+    if broad_inbox_scan:
+        parts = [
+            part
+            for part in parts
+            if re.match(
+                r"^(?:in:|is:|after:|before:|newer_than:|older_than:|label:|category:|has:)",
+                part,
+                flags=re.I,
+            )
+        ]
     lower = str(request_text or "").lower()
     if "inbox" in lower and not any(part.startswith("in:") for part in parts):
         parts.append("in:inbox")
     if "unread" in lower and "is:unread" not in parts:
         parts.append("is:unread")
-    if not any(part.startswith("newer_than:") for part in parts):
-        parts.append("newer_than:30d")
+    if not any(part.startswith(("newer_than:", "after:")) for part in parts):
+        parts.append("newer_than:1d" if broad_inbox_scan else "newer_than:30d")
     sender_email = configured_sender or _email_address_from_text(request_text)
     if sender_email:
         parts.append(f"from:{sender_email}")
-    terms = _gmail_search_terms_from_request(request_text)
-    if configured_sender_alias:
+    if configured_recipient:
+        parts.append(f"to:{configured_recipient}")
+    terms = [] if broad_inbox_scan else _gmail_search_terms_from_request(request_text)
+    if configured_sender_alias or configured_recipient_alias:
         terms = [
             term
             for term in terms
-            if "configured exact test sender" not in term.lower()
+            if not re.search(
+                r"configured\s+exact\s+test\s+(?:sender|recipient)",
+                term,
+                flags=re.I,
+            )
         ]
     parts.extend(_quote_gmail_query_term(term) for term in terms[:4])
     return " ".join(list(dict.fromkeys(part for part in parts if part))).strip()
+
+
+def _gmail_request_is_broad_inbox_scan(request_text: str) -> bool:
+    text = str(request_text or "")
+    lower = text.lower()
+    if not re.search(r"\b(?:gmail|inbox|messages?|emails?)\b", lower):
+        return False
+    if not re.search(r"\b(?:today|this morning|this afternoon|received today)\b", lower):
+        return False
+    if re.search(
+        r"\b(?:subject(?: line)?\s+(?:is|contains|about|with)|"
+        r"body\s+(?:contains|mentions|about|with)|"
+        r"(?:email|message|thread)s?\s+from\s+[A-Za-z0-9])",
+        text,
+        flags=re.I,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:review|scan|triage|identify|rank|prioriti[sz]e|shortlist)\b",
+            lower,
+        )
+    )
 
 
 def _configured_gmail_sender_alias_requested(text: str) -> bool:
@@ -9916,6 +10089,21 @@ def _configured_gmail_sender() -> str:
         or os.getenv("GMAIL_USERNAME")
         or ""
     ).strip().lower()
+    return candidate if re.fullmatch(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", candidate) else ""
+
+
+def _configured_gmail_recipient_alias_requested(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:the\s+)?configured\s+exact\s+test\s+recipient\b",
+            str(text or ""),
+            flags=re.I,
+        )
+    )
+
+
+def _configured_gmail_recipient() -> str:
+    candidate = str(os.getenv("KEYSTONE_GMAIL_TEST_SEND_RECIPIENT") or "").strip().lower()
     return candidate if re.fullmatch(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", candidate) else ""
 
 
@@ -12034,7 +12222,24 @@ def _advance_research(
     store: SQLiteStore | None,
     sdk_session: Any | None = None,
 ) -> WorkflowRunResult:
-    request_text = request.request_text.strip()
+    effective_request_text = _effective_work_item_request_text(request, work_item)
+    gmail_focus_terms = [
+        " ".join(str(term or "").split())
+        for term in work_item.target.metadata.get("gmail_research_focus_terms") or []
+        if " ".join(str(term or "").split())
+    ]
+    if gmail_focus_terms:
+        focus_prefix = " ".join(gmail_focus_terms[:4])
+        data_focus = (
+            " datasource provenance linkage records claims limitations."
+            if re.search(r"\bdata\s*source\b", effective_request_text, flags=re.I)
+            else ""
+        )
+        effective_request_text = (
+            f"Research focus: {focus_prefix}.{data_focus} {effective_request_text}"
+        ).strip()
+    request = request.model_copy(update={"request_text": effective_request_text})
+    request_text = effective_request_text
     selected_opportunity = selected_artifacts(work_item, "opportunity")
     target = ""
     if selected_opportunity and _should_research_selected_opportunity(request_text):
@@ -12277,7 +12482,16 @@ def _advance_research(
     artifact_id = ""
     if store is not None:
         artifact_id = str(store.save_company(profile))
-    combined_request_text = f"{request.request_text} {work_item.request_text}"
+    combined_request_text = " ".join(
+        part
+        for part in (
+            request.request_text,
+            work_item.request_text,
+            str((request.manual_request_plan or {}).get("objective") or ""),
+            _manual_request_objective(work_item),
+        )
+        if str(part or "").strip()
+    )
     planning_only = _manager_loop_request_is_planning_only(
         combined_request_text,
         manual_request_plan=request.manual_request_plan,
@@ -13459,17 +13673,66 @@ def _slack_conservative_company_research_query_builder(
     request: WorkflowRunRequest,
 ) -> Callable[[str, str | None], list[str]]:
     focus_terms = _request_focus_terms_for_search(latest_user_request(request.request_text))
+    datasource_requested = bool(
+        re.search(
+            r"\b(?:data\s*source|provenance|claims linkage|data dictionary|methodology)\b",
+            str(request.request_text or ""),
+            flags=re.I,
+        )
+    )
 
     def build_queries(company: str, company_url: str | None = None) -> list[str]:
         normalized_company = company.strip()
         focus_phrase = " ".join(
             term for term in focus_terms if term.lower() != normalized_company.lower()
         )
+        product_terms = [
+            term
+            for term in focus_terms
+            if term.lower()
+            not in {
+                normalized_company.lower(),
+                "claim",
+                "data",
+                "datasource",
+                "linkage",
+                "limitation",
+                "provenance",
+                "record",
+            }
+        ]
+        product_focus = " ".join(product_terms[:2])
         company_domain = ""
         if company_url:
             parsed = urlparse(company_url if "://" in company_url else f"https://{company_url}")
             company_domain = parsed.netloc.removeprefix("www.")
+        datasource_queries = (
+            [
+                (
+                    f"{normalized_company} {product_focus} data source clinical records "
+                    "claims linkage provenance"
+                ),
+                f"site:{company_domain} {product_focus} database data source records"
+                if company_domain
+                else f"{normalized_company} {product_focus} official database data source records",
+                f'"{product_focus}" methodology data provenance',
+                f'"{product_focus}" EHR claims linkage',
+                f'"{product_focus}" data dictionary coverage limitations',
+            ]
+            if datasource_requested and product_focus
+            else []
+        )
+        organization_queries = [
+            (
+                f"site:{company_domain} {normalized_company} about company product ownership"
+                if company_domain
+                else f"{normalized_company} official company about product ownership"
+            ),
+            f"{normalized_company} current ownership funding business model 2026",
+        ]
         queries = [
+            *datasource_queries,
+            *organization_queries,
             f"{normalized_company} official website",
             f"{normalized_company} 2026 recent news partnership funding",
             f"{normalized_company} 2026 independent coverage",
@@ -16121,7 +16384,12 @@ def _advance_outreach(
         recommendation=recommendation,
         gmail_thread_context=gmail_thread_context,
     )
-    if recommendation_mismatches:
+    should_repair_with_model = _should_repair_outreach_with_model(
+        request,
+        recommendation=recommendation,
+        mismatches=recommendation_mismatches,
+    )
+    if recommendation_mismatches and should_repair_with_model:
         if sdk_usage_event is not None:
             _record_workflow_sdk_cost_event(
                 work_item,
@@ -16178,8 +16446,35 @@ def _advance_outreach(
                 "Manager review withheld the optional draft and retained the model's "
                 "internal next-step recommendation; no operator clarification was required."
             )
-    draft_id = str(store.save_outreach_draft(draft))
+    elif recommendation_mismatches:
+        recommendation = {
+            **recommendation,
+            "reply_recommended": False,
+            "deferral_reason": _compact_outreach_summary_text(
+                recommendation.get("deferral_reason")
+            )
+            or (
+                "No reply is recommended because the optional copy did not pass "
+                "conversation-state review."
+            ),
+        }
+        draft_audit_notes.append(
+            "Deterministic review withheld optional reply copy without a second model call; "
+            "the recommendation and evidence-bounded next step were retained."
+        )
     reply_recommended = recommendation.get("reply_recommended") is not False
+    if not reply_recommended:
+        draft = draft.model_copy(
+            update={
+                "email_subject": "",
+                "email_body": "",
+                "linkedin_note": "",
+                "personalization_rationale": _recommendation_only_rationale(
+                    draft.personalization_rationale
+                ),
+            }
+        )
+    draft_id = str(store.save_outreach_draft(draft))
     approval_item = None
     if reply_recommended:
         approval_item = build_approval_queue_item(
@@ -17602,6 +17897,9 @@ def _format_outreach_draft_work_item_summary(
     ]
     lines: list[str] = []
     recommendation = recommendation or {}
+    reply_recommended = recommendation.get("reply_recommended") is not False
+    if not reply_recommended:
+        rationale = _recommendation_only_rationale(rationale)
     if gmail_thread_context is not None:
         main_point = _compact_outreach_summary_text(
             gmail_thread_context.summary or gmail_thread_context.thread_context
@@ -17643,7 +17941,7 @@ def _format_outreach_draft_work_item_summary(
                 ),
             ]
         )
-        if recommendation.get("reply_recommended") is False:
+        if not reply_recommended:
             lines.extend(
                 [
                     "",
@@ -17655,7 +17953,7 @@ def _format_outreach_draft_work_item_summary(
             lines.extend(["", "*Suggested reply:*"])
     else:
         lines.extend([f"Draft email for {company_name}", "", "Email draft"])
-    if gmail_thread_context is None or recommendation.get("reply_recommended") is not False:
+    if gmail_thread_context is None or reply_recommended:
         lines.extend([
             f"Subject: {subject}",
             "",
@@ -17685,10 +17983,15 @@ def _format_outreach_draft_work_item_summary(
             + "; ".join(_compact_outreach_summary_text(item) for item in draft.blocked_facts[:3])
         )
     review_notes.append(
-        "- Safety: Draft-only; no external message was sent, no Gmail draft was created, "
+        "- Safety: Read-only recommendation; no reply copy or Gmail draft was created, "
         "and no external save/post/write was performed."
+        if not reply_recommended
+        else (
+            "- Safety: Draft-only; no external message was sent, no Gmail draft was "
+            "created, and no external save/post/write was performed."
+        )
     )
-    if recommendation.get("reply_recommended") is False:
+    if not reply_recommended:
         review_notes.append(
             "- Approval status: no immediate reply is recommended; external-use approval "
             "is only needed if a future draft is prepared."
@@ -17707,6 +18010,22 @@ def _format_outreach_draft_work_item_summary(
         heading = "*Supporting evidence and approval status:*" if gmail_thread_context else "*Review notes:*"
         lines.extend(["", heading, *review_notes])
     return "\n".join(lines).strip()
+
+
+def _recommendation_only_rationale(value: object) -> str:
+    """Remove narration that implies a nonexistent outbound artifact."""
+
+    rationale = _compact_outreach_summary_text(value)
+    return re.sub(
+        r"\b(?:this|the)\s+(?:reply|draft)\b",
+        lambda match: (
+            "This recommendation"
+            if match.group(0)[0].isupper()
+            else "the recommendation"
+        ),
+        rationale,
+        flags=re.I,
+    )
 
 
 def _gmail_thread_chronology_context(
@@ -17856,6 +18175,21 @@ def _gmail_thread_recommendation_mismatches(
     ):
         mismatches.append("The model deferred the reply without explaining why.")
     return mismatches
+
+
+def _should_repair_outreach_with_model(
+    request: WorkflowRunRequest,
+    *,
+    recommendation: dict[str, Any],
+    mismatches: list[str],
+) -> bool:
+    """Spend a repair call only for approved, still-actionable reply copy."""
+
+    return bool(
+        mismatches
+        and request.allow_manager_loop_repair
+        and recommendation.get("reply_recommended") is not False
+    )
 
 
 def _sanitize_gmail_chronology_detail(value: object) -> str:
@@ -18317,6 +18651,110 @@ def _inline_outreach_review_subject(text: str) -> str:
     return ""
 
 
+def _compact_approved_outreach_sdk_context(approved_context: Any) -> dict[str, Any]:
+    """Keep only the source-backed fields needed by the no-tools synthesis agent."""
+
+    company = approved_context.company_profile
+    style = approved_context.email_style_profile
+    return {
+        "company": {
+            "name": company.name,
+            "description": str(company.description or "")[:800],
+            "fit_summary": str(company.fit_summary or "")[:800],
+        },
+        "allowed_facts": [
+            {
+                "claim_text": fact.claim_text,
+                "source_id": fact.source_id,
+                "confidence": fact.confidence,
+            }
+            for fact in approved_context.allowed_facts[:12]
+        ],
+        "allowed_source_ids": list(approved_context.allowed_source_ids[:12]),
+        "blocked_facts": list(approved_context.blocked_facts[:6]),
+        "objective": approved_context.objective,
+        "revision_request": approved_context.revision_request,
+        "email_style_profile": (
+            {
+                "greeting_patterns": list(style.greeting_patterns[:3]),
+                "signoffs": list(style.signoffs[:3]),
+                "sentence_length": style.sentence_length,
+                "directness": style.directness,
+                "cta_style": style.cta_style,
+                "formality": style.formality,
+                "preferred_phrases": list(style.preferred_phrases[:5]),
+                "avoided_phrases": list(style.avoided_phrases[:5]),
+            }
+            if style is not None
+            else None
+        ),
+        "approval_state": str(approved_context.approval_state.value),
+        "approved_context_used": bool(approved_context.approved_context_used),
+    }
+
+
+def _compact_outreach_orchestrator_context(
+    request: WorkflowRunRequest,
+    work_item: WorkItem,
+) -> dict[str, Any]:
+    """Preserve Orchestrator advice without replaying full WorkItem state."""
+
+    payload = _specialist_orchestrator_context_payload(request, work_item)
+    manual_plan = payload.get("manual_request_plan")
+    preflight = payload.get("orchestrator_preflight")
+    context_pack = payload.get("context_pack")
+    return {
+        "raw_request": payload.get("raw_request"),
+        "work_item_id": payload.get("work_item_id"),
+        "side_effect_policy": payload.get("side_effect_policy"),
+        "manual_request_plan": (
+            {
+                key: manual_plan.get(key)
+                for key in (
+                    "objective",
+                    "constraints",
+                    "draft_policy",
+                    "requires_live_search",
+                    "side_effect_policy",
+                )
+                if manual_plan.get(key) not in (None, "", [], {})
+            }
+            if isinstance(manual_plan, dict)
+            else None
+        ),
+        "orchestrator_preflight": (
+            {
+                key: preflight.get(key)
+                for key in (
+                    "selected_agent",
+                    "preflight_memo",
+                    "route_result",
+                )
+                if preflight.get(key) not in (None, "", [], {})
+            }
+            if isinstance(preflight, dict)
+            else None
+        ),
+        "context_pack": (
+            {
+                key: context_pack.get(key)
+                for key in (
+                    "pack_type",
+                    "route",
+                    "ready",
+                    "can_synthesize",
+                    "source_context_status",
+                    "missing_requirements",
+                    "limitation_notes",
+                )
+                if context_pack.get(key) not in (None, "", [], {})
+            }
+            if isinstance(context_pack, dict)
+            else None
+        ),
+    }
+
+
 def _compose_outreach_draft_for_work_item(
     *,
     company_profile: Any,
@@ -18394,11 +18832,10 @@ def _compose_outreach_draft_for_work_item(
 
         def retrieve() -> dict[str, Any]:
             return {
-                "company_profile": company_profile,
-                "opportunity_record": opportunity_record,
-                "email_style_profile": style_profile,
-                "approved_context": approved_context,
-                "orchestrator_context": _specialist_orchestrator_context_payload(
+                "approved_context": _compact_approved_outreach_sdk_context(
+                    approved_context
+                ),
+                "orchestrator_context": _compact_outreach_orchestrator_context(
                     request,
                     work_item,
                 ),
@@ -18411,12 +18848,14 @@ def _compose_outreach_draft_for_work_item(
                 recent_signal=opportunity_record.rationale if opportunity_record else "",
                 outreach_goal=objective,
                 approved_context=(
-                    _specialist_orchestrator_context_text(request, work_item) + "\n\n"
+                    "Orchestrator memo for this specialist WorkItem run:\n"
+                    f"{json.dumps(context['orchestrator_context'], ensure_ascii=True, sort_keys=True)}"
+                    "\n\n"
                     "Approved source-backed WorkItem outreach context:\n"
-                    f"{json.dumps(jsonable(context), ensure_ascii=True, sort_keys=True)}"
+                    f"{json.dumps(context['approved_context'], ensure_ascii=True, sort_keys=True)}"
                 ),
                 email_style_profile=json.dumps(
-                    jsonable(style_profile),
+                    context["approved_context"].get("email_style_profile") or {},
                     ensure_ascii=True,
                     sort_keys=True,
                 ),
@@ -18425,6 +18864,7 @@ def _compose_outreach_draft_for_work_item(
         outcome = run_retrieved_sdk_synthesis(
             agent=build_outreach_composer_compact_synthesis_agent(
                 request_text=request.request_text,
+                include_tools_policy=True,
             ),
             output_type=OutreachLLMDraftPayload,
             retrieve=retrieve,

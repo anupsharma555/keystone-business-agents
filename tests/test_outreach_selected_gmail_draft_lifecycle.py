@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from keystone_agents.schemas.outreach import OutreachDraft
-from scripts.run_outreach_selected_gmail_draft_lifecycle import execute_validation
+from scripts.run_outreach_selected_gmail_draft_lifecycle import (
+    _select_synthetic_thread,
+    build_graph_source_bundle,
+    execute_validation,
+)
 
 
 class FakeGmail:
@@ -110,3 +116,117 @@ def test_selected_synthetic_thread_to_outreach_provider_draft_cleanup(monkeypatc
     assert "operator@example.test" not in rendered
     assert "recipient@example.test" not in rendered
     assert "Following up" not in rendered
+
+
+def test_selects_newest_exact_marked_thread_when_validation_history_accumulates(
+    monkeypatch,
+) -> None:
+    class HistoricalGmail(FakeGmail):
+        def list_recent_messages(self, *, label, max_results, query):
+            assert label == "SENT"
+            assert max_results == 10
+            assert 'subject:"KBA_TEST_EMAIL"' in query
+            assert 'to:"recipient@example.test"' in query
+            return [
+                {"id": "message-new", "threadId": "thread-new"},
+                {"id": "message-old", "threadId": "thread-old"},
+            ]
+
+        def get_thread(self, thread_id):
+            message_id = "message-new" if thread_id == "thread-new" else "message-old"
+            return {
+                "subject": f"KBA_TEST_EMAIL {thread_id}",
+                "messages": [
+                    {
+                        "id": message_id,
+                        "subject": f"KBA_TEST_EMAIL {thread_id}",
+                        "normalized_body": "KBA_TEST_EMAIL synthetic validation.",
+                        "to": ["recipient@example.test"],
+                    }
+                ],
+            }
+
+    monkeypatch.setenv(
+        "KEYSTONE_GMAIL_TEST_SEND_RECIPIENT", "recipient@example.test"
+    )
+
+    selected = _select_synthetic_thread(HistoricalGmail())
+
+    assert selected["thread_id"] == "thread-new"
+    assert selected["message_id"] == "message-new"
+    assert selected["candidate_count"] == 2
+    assert selected["selection_policy"] == "newest_exact_marked_thread"
+
+
+def test_rejects_unsafe_configured_recipient_before_gmail_query(monkeypatch) -> None:
+    class NoQueryGmail(FakeGmail):
+        def list_recent_messages(self, *, label, max_results, query):
+            raise AssertionError("unsafe recipient must fail before Gmail query")
+
+    monkeypatch.setenv(
+        "KEYSTONE_GMAIL_TEST_SEND_RECIPIENT", 'recipient@example.test" OR newer_than:1d'
+    )
+
+    with pytest.raises(RuntimeError, match="configured_test_recipient_invalid"):
+        _select_synthetic_thread(NoQueryGmail())
+
+
+def test_selects_marker_bearing_message_when_thread_has_later_unmarked_reply(
+    monkeypatch,
+) -> None:
+    class RepliedThreadGmail(FakeGmail):
+        def get_thread(self, thread_id):
+            assert thread_id == "thread-test"
+            return {
+                "subject": "KBA_TEST_EMAIL operational validation",
+                "messages": [
+                    {
+                        "id": "message-marked",
+                        "subject": "KBA_TEST_EMAIL operational validation",
+                        "normalized_body": "KBA_TEST_EMAIL synthetic validation.",
+                        "to": ["recipient@example.test"],
+                    },
+                    {
+                        "id": "message-later-reply",
+                        "subject": "Re: KBA_TEST_EMAIL operational validation",
+                        "normalized_body": "Thanks, received.",
+                        "to": ["operator@example.test"],
+                    },
+                ],
+            }
+
+    monkeypatch.setenv(
+        "KEYSTONE_GMAIL_TEST_SEND_RECIPIENT", "recipient@example.test"
+    )
+
+    selected = _select_synthetic_thread(RepliedThreadGmail())
+
+    assert selected["thread_id"] == "thread-test"
+    assert selected["message_id"] == "message-marked"
+    assert selected["message_count"] == 2
+    assert selected["marked_message_count"] == 1
+
+
+def test_graph_source_bundle_preserves_hashed_identity_without_private_copy() -> None:
+    selected = {
+        "thread_id": "provider-thread-private",
+        "message_id": "provider-message-private",
+        "subject": "KBA_TEST_EMAIL private subject",
+        "body": "KBA_TEST_EMAIL private body for recipient@example.test",
+        "recipient": "recipient@example.test",
+        "message_count": 3,
+    }
+
+    bundle = build_graph_source_bundle(selected)
+    rendered = str(bundle)
+
+    assert bundle["schema"] == "keystone.work_item.source_bundle.v1"
+    assert bundle["target"]["name"] == "Keystone Business Agents validation"
+    assert bundle["gmail_context"]["thread_id"].startswith("gmail-thread:")
+    assert bundle["gmail_context"]["message_id"].startswith("gmail-message:")
+    assert bundle["facts"][0]["approval_state"] == "approved_for_drafting"
+    assert "provider-thread-private" not in rendered
+    assert "provider-message-private" not in rendered
+    assert "private subject" not in rendered
+    assert "private body" not in rendered
+    assert "recipient@example.test" not in rendered

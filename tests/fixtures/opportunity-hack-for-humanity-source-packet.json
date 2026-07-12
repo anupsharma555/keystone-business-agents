@@ -1,0 +1,41 @@
+{
+  "checked_at_utc": "2026-07-11T07:58:46Z",
+  "evidence_caveats": [
+    "Both pages are first-party Devpost event pages on one source domain, so they count as one independent source domain.",
+    "Geographic eligibility and participant-location restrictions were not established by the bounded extracts.",
+    "The submission window is upcoming and had not opened as of 2026-07-11.",
+    "The pages support a conditional prototype or portfolio opportunity, not a consulting engagement, revenue opportunity, or outreach target.",
+    "The listed prizes are in-kind subscriptions, domains, or courses; do not claim a cash prize."
+  ],
+  "operator_request": "Assess this supplied Hack for Humanity Summer 2026 packet as a possible KNI opportunity. State the opportunity type, timing, geography evidence, fit, missing eligibility evidence, and a conditional next step. Use only the supplied pages, do not search, do not draft outreach, and do not write anywhere.",
+  "schema_version": "keystone.opportunity.supplied_source_packet.v1",
+  "source_domain": "hack-for-humanity-summer-26.devpost.com",
+  "sources": [
+    {
+      "content_sha256": "8d755e72fc438a3da86653176f1e902ba6a871b0d3fd97e54234eae8f8a015d2",
+      "facts": [
+        "The event is a one-month hackathon addressing mental or physical health, with an optional AI focus.",
+        "Participants may enter individually or in teams of two to four, and no prior experience is required.",
+        "Submissions must build software intended to improve mental or physical wellbeing.",
+        "Tracks include AI/ML and responsible AI, and brain injury recovery.",
+        "A submission must include a GitHub repository with functioning source code and a video no longer than four minutes.",
+        "The listed prizes are in-kind subscriptions, domains, or courses; the page does not establish a cash prize.",
+        "Partners named on the page include Sprqs and Rutgers Synapse."
+      ],
+      "source_id": "devpost:hack-for-humanity-summer-2026:event",
+      "title": "Hack for Humanity | Summer 2026: AI for Mental and Physical Health - Devpost",
+      "url": "https://hack-for-humanity-summer-26.devpost.com/"
+    },
+    {
+      "content_sha256": "4446707694225e4380c14a6d400e97f021e7050c9414f7513d24d40e302c7d8c",
+      "facts": [
+        "Submissions run from August 7, 2026 at 12:00 PM EDT through September 4, 2026 at 11:45 PM EDT.",
+        "Public voting and judging run from September 5, 2026 at 9:00 AM EDT through September 11, 2026 at 11:45 PM EDT.",
+        "Winners are scheduled to be announced September 13, 2026 at 12:00 PM EDT."
+      ],
+      "source_id": "devpost:hack-for-humanity-summer-2026:dates",
+      "title": "Hack for Humanity | Summer 2026: AI for Mental and Physical Health - Devpost",
+      "url": "https://hack-for-humanity-summer-26.devpost.com/details/dates"
+    }
+  ]
+}

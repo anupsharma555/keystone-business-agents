@@ -665,15 +665,15 @@ or trace linkage as a stop event.
   attempted launch was still denied by the execution safety boundary before
   process start. There is no post-run usage receipt and the new eight-call
   allowance remains intact; do not retry or route around that control.
-- The live boundary now builds a separate
-  `keystone.weekly_ops.external_synthesis_bundle.v1` projection. It retains only
-  business-topic summaries, day-level dates, next actions, relevance, and
-  aggregate usage. Provider/thread/run/event/WorkItem identities, links, exact
-  timestamps, sender/owner labels, routes, and receipt references remain local;
-  email addresses and URLs are deterministically removed, and a local sidecar
-  supplies personal-name redactions. Live mode also requires the explicit
-  `--approve-external-business-synthesis` flag. The full local source bundle is
-  never passed to the model.
+- The live boundary now builds a shared
+  `keystone.privacy_minimized_synthesis.v1` packet. It transmits only allowlisted
+  operational concept tokens, evidence counts, and one-way provenance hashes.
+  Raw business summaries, provider/thread/run/event/WorkItem identities, titles,
+  links, timestamps, names, routes, receipt references, and exact private values
+  remain local. This is semantic minimization, not redaction: no encoded source
+  fragments or redaction placeholders are allowed. Live mode requires
+  `--approve-privacy-minimized-context` and records
+  `proof_scope=sanitized_context_proof`.
 - The identity-free projection was then attempted once with the explicit
   external-business-synthesis flag, one-request ceiling, and `$0.05` cap. The
   managed execution reviewer still denied it before process start because
@@ -682,8 +682,8 @@ or trace linkage as a stop event.
   newly approved calls remain. Do not retry from Codex. The guarded command is
   ready for the operator to run directly in an appropriately approved local
   terminal environment.
-- The named CLI supports `--preview-external-synthesis` to emit the exact
-  identity-free payload without an API call, and `--output` to atomically save
+- The named CLI supports `--preview-privacy-minimized-context` to emit the exact
+  privacy-minimized payload without an API call, and `--output` to atomically save
   either that preview or the validated live result. This gives the operator a
   review-before-transmit step and leaves a durable usage/cost/safety receipt
   without shell redirection.
@@ -820,6 +820,25 @@ or trace linkage as a stop event.
 
 ## Stop Rules
 
+Current ANU-174 batch checkpoint: L174-14 is a live PASS. One
+`gpt-5.4-mini` request used 45,559 input tokens (45,312 cached) and 783 output
+tokens with a maintained `$0.00710715` estimate, zero retries, zero tools, and
+zero side effects. The authorized L174-16 trusted-private command was rejected
+before process creation by the managed boundary; it made no model request and
+no Workspace write. The second request was reassigned to L174-20's
+privacy-minimized weekly diagnostic. It used 45,870 input and 1,052 output
+tokens with a maintained `$0.0391365` estimate, but returned only generic
+concept-language despite satisfying the section schema. It is PARTIAL and its
+receipt is now blocked from Doc or Slack delivery. The batch consumed two
+requests. A later L174-19 privacy-minimized finance-posture run passed and is
+reusable. Do not retry raw/trusted-private execution. L174-16 now has a
+synthesis-ready five-category assertion packet with explicit evidence-density,
+limitation, and next-action relationships; L174-20 has an aggregated 38-source
+assertion packet covering workstream, status, action state, and owner role.
+Both raw source bodies and identifiers remain local. The next batch, after a
+new explicit allowance, should run only these assertion-backed paths one at a
+time and stop before write/delivery if output usefulness is partial.
+
 L174-04 is now a joined live PASS. Direct extraction of NeuroFlow's official
 page produced ten claims without broad search; one no-tool `gpt-5.4-mini`
 request produced the structured brief with 31,564 input and 635 output tokens,
@@ -865,3 +884,45 @@ Stop on the first retry, shared failure, missing usage/trace evidence,
 unexpected side effect, request-limit breach, or budget breach. Do not run
 Promptfoo, live search, connector writes, Slack posts, or another OpenAI request
 without the applicable explicit approval.
+
+## 2026-07-11 L174-16 assertion-backed lifecycle checkpoint
+
+L174-16 is PASS and ANU-174 is 19/20. Four serial requests were consumed under
+the approved ceiling. The first two stopped before writes because model wording
+did not expose the typed `limitation_status=not_observed` invariant. The third
+passed synthesis but stopped before document creation because the launcher had
+not enabled the provider's general Workspace write gate. The shared workflow
+now deterministically materializes verified typed status into the structured
+brief and the explicit lifecycle flag enables both required write gates. The
+fourth request used 33,057 input and 708 output tokens with a maintained
+`$0.02797875` estimate, then created, read, updated, reread, trashed, and
+verified the same marked Google Doc identity. No test Doc remains. L174-20 is
+the only remaining partial; do not run it without a new explicit API allowance.
+
+## 2026-07-11 L174-20 assertion wording checkpoint
+
+One newly approved L174-20 request completed model synthesis but the validator
+stopped before delivery because the packet omitted the explicit
+`gmail_follow_up:action_state` count. No Doc or Slack write occurred and no
+retry ran. The exception preceded serialized usage/cost output; the immediate
+Admin Usage page was partial and had not ingested the call. A later 30-bucket
+query found one request in the run minute with 49,509 input and 1,273 output
+tokens, a maintained estimate of `$0.04286025`; attribution is probable rather
+than exact because organization model/project/key dimensions were null and
+adjacent minutes contained concurrent traffic. The model narrative is no
+longer solely responsible for typed operating facts: the runner now
+appends a deterministic basis covering Slack status, Gmail action state,
+completed-run workstream, and one-time Calendar workstream from the approved
+identity-free assertion packet. Focused runner/delivery coverage passes 22
+tests. A new explicit one-request allowance is required for the patched rerun.
+
+## 2026-07-11 ANU-174 20/20 completion checkpoint
+
+The final assertion-backed L174-16 run used one request, produced a useful
+source-quality/workflow brief, and completed exact same-Doc create/read/update/
+reread/trash verification with no active test Doc remaining. The final L174-20
+run used one request, passed typed source-family specificity, and produced a
+useful categorical weekly packet. Delivery then created and verified one
+4,151-character durable `KNIOps` Doc and posted one concise verified-Doc link to
+the uniquely resolved `#ops-finance` channel without repeating synthesis or
+creating a duplicate Doc. ANU-174 is now 20 PASS / 0 PARTIAL / 0 PENDING.

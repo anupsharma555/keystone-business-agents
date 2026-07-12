@@ -394,6 +394,45 @@ class OpportunityRecord(BaseModel):
         return _drop_empty_discovery_metadata(handler(self))
 
 
+class OpportunityAssessmentFact(BaseModel):
+    """One concise confirmed fact tied to retained source identities."""
+
+    statement: str = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1)
+
+
+class OpportunityAssessmentBrief(BaseModel):
+    """Compact operator-facing assessment for one supplied opportunity."""
+
+    opportunity_name: str = Field(min_length=1)
+    opportunity_type: OpportunityType
+    confirmed_facts: list[OpportunityAssessmentFact] = Field(min_length=1, max_length=8)
+    interpretation: str = Field(min_length=1)
+    keystone_fit: str = Field(min_length=1)
+    timing_status: str = Field(min_length=1)
+    geography_status: str = Field(min_length=1)
+    missing_evidence: list[str] = Field(default_factory=list, max_length=6)
+    next_safe_action: str = Field(min_length=1)
+    retained_sources: list[OpportunitySource] = Field(min_length=1, max_length=6)
+    outreach_recommended: bool = False
+    external_action_performed: bool = False
+
+    @model_validator(mode="after")
+    def validate_compact_evidence_and_safety(self) -> OpportunityAssessmentBrief:
+        source_ids = {source.source_id for source in self.retained_sources}
+        unknown_ids = {
+            source_id
+            for fact in self.confirmed_facts
+            for source_id in fact.source_ids
+            if source_id not in source_ids
+        }
+        if unknown_ids:
+            raise ValueError("Confirmed facts must cite retained source identities.")
+        if self.outreach_recommended or self.external_action_performed:
+            raise ValueError("Compact supplied-source assessment must remain review-only.")
+        return self
+
+
 class OpportunityScoutResult(BaseModel):
     topic: str | None = None
     dry_run: bool = True

@@ -204,6 +204,18 @@ _RENDERED_PAGE_ONLY_PROVIDERS = frozenset(
         "trafilatura",
     }
 )
+_DEEPENING_LANE_QUERY_TERMS: dict[str, str] = {
+    "careers_jobs": "official careers jobs",
+    "clinical_trials": "clinical trial registry protocol",
+    "company_site": "official company website",
+    "conference_events": "official conference call for proposals CFP",
+    "grants_funding": "official grant funding award",
+    "literature": "peer reviewed study publication",
+    "people_institutions": "official leadership faculty institution",
+    "press_news": "official press release recent news",
+    "procurement_rfp": "official procurement RFP solicitation",
+    "regulatory": "official regulatory filing approval",
+}
 
 
 @dataclass(frozen=True)
@@ -303,6 +315,37 @@ class ProviderUseLadder:
 
     def active_providers(self) -> tuple[str, ...]:
         return tuple(rule.provider for rule in self.rules if rule.use_now)
+
+
+def _deepening_search_request(
+    *,
+    provider_name: str,
+    request: SearchRequest,
+    assessment: RetrievalQualityAssessment,
+) -> SearchRequest:
+    """Build a bounded evidence-gap query for conditional deepening providers."""
+
+    normalized_provider = _normalize_provider_name(provider_name)
+    if normalized_provider not in {SearchProviderName.EXA.value, SearchProviderName.TAVILY.value}:
+        return request
+
+    query_terms: list[str] = [request.query]
+    if normalized_provider == SearchProviderName.EXA.value:
+        query_terms.append("related organizations primary sources")
+    else:
+        query_terms.append("official primary sources")
+
+    for lane in assessment.missing_source_lanes[:3]:
+        term = _DEEPENING_LANE_QUERY_TERMS.get(str(lane).strip().lower())
+        if term:
+            query_terms.append(term)
+    if assessment.needs_structured_enrichment:
+        query_terms.append("leadership partnerships customers")
+    if assessment.needs_precision_search and not assessment.missing_source_lanes:
+        query_terms.append("current verified")
+
+    expanded_query = " ".join(dict.fromkeys(term for term in query_terms if term)).strip()
+    return request.model_copy(update={"query": expanded_query})
 
 
 def provider_value_summary(
@@ -700,13 +743,15 @@ def build_provider_use_ladder(
         ),
         ProviderUseRule(
             provider="crawl4ai",
-            stage="future_extraction_boundary",
-            use_frequency="future_boundary",
+            stage="selected_page_extraction_alternative",
+            use_frequency="explicit_experimental",
             use_now=False,
-            budget_class="local or self-hosted candidate",
-            trigger="reviewed adapter and repeatable quality evidence",
-            rationale="Potential local extraction path, but not enabled as a provider today.",
-            reason_codes=("future_adapter_boundary",),
+            budget_class="free/local compute plus target HTTP request",
+            trigger="explicit configuration or extraction eval while quality evidence matures",
+            rationale=(
+                "Implemented local extraction alternative; non-default pending eval evidence."
+            ),
+            reason_codes=("experimental_extraction_adapter",),
         ),
     ]
     return ProviderUseLadder(tuple(rules))
@@ -1061,6 +1106,7 @@ class HybridSearchProvider:
         }
         self._provider_errors: list[dict[str, str]] = []
         self._provider_result_samples: dict[str, list[dict[str, str]]] = {}
+        self._provider_queries: dict[str, list[str]] = {}
         self._search_queries: list[str] = []
         self._all_results: list[Any] = []
         self._precision_search_escalated = False
@@ -1110,6 +1156,7 @@ class HybridSearchProvider:
                 continue
             self._increment_usage(provider_name, "requests_attempted")
             provider = self._get_provider(provider_name)
+            self._record_provider_query(provider_name, request.query)
             started_at = perf_counter()
             try:
                 results = self._provider_search(provider, request)
@@ -1145,12 +1192,12 @@ class HybridSearchProvider:
                 break
             self._precision_search_escalated = True
 
+        merged = self._run_deepening_providers_if_needed(
+            merged,
+            request,
+            assessment=last_assessment,
+        )
         if merged:
-            merged = self._run_deepening_providers_if_needed(
-                merged,
-                request,
-                assessment=last_assessment,
-            )
             self._all_results.extend(merged)
             if recovered_from_error:
                 self._provider_error_fallback_used = True
@@ -1174,6 +1221,7 @@ class HybridSearchProvider:
             provider_name: str,
         ) -> tuple[str, list[Any], float, dict[str, Any], Exception | None]:
             provider = self._get_provider(provider_name)
+            self._record_provider_query(provider_name, request.query)
             started_at = perf_counter()
             try:
                 results = self._provider_search(provider, request)
@@ -1229,9 +1277,6 @@ class HybridSearchProvider:
             if provider_name in result_groups
         ]
         merged = merge_search_results(*ordered_result_groups)
-        if not merged:
-            return []
-
         assessment = self._quality_assessor(merged, request.query)
         self._record_assessment(assessment)
         if self._should_use_backup_provider(assessment):
@@ -1274,9 +1319,16 @@ class HybridSearchProvider:
                 continue
             self._increment_usage(provider_name, "requests_attempted")
             provider = self._get_provider(provider_name)
+            provider_request = _deepening_search_request(
+                provider_name=provider_name,
+                request=request,
+                assessment=current_assessment,
+            )
+            self._record_search_query(provider_request.query)
+            self._record_provider_query(provider_name, provider_request.query)
             started_at = perf_counter()
             try:
-                results = self._provider_search(provider, request)
+                results = self._provider_search(provider, provider_request)
             except _RECOVERABLE_PROVIDER_EXCEPTIONS as exc:
                 self._record_provider_elapsed(provider_name, perf_counter() - started_at)
                 with self._lock:
@@ -1352,6 +1404,10 @@ class HybridSearchProvider:
             "provider_error_fallback_used": self._provider_error_fallback_used,
             "search_provider_errors": list(self._provider_errors),
             "provider_usage": provider_usage,
+            "provider_queries": {
+                provider_name: list(queries)
+                for provider_name, queries in self._provider_queries.items()
+            },
             "provider_result_samples": dict(self._provider_result_samples),
             "provider_value_summary": provider_value_summary(provider_usage),
             "tavily_estimated_credits_used": self._provider_usage[
@@ -1449,6 +1505,15 @@ class HybridSearchProvider:
         with self._lock:
             if cleaned not in self._search_queries:
                 self._search_queries.append(cleaned)
+
+    def _record_provider_query(self, provider_name: str, query: str) -> None:
+        cleaned = " ".join(str(query or "").strip().split())
+        if not cleaned:
+            return
+        with self._lock:
+            queries = self._provider_queries.setdefault(provider_name, [])
+            if cleaned not in queries:
+                queries.append(cleaned)
 
     def _record_provider_result_samples(self, provider_name: str, results: Sequence[Any]) -> None:
         samples: list[dict[str, str]] = []

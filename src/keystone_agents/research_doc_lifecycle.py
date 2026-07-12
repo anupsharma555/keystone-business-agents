@@ -141,6 +141,7 @@ def build_research_doc_content(
             ("Why it matters", brief.why_it_matters),
         ]
         sources = [(source.title, source.url) for source in brief.sources]
+        document_descriptor = "concise company summary"
         if not brief.sources or not any(value for _, value in sections):
             raise ValueError(
                 "Focused Business Research result lacks source-backed summary content."
@@ -156,6 +157,7 @@ def build_research_doc_content(
             ("Next steps", "\n".join(f"- {item}" for item in brief.next_steps[:6])),
         ]
         sources = [(source.title, source.url) for source in brief.sources]
+        document_descriptor = "concise research brief"
         if not brief.sources or not brief.summary or not brief.key_findings:
             raise ValueError("Research brief lacks source-backed summary content.")
     elif output_type in {"", "CompanyProfile"}:
@@ -168,6 +170,7 @@ def build_research_doc_content(
             ("Evidence gaps", "\n".join(f"- {gap}" for gap in profile.missing_evidence[:6])),
         ]
         sources = [(source.title, source.url) for source in profile.sources]
+        document_descriptor = "concise company summary"
         if not profile.sources or not any(value for _, value in sections[:2]):
             raise ValueError("Company profile lacks source-backed summary content.")
     else:
@@ -179,7 +182,7 @@ def build_research_doc_content(
     clean_company = " ".join(company.split())
     safe_company = re.sub(r"[^A-Za-z0-9_-]+", "_", clean_company).strip("_")[:50]
     title = f"{RESEARCH_DOC_TEST_MARKER}_{suffix}_{safe_company}"
-    body_parts = [RESEARCH_DOC_TEST_MARKER, f"# {clean_company} — concise company summary"]
+    body_parts = [RESEARCH_DOC_TEST_MARKER, f"# {clean_company} — {document_descriptor}"]
     for heading, value in sections:
         clean_value = str(value or "").strip()
         if clean_value:

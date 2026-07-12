@@ -41,6 +41,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--budget-usd", type=float, default=MAX_BUDGET_USD)
     parser.add_argument("--folder-path", default="KNIOps")
     parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Return a reviewed Google Doc write plan without creating or modifying a Doc.",
+    )
+    parser.add_argument(
         "--research-output",
         type=Path,
         default=Path("artifacts/test-pack/neuroflow-direct-research-live.json"),
@@ -107,9 +112,11 @@ def _run_model(profile: Any, *, model: str) -> Any:
     typed_input = focused_brief_input_from_profile(
         profile,
         brief_goal=(
-            "Prepare a concise company summary for an internal Google Doc. Cover product, "
-            "customers, source-visible traction signals, leadership only if supported, "
-            "and why the company may matter to Keystone. Use only the supplied official page."
+            "Research the selected company for current KNI relevance, then prepare concise "
+            "source-backed Google Doc content and an exact reviewed write plan without "
+            "creating or modifying a document. Cover product, customers, source-visible "
+            "traction signals, leadership only if supported, and why the company may matter "
+            "to Keystone. Use only the supplied official page."
         ),
     )
     return run_typed_sdk_agent(
@@ -173,6 +180,7 @@ def execute_validation(
     extractor: Callable[..., WebsiteExtractionResult] = extract_website_content,
     model_runner: Callable[..., Any] = _run_model,
     doc_runner: Callable[..., dict[str, Any]] = execute_research_doc_lifecycle,
+    plan_only: bool = False,
 ) -> dict[str, Any]:
     extraction = extractor(company_url, company_name=company, live=True)
     profile = _profile_from_extraction(company, company_url, extraction)
@@ -234,6 +242,46 @@ def execute_validation(
             "doc": {"executed": False},
         }
 
+    if plan_only:
+        return {
+            "status": "pass",
+            "failure": "",
+            "scenario": "direct_official_company_research_to_reviewed_doc_plan",
+            "model": model,
+            "research": {
+                "requests": requests,
+                "estimated_usd": estimated_usd,
+                "rate_limit_retries": retries,
+                "official_source_preserved": official_source_preserved,
+                "extraction_provider": extraction.provider,
+                "claim_count": len(extraction.claims),
+                "live_search": False,
+                "tools_attached": False,
+            },
+            "doc": {
+                "executed": False,
+                "plan_status": "reviewed_no_write",
+                "folder_path": folder_path,
+                "title": f"{company} — KNI relevance brief",
+                "sections": [
+                    "Product",
+                    "Customers",
+                    "Traction signals",
+                    "Leadership evidence",
+                    "Why it matters to Keystone",
+                    "Sources and unknowns",
+                ],
+                "source_urls": sorted(source_urls),
+                "approval_required_before_create": True,
+            },
+            "safety": {
+                "send_enabled": False,
+                "search_requests": 0,
+                "provider_writes": 0,
+                "source_url_count": len(source_urls),
+            },
+        }
+
     suffix = uuid4().hex[:10]
     doc_result = doc_runner(
         research_payload,
@@ -274,7 +322,8 @@ def main() -> int:
     os.environ["KEYSTONE_LIVE_MODEL_MAX_RETRIES"] = "0"
     os.environ["KEYSTONE_SDK_RATE_LIMIT_MAX_RETRIES"] = "0"
     load_settings(force_dotenv=True)
-    _require_workspace_write_gates()
+    if not args.plan_only:
+        _require_workspace_write_gates()
     payload = execute_validation(
         company=args.company,
         company_url=args.company_url,
@@ -282,6 +331,7 @@ def main() -> int:
         budget_usd=args.budget_usd,
         folder_path=args.folder_path,
         research_output=args.research_output,
+        plan_only=args.plan_only,
     )
     _write_atomic(args.output, payload)
     print(json.dumps(payload, indent=2, sort_keys=True))

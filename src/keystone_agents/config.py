@@ -75,7 +75,7 @@ class Settings:
     exa_service_api_key: str | None = None
     exa_api_key_id: str | None = None
     exa_api_key_name: str | None = None
-    exa_monthly_free_request_limit: int = 1000
+    exa_monthly_free_request_limit: int = 20_000
     serper_enabled: bool = False
     serper_api_key: str | None = None
     searxng_base_url: str | None = None
@@ -280,7 +280,7 @@ def load_settings(env_file: str | Path | None = None, *, force_dotenv: bool = Fa
         exa_service_api_key=_env_value("EXA_SERVICE_API_KEY"),
         exa_api_key_id=_env_value("EXA_API_KEY_ID"),
         exa_api_key_name=_env_value("EXA_API_KEY_NAME"),
-        exa_monthly_free_request_limit=_env_int("KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT", 1000),
+        exa_monthly_free_request_limit=_env_int("KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT", 20_000),
         serper_enabled=parse_bool(os.getenv("KEYSTONE_SERPER_ENABLED")),
         serper_api_key=_env_value("SERPER_API_KEY"),
         searxng_base_url=_env_value("SEARXNG_BASE_URL"),

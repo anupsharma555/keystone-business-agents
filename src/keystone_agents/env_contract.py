@@ -314,7 +314,7 @@ def keystone_env_contract() -> dict[str, Any]:
             "default_overlays": {
                 "SEARXNG_BASE_URL": "http://127.0.0.1:18080",
                 "KEYSTONE_SEARXNG_TRANSIENT": "true",
-                "KEYSTONE_TAVILY_SEARCH_FALLBACK": "false",
+                "KEYSTONE_TAVILY_SEARCH_FALLBACK": "true",
                 "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN": "2",
                 "KEYSTONE_EXA_SEARCH_FALLBACK": "true",
                 "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "2",

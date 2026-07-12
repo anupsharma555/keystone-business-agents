@@ -11,6 +11,11 @@ from keystone_agents.agents.chief_of_staff import run_chief_of_staff_sdk
 from keystone_agents.local_kni_evidence import build_local_kni_evidence_packet_for_query
 from keystone_agents.model_provider import OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL
 from keystone_agents.models import TypedAgentRunResult
+from keystone_agents.privacy_minimized_synthesis import (
+    build_concept_signal_packet,
+    packet_for_model,
+    sanitized_source_id,
+)
 from keystone_agents.quality_budget import AgentQualityBudget, QualityMode
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
 from keystone_agents.sdk import private_context_sdk_profile
@@ -20,9 +25,42 @@ LOCAL_KNI_SUMMARY_MAX_REQUESTS = 1
 LOCAL_KNI_SUMMARY_MAX_COST_USD = Decimal("0.05")
 LOCAL_KNI_SUMMARY_WORKFLOW = "KNI capability statement summary"
 
+_CAPABILITY_TAXONOMY = {
+    "clinical_ai_evaluation": ("clinical ai", "ai evaluation", "model evaluation"),
+    "research_design": ("research design", "study design", "evaluation design"),
+    "data_strategy": ("data strategy", "data governance", "data architecture"),
+    "analytics_measurement": ("analytics", "measurement", "metrics"),
+    "workflow_advisory": ("workflow", "advisory", "consulting"),
+    "implementation_support": ("implementation", "deployment", "operationalization"),
+}
+
 
 def local_kni_summary_live_plan(query: str) -> dict[str, Any]:
     packet = build_local_kni_evidence_packet_for_query(query)
+    return _local_kni_summary_live_plan_from_packet(packet)
+
+
+def local_kni_summary_privacy_preview(query: str) -> dict[str, Any]:
+    """Materialize the exact identity-free model packet without a model call."""
+
+    packet = build_local_kni_evidence_packet_for_query(query)
+    if not _packet_is_ready(packet):
+        raise ValueError("Local KNI capability summary is not synthesis-ready.")
+    minimized_packet = _privacy_minimized_capability_packet(packet)
+    return {
+        "status": "privacy_minimized_preview",
+        "proof_scope": "sanitized_context_proof",
+        "plan": _local_kni_summary_live_plan_from_packet(packet),
+        "bundle": packet_for_model(minimized_packet),
+        "local_source_mapping_verified": (
+            len(minimized_packet.source_hashes) == len(_candidate_documents(packet))
+        ),
+        "openai_requests_made": 0,
+        "provider_writes": 0,
+    }
+
+
+def _local_kni_summary_live_plan_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     candidates = _candidate_documents(packet)
     return {
         "schema": "keystone.local_kni_summary.live_run_plan.v1",
@@ -36,6 +74,8 @@ def local_kni_summary_live_plan(query: str) -> dict[str, Any]:
         "provider_writes": False,
         "send_enabled": False,
         "private_context_approval_required": True,
+        "transmission_mode": "privacy_minimized_concept_signals",
+        "proof_scope": "sanitized_context_proof",
         "data_handling": {
             "response_store": False,
             "prompt_cache_retention": "in_memory",
@@ -60,7 +100,7 @@ def run_local_kni_capability_summary(
     live_sdk: bool = False,
     max_openai_requests: int = LOCAL_KNI_SUMMARY_MAX_REQUESTS,
     max_cost_usd: Decimal = LOCAL_KNI_SUMMARY_MAX_COST_USD,
-    approved_private_context: bool = False,
+    approved_privacy_minimized_context: bool = False,
     runner: Callable[..., TypedAgentRunResult[ChiefOfStaffResult]] = run_chief_of_staff_sdk,
 ) -> dict[str, Any]:
     """Validate locally or run one no-tool Chief turn over bounded local excerpts."""
@@ -69,27 +109,26 @@ def run_local_kni_capability_summary(
     packet = build_local_kni_evidence_packet_for_query(query)
     if not _packet_is_ready(packet):
         raise ValueError("Local KNI capability summary is not synthesis-ready.")
-    plan = local_kni_summary_live_plan(query)
+    plan = _local_kni_summary_live_plan_from_packet(packet)
     if not live_sdk:
         return {"status": "validated_offline", "plan": plan}
-    if not approved_private_context:
+    if not approved_privacy_minimized_context:
         raise ValueError(
-            "Live local KNI synthesis requires explicit approval to transmit bounded "
-            "private business-document excerpts."
+            "Live local synthesis requires explicit approval for the privacy-minimized "
+            "concept packet."
         )
 
+    minimized_packet = _privacy_minimized_capability_packet(packet)
+
     request = (
-        "Search the supplied bounded local KNI evidence for the latest appropriate client "
-        "proposal or capability statement and summarize the key service areas. Re-rank the "
-        "candidate documents against this request; do not assume the first match is best. "
-        "Distinguish current KNI material from templates or unrelated proposals. Include the "
-        "evidence path for every source used, state uncertainty, and retain human-review, "
-        "local_only=true, and send_enabled=false. Do not search, call tools, send, post, "
-        "publish, create an artifact, or write any provider."
+        "Summarize the service capabilities indicated by the supplied privacy-minimized "
+        "concept signals. Populate sources with at least one supplied sanitized source ID "
+        "as its exact title, state that the result is based on "
+        "abstracted rather than raw evidence, and preserve uncertainty and human review."
     )
     sdk_input = {
         "request": request,
-        "local_kni_evidence_packet": packet,
+        "privacy_minimized_context": packet_for_model(minimized_packet),
         "include_specialist_tools": False,
         "specialist_tool_mode": "read_plan",
         "manual_request_plan": {
@@ -128,7 +167,7 @@ def run_local_kni_capability_summary(
         )
     return _validated_receipt(
         result,
-        packet=packet,
+        minimized_packet=minimized_packet,
         plan=plan,
         max_openai_requests=max_openai_requests,
         max_cost_usd=max_cost_usd,
@@ -139,7 +178,7 @@ def run_local_kni_capability_summary(
 def _validated_receipt(
     result: TypedAgentRunResult[ChiefOfStaffResult],
     *,
-    packet: dict[str, Any],
+    minimized_packet: Any,
     plan: dict[str, Any],
     max_openai_requests: int,
     max_cost_usd: Decimal,
@@ -148,20 +187,20 @@ def _validated_receipt(
     output = result.output
     if output.send_enabled or output.slack_post_allowed or output.write_requests:
         raise RuntimeError("Local KNI synthesis returned an unexpected side-effect request.")
-    diagnostics = dict(output.retrieval_diagnostics or {})
-    if diagnostics.get("local_only") is not True or diagnostics.get("send_enabled") is not False:
-        raise RuntimeError("Local KNI synthesis omitted local-only/no-send diagnostics.")
     summary = str(output.synthesis or output.summary or "").strip()
     if len(summary) < 40:
         raise RuntimeError("Local KNI synthesis did not return a substantive summary.")
-    candidate_paths = {doc["relative_path"] for doc in _candidate_documents(packet)}
-    used_paths = {
+    allowed_source_ids = {
+        sanitized_source_id(source_hash)
+        for source_hash in minimized_packet.source_hashes
+    }
+    used_source_ids = {
         str(source.title or "").strip()
         for source in output.sources
-        if str(source.title or "").strip() in candidate_paths
+        if str(source.title or "").strip() in allowed_source_ids
     }
-    if not used_paths:
-        raise RuntimeError("Local KNI synthesis omitted a candidate evidence path.")
+    if not used_source_ids:
+        raise RuntimeError("Local synthesis omitted a sanitized source ID.")
 
     usage = dict(result.usage or {})
     observed_requests = _numeric_value(usage, "requests", "request_count", "total_requests")
@@ -178,12 +217,18 @@ def _validated_receipt(
 
     return {
         "status": "success",
+        "proof_scope": "sanitized_context_proof",
         "plan": plan,
+        "summary": summary,
+        "summary_storage": "local_artifact_only",
         "summary_present": True,
         "summary_character_count": len(summary),
         "summary_sha256": hashlib.sha256(summary.encode()).hexdigest(),
-        "used_source_count": len(used_paths),
-        "used_path_hashes": sorted(_path_hash(path) for path in used_paths),
+        "used_source_count": len(used_source_ids),
+        "used_source_hashes": sorted(
+            source_id.removeprefix("sanitized-source:")
+            for source_id in used_source_ids
+        ),
         "human_review_required": output.human_review_required,
         "local_only": True,
         "send_enabled": False,
@@ -219,6 +264,23 @@ def _packet_is_ready(packet: dict[str, Any]) -> bool:
             doc.get("content_excerpt") and doc.get("model_context_allowed")
             for doc in candidates
         )
+    )
+
+
+def _privacy_minimized_capability_packet(packet: dict[str, Any]) -> Any:
+    candidates = _candidate_documents(packet)
+    return build_concept_signal_packet(
+        workflow="capability_summary",
+        sources={
+            str(doc["relative_path"]): str(doc["content_excerpt"])
+            for doc in candidates
+        },
+        taxonomy=_CAPABILITY_TAXONOMY,
+        constraints=(
+            "human_review_required",
+            "abstracted_evidence_only",
+            "no_external_action",
+        ),
     )
 
 

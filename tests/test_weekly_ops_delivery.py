@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from keystone_agents.weekly_ops_delivery import (
-    GOOGLE_FOLDER_MIME,
-    deliver_weekly_ops_packet,
-)
+from keystone_agents.weekly_ops_delivery import deliver_weekly_ops_packet
+from scripts.deliver_weekly_chief_packet import main as delivery_cli_main
 
 
 def _synthesis() -> dict[str, object]:
     return {
         "status": "success",
+        "context_mode": "privacy_minimized_assertions",
+        "proof_scope": "sanitized_context_proof",
         "plan": {"packet_title": "KNI Weekly Operations Packet — 2026-07-10"},
         "packet": {
             "summary": (
@@ -25,10 +27,12 @@ def _synthesis() -> dict[str, object]:
     }
 
 
-def _folder_search(*_args, **_kwargs):
+def _folder_list(*_args, **_kwargs):
     return {
         "status": "success",
-        "items": [{"id": "folder-1", "name": "KNIOps", "mime_type": GOOGLE_FOLDER_MIME}],
+        "folder_id": "folder-1",
+        "folder_path": "KNIOps",
+        "items": [],
     }
 
 
@@ -65,13 +69,67 @@ def test_delivery_plan_has_no_provider_writes() -> None:
     assert "One focus" not in str(result)
 
 
+def test_delivery_rejects_privacy_minimized_diagnostic_receipt() -> None:
+    diagnostic = _synthesis()
+    diagnostic["context_mode"] = "privacy_minimized_concept_signals"
+    diagnostic["proof_scope"] = "sanitized_context_proof"
+
+    with pytest.raises(ValueError, match="operationally specific"):
+        deliver_weekly_ops_packet(
+            diagnostic,
+            live_workspace_write=False,
+            live_slack_post=False,
+        )
+
+
+def test_delivery_accepts_assertion_backed_sanitized_receipt() -> None:
+    assertion_backed = _synthesis()
+    assertion_backed["context_mode"] = "privacy_minimized_assertions"
+    assertion_backed["proof_scope"] = "sanitized_context_proof"
+
+    result = deliver_weekly_ops_packet(
+        assertion_backed,
+        live_workspace_write=False,
+        live_slack_post=False,
+    )
+
+    assert result["status"] == "delivery_planned"
+
+
+def test_delivery_cli_reports_stale_receipt_as_structured_blocker(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    stale = _synthesis()
+    stale.pop("context_mode")
+    input_path = tmp_path / "stale.json"
+    output_path = tmp_path / "result.json"
+    input_path.write_text(json.dumps(stale), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "deliver_weekly_chief_packet.py",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert delivery_cli_main() == 1
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["status"] == "blocked"
+    assert "privacy-minimized assertion contract" in result["blocker"]
+    assert result["provider_writes"] == 0
+    assert json.loads(capsys.readouterr().out) == result
+
+
 def test_doc_delivery_requires_exact_folder_and_readback() -> None:
     result = deliver_weekly_ops_packet(
         _synthesis(),
         live_workspace_write=True,
         workspace_approval_reference="approval:doc",
         live_slack_post=False,
-        search_files=_folder_search,
+        list_folder=_folder_list,
         write_doc=_write_doc,
         read_doc=_read_doc,
     )
@@ -97,7 +155,7 @@ def test_slack_delivery_occurs_only_after_verified_doc() -> None:
         live_slack_post=True,
         slack_channel_id="COPS",
         slack_approval_reference="approval:slack",
-        search_files=_folder_search,
+        list_folder=_folder_list,
         write_doc=_write_doc,
         read_doc=_read_doc,
         post_slack=fake_post,
@@ -127,7 +185,7 @@ def test_slack_retry_reuses_verified_doc_without_second_workspace_write() -> Non
         live_workspace_write=True,
         workspace_approval_reference="approval:doc",
         live_slack_post=False,
-        search_files=_folder_search,
+        list_folder=_folder_list,
         write_doc=_write_doc,
         read_doc=_read_doc,
     )
@@ -166,7 +224,7 @@ def test_slack_retry_rejects_doc_receipt_for_different_packet() -> None:
         live_workspace_write=True,
         workspace_approval_reference="approval:doc",
         live_slack_post=False,
-        search_files=_folder_search,
+        list_folder=_folder_list,
         write_doc=_write_doc,
         read_doc=_read_doc,
     )
@@ -191,7 +249,7 @@ def test_delivery_blocks_ambiguous_knio_ps_folder() -> None:
             live_workspace_write=True,
             workspace_approval_reference="approval:doc",
             live_slack_post=False,
-            search_files=lambda *_args, **_kwargs: {"items": []},
+            list_folder=lambda *_args, **_kwargs: {"status": "missing"},
             write_doc=_write_doc,
             read_doc=_read_doc,
         )
@@ -204,7 +262,7 @@ def test_delivery_blocks_mismatched_doc_readback() -> None:
             live_workspace_write=True,
             workspace_approval_reference="approval:doc",
             live_slack_post=False,
-            search_files=_folder_search,
+            list_folder=_folder_list,
             write_doc=_write_doc,
             read_doc=lambda *_args, **_kwargs: {
                 "status": "success",

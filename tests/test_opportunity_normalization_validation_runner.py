@@ -139,13 +139,13 @@ def test_source_packet_retains_exact_two_pages_and_one_domain(require_local_evid
     assert len(packet["evidence_caveats"]) >= 5
 
 
-def test_runner_defaults_to_one_request_and_five_cent_budget(monkeypatch) -> None:
+def test_runner_defaults_to_one_request_and_ten_cent_budget(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["run_opportunity_normalization_validation.py"])
     args = build_parser().parse_args()
 
     assert args.model == EXPECTED_MODEL
     assert args.max_openai_requests == EXPECTED_REQUESTS
-    assert args.budget_usd == 0.05
+    assert args.budget_usd == 0.10
 
 
 def test_typed_input_forbids_search_tools_and_outreach(require_local_evidence) -> None:
@@ -156,6 +156,19 @@ def test_typed_input_forbids_search_tools_and_outreach(require_local_evidence) -
     assert "search_provider\": \"none" in typed_input.context
     assert "do not draft outreach" in typed_input.topic.lower()
     assert "geography is unknown" in typed_input.context.lower()
+
+
+def test_typed_input_can_bind_an_exact_pilot_ask(require_local_evidence) -> None:
+    packet = _load_packet(SOURCE_PACKET)
+    pilot_ask = (
+        "Assess the selected current opportunity for KNI fit, separate confirmed facts "
+        "from interpretation, show the retained sources, and recommend the next safe action."
+    )
+
+    typed_input = _typed_input(packet, operator_request=pilot_ask)
+
+    assert typed_input.topic == pilot_ask
+    assert packet["operator_request"] != pilot_ask
 
 
 def test_passing_payload_requires_both_normalization_levels_and_safety() -> None:
@@ -193,6 +206,23 @@ def test_unknown_geography_and_explicit_negated_boundaries_are_not_false_failure
 
     assert payload["checks"]["geography_unknown"] is True
     assert payload["checks"]["no_consulting_revenue_or_cash_inference"] is True
+
+
+def test_upcoming_timing_can_be_carried_by_typed_novelty() -> None:
+    result = _passing_result()
+    record = result.final_output.records[0]
+    record.why_now_signal = "The submission window begins soon."
+    record.novelty = "Current and upcoming."
+
+    payload = _build_payload(
+        result,
+        execution_identity=_identity(),
+        model=EXPECTED_MODEL,
+        request_ceiling=EXPECTED_REQUESTS,
+        budget_usd=0.05,
+    )
+
+    assert payload["checks"]["upcoming_timing_retained"] is True
 
 
 def test_payload_fails_on_request_overrun_or_tool_use() -> None:

@@ -9,7 +9,7 @@ from typing import Any
 from keystone_agents.tools.internal_data_tools import (
     google_doc_read_impl,
     google_doc_write_impl,
-    google_drive_search_files_impl,
+    google_drive_list_folder_impl,
 )
 from keystone_agents.tools.slack_tool import SlackTool
 
@@ -27,7 +27,7 @@ def deliver_weekly_ops_packet(
     slack_channel_id: str = "",
     slack_approval_reference: str = "",
     prior_delivery_receipt: dict[str, Any] | None = None,
-    search_files: Callable[..., dict[str, Any]] = google_drive_search_files_impl,
+    list_folder: Callable[..., dict[str, Any]] = google_drive_list_folder_impl,
     write_doc: Callable[..., dict[str, Any]] = google_doc_write_impl,
     read_doc: Callable[..., dict[str, Any]] = google_doc_read_impl,
     post_slack: Callable[[str, str], dict[str, Any]] | None = None,
@@ -60,15 +60,13 @@ def deliver_weekly_ops_packet(
         }
 
     if live_workspace_write:
-        folder_search = search_files(PACKET_FOLDER, folder_path="", max_items=10, live=True)
-        folder_matches = [
-            item
-            for item in folder_search.get("items") or []
-            if str(item.get("name") or "").strip().casefold() == PACKET_FOLDER.casefold()
-            and str(item.get("mime_type") or item.get("mimeType") or "")
-            == GOOGLE_FOLDER_MIME
-        ]
-        if len(folder_matches) != 1:
+        folder_resolution = list_folder("", max_items=1, live=True)
+        if not (
+            folder_resolution.get("status") == "success"
+            and str(folder_resolution.get("folder_id") or "").strip()
+            and str(folder_resolution.get("folder_path") or "").split("/")[-1].strip()
+            == PACKET_FOLDER
+        ):
             raise RuntimeError("Weekly packet delivery requires exactly one KNIOps folder.")
 
         created = write_doc(
@@ -160,6 +158,15 @@ def deliver_weekly_ops_packet(
 def _packet_artifact(synthesis_result: dict[str, Any]) -> tuple[str, str]:
     if synthesis_result.get("status") != "success":
         raise ValueError("Weekly packet delivery requires a successful synthesis receipt.")
+    if synthesis_result.get("context_mode") == "privacy_minimized_concept_signals":
+        raise ValueError(
+            "Weekly packet delivery requires an operationally specific assertion-backed "
+            "synthesis receipt."
+        )
+    if synthesis_result.get("context_mode") != "privacy_minimized_assertions":
+        raise ValueError(
+            "Weekly packet delivery requires the privacy-minimized assertion contract."
+        )
     plan = synthesis_result.get("plan") or {}
     packet = synthesis_result.get("packet") or {}
     title = str(plan.get("packet_title") or "").strip()

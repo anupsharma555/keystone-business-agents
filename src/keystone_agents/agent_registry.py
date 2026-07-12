@@ -333,7 +333,10 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "evals/local/opportunity_scoring.jsonl",
             "evals/local/source_attribution.jsonl",
         ),
-        validation_paths=("tests/test_opportunity_scout.py",),
+        validation_paths=(
+            "tests/test_opportunity_scout.py",
+            "tests/test_compact_opportunity_assessment.py",
+        ),
         handoff_description=(
             "Find and score opportunities, leads, grants, partners, and companies."
         ),
@@ -341,6 +344,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "No outreach generation",
             "Deduplicate before prioritizing",
             "Source-backed scoring required",
+            "Single supplied-opportunity asks use the compact review-only assessment schema",
             "Google Workspace writes require live flags and approval references",
         ),
     ),
@@ -476,17 +480,23 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         live_flags_required=("--live-sdk",),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
-        validation_paths=("tests/test_agent_registry.py", "tests/test_chief_of_staff.py"),
+        validation_paths=(
+            "tests/test_agent_registry.py",
+            "tests/test_chief_of_staff.py",
+            "tests/test_presentation_index.py",
+            "tests/test_presentation_index_runner.py",
+        ),
         handoff_description=(
-            "Read scoped Google Drive, Docs, Sheets, and file/image metadata, perform "
-            "direct approved Workspace writes, or return nested reviewable "
-            "write-plan guidance for specialist/action-handler execution."
+            "Read scoped Google Drive, Docs, Sheets, and local presentation evidence, "
+            "promote lexical slide matches into typed context, perform direct approved "
+            "Workspace writes, or return nested reviewable write-plan guidance."
         ),
         safety_notes=(
             "Direct writes require live flags and approval references",
             "No nested live writes",
             "Chief of Staff owns review and approval handoff when this agent is nested",
             "Drive image/media support is metadata-only until download/OCR tooling is added",
+            "Local presentation indexing stores bounded slide text and notes in repo-local SQLite",
             "Return blockers when folder, file, Doc, Sheet, or tab identity is ambiguous",
         ),
         handoff_enabled=True,

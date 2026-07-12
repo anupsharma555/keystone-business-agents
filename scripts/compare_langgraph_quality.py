@@ -519,6 +519,9 @@ def _run_comparison_in_dir(
         request_text=request_text,
         control_output=control["output_surface"],
         graph_output=graph["output_surface"],
+        quality_target_terms=(
+            str(scenario_config["manual_request_plan"].get("primary_target") or ""),
+        ),
         all_scenarios_ready=(
             bool(all_scenarios_report.get("ready")) if all_scenarios_report else None
         ),

@@ -24,6 +24,19 @@ def test_classify_source_lanes_detects_high_value_domains() -> None:
     )
 
 
+def test_classify_source_lanes_recognizes_annual_meeting_pages() -> None:
+    lanes = classify_source_lanes(
+        url=(
+            "https://www.psychiatry.org/psychiatrists/meetings/annual-meeting/"
+            "blog/2026-session-search"
+        ),
+        title="2026 APA Annual Meeting Session Search",
+        snippet="Discover expert speakers and sessions for the annual meeting.",
+    )
+
+    assert "conference_events" in lanes
+
+
 def test_assess_source_coverage_reports_missing_lanes_and_domains() -> None:
     coverage = assess_source_coverage(
         [

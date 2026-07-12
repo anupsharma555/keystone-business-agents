@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from keystone_agents.gmail_triage.draft_actions import GMAIL_TEST_DRAFT_DELETE_ENV
+from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.schemas.email_triage import EmailTriageResult
 from scripts.run_gmail_natural_draft_lifecycle import (
     EXPECTED_MODEL,
@@ -242,6 +243,18 @@ def test_safe_receipt_omits_recipient_subject_and_body() -> None:
     assert "private@example" not in encoded
     assert "private subject" not in encoded
     assert "private body" not in encoded
+
+
+def test_comma_separated_do_not_clause_blocks_provider_draft_creation() -> None:
+    plan = infer_gmail_execution_plan(
+        "Prepare a concise reply for review. Do not send, create a provider draft, "
+        "search, post, schedule, share, or write externally."
+    )
+
+    assert plan.operation == "draft_reply"
+    assert plan.create_gmail_drafts is False
+    assert plan.artifact_policy == "draft_text_in_output"
+    assert plan.side_effect_policy == "read_only_or_draft_only"
 
 
 def test_persisted_plan_requires_fresh_approval_and_no_search(require_local_evidence) -> None:

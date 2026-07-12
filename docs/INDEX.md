@@ -42,6 +42,7 @@ Start here when changing or operating the repository.
   for basic agent functions and backend-selected graph runs; the legacy
   Promptfoo suite is explicitly deferred for future migration.
 - `docs/DIFFERENTIATION_MATRIX.md`: ANU-175 comparison and validation matrix
+- `docs/WORKFLOW_VOCABULARY.md`: ANU-216 controlled cross-system context tags and safety gates
   defining how KBA should differ from ChatGPT and Codex.
 - `docs/VISUAL_CONTEXT.md`: repo-local architecture visuals for operator and agent context.
 - `docs/assets/kba-current-agent-architecture.svg`: generated current architecture visual.

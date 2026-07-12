@@ -13,6 +13,7 @@ from keystone_agents.finance_bd_priority_workflow import (
     BusinessDevelopmentOption,
     collect_current_quarter_finance_packet,
     execute_finance_bd_priority_decision,
+    finance_bd_priority_privacy_preview,
 )
 
 DEFAULT_OPTIONS = (
@@ -33,30 +34,44 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live-airtable-reads", action="store_true")
     parser.add_argument("--live-sdk", action="store_true")
-    parser.add_argument("--approve-private-context", action="store_true")
+    parser.add_argument("--preview-privacy-minimized-context", action="store_true")
+    parser.add_argument("--approve-privacy-minimized-context", action="store_true")
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("artifacts/test-pack/finance-bd-priority-validation.json"),
     )
     args = parser.parse_args()
+    if args.live_sdk and args.preview_privacy_minimized_context:
+        parser.error("--live-sdk and --preview-privacy-minimized-context are mutually exclusive")
     load_settings(force_dotenv=True)
     if not args.live_airtable_reads:
         raise SystemExit("This proof requires --live-airtable-reads.")
     os.environ["KEYSTONE_AIRTABLE_LIVE_READS"] = "true"
     packet = collect_current_quarter_finance_packet(options=DEFAULT_OPTIONS, live=True)
-    result = execute_finance_bd_priority_decision(
-        packet,
-        live_sdk=bool(args.live_sdk),
-        approved_private_context=bool(args.approve_private_context),
-    )
+    if args.preview_privacy_minimized_context:
+        result = finance_bd_priority_privacy_preview(packet)
+    else:
+        result = execute_finance_bd_priority_decision(
+            packet,
+            live_sdk=bool(args.live_sdk),
+            approved_privacy_minimized_context=bool(
+                args.approve_privacy_minimized_context
+            ),
+            approved_private_context=False,
+        )
     rendered = json.dumps(result, indent=2, sort_keys=True, default=str) + "\n"
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     temporary.write_text(rendered, encoding="utf-8")
     temporary.replace(args.output)
     print(rendered, end="")
-    return 0 if result["status"] in {"validated_offline", "passed"} else 1
+    return (
+        0
+        if result["status"]
+        in {"validated_offline", "privacy_minimized_preview", "passed"}
+        else 1
+    )
 
 
 if __name__ == "__main__":

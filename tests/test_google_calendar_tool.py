@@ -136,6 +136,15 @@ def test_calendar_plan_extracts_timed_meeting_without_defaulting_all_day() -> No
     assert plan.complete is True
 
 
+def test_calendar_plan_ignores_informational_event_and_negated_schedule() -> None:
+    plan = infer_calendar_action_plan(
+        "Research a company product, dataset, partnership, or funding event. "
+        "Do not draft outreach, post elsewhere, schedule, share, save, or write externally."
+    )
+
+    assert plan is None
+
+
 def test_calendar_plan_captures_note_and_exact_update_id() -> None:
     plan = infer_calendar_action_plan(
         "add a note to calendar event kba0123456789abcdef that note: submit final paper"

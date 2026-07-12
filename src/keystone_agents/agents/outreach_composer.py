@@ -1550,18 +1550,40 @@ def build_outreach_composer_compact_synthesis_agent(
     *,
     request_text: str = "",
     include_all_skills: bool = False,
+    include_tools_policy: bool = False,
 ) -> Agent:
     """Build a compact structured-output outreach agent for constrained providers."""
 
+    prompt_files = ["keystone_profile.md", "safety_policy.md"]
+    if include_tools_policy:
+        prompt_files.append("tools.md")
+    prompt_files.append("outreach_composer.md")
     instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "tools.md",
-        "outreach_composer.md",
-        skill_files=select_agent_skill_names(
-            "outreach_composer",
-            request_text=request_text,
-            include_all=include_all_skills,
+        *prompt_files,
+        skill_files=(
+            select_agent_skill_names(
+                "outreach_composer",
+                request_text=request_text,
+                include_all=True,
+            )
+            if include_all_skills
+            else [
+                name
+                for name in select_agent_skill_names(
+                    "outreach_composer",
+                    request_text=request_text,
+                )
+                if name
+                in {
+                    "evidence_attribution_and_claim_mapping",
+                    "context_permission_gating",
+                    "action_boundary_enforcement",
+                    "unsupported_claim_and_gap_handling",
+                    "structured_output_quality_review",
+                    "writing_style_adaptation",
+                    "outreach_composer_specialist_contracts",
+                }
+            ]
         ),
     )
     instructions = "\n\n".join(
@@ -1584,6 +1606,9 @@ def build_outreach_composer_compact_synthesis_agent(
                 "next step, useful missing information, provisional collaboration ideas, and a "
                 "deferral reason. Any optional future reply must contain zero questions and must "
                 "not reopen scheduling, another call, or a generic compare-notes exchange."
+                " When reply_recommended=false, do not describe a reply or draft as though one "
+                "exists. Write personalization_rationale as the recommendation rationale and "
+                "leave email_subject, email_body, and linkedin_note empty."
                 " Write any optional reply as normal correspondence; avoid workflow narration "
                 "such as 'based on our thread,' 'the selected context,' or 'if it would be "
                 "helpful.' State a concrete point plainly."

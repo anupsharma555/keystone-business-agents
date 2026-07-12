@@ -3,19 +3,49 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from agents.exceptions import OutputGuardrailTripwireTriggered
+
 from keystone_agents.agents.chief_of_staff import run_chief_of_staff_sdk
 from keystone_agents.models import TypedAgentRunResult
+from keystone_agents.privacy_minimized_synthesis import (
+    PrivacyMinimizedFact,
+    build_concept_signal_packet,
+    packet_for_model,
+    validate_privacy_minimized_packet,
+)
 from keystone_agents.quality_budget import AgentQualityBudget, QualityMode
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
 from keystone_agents.sdk import private_context_sdk_profile
 
 MAX_OPENAI_REQUESTS = 1
 MAX_COST_USD = Decimal("0.05")
+
+_FINANCE_TAXONOMY = {
+    "current_quarter": ("current quarter", "current-quarter", "q1", "q2", "q3", "q4"),
+    "income_data_present": ("income", "revenue"),
+    "expense_data_present": ("expense", "cost", "spend"),
+    "uncategorized_gap_present": ("uncategorized", "missing category"),
+    "bounded_experiment_supported": ("bounded experiment", "bounded pilot"),
+    "cost_constraint_present": ("cost constraint", "budget constraint", "limited budget"),
+}
+_TOTAL_PATTERN = re.compile(
+    r"(?:total|combined)\s+(income|expenses?)\s*:\s*\$?([\d,]+(?:\.\d+)?)",
+    re.I,
+)
+_DECISION_BEARING_FINANCE_CONCEPTS = {
+    "operating_margin_positive",
+    "operating_margin_negative",
+    "operating_margin_neutral",
+    "expense_load_low",
+    "expense_load_moderate",
+    "expense_load_high",
+}
 
 
 @dataclass(frozen=True)
@@ -130,6 +160,54 @@ def finance_bd_priority_plan(packet: FinanceBDPriorityPacket) -> dict[str, Any]:
         "live_search": False,
         "provider_writes": False,
         "send_enabled": False,
+        "transmission_mode": "privacy_minimized_concept_signals",
+        "supported_context_modes": ["privacy_minimized_concept_signals"],
+        "privacy_minimized_preview_available": True,
+        "proof_scope": "sanitized_context_proof",
+    }
+
+
+def finance_bd_priority_privacy_preview(
+    packet: FinanceBDPriorityPacket,
+) -> dict[str, Any]:
+    """Materialize the exact no-tool decision context without a model call."""
+
+    _validate_options(packet.options)
+    minimized_packet = _finance_privacy_packet(packet)
+    concepts = {fact.concept for fact in minimized_packet.facts}
+    decision_signal_sufficient = bool(
+        concepts
+        & (
+            _DECISION_BEARING_FINANCE_CONCEPTS
+            | {"bounded_experiment_supported", "cost_constraint_present"}
+        )
+    )
+    return {
+        "status": (
+            "privacy_minimized_preview"
+            if decision_signal_sufficient
+            else "privacy_minimized_preview_insufficient"
+        ),
+        "proof_scope": "sanitized_context_proof",
+        "plan": finance_bd_priority_plan(packet),
+        "bundle": {
+            "finance_context": packet_for_model(minimized_packet),
+            "business_development_options": [
+                {
+                    "option_id": option.option_id,
+                    "title": option.title,
+                    "description": option.description,
+                }
+                for option in packet.options
+            ],
+        },
+        "exact_financial_values_transmitted": False,
+        "decision_signal_sufficient": decision_signal_sufficient,
+        "provider_read_verified": bool(
+            packet.finance_receipt.get("provider_read_verified")
+        ),
+        "openai_requests_made": 0,
+        "provider_writes": 0,
     }
 
 
@@ -137,6 +215,7 @@ def execute_finance_bd_priority_decision(
     packet: FinanceBDPriorityPacket,
     *,
     live_sdk: bool,
+    approved_privacy_minimized_context: bool = False,
     approved_private_context: bool = False,
     decision_runner: Callable[..., TypedAgentRunResult[ChiefOfStaffResult]] = (
         run_chief_of_staff_sdk
@@ -148,19 +227,47 @@ def execute_finance_bd_priority_decision(
     plan = finance_bd_priority_plan(packet)
     if not live_sdk:
         return {"status": "validated_offline", "plan": plan}
-    if not approved_private_context:
-        raise ValueError("Finance-aware Chief decision requires private-context approval.")
+    if approved_privacy_minimized_context and approved_private_context:
+        raise ValueError("Choose exactly one finance context mode.")
+    if approved_private_context:
+        raise ValueError(
+            "Trusted-private finance synthesis is disabled; use the typed "
+            "privacy-minimized posture packet."
+        )
+    if not approved_privacy_minimized_context and not approved_private_context:
+        raise ValueError(
+            "Finance-aware Chief decision requires approval for the privacy-minimized "
+            "posture packet."
+        )
+    minimized_packet = _finance_privacy_packet(packet)
+    concepts = {fact.concept for fact in minimized_packet.facts}
+    if not concepts & (
+        _DECISION_BEARING_FINANCE_CONCEPTS
+        | {"bounded_experiment_supported", "cost_constraint_present"}
+    ):
+        raise ValueError(
+            "Privacy-minimized finance context lacks a decision-bearing cost or "
+            "bounded-experiment signal; add a deterministic posture assertion."
+        )
+    finance_context: Any = packet_for_model(minimized_packet)
+    context_mode = "privacy_minimized_concept_signals"
+    proof_scope = "sanitized_context_proof"
+    exact_financial_values_transmitted = False
 
     request = (
-        "Use the supplied current-quarter finance aggregate before choosing exactly one "
+        "Use the supplied privacy-minimized current-quarter finance posture before "
+        "choosing exactly one "
         "business-development priority. Explain how the finance constraints affect the "
         "choice, compare both supplied options, and hand the selected option to Opportunity "
-        "Scout for read-only validation. Do not search, call tools, write, send, post, or "
-        "publish. Do not provide tax advice."
+        "Scout for read-only validation. End the summary with exactly one line in the form "
+        "'Priority: Option Alpha' or 'Priority: Option Beta'. "
+        "Do not search, call tools, write, send, post, or "
+        "publish. Keep the result strictly to operating posture and option tradeoffs; omit "
+        "tax, legal, medical, and regulatory topics."
     )
     sdk_input = {
         "request": request,
-        "finance_context": packet.finance_summary,
+        "finance_context": finance_context,
         "business_development_options": [
             {
                 "option_id": option.option_id,
@@ -195,20 +302,35 @@ def execute_finance_bd_priority_decision(
         notes=["One finance-aware BD priority decision; supplied context only."],
     )
     with private_context_sdk_profile() as data_profile:
-        result = decision_runner(
-            sdk_input,
-            live=True,
-            force_sdk_interpretation=True,
-            include_specialist_tools=False,
-            attach_tools=False,
-            quality_budget=budget,
-        )
+        try:
+            result = decision_runner(
+                sdk_input,
+                live=True,
+                force_sdk_interpretation=True,
+                include_specialist_tools=False,
+                attach_tools=False,
+                quality_budget=budget,
+            )
+        except OutputGuardrailTripwireTriggered as exc:
+            output_info = getattr(exc.guardrail_result.output, "output_info", {}) or {}
+            risk_flags = tuple(output_info.get("risk_flags") or ())
+            reasons = tuple(output_info.get("reasons") or ())
+            raise RuntimeError(
+                "Finance-priority synthesis tripped the output guardrail; "
+                f"risk_flags={risk_flags!r}; reasons={reasons!r}."
+            ) from exc
     selected = _validate_decision(result, packet)
+    decision_text = _decision_text(result.output)
     return {
         "status": "passed",
+        "proof_scope": proof_scope,
+        "context_mode": context_mode,
+        "exact_financial_values_transmitted": exact_financial_values_transmitted,
         "plan": plan,
         "selected_option_id": selected.option_id,
-        "decision_sha256": hashlib.sha256(_decision_text(result.output).encode()).hexdigest(),
+        "decision": decision_text,
+        "decision_storage": "local_artifact_only",
+        "decision_sha256": hashlib.sha256(decision_text.encode()).hexdigest(),
         "finance_basis_visible": True,
         "both_options_considered": True,
         "specialist_receipts": [
@@ -239,6 +361,74 @@ def _validate_options(options: tuple[BusinessDevelopmentOption, ...]) -> None:
     descriptions = [option.description.strip() for option in options]
     if not all(ids) or len(set(ids)) != 2 or not all(titles) or not all(descriptions):
         raise ValueError("Business-development options require unique IDs, titles, and details.")
+
+
+def _finance_privacy_packet(packet: FinanceBDPriorityPacket) -> Any:
+    minimized = build_concept_signal_packet(
+        workflow="finance_priority",
+        sources={"current_quarter_aggregate": packet.finance_summary},
+        taxonomy=_FINANCE_TAXONOMY,
+        constraints=(
+            "no_exact_financial_values",
+            "compare_both_options",
+            "select_exactly_one",
+            "no_external_action",
+        ),
+    )
+    posture_concepts = _derive_finance_posture_concepts(packet.finance_summary)
+    if not posture_concepts:
+        return minimized
+    source_hashes = minimized.source_hashes
+    enriched = minimized.model_copy(
+        update={
+            "facts": minimized.facts
+            + tuple(
+                PrivacyMinimizedFact(
+                    concept=concept,
+                    evidence_count=1,
+                    source_hashes=source_hashes,
+                )
+                for concept in posture_concepts
+                if concept not in {fact.concept for fact in minimized.facts}
+            )
+        }
+    )
+    return validate_privacy_minimized_packet(
+        enriched,
+        forbidden_raw_values=(packet.finance_summary,),
+    )
+
+
+def _derive_finance_posture_concepts(summary: str) -> tuple[str, ...]:
+    """Convert exact local totals into non-identifying decision posture bands."""
+
+    totals: dict[str, Decimal] = {}
+    for match in _TOTAL_PATTERN.finditer(summary):
+        label = match.group(1).casefold()
+        key = "expense" if label.startswith("expense") else "income"
+        totals.setdefault(key, Decimal(match.group(2).replace(",", "")))
+    income = totals.get("income")
+    expense = totals.get("expense")
+    if income is None or expense is None:
+        return ()
+    concepts: list[str] = []
+    if income > expense:
+        concepts.append("operating_margin_positive")
+    elif expense > income:
+        concepts.append("operating_margin_negative")
+    else:
+        concepts.append("operating_margin_neutral")
+    if income <= 0:
+        concepts.append("expense_load_high" if expense > 0 else "expense_load_low")
+    else:
+        ratio = expense / income
+        if ratio < Decimal("0.50"):
+            concepts.append("expense_load_low")
+        elif ratio <= Decimal("1.00"):
+            concepts.append("expense_load_moderate")
+        else:
+            concepts.append("expense_load_high")
+    return tuple(concepts)
 
 
 def _validate_decision(

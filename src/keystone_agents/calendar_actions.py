@@ -123,9 +123,14 @@ def infer_calendar_action_plan(
 
     text = " ".join(str(request_text or "").split()).strip()
     lower = text.lower()
-    if not text or not re.search(r"\b(?:calendar|event|meeting)\b", lower):
+    action_text = re.sub(
+        r"\b(?:do\s+not|don't|dont|never|without)\b[^.;]*",
+        " ",
+        lower,
+    )
+    if not text or not re.search(r"\b(?:calendar|event|meeting)\b", action_text):
         return None
-    operation = _operation(lower)
+    operation = _operation(action_text)
     if not operation:
         return None
     calendar_id = os.getenv(GOOGLE_CALENDAR_ID_ENV, DEFAULT_CALENDAR_ID).strip()

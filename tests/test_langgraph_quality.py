@@ -7,10 +7,12 @@ import pytest
 
 import scripts.compare_langgraph_quality as compare_script
 from keystone_agents.langgraph_quality import (
+    compare_user_facing_output_quality,
     finalize_langgraph_live_output_review,
     langgraph_edge_program_inventory,
     langgraph_live_smoke_plan,
     langgraph_live_smoke_plan_from_packet,
+    langgraph_live_user_facing_output_quality,
     langgraph_llm_reasoning_touchpoints,
     langgraph_open_smoke_checkpoint,
     render_langgraph_edge_program_inventory,
@@ -19,6 +21,7 @@ from keystone_agents.langgraph_quality import (
     render_langgraph_live_output_review_rubric,
     render_langgraph_live_smoke_plan,
     render_langgraph_open_smoke_checkpoint,
+    user_facing_output_quality_scorecard,
     validate_langgraph_edge_program_inventory,
 )
 from keystone_agents.schemas.work_item import (
@@ -40,6 +43,81 @@ NO_SIDE_EFFECTS = {
     "schedule_created": False,
     "external_write_performed": False,
 }
+
+
+def test_matched_northstar_visible_output_scorecard_favors_graph_terminal_brief() -> None:
+    control_summary = (
+        "*Answer:*\nJordan asked about evaluation design.\n\n"
+        "*Organization context:*\nNorthstar provides workflow analytics for "
+        "behavioral-health clinics.\n\n"
+        "*Recommended next step:*\nReview a draft before external use.\n\n"
+        "*Suggested reply:*\nHi Jordan, would a brief conversation be useful?\n\n"
+        "*Supporting evidence and approval status:*\nDraft-only; no send occurred."
+    )
+    graph_summary = (
+        "*Recommendation:*\nProceed with a brief exploratory reply after human review.\n\n"
+        "*Strongest evidence:*\n"
+        "- Northstar provides workflow analytics for behavioral-health clinics.\n"
+        "- Jordan asked whether Keystone could advise on evaluation design.\n\n"
+        "*Main uncertainty:*\n- The exact workflow and intended users are unknown.\n\n"
+        "*Next step:*\nReview the draft, then ask for a short exploratory conversation.\n\n"
+        "*Draft for review:*\nHi Jordan, would a brief conversation be useful?"
+    )
+    kwargs = {
+        "expected_target_terms": ("Northstar", "evaluation design"),
+        "openai_requests": 1,
+        "total_tokens": 42200,
+        "max_openai_requests": 1,
+        "max_total_tokens": 50000,
+        "side_effects": NO_SIDE_EFFECTS,
+    }
+
+    control = user_facing_output_quality_scorecard(control_summary, **kwargs)
+    graph = user_facing_output_quality_scorecard(graph_summary, **kwargs)
+    comparison = compare_user_facing_output_quality(control, graph)
+
+    assert control["passed"] is False
+    assert graph["passed"] is True
+    assert graph["total_score"] == 16
+    assert comparison["score_delta"] > 0
+    assert comparison["graph_quality_improved"] is True
+    assert comparison["dimension_deltas"]["request_token_efficiency"] == 0
+    assert comparison["dimension_deltas"]["side_effect_safety"] == 0
+
+
+def test_matched_gmail_visible_output_scorecard_favors_graph_terminal_brief() -> None:
+    control_summary = (
+        "Heading: Draft email for synthetic validation correspondent\n\n"
+        "Body: Thanks for the packet. Would a brief conversation be useful?\n\n"
+        "Safety: No Gmail draft was created and no message was sent."
+    )
+    graph_summary = (
+        "*Recommendation:*\nUse the thread-local reply for human review only.\n\n"
+        "*Strongest evidence:*\n"
+        "- The correspondence is synthetic KBA validation material.\n"
+        "- The approved objective is one concise confirmation reply.\n\n"
+        "*Main uncertainty:*\n- No real client relationship is supported.\n\n"
+        "*Next step:*\nReview the draft; no Gmail/provider draft or send is authorized.\n\n"
+        "*Draft for review:*\nThanks for the validation packet. "
+        "Would a brief conversation be useful?"
+    )
+    kwargs = {
+        "expected_target_terms": ("validation", "Gmail"),
+        "openai_requests": 1,
+        "total_tokens": 38158,
+        "max_openai_requests": 1,
+        "max_total_tokens": 50000,
+        "side_effects": NO_SIDE_EFFECTS,
+    }
+
+    control = user_facing_output_quality_scorecard(control_summary, **kwargs)
+    graph = user_facing_output_quality_scorecard(graph_summary, **kwargs)
+    comparison = compare_user_facing_output_quality(control, graph)
+
+    assert graph["passed"] is True
+    assert graph["dimensions"]["side_effect_safety"] == 2
+    assert graph["diagnostics"]["backend_terms"] == []
+    assert comparison["graph_quality_improved"] is True
 
 
 def test_langgraph_edge_program_inventory_names_selected_durable_edges() -> None:
@@ -1308,6 +1386,93 @@ def test_finalize_live_output_review_stays_unreviewed_until_all_criteria_scored(
     assert decision["decision"] == "unreviewed"
     assert "unreviewed:relevance" in decision["blockers"]
     assert "unreviewed:evidence_quality" in decision["blockers"]
+
+
+def test_live_visible_output_scorecard_waits_for_forced_mode_evidence() -> None:
+    packet = run_comparison(scenario="gmail-research-thread-draft")[
+        "live_output_review_packet"
+    ]
+
+    scored = langgraph_live_user_facing_output_quality(packet)
+
+    assert scored["status"] == "pending_live_mode_evidence"
+    assert "control.visible_output" in scored["missing"]
+    assert "graph.workflow_sdk_usage_event" in scored["missing"]
+
+
+def test_live_visible_output_scorecard_scores_complete_matched_evidence() -> None:
+    packet = run_comparison(scenario="gmail-research-thread-draft")[
+        "live_output_review_packet"
+    ]
+    packet["quality_target_terms"] = ["Mindful Care", "evaluation design"]
+    _fill_required_mode_evidence(packet)
+    control = next(
+        item
+        for item in packet["mode_evidence"]
+        if item["mode"] == "forced_langgraph_false_control"
+    )
+    graph = next(
+        item
+        for item in packet["mode_evidence"]
+        if item["mode"] == "forced_langgraph_true"
+    )
+    control["visible_output"] = (
+        "Mindful Care asked about evaluation design. Draft reply for review only."
+    )
+    graph["visible_output"] = (
+        "*Recommendation:*\nProceed after human review.\n\n"
+        "*Strongest evidence:*\n- Mindful Care asked about evaluation design.\n"
+        "- The supplied thread requests measurement support.\n\n"
+        "*Main uncertainty:*\n- The exact workflow is unknown.\n\n"
+        "*Next step:*\nReview the reply and ask for workflow context.\n\n"
+        "*Draft for review:*\nWould a brief conversation be useful?"
+    )
+    for item in (control, graph):
+        item["workflow_sdk_usage_event"]["usage"].update(
+            {"input_tokens": 37000, "output_tokens": 400, "total_tokens": 37400}
+        )
+
+    scored = langgraph_live_user_facing_output_quality(packet)
+    decision = finalize_langgraph_live_output_review(packet)
+
+    assert scored["status"] == "scored"
+    assert scored["graph"]["passed"] is True
+    assert scored["comparison"]["graph_quality_improved"] is True
+    assert decision["user_facing_output_quality"] == scored
+    rendered = render_langgraph_live_output_review_decision(decision)
+    assert "Automated visible-output score: scored" in rendered
+    assert "Automated graph quality improved: yes" in rendered
+
+
+def test_live_visible_output_scorecard_surfaces_safety_and_metadata_regressions() -> None:
+    packet = run_comparison(scenario="gmail-research-thread-draft")[
+        "live_output_review_packet"
+    ]
+    packet["quality_target_terms"] = ["Mindful Care"]
+    _fill_required_mode_evidence(packet)
+    graph = next(
+        item
+        for item in packet["mode_evidence"]
+        if item["mode"] == "forced_langgraph_true"
+    )
+    graph["visible_output"] = (
+        "*Recommendation:*\nReview Mindful Care.\n\n"
+        "*Strongest evidence:*\n- Evidence one.\n- Evidence two.\n\n"
+        "*Main uncertainty:*\n- Unknown.\n\n"
+        "*Next step:*\nReview the WorkItem node_path.\n\n"
+        "*Draft for review:*\nDraft."
+    )
+    graph["side_effects"] = {
+        **graph["side_effects"],
+        "external_write_performed": True,
+    }
+
+    scored = langgraph_live_user_facing_output_quality(packet)
+
+    assert scored["graph"]["dimensions"]["side_effect_safety"] == 0
+    assert "workitem" in scored["graph"]["diagnostics"]["backend_terms"]
+    assert "node_path" in scored["graph"]["diagnostics"]["backend_terms"]
+    assert scored["comparison"]["graph_quality_improved"] is False
 
 
 def test_compare_script_finalizes_edited_review_packet_json(

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from keystone_agents.finance_bd_priority_workflow import (
     BusinessDevelopmentOption,
     collect_current_quarter_finance_packet,
     execute_finance_bd_priority_decision,
+    finance_bd_priority_privacy_preview,
 )
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
@@ -32,7 +35,8 @@ def _finance_result() -> TypedAgentRunResult[ChiefOfStaffResult]:
         output=ChiefOfStaffResult(
             mode="deterministic",
             summary=(
-                "Q3 current-quarter finance summary: income and expense records were read. "
+                "Q3 current-quarter finance summary: Total income: $10,000.00. "
+                "Total expenses: $3,000.00. "
                 "The quarter supports one bounded experiment; one expense is uncategorized."
             ),
             write_requests=[],
@@ -78,7 +82,56 @@ def test_offline_decision_plan_is_sanitized_and_no_write() -> None:
     assert result["status"] == "validated_offline"
     assert result["plan"]["max_openai_requests"] == 1
     assert result["plan"]["provider_writes"] is False
+    assert result["plan"]["proof_scope"] == "sanitized_context_proof"
+    assert result["plan"]["transmission_mode"] == (
+        "privacy_minimized_concept_signals"
+    )
     assert packet.finance_summary not in str(result)
+
+
+def test_privacy_preview_uses_provider_receipt_but_omits_exact_aggregate() -> None:
+    packet = _packet()
+
+    result = finance_bd_priority_privacy_preview(packet)
+
+    assert result["status"] == "privacy_minimized_preview"
+    assert result["provider_read_verified"] is True
+    assert result["openai_requests_made"] == 0
+    assert result["provider_writes"] == 0
+    assert result["exact_financial_values_transmitted"] is False
+    assert result["decision_signal_sufficient"] is True
+    assert packet.finance_summary not in str(result)
+    context = result["bundle"]["finance_context"]
+    assert context["proof_scope"] == "sanitized_context_proof"
+    assert context["transmission_contract"]["exact_financial_values"] is False
+    concepts = {fact["concept"] for fact in context["facts"]}
+    assert "operating_margin_positive" in concepts
+    assert "expense_load_low" in concepts
+    assert "$10,000.00" not in str(context)
+
+
+def test_privacy_preview_flags_context_without_decision_signal() -> None:
+    packet = replace(
+        _packet(),
+        finance_summary=(
+            "Q3 current-quarter income and expense records include one uncategorized gap."
+        ),
+    )
+
+    result = finance_bd_priority_privacy_preview(packet)
+
+    assert result["status"] == "privacy_minimized_preview_insufficient"
+    assert result["decision_signal_sufficient"] is False
+    assert result["openai_requests_made"] == 0
+
+
+def test_trusted_private_finance_mode_is_disabled() -> None:
+    with pytest.raises(ValueError, match="Trusted-private finance synthesis is disabled"):
+        execute_finance_bd_priority_decision(
+            _packet(),
+            live_sdk=True,
+            approved_private_context=True,
+        )
 
 
 def test_fake_model_decision_compares_both_selects_one_and_preserves_receipts() -> None:
@@ -108,12 +161,14 @@ def test_fake_model_decision_compares_both_selects_one_and_preserves_receipts() 
     result = execute_finance_bd_priority_decision(
         packet,
         live_sdk=True,
-        approved_private_context=True,
+        approved_privacy_minimized_context=True,
         decision_runner=fake_decision_runner,
     )
 
     assert result["status"] == "passed"
     assert result["selected_option_id"] == "option-alpha"
+    assert result["decision_storage"] == "local_artifact_only"
+    assert "Option Alpha" in result["decision"]
     assert result["both_options_considered"] is True
     assert [item["schema"] for item in result["specialist_receipts"]] == [
         "keystone.finance_context.receipt.v1",
@@ -123,12 +178,19 @@ def test_fake_model_decision_compares_both_selects_one_and_preserves_receipts() 
     assert captured["kwargs"]["attach_tools"] is False
     assert captured["kwargs"]["include_specialist_tools"] is False
     assert captured["kwargs"]["quality_budget"].max_turns == 1
-    assert packet.finance_summary in captured["sdk_input"]["finance_context"]
+    assert packet.finance_summary not in str(captured["sdk_input"]["finance_context"])
+    assert captured["sdk_input"]["finance_context"]["proof_scope"] == (
+        "sanitized_context_proof"
+    )
+    assert {
+        fact["concept"] for fact in captured["sdk_input"]["finance_context"]["facts"]
+    } >= {"current_quarter", "income_data_present", "expense_data_present"}
+    assert result["exact_financial_values_transmitted"] is False
     assert result["data_handling"]["response_store"] is False
 
 
 def test_live_decision_requires_private_context_approval() -> None:
-    with pytest.raises(ValueError, match="private-context approval"):
+    with pytest.raises(ValueError, match="privacy-minimized posture packet"):
         execute_finance_bd_priority_decision(_packet(), live_sdk=True)
 
 
@@ -155,6 +217,6 @@ def test_decision_rejects_ambiguous_selection() -> None:
         execute_finance_bd_priority_decision(
             packet,
             live_sdk=True,
-            approved_private_context=True,
+            approved_privacy_minimized_context=True,
             decision_runner=fake_runner,
         )

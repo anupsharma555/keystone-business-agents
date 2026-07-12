@@ -68,6 +68,7 @@ DEFAULT_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 8
 MAX_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 12
 DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN = 2
 DEFAULT_EXA_SEARCH_MAX_CALLS_PER_RUN = 2
+DEFAULT_TAVILY_SEARCH_MAX_CALLS_PER_RUN = 2
 DEFAULT_SEARXNG_TRANSIENT_TIMEOUT_SECONDS = 2.0
 
 
@@ -131,6 +132,7 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
         "provider_policy": _compact_provider_policy(providers_used),
         "provider_use_ladder": _compact_provider_use_ladder(metadata, source_coverage, quality),
         "search_queries": _compact_search_queries(metadata.get("search_queries")),
+        "provider_queries": _compact_provider_queries(metadata.get("provider_queries")),
         "provider_usage": _compact_provider_usage(provider_usage),
         "provider_result_samples": _compact_provider_result_samples(
             metadata.get("provider_result_samples")
@@ -394,6 +396,16 @@ def _compact_search_queries(value: Any) -> list[str]:
     else:
         return []
     return [query.strip()[:240] for query in queries[:6] if query.strip()]
+
+
+def _compact_provider_queries(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(provider): _compact_search_queries(queries)
+        for provider, queries in value.items()
+        if str(provider).strip()
+    }
 
 
 def _compact_provider_result_samples(value: Any) -> dict[str, list[dict[str, str]]]:
@@ -954,6 +966,7 @@ def retrieve_company_profile_live(
 
     total_started_at = perf_counter()
     settings_loader = settings_loader or load_settings
+    default_query_builder = query_builder is None
     query_builder = query_builder or build_company_research_queries
     search_provider_builder = search_provider_builder or build_search_provider
     profile_builder = profile_builder or research_account_from_search_results
@@ -997,7 +1010,15 @@ def retrieve_company_profile_live(
     if len(search_config.provider_sequence) == 1:
         client.validate_configuration()
 
-    queries = query_builder(company, company_url)
+    queries = (
+        query_builder(
+            company,
+            company_url,
+            request_text=request_text,
+        )
+        if default_query_builder and _query_builder_accepts_request_text(query_builder)
+        else query_builder(company, company_url)
+    )
     request_focus_terms = _company_extraction_query_terms(company=company, queries=queries)
     search_results: list[Any] = []
     query_timings: list[dict[str, Any]] = []
@@ -1438,6 +1459,16 @@ def _profile_builder_accepts_request_focus(builder: Callable[..., Any]) -> bool:
     )
 
 
+def _query_builder_accepts_request_text(builder: Callable[..., Any]) -> bool:
+    try:
+        parameters = signature(builder).parameters
+    except (TypeError, ValueError):
+        return True
+    return "request_text" in parameters or any(
+        parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
 def _profile_source_focus_diagnostics(
     profile: CompanyProfile,
     *,
@@ -1623,6 +1654,7 @@ def build_shared_search_provider_config(
         provider_request_budget=_optional_search_request_budget(
             agents_enabled=agents_enabled,
             agents_max_calls=agents_web_search_max_calls,
+            tavily_enabled=tavily_search_fallback,
             exa_enabled=exa_search_fallback,
             exa_max_calls=exa_search_max_calls,
         ),
@@ -1677,13 +1709,6 @@ def _deepening_search_providers(
 ) -> tuple[str, ...]:
     requested = (requested_provider or "").strip().lower()
     providers: list[str] = []
-    use_tavily = (
-        _env_bool("KEYSTONE_TAVILY_SEARCH_FALLBACK", default=False)
-        if tavily_enabled is None
-        else tavily_enabled
-    )
-    if use_tavily and requested != "tavily":
-        providers.append("tavily")
     use_exa = (
         _env_bool("KEYSTONE_EXA_SEARCH_FALLBACK", default=False)
         if exa_enabled is None
@@ -1691,6 +1716,13 @@ def _deepening_search_providers(
     )
     if use_exa and requested != "exa":
         providers.append("exa")
+    use_tavily = (
+        _env_bool("KEYSTONE_TAVILY_SEARCH_FALLBACK", default=False)
+        if tavily_enabled is None
+        else tavily_enabled
+    )
+    if use_tavily and requested != "tavily":
+        providers.append("tavily")
     if agents_enabled and requested in {"", "searxng"}:
         providers.append("agents-web-search")
     return tuple(
@@ -1704,12 +1736,20 @@ def _optional_search_request_budget(
     *,
     agents_enabled: bool,
     agents_max_calls: int | None = None,
+    tavily_enabled: bool | None = None,
     exa_enabled: bool | None = None,
     exa_max_calls: int | None = None,
 ) -> ProviderRequestBudget | None:
     limits: dict[str, int] = {}
     if agents_enabled:
         limits["agents-web-search"] = _agents_web_search_max_calls(agents_max_calls)
+    use_tavily = (
+        _env_bool("KEYSTONE_TAVILY_SEARCH_FALLBACK", default=False)
+        if tavily_enabled is None
+        else tavily_enabled
+    )
+    if use_tavily:
+        limits["tavily"] = _tavily_search_max_calls()
     use_exa = (
         _env_bool("KEYSTONE_EXA_SEARCH_FALLBACK", default=False)
         if exa_enabled is None
@@ -1751,6 +1791,15 @@ def _exa_search_max_calls(max_calls: int | None = None) -> int:
             cap = DEFAULT_EXA_SEARCH_MAX_CALLS_PER_RUN
     else:
         cap = int(max_calls)
+    return max(0, cap)
+
+
+def _tavily_search_max_calls() -> int:
+    raw = os.getenv("KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN", "").strip()
+    try:
+        cap = int(raw) if raw else DEFAULT_TAVILY_SEARCH_MAX_CALLS_PER_RUN
+    except ValueError:
+        cap = DEFAULT_TAVILY_SEARCH_MAX_CALLS_PER_RUN
     return max(0, cap)
 
 
@@ -1888,6 +1937,7 @@ def _merge_company_search_telemetry(
     providers_used: list[str] = []
     deepening_provider_sequence: list[str] = []
     provider_usage: dict[str, dict[str, float | int]] = {}
+    provider_queries: dict[str, list[str]] = {}
     provider_errors: list[dict[str, Any]] = []
     quality_reasons: list[str] = []
     structured_enrichment_recommended = False
@@ -1953,6 +2003,13 @@ def _merge_company_search_telemetry(
                     float(target["total_seconds"]) + float(usage.get("total_seconds") or 0),
                     3,
                 )
+        raw_provider_queries = packet.get("provider_queries")
+        if isinstance(raw_provider_queries, dict):
+            for provider_name, queries in raw_provider_queries.items():
+                target_queries = provider_queries.setdefault(str(provider_name), [])
+                for query in _compact_search_queries(queries):
+                    if query not in target_queries:
+                        target_queries.append(query)
         for error in packet.get("search_provider_errors") or []:
             if isinstance(error, dict):
                 provider_errors.append(error)
@@ -1993,6 +2050,7 @@ def _merge_company_search_telemetry(
         "provider_error_fallback_used": provider_error_fallback_used,
         "search_provider_errors": provider_errors,
         "provider_usage": provider_usage,
+        "provider_queries": provider_queries,
         "provider_value_summary": provider_value_summary(provider_usage),
         "tavily_estimated_credits_used": tavily_credits,
         "tavily_credit_budget": _latest_tavily_credit_budget(telemetry_packets),

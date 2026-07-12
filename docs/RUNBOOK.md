@@ -240,8 +240,13 @@ not become the user-facing answer for a normal local-document QA request.
 For the bounded ANU-174 capability-statement proof, validate source readiness
 without a model using `npm run run:local-kni-capability-summary`. Live mode is
 one no-tool `gpt-5.4-mini` request with a `$0.05` ceiling and requires
-`--live-sdk --approve-private-context`; obtain explicit approval before sending
-the guarded local-document excerpts selected by the offline plan to OpenAI. The
+`--live-sdk --approve-privacy-minimized-context`; obtain explicit approval
+before sending the locally derived concept-signal packet to OpenAI. Raw guarded
+document excerpts, paths, URLs, and provider identities are not included. The
+exact outbound object can be materialized without a model call using
+`--preview-privacy-minimized-context`; require
+`local_source_mapping_verified=true`, zero requests/writes, and an all-false
+private-data transmission contract before live execution. The
 offline gate rejects a packet unless every candidate matches the requested
 document family; for the current capability-statement ask it excludes archived
 source templates, internal strategy memos, unsupported presentation/workbook
@@ -256,10 +261,12 @@ are not Zero Data Retention eligible. OpenAI API inputs are not used for model
 training by default, but default API abuse-monitoring logs may retain customer
 content for up to 30 days. For stronger organizational controls, apply for
 Modified Abuse Monitoring or Zero Data Retention and configure the approved
-setting under Platform organization/project data controls. A Codex managed
-execution denial is separate from this KBA contract; do not weaken or disguise
-the payload to bypass it. Run the reviewed command from the trusted operator
-runtime or use a local model when that launch boundary applies.
+setting under Platform organization/project data controls. A managed execution
+denial is separate from this KBA contract; do not weaken, encode, split, or
+disguise private content to bypass it. The four guarded ANU-174 lanes instead
+use the shared typed privacy-minimization boundary: only allowlisted concepts
+and one-way provenance hashes cross the model boundary, and raw private context
+is rejoined locally after synthesis when needed.
 
 ## WorkItem Natural-Language Smoke Test
 
@@ -609,7 +616,7 @@ Run `scripts/run_search_coverage_eval.py` against
 useful websites. This eval measures source-lane and expected-domain recall; use
 browser extraction evals only after URLs have already been discovered.
 
-Exa is free-tier aware. The current operating assumption is 1,000 credits per
+Exa is free-tier aware. The current operating assumption is 20,000 requests per
 month. Set `EXA_SERVICE_API_KEY` plus either `EXA_API_KEY_ID` or
 `EXA_API_KEY_NAME=default` so the Friday API usage automation can resolve usage
 through Exa's admin API. The local estimate is reported against
@@ -618,7 +625,7 @@ authoritative balance source.
 
 ```bash
 export EXA_API_KEY_NAME=default
-export KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT=1000
+export KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT=20000
 export KEYSTONE_EXA_SEARCH_FALLBACK=true
 export KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2
 ```
@@ -1036,14 +1043,20 @@ npm run run:workspace-research-brief-lifecycle -- --live-google-workspace-reads
 
 It uniquely resolves and fully reads the latest Google Doc in
 `KNIOps/Research`, but persists only source hashes and a no-model/no-write plan.
-The reviewed trusted-runtime proof adds `--live-sdk --approve-private-context`
-for exactly one no-tool model request. Add `--live-google-workspace-writes`, an
+Add `--preview-privacy-minimized-context` to materialize the exact sanitized
+model packet after that read while keeping OpenAI and Workspace writes at zero.
+Treat this as a sufficiency check. The current assertion-backed packet is ready
+for one bounded synthesis without raw note text. Add
+`--live-sdk --approve-privacy-minimized-context` for exactly one no-tool model
+request. Add
+`--live-google-workspace-writes`, an
 exact `--approval-reference`, and
 `KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE=true` only for the same approved
 run to create, read back, update, reread, trash, and verify one marked
-`KBA_TEST_DOC`. The selected provider ID and note body stay in-process; the
-receipt retains hashes, usage/cost evidence, same-object verification, and
-cleanup status.
+`KBA_TEST_DOC`. The selected provider ID and note body stay local and are not
+supplied to the model. The persisted receipt
+retains hashes, usage/cost evidence, same-object verification, and cleanup
+status rather than the note body or raw provider ID.
 
 For ANU-174 L174-19, collect a real current-quarter Airtable aggregate and
 persist only its sanitized receipt with:
@@ -1054,14 +1067,23 @@ npm run run:finance-bd-priority-validation -- --live-airtable-reads
 
 The preparation step uses deterministic schema-selected Airtable reads and
 local arithmetic, preserves both supplied option identities, and performs no
-model call, search, write, send, or post. The trusted-runtime decision adds
-`--live-sdk --approve-private-context` for one no-tool Chief turn capped at one
-request and `$0.05`. A pass requires both options to be visibly compared,
+model call, search, write, send, or post. Before a live turn, exact totals are
+reduced locally to categorical finance-posture assertions. The packet can be
+inspected with `--preview-privacy-minimized-context`; this mode
+requires the live read but makes no model request or provider write. The
+preview must contain a decision-bearing posture signal. The decision adds
+`--live-sdk --approve-privacy-minimized-context` for one no-tool Chief turn,
+capped at one request and `$0.05`. A pass requires both options to be visibly compared,
 exactly one priority to be selected, a finance-aware rationale, and a sanitized
 handoff receipt naming Opportunity Scout as the downstream owner.
 
-After a successful Chief Prior Week Packet synthesis has been saved with
-`--output`, deliver from that receipt rather than repeating the model call:
+For L174-20, do not deliver the older concept-only result. The current typed
+assertion packet carries non-identifying source-family counts plus workstream,
+status, owner-role, and action-state relationships. Use
+`--approve-privacy-minimized-context`; raw operational summaries remain local.
+
+After a successful Chief Prior Week Packet assertion-backed synthesis has been
+saved with `--output`, deliver from that receipt rather than repeating the model call:
 
 ```bash
 npm run deliver:chief-prior-week-packet -- \

@@ -22,7 +22,11 @@ from keystone_agents.guardrails import (
 from keystone_agents.source_enrichment import extract_claim_candidates, extract_clean_text
 
 WebsiteExtractorProvider = Literal["trafilatura", "crawl4ai", "firecrawl"]
-WebsiteExtractionGuardrailContext = Literal["default", "public_opportunity_source"]
+WebsiteExtractionGuardrailContext = Literal[
+    "default",
+    "public_opportunity_source",
+    "public_web_source",
+]
 
 
 class WebsiteExtractionError(RuntimeError):
@@ -322,7 +326,7 @@ def _enforce_extraction_output_guardrails(
     *,
     guardrail_context: WebsiteExtractionGuardrailContext,
 ) -> WebsiteExtractionResult:
-    if guardrail_context == "public_opportunity_source":
+    if guardrail_context in {"public_opportunity_source", "public_web_source"}:
         return enforce_public_source_output_guardrails("website_extract_content", result)
     return enforce_tool_output_guardrails("website_extract_content", result)
 

@@ -264,7 +264,11 @@ def _draft_requested(lowered: str) -> bool:
 
 
 def _provider_draft_write_requested(lowered: str) -> bool:
-    if re.search(r"\b(?:do not|don't|dont)\s+(?:create|save|write)\b", lowered):
+    if re.search(
+        r"\b(?:do not|don't|dont)\b[^.!?]{0,120}"
+        r"\b(?:create|save|write|add)\b[^.!?]{0,40}\b(?:gmail\s+)?draft\b",
+        lowered,
+    ):
         return False
     return bool(
         re.search(

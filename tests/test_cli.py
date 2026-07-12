@@ -66,6 +66,20 @@ def test_cli_health_smoke(capsys) -> None:
     assert "Overall status:" in capsys.readouterr().out
 
 
+def test_manual_plan_advice_preserves_gmail_as_first_stage() -> None:
+    plan = infer_manual_request_plan(
+        "Review Gmail today, select the strongest opportunity, then research the company.",
+        requested_agent="gmail_triage",
+    ).model_copy(
+        update={
+            "target_agent": "business_research_analyst",
+            "intent": "gmail_triage",
+        }
+    )
+
+    assert cli._route_with_manual_plan_advice("orchestrator", plan) == "gmail_triage"
+
+
 def test_cli_promptfoo_agent_eval_mode_disables_eval_helpers(monkeypatch) -> None:
     monkeypatch.delenv("KEYSTONE_PROMPTFOO_EVAL", raising=False)
     assert cli._promptfoo_agent_eval_mode() is False
@@ -4741,8 +4755,89 @@ def test_bounded_connector_graph_accepts_state_and_collaboration_wording() -> No
         "move the relationship forward."
     )
 
+    assert cli._is_bounded_gmail_recommendation_graph(request, manager_steps=3) is False
     assert cli._is_bounded_gmail_research_reply_graph(request, manager_steps=3) is True
     assert cli._request_forbids_live_research(request) is True
+
+
+def test_controlled_gmail_recommendation_fits_two_request_ceiling() -> None:
+    request = (
+        "Review the latest Gmail thread from the configured exact test sender, including "
+        "the original inquiry and all messages. Using only that complete thread and "
+        "approved KNI context, identify the current conversation state and recommend the "
+        "most useful KNI-specific next step. Include reply copy only if replying now would "
+        "move the relationship forward, and return the result here for review."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=False,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+    )
+
+    assert cli._is_bounded_gmail_recommendation_graph(request, manager_steps=3) is True
+    assert estimate["max"] == 2
+    assert estimate["stages"] == ["manual_request_planner", "outreach_composer_sdk"]
+
+
+def test_bounded_gmail_research_summary_fits_eight_request_ceiling() -> None:
+    request = (
+        "Read the latest Gmail thread from the configured exact sender, including all "
+        "messages. Identify the organization and product, then research them using "
+        "current public sources. Determine the underlying data source, distinguish "
+        "supported facts from inference, summarize the limitations, and include visible "
+        "source links. Do not draft or send a reply, create a Gmail draft, post, schedule, "
+        "share, or write externally."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=True,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+    )
+
+    assert cli._is_bounded_gmail_research_summary_graph(request, manager_steps=3) is True
+    assert estimate["max"] == 8
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "gmail_provider_read",
+        "business_research_sdk",
+        "final_response_synthesis",
+    ]
+
+
+def test_gmail_research_without_explicit_summary_and_no_write_boundary_stays_generic() -> None:
+    request = "Read the latest Gmail thread, research the company, and tell me what to do."
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=True,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+    )
+
+    assert cli._is_bounded_gmail_research_summary_graph(request, manager_steps=3) is False
+    assert estimate["max"] == 20
 
 
 def test_cli_explicit_chief_budget_uses_delegated_context_owner_turn_limit(
