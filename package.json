@@ -12,6 +12,7 @@
     "run:workspace-research-brief-lifecycle": ".venv/bin/python scripts/run_workspace_research_brief_lifecycle.py",
     "run:finance-bd-priority-validation": ".venv/bin/python scripts/run_finance_bd_priority_validation.py",
     "deliver:chief-prior-week-packet": ".venv/bin/python scripts/deliver_weekly_chief_packet.py",
+    "score:controlled-pilot": ".venv/bin/python scripts/build_controlled_pilot_scorecard.py",
     "eval:promptfoo": "mkdir -p .keystone/promptfoo/config .keystone/promptfoo/cache .keystone/promptfoo/logs && PROMPTFOO_CONFIG_DIR=.keystone/promptfoo/config PROMPTFOO_CACHE_PATH=.keystone/promptfoo/cache PROMPTFOO_LOG_DIR=.keystone/promptfoo/logs promptfoo eval -c promptfooconfig.yaml --no-cache --max-concurrency 1",
     "eval:promptfoo:json": "mkdir -p .keystone/promptfoo/config .keystone/promptfoo/cache .keystone/promptfoo/logs && PROMPTFOO_CONFIG_DIR=.keystone/promptfoo/config PROMPTFOO_CACHE_PATH=.keystone/promptfoo/cache PROMPTFOO_LOG_DIR=.keystone/promptfoo/logs promptfoo eval -c promptfooconfig.yaml --no-cache --max-concurrency 1 --no-table -o .keystone/promptfoo/latest-eval.json",
     "eval:promptfoo:db": "npm run eval:promptfoo:json && .venv/bin/python scripts/promptfoo_eval_db.py import-latest",

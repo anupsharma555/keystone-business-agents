@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from keystone_agents.schemas.approval import ApprovalState
 from keystone_agents.schemas.memory import MemoryItem
 from keystone_agents.schemas.work_item import (
@@ -18,6 +21,7 @@ from keystone_agents.work_items import (
     build_opportunity_context_pack,
     build_outreach_context,
     build_outreach_context_pack,
+    build_project_context_pack,
     build_research_context,
     build_research_context_pack,
     drafting_ready,
@@ -227,6 +231,150 @@ def test_build_context_pack_for_route_selects_specialist_pack() -> None:
     assert pack.type_compatibility_status == "compatible"
     assert pack.handoff_type_contract.target_input_type == pack.satisfies_input_type
     assert pack.handoff_type_contract.target_output_type == pack.expected_output_type
+
+
+def test_project_context_fixture_is_typed_and_attached_without_loose_duplication() -> None:
+    fixture_path = Path(__file__).parent / "fixtures/project_context_gmail_research_outreach.json"
+    project_context = json.loads(fixture_path.read_text(encoding="utf-8"))
+    item = WorkItem(
+        kind=WorkItemKind.GMAIL_THREAD,
+        title="Review synthetic partner inquiry",
+        request_text="Review the selected thread and prepare the next safe action.",
+        target=WorkItemTarget(
+            name="Synthetic Partner",
+            email="sender@example.com",
+            metadata={
+                "thread_id": "thread-synthetic",
+                "project_context": project_context,
+            },
+        ),
+    )
+
+    project_pack = build_project_context_pack(item)
+    assert project_pack is not None
+    assert project_pack.ready is True
+    assert project_pack.project_id == "project-kni-synthetic-001"
+    assert project_pack.source_refs[0].source_id == (
+        "fixture:gmail-thread:synthetic-partner"
+    )
+    assert project_pack.allowed_actions == project_context["allowed_actions"]
+    assert project_pack.blocked_actions == project_context["blocked_actions"]
+
+    pack = build_gmail_context_pack(item)
+    assert pack.ready is True
+    assert pack.project_context == project_pack
+    assert "project_context" not in pack.summary["target"]["metadata"]
+    assert pack.readiness_gates[0].name == "project_context_readiness"
+    assert pack.readiness_gates[0].ready is True
+
+
+def test_project_context_is_attached_beside_every_specialist_pack() -> None:
+    project_context = {
+        "project_id": "project-synthetic",
+        "name": "Synthetic Project",
+        "objective": "Evaluate one synthetic source-backed business opportunity.",
+        "approved_for_agent_use": True,
+        "contains_phi": False,
+        "allowed_actions": ["research", "draft reply text"],
+        "blocked_actions": ["send email"],
+    }
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Research Synthetic Partner",
+        request_text="Research Synthetic Partner",
+        target=WorkItemTarget(
+            name="Synthetic Partner",
+            email="sender@example.com",
+            metadata={
+                "thread_id": "thread-synthetic",
+                "project_context": project_context,
+            },
+        ),
+    )
+
+    packs = [
+        build_research_context_pack(item),
+        build_opportunity_context_pack(item),
+        build_outreach_context_pack(item),
+        build_gmail_context_pack(item),
+    ]
+
+    assert all(pack.project_context is not None for pack in packs)
+    assert {pack.project_context.project_id for pack in packs} == {"project-synthetic"}
+    assert all(pack.readiness_gates[0].name == "project_context_readiness" for pack in packs)
+
+
+def test_project_context_blocked_actions_override_allowed_actions() -> None:
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Synthetic project",
+        target=WorkItemTarget(
+            name="Synthetic Partner",
+            metadata={
+                "project_context": {
+                    "project_id": "project-synthetic",
+                    "name": "Synthetic Project",
+                    "objective": "Prepare an internal summary.",
+                    "approved_for_agent_use": True,
+                    "allowed_actions": ["prepare internal summary", "send email"],
+                    "blocked_actions": ["send email"],
+                }
+            },
+        ),
+    )
+
+    project_pack = build_project_context_pack(item)
+    assert project_pack is not None
+    assert project_pack.allowed_actions == ["prepare internal summary"]
+    assert project_pack.blocked_actions == ["send email"]
+
+
+def test_unapproved_or_phi_project_context_blocks_specialist_readiness() -> None:
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Synthetic project",
+        request_text="Research Synthetic Partner",
+        target=WorkItemTarget(
+            name="Synthetic Partner",
+            metadata={
+                "project_context": {
+                    "project_id": "project-synthetic",
+                    "name": "Synthetic Project",
+                    "objective": "Prepare an internal summary.",
+                    "approved_for_agent_use": False,
+                    "contains_phi": True,
+                }
+            },
+        ),
+    )
+
+    pack = build_research_context_pack(item)
+
+    assert pack.ready is False
+    assert pack.project_context is not None
+    assert pack.project_context.ready is False
+    assert {blocker.code for blocker in pack.project_context.blockers} == {
+        "project_context_not_approved",
+        "project_context_contains_phi",
+    }
+    assert pack.missing_requirements[:2] == [
+        "Approve this bounded project context before specialist use.",
+        "Project context containing PHI or patient-specific data cannot be used.",
+    ]
+
+
+def test_absent_project_context_does_not_add_friction() -> None:
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Research Synthetic Partner",
+        target=WorkItemTarget(name="Synthetic Partner"),
+    )
+
+    pack = build_research_context_pack(item)
+
+    assert pack.project_context is None
+    assert [gate.name for gate in pack.readiness_gates] == ["research_target_readiness"]
+    assert pack.ready is True
 
 
 def test_context_pack_payload_preserves_ordered_sources_for_followups() -> None:

@@ -178,6 +178,7 @@ from keystone_agents.work_items import (
     add_blocker,
     attach_artifact,
     build_context_pack_for_route,
+    build_project_context_pack,
     create_or_load_work_item,
     derive_case_status,
     drafting_ready,
@@ -7737,6 +7738,8 @@ def _apply_external_context(
             context,
             context_file_path=context_file_path,
         )
+    if str(context.get("schema") or "") == "keystone.project_context.v1":
+        return _apply_project_context(work_item, context)
     metadata = {
         **work_item.target.metadata,
         "external_context": _bounded_context_metadata(context),
@@ -7745,6 +7748,77 @@ def _apply_external_context(
         metadata["external_context_file_path"] = context_file_path
     return work_item.model_copy(
         update={"target": work_item.target.model_copy(update={"metadata": metadata})}
+    ).touch()
+
+
+def _apply_project_context(work_item: WorkItem, context: dict[str, Any]) -> WorkItem:
+    """Promote an allowlisted project fixture into typed specialist context."""
+
+    project_context = {
+        "project_id": _compact_context_text(context.get("project_id"), max_chars=120),
+        "name": _compact_context_text(context.get("name"), max_chars=160),
+        "objective": _compact_context_text(context.get("objective"), max_chars=600),
+        "status": _compact_context_text(context.get("status"), max_chars=80),
+        "owner": _compact_context_text(context.get("owner"), max_chars=160),
+        "reviewer": _compact_context_text(context.get("reviewer"), max_chars=160),
+        "sensitivity": _compact_context_text(context.get("sensitivity"), max_chars=40),
+        "approved_for_agent_use": bool(context.get("approved_for_agent_use")),
+        "contains_phi": bool(context.get("contains_phi")),
+        "source_refs": [
+            {
+                "source_id": _compact_context_text(item.get("source_id"), max_chars=240),
+                "title": _compact_context_text(item.get("title"), max_chars=240),
+                "url": _compact_context_text(item.get("url"), max_chars=800),
+                "source_type": _compact_context_text(item.get("source_type"), max_chars=120),
+                "supported_claim": _compact_context_text(
+                    item.get("supported_claim"), max_chars=600
+                ),
+                "provider": _compact_context_text(item.get("provider"), max_chars=80),
+            }
+            for item in context.get("source_refs") or []
+            if isinstance(item, dict)
+        ][:12],
+        "slack_refs": _context_string_list(
+            context.get("slack_refs"), max_items=12, max_chars=320
+        ),
+        "workspace_refs": _context_string_list(
+            context.get("workspace_refs"), max_items=12, max_chars=320
+        ),
+        "airtable_refs": _context_string_list(
+            context.get("airtable_refs"), max_items=12, max_chars=320
+        ),
+        "zotero_refs": _context_string_list(
+            context.get("zotero_refs"), max_items=12, max_chars=320
+        ),
+        "related_work_item_ids": _context_string_list(
+            context.get("related_work_item_ids"), max_items=12, max_chars=160
+        ),
+        "allowed_actions": _context_string_list(
+            context.get("allowed_actions"), max_items=20, max_chars=320
+        ),
+        "blocked_actions": _context_string_list(
+            context.get("blocked_actions"), max_items=20, max_chars=320
+        ),
+    }
+    metadata = {**work_item.target.metadata, "project_context": project_context}
+    updated = work_item.model_copy(
+        update={"target": work_item.target.model_copy(update={"metadata": metadata})}
+    ).touch()
+    pack = build_project_context_pack(updated)
+    if pack is None:
+        return updated
+    for blocker in pack.blockers:
+        updated = add_blocker(updated, blocker)
+    return updated.model_copy(
+        update={
+            "audit_notes": [
+                *updated.audit_notes,
+                (
+                    f"Typed project context attached for {pack.project_id or 'missing project id'}; "
+                    f"ready={str(pack.ready).lower()}."
+                ),
+            ]
+        }
     ).touch()
 
 

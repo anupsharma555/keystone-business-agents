@@ -58,6 +58,28 @@ def _database_url(tmp_path: Path) -> str:
     return f"sqlite:///{tmp_path / 'langgraph_workflow.db'}"
 
 
+def test_graph_write_review_does_not_infer_research_from_graph_evidence_wording() -> None:
+    stages = langgraph_workflow._graph_requested_stage_review(
+        request_text=(
+            "Create a marked Sheet, verify cleanup status, and return graph evidence."
+        ),
+        manual_intent="business_system_write",
+        node_path=["run_chief_of_staff", "approval_checkpoint"],
+        loop_steps=[{"route": "chief_of_staff"}],
+        artifact_types=["chief_of_staff_plan"],
+        blocker_codes=set(),
+        checkpoint_required=True,
+        checkpoint_reason="Review the provider write plan.",
+    )
+
+    stage_statuses = {stage["stage"]: stage["status"] for stage in stages}
+    assert "business_research" not in stage_statuses
+    assert stage_statuses == {
+        "chief_of_staff": "completed",
+        "approval_checkpoint": "completed",
+    }
+
+
 def test_optional_langgraph_workflow_advances_existing_work_item_runner(tmp_path: Path) -> None:
     database_url = _database_url(tmp_path)
 

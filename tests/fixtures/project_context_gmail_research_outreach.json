@@ -1,0 +1,36 @@
+{
+  "schema": "keystone.project_context.v1",
+  "project_id": "project-kni-synthetic-001",
+  "name": "Synthetic Partner Evaluation",
+  "objective": "Assess a synthetic partner inquiry and prepare a source-backed internal next step.",
+  "status": "active",
+  "owner": "KNI operator",
+  "reviewer": "KNI reviewer",
+  "sensitivity": "internal",
+  "approved_for_agent_use": true,
+  "contains_phi": false,
+  "source_refs": [
+    {
+      "source_id": "fixture:gmail-thread:synthetic-partner",
+      "title": "Synthetic partner inquiry",
+      "source_type": "gmail_thread_fixture",
+      "supported_claim": "The synthetic sender requested an evaluation discussion."
+    }
+  ],
+  "slack_refs": ["fixture:slack-thread:project-kni-synthetic-001"],
+  "workspace_refs": ["fixture:drive-folder:synthetic-project"],
+  "airtable_refs": ["fixture:airtable-record:synthetic-project"],
+  "related_work_item_ids": ["fixture:work-item:synthetic-project"],
+  "allowed_actions": [
+    "read selected project sources",
+    "research public company context",
+    "prepare internal summary",
+    "draft reply text"
+  ],
+  "blocked_actions": [
+    "send email",
+    "post externally",
+    "write provider records",
+    "process PHI"
+  ]
+}

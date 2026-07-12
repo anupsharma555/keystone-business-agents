@@ -5634,6 +5634,84 @@ def test_source_bundle_context_promotes_typed_sources_facts_and_gmail_identity()
     }
 
 
+def test_project_context_fixture_promotes_typed_pack_across_route_handoff() -> None:
+    fixture_path = Path(__file__).parent / "fixtures/project_context_gmail_research_outreach.json"
+    context = json.loads(fixture_path.read_text(encoding="utf-8"))
+    work_item = WorkItem(
+        kind=WorkItemKind.GMAIL_THREAD,
+        title="Synthetic partner inquiry",
+        request_text="Review the selected thread, research the partner, and prepare a draft.",
+        target=WorkItemTarget(
+            name="Synthetic Partner",
+            email="sender@example.com",
+            metadata={"thread_id": "thread-synthetic"},
+        ),
+    )
+
+    updated = workflow_runner._apply_external_context(
+        work_item,
+        context,
+        context_file_path=str(fixture_path),
+    )
+
+    assert updated.blockers == []
+    assert updated.target.metadata["project_context"]["project_id"] == (
+        "project-kni-synthetic-001"
+    )
+    gmail_pack = build_context_pack_for_route(updated, WorkItemRoute.GMAIL_TRIAGE)
+    research_pack = build_context_pack_for_route(
+        updated, WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    )
+    outreach_pack = build_context_pack_for_route(updated, WorkItemRoute.OUTREACH_COMPOSER)
+    assert gmail_pack.project_context is not None
+    assert research_pack.project_context is not None
+    assert outreach_pack.project_context is not None
+    assert {
+        gmail_pack.project_context.project_id,
+        research_pack.project_context.project_id,
+        outreach_pack.project_context.project_id,
+    } == {"project-kni-synthetic-001"}
+    assert all(
+        "project_context" not in pack.summary["target"]["metadata"]
+        for pack in (gmail_pack, research_pack, outreach_pack)
+    )
+    assert any("ready=true" in note for note in updated.audit_notes)
+
+
+def test_project_context_with_phi_blocks_before_specialist_use() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Restricted project",
+        request_text="Research Synthetic Partner",
+        target=WorkItemTarget(name="Synthetic Partner"),
+    )
+    context = {
+        "schema": "keystone.project_context.v1",
+        "project_id": "project-restricted",
+        "name": "Restricted Project",
+        "objective": "Review patient-specific project context.",
+        "approved_for_agent_use": True,
+        "contains_phi": True,
+    }
+
+    updated = workflow_runner._apply_external_context(
+        work_item,
+        context,
+        context_file_path="synthetic.json",
+    )
+
+    assert {blocker.code for blocker in updated.blockers} == {
+        "project_context_contains_phi"
+    }
+    pack = build_context_pack_for_route(
+        updated, WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    )
+    assert pack.ready is False
+    assert pack.project_context is not None
+    assert pack.project_context.contains_phi is True
+    assert any("ready=false" in note for note in updated.audit_notes)
+
+
 def test_source_bundle_target_mismatch_blocks_before_promoting_evidence() -> None:
     fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
     context = json.loads(fixture_path.read_text(encoding="utf-8"))

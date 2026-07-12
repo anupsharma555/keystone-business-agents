@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from keystone_agents.schemas.handoff_types import HandoffTypeContract, build_handoff_type_contract
 from keystone_agents.schemas.work_item import (
@@ -48,6 +48,34 @@ class MemoryContextRef(BaseModel):
     created_at: str = ""
 
 
+class ProjectContextPack(BaseModel):
+    """Approved bounded project identity and operating references."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pack_type: Literal["project"] = "project"
+    project_id: str = ""
+    name: str = ""
+    objective: str = ""
+    status: str = ""
+    owner: str = ""
+    reviewer: str = ""
+    sensitivity: Literal["public", "internal", "private", "restricted"] = "internal"
+    approved_for_agent_use: bool = False
+    contains_phi: bool = False
+    source_refs: list[WorkItemSourceRef] = Field(default_factory=list)
+    slack_refs: list[str] = Field(default_factory=list)
+    workspace_refs: list[str] = Field(default_factory=list)
+    airtable_refs: list[str] = Field(default_factory=list)
+    zotero_refs: list[str] = Field(default_factory=list)
+    related_work_item_ids: list[str] = Field(default_factory=list)
+    allowed_actions: list[str] = Field(default_factory=list)
+    blocked_actions: list[str] = Field(default_factory=list)
+    blockers: list[WorkItemBlocker] = Field(default_factory=list)
+    ready: bool = False
+    missing_requirements: list[str] = Field(default_factory=list)
+
+
 class ContextPackBase(BaseModel):
     """Common WorkItem state shared by every specialist context pack."""
 
@@ -81,6 +109,7 @@ class ContextPackBase(BaseModel):
     missing_requirements: list[str] = Field(default_factory=list)
     limitation_notes: list[str] = Field(default_factory=list)
     relevant_memory_refs: list[MemoryContextRef] = Field(default_factory=list)
+    project_context: ProjectContextPack | None = None
     summary: dict[str, Any] = Field(default_factory=dict)
 
 
