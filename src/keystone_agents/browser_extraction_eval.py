@@ -283,6 +283,7 @@ class FirecrawlRenderedPageProvider:
                 company_name=urlparse(url).netloc or "web page",
                 provider="firecrawl",
                 live=True,
+                guardrail_context="public_web_source",
             )
         except WebsiteExtractionError as exc:
             return _error_page(
@@ -295,6 +296,50 @@ class FirecrawlRenderedPageProvider:
             provider=self.provider_name,
             url=url,
             final_url=result.url,
+            status=result.status,
+            title=result.title,
+            text_or_markdown=_truncate(result.text_or_markdown, self.max_output_chars),
+            links=[],
+            html_length=0,
+            latency_ms=_elapsed_ms(started_at),
+            metadata={
+                **result.metadata,
+                "output_truncated": len(result.text_or_markdown) > self.max_output_chars,
+                "timeout_seconds": timeout_seconds,
+            },
+        )
+
+
+@dataclass(frozen=True)
+class Crawl4AIRenderedPageProvider:
+    """Local Crawl4AI selected-page extraction provider."""
+
+    dry_run: bool = False
+    max_output_chars: int = DEFAULT_RENDERED_PAGE_MAX_OUTPUT_CHARS
+    provider_name: str = "crawl4ai"
+
+    def render(self, url: str, timeout_seconds: int) -> RenderedPage:
+        if self.dry_run:
+            return DryRunRenderedPageProvider(self.provider_name).render(url, timeout_seconds)
+        started_at = perf_counter()
+        try:
+            result = extract_website_content(
+                url,
+                company_name=urlparse(url).netloc or "web page",
+                provider="crawl4ai",
+                live=True,
+            )
+        except WebsiteExtractionError as exc:
+            return _error_page(
+                provider=self.provider_name,
+                url=url,
+                error=str(exc),
+                latency_ms=_elapsed_ms(started_at),
+            )
+        return RenderedPage(
+            provider=self.provider_name,
+            url=url,
+            final_url=str(result.metadata.get("final_url") or result.url),
             status=result.status,
             title=result.title,
             text_or_markdown=_truncate(result.text_or_markdown, self.max_output_chars),
@@ -449,7 +494,9 @@ def build_rendered_page_provider(
         return BrowserlessRenderedPageProvider(max_output_chars=max_output_chars)
     if provider == "playwright":
         return PlaywrightRenderedPageProvider(max_output_chars=max_output_chars)
-    if provider in {"apify", "crawl4ai"}:
+    if provider == "crawl4ai":
+        return Crawl4AIRenderedPageProvider(max_output_chars=max_output_chars)
+    if provider == "apify":
         return UnsupportedRenderedPageProvider(provider_name=provider)
     return TrafilaturaRenderedPageProvider(max_output_chars=max_output_chars)
 
@@ -879,15 +926,15 @@ def build_browser_provider_diagnostic_specs() -> dict[str, BrowserProviderDiagno
             promotion_rule="requires adapter, tests, credentials, and attribution checks",
         ),
         "crawl4ai": BrowserProviderDiagnosticSpec(
-            role="future local/open-source extraction boundary",
-            promotion_status="future_boundary",
-            readiness="not implemented",
-            budget_class="local or self-hosted candidate",
-            default_use="unsupported eval boundary",
-            live_requirement="reviewed adapter not implemented",
-            benchmark_focus="local extraction lift over Trafilatura after adapter review",
-            next_validation="prototype behind eval boundary before runtime promotion",
-            promotion_rule="requires adapter, tests, and repeatable quality evidence",
+            role="local/open-source selected-page extractor",
+            promotion_status="experimental_eval",
+            readiness="implemented optional adapter; quality evidence pending",
+            budget_class="free/local compute plus target HTTP request",
+            default_use="explicit extraction and eval lane",
+            live_requirement="optional crawl4ai dependency and live extraction flag",
+            benchmark_focus="local extraction lift over Trafilatura on JS-heavy pages",
+            next_validation="compare Crawl4AI against Trafilatura before runtime promotion",
+            promotion_rule="promote only with repeatable quality gains and acceptable latency",
         ),
     }
 
@@ -1082,6 +1129,7 @@ __all__ = [
     "BrowserExtractionScore",
     "BrowserProviderDiagnosticSpec",
     "BrowserlessRenderedPageProvider",
+    "Crawl4AIRenderedPageProvider",
     "DryRunRenderedPageProvider",
     "FirecrawlRenderedPageProvider",
     "PlaywrightRenderedPageProvider",

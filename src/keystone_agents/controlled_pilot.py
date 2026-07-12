@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Literal
 
@@ -39,6 +40,7 @@ class ControlledPilotObservation:
     natural_request_sha256: str
     slack_permalink_present: bool
     answer_first: bool
+    human_review_passed: bool
     final_response_count: int
     route_correct: bool
     graph_used: bool
@@ -69,17 +71,17 @@ class ControlledPilotAssessment:
 CONTROLLED_PILOT_CASES: tuple[ControlledPilotCase, ...] = (
     ControlledPilotCase(
         case_id="research_to_internal_doc",
-        title="Source-backed research to verified internal Doc",
+        title="Source-backed research to reviewed internal Doc plan",
         natural_ask=(
-            "Research the selected company for current KNI relevance, then create one "
-            "concise internal Google Doc from the approved source-backed result and return "
-            "the verified Doc link."
+            "Research the selected company for current KNI relevance, then prepare concise "
+            "source-backed Google Doc content and an exact reviewed write plan without "
+            "creating or modifying a document."
         ),
         expected_entry_owner="chief_of_staff",
         backend="langgraph",
         context_sources=("public_research", "google_workspace"),
-        expected_artifact="verified_google_doc",
-        allowed_provider_writes=1,
+        expected_artifact="reviewed_google_doc_write_plan",
+        allowed_provider_writes=0,
         requires_cleanup=False,
         max_openai_requests=4,
         max_cost_usd=0.15,
@@ -93,18 +95,20 @@ CONTROLLED_PILOT_CASES: tuple[ControlledPilotCase, ...] = (
         case_id="selected_gmail_thread_followup",
         title="Selected Gmail thread to current-state next step",
         natural_ask=(
-            "Review the selected Gmail thread including all messages, identify the current "
-            "conversation state, and recommend the most useful KNI-specific next step. "
-            "Include reply copy only if replying now would move the relationship forward."
+            "Review the latest Gmail thread from the configured exact test sender, including "
+            "the original inquiry and all messages. Using only that complete thread and "
+            "approved KNI context, identify the current conversation state and recommend the "
+            "most useful KNI-specific next step. Include reply copy only if replying now would "
+            "move the relationship forward, and return the result here for review."
         ),
-        expected_entry_owner="chief_of_staff",
+        expected_entry_owner="orchestrator",
         backend="langgraph",
         context_sources=("gmail_selected_thread", "approved_kni_context"),
         expected_artifact="reviewed_next_action_or_draft",
         allowed_provider_writes=0,
         requires_cleanup=False,
-        max_openai_requests=6,
-        max_cost_usd=0.25,
+        max_openai_requests=2,
+        max_cost_usd=0.10,
         differentiation_case_ids=(
             "slack_native_execution",
             "persistent_workitem_state",
@@ -160,6 +164,12 @@ def controlled_pilot_cases() -> tuple[ControlledPilotCase, ...]:
     return CONTROLLED_PILOT_CASES
 
 
+def controlled_pilot_natural_request_sha256(case: ControlledPilotCase) -> str:
+    """Return the canonical hash used to bind observations to an unchanged ask."""
+
+    return hashlib.sha256(case.natural_ask.encode("utf-8")).hexdigest()
+
+
 def controlled_pilot_ready(trusted_runtime_rows: dict[str, str]) -> bool:
     """Require all four trusted rows before starting the live pilot."""
 
@@ -178,12 +188,16 @@ def assess_controlled_pilot_observation(
     )
     if case is None:
         raise ValueError(f"Unknown controlled pilot case: {observation.case_id}")
-    if len(observation.natural_request_sha256) != 64:
-        raise ValueError("Pilot observation requires the SHA-256 of the natural ask.")
+    expected_hash = controlled_pilot_natural_request_sha256(case)
+    if observation.natural_request_sha256 != expected_hash:
+        raise ValueError(
+            "Pilot observation requires the SHA-256 of the catalog's unchanged natural ask."
+        )
 
     checks = {
         "slack_permalink_present": observation.slack_permalink_present,
         "answer_first": observation.answer_first,
+        "human_review_passed": observation.human_review_passed,
         "one_final_response": observation.final_response_count == 1,
         "route_correct": observation.route_correct,
         "backend_matches": observation.graph_used == (case.backend == "langgraph"),

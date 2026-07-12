@@ -138,14 +138,23 @@ Provider selection stays in Python policy rather than prompt-specific branches.
 The current ladder is:
 
 - Always/default live discovery: SearXNG.
+  The repo container mounts `infra/searxng/core-config/settings.yml` as a
+  read-only file so JSON API output remains enabled. Restart the dedicated
+  `kba-searxng` profile after changing this mount contract.
 - Default capped corroboration: `agents-web-search`, bounded by hosted-search
   caps and not expanded by default.
 - Conditional semantic deepening: Exa when broad recall misses lanes or the ask
   needs related-source/landscape discovery, including Orchestrator structured
-  enrichment hints.
+  enrichment hints. Exa receives a bounded related-source query expanded with
+  up to three missing source-lane terms, including when baseline search returns
+  no results.
 - Conditional research deepening: Tavily for grants, trials, RFPs, literature,
   conference/CFP, and formal opportunity gaps with credit accounting, especially
-  when Orchestrator marks the ask as precision-sensitive.
+  when Orchestrator marks the ask as precision-sensitive. Tavily receives a
+  bounded official-primary-source query expanded with missing lane terms and is
+  capped by `KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN`.
+  When both lanes are eligible, Exa runs first because its current allowance is
+  materially larger; Tavily runs only if the evidence gap remains.
 - Selected-page extraction baseline: Trafilatura after URLs are selected and
   claim-supporting text is needed.
 - Selected-page extraction fallback: Firecrawl only when the selected page is
@@ -153,8 +162,8 @@ The current ladder is:
 - Rendered diagnostics: Playwright for read-only rendered-page failure
   diagnosis, not routine extraction.
 - Disabled unless explicitly restored: Serper.
-- Eval/future boundaries: Browserless, Apify, and Crawl4AI until reviewed
-  adapters, safety boundaries, and attribution tests justify promotion.
+- Eval/future search boundaries: Browserless, Apify, and Crawl4AI are not search
+  indexes. Crawl4AI may be evaluated separately as a selected-page extractor.
 
 ## Provider Readiness Matrix
 
@@ -171,7 +180,7 @@ defaults.
 | Tavily | Research/opportunity deepening | Candidate with credit guard | Needs credit/rate and depth-value evidence | Formal grant, trial, RFP, literature, and conference lane recall | Compare basic-depth Tavily against targeted SearXNG official-domain followups |
 | Firecrawl search | Explicit search/extraction lane | Explicit fallback only | Search role is less proven than extraction role | Source recall plus extraction content yield | Prefer selected-page extraction comparison before promoting Firecrawl search |
 | Serper | Google-style fallback | Disabled | Credits unavailable/not deliberately restored | None while disabled | Restore only after credit availability and policy review |
-| Browserless/Apify/Crawl4AI | Not search providers today | Eval/future boundaries | Need adapters, attribution tests, and safety rules | Not applicable as discovery providers | Keep out of `SearchProvider` defaults unless backed by a real search API |
+| Browserless/Apify/Crawl4AI | Not search providers today | Outside discovery policy | These tools render or extract selected pages rather than query a search index | Not applicable as discovery providers | Keep out of `SearchProvider` defaults unless backed by a real search API |
 
 Live retrieval metadata also exposes compact Slack/CLI-safe diagnostics:
 `provider_policy` summarizes the providers actually used by role and budget

@@ -136,6 +136,39 @@ def test_public_opportunity_extraction_allows_contract_page_terms(
     assert result.metadata["guardrail_context"] == "public_opportunity_source"
 
 
+def test_public_web_extraction_allows_incidental_login_page_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "test-firecrawl-key")
+
+    def fake_post(*_args, **_kwargs):
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "data": {
+                    "markdown": (
+                        "2026 APA Annual Meeting sessions and expert speakers. "
+                        "Members may log in to save a personal schedule."
+                    ),
+                    "metadata": {"title": "2026 APA Annual Meeting"},
+                }
+            },
+        )
+
+    result = extract_website_content(
+        "https://www.psychiatry.org/annual-meeting",
+        company_name="American Psychiatric Association",
+        provider="firecrawl",
+        live=True,
+        guardrail_context="public_web_source",
+        http_post=fake_post,
+    )
+
+    assert result.status == "success"
+    assert "Members may log in" in result.text_or_markdown
+    assert result.metadata["guardrail_context"] == "public_web_source"
+
+
 def test_firecrawl_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
 

@@ -47,15 +47,23 @@ def main() -> int:
         if args.resume_delivery_receipt
         else None
     )
-    result = deliver_weekly_ops_packet(
-        synthesis,
-        live_workspace_write=bool(args.live_google_workspace_write),
-        workspace_approval_reference=args.workspace_approval_reference,
-        live_slack_post=bool(args.live_slack_post),
-        slack_channel_id=args.slack_channel_id,
-        slack_approval_reference=args.slack_approval_reference,
-        prior_delivery_receipt=prior_delivery,
-    )
+    try:
+        result = deliver_weekly_ops_packet(
+            synthesis,
+            live_workspace_write=bool(args.live_google_workspace_write),
+            workspace_approval_reference=args.workspace_approval_reference,
+            live_slack_post=bool(args.live_slack_post),
+            slack_channel_id=args.slack_channel_id,
+            slack_approval_reference=args.slack_approval_reference,
+            prior_delivery_receipt=prior_delivery,
+        )
+    except ValueError as exc:
+        result = {
+            "status": "blocked",
+            "blocker": str(exc),
+            "provider_writes": 0,
+            "send_enabled": False,
+        }
     rendered = json.dumps(result, indent=2, sort_keys=True, default=str) + "\n"
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")

@@ -155,6 +155,8 @@ def classify_source_lanes(
     if any(
         term in haystack
         for term in (
+            "annual meeting",
+            "call for sessions",
             "conference",
             "symposium",
             "summit",

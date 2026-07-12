@@ -97,7 +97,7 @@ def test_live_test_profile_replaces_existing_serper_default_with_searxng(tmp_pat
     assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text
     assert "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2" in text
     assert "KEYSTONE_SERPER_ENABLED=false" in text
-    assert "KEYSTONE_TAVILY_SEARCH_FALLBACK=false" in text
+    assert "KEYSTONE_TAVILY_SEARCH_FALLBACK=true" in text
     assert "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW=true" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2" in text
@@ -120,7 +120,7 @@ def test_live_test_profile_can_explicitly_select_exa(tmp_path) -> None:
     assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text
     assert "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2" in text
     assert "KEYSTONE_SERPER_ENABLED=false" in text
-    assert "KEYSTONE_TAVILY_SEARCH_FALLBACK=false" in text
+    assert "KEYSTONE_TAVILY_SEARCH_FALLBACK=true" in text
     assert "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW=true" in text
 
@@ -146,7 +146,7 @@ def test_full_live_profile_creates_missing_env_file_with_expected_values(tmp_pat
     assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text
     assert "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2" in text
     assert "KEYSTONE_SERPER_ENABLED=false" in text
-    assert "KEYSTONE_TAVILY_SEARCH_FALLBACK=false" in text
+    assert "KEYSTONE_TAVILY_SEARCH_FALLBACK=true" in text
     assert "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW=true" in text
     assert "KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2" in text

@@ -40,10 +40,13 @@ from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
     WorkItem,
+    WorkItemArtifactRef,
+    WorkItemFact,
     WorkItemKind,
     WorkItemNextAction,
     WorkItemRoute,
     WorkItemStatus,
+    WorkItemTarget,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.weekly_ops_packet import build_weekly_ops_source_bundle
@@ -78,6 +81,253 @@ def test_graph_write_review_does_not_infer_research_from_graph_evidence_wording(
         "chief_of_staff": "completed",
         "approval_checkpoint": "completed",
     }
+
+
+def test_manager_loop_continue_keeps_cursor_and_original_objective() -> None:
+    request = WorkflowRunRequest(
+        request_text="Review the supplied company packet and prepare a concise reply."
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(kind=WorkItemKind.COMPANY_RESEARCH, title="Company packet"),
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.IN_PROGRESS,
+        advanced=True,
+        next_action=WorkItemNextAction(
+            action="draft_reply",
+            agent=WorkItemRoute.OUTREACH_COMPOSER,
+        ),
+    )
+
+    updated = langgraph_workflow._manager_loop_continue_node(
+        {
+            "original_request": request.model_dump(mode="json"),
+            "request": request.model_dump(mode="json"),
+            "result": result.model_dump(mode="json"),
+            "node_path": ["run_business_research", "finalize_step"],
+        }
+    )
+
+    assert updated["request"]["request_text"] == "continue"
+    assert updated["request"]["work_item_id"] == result.work_item.id
+    assert updated["request"]["manual_request_plan"]["objective"] == request.request_text
+
+
+def test_graph_terminal_summary_integrates_decision_evidence_and_draft() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.OUTREACH,
+        title="Northstar review",
+        facts=[
+            WorkItemFact(
+                key="product_focus",
+                value="Northstar provides workflow analytics for behavioral-health clinics.",
+                approval_state=ApprovalState.APPROVED_FOR_DRAFTING.value,
+            ),
+            WorkItemFact(
+                key="inbound_request",
+                value="Jordan asked whether Keystone could advise on evaluation design.",
+                approval_state=ApprovalState.APPROVED_FOR_DRAFTING.value,
+            ),
+        ],
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="outreach_draft",
+                artifact_id="draft-1",
+                source_agent=WorkItemRoute.OUTREACH_COMPOSER.value,
+                metadata={
+                    "model_recommendation": {
+                        "reply_recommended": True,
+                        "recommended_next_step": "Ask for a short exploratory conversation.",
+                        "additional_information_needed": ["Workflow specifics"],
+                    }
+                },
+            )
+        ],
+    )
+    result = WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.OUTREACH_COMPOSER,
+        status=WorkItemStatus.NEEDS_APPROVAL,
+        advanced=True,
+        human_summary=(
+            "*Answer:*\nExploratory fit.\n\n"
+            "*Suggested reply:*\nSubject: Re: evaluation design\n\n"
+            "Hi Jordan,\n\nWould a brief conversation be useful?\n\n"
+            "*Supporting evidence and approval status:*\n- Source basis: fixture:id"
+        ),
+    )
+
+    enhanced = langgraph_workflow._enhance_graph_terminal_summary(
+        original_request=WorkflowRunRequest(
+            request_text=(
+                "The visible result should state the recommendation, strongest evidence, "
+                "main uncertainty, next step, and draft reply."
+            )
+        ),
+        result=result,
+        graph_completion_review={
+            "completed_routes": ["gmail_triage", "business_research_analyst", "outreach_composer"]
+        },
+    )
+
+    assert enhanced.human_summary.startswith("*Recommendation:*")
+    assert "*Strongest evidence:*" in enhanced.human_summary
+    assert "*Main uncertainty:*" in enhanced.human_summary
+    assert "*Next step:*" in enhanced.human_summary
+    assert "*Draft for review:*" in enhanced.human_summary
+    assert "Would a brief conversation be useful?" in enhanced.human_summary
+    assert "Exploratory fit" not in enhanced.human_summary
+    assert "fixture:id" not in enhanced.human_summary
+    assert "LangGraph terminal operator brief composed deterministically" in " ".join(
+        enhanced.audit_notes
+    )
+
+
+def test_graph_terminal_summary_handles_thread_local_gmail_draft() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.OUTREACH,
+        title="Gmail validation reply",
+        facts=[
+            WorkItemFact(
+                key="synthetic_validation_scope",
+                value="The selected correspondence is synthetic validation material.",
+                approval_state=ApprovalState.APPROVED_FOR_DRAFTING.value,
+            ),
+            WorkItemFact(
+                key="unsupported_claim_boundary",
+                value="No real client or prior relationship is supported.",
+                approval_state=ApprovalState.APPROVED_FOR_RESEARCH.value,
+            ),
+        ],
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="outreach_draft",
+                artifact_id="draft-2",
+                source_agent=WorkItemRoute.OUTREACH_COMPOSER.value,
+                metadata={"thread_local_slack_draft": True},
+            )
+        ],
+    )
+    result = WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.OUTREACH_COMPOSER,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary="Thanks for sharing this. Would a brief conversation be useful?",
+    )
+
+    enhanced = langgraph_workflow._enhance_graph_terminal_summary(
+        original_request=WorkflowRunRequest(
+            request_text=(
+                "The visible result should state the recommendation, strongest evidence, "
+                "main uncertainty, next step, and draft reply."
+            )
+        ),
+        result=result,
+        graph_completion_review={
+            "completed_routes": ["gmail_triage", "outreach_composer"]
+        },
+    )
+
+    assert "Proceed with a brief exploratory reply after human review." in (
+        enhanced.human_summary
+    )
+    assert "*Main uncertainty:*\n- No real client or prior relationship is supported." in (
+        enhanced.human_summary
+    )
+    assert "no Gmail/provider draft or send is authorized" in enhanced.human_summary
+
+
+def test_graph_terminal_summary_promotes_research_datasource_evidence() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Research Acme Data",
+        target=WorkItemTarget(
+            name="Acme Data",
+            metadata={
+                "gmail_research_focus_terms": ["Acme Analytics"],
+                "gmail_research_target": "Acme Health",
+            },
+        ),
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="profile-1",
+                source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                title="Acme Data",
+                metadata={
+                    "source_refs": [
+                        {
+                            "title": "Acme platform update",
+                            "url": "https://example.test/platform",
+                            "key_facts": [
+                                (
+                                    "Acme Analytics uses de-identified clinical records "
+                                    "from partner health systems."
+                                ),
+                                (
+                                    "Tokenization allows clinical data to be linked with "
+                                    "claims outcomes."
+                                ),
+                            ],
+                        },
+                        {
+                            "title": "Acme company",
+                            "url": "https://example.test/company",
+                            "key_facts": [
+                                (
+                                    "The dataset contains longitudinal behavioral-health "
+                                    "patient encounters."
+                                )
+                            ],
+                        },
+                        {
+                            "title": "Irrelevant registry glossary",
+                            "url": "https://example.test/glossary",
+                            "key_facts": ["A generic clinical study glossary."],
+                        },
+                    ]
+                },
+            )
+        ],
+    )
+    result = WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary="Generic research artifact summary.",
+    )
+
+    enhanced = langgraph_workflow._enhance_graph_terminal_summary(
+        original_request=WorkflowRunRequest(
+            request_text=(
+                "Research the company, determine the underlying datasource, distinguish "
+                "supported facts from inference, summarize limitations and the KNI "
+                "collaboration angle, and include source links."
+            )
+        ),
+        result=result,
+        graph_completion_review={
+            "completed_routes": ["gmail_triage", "business_research_analyst"]
+        },
+    )
+
+    assert enhanced.human_summary.startswith("*Answer:*")
+    assert "identifies Acme Health as the organization" in enhanced.human_summary
+    assert "*Organization:*" in enhanced.human_summary
+    assert "Acme Health is the sender organization" in enhanced.human_summary
+    assert "Acme Analytics" in enhanced.human_summary
+    assert "*Directly supported facts:*" in enhanced.human_summary
+    assert "de-identified clinical records" in enhanced.human_summary
+    assert "*Inference and unknowns:*" in enhanced.human_summary
+    assert "*Why it matters for KNI:*" in enhanced.human_summary
+    assert "*Sources:*" in enhanced.human_summary
+    assert "https://example.test/platform" in enhanced.human_summary
+    assert "https://example.test/glossary" not in enhanced.human_summary
+    assert "source-provenance and fitness-for-purpose" in enhanced.human_summary
+    assert "LangGraph research terminal brief composed deterministically" in " ".join(
+        enhanced.audit_notes
+    )
 
 
 def test_optional_langgraph_workflow_advances_existing_work_item_runner(tmp_path: Path) -> None:

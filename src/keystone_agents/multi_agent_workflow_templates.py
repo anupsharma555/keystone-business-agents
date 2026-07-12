@@ -81,6 +81,37 @@ class MultiAgentWorkflowTemplate(BaseModel):
     implementation_status: str = "candidate"
 
 
+class WorkflowDryRunPlan(BaseModel):
+    """Executable no-live receipt for a combined or scheduled template."""
+
+    contract_schema: str = Field(
+        default="keystone.multi_agent_workflow_dry_run.v1",
+        serialization_alias="schema",
+    )
+    template_id: str
+    run_mode: WorkflowRunMode
+    trigger_type: WorkflowTriggerType
+    cadence: str
+    schedule_enabled: bool = False
+    project_id: str
+    agent_chain: list[str]
+    context_packs: list[str]
+    source_refs: list[str]
+    passed_state: list[str]
+    blockers: list[str]
+    approval_gate: str
+    output_destinations: list[str]
+    budget_stop_condition: str
+    effective_tool_tier: WorkflowToolTier = WorkflowToolTier.FIXTURE_ONLY
+    max_openai_requests: int = 0
+    max_provider_reads: int = 0
+    max_provider_writes: int = 0
+    external_post_allowed: bool = False
+    send_allowed: bool = False
+    validation_path: list[str]
+    status: str = "dry_run_ready"
+
+
 def workflow_template_catalog() -> tuple[MultiAgentWorkflowTemplate, ...]:
     """Return the first realistic workflow templates KBA should support."""
 
@@ -95,6 +126,42 @@ def get_workflow_template(template_id: str) -> MultiAgentWorkflowTemplate | None
         if template.id == normalized:
             return template
     return None
+
+
+def build_workflow_dry_run_plan(
+    template_id: str,
+    *,
+    run_mode: WorkflowRunMode,
+    project_id: str,
+    source_refs: Iterable[str],
+) -> WorkflowDryRunPlan:
+    """Build a disabled fixture-only plan without granting runtime authority."""
+
+    template = get_workflow_template(template_id)
+    if template is None:
+        raise ValueError(f"Unknown workflow template: {template_id}")
+    if run_mode not in template.run_modes:
+        raise ValueError(f"Workflow template {template_id} does not support {run_mode.value}.")
+    clean_project_id = str(project_id or "").strip()
+    clean_refs = [str(item).strip() for item in source_refs if str(item).strip()]
+    if not clean_project_id or not clean_refs:
+        raise ValueError("Workflow dry run requires project identity and source refs.")
+    return WorkflowDryRunPlan(
+        template_id=template.id,
+        run_mode=run_mode,
+        trigger_type=template.trigger_type,
+        cadence=template.cadence,
+        project_id=clean_project_id,
+        agent_chain=list(template.agent_chain),
+        context_packs=list(template.handoff_contract.context_packs),
+        source_refs=clean_refs,
+        passed_state=list(template.handoff_contract.passed_state),
+        blockers=list(template.handoff_contract.blockers),
+        approval_gate=template.approval_gate,
+        output_destinations=["local JSON dry-run artifact", "WorkItem dry-run note"],
+        budget_stop_condition=template.budget_stop_condition,
+        validation_path=list(template.validation_path),
+    )
 
 
 def select_workflow_templates_for_backend_context(

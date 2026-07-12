@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 QUALITY_MARKERS_SCHEMA = "keystone.langgraph.quality_markers.v1"
@@ -12,6 +12,8 @@ QUALITY_COMPARISON_SCHEMA = "keystone.langgraph.quality_comparison.v1"
 LIVE_OUTPUT_REVIEW_RUBRIC_SCHEMA = "keystone.langgraph.live_output_review_rubric.v1"
 LIVE_OPEN_SMOKE_CHECKPOINT_SCHEMA = "keystone.langgraph.live_open_smoke_checkpoint.v1"
 LIVE_OUTPUT_REVIEW_DECISION_SCHEMA = "keystone.langgraph.live_output_review_decision.v1"
+USER_FACING_OUTPUT_SCORECARD_SCHEMA = "keystone.langgraph.user_facing_output_scorecard.v1"
+USER_FACING_OUTPUT_COMPARISON_SCHEMA = "keystone.langgraph.user_facing_output_comparison.v1"
 LIVE_SMOKE_PLAN_SCHEMA = "keystone.langgraph.live_smoke_plan.v1"
 LLM_REASONING_TOUCHPOINTS_SCHEMA = "keystone.langgraph.llm_reasoning_touchpoints.v1"
 APPROVED_MAX_LIVE_SDK_CALLS = 5
@@ -91,6 +93,36 @@ LIVE_OUTPUT_REVIEW_RUBRIC = [
         ),
     },
 ]
+
+_USER_FACING_REQUIRED_HEADINGS = (
+    "recommendation",
+    "strongest evidence",
+    "main uncertainty",
+    "next step",
+    "draft for review",
+)
+_USER_FACING_BACKEND_TERMS = (
+    "workitem",
+    "artifact_id",
+    "node_path",
+    "completed_routes",
+    "manager_loop",
+    "gmail-thread:",
+    "gmail:selected",
+    "fixture:",
+)
+_ACTION_VERBS = (
+    "review",
+    "ask",
+    "send",
+    "confirm",
+    "prepare",
+    "schedule",
+    "compare",
+    "decide",
+    "hold",
+    "proceed",
+)
 
 _CONTEXT_PROVIDERS = {
     "rss_context_agent",
@@ -573,6 +605,132 @@ def render_langgraph_edge_program_inventory(inventory: dict[str, Any] | None = N
     return "\n".join(lines)
 
 
+def user_facing_output_quality_scorecard(
+    summary: str,
+    *,
+    expected_target_terms: Iterable[str] = (),
+    openai_requests: int = 0,
+    total_tokens: int = 0,
+    max_openai_requests: int = 1,
+    max_total_tokens: int = 50000,
+    side_effects: Mapping[str, bool] | None = None,
+) -> dict[str, Any]:
+    """Score visible operator output with bounded deterministic signals."""
+
+    text = str(summary or "").strip()
+    lowered = text.lower()
+    heading_counts = {
+        heading: len(re.findall(rf"(?im)^\*{re.escape(heading)}:\*", text))
+        for heading in _USER_FACING_REQUIRED_HEADINGS
+    }
+    present_headings = sum(count > 0 for count in heading_counts.values())
+    completeness = 2 if present_headings == len(heading_counts) else 1 if present_headings >= 3 else 0
+    evidence_section = _visible_section(text, "strongest evidence")
+    evidence_bullets = len(re.findall(r"(?m)^-\s+\S", evidence_section))
+    evidence_use = 2 if evidence_bullets >= 2 else 1 if evidence_section.strip() else 0
+    target_terms = [str(term).strip().lower() for term in expected_target_terms if str(term).strip()]
+    matched_terms = [term for term in target_terms if term in lowered]
+    relevance = 2 if target_terms and len(matched_terms) == len(target_terms) else 1 if matched_terms else 0
+    paragraphs = [" ".join(part.lower().split()) for part in re.split(r"\n\s*\n", text) if part.strip()]
+    duplicate_paragraphs = len(paragraphs) - len(set(paragraphs))
+    duplication = (
+        2
+        if duplicate_paragraphs == 0 and all(count <= 1 for count in heading_counts.values())
+        else 1
+        if duplicate_paragraphs <= 1
+        else 0
+    )
+    next_step = _visible_section(text, "next step")
+    actionability = (
+        2
+        if next_step and any(re.search(rf"\b{verb}\b", next_step, flags=re.I) for verb in _ACTION_VERBS)
+        else 1
+        if next_step
+        else 0
+    )
+    backend_terms = [term for term in _USER_FACING_BACKEND_TERMS if term in lowered]
+    slack_readability = (
+        2
+        if text and len(text) <= 3000 and present_headings >= 3 and not backend_terms
+        else 1
+        if text and len(text) <= 5000
+        else 0
+    )
+    efficiency = (
+        2
+        if openai_requests <= max_openai_requests and total_tokens <= max_total_tokens
+        else 1
+        if openai_requests <= max_openai_requests + 1
+        else 0
+    )
+    side_effect_flags = dict(side_effects or {})
+    side_effect_names = [name for name, occurred in side_effect_flags.items() if occurred]
+    side_effect_score = 2 if not side_effect_names else 0
+    dimensions = {
+        "answer_completeness": completeness,
+        "evidence_use": evidence_use,
+        "relevance": relevance,
+        "duplication_control": duplication,
+        "actionable_next_step": actionability,
+        "slack_readability": slack_readability,
+        "request_token_efficiency": efficiency,
+        "side_effect_safety": side_effect_score,
+    }
+    return {
+        "schema": USER_FACING_OUTPUT_SCORECARD_SCHEMA,
+        "dimensions": dimensions,
+        "total_score": sum(dimensions.values()),
+        "max_score": 16,
+        "passed": sum(dimensions.values()) >= 14 and all(score > 0 for score in dimensions.values()),
+        "diagnostics": {
+            "present_headings": present_headings,
+            "matched_target_terms": matched_terms,
+            "duplicate_paragraph_count": duplicate_paragraphs,
+            "backend_terms": backend_terms,
+            "side_effects": side_effect_names,
+            "openai_requests": int(openai_requests),
+            "total_tokens": int(total_tokens),
+        },
+    }
+
+
+def compare_user_facing_output_quality(
+    control: dict[str, Any],
+    graph: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare matched visible-output scorecards without changing safety authority."""
+
+    control_dimensions = dict(control.get("dimensions") or {})
+    graph_dimensions = dict(graph.get("dimensions") or {})
+    dimension_deltas = {
+        name: int(graph_dimensions.get(name) or 0) - int(control_dimensions.get(name) or 0)
+        for name in sorted(set(control_dimensions) | set(graph_dimensions))
+    }
+    return {
+        "schema": USER_FACING_OUTPUT_COMPARISON_SCHEMA,
+        "control_score": int(control.get("total_score") or 0),
+        "graph_score": int(graph.get("total_score") or 0),
+        "score_delta": int(graph.get("total_score") or 0) - int(control.get("total_score") or 0),
+        "dimension_deltas": dimension_deltas,
+        "graph_quality_improved": bool(
+            int(graph.get("total_score") or 0) > int(control.get("total_score") or 0)
+            and graph.get("passed") is True
+            and int(graph_dimensions.get("side_effect_safety") or 0) == 2
+            and int(graph_dimensions.get("request_token_efficiency") or 0)
+            >= int(control_dimensions.get("request_token_efficiency") or 0)
+        ),
+    }
+
+
+def _visible_section(text: str, heading: str) -> str:
+    match = re.search(
+        rf"(?ims)^\*{re.escape(heading)}:\*\s*(?P<body>.*?)"
+        r"(?=^\*[^\n]+:\*|\Z)",
+        str(text or ""),
+    )
+    return match.group("body").strip() if match is not None else ""
+
+
 def langgraph_quality_markers(result: Any, events: Iterable[Any]) -> dict[str, Any]:
     """Summarize deterministic output-quality markers for one WorkItem run.
 
@@ -754,18 +912,19 @@ def langgraph_live_output_review_packet(
     request_text: str,
     control_output: dict[str, Any],
     graph_output: dict[str, Any],
+    quality_target_terms: Iterable[str] = (),
     all_scenarios_ready: bool | None = None,
     all_scenarios_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the review packet for judging visible live output quality.
 
-    This packet is intentionally not an automated score. The graph can prove
-    route and safety fidelity offline, but usefulness, relevance, and judgment
-    quality must be reviewed against the final Slack/API output a user sees.
+    The packet includes a bounded deterministic visible-output scorecard when
+    complete forced-mode evidence is attached. Human usefulness and judgment
+    review remains authoritative.
     """
 
     rubric = langgraph_live_output_review_rubric()
-    return {
+    packet = {
         "schema": "keystone.langgraph.live_output_review_packet.v1",
         "request_text": request_text,
         "rubric": rubric,
@@ -774,6 +933,9 @@ def langgraph_live_output_review_packet(
         "all_scenarios_summary": dict(all_scenarios_summary or {}),
         "control_output": control_output,
         "graph_output": graph_output,
+        "quality_target_terms": [
+            str(term).strip() for term in quality_target_terms if str(term).strip()
+        ],
         "mode_evidence": [
             _live_output_mode_evidence_template(
                 mode="open_default_backend_selected",
@@ -813,17 +975,76 @@ def langgraph_live_output_review_packet(
             for item in rubric["criteria"]
         ],
         "decision": "unreviewed",
+        "user_facing_output_quality": {
+            "status": "pending_live_mode_evidence",
+            "control": {},
+            "graph": {},
+            "comparison": {},
+        },
         "note": (
             "Use this packet after the live Slack/API run output is available. "
             "The graph should be considered better only if it improves the "
             "minimum criteria without safety or permission regressions."
         ),
     }
+    return packet
+
+
+def langgraph_live_user_facing_output_quality(packet: dict[str, Any]) -> dict[str, Any]:
+    """Score complete forced-mode visible output without replacing human review."""
+
+    control = _mode_evidence(packet, "forced_langgraph_false_control")
+    graph = _mode_evidence(packet, "forced_langgraph_true")
+    missing: list[str] = []
+    for label, evidence in (("control", control), ("graph", graph)):
+        if not str(evidence.get("visible_output") or "").strip():
+            missing.append(f"{label}.visible_output")
+        if evidence.get("side_effects_reviewed") is not True:
+            missing.append(f"{label}.side_effects_reviewed")
+        if not _workflow_sdk_usage_events(evidence):
+            missing.append(f"{label}.workflow_sdk_usage_event")
+    if missing:
+        return {
+            "status": "pending_live_mode_evidence",
+            "missing": missing,
+            "control": {},
+            "graph": {},
+            "comparison": {},
+        }
+    control_requests, control_tokens = _workflow_sdk_usage_totals(control)
+    graph_requests, graph_tokens = _workflow_sdk_usage_totals(graph)
+    target_terms = _string_list(packet.get("quality_target_terms"))
+    control_score = user_facing_output_quality_scorecard(
+        str(control.get("visible_output") or ""),
+        expected_target_terms=target_terms,
+        openai_requests=control_requests,
+        total_tokens=control_tokens,
+        max_openai_requests=max(1, control_requests),
+        max_total_tokens=max(1, control_tokens),
+        side_effects=_boolean_mapping(control.get("side_effects")),
+    )
+    graph_score = user_facing_output_quality_scorecard(
+        str(graph.get("visible_output") or ""),
+        expected_target_terms=target_terms,
+        openai_requests=graph_requests,
+        total_tokens=graph_tokens,
+        max_openai_requests=max(1, control_requests),
+        max_total_tokens=max(1, control_tokens),
+        side_effects=_boolean_mapping(graph.get("side_effects")),
+    )
+    return {
+        "status": "scored",
+        "missing": [],
+        "control": control_score,
+        "graph": graph_score,
+        "comparison": compare_user_facing_output_quality(control_score, graph_score),
+    }
 
 
 def finalize_langgraph_live_output_review(packet: dict[str, Any]) -> dict[str, Any]:
     """Return a deterministic decision from a completed live output review packet."""
 
+    automated_output_quality = langgraph_live_user_facing_output_quality(packet)
     minimum = set(_string_list(packet.get("minimum_better_than_control")))
     review_questions = packet.get("review_questions")
     if not isinstance(review_questions, list):
@@ -917,6 +1138,7 @@ def finalize_langgraph_live_output_review(packet: dict[str, Any]) -> dict[str, A
         "graph_meets_minimum": graph_meets_minimum,
         "efficiency_winner": efficiency_winner,
         "safety_winner": safety_winner,
+        "user_facing_output_quality": automated_output_quality,
         "note": (
             "graph_better requires graph to win every minimum criterion and avoid "
             "an efficiency loss; otherwise the architecture is not yet proven "
@@ -1320,6 +1542,24 @@ def render_langgraph_live_output_review_decision(decision: dict[str, Any]) -> st
         f"- Efficiency winner: {str(decision.get('efficiency_winner') or 'unreviewed')}",
         f"- Safety winner: {str(decision.get('safety_winner') or 'unreviewed')}",
     ]
+    automated = decision.get("user_facing_output_quality")
+    if isinstance(automated, dict):
+        comparison = automated.get("comparison")
+        if not isinstance(comparison, dict):
+            comparison = {}
+        lines.extend(
+            [
+                "- Automated visible-output score: "
+                f"{str(automated.get('status') or 'pending_live_mode_evidence')}",
+                "- Automated control/graph score: "
+                f"{int(comparison.get('control_score') or 0)}/"
+                f"{int(comparison.get('graph_score') or 0)}",
+                "- Automated graph score delta: "
+                f"{int(comparison.get('score_delta') or 0):+d}",
+                "- Automated graph quality improved: "
+                f"{_yes_no(comparison.get('graph_quality_improved'))}",
+            ]
+        )
     blockers = _string_list(decision.get("blockers"))
     if blockers:
         lines.append(f"- Blockers: {', '.join(blockers)}")
@@ -1567,6 +1807,37 @@ def _workflow_sdk_usage_events(item: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(usage_event, dict) and usage_event:
         return [usage_event]
     return []
+
+
+def _workflow_sdk_usage_totals(item: dict[str, Any]) -> tuple[int, int]:
+    requests = 0
+    total_tokens = 0
+    for event in _workflow_sdk_usage_events(item):
+        usage = event.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        try:
+            requests += int(usage.get("requests") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            event_total = int(usage.get("total_tokens") or 0)
+        except (TypeError, ValueError):
+            event_total = 0
+        if event_total <= 0:
+            for key in ("input_tokens", "output_tokens"):
+                try:
+                    event_total += int(usage.get(key) or 0)
+                except (TypeError, ValueError):
+                    continue
+        total_tokens += event_total
+    return requests, total_tokens
+
+
+def _boolean_mapping(value: Any) -> dict[str, bool]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(key): bool(item) for key, item in value.items()}
 
 
 def _mode_evidence(

@@ -3,16 +3,53 @@
 from __future__ import annotations
 
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 from typing import Any
 
+from keystone_agents.privacy_minimized_synthesis import (
+    PrivacyMinimizedAssertion,
+    PrivacyMinimizedSynthesisPacket,
+    build_concept_signal_packet,
+    validate_privacy_minimized_packet,
+)
 from keystone_agents.schemas.weekly_ops import WeeklyOpsAssemblyInput
 
 PACKET_FOLDER_NAME = "KNIOps"
 PACKET_TITLE_PREFIX = "KNI Weekly Operations Packet"
 _EXTERNAL_FACT_FIELDS = frozenset(
     {"summary", "next_action", "carry_forward", "relevance", "usage"}
+)
+_WEEKLY_OPS_TAXONOMY = {
+    "completed_operation": ("completed", "finished", "passed"),
+    "follow_up_required": ("follow-up", "follow up", "needs reply", "response needed"),
+    "approval_state": ("approved", "approval", "review required"),
+    "decision_or_action": ("decision", "next action", "owner", "carry forward"),
+    "calendar_focus": ("calendar", "meeting", "review", "sync"),
+    "recurring_cadence": ("weekly", "recurring", "cadence"),
+    "blocker_or_failure": ("blocked", "failed", "failure", "missing", "incomplete"),
+    "usage_evidence": ("usage", "cost", "request", "receipt"),
+    "safety_boundary": ("no-send", "no send", "draft-only", "without a draft"),
+}
+_WORKSTREAM_TERMS = (
+    ("calendar_operations", ("calendar", "meeting", "event", "schedule", "deadline")),
+    ("gmail_operations", ("gmail", "email", "inbox", "reply", "draft")),
+    ("finance_operations", ("finance", "expense", "income", "tax", "budget")),
+    ("workspace_operations", ("drive", "document", "doc", "sheet", "folder")),
+    ("research_operations", ("research", "source", "evidence", "company", "article")),
+    ("outreach_operations", ("outreach", "contact", "relationship")),
+    ("agent_validation", ("agent", "validation", "test", "smoke", "workflow")),
+)
+_OWNER_ROLE_TERMS = (
+    ("chief_of_staff", ("chief", "chief_of_staff")),
+    ("business_research", ("business_research", "research analyst")),
+    ("opportunity_scout", ("opportunity", "scout")),
+    ("outreach_composer", ("outreach", "composer")),
+    ("gmail_triage", ("gmail", "triage")),
+    ("workspace_agent", ("workspace", "drive")),
+    ("airtable_agent", ("airtable",)),
+    ("zotero_agent", ("zotero",)),
+    ("operator", ("operator", "anup")),
 )
 
 
@@ -232,6 +269,136 @@ def build_weekly_ops_external_synthesis_bundle(
         "terminal_section_contract": local_bundle["terminal_section_contract"],
         "synthesis_ready": all(source["key_facts"] for source in sources[:4]),
     }
+
+
+def build_weekly_ops_privacy_minimized_packet(
+    payload: WeeklyOpsAssemblyInput,
+) -> PrivacyMinimizedSynthesisPacket:
+    """Derive non-identifying weekly concept signals while keeping prose local."""
+
+    local_bundle = build_weekly_ops_source_bundle(payload)
+    sources: dict[str, str] = {}
+    for source_index, source in enumerate(local_bundle["sources"]):
+        for fact_index, fact in enumerate(source["key_facts"]):
+            sources[f"source_{source_index}_fact_{fact_index}"] = " ".join(
+                str(value or "")
+                for value in fact.values()
+                if str(value or "").strip()
+            )
+    for signal_index, signal in enumerate(local_bundle["operational_health_signals"]):
+        sources[f"health_signal_{signal_index}"] = " ".join(
+            str(value or "")
+            for value in signal.values()
+            if str(value or "").strip()
+        )
+    minimized = build_concept_signal_packet(
+        workflow="weekly_ops_packet",
+        sources=sources,
+        taxonomy=_WEEKLY_OPS_TAXONOMY,
+        constraints=(
+            "abstracted_evidence_only",
+            "required_sections",
+            "review_only",
+            "no_external_action",
+            "human_review_required",
+        ),
+    )
+    source_hash_by_ref = dict(zip(sources, minimized.source_hashes, strict=True))
+    assertions = _weekly_assertion_layer(
+        local_bundle,
+        source_hash_by_ref=source_hash_by_ref,
+    )
+    return validate_privacy_minimized_packet(
+        minimized.model_copy(update={"assertions": assertions}),
+        forbidden_raw_values=tuple(sources) + tuple(sources.values()),
+    )
+
+
+def _weekly_assertion_layer(
+    local_bundle: dict[str, Any],
+    *,
+    source_hash_by_ref: dict[str, str],
+) -> tuple[PrivacyMinimizedAssertion, ...]:
+    counts: Counter[tuple[str, str, str]] = Counter()
+    hashes: defaultdict[tuple[str, str, str], set[str]] = defaultdict(set)
+    for source_index, source in enumerate(local_bundle["sources"]):
+        subject = _source_family(str(source.get("source_type") or ""))
+        for fact_index, fact in enumerate(source.get("key_facts") or []):
+            source_hash = source_hash_by_ref[f"source_{source_index}_fact_{fact_index}"]
+            text = " ".join(str(value or "") for value in fact.values()).casefold()
+            relationships = {
+                (subject, "workstream", _classify_workstream(text)),
+                (subject, "status", _classify_status(text)),
+                (subject, "action_state", _classify_action_state(fact, text)),
+            }
+            owner_role = _classify_owner_role(str(fact.get("owner") or ""))
+            if owner_role:
+                relationships.add((subject, "owner_role", owner_role))
+            for relationship in relationships:
+                counts[relationship] += 1
+                hashes[relationship].add(source_hash)
+    return tuple(
+        PrivacyMinimizedAssertion(
+            subject=subject,
+            predicate=predicate,
+            object=object_value,
+            count=count,
+            source_hashes=tuple(sorted(hashes[(subject, predicate, object_value)])),
+        )
+        for (subject, predicate, object_value), count in sorted(counts.items())
+    )
+
+
+def _source_family(source_type: str) -> str:
+    lowered = source_type.casefold()
+    if "slack" in lowered:
+        return "slack_workstream"
+    if "gmail" in lowered:
+        return "gmail_follow_up"
+    if "completed" in lowered or "agent_run" in lowered:
+        return "completed_run"
+    if "non_recurring" in lowered:
+        return "one_time_calendar"
+    if "recurring" in lowered:
+        return "recurring_calendar"
+    return "weekly_context"
+
+
+def _classify_workstream(text: str) -> str:
+    for label, terms in _WORKSTREAM_TERMS:
+        if any(term in text for term in terms):
+            return label
+    return "general_operations"
+
+
+def _classify_status(text: str) -> str:
+    if any(term in text for term in ("blocked", "failed", "missing", "incomplete")):
+        return "blocked_or_partial"
+    if any(term in text for term in ("completed", "finished", "passed", "done")):
+        return "completed"
+    if any(term in text for term in ("pending", "waiting", "review", "follow-up")):
+        return "pending_review"
+    return "observed"
+
+
+def _classify_action_state(fact: dict[str, Any], text: str) -> str:
+    if fact.get("next_action") or fact.get("carry_forward"):
+        return "follow_up_required"
+    if any(term in text for term in ("follow-up", "follow up", "needs reply")):
+        return "follow_up_required"
+    if any(term in text for term in ("approved", "approval", "review required")):
+        return "approval_or_review"
+    return "no_action_recorded"
+
+
+def _classify_owner_role(owner: str) -> str:
+    lowered = owner.casefold().strip()
+    if not lowered:
+        return ""
+    for label, terms in _OWNER_ROLE_TERMS:
+        if any(term in lowered for term in terms):
+            return label
+    return "assigned_other"
 
 
 def _sanitize_external_text(value: Any, redaction_terms: Sequence[str]) -> str:

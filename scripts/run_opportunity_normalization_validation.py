@@ -21,7 +21,7 @@ from keystone_agents.schemas.opportunity import OpportunityScoutResult
 
 EXPECTED_MODEL = "gpt-5.4-mini"
 EXPECTED_REQUESTS = 1
-MAX_BUDGET_USD = 0.05
+MAX_BUDGET_USD = 0.10
 SOURCE_PACKET = Path(
     "artifacts/test-pack/opportunity-hack-for-humanity-source-packet.json"
 )
@@ -37,6 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-openai-requests", type=int, default=EXPECTED_REQUESTS)
     parser.add_argument("--budget-usd", type=float, default=MAX_BUDGET_USD)
     parser.add_argument("--source-packet", type=Path, default=SOURCE_PACKET)
+    parser.add_argument(
+        "--operator-request",
+        default="",
+        help=(
+            "Optional exact natural ask to bind to the supplied packet. The packet's "
+            "stored request remains the default."
+        ),
+    )
     parser.add_argument(
         "--revalidate-receipt",
         type=Path,
@@ -56,7 +64,7 @@ def _validate_run_limits(args: argparse.Namespace) -> None:
     if args.max_openai_requests != EXPECTED_REQUESTS:
         raise SystemExit("Opportunity validation requires max_openai_requests=1.")
     if args.budget_usd <= 0 or args.budget_usd > MAX_BUDGET_USD:
-        raise SystemExit("Opportunity validation requires a budget at or below $0.05.")
+        raise SystemExit("Opportunity validation requires a budget at or below $0.10.")
 
 
 def _configure_bounded_environment(args: argparse.Namespace) -> None:
@@ -75,7 +83,9 @@ def _load_packet(path: Path) -> dict[str, Any]:
     return packet
 
 
-def _typed_input(packet: dict[str, Any]) -> OpportunityScoutSDKInput:
+def _typed_input(
+    packet: dict[str, Any], *, operator_request: str | None = None
+) -> OpportunityScoutSDKInput:
     instructions = {
         "execution_contract": {
             "attach_tools": False,
@@ -93,7 +103,7 @@ def _typed_input(packet: dict[str, Any]) -> OpportunityScoutSDKInput:
         "source_packet": packet,
     }
     return OpportunityScoutSDKInput(
-        topic=str(packet["operator_request"]),
+        topic=str(operator_request or packet["operator_request"]),
         max_results=1,
         context=(
             "Use only this verified supplied-source packet. Treat the two URLs as two pages "
@@ -175,6 +185,7 @@ def _build_payload(
     combined_text = " ".join(
         [
             record.why_now_signal if record else "",
+            (record.novelty or "") if record else "",
             record.recommended_next_step if record else "",
             record.keystone_fit_reason if record else "",
             *(record.missing_evidence if record else []),
@@ -296,6 +307,9 @@ def main() -> int:
         return 0 if payload["status"] == "pass" else 2
     load_settings(force_dotenv=True)
     packet = _load_packet(args.source_packet)
+    operator_request = str(args.operator_request or packet["operator_request"]).strip()
+    if not operator_request:
+        raise SystemExit("Opportunity validation requires a non-empty operator request.")
     execution_identity = create_validation_execution_identity(
         scenario="opportunity_same_packet_top_level_normalization",
         route="opportunity_scout",
@@ -303,10 +317,10 @@ def main() -> int:
     result = run_typed_sdk_agent(
         agent=build_opportunity_scout_agent(
             model=args.model,
-            request_text=str(packet["operator_request"]),
+            request_text=operator_request,
             attach_tools=False,
         ),
-        typed_input=_typed_input(packet),
+        typed_input=_typed_input(packet, operator_request=operator_request),
         output_type=OpportunityScoutResult,
         live=True,
         workflow_name="Keystone Opportunity supplied-packet normalization validation",

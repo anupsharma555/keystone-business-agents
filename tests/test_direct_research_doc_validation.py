@@ -184,3 +184,37 @@ def test_direct_research_stops_before_doc_when_source_is_not_preserved(tmp_path:
     assert result["status"] == "partial"
     assert result["doc"]["executed"] is False
     assert doc_called is False
+
+
+def test_direct_research_plan_only_returns_exact_no_write_plan(tmp_path: Path) -> None:
+    doc_called = False
+
+    def fake_doc(*_args, **_kwargs):
+        nonlocal doc_called
+        doc_called = True
+        return {}
+
+    result = execute_validation(
+        company="NeuroFlow",
+        company_url="https://www.neuroflow.com/",
+        model="gpt-5.4-mini",
+        budget_usd=0.05,
+        folder_path="KNIOps",
+        research_output=tmp_path / "research.json",
+        extractor=lambda *_args, **_kwargs: _extraction(),
+        model_runner=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=_brief(),
+            usage={"requests": 1},
+            cost={"estimated_usd": 0.02},
+            request_cache={"rate_limit_retries": 0},
+        ),
+        doc_runner=fake_doc,
+        plan_only=True,
+    )
+
+    assert result["status"] == "pass"
+    assert result["doc"]["executed"] is False
+    assert result["doc"]["plan_status"] == "reviewed_no_write"
+    assert result["doc"]["approval_required_before_create"] is True
+    assert result["safety"]["provider_writes"] == 0
+    assert doc_called is False

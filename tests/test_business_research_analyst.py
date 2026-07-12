@@ -660,6 +660,26 @@ def test_company_research_queries_cover_mira_style_sources() -> None:
     assert "differentiator unique approach" in query_text
 
 
+def test_company_research_queries_prioritize_requested_official_source_lanes() -> None:
+    queries = build_company_research_queries(
+        "Curebase",
+        "https://www.curebase.com",
+        request_text=(
+            "Review Curebase clinical trials, peer-reviewed studies, leadership, and hiring."
+        ),
+    )
+
+    assert queries[4:11] == [
+        "Curebase official careers jobs",
+        "site:boards.greenhouse.io Curebase",
+        "site:jobs.lever.co Curebase",
+        "site:jobs.ashbyhq.com Curebase",
+        "site:clinicaltrials.gov Curebase study sponsor recruiting",
+        "site:pubmed.ncbi.nlm.nih.gov Curebase study outcomes validation",
+        "Curebase official leadership founders executives team",
+    ]
+
+
 def test_business_research_analyst_consumes_mocked_search_results_and_preserves_sources() -> None:
     results = [
         SearchResult(

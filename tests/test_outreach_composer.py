@@ -7,6 +7,7 @@ from keystone_agents.agents.outreach_composer import (
     build_approved_outreach_drafting_context,
     build_follow_up_schedule_record,
     build_outreach_composer_agent,
+    build_outreach_composer_compact_synthesis_agent,
     build_outreach_draft_variant_set,
     check_unsupported_claims,
     compose_outreach_draft_fixture,
@@ -124,6 +125,22 @@ def test_build_outreach_composer_agent() -> None:
         "build_follow_up_schedule_record",
         "create_approval_request_placeholder",
     } <= tool_names
+
+
+def test_compact_synthesis_agent_omits_unused_tool_contract_prompt() -> None:
+    agent = build_outreach_composer_compact_synthesis_agent(
+        request_text="Review a closed Gmail thread and recommend the next step."
+    )
+
+    assert agent.tools == []
+    assert "Shared Web Search Contract" not in str(agent.instructions)
+    assert "Compact synthesis mode" in str(agent.instructions)
+    assert "<!-- outreach_composer_specialist_contracts/SKILL.md -->" in str(
+        agent.instructions
+    )
+    assert "<!-- action_boundary_enforcement/SKILL.md -->" in str(agent.instructions)
+    assert "<!-- tool_result_resilience/SKILL.md -->" not in str(agent.instructions)
+    assert "<!-- workflow_lifecycle_tracking/SKILL.md -->" not in str(agent.instructions)
 
 
 def test_build_outreach_composer_agent_supports_synthesis_only_mode() -> None:

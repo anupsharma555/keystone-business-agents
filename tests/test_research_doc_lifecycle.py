@@ -208,5 +208,6 @@ def test_research_doc_content_supports_general_source_backed_brief() -> None:
     )
 
     assert content["title"].startswith("KBA_TEST_DOC_abc_")
+    assert "concise research brief" in content["original_body"]
     assert "## Executive summary" in content["original_body"]
     assert "## Sources" in content["original_body"]

@@ -41,7 +41,9 @@ Optional integrations must not be required for tests. They should be introduced 
 - Firecrawl: optional LLM-ready search and website extraction provider through
   `SearchProvider` and the website extraction tool. It requires `FIRECRAWL_API_KEY`
   for live use.
-- Crawl4AI: optional future extraction provider. It is not implemented today.
+- Crawl4AI: optional local selected-page extraction provider and comparison lane.
+  It is implemented behind the optional dependency and explicit live extraction gate,
+  but remains non-default until repeatable extraction evals show a quality gain.
 - Browserless cloud features: Smart Scrape, Search, Map, and Crawl are future-consideration
   candidates only. They are not implemented, not wired into any current agent, and not available
   to agent tools today. If added later, treat them as provider implementations only, not as
@@ -98,9 +100,9 @@ KEYSTONE_TAVILY_MONTHLY_CREDIT_LIMIT=1000
 KEYSTONE_TAVILY_MONTHLY_SOFT_LIMIT=850
 KEYSTONE_TAVILY_CREDIT_ENFORCEMENT=warn
 KEYSTONE_TAVILY_USAGE_PATH=
-KEYSTONE_TAVILY_SEARCH_FALLBACK=false
+KEYSTONE_TAVILY_SEARCH_FALLBACK=true
 KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN=2
-KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT=1000
+KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT=20000
 KEYSTONE_EXA_SEARCH_FALLBACK=true
 KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2
 KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK=true

@@ -58,6 +58,7 @@ from keystone_agents.source_enrichment import (
     normalize_source_record,
 )
 from keystone_agents.source_layer_context import append_runtime_source_layer_policy_text
+from keystone_agents.source_registry import required_source_lanes_for_company
 from keystone_agents.tools.apify_tool import fetch_linkedin_or_profile_placeholder
 from keystone_agents.tools.browser_diagnostics_tool import (
     capture_browser_diagnostics,
@@ -150,12 +151,43 @@ def _refresh_research_data_points(profile: CompanyProfile) -> list[ResearchDataP
     return merged
 
 
-def build_company_research_queries(company: str, company_url: str | None = None) -> list[str]:
-    """Build targeted Serper queries for source-attributed company research."""
+def build_company_research_queries(
+    company: str,
+    company_url: str | None = None,
+    *,
+    request_text: str = "",
+) -> list[str]:
+    """Build prioritized, source-lane-aware queries for company research."""
 
     normalized_company = company.strip()
     company_domain = _company_domain_for_search(company_url)
+    required_lanes = required_source_lanes_for_company(
+        company_url=company_url,
+        request_text=request_text,
+    )
+    lane_queries: list[str] = []
+    if "careers_jobs" in required_lanes:
+        lane_queries.extend(
+            [
+                f"{normalized_company} official careers jobs",
+                f"site:boards.greenhouse.io {normalized_company}",
+                f"site:jobs.lever.co {normalized_company}",
+                f"site:jobs.ashbyhq.com {normalized_company}",
+            ]
+        )
+    if "clinical_trials" in required_lanes:
+        lane_queries.append(
+            f"site:clinicaltrials.gov {normalized_company} study sponsor recruiting"
+        )
+    if "literature" in required_lanes:
+        lane_queries.append(
+            f"site:pubmed.ncbi.nlm.nih.gov {normalized_company} study outcomes validation"
+        )
+    if "people_institutions" in required_lanes:
+        lane_queries.append(f"{normalized_company} official leadership founders executives team")
+
     queries = [
+        *lane_queries,
         f"{normalized_company} official website",
         f"{normalized_company} about product platform",
         f"{normalized_company} LinkedIn company profile",

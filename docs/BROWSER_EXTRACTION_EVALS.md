@@ -40,7 +40,9 @@ Current eval provider boundaries:
 - `firecrawl`: optional Firecrawl scrape path when configured.
 - `browserless`: current placeholder boundary; live rendering is not implemented.
 - `apify`: not a general rendered-page provider in this repo; exposed as unsupported here.
-- `playwright` and `crawl4ai`: future provider placeholders.
+- `crawl4ai`: optional local/open-source extraction adapter; non-default while
+  repeatable quality evidence is pending.
+- `playwright`: read-only rendered diagnostics, not routine extraction.
 
 ## Dataset
 
@@ -74,7 +76,7 @@ network or browser execution:
 
 ```bash
 .venv/bin/python scripts/run_browser_extraction_eval.py \
-  --provider browserless \
+  --provider crawl4ai \
   --cases evals/provider/browser_extraction_cases.jsonl \
   --output artifacts/browser_extraction_evals \
   --json
@@ -85,7 +87,7 @@ Compare current configured providers:
 ```bash
 .venv/bin/python scripts/run_browser_extraction_eval.py \
   --provider firecrawl \
-  --provider browserless \
+  --provider crawl4ai \
   --cases evals/provider/browser_extraction_cases.jsonl \
   --output artifacts/browser_extraction_evals/current-providers \
   --live --no-dry-run \
@@ -117,8 +119,8 @@ Reports also include provider diagnostic specs: intended role, budget class,
 promotion status, readiness, default use, live requirement, benchmark focus,
 next validation, and promotion rule. Treat `trafilatura` as the static
 extraction baseline, Firecrawl as an explicit managed scrape fallback,
-Playwright as read-only diagnostics, and Browserless/Apify/Crawl4AI as eval or
-future boundaries until reviewed live adapters and attribution tests exist.
+Playwright as read-only diagnostics, Crawl4AI as an experimental local eval lane,
+and Browserless/Apify as future boundaries until reviewed live adapters exist.
 
 ## Extraction Readiness Matrix
 
@@ -132,7 +134,7 @@ This is the selected-page counterpart to the search-provider matrix in
 | Playwright diagnostics | Local rendered-page diagnostics | Ready for explicit read-only diagnostics, not routine extraction | Does not become a production extractor just because search review is requested | Console/page-error/request-failure diagnosis for selected URLs | Use only after static extraction is weak or rendered diagnostics are requested |
 | Browserless | Rendered-browser boundary | Placeholder/eval boundary | Live production adapter and safety constraints are not implemented | JS-heavy selected pages after adapter review | Keep out of production until adapter, safety constraints, and attribution tests exist |
 | Apify | Actor-based future extraction boundary | Not implemented | No reviewed adapter | Not applicable yet | Add adapter/tests before any provider comparison |
-| Crawl4AI | Local/open-source future extraction boundary | Not implemented | No reviewed adapter or repeatable quality evidence | Local extraction lift over Trafilatura after adapter review | Prototype behind eval boundary before runtime promotion |
+| Crawl4AI | Local/open-source selected-page extractor | Optional adapter implemented | Repeatable quality and latency evidence is still missing | Local extraction lift over Trafilatura on JS-heavy pages | Compare against Trafilatura before runtime promotion |
 
 Promotion criteria should stay conservative:
 

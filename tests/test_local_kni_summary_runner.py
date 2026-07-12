@@ -5,7 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from keystone_agents.local_kni_summary_runner import run_local_kni_capability_summary
+from keystone_agents.local_kni_summary_runner import (
+    local_kni_summary_privacy_preview,
+    run_local_kni_capability_summary,
+)
+from keystone_agents.privacy_minimized_synthesis import (
+    build_concept_signal_packet,
+    sanitized_source_id,
+)
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult, ChiefOfStaffSourceRef
 from keystone_agents.sdk import active_sdk_data_handling_profile
 
@@ -33,7 +40,16 @@ def _packet() -> dict[str, object]:
 
 
 def _result(*, retries: int = 0, include_source: bool = True):
-    source = "07_Marketing/Capability_Statement.md"
+    packet = build_concept_signal_packet(
+        workflow="capability_summary",
+        sources={
+            str(item["relative_path"]): str(item["content_excerpt"])
+            for item in _packet()["candidate_documents"]
+        },
+        taxonomy={"clinical_ai_evaluation": ("clinical ai evaluation",)},
+        constraints=("human_review_required",),
+    )
+    source = sanitized_source_id(packet.source_hashes[0])
     output = ChiefOfStaffResult(
         mode="llm",
         summary=(
@@ -43,7 +59,6 @@ def _result(*, retries: int = 0, include_source: bool = True):
         sources=[ChiefOfStaffSourceRef(title=source, source_type="local_kni_document")]
         if include_source
         else [],
-        retrieval_diagnostics={"local_only": True, "send_enabled": False},
     )
     return SimpleNamespace(
         output=output,
@@ -68,6 +83,36 @@ def test_offline_plan_is_sanitized_and_ready(monkeypatch) -> None:
     assert "clinical AI evaluation" not in str(result)
 
 
+def test_privacy_preview_materializes_exact_safe_model_packet(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "keystone_agents.local_kni_summary_runner.build_local_kni_evidence_packet_for_query",
+        lambda _query: _packet(),
+    )
+
+    result = local_kni_summary_privacy_preview("summarize local KNI capabilities")
+
+    assert result["status"] == "privacy_minimized_preview"
+    assert result["openai_requests_made"] == 0
+    assert result["provider_writes"] == 0
+    assert result["local_source_mapping_verified"] is True
+    assert result["bundle"]["proof_scope"] == "sanitized_context_proof"
+    assert result["bundle"]["transmission_contract"] == {
+        "raw_text": False,
+        "personal_identifiers": False,
+        "provider_identifiers": False,
+        "file_paths": False,
+        "urls": False,
+        "exact_financial_values": False,
+        "secrets": False,
+        "phi": False,
+    }
+    rendered = str(result)
+    assert "Capability_Statement" not in rendered
+    assert "Proposal.docx" not in rendered
+    assert "clinical AI evaluation" not in rendered
+    assert "client proposal" not in rendered
+
+
 def test_live_summary_uses_one_no_tool_turn_and_returns_sanitized_receipt(monkeypatch) -> None:
     monkeypatch.setattr(
         "keystone_agents.local_kni_summary_runner.build_local_kni_evidence_packet_for_query",
@@ -85,20 +130,26 @@ def test_live_summary_uses_one_no_tool_turn_and_returns_sanitized_receipt(monkey
     result = run_local_kni_capability_summary(
         "summarize local KNI capabilities",
         live_sdk=True,
-        approved_private_context=True,
+        approved_privacy_minimized_context=True,
         runner=fake_runner,
     )
 
     assert result["status"] == "success"
     assert result["usage"]["requests"] == 1
     assert result["used_source_count"] == 1
+    assert result["local_only"] is True
+    assert result["send_enabled"] is False
+    assert result["summary_storage"] == "local_artifact_only"
+    assert "clinical AI evaluation" in result["summary"]
     assert "Capability_Statement" not in str(result)
-    assert "clinical AI evaluation" not in str(result)
     assert captured["kwargs"]["attach_tools"] is False
     assert captured["kwargs"]["include_specialist_tools"] is False
     assert captured["kwargs"]["quality_budget"].max_turns == 1
     assert captured["kwargs"]["quality_budget"].max_tool_calls == 0
-    assert captured["sdk_input"]["local_kni_evidence_packet"]["candidate_documents"]
+    outbound = captured["sdk_input"]["privacy_minimized_context"]
+    assert outbound["proof_scope"] == "sanitized_context_proof"
+    assert outbound["facts"][0]["concept"] == "clinical_ai_evaluation"
+    assert "content_excerpt" not in str(outbound)
     assert captured["data_handling"] == {
         "name": "bounded_private_context",
         "response_store": False,
@@ -126,7 +177,7 @@ def test_live_summary_requires_private_context_approval(monkeypatch) -> None:
     ("result", "message"),
     [
         (_result(retries=1), "unexpected retry"),
-        (_result(include_source=False), "evidence path"),
+        (_result(include_source=False), "sanitized source ID"),
     ],
 )
 def test_live_summary_rejects_missing_evidence(monkeypatch, result, message) -> None:
@@ -139,7 +190,7 @@ def test_live_summary_rejects_missing_evidence(monkeypatch, result, message) -> 
         run_local_kni_capability_summary(
             "summarize local KNI capabilities",
             live_sdk=True,
-            approved_private_context=True,
+            approved_privacy_minimized_context=True,
             runner=lambda *_args, **_kwargs: result,
         )
 

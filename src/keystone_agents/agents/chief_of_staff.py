@@ -53,6 +53,7 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
     ChiefOfStaffSourceRef,
+    ChiefSlackCommandResolution,
 )
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.sdk import (
@@ -60,6 +61,7 @@ from keystone_agents.sdk import (
     build_model_settings,
     build_sdk_agent,
     compose_instructions,
+    load_prompt,
 )
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.specialist_agent_tools import (
@@ -83,11 +85,13 @@ from keystone_agents.tools.chief_of_staff_tool import (
     OFFICIAL_OPERATIONS_DOCS,
     _capability_for_topic,
     list_chief_of_staff_context_sources,
+    list_slack_slash_commands,
     lookup_slack_workflow_capability,
     read_slack_repo_context_file,
     search_official_operations_docs,
     search_slack_repo_context,
     summarize_slack_runtime_config,
+    validate_slack_slash_command,
 )
 from keystone_agents.tools.google_calendar_tool import (
     create_google_calendar_event,
@@ -293,10 +297,12 @@ def _chief_of_staff_tools(
 ) -> list[Any]:
     tools = [
         list_chief_of_staff_context_sources,
+        list_slack_slash_commands,
         summarize_slack_runtime_config,
         search_slack_repo_context,
         read_slack_repo_context_file,
         lookup_slack_workflow_capability,
+        validate_slack_slash_command,
         search_official_operations_docs,
         retrieve_chief_of_staff_memory,
         list_automation_specs,
@@ -347,6 +353,185 @@ def _chief_of_staff_tools(
     return append_configured_file_search_tools(
         "chief_of_staff",
         tools,
+    )
+
+
+def build_chief_slack_command_resolver_agent(
+    *, model: str | None = None
+) -> Agent:
+    """Build the compact Chief mode that only selects a native KS command."""
+
+    return build_sdk_agent(
+        name="chief_slack_command_resolver",
+        instructions=load_prompt("chief_slack_command_resolver.md").strip(),
+        output_type=ChiefSlackCommandResolution,
+        tools=[],
+        model=model or "gpt-5.4-mini",
+        model_settings=build_model_settings(
+            reasoning_effort="low",
+            verbosity="low",
+            max_tokens=300,
+        ),
+        handoff_description="Resolve one natural-language Chief ask to one native KS command.",
+    )
+
+
+def run_chief_slack_command_resolver(
+    request_text: str,
+    command_catalog: list[dict[str, str]],
+    *,
+    live: bool = False,
+    model: str | None = None,
+    run_config: Any | None = None,
+) -> TypedAgentRunResult[ChiefSlackCommandResolution]:
+    """Resolve a native Slack command with one compact model turn and no tools."""
+
+    return run_typed_sdk_agent(
+        agent=build_chief_slack_command_resolver_agent(model=model),
+        typed_input={
+            "request": " ".join(str(request_text or "").split()),
+            "configured_commands": command_catalog,
+            "execution_boundary": (
+                "Selection only. Keystone Slack WorkflowRunner executes the result."
+            ),
+        },
+        output_type=ChiefSlackCommandResolution,
+        run_config=run_config,
+        live=live,
+        workflow_name="chief_slack_command_resolution",
+        trace_metadata={
+            "agent_name": "chief_of_staff",
+            "run_kind": "native_slack_command_resolution",
+        },
+        max_turns=1,
+    )
+
+
+def validate_chief_slack_command_resolution(
+    resolution: ChiefSlackCommandResolution,
+    command_catalog: list[dict[str, str]],
+) -> ChiefSlackCommandResolution:
+    """Reject model-invented commands before KS backend dispatch."""
+
+    if resolution.status != "matched":
+        return resolution
+    configured = {
+        str(item.get("command") or "").strip()
+        for item in command_catalog
+        if str(item.get("command") or "").strip()
+    }
+    command_name = resolution.command_text.split(" ", 1)[0].strip().lower()
+    if command_name in configured:
+        return resolution
+    return ChiefSlackCommandResolution(
+        status="no_match",
+        rationale="The selected command is not configured in the Keystone Slack manifest.",
+        confidence="low",
+    )
+
+
+_SLACK_COMMAND_MATCH_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "can",
+        "chief",
+        "do",
+        "for",
+        "get",
+        "kni",
+        "me",
+        "of",
+        "on",
+        "please",
+        "run",
+        "slack",
+        "staff",
+        "the",
+        "to",
+        "with",
+    }
+)
+
+
+def _command_match_token(value: str) -> str:
+    token = re.sub(r"[^a-z0-9]+", "", value.lower())
+    if len(token) > 4 and token.endswith("ies"):
+        return f"{token[:-3]}y"
+    if len(token) > 4 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+def _command_match_tokens(value: str) -> set[str]:
+    return {
+        normalized
+        for raw in re.findall(r"[A-Za-z0-9]+", value)
+        if (normalized := _command_match_token(raw))
+        and normalized not in _SLACK_COMMAND_MATCH_STOPWORDS
+    }
+
+
+def _deterministic_command_arguments(
+    request_text: str,
+    command_tokens: set[str],
+) -> str:
+    text = re.sub(
+        r"^\s*(?:slack\s+)?chief\s+of\s+staff\s*[:,;\-]*\s*",
+        "",
+        " ".join(str(request_text or "").split()),
+        flags=re.I,
+    )
+    kept: list[str] = []
+    for raw in text.split():
+        normalized = _command_match_token(raw)
+        if normalized in _SLACK_COMMAND_MATCH_STOPWORDS or normalized in command_tokens:
+            continue
+        kept.append(raw.strip(" ,;:"))
+    return " ".join(item for item in kept if item)
+
+
+def resolve_high_confidence_chief_slack_command(
+    request_text: str,
+    command_catalog: list[dict[str, str]],
+) -> ChiefSlackCommandResolution | None:
+    """Resolve an unambiguous manifest command without spending a model call."""
+
+    request_tokens = _command_match_tokens(request_text)
+    scored: list[tuple[int, int, str, set[str]]] = []
+    for item in command_catalog:
+        command = str(item.get("command") or "").strip()
+        if not command or command == "/kni":
+            continue
+        command_tokens = _command_match_tokens(command.removeprefix("/kni-"))
+        semantic_tokens = _command_match_tokens(
+            " ".join(
+                (
+                    str(item.get("description") or ""),
+                    str(item.get("usage_hint") or ""),
+                )
+            )
+        )
+        command_overlap = len(request_tokens & command_tokens)
+        semantic_overlap = len(request_tokens & semantic_tokens)
+        score = command_overlap * 4 + semantic_overlap
+        if score:
+            scored.append((score, len(command_tokens), command, command_tokens))
+    scored.sort(key=lambda row: (-row[0], -row[1], row[2]))
+    if not scored:
+        return None
+    top = scored[0]
+    runner_up_score = scored[1][0] if len(scored) > 1 else 0
+    if top[0] < 4 or top[0] - runner_up_score < 2:
+        return None
+    arguments = _deterministic_command_arguments(request_text, top[3])
+    command_text = " ".join(part for part in (top[2], arguments) if part)
+    return ChiefSlackCommandResolution(
+        status="matched",
+        command_text=command_text,
+        rationale="Unique high-confidence match from the configured Slack command catalog.",
+        confidence="high",
     )
 
 

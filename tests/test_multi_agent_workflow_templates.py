@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from keystone_agents.multi_agent_workflow_templates import (
     WorkflowRunMode,
     WorkflowToolTier,
     WorkflowTriggerType,
+    build_workflow_dry_run_plan,
     get_workflow_template,
     select_workflow_templates_for_backend_context,
     workflow_template_catalog,
@@ -87,3 +90,62 @@ def test_gmail_workflow_keeps_draft_creation_approval_gated() -> None:
     assert "OutreachContextPack" in template.handoff_contract.context_packs
     assert "sending is never allowed" in template.approval_gate
     assert "No email send" in template.side_effect_boundary
+
+
+def test_first_combined_workflow_dry_run_preserves_typed_handoffs_without_authority() -> None:
+    plan = build_workflow_dry_run_plan(
+        "gmail_thread_research_opportunity_outreach",
+        run_mode=WorkflowRunMode.COMBINED,
+        project_id="project-kni-synthetic-001",
+        source_refs=["fixture:gmail-thread:synthetic-partner"],
+    )
+
+    assert plan.status == "dry_run_ready"
+    assert plan.schedule_enabled is False
+    assert plan.context_packs == [
+        "GmailContextPack",
+        "ResearchContextPack",
+        "OpportunityContextPack",
+        "OutreachContextPack",
+    ]
+    assert plan.max_openai_requests == 0
+    assert plan.max_provider_writes == 0
+    assert plan.send_allowed is False
+    assert plan.external_post_allowed is False
+
+
+def test_scheduled_email_queue_dry_run_is_disabled_and_fixture_only() -> None:
+    plan = build_workflow_dry_run_plan(
+        "key_email_response_queue",
+        run_mode=WorkflowRunMode.SCHEDULED,
+        project_id="project-kni-synthetic-001",
+        source_refs=["fixture:gmail-thread:synthetic-partner"],
+    )
+
+    assert plan.trigger_type == WorkflowTriggerType.SCHEDULE
+    assert plan.cadence == "daily weekday review"
+    assert plan.schedule_enabled is False
+    assert plan.effective_tool_tier == WorkflowToolTier.FIXTURE_ONLY
+    assert plan.output_destinations == [
+        "local JSON dry-run artifact",
+        "WorkItem dry-run note",
+    ]
+    assert plan.max_provider_reads == 0
+    assert plan.max_provider_writes == 0
+
+
+def test_dry_run_rejects_unknown_mode_or_missing_identity() -> None:
+    with pytest.raises(ValueError, match="does not support scheduled"):
+        build_workflow_dry_run_plan(
+            "gmail_thread_research_opportunity_outreach",
+            run_mode=WorkflowRunMode.SCHEDULED,
+            project_id="project",
+            source_refs=["fixture:source"],
+        )
+    with pytest.raises(ValueError, match="project identity and source refs"):
+        build_workflow_dry_run_plan(
+            "key_email_response_queue",
+            run_mode=WorkflowRunMode.SCHEDULED,
+            project_id="",
+            source_refs=[],
+        )

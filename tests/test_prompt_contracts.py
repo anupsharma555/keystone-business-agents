@@ -444,11 +444,11 @@ def test_compact_outreach_builder_preserves_request_aware_skill_visibility() -> 
     )
 
     assert "<!-- outreach_composer.md -->" in request_instructions
-    assert "<!-- tools.md -->" in request_instructions
+    assert "<!-- tools.md -->" not in request_instructions
     assert "<!-- action_boundary_enforcement/SKILL.md -->" in request_instructions
     assert "<!-- context_permission_gating/SKILL.md -->" in request_instructions
     assert "<!-- workspace_artifact_governance/SKILL.md -->" not in default_instructions
-    assert "<!-- workspace_artifact_governance/SKILL.md -->" in request_instructions
+    assert "<!-- workspace_artifact_governance/SKILL.md -->" not in request_instructions
     assert "<!-- unsupported_claim_and_gap_handling/SKILL.md -->" in request_instructions
 
 

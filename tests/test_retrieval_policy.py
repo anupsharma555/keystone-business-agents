@@ -19,6 +19,7 @@ def _assessment(
     needs_precision_search: bool,
     needs_structured_enrichment: bool = False,
     needs_search_review: bool = False,
+    missing_source_lanes: tuple[str, ...] = (),
     reasons: tuple[str, ...] = (),
 ) -> RetrievalQualityAssessment:
     return RetrievalQualityAssessment(
@@ -33,6 +34,7 @@ def _assessment(
         needs_structured_enrichment=needs_structured_enrichment,
         needs_search_review=needs_search_review,
         reasons=reasons,
+        missing_source_lanes=missing_source_lanes,
     )
 
 
@@ -193,7 +195,7 @@ def test_provider_use_ladder_separates_extraction_baseline_from_fallbacks() -> N
     assert fallback.rule_for("playwright").use_now is True
 
 
-def test_provider_use_ladder_keeps_rendered_and_future_providers_non_production() -> None:
+def test_provider_use_ladder_keeps_non_default_rendered_providers_non_production() -> None:
     ladder = build_provider_use_ladder(
         request_text="inspect rendered page failure",
         rendered_diagnostics_requested=True,
@@ -204,7 +206,8 @@ def test_provider_use_ladder_keeps_rendered_and_future_providers_non_production(
     assert ladder.rule_for("playwright").use_now is True
     assert ladder.rule_for("browserless").use_now is False
     assert ladder.rule_for("apify").use_frequency == "future_boundary"
-    assert ladder.rule_for("crawl4ai").use_frequency == "future_boundary"
+    assert ladder.rule_for("crawl4ai").use_frequency == "explicit_experimental"
+    assert ladder.rule_for("crawl4ai").use_now is False
     assert ladder.rule_for("serper").use_frequency == "specific_opt_in"
     assert ladder.rule_for("serper").use_now is False
 
@@ -675,12 +678,108 @@ def test_hybrid_search_provider_deepens_when_structured_enrichment_is_needed() -
 
     assert calls == [
         "searxng:Mentavi Health leadership:3",
-        "tavily:Mentavi Health leadership:3",
+        (
+            "tavily:Mentavi Health leadership official primary sources "
+            "leadership partnerships customers:3"
+        ),
     ]
     assert [result.source for result in results] == ["searxng", "tavily"]
     assert telemetry["deepening_search_used"] is True
     assert telemetry["tavily_estimated_credits_used"] == 1
     assert telemetry["provider_usage"]["tavily"]["credits_used"] == 1
+    assert telemetry["search_queries"][-1].endswith("leadership partnerships customers")
+    assert telemetry["provider_queries"]["tavily"] == [
+        (
+            "Mentavi Health leadership official primary sources "
+            "leadership partnerships customers"
+        )
+    ]
+
+
+def test_hybrid_search_provider_expands_exa_query_for_missing_source_lanes() -> None:
+    calls: list[str] = []
+
+    class Provider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"{self.name}:{query}")
+            return [
+                SearchResult(
+                    title=f"{self.name} result",
+                    link=f"https://{self.name}.example.test/result",
+                    snippet="Source evidence.",
+                    source=self.name,
+                )
+            ]
+
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng",),
+        deepening_provider_sequence=("exa",),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=len(results) < 2,
+            missing_source_lanes=("clinical_trials", "grants_funding"),
+        ),
+        provider_factory=lambda provider_name: Provider(provider_name),
+    )
+
+    provider.search_web("behavioral health AI opportunities", num_results=5)
+
+    assert calls == [
+        "searxng:behavioral health AI opportunities",
+        (
+            "exa:behavioral health AI opportunities related organizations primary sources "
+            "clinical trial registry protocol official grant funding award"
+        ),
+    ]
+
+
+def test_hybrid_search_provider_deepens_when_baseline_returns_no_results() -> None:
+    calls: list[str] = []
+
+    class Provider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(f"{self.name}:{query}")
+            if self.name == "searxng":
+                return []
+            return [
+                SearchResult(
+                    title="Exa recovery result",
+                    link="https://exa.example.test/recovery",
+                    snippet="Official clinical trial evidence.",
+                    source="exa",
+                )
+            ]
+
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng",),
+        deepening_provider_sequence=("exa",),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=not results,
+            missing_source_lanes=("clinical_trials",) if not results else (),
+        ),
+        provider_factory=lambda provider_name: Provider(provider_name),
+    )
+
+    results = provider.search_web("behavioral health trial", num_results=5)
+
+    assert [result.source for result in results] == ["exa"]
+    assert calls == [
+        "searxng:behavioral health trial",
+        (
+            "exa:behavioral health trial related organizations primary sources "
+            "clinical trial registry protocol"
+        ),
+    ]
+    assert provider.telemetry()["deepening_search_used"] is True
 
 
 def test_hybrid_search_provider_skips_deepening_provider_when_fast_results_are_enough() -> None:

@@ -33,7 +33,7 @@ def test_anu174_linear_scorecard_totals_match_rows() -> None:
         status: sum(row_status == status for _, row_status in rows) for status in statuses
     }
 
-    assert counts == {"PASS": 16, "PARTIAL": 4, "PENDING": 0}
+    assert counts == {"PASS": 20, "PARTIAL": 0, "PENDING": 0}
     assert "- Total: **20**" in text
     assert "Promptfoo remains deferred" in text
     smoke_doc = (ROOT / "docs" / "BASIC_AGENT_EXECUTION_SMOKE_TASKS.md").read_text(

@@ -19,6 +19,7 @@ from keystone_agents.search_coverage_eval import (
     score_search_results,
     write_search_coverage_artifacts,
 )
+from keystone_agents.source_registry import SOURCE_LANES
 from keystone_agents.tools.search_provider import SearchRequest, SearchResult
 
 
@@ -44,6 +45,18 @@ def test_load_search_coverage_cases_jsonl(tmp_path: Path) -> None:
     assert len(cases) == 1
     assert cases[0].id == "wide-query"
     assert cases[0].expected_source_lanes == ["grants_funding"]
+
+
+def test_default_search_coverage_cases_prove_each_source_lane_directly() -> None:
+    cases = load_search_coverage_cases("evals/provider/search_coverage_cases.jsonl")
+    directly_tested_lanes = {
+        lane
+        for case in cases
+        if len(case.expected_source_lanes) <= 2
+        for lane in case.expected_source_lanes
+    }
+
+    assert set(SOURCE_LANES) <= directly_tested_lanes
 
 
 def test_score_search_results_measures_lane_domain_and_claim_coverage() -> None:

@@ -1812,10 +1812,17 @@ def _draft_policy(text: str) -> str:
     lower = text.lower()
     if "draft" not in lower and "reply" not in lower:
         return "no_drafts_requested"
-    if re.search(
-        r"\b(?:do\s+not|don't|dont|never|no|without)\b[^.;\n]{0,80}"
-        r"\b(?:draft|drafting|reply|replies)\b",
+    review_copy_scope = re.sub(
+        r"\b(?:do\s+not|don't|dont|never|without)\s+"
+        r"(?:create|save|write)\s+(?:a\s+|any\s+)?"
+        r"(?:gmail\s+|provider\s+)?drafts?\b",
+        "",
         lower,
+    )
+    if re.search(
+        r"\b(?:do\s+not|don't|dont|never|no|without)\b[^,.;\n]{0,80}"
+        r"\b(?:draft|drafting|reply|replies)\b",
+        review_copy_scope,
     ):
         return "no_drafts_requested"
     if "urgent" in lower:

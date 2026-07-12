@@ -333,7 +333,10 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "evals/local/opportunity_scoring.jsonl",
             "evals/local/source_attribution.jsonl",
         ),
-        validation_paths=("tests/test_opportunity_scout.py",),
+        validation_paths=(
+            "tests/test_opportunity_scout.py",
+            "tests/test_compact_opportunity_assessment.py",
+        ),
         handoff_description=(
             "Find and score opportunities, leads, grants, partners, and companies."
         ),
@@ -341,6 +344,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "No outreach generation",
             "Deduplicate before prioritizing",
             "Source-backed scoring required",
+            "Single supplied-opportunity asks use the compact review-only assessment schema",
             "Google Workspace writes require live flags and approval references",
         ),
     ),
@@ -672,10 +676,12 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
     skills=AGENT_SKILL_NAMES["chief_of_staff"],
     tools=(
         "list_chief_of_staff_context_sources",
+        "list_slack_slash_commands",
         "summarize_slack_runtime_config",
         "search_slack_repo_context",
         "read_slack_repo_context_file",
         "lookup_slack_workflow_capability",
+        "validate_slack_slash_command",
         "search_official_operations_docs",
         "retrieve_chief_of_staff_memory",
         "list_local_context_sources",

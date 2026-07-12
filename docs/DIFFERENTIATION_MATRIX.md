@@ -62,3 +62,15 @@ correctly routed result with zero unintended writes, zero duplicate artifacts,
 and no developer intervention. A comparative claim is supported only when the
 matched KBA observation is safe and useful, improves at least one committed
 operator metric, and introduces no recorded capability or safety regression.
+
+Run the focused operator-safe contract smoke with:
+
+```bash
+npm run test:differentiation:no-live -- \
+  --json-output artifacts/test-pack/anu175-no-live-smoke.json
+```
+
+The receipt records zero OpenAI requests, connectors, provider writes, and
+external side effects. It proves that matched observations can support a claim
+and that missing or mismatched baseline evidence cannot. It does not fabricate
+or replace the later real matched operator baseline observation.

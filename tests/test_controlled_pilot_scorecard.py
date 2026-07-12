@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from keystone_agents.controlled_pilot import ControlledPilotObservation, controlled_pilot_cases
+from keystone_agents.controlled_pilot import (
+    ControlledPilotObservation,
+    controlled_pilot_cases,
+    controlled_pilot_natural_request_sha256,
+)
 from keystone_agents.controlled_pilot_scorecard import build_controlled_pilot_scorecard
 from keystone_agents.differentiation_matrix import DifferentiationObservation
 
@@ -16,9 +20,10 @@ def _observation(case_id: str) -> ControlledPilotObservation:
     case = next(item for item in controlled_pilot_cases() if item.case_id == case_id)
     return ControlledPilotObservation(
         case_id=case_id,
-        natural_request_sha256="a" * 64,
+        natural_request_sha256=controlled_pilot_natural_request_sha256(case),
         slack_permalink_present=True,
         answer_first=True,
+        human_review_passed=True,
         final_response_count=1,
         route_correct=True,
         graph_used=case.backend == "langgraph",
@@ -41,10 +46,11 @@ def _observation(case_id: str) -> ControlledPilotObservation:
 
 
 def _baseline(case_id: str) -> DifferentiationObservation:
+    case = next(item for item in controlled_pilot_cases() if item.case_id == case_id)
     return DifferentiationObservation(
         system="codex_chatgpt_baseline",
         workflow_id=case_id,
-        natural_request_sha256="a" * 64,
+        natural_request_sha256=controlled_pilot_natural_request_sha256(case),
         useful_result=True,
         route_correct=True,
         sources_visible=False,
@@ -72,6 +78,11 @@ def test_scorecard_stays_pending_when_trusted_rows_or_cases_are_missing() -> Non
     assert scorecard["observed_case_count"] == 1
     assert [row["status"] for row in scorecard["cases"]].count("missing") == 3
     assert scorecard["comparative_claims_supported"] == 0
+    assert scorecard["planned_ceiling"]["provider_writes"] == 0
+    missing = next(row for row in scorecard["cases"] if row["status"] == "missing")
+    assert missing["backend"] in {"direct_specialist", "langgraph"}
+    assert missing["expected_artifact"]
+    assert missing["max_openai_requests"] > 0
 
 
 def test_complete_safe_observations_pass_and_aggregate_metrics() -> None:

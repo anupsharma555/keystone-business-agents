@@ -112,6 +112,9 @@ validate against the same schema and safety rules as deterministic drafts.
   `reply_recommended=false`; choose whether more evidence, provisional ideas, or deferral is
   the best next step. Any optional future reply must contain no question and must not reopen
   scheduling, another call, or a generic compare-notes exchange.
+- When `reply_recommended=false`, do not describe a reply or draft as though one exists.
+  Write `personalization_rationale` as the rationale for the recommendation, and leave
+  `email_subject`, `email_body`, and `linkedin_note` empty.
 - Write optional reply copy as normal correspondence. Do not narrate the workflow with
   phrases such as "based on our thread," "the selected context," or "if it would be
   helpful." State a concrete, relationship-appropriate point plainly.

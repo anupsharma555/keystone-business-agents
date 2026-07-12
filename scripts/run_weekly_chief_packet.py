@@ -11,10 +11,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from keystone_agents.schemas.weekly_ops import WeeklyOpsAssemblyInput
-from keystone_agents.weekly_ops_packet import (
-    build_weekly_ops_external_synthesis_bundle,
+from keystone_agents.weekly_ops_runner import (
+    run_weekly_ops_packet_synthesis,
+    weekly_ops_privacy_preview,
 )
-from keystone_agents.weekly_ops_runner import run_weekly_ops_packet_synthesis
 
 
 def main() -> None:
@@ -28,10 +28,9 @@ def main() -> None:
     parser.add_argument("--live-sdk", action="store_true")
     parser.add_argument("--max-openai-requests", type=int, default=1)
     parser.add_argument("--max-cost-usd", type=Decimal, default=Decimal("0.05"))
-    parser.add_argument("--approve-external-business-synthesis", action="store_true")
-    parser.add_argument("--redactions-file")
+    parser.add_argument("--approve-privacy-minimized-context", action="store_true")
     parser.add_argument(
-        "--preview-external-synthesis",
+        "--preview-privacy-minimized-context",
         action="store_true",
         help="Print the exact identity-free bundle that live mode would transmit.",
     )
@@ -40,41 +39,25 @@ def main() -> None:
         help="Atomically save the preview or validated live result as JSON.",
     )
     args = parser.parse_args()
-    if args.preview_external_synthesis and args.live_sdk:
-        parser.error("--preview-external-synthesis cannot be combined with --live-sdk")
+    if args.preview_privacy_minimized_context and args.live_sdk:
+        parser.error("--preview-privacy-minimized-context cannot be combined with --live-sdk")
 
     load_dotenv(Path(".env"))
     payload = WeeklyOpsAssemblyInput.model_validate(
         json.loads(Path(args.input).read_text(encoding="utf-8"))
     )
-    redaction_terms: tuple[str, ...] = ()
-    if args.redactions_file:
-        redaction_payload = json.loads(
-            Path(args.redactions_file).read_text(encoding="utf-8")
-        )
-        if not isinstance(redaction_payload, list) or not all(
-            isinstance(item, str) and item.strip() for item in redaction_payload
-        ):
-            raise ValueError("Redactions file must contain a JSON list of non-empty strings.")
-        redaction_terms = tuple(redaction_payload)
-    if args.preview_external_synthesis:
-        result = {
-            "status": "external_synthesis_preview",
-            "bundle": build_weekly_ops_external_synthesis_bundle(
-                payload,
-                personal_redaction_terms=redaction_terms,
-            ),
-        }
+    if args.preview_privacy_minimized_context:
+        result = weekly_ops_privacy_preview(payload)
     else:
         result = run_weekly_ops_packet_synthesis(
             payload,
             live_sdk=bool(args.live_sdk),
             max_openai_requests=args.max_openai_requests,
             max_cost_usd=args.max_cost_usd,
-            approved_external_business_synthesis=bool(
-                args.approve_external_business_synthesis
+            approved_privacy_minimized_context=bool(
+                args.approve_privacy_minimized_context
             ),
-            personal_redaction_terms=redaction_terms,
+            approved_private_context=False,
         )
     rendered = json.dumps(result, ensure_ascii=True, sort_keys=True, default=str)
     if args.output:

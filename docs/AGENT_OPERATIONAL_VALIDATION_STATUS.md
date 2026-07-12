@@ -70,6 +70,38 @@ Airtable write gating, stale-write reversal, typed context handoffs, and useful
 completion review without false blocking. Live model comparison remains a later
 bounded quality proof, not a prerequisite for these deterministic invariants.
 
+ANU-61 now has two reusable exact-ask live reasoning proofs below the Slack
+acceptance layer. The compact Opportunity assessment passed offline
+revalidation with one request, 26,167 input and 998 output tokens, a maintained
+`$0.02411625` estimate, both supplied URLs retained once, explicit fact versus
+interpretation separation, bounded geography/timing uncertainty, and zero
+tools/search/outreach/writes. The research-to-Doc plan used one request at a
+maintained `$0.027426`, preserved ten official-page claims and the exact source,
+and staged an approval-gated `KNIOps` plan without a Workspace write. Neither is
+misclassified as a full pilot PASS because the Slack permalink/entry layer was
+not exercised.
+
+ANU-174 is now 20/20. L174-14 passed with one privacy-minimized Chief request:
+45,559 input tokens including 45,312 cached, 783 output tokens, and a maintained
+`$0.00710715` estimate. The answer cited the sanitized source identity,
+summarized five service-area signals, retained human-review/abstracted-evidence
+caveats, and used no tools, search, writes, sends, or posts. L174-19 also passed
+after deterministic local arithmetic derived non-identifying negative-margin
+and high-expense-load posture assertions; one request selected the lower-cost,
+faster-validation option with zero tools or writes. L174-16 and L174-20 use typed
+assertion layers: the research-note preview carries five domain categories plus
+explicit evidence-density, limitation, and next-action relationships; the
+weekly preview carries aggregated source-family workstream, status, action, and
+owner-role relationships across 38 one-way source hashes. Raw/trusted-private
+execution is disabled. L174-16 now passes end to end: the final assertion-backed
+brief used one request, then one exact marked Doc was created, read, updated,
+reread, trashed, and verified absent. L174-20 also passes: one assertion-backed
+synthesis produced a useful categorical weekly packet, one exact 4,151-character
+durable `KNIOps` Doc was read back, and one concise verified-link post reached
+the uniquely resolved `#ops-finance` channel without repeated synthesis or a
+duplicate Doc. Reuse these receipts; the trusted-runtime prerequisite for the
+controlled pilot is satisfied.
+
 ANU-223 now has a separate five-provider pre-live delegation registry and
 scorecard. Calendar, Gmail, and Airtable have joined manager-entry plus
 provider-operation proof and should be reused. Google Workspace and Zotero each
@@ -301,6 +333,43 @@ unintended side effects. No fixture result can mark these live rows complete.
   separate live gate, channel allowlist, and ambiguous-post recovery are tested.
   Zero OpenAI requests or search occurred. ANU-60's natural/model/graph Slack
   probes remain a separate acceptance layer.
+
+### Multistep natural Slack asks — 2026-07-11
+
+- Four distinct read-only asks were launched in `#ai-agents-workflow`: Eze
+  Gmail -> NeuroBlu datasource research; today's Gmail -> opportunity ranking
+  -> organization research; RSS signal selection -> organization/product
+  research; and Eze Gmail -> Holmusk organization/market-position decision
+  brief. No Gmail draft, send, label change, schedule, share, or other provider
+  mutation occurred.
+- The NeuroBlu run invoked the 11-node LangGraph Gmail -> Business Research
+  path and preserved the correct thread, Holmusk target, and NeuroBlu product.
+  Retrieval found the needed scale, longitudinal, care-setting, NLP,
+  de-identification, and claims-linkage evidence, but the terminal selector
+  initially displayed generic headings instead. Evidence ranking now favors
+  product-specific scale/provenance facts, compacts multiline facts, excludes
+  unused sources, and renders an explicit organization section.
+- The first today-inbox run exposed planner instruction words in the Gmail
+  query (`Exclude Select Compare Return`). The unchanged rerun removed those
+  terms but skipped Gmail and researched the request phrase as companies
+  (`Workspace`, `Google`, `Youtube`). Broad-inbox query sanitization and
+  Gmail-first route precedence now have focused regressions; the corrected
+  end-to-end sequence still needs a live confirmation.
+- The RSS ask first exposed a false Calendar create route from informational
+  `funding event` plus negated `do not ... schedule` wording. The calendar
+  planner now removes negated action clauses before activation. The unchanged
+  rerun then stopped correctly before model execution because its generic
+  5-20-request estimate exceeded the Slack ceiling of eight.
+- The organization-focused Eze ask returned unrelated xCures, Abridge, and
+  Mercosur opportunity context instead of the selected Gmail thread and
+  Holmusk. It did not expose a canonical WorkItem or graph receipt in the
+  inspected database. This is a current-context/route isolation failure and a
+  user-facing answer-quality failure, not a valid organization brief.
+- Persisted WorkItem receipts account for five `gpt-5.4-mini` requests across
+  the successful and failed Gmail runs. The final unrelated opportunity output
+  additionally reports one successful `agents-web-search` request; exact
+  aggregate model-versus-hosted-search accounting is partial because that run
+  did not persist a matching WorkItem usage receipt.
 
 ## Priority Order
 

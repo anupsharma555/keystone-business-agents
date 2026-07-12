@@ -58,6 +58,7 @@ from keystone_agents.schemas.decision_trace import DecisionTrace
 from keystone_agents.schemas.opportunity import (
     ExistingOpportunityState,
     FilteredOpportunityCandidate,
+    OpportunityAssessmentBrief,
     OpportunityRecord,
     OpportunityScoutResult,
     OpportunitySignal,
@@ -6828,6 +6829,36 @@ def build_opportunity_scout_agent(
         handoff_description=(
             "Use to discover, source, deduplicate, score, and prioritize opportunities "
             "without generating outreach."
+        ),
+    )
+
+
+def build_opportunity_assessment_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+) -> Agent:
+    """Build a no-tool Scout variant for one compact supplied-source assessment."""
+
+    instructions = compose_instructions(
+        "keystone_profile.md",
+        "safety_policy.md",
+        "opportunity_scout.md",
+        skill_files=select_agent_skill_names(
+            "opportunity_scout",
+            request_text=request_text,
+        ),
+    )
+    return build_sdk_agent(
+        name="opportunity_scout",
+        instructions=instructions,
+        output_type=OpportunityAssessmentBrief,
+        tools=[],
+        guardrails=keystone_guardrails(),
+        model=model,
+        policy_agent_name="opportunity_scout",
+        handoff_description=(
+            "Use for a concise review-only assessment of one supplied opportunity packet."
         ),
     )
 

@@ -73,6 +73,23 @@ draft creation. The pilot is resolved only when the selected project, source
 basis, WorkItem state, approval boundary, and next safe action survive the full
 no-live flow.
 
+## First ANU-203 executable dry-run plans
+
+`scripts/build_anu203_dry_run_plans.py` materializes two disabled plans from the
+canonical catalog:
+
+1. the synthetic Gmail thread → Research → Opportunity → Workspace/Airtable
+   plans → Outreach review combined workflow;
+2. the weekday key-email response queue scheduled workflow.
+
+The saved receipt is
+`artifacts/test-pack/anu203-first-workflow-dry-run-plans.json`. Both plans use
+the existing synthetic project/source identities and typed context-pack names.
+They set `schedule_enabled=false`, use the fixture-only tool tier, permit zero
+model calls, provider reads, provider writes, sends, or external posts, and
+retain the template approval gate and budget stop condition. This proves the
+combined/scheduled contract shape; it does not activate ANU-203 before ANU-61.
+
 Common repo work across all five workflows:
 
 - The minimal `ProjectContextPack` contract is now implemented with project
