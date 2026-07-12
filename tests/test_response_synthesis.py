@@ -28,6 +28,36 @@ from keystone_agents.visible_sources import (
 )
 
 
+def test_response_synthesis_receives_manual_plan_ask_shape() -> None:
+    result = WorkflowRunResult(
+        work_item=WorkItem(kind=WorkItemKind.RESEARCH_BRIEF, title="Exact review"),
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        advanced=False,
+        human_summary="No exact source-backed match was retained.",
+        manual_request_plan={
+            "ask_shape": {
+                "strict_filter_mode": "exact",
+                "output_form": "table",
+                "permission_state": "read_only",
+                "stop_condition": "return_zero_without_broadening_if_no_exact_match",
+            }
+        },
+    )
+
+    synthesis_input = _user_response_synthesis_input(
+        result, user_request="Return exact matches in a table or zero."
+    )
+
+    assert synthesis_input.manual_plan is not None
+    assert synthesis_input.manual_plan["ask_shape"]["strict_filter_mode"] == "exact"
+    assert synthesis_input.manual_plan["ask_shape"]["output_form"] == "table"
+    assert (
+        synthesis_input.manual_plan["ask_shape"]["stop_condition"]
+        == "return_zero_without_broadening_if_no_exact_match"
+    )
+
+
 def test_visible_sources_appends_structured_urls_to_plain_text() -> None:
     text = append_visible_source_urls_to_text(
         "Confirmed: the Q2 estimated tax payment date is June 15, 2026.",

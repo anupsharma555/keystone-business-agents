@@ -79,3 +79,7 @@ Populate:
   Keep `requires_approved_context=true`.
 - `requires_live_search=true` for opportunity and business research discovery.
 - `rationale` with a short explanation.
+Preserve explicit ask-shape constraints in `ask_shape`: breadth, evidence depth,
+source preference, strict or exact filtering, requested output form, dependency
+on selected/prior context, permission boundary, cost mode, and stop condition.
+These fields constrain execution but never grant approval or side-effect authority.

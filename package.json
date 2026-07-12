@@ -11,6 +11,7 @@
     "compare:opportunity-assessment:baseline": ".venv/bin/python scripts/compare_compact_opportunity_baseline.py",
     "test:presentation-index:local": ".venv/bin/python scripts/run_presentation_index_validation.py",
     "test:slack-entrypoints:no-live": ".venv/bin/python scripts/run_slack_entrypoint_readiness.py",
+    "check:staged-publish-files": ".venv/bin/python scripts/check_staged_publish_files.py",
     "run:chief-prior-week-packet": ".venv/bin/python scripts/run_chief_prior_week_packet.py",
     "run:local-kni-capability-summary": ".venv/bin/python scripts/run_local_kni_capability_summary.py",
     "run:research-doc-lifecycle": ".venv/bin/python scripts/run_research_doc_lifecycle.py",

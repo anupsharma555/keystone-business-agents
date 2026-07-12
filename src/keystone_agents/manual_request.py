@@ -18,6 +18,7 @@ from keystone_agents.orchestrator.routing import (
     payload_text,
 )
 from keystone_agents.schemas.manual_request_plan import (
+    AskShapePolicy,
     ManualExpectedArtifactType,
     ManualRequestIntent,
     ManualRequestPlan,
@@ -365,6 +366,7 @@ def infer_manual_request_plan(
         ),
         desired_count=desired_count,
         constraints=_constraints(text),
+        ask_shape=_ask_shape_policy(text),
         required_entities=_required_entities(text),
         required_terms=_required_terms(text),
         gmail_query=_gmail_query(text) if target_agent == "gmail_triage" else "",
@@ -397,6 +399,159 @@ def _requires_live_search_for_plan(text: str, *, target_agent: ManualTargetAgent
     if target_agent not in {"business_research_analyst", "opportunity_scout"}:
         return False
     return not bool(_NO_EXTERNAL_RESEARCH_RE.search(str(text or "")))
+
+
+def _ask_shape_policy(text: str) -> AskShapePolicy:
+    """Extract only explicit cross-cutting request constraints."""
+
+    lower = " ".join(str(text or "").lower().split())
+    exact = bool(
+        re.search(
+            r"\b(exact(?:ly)?|exact matches? only|no adjacent|no padding|do not broaden|"
+            r"zero (?:results? )?if (?:there are )?none)\b",
+            lower,
+        )
+    )
+    selected_context = bool(
+        re.search(r"\b(selected|supplied|provided|this) (?:gmail )?(?:thread|source|context)\b", lower)
+    )
+    source_types = [
+        label
+        for phrase, label in (
+            ("official sources", "official"),
+            ("official source", "official"),
+            ("primary sources", "primary"),
+            ("primary source", "primary"),
+            ("selected sources", "selected"),
+            ("selected source", "selected"),
+            ("provided sources", "provided"),
+            ("provided source", "provided"),
+            ("supplied sources", "provided"),
+            ("supplied source", "provided"),
+            ("local sources", "local"),
+            ("local source", "local"),
+        )
+        if phrase in lower
+    ]
+    read_only = bool(
+        re.search(
+            r"\b(read[- ]only|do not (?:send|post|create|modify|write|publish)|"
+            r"without (?:sending|posting|creating|modifying|writing|publishing))\b",
+            lower,
+        )
+        or re.search(
+            r"\bdo not [^.]{0,80}\b(?:send|post|create|modify|write|publish)\b",
+            lower,
+        )
+    )
+    draft_requested = bool(
+        re.search(r"\b(draft|prepare (?:a )?reply|reply copy)\b", lower)
+        and not re.search(r"\bdo not [^.]{0,40}\bdraft\b", lower)
+    )
+    approval_required = bool(
+        re.search(r"\b(?:after|before|pending|requires?) (?:human )?approval\b", lower)
+        or "only after approval" in lower
+    )
+    stop_condition = ""
+    if exact and re.search(r"\b(zero .* if .*none|do not broaden|no adjacent|no padding)\b", lower):
+        stop_condition = "return_zero_without_broadening_if_no_exact_match"
+    elif approval_required:
+        stop_condition = "stop_before_external_action_until_approval"
+    elif "stop after" in lower:
+        stop_condition = "honor_explicit_stop_after_boundary"
+
+    return AskShapePolicy(
+        ask_breadth=(
+            "narrow"
+            if selected_context or "only" in lower
+            else "bounded"
+            if exact or re.search(r"\b(?:find|return|show) [1-9]\d?\b", lower)
+            else "broad"
+            if re.search(r"\b(broad|comprehensive|all relevant)\b", lower)
+            else "unspecified"
+        ),
+        evidence_depth=(
+            "quick"
+            if re.search(r"\b(quick|brief|concise|do not deepen)\b", lower)
+            else "deep"
+            if re.search(r"\b(deep|comprehensive|thorough|detailed)\b", lower)
+            else "unspecified"
+        ),
+        source_type_preference=source_types,
+        strict_filter_mode=(
+            "exact"
+            if exact
+            else "strict"
+            if re.search(r"\b(strict|hard filters?)\b", lower)
+            else "flexible"
+            if re.search(r"\b(adjacent matches? (?:are )?(?:ok|acceptable)|broaden)\b", lower)
+            else "unspecified"
+        ),
+        output_form=(
+            "table"
+            if re.search(r"\btable\b", lower)
+            else "bullets"
+            if re.search(r"\b(?:bullet|bulleted)\b", lower)
+            else "plan"
+            if re.search(r"\b(?:plan|next steps)\b", lower)
+            else "draft"
+            if draft_requested
+            else "brief"
+            if re.search(r"\b(?:brief|summary|concise)\b", lower)
+            else "unspecified"
+        ),
+        prior_context_dependency=(
+            "none"
+            if re.search(r"\b(?:ignore|do not use) (?:the )?(?:prior|previous) context\b", lower)
+            else "selected_context"
+            if selected_context
+            else "required"
+            if re.search(r"\b(?:prior|previous|earlier|above) (?:context|thread|result|work)\b", lower)
+            else "unspecified"
+        ),
+        permission_state=(
+            "approval_required"
+            if approval_required
+            else "draft_only"
+            if draft_requested and (read_only or "do not send" in lower)
+            else "read_only"
+            if read_only
+            else "unspecified"
+        ),
+        cost_mode=(
+            "minimize"
+            if re.search(r"\b(low[- ]cost|minimi[sz]e cost|quick|cheap)\b", lower)
+            else "quality"
+            if re.search(r"\b(best quality|deep|thorough)\b", lower)
+            else "unspecified"
+        ),
+        stop_condition=stop_condition,
+    )
+
+
+def _merge_ask_shape_policy(base: AskShapePolicy, candidate: AskShapePolicy) -> AskShapePolicy:
+    """Preserve explicit local constraints while accepting nonconflicting additions."""
+
+    resolved_candidate = AskShapePolicy.model_validate(candidate)
+    values = resolved_candidate.model_dump(mode="json")
+    for field_name in (
+        "ask_breadth",
+        "evidence_depth",
+        "strict_filter_mode",
+        "output_form",
+        "prior_context_dependency",
+        "permission_state",
+        "cost_mode",
+    ):
+        base_value = getattr(base, field_name)
+        if base_value != "unspecified":
+            values[field_name] = base_value
+    values["source_type_preference"] = list(
+        dict.fromkeys([*base.source_type_preference, *resolved_candidate.source_type_preference])
+    )
+    if base.stop_condition:
+        values["stop_condition"] = base.stop_condition
+    return AskShapePolicy.model_validate(values)
 
 
 def merge_manual_request_plan(
@@ -438,6 +593,7 @@ def merge_manual_request_plan(
             }
         )
     merged = base.model_copy(update=plan.model_dump(mode="json"))
+    merged.ask_shape = _merge_ask_shape_policy(base.ask_shape, plan.ask_shape)
     if not merged.requested_agent:
         merged.requested_agent = base.requested_agent
     if not merged.primary_target:

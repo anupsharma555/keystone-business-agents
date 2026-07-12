@@ -26,6 +26,7 @@ from keystone_agents.schemas.context_pack import (
     ProjectContextPack,
     ResearchContextPack,
 )
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy
 from keystone_agents.schemas.memory import normalize_memory_key
 from keystone_agents.schemas.work_item import (
     WorkItem,
@@ -686,6 +687,14 @@ def build_context_pack_for_route(
     return hydrate_context_pack_memory(build_research_context_pack(work_item), work_item, store)
 
 
+def _work_item_ask_shape(work_item: WorkItem) -> AskShapePolicy:
+    plan = work_item.target.metadata.get("manual_request_plan")
+    if not isinstance(plan, dict):
+        return AskShapePolicy()
+    payload = plan.get("ask_shape")
+    return AskShapePolicy.model_validate(payload) if isinstance(payload, dict) else AskShapePolicy()
+
+
 def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
     ready = research_ready(work_item)
     project_context = build_project_context_pack(work_item)
@@ -699,6 +708,7 @@ def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
         current_status=work_item.status,
         target=work_item.target,
         request_text=work_item.request_text,
+        ask_shape=_work_item_ask_shape(work_item),
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
@@ -741,6 +751,7 @@ def build_opportunity_context_pack(work_item: WorkItem) -> OpportunityContextPac
         current_status=work_item.status,
         target=work_item.target,
         request_text=work_item.request_text,
+        ask_shape=_work_item_ask_shape(work_item),
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
@@ -805,6 +816,7 @@ def build_outreach_context_pack(work_item: WorkItem) -> OutreachContextPack:
         current_status=work_item.status,
         target=work_item.target,
         request_text=work_item.request_text,
+        ask_shape=_work_item_ask_shape(work_item),
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
@@ -855,6 +867,7 @@ def build_gmail_context_pack(work_item: WorkItem) -> GmailContextPack:
         current_status=work_item.status,
         target=work_item.target,
         request_text=work_item.request_text,
+        ask_shape=_work_item_ask_shape(work_item),
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],

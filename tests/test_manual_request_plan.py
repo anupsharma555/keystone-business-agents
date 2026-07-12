@@ -19,6 +19,55 @@ from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.test_pack_specs import get_test_pack_spec
 
 
+def test_manual_plan_preserves_exact_source_table_and_no_broadening_shape() -> None:
+    plan = infer_manual_request_plan(
+        "Find exactly active roles from official sources only. Return a table and zero "
+        "results if none; do not broaden.",
+        requested_agent="opportunity_scout",
+    )
+
+    assert plan.ask_shape.ask_breadth == "narrow"
+    assert plan.ask_shape.source_type_preference == ["official"]
+    assert plan.ask_shape.strict_filter_mode == "exact"
+    assert plan.ask_shape.output_form == "table"
+    assert plan.ask_shape.stop_condition == "return_zero_without_broadening_if_no_exact_match"
+
+
+def test_manual_plan_preserves_quick_selected_thread_read_only_shape() -> None:
+    plan = infer_manual_request_plan(
+        "Give me a quick read of this Gmail thread. Do not search, draft, or send anything.",
+        requested_agent="gmail_triage",
+    )
+
+    assert plan.ask_shape.ask_breadth == "narrow"
+    assert plan.ask_shape.evidence_depth == "quick"
+    assert plan.ask_shape.prior_context_dependency == "selected_context"
+    assert plan.ask_shape.permission_state == "read_only"
+    assert plan.ask_shape.cost_mode == "minimize"
+
+
+def test_manual_plan_preserves_staged_approval_stop_against_weaker_planner() -> None:
+    base = infer_manual_request_plan(
+        "Research first, then draft only after approval.", requested_agent="orchestrator"
+    )
+    candidate = ManualRequestPlan.model_validate(
+        {
+            **base.model_dump(mode="json"),
+            "source": "llm",
+            "ask_shape": {
+                "permission_state": "unspecified",
+                "stop_condition": "",
+                "output_form": "draft",
+            },
+        }
+    )
+    merged = merge_manual_request_plan(base, candidate)
+
+    assert merged.ask_shape.permission_state == "approval_required"
+    assert merged.ask_shape.stop_condition == "stop_before_external_action_until_approval"
+    assert merged.ask_shape.output_form == "draft"
+
+
 def test_manual_plan_routes_conference_search_to_opportunity_scout() -> None:
     plan = infer_manual_request_plan(
         "Find 5 broad behavioral health AI opportunities across conferences "

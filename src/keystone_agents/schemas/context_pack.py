@@ -7,6 +7,7 @@ from typing import Any, Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field
 
 from keystone_agents.schemas.handoff_types import HandoffTypeContract, build_handoff_type_contract
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy
 from keystone_agents.schemas.work_item import (
     WorkItemApprovalGate,
     WorkItemArtifactRef,
@@ -91,6 +92,7 @@ class ContextPackBase(BaseModel):
     current_status: WorkItemStatus
     target: WorkItemTarget = Field(default_factory=WorkItemTarget)
     request_text: str = ""
+    ask_shape: AskShapePolicy = Field(default_factory=AskShapePolicy)
     approved_facts: list[WorkItemFact] = Field(default_factory=list)
     source_refs: list[WorkItemSourceRef] = Field(default_factory=list)
     retrieved_sources: list[WorkItemSourceRef] = Field(default_factory=list)
