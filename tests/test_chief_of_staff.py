@@ -60,11 +60,13 @@ from keystone_agents.specialist_tool_names import specialist_agent_tool_name
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.tools.chief_of_staff_tool import (
     list_chief_of_staff_context_sources,
+    list_slack_slash_commands,
     lookup_slack_workflow_capability,
     read_slack_repo_context_file,
     search_official_operations_docs,
     search_slack_repo_context,
     summarize_slack_runtime_config,
+    validate_slack_slash_command,
 )
 from keystone_agents.tools.internal_data_tools import (
     _google_workspace_token_path,
@@ -5969,6 +5971,122 @@ def test_slack_repo_context_tools_are_read_only_and_secret_filtered(tmp_path: Pa
 
     with pytest.raises(ValueError):
         read_slack_repo_context_file(".env", repo_path=str(repo))
+
+
+def test_chief_of_staff_slash_command_catalog_tracks_native_workflow_runner(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "keystone-slack"
+    source = repo / "kni_integrations" / "workflow_runner.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        'COMMANDS = {"/kni-status": "status", "/kni-preprints-digest": "knowledge"}\n',
+        encoding="utf-8",
+    )
+    manifest = repo / "slack" / "kni-app-manifest.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "features:\n"
+        "  slash_commands:\n"
+        "    - command: /kni-status\n"
+        "      description: Check runtime status\n"
+        "    - command: /kni-preprints-digest\n"
+        "      description: Gather recent preprints\n"
+        "      usage_hint: digital phenotyping\n",
+        encoding="utf-8",
+    )
+
+    catalog = _payload(list_slack_slash_commands(repo_path=str(repo)))
+
+    assert catalog["commands"] == ["/kni-status", "/kni-preprints-digest"]
+    assert catalog["command_count"] == 2
+    assert catalog["command_details"][1] == {
+        "command": "/kni-preprints-digest",
+        "description": "Gather recent preprints",
+        "usage_hint": "digital phenotyping",
+    }
+    assert catalog["backend_only_aliases"] == ["/kni"]
+    assert catalog["execution_owner"] == "keystone-slack WorkflowRunner"
+
+
+def test_chief_of_staff_validates_complete_native_slash_command(tmp_path: Path) -> None:
+    repo = tmp_path / "keystone-slack"
+    source = repo / "kni_integrations" / "workflow_runner.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        'COMMANDS = {"/kni-preprints-digest": "knowledge"}\n',
+        encoding="utf-8",
+    )
+
+    valid = _payload(
+        validate_slack_slash_command(
+            "/kni-preprints-digest depression digital biomarkers",
+            repo_path=str(repo),
+        )
+    )
+    invalid = _payload(
+        validate_slack_slash_command("/kni-invented topic", repo_path=str(repo))
+    )
+
+    assert valid["supported"] is True
+    assert valid["command_text"] == (
+        "/kni-preprints-digest depression digital biomarkers"
+    )
+    assert valid["execute_in_tool"] is False
+    assert valid["configured_in_slack"] is False
+    assert invalid["supported"] is False
+    assert invalid["blocker"]
+
+
+def test_live_checkout_chief_catalog_covers_every_configured_slack_command() -> None:
+    slack_repo = Path(__file__).resolve().parents[2] / "keystone-slack"
+    if not slack_repo.is_dir():
+        pytest.skip("Sibling keystone-slack checkout is unavailable in clean CI.")
+
+    catalog = _payload(list_slack_slash_commands(repo_path=str(slack_repo)))
+    configured = set(catalog["commands"])
+    registered = set(catalog["backend_registered_commands"])
+    expected_configured = {
+        "/kni",
+        "/kni-airtable",
+        "/kni-approve",
+        "/kni-calendar",
+        "/kni-calendar-month",
+        "/kni-calendar-next-week",
+        "/kni-calendar-prior-week",
+        "/kni-calendar-today",
+        "/kni-calendar-tomorrow",
+        "/kni-clinical-ai-status",
+        "/kni-clinical-ai-update",
+        "/kni-doc",
+        "/kni-founder-brief",
+        "/kni-founder-brief-preview",
+        "/kni-founder-sheet",
+        "/kni-gmail",
+        "/kni-gmail-all",
+        "/kni-gmail-summarize",
+        "/kni-gmail-triage",
+        "/kni-gmail-triage-publish",
+        "/kni-knowledge",
+        "/kni-linkedin-opportunities",
+        "/kni-preprints-digest",
+        "/kni-psychpaperapp",
+        "/kni-psychpaperevalapp",
+        "/kni-repo",
+        "/kni-status",
+        "/kni-trello",
+        "/kni-trials-watch",
+        "/kni-web-opportunities",
+        "/kni-web-search",
+        "/kni-zotero-brief",
+        "/kni-zotero-search",
+    }
+
+    assert configured == expected_configured
+    assert configured <= registered
+    assert len(catalog["command_details"]) == len(configured)
+    assert all(item["description"] for item in catalog["command_details"])
+    assert "/kni-preprints-digest" in configured
 
 
 def test_runtime_summary_and_docs_catalog_are_capped_and_official(tmp_path: Path) -> None:

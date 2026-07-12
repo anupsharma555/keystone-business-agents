@@ -42,7 +42,10 @@ from keystone_agents.agents.business_research_analyst import (
 )
 from keystone_agents.agents.chief_of_staff import (
     build_chief_of_staff_agent,
+    build_chief_slack_command_resolver_agent,
+    resolve_high_confidence_chief_slack_command,
     run_chief_of_staff_sdk,
+    validate_chief_slack_command_resolution,
 )
 from keystone_agents.agents.gmail_triage import (
     build_gmail_priority_grouping_agent,
@@ -98,7 +101,11 @@ from keystone_agents.run import (
     run_typed_sdk_agent,
 )
 from keystone_agents.schemas.announcement_feed import AnnouncementFeedItem
-from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult, ChiefSpecialistToolInput
+from keystone_agents.schemas.chief_of_staff import (
+    ChiefOfStaffResult,
+    ChiefSlackCommandResolution,
+    ChiefSpecialistToolInput,
+)
 from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
 from keystone_agents.schemas.email_triage import EmailTriageResult, GmailPriorityGroupingResult
 from keystone_agents.schemas.operational_context import (
@@ -3111,6 +3118,157 @@ def test_fake_model_tool_call_executes_fixture_tool(monkeypatch: pytest.MonkeyPa
     tool_outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
     assert tool_outputs
     assert "dry-run" in str(tool_outputs[0].output)
+
+
+def test_chief_fake_model_selects_and_validates_native_slack_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    slack_repo = tmp_path / "keystone-slack"
+    runner_source = slack_repo / "kni_integrations" / "workflow_runner.py"
+    runner_source.parent.mkdir(parents=True)
+    runner_source.write_text(
+        'COMMANDS = {"/kni-preprints-digest": "knowledge"}\n',
+        encoding="utf-8",
+    )
+    manifest = slack_repo / "slack" / "kni-app-manifest.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "features:\n"
+        "  slash_commands:\n"
+        "    - command: /kni-preprints-digest\n"
+        "      description: Gather recent medRxiv preprints\n"
+        "      usage_hint: digital biomarkers\n",
+        encoding="utf-8",
+    )
+    command_text = "/kni-preprints-digest depression digital biomarkers"
+    payload = _chief_of_staff_payload(
+        intent="run a preprints digest for depression digital biomarkers",
+        summary="Run the requested native Keystone Slack preprints workflow.",
+        recommended_route={
+            "workflow_type": "slack-command",
+            "command_text": command_text,
+            "target_channel": "knowledge-hub",
+            "rationale": "The manifest description matches a recent preprints request.",
+            "requires_live_connector": True,
+            "requires_human_approval_before_post": True,
+        },
+    )
+    model = FakeModel(
+        outputs=[
+            [
+                _tool_call(
+                    "list_slack_slash_commands",
+                    {"repo_path": str(slack_repo)},
+                )
+            ],
+            [
+                _tool_call(
+                    "validate_slack_slash_command",
+                    {"command_text": command_text, "repo_path": str(slack_repo)},
+                )
+            ],
+            [_structured_message(payload)],
+        ]
+    )
+
+    result = _run_with_fake_model(
+        build_chief_of_staff_agent(),
+        model,
+        "do a preprints run for depression digital biomarkers",
+    )
+
+    assert isinstance(result.final_output, ChiefOfStaffResult)
+    assert result.final_output.recommended_route.workflow_type == "slack-command"
+    assert result.final_output.recommended_route.command_text == command_text
+    tool_outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert len(tool_outputs) == 2
+    assert "Gather recent medRxiv" in str(tool_outputs[0].output)
+    assert '"supported": true' in str(tool_outputs[1].output).lower()
+
+
+def test_compact_chief_slack_resolver_uses_one_tool_free_model_turn() -> None:
+    command_text = "/kni-preprints-digest depression digital biomarkers"
+    model = FakeModel(
+        outputs=[
+            [
+                _structured_message(
+                    {
+                        "status": "matched",
+                        "command_text": command_text,
+                        "rationale": "The preprints digest command matches the requested run.",
+                        "confidence": "high",
+                    }
+                )
+            ]
+        ]
+    )
+
+    result = _run_with_fake_model(
+        build_chief_slack_command_resolver_agent(),
+        model,
+        (
+            '{"request":"do a preprints run for depression digital biomarkers",'
+            '"configured_commands":[{"command":"/kni-preprints-digest",'
+            '"description":"Gather recent preprints",'
+            '"usage_hint":"digital phenotyping"}]}'
+        ),
+    )
+
+    assert isinstance(result.final_output, ChiefSlackCommandResolution)
+    assert result.final_output.command_text == command_text
+    assert len(model.calls) == 1
+    assert model.calls[0]["tool_names"] == []
+
+
+def test_compact_chief_resolver_rejects_model_invented_command() -> None:
+    resolution = ChiefSlackCommandResolution(
+        status="matched",
+        command_text="/kni-invented do something",
+        rationale="Invalid fake selection.",
+        confidence="high",
+    )
+
+    validated = validate_chief_slack_command_resolution(
+        resolution,
+        [
+            {
+                "command": "/kni-preprints-digest",
+                "description": "Gather recent preprints",
+                "usage_hint": "digital phenotyping",
+            }
+        ],
+    )
+
+    assert validated.status == "no_match"
+    assert validated.command_text == ""
+    assert validated.confidence == "low"
+
+
+def test_high_confidence_manifest_match_resolves_preprints_without_model() -> None:
+    resolved = resolve_high_confidence_chief_slack_command(
+        "Slack Chief of Staff, do a preprints run for depression digital biomarkers",
+        [
+            {
+                "command": "/kni-preprints-digest",
+                "description": "Gather recent medRxiv and arXiv items",
+                "usage_hint": "digital phenotyping",
+            },
+            {
+                "command": "/kni-web-search",
+                "description": "Headless web search through SearXNG",
+                "usage_hint": "recent psychiatry biomarkers",
+            },
+        ],
+    )
+
+    assert resolved is not None
+    assert resolved.command_text == (
+        "/kni-preprints-digest depression digital biomarkers"
+    )
+    assert resolved.confidence == "high"
 
 
 def test_gmail_fake_model_selects_attachment_draft_tool_for_explicit_ask(

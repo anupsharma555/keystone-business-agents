@@ -672,10 +672,12 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
     skills=AGENT_SKILL_NAMES["chief_of_staff"],
     tools=(
         "list_chief_of_staff_context_sources",
+        "list_slack_slash_commands",
         "summarize_slack_runtime_config",
         "search_slack_repo_context",
         "read_slack_repo_context_file",
         "lookup_slack_workflow_capability",
+        "validate_slack_slash_command",
         "search_official_operations_docs",
         "retrieve_chief_of_staff_memory",
         "list_local_context_sources",
