@@ -36,6 +36,7 @@ from keystone_agents.config import (
     with_cli_environment,
 )
 from keystone_agents.founder_profile import (
+    DEFAULT_FOUNDER_FIT_PROFILE_PATH,
     founder_profile_audit_payload,
     founder_search_context,
     load_founder_fit_profile,
@@ -136,10 +137,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--founder-fit-profile",
-        default="documents/founder_fit_profile.json",
+        default=(
+            str(DEFAULT_FOUNDER_FIT_PROFILE_PATH)
+            if DEFAULT_FOUNDER_FIT_PROFILE_PATH.is_file()
+            else None
+        ),
         help=(
             "Approved founder-fit JSON profile for search query planning and "
-            "opportunity-fit assessment (defaults to the repo's reviewed profile)."
+            "opportunity-fit assessment. The repo-local reviewed profile is used "
+            "automatically when present; clean checkouts continue without private "
+            "documents content."
         ),
     )
     parser.add_argument(

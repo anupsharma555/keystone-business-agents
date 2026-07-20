@@ -26,8 +26,9 @@ def test_founder_fit_profile_contexts_use_approval_flags() -> None:
     assert claims[0].source_id == "founder_fit_profile:founder_fit_test"
 
 
-def test_default_founder_profile_covers_expanded_opportunity_identity_context() -> None:
-    profile = load_founder_fit_profile("documents/founder_fit_profile.json")
+def test_sanitized_founder_profile_covers_expanded_opportunity_identity_context() -> None:
+    profile_path = "tests/fixtures/founder_fit_profile_approved.json"
+    profile = load_founder_fit_profile(profile_path)
     assert profile is not None
 
     context = founder_search_context(profile)
@@ -39,7 +40,7 @@ def test_default_founder_profile_covers_expanded_opportunity_identity_context() 
     assert "industry-sponsored collaborations and pilots" in context
     assert "Remote, virtual, or online opportunities are preferred for now." in context
 
-    audit = founder_profile_audit_payload("documents/founder_fit_profile.json", profile)
+    audit = founder_profile_audit_payload(profile_path, profile)
     assert audit["search_context_complete"] is True
     assert set(audit["search_context_fields"]) >= {
         "summary",

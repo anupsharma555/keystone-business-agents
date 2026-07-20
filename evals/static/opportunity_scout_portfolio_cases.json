@@ -1,0 +1,75 @@
+[
+  {
+    "id": "broad_remote_accessible_keystone_portfolio",
+    "prompt": "Find a broad range of current remote-accessible opportunities relevant to Keystone and its physician-scientist founder.",
+    "required_lanes": [
+      "conference_speaking",
+      "workshop_training",
+      "certification_professional_development",
+      "grant_fellowship",
+      "industry_collaboration",
+      "consulting_advisory",
+      "networking_community",
+      "contract_procurement"
+    ],
+    "minimum_verified_results": 1,
+    "requirements": [
+      "Use approved Keystone and founder fit context",
+      "Separate opportunity kind from clinical domain",
+      "Favor remote, virtual, online, or realistically accessible opportunities",
+      "Do not pad weak results"
+    ]
+  },
+  {
+    "id": "precise_current_grant_no_padding",
+    "prompt": "Find up to 3 active U.S. grants for behavioral-health AI evaluation that a small consulting company could plausibly pursue; return none if eligibility or current status cannot be verified.",
+    "required_lanes": ["grant_funding"],
+    "minimum_verified_results": 0,
+    "requirements": [
+      "Require a specific program URL",
+      "Require current status or cycle timing",
+      "Preserve eligibility uncertainty",
+      "Reject expired and generic search pages"
+    ]
+  },
+  {
+    "id": "precise_remote_advisory_roles",
+    "prompt": "Find up to 5 current remote U.S. consulting, fractional, or advisory roles relevant to a physician-scientist psychiatrist; exclude clinical-care, AI tutor, unpaid, onsite, and stale roles.",
+    "required_lanes": ["consulting_advisory"],
+    "minimum_verified_results": 0,
+    "requirements": [
+      "Apply every hard filter before ranking",
+      "Preserve posting recency and active status",
+      "Return exact matches separately from adjacent leads",
+      "Allow zero results"
+    ]
+  },
+  {
+    "id": "current_workshops_certifications_networking",
+    "prompt": "Find current remote workshops, certifications, professional-development programs, and networking communities in clinical AI, psychiatry, or neuroinformatics.",
+    "required_lanes": [
+      "workshop_training",
+      "certification_professional_development",
+      "networking_community"
+    ],
+    "minimum_verified_results": 1,
+    "requirements": [
+      "Return a specific program or event rather than a directory",
+      "Verify current enrollment, registration, membership, or cycle status",
+      "Explain physician-scientist and Keystone relevance",
+      "Reject closed or outdated pages"
+    ]
+  },
+  {
+    "id": "industry_collaboration_and_consulting",
+    "prompt": "Find current industry-sponsored collaboration, pilot, advisory-board, workshop-facilitation, or consulting opportunities relevant to Keystone clinical AI and behavioral-health work.",
+    "required_lanes": ["industry_collaboration", "consulting_advisory"],
+    "minimum_verified_results": 1,
+    "requirements": [
+      "Require an actionable external partner or contact path",
+      "Distinguish an active need from general company activity",
+      "Use source-visible evidence",
+      "Do not generate outreach"
+    ]
+  }
+]
