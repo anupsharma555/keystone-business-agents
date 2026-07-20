@@ -21,6 +21,9 @@ from keystone_agents.tools.search_provider import build_search_provider
 from keystone_agents.tools.website_extraction_tool import (
     WebsiteExtractionError,
     extract_website_content,
+    extract_website_content_with_fallbacks,
+    website_extraction_budget,
+    website_extraction_page_profile,
 )
 
 DEFAULT_ZOTERO_IMPORT_CACHE = Path(".cache/zotero-import")
@@ -252,6 +255,39 @@ def build_zotero_article_research_brief(
     return brief, paragraphs
 
 
+def list_zotero_cached_item_metadata(
+    *,
+    limit: int = 10,
+    item_type: str = "",
+    cache_dir: Path | None = None,
+) -> list[dict[str, str]]:
+    """Return a bounded deterministic inventory of readable cached Zotero items."""
+
+    bounded_limit = min(max(int(limit or 10), 1), 25)
+    clean_item_type = str(item_type or "").strip().lower()
+    cache_path = cache_dir or _zotero_cache_dir()
+    results: list[dict[str, str]] = []
+    for item in _load_items(cache_path):
+        data = _item_data(item)
+        title = _clean_text(data.get("title"))
+        current_type = _clean_text(data.get("itemType"))
+        if not title or (clean_item_type and current_type.lower() != clean_item_type):
+            continue
+        results.append(
+            {
+                "item_key": _clean_text(data.get("key")),
+                "title": title,
+                "item_type": current_type or "zotero_item",
+                "date": _clean_text(data.get("date")),
+                "doi": _clean_text(data.get("DOI")),
+                "url": _source_url(data),
+            }
+        )
+        if len(results) >= bounded_limit:
+            break
+    return results
+
+
 def build_zotero_live_source_context(
     brief: ResearchBrief,
     *,
@@ -274,6 +310,7 @@ def build_zotero_live_source_context(
         "exactly when citing facts.",
     ]
     notes: list[str] = []
+    extraction_budget = website_extraction_budget()
     for source in brief.sources[:max_sources]:
         lines.extend(
             [
@@ -305,11 +342,20 @@ def build_zotero_live_source_context(
         if not live:
             lines.append("Extracted text: not requested; only local Zotero metadata is available.")
             continue
+        if (
+            website_extraction_page_profile(source.url) == "structured_api_preferred"
+            and enrichment.structured_facts
+        ):
+            lines.append("Extraction status: skipped; structured source API evidence preferred.")
+            continue
         try:
-            extraction = extract_website_content(
+            extraction = extract_website_content_with_fallbacks(
                 source.url,
                 company_name=brief.target_name,
+                guardrail_context="public_web_source",
                 live=True,
+                budget=extraction_budget,
+                extractor=extract_website_content,
             )
         except (WebsiteExtractionError, ValueError, RuntimeError) as exc:
             message = f"Page extraction failed for {source.url}: {exc}"
