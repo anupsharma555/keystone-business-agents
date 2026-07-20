@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from datetime import date
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -48,6 +49,7 @@ def _select_candidate(
     *,
     query: str,
     max_messages: int,
+    today: date | None = None,
 ) -> tuple[dict[str, Any], EmailCalendarCandidate, int]:
     summaries = gmail.search_message_summaries(query=query, max_results=max_messages)
     inspected = 0
@@ -62,6 +64,7 @@ def _select_candidate(
             body=str(message.get("normalized_body") or message.get("body") or ""),
             sender_email=str(message.get("from") or ""),
             recipient_text=str(message.get("to") or ""),
+            today=today,
         )
         if candidate.complete:
             return message, candidate, inspected
@@ -75,6 +78,7 @@ def execute_joined_lifecycle(
     query: str,
     max_messages: int,
     calendar_id: str,
+    today: date | None = None,
 ) -> dict[str, Any]:
     suffix = uuid4().hex[:10]
     approval = f"operator-command:l174-01:{suffix}"
@@ -90,6 +94,7 @@ def execute_joined_lifecycle(
             gmail,
             query=query,
             max_messages=max_messages,
+            today=today,
         )
         title = f"{TEST_MARKER} {suffix} {candidate.title}"[:240]
         create = create_google_calendar_event_impl(
