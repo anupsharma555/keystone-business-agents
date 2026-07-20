@@ -147,6 +147,88 @@ def infer_finance_expense_receipt_target(text: object) -> FinanceExpenseReceiptT
     )
 
 
+def resolve_finance_expense_receipt_target(
+    text: object,
+    *,
+    manual_plan: object | None = None,
+) -> FinanceExpenseReceiptTarget | None:
+    """Resolve a receipt target from the semantic plan, with heuristic fallback.
+
+    A live LLM plan is authoritative for whether this is an Airtable expense
+    operation and which expense table it targets. Raw text is used only to
+    recover a selected local attachment path. The legacy phrase recognizer is
+    retained solely for dry-run or planner-unavailable execution.
+    """
+
+    plan = _manual_plan_mapping(manual_plan)
+    if str(plan.get("source") or "") != "llm":
+        return infer_finance_expense_receipt_target(text)
+    if str(plan.get("provider_system") or "") != "airtable":
+        return None
+    if str(plan.get("intent") or "") not in {
+        "business_system_write",
+        "context_lookup",
+    }:
+        return None
+
+    table = _semantic_expense_table(plan)
+    if not table:
+        return None
+    operations = [
+        str(item or "").strip().lower()
+        for item in (plan.get("provider_operations") or [])
+        if str(item or "").strip()
+    ]
+    paths = _local_receipt_paths(str(text or ""))
+    if not paths and "attach" not in operations:
+        return None
+
+    mutation_operations = [item for item in operations if item in {"create", "update"}]
+    operation = (
+        "update"
+        if "update" in mutation_operations and "create" not in mutation_operations
+        else "create"
+        if "create" in mutation_operations
+        else "read"
+    )
+    return FinanceExpenseReceiptTarget(
+        base_alias=FINANCE_TAX_TRACKER_BASE_ALIAS,
+        base_name=FINANCE_TAX_TRACKER_BASE_NAME,
+        table=table,
+        operation=operation,
+        receipt_local_path=paths[0] if paths else "",
+    )
+
+
+def _manual_plan_mapping(value: object | None) -> Mapping[str, object]:
+    if isinstance(value, Mapping):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        payload = model_dump(mode="python")
+        if isinstance(payload, Mapping):
+            return payload
+    return {}
+
+
+def _semantic_expense_table(plan: Mapping[str, object]) -> str:
+    candidates = [
+        str(plan.get("primary_target") or ""),
+        *[
+            str(item or "")
+            for item in (plan.get("required_entities") or [])
+            if str(item or "").strip()
+        ],
+    ]
+    for candidate in candidates:
+        normalized = re.sub(r"[^a-z0-9]+", " ", candidate.lower()).strip()
+        if normalized == "business expenses" or normalized.endswith(" business expenses"):
+            return "Business Expenses"
+        if normalized == "personal expenses" or normalized.endswith(" personal expenses"):
+            return "Personal Expenses"
+    return ""
+
+
 def finance_expense_receipt_provider_context(
     target: FinanceExpenseReceiptTarget,
 ) -> list[dict[str, str]]:
@@ -437,7 +519,14 @@ def _extract_local_artifact_text(path: Path) -> tuple[str, str, str]:
         except Exception as exc:  # pragma: no cover - optional dependency fallback
             return "", "pypdf", f"{type(exc).__name__}: {exc}"
     if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
-        tesseract = shutil.which("tesseract")
+        tesseract = _resolve_local_executable(
+            os.getenv("KEYSTONE_TESSERACT_COMMAND", "tesseract"),
+            fallback_paths=(
+                "/opt/homebrew/bin/tesseract",
+                "/usr/local/bin/tesseract",
+                "/usr/bin/tesseract",
+            ),
+        )
         if not tesseract:
             return "", "", "image OCR requires tesseract or live model image input"
         try:
@@ -486,7 +575,13 @@ def _vendor_from_text(text: str) -> str:
         suffix = r"(?:Inc\.|Inc|LLC|Ltd\.|Ltd|Corporation|Corp\.|Corp|Company)"
         match = re.search(rf"\b([A-Z][A-Za-z0-9 &'.,-]{{1,80}}?\b{suffix})(?:\s|$)", clean)
         if match:
-            return match.group(1).strip()
+            vendor = match.group(1).strip()
+            return re.sub(
+                r"^(?:Receipt|Invoice)\s+from\s+",
+                "",
+                vendor,
+                flags=re.I,
+            ).strip()
     return ""
 
 
@@ -557,10 +652,19 @@ def _money_after_label(text: str, label: str) -> str:
 
 
 def _total_from_text(text: str) -> tuple[str, str]:
-    match = re.search(r"\bTotal\b\s+(?:(USD|CAD|EUR|GBP)\s+)?\$?([0-9][0-9,]*\.?\d*)", text, re.I)
+    match = re.search(
+        r"\b(?:Grand\s+Total|Amount\s+Paid|Total\s+Paid|Total)\b"
+        r"\s+(?:(USD|CAD|EUR|GBP)\s+)?\$?([0-9][0-9,]*\.?\d*)",
+        text,
+        re.I,
+    )
     if not match:
         return "", ""
-    return _normalize_money(match.group(2)), (match.group(1) or "").upper()
+    currency = (match.group(1) or "").upper()
+    if not currency:
+        currency_match = re.search(r"\b(USD|CAD|EUR|GBP)\b", text, re.I)
+        currency = currency_match.group(1).upper() if currency_match else ""
+    return _normalize_money(match.group(2)), currency
 
 
 def _payment_summary_from_text(text: str) -> str:

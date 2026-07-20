@@ -8,6 +8,87 @@ These cases are not all automated yet. Treat them as acceptance targets to
 convert into pytest fixtures, static eval rows, local JSONL evals, or live smoke
 tests as each capability matures.
 
+## Shared Natural-Ask Instruction Following
+
+All natural-language entrypoints must preserve the raw request plus the
+Orchestrator's typed interpretation of output constraints through specialist
+synthesis and final rendering. The specialist LLM owns the substantive answer.
+Deterministic helpers may measure objective requirements, such as exact or
+maximum word counts, sentence counts, item ranges, required sections, forbidden
+phrases, visible source URLs, and em-dash exclusions, but must not author or
+truncate the answer. A failed measurement permits at most one bounded,
+tool-free LLM repair; a second failure blocks instead of silently publishing a
+noncompliant response.
+
+Exercise the same contract across Business Research, Opportunity Scout, Gmail
+Triage, Outreach Composer, Chief of Staff, and context-specialist responses.
+For draft asks, validate the canonical draft body independently from Slack or
+CLI wrapper metadata. Safety, approval, source-attribution, and no-send gates
+remain authoritative.
+
+### Semantic-equivalence acceptance
+
+`evals/static/semantic_routing_variations.json` holds five ordinary phrasings
+for each of five goals: marked Airtable, Google Docs, and Gmail lifecycles;
+Opportunity Scout discovery; and Chief of Staff operational prioritization.
+The forms include direct and delegated asks, passive voice, questions,
+object-first wording, and lifecycle shorthand.
+
+`tests/test_semantic_routing_variations.py` checks that a correct LLM planner
+interpretation survives explicit-agent advice, fallback-plan merging, and the
+direct single-owner lifecycle gate without a phrase-specific routing branch.
+This is an offline control-plane acceptance test. It proves that Python does not
+veto an equivalent interpretation; it does not prove that the live model will
+produce the correct interpretation for every paraphrase. Live paraphrase
+quality remains a separately budgeted Slack acceptance check.
+
+For WorkItem/LangGraph execution, the same interpreted `constraints` list must
+be copied into the typed context pack for Business Research, Opportunity Scout,
+Outreach Composer, and Gmail Triage. The WorkItem route must not silently lose
+hard filters, no-send/no-write boundaries, or other LLM-interpreted constraints
+that a direct route would retain. Multi-provider thread referents must remain a
+clarification until the live planner or operator resolves one source object;
+the deterministic fallback must not choose the first provider name in history.
+
+Thread compaction must retain chronological order, the newest eight messages,
+the newest five prior runs, and both the root and newest tail of an oversized
+transcript. Raw Slack message fields (`ts`, `user_id`, and `text`) must normalize
+into the planner's compact identity/source/summary shape instead of becoming
+empty objects. Record counts and dropped-oldest/retained sizes in a redacted
+compaction receipt; never include private message content in the receipt.
+
+For a continuing WorkItem, bounded planner context must also include the
+canonical WorkItem route/status, prior request, exact target name/object
+type/external ID, up to three selected artifact identities, and the current
+next action. This identity expansion must survive when a Slack context file is
+also present. Do not expose arbitrary WorkItem metadata, provider payloads,
+command hints, draft bodies, or unselected artifacts.
+
+Explicit negative clauses must also survive as verbatim planner constraints:
+for example, `do not send`, `without modifying Zotero`, `never post`, and
+`no outreach or CRM write`. The fallback may copy and bound these clauses, but
+must not use them as an intent or owner classifier. LLM plan merging must not
+drop them, and the shared WorkItem context-pack constraint field must carry them
+to the specialist.
+
+### Slack attachment transport acceptance
+
+An ask that explicitly depends on a selected Slack attachment must not enter
+Orchestrator planning, model execution, a WorkItem, or a provider tool unless
+the attachment exists as readable local bytes and matches both the bridge-
+supplied SHA-256 checksum and any nonzero Slack byte-size metadata. A path plus
+a checksum-shaped string is not sufficient evidence.
+
+The admission result must distinguish no attachment metadata from metadata-only,
+missing, checksum-mismatched, and size-mismatched local files. It must expose a
+typed operator-readable blocker, retain the same raw request and selected
+context path for retry, omit private Slack file URLs, and tell the bridge to
+materialize the authenticated file rather than telling the operator to rephrase
+the ask. A selected message may still proceed when the request explicitly says
+to use Slack text only and ignore attachments. These checks are evidence-
+sufficiency gates; they must not select the agent, provider, operation, or
+approval state.
+
 ## Structured Spec Model
 
 Replacement live-LLM prompts from `artifacts/keystone_business_agents_test_prompts.md`
@@ -155,6 +236,14 @@ XX-2 hardening notes from the April 2026 live run:
 
 ## Agent Ask Matrix: Diverse vs Deterministic
 
+The architecture-level companion is executable with
+`npm run test:diverse-asks:no-live`. It keeps one diverse and one deterministic
+row per major agent, validates route/context/tool/side-effect/stop/output
+coverage, and runs every referenced proof node. All twelve rows now have
+executable offline behavioral coverage. The runner claims an offline behavioral
+pass only when all twelve remain automated and every proof succeeds; it never
+converts that result into a live/provider acceptance claim.
+
 Use this matrix when evaluating the post-architecture-change agent set. Each
 agent should have coverage for both diverse/open-ended Slack-style requests and
 deterministic/exact requests. Do not expand intent enums just to cover these
@@ -178,6 +267,7 @@ the executable contract.
 | Diverse / open-ended | `review the @KNI architecture and recommend next implementation steps`; `why did this response not match my Slack request?`; `what is the state of KNI and what should we improve next?` | Reads the raw request first, reasons before deterministic routing, keeps explicit agent calls advise-only unless blocked, and chooses capabilities rather than phrase lanes. | `OR-1` to `OR-5`, CLI `ask` tests, Slack bridge backlog checks. Local dry-run manager-loop coverage: `test_orchestrator_test_pack_prompts_enter_safe_specialist_manager_loop`. |
 | Deterministic / exact | `@KNI business research analyst research Lindus Health`; `continue this WorkItem`; `send this now`; `route this but do not run live tools`. | Produces a stable route/result, blocks send/write requests, preserves approval gates, and passes a compact preflight memo to specialists. | Orchestrator preflight tests, send-boundary tests, WorkItem route selection tests. |
 | Prior Slack regression shapes | Architecture review request incorrectly answered with `2026 tax payments`; repeated `same response`; `should we run it again?`; Slack-history review ask. | Stale or unrelated prior context must not override the current request; wrong-lane output is caught by Orchestrator review. | Covered by `test_orchestrator_review_flags_wrong_response_diagnostic_wrong_lane`, `test_orchestrator_review_allows_wrong_response_diagnostic_answer`, and `test_wrong_response_diagnostics_do_not_trigger_tax_payment_shortcut`. |
+| Explicit specialist ownership mismatch | `@KNI OS, who is Abridge and summarize the company in 20 words.` plus wrong-agent asks for opportunity discovery, Gmail triage, outreach drafting, Slack operations, and named business-system context. Also run the same provider-free supplied-fact formatting ask across each named specialist with nuisance context such as `meeting`, `now`, `review`, `test`, and a provider name inside the facts. | Preserve the named specialist as `requested_agent` for audit. Reassign only when semantic intent agrees with bounded positive capability evidence: an operation bound to the provider/object, a capability-specific artifact, or a genuine multi-owner workflow. Ambiguous asks, supplied facts, negative constraints, time pressure, and generic operational words stay with the requested specialist. Genuine funding, partnership, pilot, role, and other actionable opportunity asks remain with Scout. | `test_manual_plan_delegates_wrong_explicit_specialist_to_clear_task_owner`, `test_incidental_time_pressure_and_operational_facts_never_change_named_owner`, `test_owner_reconciliation_requires_bounded_slack_operation_evidence`, `test_manual_plan_route_rejects_unbounded_named_owner_override`, and the direct supplied-response regressions. |
 
 Expanded scenario queue:
 
@@ -251,6 +341,14 @@ Expanded scenario queue:
 
 Expanded scenario queue:
 
+The executable portfolio companion is
+`evals/static/opportunity_scout_portfolio_cases.json`. It covers broad
+remote-accessible discovery plus precise grants, remote advisory work,
+workshops/certifications/networking, and industry collaboration. Offline tests
+must prove lane planning, opportunity-kind normalization, and stale/closed
+rejection; bounded live tests must separately prove current-source recall and
+human usefulness.
+
 - Diverse: `Find good opportunities for me in digital health and state the assumptions you used.`
 - Diverse: `Find behavioral health AI partners that look relevant for Keystone consulting or advisory conversations.`
 - Diverse: `Look for advisory opportunities from this Slack context and separate exact matches from adjacent leads.`
@@ -303,10 +401,10 @@ or a generic unsupported-route message when a specialist path is available.
 | --- | --- | --- | --- | --- |
 | Orchestrator / Planner | A plan, route rationale, safe next actions, and specialist handoff context when the user asks for broad workflow help. | A stable route or continuation decision that preserves requested specialist, WorkItem id, approval state, and compact preflight context. | A targeted clarification for missing WorkItem/thread/artifact id, or an Orchestrator plan artifact with downstream blockers when some safe stages cannot run. | Must attach `search_web` and pass compact preflight/context packs to child agents; current dry preflight probe returns `orchestrator_plan_summary` for planning-first asks. |
 | Chief of Staff | An operational synthesis from Slack/thread/runtime/backlog context with prioritized next actions and no external side effects. | An audit, blocker list, or internal draft artifact that names owners, stale schedules, unsafe writes, or next approvals. | A request for selected thread/run/automation scope, not a fallback to Business Research or generic clarification. | Must have Slack/context readers, WorkItem inspection, automation inspection, local repo context, memory, and `search_web` for policy or external context checks. |
-| Gmail Triage Agent | Prioritized email follow-up summary, action items, draft-only recommendations, and context/date boundaries. | A draft reply, label plan, or triage action plan that blocks sends and live writes until approval and message ids are present. | `gmail_context_required`, missing thread/message id, missing live Gmail scope, or missing write approval. | Must have Gmail read tools, draft/label tools behind live flags, approval gates, style profile, and `search_web` only for bounded external context, not message reconstruction. |
+| Gmail Triage Agent | Prioritized email follow-up summary, action items, draft-only recommendations, and context/date boundaries. A deterministic fallback must group every supplied sanitized message exactly once when model/provider access is unavailable. | A draft reply, label plan, or triage action plan that blocks sends and live writes until approval and message ids are present. | `gmail_context_required`, missing thread/message id, missing live Gmail scope, or missing write approval. | Must have Gmail read tools, draft/label tools behind live flags, approval gates, style profile, and `search_web` only for bounded external context, not message reconstruction. |
 | Business Research Analyst | Source-backed company/topic synthesis with facts, inferences, unknowns, Keystone relevance, and source ids. | Exact requested sections, comparison criteria, source-bundle-only behavior, and citation coverage for every factual claim. | `source_bundle_required`, insufficient evidence, missing company/entity target, or source conflict note. | Must have `search_web`, website extraction, source/claim structuring, browser diagnostics fallback, CRM/contact readers, and fixture/live mode separation. |
 | Opportunity Scout | Assumption-stated opportunity discovery with exact vs adjacent matches, source-backed ranking, and no weak padding. | Hard-filtered result set, filter-removal explanation, CRM-ready preview only for write requests, and no CRM mutation without approval. | No-result or `weak_adjacent_matches` with removed-filter details; CRM write approval blocker for save requests. | Must have `search_web`, opportunity source/extraction tools, deterministic hard filters, dedup/memory, scoring helpers, and write-gated CRM/Airtable handoff tools. |
-| Outreach Composer | Draft options only from approved facts, with tone/channel fit, missing-evidence notes, and source/fact references. | Channel-specific drafts that preserve length/style constraints and block send/publish wording. | Approved-context blocker, missing recipient/channel/facts/source ids, or no-send approval blocker. | Must have approved context loaders, unsupported-claim checks, style retrieval, approval queue, channel renderers, and `search_web` only for bounded verification when explicitly allowed. |
+| Outreach Composer | Draft options only from approved facts, with tone/channel fit, missing-evidence notes, and source/fact references. | Channel-specific drafts that preserve length/style constraints and block send/publish wording. Selected-draft revisions must retain typed draft identity, recipient, exact CTA when requested, and the explicit word ceiling. | Approved-context blocker, missing recipient/channel/facts/source ids, selected-draft constraint drift, or no-send approval blocker. | Must have approved context loaders, unsupported-claim checks, style retrieval, approval queue, channel renderers, and `search_web` only for bounded verification when explicitly allowed. |
 
 Tool-readiness note: the registry and local tool policy currently declare
 `search_web` for Orchestrator, Chief of Staff, Gmail Triage, Business Research
@@ -488,6 +586,29 @@ Latest result:
 - Next Step: keep the `--improvement-case br-1` path as the repeatable live
   smoke test with `--live-search --no-dry-run`, and improve source ranking or
   page-fetch enrichment only if source quality becomes a blocking issue.
+
+### BR-1A: Exact Natural-Language Summary Contract
+
+Prompt:
+
+> Who is Abridge, and summarize the company in 20 words.
+
+Check:
+
+- Orchestrator interprets this as an exact 20-word answer, not a generic brief.
+- Business Research writes the answer itself from source-backed evidence.
+- Visible source references may follow outside the counted answer.
+- The standard detailed-summary template does not override the narrower ask.
+- An objective validator measures the answer and permits one tool-free LLM
+  repair; it never truncates or deterministically rewrites the answer.
+- The same typed constraint contract remains available to other specialist
+  routes rather than being implemented as an Abridge-specific branch.
+
+Likely coverage target:
+
+- Manual request planning, focused-brief schema and prompt, shared
+  instruction-following validator/repair, direct-agent CLI rendering, and
+  Slack acceptance evidence.
 
 ### BR-2: Conflicting Sources
 

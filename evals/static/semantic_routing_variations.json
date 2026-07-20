@@ -121,6 +121,196 @@
       ]
     },
     {
+      "id": "calendar_event_create",
+      "expected": {
+        "target_agent": "chief_of_staff",
+        "intent": "business_system_write",
+        "provider": "google_calendar",
+        "provider_operations": [
+          "create",
+          "verify"
+        ],
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "internal_write_approval_required",
+        "primary_target": "Board prep",
+        "target_type": "business_system_context",
+        "task_objective": "business_system_write",
+        "expected_artifact_type": "business_system_write_plan",
+        "objective": "Create and verify the Board prep event on Google Calendar for July 23, 2026.",
+        "constraints": [
+          "July 23, 2026",
+          "configured primary calendar",
+          "provider read-back required"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI CoS add Board prep to my calendar for July 23, 2026."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI Board prep should appear on my schedule for July 23, 2026."
+        },
+        {
+          "form": "polite question",
+          "prompt": "@KNI Could you make sure Board prep is on my calendar July 23, 2026?"
+        },
+        {
+          "form": "object first",
+          "prompt": "@KNI Board prep, July 23, 2026: please put that on my schedule."
+        },
+        {
+          "form": "shorthand",
+          "prompt": "@KNI CoS Board prep — July 23, 2026 — on my calendar please."
+        }
+      ]
+    },
+    {
+      "id": "calendar_event_verification",
+      "expected": {
+        "target_agent": "chief_of_staff",
+        "intent": "context_lookup",
+        "provider": "google_calendar",
+        "provider_operations": [
+          "search",
+          "read",
+          "verify"
+        ],
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "Board prep",
+        "target_type": "business_system_context",
+        "task_objective": "context_lookup",
+        "expected_artifact_type": "context_summary",
+        "objective": "Verify whether the Board prep event exists on Google Calendar for July 23, 2026.",
+        "constraints": [
+          "July 23, 2026",
+          "read only",
+          "provider result required"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI CoS check whether Board prep is on my calendar for July 23, 2026."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI Board prep is supposed to be on the calendar July 23, 2026; verify that it is there."
+        },
+        {
+          "form": "question",
+          "prompt": "@KNI Is Board prep on my calendar now for July 23, 2026?"
+        },
+        {
+          "form": "object first",
+          "prompt": "@KNI Board prep on July 23, 2026 — does that event exist?"
+        },
+        {
+          "form": "polite question",
+          "prompt": "@KNI Could you tell me if the July 23 Board prep entry is actually on my schedule?"
+        }
+      ]
+    },
+    {
+      "id": "gmail_selected_message_read",
+      "expected": {
+        "target_agent": "gmail_triage",
+        "intent": "gmail_triage",
+        "provider": "gmail",
+        "provider_operations": [
+          "search",
+          "read"
+        ],
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "Product Leader",
+        "target_type": "gmail_thread",
+        "task_objective": "gmail_triage",
+        "expected_artifact_type": "gmail_triage_report",
+        "gmail_query": "subject:\"Product Leader\"",
+        "objective": "Find and summarize the Gmail thread with Product Leader in the subject.",
+        "constraints": [
+          "read only",
+          "no Gmail draft",
+          "no send"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Gmail find the message with Product Leader in the subject and summarize it."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI The Product Leader email needs to be found and summarized without changing Gmail."
+        },
+        {
+          "form": "question",
+          "prompt": "@KNI What does the email titled Product Leader say?"
+        },
+        {
+          "form": "object first",
+          "prompt": "@KNI Product Leader email: give me the important points."
+        },
+        {
+          "form": "chief delegation",
+          "prompt": "@KNI CoS check Gmail for Product Leader and tell me what matters; no draft or send."
+        }
+      ]
+    },
+    {
+      "id": "airtable_personal_receipt",
+      "expected": {
+        "target_agent": "airtable_context_agent",
+        "intent": "business_system_write",
+        "provider": "airtable",
+        "provider_operations": [
+          "create",
+          "attach",
+          "verify"
+        ],
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "internal_write_approval_required",
+        "primary_target": "Personal Expenses",
+        "target_type": "business_system_context",
+        "task_objective": "business_system_write",
+        "expected_artifact_type": "business_system_write_plan",
+        "required_entities": [
+          "2026 Finance & Tax Tracker"
+        ],
+        "objective": "Create and verify one Personal Expenses record in Airtable from the selected receipt and attach that receipt.",
+        "constraints": [
+          "selected receipt only",
+          "one Personal Expenses record",
+          "attachment read-back required"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Airtable add this receipt as one personal expense and keep the receipt attached."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI This receipt should be recorded under Personal Expenses with the file attached."
+        },
+        {
+          "form": "polite question",
+          "prompt": "@KNI Could CoS file this as a personal expense in Airtable and attach the image?"
+        },
+        {
+          "form": "object first",
+          "prompt": "@KNI Personal expense receipt: put the details in the tracker and keep the file with the record."
+        },
+        {
+          "form": "shorthand",
+          "prompt": "@KNI CoS this receipt belongs in Personal Expenses, including the attachment."
+        }
+      ]
+    },
+    {
       "id": "opportunity_discovery",
       "expected": {
         "target_agent": "opportunity_scout",

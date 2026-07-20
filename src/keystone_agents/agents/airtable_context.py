@@ -7,7 +7,9 @@ from collections.abc import Mapping
 from typing import Any
 
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
-from keystone_agents.finance_expense_receipts import infer_finance_expense_receipt_target
+from keystone_agents.finance_expense_receipts import (
+    resolve_finance_expense_receipt_target,
+)
 from keystone_agents.guardrails import keystone_guardrails
 from keystone_agents.schemas.operational_context import AirtableContextResult
 from keystone_agents.sdk import (
@@ -34,6 +36,7 @@ def _airtable_context_tools(
     *,
     tool_tier: str | int | None = None,
     request_text: str = "",
+    manual_plan: object | None = None,
 ) -> list[Any]:
     tools: list[Any] = [
         airtable_get_base_schema,
@@ -49,11 +52,23 @@ def _airtable_context_tools(
     if tool_tier is not None:
         tools = filter_tools_for_tier("airtable_context_agent", tools, tool_tier)
     normalized = " ".join(str(request_text or "").lower().split())
+    plan_source = str(getattr(manual_plan, "source", "") or "")
+    provider_operations = {
+        str(item or "").strip().lower()
+        for item in (getattr(manual_plan, "provider_operations", []) or [])
+        if str(item or "").strip()
+    }
     marked_lifecycle = bool(
         re.search(r"\bkba_test_record(?:_[a-z0-9]+)*\b", normalized)
-        and re.search(r"\b(?:add|create|make|write|insert)\b", normalized)
-        and re.search(r"\b(?:update|change|modify|revise|edit|set)\b", normalized)
-        and re.search(r"\b(?:delete|remove|clean\s*up)\b", normalized)
+        and (
+            {"create", "update", "delete"} <= provider_operations
+            if plan_source == "llm"
+            else (
+                re.search(r"\b(?:add|create|make|write|insert)\b", normalized)
+                and re.search(r"\b(?:update|change|modify|revise|edit|set)\b", normalized)
+                and re.search(r"\b(?:delete|remove|clean\s*up)\b", normalized)
+            )
+        )
     )
     if marked_lifecycle:
         return [
@@ -61,7 +76,10 @@ def _airtable_context_tools(
             for tool in tools
             if getattr(tool, "name", "") == "airtable_test_record_lifecycle"
         ]
-    receipt_target = infer_finance_expense_receipt_target(request_text)
+    receipt_target = resolve_finance_expense_receipt_target(
+        request_text,
+        manual_plan=manual_plan,
+    )
     if receipt_target is not None and receipt_target.operation == "create":
         # This composite tool owns artifact reading, live schema mapping, the
         # single record create, attachment upload, and provider read-back. Do
@@ -96,6 +114,7 @@ def build_airtable_context_agent(
     model: str | None = None,
     *,
     request_text: str = "",
+    manual_plan: object | None = None,
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
@@ -123,7 +142,11 @@ def build_airtable_context_agent(
         instructions=instructions,
         output_type=AirtableContextResult,
         tools=(
-            _airtable_context_tools(tool_tier=tool_tier, request_text=request_text)
+            _airtable_context_tools(
+                tool_tier=tool_tier,
+                request_text=request_text,
+                manual_plan=manual_plan,
+            )
             if attach_tools
             else []
         ),

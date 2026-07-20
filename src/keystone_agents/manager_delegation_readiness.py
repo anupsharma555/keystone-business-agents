@@ -28,7 +28,7 @@ MANAGER_DELEGATION_READINESS_CASES: tuple[ManagerDelegationReadinessCase, ...] =
             "event, and keep its provider ID internal."
         ),
         manager_entry_nodeids=(
-            "tests/test_cli.py::test_chief_calendar_fast_path_resolves_natural_update_reference",
+            "tests/test_cli.py::test_typed_calendar_executor_resolves_natural_update_reference",
         ),
         provider_lifecycle_nodeids=(
             "tests/test_google_calendar_tool.py::"

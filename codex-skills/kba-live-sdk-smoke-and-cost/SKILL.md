@@ -15,6 +15,10 @@ Default to fixture/dry-run validation. Run live SDK calls only when the user
 explicitly asks for live model execution or the task is specifically about live
 SDK smoke/cost behavior.
 
+Pair this repo-local skill with `$codex-general-api-cost-aware-agent-testing`
+for every approved live batch. Use `$kba-operational-validation` when the live
+run must also be accepted in Slack.
+
 ## First Reads
 
 Read the smallest set that matches the task:
@@ -59,6 +63,8 @@ Use this workflow for requests like:
    avoid hot-loop retries.
 6. Inspect usage, cost, request-cache, trace, and WorkItem `workflow_sdk_usage`
    events when claiming a live run was measured.
+7. Record the configured request ceiling, conservative preflight estimate, and
+   actual requests made separately. A blocked estimate is not consumption.
 
 ## Decision Rules
 
@@ -71,6 +77,8 @@ Use this workflow for requests like:
   deliberately changes direction.
 - Do not claim exact provider billing cost unless provider-reported or
   calculated from an explicitly maintained pricing table.
+- Do not describe `--max-openai-requests` as a target or expected call count;
+  it is a stop ceiling.
 
 ## Verification
 

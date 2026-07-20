@@ -1179,6 +1179,11 @@ _TRACE_DIAGNOSTIC_DEFINITIONS: dict[str, dict[str, str]] = {
         "severity": "warn",
         "detail": "Older run summary lacks compact timing/model/tool/retrieval diagnostics.",
     },
+    "missing_execution_provenance": {
+        "label": "Missing execution provenance",
+        "severity": "fail",
+        "detail": "Run summary lacks the resolved fixture/live SDK/live search mode.",
+    },
     "missing_model_metadata": {
         "label": "Missing model metadata",
         "severity": "warn",
@@ -1188,6 +1193,11 @@ _TRACE_DIAGNOSTIC_DEFINITIONS: dict[str, dict[str, str]] = {
         "label": "Missing retrieval metadata",
         "severity": "warn",
         "detail": "Run summary lacks search provider, source visibility, or extraction metadata.",
+    },
+    "missing_child_step_metadata": {
+        "label": "Missing child-step metadata",
+        "severity": "warn",
+        "detail": "Run summary lacks the bounded WorkItem/tool execution timeline.",
     },
     "tool_failures": {
         "label": "Tool failures",
@@ -1208,6 +1218,16 @@ _TRACE_DIAGNOSTIC_DEFINITIONS: dict[str, dict[str, str]] = {
         "label": "Orchestrator feedback",
         "severity": "info",
         "detail": "Run includes orchestrator preflight or review feedback.",
+    },
+    "workflow_blocker": {
+        "label": "Workflow blocker",
+        "severity": "warn",
+        "detail": "Blocked run includes an actionable blocker diagnostic packet.",
+    },
+    "missing_blocker_metadata": {
+        "label": "Missing blocker metadata",
+        "severity": "fail",
+        "detail": "Blocked run lacks block kind, reason, codes, gate, or next-action evidence.",
     },
     "approval_gate": {
         "label": "Approval gate",
@@ -1253,20 +1273,38 @@ def _trace_diagnostic_categories(
         metadata.get("diagnostic_summary") if isinstance(metadata.get("diagnostic_summary"), dict) else {}
     )
     has_contract = isinstance(metadata.get("diagnostic_contract"), dict)
+    execution = metadata.get("execution") if isinstance(metadata.get("execution"), dict) else {}
+    run_mode = str(execution.get("run_mode") or metadata.get("run_mode") or "").strip()
     if not _eval_trace_join_key(group_id, metadata):
         categories.append("unjoined_run_summary")
     if not has_contract:
         categories.append("missing_diagnostic_contract")
-    if has_contract and not bool(diagnostic_summary.get("has_model_metadata")):
+    if has_contract and not run_mode:
+        categories.append("missing_execution_provenance")
+    if (
+        has_contract
+        and "live_sdk" in run_mode
+        and not bool(diagnostic_summary.get("has_model_metadata"))
+    ):
         categories.append("missing_model_metadata")
-    if has_contract and not bool(diagnostic_summary.get("has_retrieval_metadata")):
+    if (
+        has_contract
+        and "search" in run_mode
+        and not bool(diagnostic_summary.get("has_retrieval_metadata"))
+    ):
         categories.append("missing_retrieval_metadata")
+    if has_contract and not bool(diagnostic_summary.get("has_child_step_metadata")):
+        categories.append("missing_child_step_metadata")
     if bool(diagnostic_summary.get("has_error_or_retry")):
         categories.append("error_or_retry")
     if bool(diagnostic_summary.get("has_web_extraction_issues")):
         categories.append("web_extraction_issues")
     if bool(diagnostic_summary.get("has_orchestrator_feedback")):
         categories.append("orchestrator_feedback")
+    if bool(diagnostic_summary.get("blocked_without_diagnostics")):
+        categories.append("missing_blocker_metadata")
+    elif bool(diagnostic_summary.get("has_blocker_metadata")):
+        categories.append("workflow_blocker")
     if _trace_metadata_int(metadata, ("tooling", "failed_tool_call_count")) > 0:
         categories.append("tool_failures")
     approval = metadata.get("approval") if isinstance(metadata.get("approval"), dict) else {}
@@ -2970,6 +3008,50 @@ def _manual_trace_string_list(value: Any, *, limit: int = 8) -> list[str]:
     return labels
 
 
+def _manual_trace_child_steps(value: Any, *, limit: int = 40) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    steps: list[dict[str, Any]] = []
+    for raw in value[:limit]:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        category = str(raw.get("category") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.:+/-]{1,120}", name):
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_.:+/-]{1,120}", category):
+            continue
+        status = str(raw.get("status") or "observed").strip()
+        error_kind = str(raw.get("error_kind") or "").strip()
+        provider = str(raw.get("provider") or "").strip()
+        steps.append(
+            {
+                "step_index": len(steps) + 1,
+                "category": category,
+                "name": name,
+                "status": status
+                if re.fullmatch(r"[A-Za-z0-9_.:+/-]{1,120}", status)
+                else "observed",
+                "duration_ms": _float_or_none(raw.get("duration_ms")),
+                "error_kind": error_kind
+                if not error_kind
+                or re.fullmatch(r"[A-Za-z0-9_.:+/-]{1,120}", error_kind)
+                else "",
+                "provider": provider
+                if not provider or re.fullmatch(r"[A-Za-z0-9_.:+/-]{1,120}", provider)
+                else "",
+                "request_count": _safe_int(raw.get("request_count")),
+                "source_count": _safe_int(raw.get("source_count")),
+                "visible_source_count": _safe_int(raw.get("visible_source_count")),
+                "estimated_cost_usd": _float_or_none(raw.get("estimated_cost_usd")),
+                "cache_hit_rate": _float_or_none(raw.get("cache_hit_rate")),
+                "approval_required": bool(raw.get("approval_required")),
+                "blocker_count": _safe_int(raw.get("blocker_count")),
+            }
+        )
+    return steps
+
+
 def _manual_trace_bool(payload: dict[str, Any], keys: tuple[str, ...], *, default: bool = False) -> bool:
     for key in keys:
         if key in payload:
@@ -3010,6 +3092,12 @@ def _manual_trace_diagnostics_from_row(row: dict[str, Any]) -> dict[str, Any]:
     if not approval and isinstance(evidence.get("approval_gate"), dict):
         approval = evidence["approval_gate"]
     side_effects = evidence.get("side_effects") if isinstance(evidence.get("side_effects"), dict) else {}
+    blocker_diagnostics = (
+        evidence.get("blocker_diagnostics")
+        if isinstance(evidence.get("blocker_diagnostics"), dict)
+        else {}
+    )
+    child_steps = _manual_trace_child_steps(evidence.get("child_step_summary"))
     retry_state = evidence.get("retry_state") if isinstance(evidence.get("retry_state"), dict) else {}
     if not retry_state and isinstance(evidence.get("retry"), dict):
         retry_state = evidence["retry"]
@@ -3026,6 +3114,7 @@ def _manual_trace_diagnostics_from_row(row: dict[str, Any]) -> dict[str, Any]:
     )
 
     warning_count = _safe_int(row.get("warning_count"))
+    row_status = str(row.get("status") or "").strip().lower()
     retry_count = _safe_int(retry_state.get("retry_count") or retry_state.get("attempt_count"))
     web_extraction_issue_count = _safe_int(
         extraction.get("issue_count") or extraction.get("warning_count") or extraction.get("error_count")
@@ -3073,6 +3162,8 @@ def _manual_trace_diagnostics_from_row(row: dict[str, Any]) -> dict[str, Any]:
                 "tooling",
                 "retrieval",
                 "orchestrator",
+                "blocker",
+                "child_steps",
                 "approval",
                 "side_effects",
                 "error_retry",
@@ -3111,6 +3202,11 @@ def _manual_trace_diagnostics_from_row(row: dict[str, Any]) -> dict[str, Any]:
             "tool_names": tool_names,
             "has_tool_metadata": bool(tool_call_count or failed_tool_call_count or tool_names),
         },
+        "child_steps": {
+            "count": len(child_steps),
+            "timeline": child_steps,
+            "raw_payloads_included": False,
+        },
         "retrieval": {
             "search_provider": search_provider,
             "search_provider_sequence": _manual_trace_string_list(search_sequence),
@@ -3128,7 +3224,32 @@ def _manual_trace_diagnostics_from_row(row: dict[str, Any]) -> dict[str, Any]:
             "has_preflight": has_orchestrator_preflight,
             "has_review": has_orchestrator_review,
             "feedback_count": _safe_int(orchestrator.get("feedback_count") or orchestrator_review.get("feedback_count")),
-            "blocker_count": _safe_int(orchestrator.get("blocker_count") or orchestrator_preflight.get("blocker_count")),
+            "blocker_count": max(
+                _safe_int(
+                    orchestrator.get("blocker_count")
+                    or orchestrator_preflight.get("blocker_count")
+                ),
+                _safe_int(blocker_diagnostics.get("blocker_count")),
+            ),
+        },
+        "blocker": {
+            "diagnostic_category": str(
+                blocker_diagnostics.get("diagnostic_category") or ""
+            ).strip(),
+            "block_kind": str(blocker_diagnostics.get("block_kind") or "").strip(),
+            "block_reason": str(blocker_diagnostics.get("block_reason") or "").strip(),
+            "blocker_count": _safe_int(blocker_diagnostics.get("blocker_count")),
+            "blocker_codes": _manual_trace_string_list(
+                blocker_diagnostics.get("blocker_codes") or []
+            ),
+            "readiness_gate_names": _manual_trace_string_list(
+                blocker_diagnostics.get("readiness_gate_names") or []
+            ),
+            "next_action": (
+                blocker_diagnostics.get("next_action")
+                if isinstance(blocker_diagnostics.get("next_action"), dict)
+                else {}
+            ),
         },
         "approval": {
             "required": approval_required,
@@ -3158,7 +3279,15 @@ def _manual_trace_diagnostics_from_row(row: dict[str, Any]) -> dict[str, Any]:
             "has_retrieval_metadata": bool(search_provider or search_sequence or row.get("source_count")),
             "has_orchestrator_feedback": has_orchestrator_preflight or has_orchestrator_review,
             "has_web_extraction_issues": web_extraction_issue_count > 0,
-            "has_error_or_retry": warning_count > 0 or retry_count > 0 or failed_tool_call_count > 0,
+            "has_error_or_retry": (
+                row_status == "blocked"
+                or warning_count > 0
+                or retry_count > 0
+                or failed_tool_call_count > 0
+            ),
+            "has_blocker_metadata": bool(blocker_diagnostics),
+            "blocked_without_diagnostics": row_status == "blocked" and not blocker_diagnostics,
+            "has_child_step_metadata": bool(child_steps),
         },
     }
 

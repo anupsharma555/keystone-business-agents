@@ -13,7 +13,65 @@ from keystone_agents.finance_expense_receipts import (
     infer_finance_expense_receipt_target,
     match_receipt_evidence_to_airtable_fields,
     parse_finance_receipt_text,
+    resolve_finance_expense_receipt_target,
 )
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Put the attached proof of payment in my personal costs tracker. /tmp/receipt.png",
+        "Please file this image with the personal expense entry. /tmp/receipt.png",
+        "This belongs in personal expenses and the image should stay with it. /tmp/receipt.png",
+    ],
+)
+def test_semantic_receipt_plan_is_stable_across_natural_phrasings(
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="airtable_context_agent",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        expected_artifact_type="business_system_write_plan",
+        provider_system="airtable",
+        provider_operations=["create", "attach", "verify"],
+        primary_target="Personal Expenses",
+        target_type="business_system_context",
+        required_entities=["2026 Finance & Tax Tracker"],
+    )
+
+    target = resolve_finance_expense_receipt_target(
+        request_text,
+        manual_plan=plan,
+    )
+
+    assert target is not None
+    assert target.table == "Personal Expenses"
+    assert target.operation == "create"
+    assert target.receipt_local_path == "/tmp/receipt.png"
+
+
+def test_semantic_airtable_plan_does_not_become_receipt_work_from_incidental_word() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="airtable_context_agent",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        provider_system="airtable",
+        provider_operations=["create"],
+        primary_target="Partner Pipeline",
+        target_type="business_system_context",
+    )
+
+    assert (
+        resolve_finance_expense_receipt_target(
+            "Add a partner record and note that we received their receipt.",
+            manual_plan=plan,
+        )
+        is None
+    )
 
 
 def test_resolve_local_executable_uses_absolute_fallback_when_path_is_minimal(
@@ -29,6 +87,32 @@ def test_resolve_local_executable_uses_absolute_fallback_when_path_is_minimal(
         "pdftotext",
         fallback_paths=(str(helper),),
     ) == str(helper)
+
+
+def test_image_receipt_ocr_uses_explicit_command_when_launch_path_is_minimal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    helper = tmp_path / "tesseract"
+    helper.write_text(
+        "#!/bin/sh\n"
+        "printf 'Jul 20, 2026\\nExample Learning Ltd\\nTotal USD $2650.00\\n'\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o700)
+    image = tmp_path / "receipt.png"
+    image.write_bytes(b"synthetic image fixture")
+    monkeypatch.setenv("KEYSTONE_TESSERACT_COMMAND", str(helper))
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    evidence = extract_finance_receipt_evidence(image)
+
+    assert evidence.content_read is True
+    assert evidence.extraction_method == "tesseract"
+    assert evidence.vendor == "Example Learning Ltd"
+    assert evidence.receipt_date == "2026-07-20"
+    assert evidence.total == "2650.00"
+    assert evidence.currency == "USD"
 
 
 def test_infer_business_expense_receipt_target_from_airtable_ask() -> None:
@@ -116,6 +200,24 @@ def test_parse_finance_receipt_text_extracts_example_print_fields() -> None:
     assert parsed["total"] == "76.80"
     assert parsed["currency"] == "USD"
     assert parsed["payment_summary"] == "credit card ending in 0000"
+
+
+def test_parse_finance_receipt_text_accepts_amount_paid_total_label() -> None:
+    parsed = parse_finance_receipt_text(
+        """
+        Receipt from Example Learning Ltd
+        Amount Paid
+        $2,650.00
+        Date Paid
+        Jul 20, 2026
+        Received full payment (in USD)
+        """
+    )
+
+    assert parsed["vendor"] == "Example Learning Ltd"
+    assert parsed["receipt_date"] == "2026-07-20"
+    assert parsed["total"] == "2650.00"
+    assert parsed["currency"] == "USD"
 
 
 def test_extract_finance_receipt_evidence_reads_supplied_example_print_pdf() -> None:

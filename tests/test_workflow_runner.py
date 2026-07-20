@@ -32,6 +32,7 @@ from keystone_agents.schemas.chief_of_staff import (
 )
 from keystone_agents.schemas.company_profile import SourceRecord
 from keystone_agents.schemas.email_triage import GmailThreadSummaryResult
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.memory import MemoryItem
 from keystone_agents.schemas.opportunity import (
     FilteredOpportunityCandidate,
@@ -288,6 +289,59 @@ def test_chief_marked_airtable_lifecycle_allows_only_verified_test_cleanup() -> 
     assert "Ordinary deletes" in policy
 
 
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Could you make sure Board prep appears on July 23 in my schedule?",
+        "Board prep should be on my calendar for July 23.",
+        "Please put the July 23 Board prep item where I keep appointments.",
+    ],
+)
+def test_chief_calendar_policy_comes_from_semantic_plan_not_request_words(
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        provider_system="google_calendar",
+        provider_operations=["create", "verify"],
+        primary_target="Board prep",
+        target_type="business_system_context",
+    )
+
+    policy = workflow_runner._chief_workflow_side_effect_policy(request_text, plan)
+
+    assert "exact Google Calendar operations create, verify" in policy
+    assert "Board prep" in policy
+    assert "provider read-back" in policy
+    assert "read-only interpretation" not in policy
+
+
+def test_chief_airtable_receipt_policy_uses_semantic_attachment_scope() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="airtable_context_agent",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        provider_system="airtable",
+        provider_operations=["create", "attach", "verify"],
+        primary_target="Personal Expenses",
+        target_type="business_system_context",
+    )
+
+    policy = workflow_runner._chief_workflow_side_effect_policy(
+        "Please take care of this selected file.",
+        plan,
+    )
+
+    assert "exact Airtable operations create, attach, verify" in policy
+    assert "Personal Expenses" in policy
+    assert "One selected attachment may be uploaded" in policy
+    assert "read-only interpretation" not in policy
+
+
 def test_chief_workflow_passes_receipt_write_policy_to_live_sdk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -360,6 +414,83 @@ def test_chief_workflow_passes_receipt_write_policy_to_live_sdk(
             "receipt path: /tmp/example-business-cards-receipt.pdf"
         )
     }
+
+
+def test_chief_workitem_preserves_llm_plan_into_sdk_and_local_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_text = "Who handled our coverage?"
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="unspecified",
+        provider_operations=["search", "read"],
+        primary_target="KNI insurance records",
+        target_type="local_document_collection",
+        constraints=["local_only=true", "send_enabled=false"],
+    )
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Coverage owner",
+        request_text=request_text,
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.IN_PROGRESS,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_packet(query_text: str, **_kwargs: object) -> dict[str, object]:
+        captured["query_text"] = query_text
+        return {
+            "packet_type": "bounded_local_kni_document_evidence",
+            "local_only": True,
+            "send_enabled": False,
+            "candidate_documents": [],
+            "retrieval_diagnostics": {},
+        }
+
+    def fake_run(
+        sdk_input: dict[str, object],
+        **kwargs: object,
+    ) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        captured["sdk_input"] = sdk_input
+        captured["kwargs"] = kwargs
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary="The local evidence was reviewed.",
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "build_local_kni_evidence_packet_for_query",
+        fake_packet,
+    )
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run)
+
+    result = workflow_runner._advance_chief_of_staff(
+        work_item,
+        request=WorkflowRunRequest(
+            request_text=request_text,
+            live_sdk=True,
+            manual_request_plan=plan.model_dump(mode="json"),
+        ),
+        store=None,
+    )
+
+    assert result.status == WorkItemStatus.DONE
+    assert captured["query_text"] == request_text
+    sdk_input = captured["sdk_input"]
+    assert sdk_input["manual_request_plan"]["target_type"] == "local_document_collection"
+    assert sdk_input["local_kni_evidence_packet"]["local_only"] is True
+    assert captured["kwargs"]["manual_request_plan"]["source"] == "llm"
 
 
 def test_chief_write_request_metadata_preserves_json_objects() -> None:
@@ -6308,7 +6439,8 @@ def test_planning_first_workflow_with_preflight_still_returns_orchestrator_plan(
         max_steps=5,
     )
 
-    assert preflight.selected_agent == WorkItemRoute.ORCHESTRATOR.value
+    assert preflight.manual_request_plan.requested_agent == WorkItemRoute.ORCHESTRATOR.value
+    assert preflight.selected_agent == WorkItemRoute.OPPORTUNITY_SCOUT.value
     assert result.route == WorkItemRoute.ORCHESTRATOR
     assert result.artifact_refs[0].artifact_type == "orchestrator_plan_summary"
     assert "Orchestrator workflow plan" in result.human_summary
@@ -12190,7 +12322,7 @@ def test_gmail_triage_latest_email_reads_one_message_without_expanding_thread(
             manual_request_plan={"gmail_query": "from:alex@example.test"},
         ),
         store=store,
-        gmail_plan=workflow_runner.infer_gmail_execution_plan(work_item.request_text),
+        gmail_plan=workflow_runner.resolve_gmail_execution_plan(work_item.request_text),
     )
 
     assert result is not None

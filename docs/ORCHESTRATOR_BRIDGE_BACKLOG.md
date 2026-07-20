@@ -46,8 +46,8 @@ again.
 ### P1 - EVAL-TRACE-DETAIL-001: Eval traces need child-step/tool-call metadata, not only summarized events
 
 - Found: 2026-06-21 01:00 EDT
-- Fixed: pending
-- Status: open
+- Fixed: SDK 2026-07-12; manual Slack/CLI 2026-07-12
+- Status: complete
 - Area: eval trace capture, OpenAI-style trace explorer, SDK run summaries,
   WorkItem trace metadata, `promptfoo/eval_database.py`,
   `promptfoo/eval_dashboard.py`, Slack/CLI eval run recording.
@@ -73,16 +73,34 @@ again.
   checkpoints, retrieval/source counts, and model/cost/cache metadata when
   available. Keep raw prompts, raw responses, Slack message text, secrets, PHI,
   and tool I/O out of trace storage.
+- Progress: SDK run summaries now persist an ordered, capped child-step packet
+  with step index, category, sanitized tool/handoff name, status, duration, and
+  error kind. Regression coverage proves tool arguments, model output, prompts,
+  and other raw payloads do not persist.
+- Resolution: Finalized WorkItem results now also carry up to 40 ordered steps
+  from the latest canonical advance. The packet includes controlled event/tool
+  names, category, status, duration, error kind, provider, request/source
+  counts, cost/cache values, and approval/blocker counts. Both CLI-context and
+  selected-message Slack writers persist the same packet; manual trace summaries
+  expose it in Trace Explorer details and field readiness. Tool summaries add
+  bounded tool steps when the canonical event stream has only aggregate tool
+  evidence. Prompts, responses, event summaries, rationale, arguments, outputs,
+  Slack text, secrets, and PHI are excluded. Historical rows without a timeline
+  receive `missing_child_step_metadata` rather than a fabricated backfill.
 - Validation: Add fixture coverage for a saved Slack/CLI eval run with multiple
   child events and verify the Trace Explorer Details panel shows same-run
   timeline, duration, model/tool/retrieval readiness, and bounded sanitized
   packet data without exposing raw content.
+- Verification: Focused tests cover canonical event ordering, numeric
+  model/retrieval fields, both Slack/CLI writers, tool-step augmentation,
+  prompt/output/argument exclusion, manual trace persistence, Trace Explorer
+  field readiness, and legacy missing-timeline diagnostics.
 
 ### P2 - EVAL-DATABASE-UX-001: Database tab needs a stable inventory contract distinct from scoring workspace
 
 - Found: 2026-06-21 01:00 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-07-12
+- Status: complete
 - Area: Eval Case Database UX, review item-level score visibility,
   CSV/JSON export, `promptfoo/eval_dashboard.py`,
   `tests/test_promptfoo_framework.py`.
@@ -103,9 +121,19 @@ again.
   explicit review-dimension score columns, compact statuses, and links to
   Review form / case bundle for full comments and rationales. Avoid putting
   editable review controls or full rationales in Database.
+- Resolution: The dashboard now emits a versioned, read-only
+  `keystone.eval.database_inventory.v1` payload distinct from complete case and
+  export data. Its rows retain case/run identity, compact machine/human/
+  Orchestrator statuses, all explicit score dimensions, evidence counts,
+  analysis state, and Review form / Case bundle links. Prompt text, response
+  text, review notes, comments, and rationales are excluded from the visible
+  inventory while remaining in CSV/JSON and case-bundle detail surfaces.
 - Validation: Add UI tests that assert item-level review dimensions remain
   visible as columns, while review editing and detailed comments stay in Runs &
   Scoring/review-detail surfaces.
+- Verification: Contract tests prove detail prose is absent from inventory but
+  present in exports. Rendered-HTML tests prove dimension columns and detail
+  links remain visible while prompt, response, and notes columns are absent.
 
 ### P1 - CONTEXT-EVAL-001: RSS and preprint context agents lack Slack eval cases
 
@@ -379,8 +407,8 @@ again.
 ### P2 - DOC-ASSET-001: Generated architecture visual is referenced before the release surface is complete
 
 - Found: 2026-06-20 00:00 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-07-12
+- Status: complete
 - Area: README/docs release surface, generated visual assets,
   `README.md`, `docs/INDEX.md`, `docs/VISUAL_CONTEXT.md`,
   `docs/assets/kba-current-agent-architecture.svg`,
@@ -402,14 +430,23 @@ again.
   together with their tests, or revert the docs to the previous committed
   visual reference. Add a lightweight doc asset/link check if this visual is
   expected to remain a generated release artifact.
+- Resolution: The SVG, generator, and generator tests are all tracked. The SVG
+  was regenerated from the current AgentSpec registry (including the current 42
+  Gmail tools), and the test suite now requires byte-for-byte reproducibility
+  using the date embedded in the committed asset. It also verifies the README,
+  docs index, and visual-context references. The generator now accepts absolute
+  output paths without crashing after the write.
 - Validation: Run `git status --short`, `git diff --check`, and the architecture
   diagram generator/test path after the release-surface decision.
+- Verification: The three generator/release-surface tests pass, XML parsing
+  succeeds, referenced files are tracked, and the regenerated asset matches the
+  current generator exactly.
 
 ### P2 - TEST-HYGIENE-001: Focused tests pass while surfacing serializer and SQLite resource warnings
 
 - Found: 2026-06-20 00:00 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-07-12
+- Status: complete
 - Area: test hygiene, Pydantic serialization, SQLite connection lifecycle,
   `src/keystone_agents/automation_inventory.py`,
   `src/keystone_agents/schemas/orchestrator.py`,
@@ -433,9 +470,18 @@ again.
   or coerce inputs before serialization, and close or context-manage SQLite
   connections opened during CLI preflight/blocked-path tests. Keep the fix
   focused on type/resource correctness rather than suppressing warnings.
+- Resolution: Current schemas no longer emit the two recorded serializer
+  warnings. `SQLiteStore.managed_connection()` now preserves commit/rollback
+  semantics and closes every transient file-backed connection; all 64 internal
+  connection scopes and the remaining workflow-runner query use it. Persistent
+  in-memory stores expose explicit/context-managed shutdown, and raw test
+  connections close explicitly.
 - Validation: Re-run the focused command above with `-W error::UserWarning
   -W error::ResourceWarning`, then run the relevant CLI and automation test
   modules.
+- Verification: The complete storage, automation-control, and CLI modules pass
+  under strict `UserWarning` and `ResourceWarning` handling: 180 tests, with no
+  warning suppression.
 
 ### P1 - EVAL-RUNTIME-001: Slack eval run IDs are not reconstructable from canonical WorkItem state
 
@@ -476,8 +522,8 @@ again.
 ### P1 - EVAL-RUNTIME-002: Slack eval rows still lack run-mode, model, and search-provider provenance
 
 - Found: 2026-06-18 15:34 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-07-12
+- Status: complete
 - Area: Slack eval provenance, `src/keystone_agents/cli.py`,
   `src/keystone_agents/slack_actions.py`, `promptfoo/eval_database.py`,
   eval dashboard filtering and live-run review.
@@ -503,12 +549,27 @@ again.
   payloads. Add dashboard/readiness checks that warn or fail for live/manual
   Slack eval rows with blank run mode or provider provenance, and add focused
   tests for CLI/app-mention and selected-message eval row creation.
+- Resolution: `WorkflowRunResult` now carries additive structured execution
+  provenance. Finalization records fixture/live SDK/live search mode, prefers
+  actual `workflow_sdk_usage` and `workflow_retrieval_usage` events for model
+  and provider identity, and falls back to the resolved model/retrieval policy
+  only when runtime events are absent. Both CLI-context and selected-message
+  Slack eval writers persist the same packet and normalized columns. Dashboard
+  diagnostics now fail blank run mode explicitly, require model metadata only
+  for SDK modes, and require retrieval metadata only for search modes.
+- Historical boundary: The current local eval database has 98 legacy Slack
+  rows and all 98 predate usable provenance. They remain blank because the
+  source evidence is also blank; the dashboard now identifies them as missing
+  execution provenance rather than inventing a backfill.
+- Verification: Focused tests prove runtime-event precedence, both Slack eval
+  writers, and mode-aware missing-field diagnostics for fixture, SDK, search,
+  and legacy-blank rows.
 
 ### P2 - EVAL-RUNTIME-003: Blocked Slack eval runs do not expose blocker diagnostics
 
 - Found: 2026-06-18 15:34 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-07-12
+- Status: complete
 - Area: Chief of Staff Slack eval runs, eval evidence payloads, blocker
   rendering, trace diagnostics.
 - Issue: Recent Chief-of-Staff Slack eval rows are saved with status
@@ -532,6 +593,16 @@ again.
   blocker codes, next safe action, readiness-gate names, and a compact
   diagnostic category. Dashboard views should treat `status=blocked` with no
   blocker metadata as an attention item even when `warning_count=0`.
+- Resolution: CLI and Slack action eval evidence both save a bounded, redacted
+  blocker packet. It now preserves explicit block kind/reason, blocker codes,
+  failed readiness-gate names, and the next safe action. Manual trace summaries
+  expose that packet and classify blocked rows as errors even when warnings are
+  zero. A blocked row without the packet becomes a distinct failing
+  `missing_blocker_metadata` diagnostic; a complete packet becomes an
+  actionable `workflow_blocker` category in dashboard rollups.
+- Verification: Focused helper tests prove actionable field preservation and
+  secret redaction. Eval database/dashboard tests prove both the visible
+  blocker packet and the missing-metadata attention path.
 
 ### P1 - STATE-PATH-001: Business-state database path split makes Slack eval joins path-dependent
 
@@ -562,8 +633,8 @@ again.
 ### P1 - WORKITEM-INTEGRITY-001: WorkItem child audit rows can orphan
 
 - Found: 2026-06-18 15:44 EDT
-- Fixed: pending
-- Status: open
+- Fixed: prevention 2026-06-18; audit completed 2026-07-12
+- Status: complete
 - Area: `src/keystone_agents/storage/sqlite_store.py`, WorkItem event/artifact
   persistence and repair diagnostics.
 - Issue: WorkItem child tables can be written without a valid parent WorkItem.
@@ -581,12 +652,23 @@ again.
   transaction where possible, verify parent existence before child inserts, and
   add a read-only orphan-audit/repair command. Consider SQLite FK enforcement
   where it can be introduced safely without breaking legacy rows.
+- Resolution: Event and artifact inserts fail inside their write transaction
+  when the parent WorkItem is missing. The new read-only
+  `npm run audit:workitem-integrity` command reports missing parent IDs, grouped
+  event/artifact types, bounded counts, and a strict nonzero mode without
+  changing legacy state. The live audit confirms the historical snapshot is
+  unchanged at 41 orphan events across 16 missing parents and zero orphan
+  artifacts; `repair_performed=false` is explicit. Automatic deletion or
+  synthetic-parent creation is intentionally excluded pending operator review.
+- Verification: Focused tests prove valid parent/child persistence, rejection
+  of new orphan events and artifacts, clean-audit PASS, legacy-orphan
+  visibility, read-only behavior, and strict CLI failure.
 
 ### P1 - SLACK-ACTION-001: Direct Slack steering actions can dedupe failed executions as handled
 
 - Found: 2026-06-18 15:44 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-06-18; reverified 2026-07-12
+- Status: complete
 - Area: direct Slack WorkItem actions, `src/keystone_agents/slack_interactions.py`,
   action idempotency and retry handling.
 - Issue: Direct steering actions such as more-research, find-contact, and
@@ -604,12 +686,20 @@ again.
   `completed` only after the WorkItem step succeeds. Retries should resume,
   report in-progress, or safely rerun when the prior attempt never reached a
   terminal state. Add tests for failure between intent save and advancement.
+- Resolution: Direct steering actions now write a unique `attempt_id` and
+  `started` event before advancement, then a terminal `completed` event only
+  after the step succeeds. Dedupe recognizes terminal attempts only, so a retry
+  after a simulated crash runs again while a retry after completion remains
+  idempotent.
+- Verification: The focused success/dedupe and crash-between-events regression
+  tests pass and prove the stored status sequence is `started`, `started`,
+  `completed` for a recovered attempt.
 
 ### P1 - SLACK-ACTION-002: Continue WorkItem Slack actions can drop live execution flags
 
 - Found: 2026-06-18 15:44 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-06-18; reverified 2026-07-12
+- Status: complete
 - Area: Chief-of-Staff continue action, `src/keystone_agents/slack_interactions.py`,
   `WorkflowRunRequest` construction and live-mode consistency.
 - Issue: The direct `continue_work_item` path can run Orchestrator preflight
@@ -627,6 +717,13 @@ again.
   Slack continuation/direct-action path and persist those flags in WorkItem
   events. Add regression coverage that `continue_work_item` preserves live
   flags and remains no-send/no-write.
+- Resolution: The continue path resolves live-search and live-SDK once, uses
+  the same values for Orchestrator preflight and `WorkflowRunRequest`, and the
+  standard `advance_started` event persists both flags. The Slack result keeps
+  `send_enabled=false`.
+- Verification: Focused continuation tests prove both live flags reach the
+  specialist request and that the optional LangGraph continuation preserves
+  WorkItem identity, preflight metadata, and the no-send boundary.
 
 ### P1 - EVAL-RUNTIME-004: Provider invocation mode is not authoritative in eval output
 
@@ -890,8 +987,8 @@ again.
 ### P1 - ASK-SHAPE-002: Specialist outputs do not consistently report request coverage or stop-condition status
 
 - Found: 2026-06-18 14:08 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-07-12
+- Status: complete
 - Area: `src/keystone_agents/schemas/email_triage.py`,
   `src/keystone_agents/schemas/research.py`,
   `src/keystone_agents/schemas/opportunity.py`,
@@ -921,12 +1018,20 @@ again.
   status, and next safe action. Wire final renderers and evals to prefer a
   precise blocker or partial answer over a broadened substitute when coverage
   is incomplete.
+- Resolution: `RequestCoverage` is now shared by Gmail Triage, general Research,
+  Company Profile, Opportunity Scout, and Outreach outputs. It records the
+  interpreted request, satisfied/unmet dimensions, output-form and stop status,
+  broadening, and next safe action. Deterministic validators reject internally
+  inconsistent completion claims and require actionable partial/blocker state.
+  Final synthesis collects validated envelopes from nested/artifact results and
+  treats missing coverage as unverified when exact filters, output form, or stop
+  conditions were requested. Legacy outputs may remain explicitly `unassessed`.
 
 ### P2 - ADAPTER-ROBUSTNESS-001: Typed handoff metadata does not prove request-shape adaptation is lossless
 
 - Found: 2026-06-18 14:08 EDT
-- Fixed: pending
-- Status: open
+- Fixed: 2026-07-12
+- Status: complete
 - Area: `src/keystone_agents/agent_registry.py`,
   `src/keystone_agents/schemas/handoff_types.py`,
   `src/keystone_agents/schemas/context_pack.py`,
@@ -953,6 +1058,15 @@ again.
   ask-shape fields, defaulted policy fields, and the safe next action. Add tests
   for Orchestrator-to-Gmail, Gmail-to-research, opportunity-to-research,
   research-to-outreach, and Chief-to-context-agent adaptation.
+- Resolution: `HandoffAdaptationAssessment` compares explicit source-plan
+  ask-shape fields with the adapted target payload. It reports required,
+  missing, lossy, and adapter-defaulted policy fields plus a safe next action.
+  Loss of exact-filter, selected/prior-context, permission, or stop boundaries
+  blocks execution; other loss requests clarification; invented defaults remain
+  compatible only with warnings. Typed WorkItem context packs attach this
+  assessment when an explicit ask-shape plan exists and remain `None` for
+  legacy/no-policy WorkItems. The five named transition families have focused
+  no-live coverage.
 
 ### P1 - HANDOFF-TYPES-001: Handoff specs do not declare typed input and output contracts
 

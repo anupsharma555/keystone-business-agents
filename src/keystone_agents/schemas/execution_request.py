@@ -61,12 +61,14 @@ class ExecutionContinuation(BaseModel):
     """Bounded prior-turn identity for one continuation request."""
 
     work_item_id: str = ""
+    provider_affinity: str = ""
     prior_request: str = ""
     prior_result_title: str = ""
     prior_result_summary: str = ""
 
     @field_validator(
         "work_item_id",
+        "provider_affinity",
         "prior_request",
         "prior_result_title",
         "prior_result_summary",

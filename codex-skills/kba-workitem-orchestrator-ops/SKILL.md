@@ -15,6 +15,9 @@ Treat WorkItems, local storage, context packs, approval records, audit rows, and
 artifacts as canonical business state. Treat local Agents SDK sessions as
 optional conversation continuity, not the canonical operating state.
 
+Use `$kba-operational-validation` for cross-path acceptance and final Slack
+content/visual review after a live run.
+
 ## First Reads
 
 Read the smallest set that matches the task:
@@ -64,6 +67,18 @@ Use this workflow for requests like:
    approval and live integration path explicitly permits the exact action.
 6. When fixing behavior, update tests for the route, context pack, Slack action,
    or WorkItem lifecycle that actually owns the bug.
+
+## Direct Versus Stateful Routing
+
+- Keep one-owner, bounded specialist jobs on the direct path when deterministic
+  preflight/context, one synthesis, validation, and rendering are sufficient.
+- Use the canonical Orchestrator/WorkItem path for ambiguous, resumable,
+  approval-dependent, cross-agent, or review/repair jobs.
+- Use LangGraph only when the validated WorkItem plan needs multiple stages,
+  handoffs, checkpoints, or repair loops.
+- Chief of Staff commonly becomes multistage when coordinating systems or
+  specialists, but its bounded status checks and exact supported actions need
+  not create a graph.
 
 ## Decision Rules
 

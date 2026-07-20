@@ -76,6 +76,37 @@ evidence.
 - Result: pass
 - Notes: one updated-in-place response; four messages reviewed; latest courtesy close controlled the recommendation; no stale scheduling action, reply copy, or unnecessary approval was shown. The graph attached a no-write collaboration recommendation, used two OpenAI requests at an estimated `$0.044811`, and performed no search or provider mutation.
 
+### Direct Zotero Provider Read
+
+- Prompt: `@KNI BA use Zotero to select the most recently added journal article. Return only its exact title, authors, and publication title. Do not use web search, full text, or modify Zotero.`
+- Slack permalink: https://as-xkn6329.slack.com/archives/C0ASJ6QU1FX/p1783976063724409
+- Local run id or WorkItem id: KBA run `5692`
+- Route: `zotero_context_agent`
+- Output type: exact Zotero article field projection
+- Authenticated provider read completed: yes
+- One final Slack response: yes
+- Requested fields preserved without treating fields as item counts: yes
+- Missing provider fields identified explicitly: yes
+- Provider/model/timing metadata appears before answer: no
+- Web search, full-text read, Zotero mutation, email, or unrelated Slack post observed: no
+- Result: pass
+- Notes: one specialist request; 14,115 input and 447 output tokens; estimated `$0.01259775`; deterministic Orchestrator review passed with evidence complete and no external side effects.
+
+### Direct Business Research Exact Constraint
+
+- Prompt: `@KNI BA, who is Abridge and summarize the company in 20 words.`
+- Slack permalink: https://as-xkn6329.slack.com/archives/C0ASJ6QU1FX/p1783977417925849
+- Local run id or WorkItem id: KBA run `5851`
+- Route: `business_research_analyst`
+- Output type: exact constrained company summary
+- Exact visible answer word count: 20
+- Generic detailed-summary expansion present: no
+- One final Slack response: yes
+- Deterministic Orchestrator review: pass, score 98
+- Unexpected provider write, draft, email, schedule, or unrelated Slack post observed: no
+- Result: pass
+- Notes: one specialist request; 9,995 input and 568 output tokens; estimated `$0.01005225`. Source-visible company-research quality is proven separately by `SLACK-DIRECT-01`; this probe isolates exact natural-language constraint handling.
+
 ### Conversational Business Research
 
 - Prompt:

@@ -70,7 +70,7 @@ def test_specialist_live_dispatch_uses_shared_provider_free_lane(
 
 
 @pytest.mark.parametrize("route", DIRECT_ROUTES)
-def test_direct_supplied_response_skips_live_planner_and_fits_one_request(
+def test_direct_supplied_response_uses_planner_then_one_specialist_request(
     route: str,
 ) -> None:
     args = SimpleNamespace(
@@ -80,7 +80,7 @@ def test_direct_supplied_response_skips_live_planner_and_fits_one_request(
         max_manager_steps=3,
     )
 
-    assert cli._skip_live_manual_plan_for_request(
+    assert not cli._skip_live_manual_plan_for_request(
         PROMPT,
         requested_route=route,
     )
@@ -88,23 +88,13 @@ def test_direct_supplied_response_skips_live_planner_and_fits_one_request(
         args,
         input_text=PROMPT,
         live_sdk=True,
-        live_manual_plan=False,
-        requested_route=route,
-    )
-    forced_planner_estimate = cli._estimate_ask_openai_requests(
-        args,
-        input_text=PROMPT,
-        live_sdk=True,
         live_manual_plan=True,
         requested_route=route,
     )
 
-    assert estimate["min"] == 1
-    assert estimate["max"] == 1
-    assert estimate["stages"] == [f"{route}_direct_supplied_response_sdk"]
-    assert forced_planner_estimate["min"] == 2
-    assert forced_planner_estimate["max"] == 2
-    assert forced_planner_estimate["stages"] == [
+    assert estimate["min"] == 2
+    assert estimate["max"] == 2
+    assert estimate["stages"] == [
         "manual_request_planner",
         f"{route}_direct_supplied_response_sdk",
     ]
@@ -133,12 +123,23 @@ def test_direct_supplied_response_reaches_executor_under_one_request_ceiling(
     tmp_path,
 ) -> None:
     database_url = f"sqlite:///{tmp_path / 'direct-budget.db'}"
-    original_preflight = cli.run_orchestrator_preflight
     captured: dict[str, object] = {}
 
-    def recording_preflight(*args: object, **kwargs: object):
+    def recording_preflight(request_text: str, **kwargs: object):
         captured["live_manual_plan"] = kwargs.get("live_manual_plan")
-        return original_preflight(*args, **kwargs)
+        plan = infer_manual_request_plan(
+            request_text,
+            requested_agent="business_research_analyst",
+        ).model_copy(update={"source": "llm"})
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent="business_research_analyst",
+            advisory_only=True,
+            selected_agent="business_research_analyst",
+            manual_request_plan=plan,
+            route_result=cli.route_request(request_text, manual_plan=plan),
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
 
     def fake_direct(
         route: str,
@@ -158,7 +159,7 @@ def test_direct_supplied_response_reaches_executor_under_one_request_ceiling(
             "business_research_analyst",
             "--live-sdk",
             "--max-openai-requests",
-            "1",
+            "2",
             "--database-url",
             database_url,
             "--json",
@@ -167,7 +168,7 @@ def test_direct_supplied_response_reaches_executor_under_one_request_ceiling(
     )
 
     assert exit_code == 0
-    assert captured["live_manual_plan"] is False
+    assert captured["live_manual_plan"] is True
     assert captured["route"] == "business_research_analyst"
     assert captured["input_text"] == PROMPT
 

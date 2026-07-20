@@ -117,24 +117,7 @@ def run_weekly_ops_packet_synthesis(
     proof_scope = PROOF_SCOPE
     specificity_bundle: dict[str, Any] | None = model_context
 
-    date_min = payload.window.time_min[:10]
-    date_max = payload.window.time_max[:10]
-    request = (
-        "Prepare an internal weekly operations packet from only the supplied bounded "
-        f"{date_min} through {date_max} context. Use these headings in order: "
-        "Executive focus areas; Workstreams and decisions; Completed runs and outcomes; "
-        "Carry forward; One-time Calendar focus; Recurring Calendar cadence; Next actions; "
-        "Source basis; Operational health; Packet metadata. For privacy-minimized "
-        "assertions, name each source family and preserve the supplied workstream, status, "
-        "action-state, owner-role, and count labels in readable form; do not invent private "
-        "topics, names, owners, or outcomes beyond those typed categories. Use "
-        "clear human-readable headings corresponding to every section. Prioritize "
-        "one-time Calendar "
-        "events, mention recurring cadence briefly, include only explicitly relevant completed "
-        "agent runs, and keep operational health and metadata succinct at the end. Return a "
-        "review-only packet. Do not search, call tools, create a Google Doc, post to Slack, "
-        "send, schedule, publish, or write any provider."
-    )
+    request = weekly_ops_operator_request(payload)
     sdk_input = {
         "request": request,
         context_key: model_context,
@@ -202,6 +185,29 @@ def run_weekly_ops_packet_synthesis(
         "context_mode": context_mode,
         "raw_private_context_transmitted": approved_private_context,
     }
+
+
+def weekly_ops_operator_request(payload: WeeklyOpsAssemblyInput) -> str:
+    """Return the canonical natural request shared by KBA and matched baselines."""
+
+    date_min = payload.window.time_min[:10]
+    date_max = payload.window.time_max[:10]
+    return (
+        "Prepare an internal weekly operations packet from only the supplied bounded "
+        f"{date_min} through {date_max} context. Use these headings in order: "
+        "Executive focus areas; Workstreams and decisions; Completed runs and outcomes; "
+        "Carry forward; One-time Calendar focus; Recurring Calendar cadence; Next actions; "
+        "Source basis; Operational health; Packet metadata. For privacy-minimized "
+        "assertions, name each source family and preserve the supplied workstream, status, "
+        "action-state, owner-role, and count labels in readable form; do not invent private "
+        "topics, names, owners, or outcomes beyond those typed categories. Use "
+        "clear human-readable headings corresponding to every section. Prioritize "
+        "one-time Calendar "
+        "events, mention recurring cadence briefly, include only explicitly relevant completed "
+        "agent runs, and keep operational health and metadata succinct at the end. Return a "
+        "review-only packet. Do not search, call tools, create a Google Doc, post to Slack, "
+        "send, schedule, publish, or write any provider."
+    )
 
 
 def _validate_live_limits(

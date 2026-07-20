@@ -12,7 +12,7 @@ class CalendarActionInterpretation(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    operation: Literal["none", "create", "update", "delete"]
+    operation: Literal["none", "read", "create", "update", "delete"]
     operation_source_text: str = ""
     title: str = ""
     title_source_text: str = ""

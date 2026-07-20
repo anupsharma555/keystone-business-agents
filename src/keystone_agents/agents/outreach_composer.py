@@ -1904,6 +1904,7 @@ def run_outreach_composer_constrained_sdk(
         cost=compact_result.cost,
         budget_guard=compact_result.budget_guard,
         request_cache=compact_result.request_cache,
+        tool_receipts=compact_result.tool_receipts,
     )
     if evidence_output_path is not None:
         _write_constrained_outreach_evidence(

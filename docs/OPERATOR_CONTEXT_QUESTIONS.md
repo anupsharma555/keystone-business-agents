@@ -6,9 +6,14 @@ founder-fit, memory, or style context.
 ## Current Status
 
 - `documents/CV_Operator_2026.docx` exists locally.
-- `documents/founder_fit_profile.json` exists, but currently has
-  `approved_for_search=false` and `approved_for_drafting=false`.
-- CV-derived facts should not be used by agents until reviewed and approved.
+- `documents/founder_fit_profile.json` exists and currently has approved,
+  sanitized search and drafting context derived from operator-reviewed inputs.
+- The approved search profile now explicitly includes Keystone strategic
+  priorities, the broad Opportunity Scout portfolio, public links, and
+  remote-first access preferences. Opportunity Scout receipts report the safe
+  field names loaded and whether this search-fit context is complete.
+- Raw CV content should not be used directly. Agents should use only the
+  approved structured founder-fit profile fields for the intended purpose.
 
 ## Orchestrator
 

@@ -7,6 +7,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+
 
 class QualityMode(StrEnum):
     """Supported run quality modes."""
@@ -67,10 +69,14 @@ def chief_of_staff_quality_budget(
     *,
     request_text: str = "",
     live_sdk: bool = False,
+    manual_request_plan: ManualRequestPlan | None = None,
 ) -> AgentQualityBudget:
     """Resolve a Chief of Staff quality budget from explicit mode or request intent."""
 
     explicit = mode is not None and str(mode).strip() != ""
+    semantic_plan = bool(
+        manual_request_plan is not None and manual_request_plan.source == "llm"
+    )
     resolved = normalize_quality_mode(
         mode,
         QualityMode.BALANCED if live_sdk else QualityMode.FAST,
@@ -78,6 +84,15 @@ def chief_of_staff_quality_budget(
     notes: list[str] = []
     if explicit:
         notes.append(f"Quality mode explicitly requested: {resolved.value}.")
+    elif semantic_plan and manual_request_plan is not None:
+        resolved = _chief_quality_mode_from_plan(
+            manual_request_plan,
+            live_sdk=live_sdk,
+        )
+        notes.append(
+            "Quality mode derived from the LLM plan's provider, workflow, search, "
+            "and ask-shape fields; request phrases did not select the budget."
+        )
     else:
         if _looks_like_bounded_live_sdk_smoke_request(request_text):
             resolved = QualityMode.FAST
@@ -94,6 +109,29 @@ def chief_of_staff_quality_budget(
                 "Quality mode inferred as fast for simple deterministic Chief of Staff routing."
             )
     budget = _budget_for_mode(resolved, notes=notes)
+    if semantic_plan and manual_request_plan is not None:
+        if not explicit and _chief_plan_is_provider_free_response(
+            manual_request_plan
+        ):
+            return budget.model_copy(
+                update={
+                    "mode": QualityMode.FAST,
+                    "max_turns": 1,
+                    "max_tokens": min(budget.max_tokens or 1200, 1200),
+                    "max_tool_calls": 0,
+                    "enable_context_deepening": False,
+                    "hosted_web_search_max_calls": 0,
+                    "tool_tier": "core_read",
+                    "notes": [
+                        *budget.notes,
+                        (
+                            "The LLM plan resolved one provider-free response, so the "
+                            "Chief uses one tool-free synthesis turn."
+                        ),
+                    ],
+                }
+            )
+        return budget
     if _looks_like_bounded_live_sdk_smoke_request(request_text):
         return budget.model_copy(
             update={
@@ -134,6 +172,53 @@ def chief_of_staff_quality_budget(
             }
         )
     return budget
+
+
+def _chief_quality_mode_from_plan(
+    plan: ManualRequestPlan,
+    *,
+    live_sdk: bool,
+) -> QualityMode:
+    ask_shape = plan.ask_shape
+    if (
+        ask_shape.evidence_depth == "deep"
+        or ask_shape.ask_breadth == "broad"
+        or ask_shape.cost_mode == "quality"
+    ):
+        return QualityMode.DEEP
+    if (
+        live_sdk
+        and (
+            plan.provider_system != "unspecified"
+            or bool(plan.provider_operations)
+            or bool(plan.workflow)
+            or plan.requires_live_search
+            or plan.requires_durable_state
+        )
+    ):
+        return QualityMode.BALANCED
+    return QualityMode.FAST
+
+
+def _chief_plan_is_provider_free_response(plan: ManualRequestPlan) -> bool:
+    return bool(
+        not plan.workflow
+        and not plan.requires_durable_state
+        and not plan.requires_live_search
+        and not plan.requires_approved_context
+        and plan.provider_system == "unspecified"
+        and not plan.provider_operations
+        and plan.side_effect_policy == "draft_or_read_only"
+        and plan.intent
+        not in {
+            "blocked_send",
+            "business_system_write",
+            "clarification",
+            "context_lookup",
+            "continue_work_item",
+            "gmail_triage",
+        }
+    )
 
 
 def business_research_quality_budget(

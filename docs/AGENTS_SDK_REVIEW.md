@@ -296,9 +296,9 @@ Scenario assessment:
 
 Recommended architecture changes:
 
-1. **Add ask-shape dimensions without adding a broad intent taxonomy.** Extend
-   the manual/orchestrator plan or specialist brief with compact fields such as
-   Implemented in `AskShapePolicy`: `ask_breadth`, `evidence_depth`, `source_type_preference`,
+1. **Add ask-shape dimensions without adding a broad intent taxonomy.** This is
+   implemented in `AskShapePolicy` with `ask_breadth`, `evidence_depth`,
+   `source_type_preference`,
    `strict_filter_mode`, `output_form`, `prior_context_dependency`,
    `permission_state`, `cost_mode`, and `stop_condition`. These are orthogonal
    dimensions, not new route enums.
@@ -307,13 +307,15 @@ Recommended architecture changes:
    `official_source_required`, and `approval_required_before_next_stage` into
    context packs and final synthesis inputs. This is the simplest way to keep
    flexible agents precise on exact-match and narrow follow-up asks.
-3. **Turn source triage into a typed contract.** The repo already has
-   source-triage skills and context-pack fields. Promote the triage result to a
+3. **Turn source triage into a typed contract.** Implemented with the full
+   retrieval `SourceTriageResult` and bounded downstream `SourceTriageSummary`.
+   The triage result is promoted to a
    structured object with `retained`, `review_only`, `rejected`, `deepen`, and
    `why_rejected` entries, then require final synthesis to support claims only
    from retained or extracted deepen sources.
-4. **Add scenario-matrix review rows before new live tests.** Create a small
-   review artifact that maps scenario family, route, required context, allowed
+4. **Add scenario-matrix review rows before new live tests.** Implemented in
+   `keystone_agents.diverse_ask_acceptance`: the artifact maps scenario family,
+   route, required context, allowed
    tool tier, expected failure mode, stop condition, and output shape. This can
    reuse `docs/AGENT_IMPROVEMENT_TEST_PACK.md` but should stay architecture
    oriented until the team chooses which cases deserve automated evals.

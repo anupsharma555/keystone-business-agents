@@ -15,6 +15,7 @@ import keystone_agents.local_kni_evidence as local_kni_evidence
 import keystone_agents.tools.internal_data_tools as internal_data_tools
 from keystone_agents.agent_registry import AGENT_REGISTRY, SPECIALIST_AGENT_SPECS
 from keystone_agents.agent_tool_policy import (
+    INTERNAL_WRITE_TOOL_NAMES,
     ToolTier,
     disallowed_tool_names,
     tool_policy_for_agent,
@@ -181,8 +182,9 @@ def test_chief_calendar_plan_exposes_only_calendar_writes() -> None:
     plan = ManualRequestPlan(
         requested_agent="chief_of_staff",
         target_agent="chief_of_staff",
-        intent="route_request",
-        target_type="unknown",
+        intent="business_system_write",
+        target_type="business_system_context",
+        provider_system="google_calendar",
         objective=request,
         primary_target="UT AI Agents application due on July 23rd",
     )
@@ -204,6 +206,249 @@ def test_chief_calendar_plan_exposes_only_calendar_writes() -> None:
     assert "publish_slack_summary" not in tool_names
 
 
+def test_chief_calendar_read_plan_exposes_only_calendar_read() -> None:
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        target_type="business_system_context",
+        provider_system="google_calendar",
+        objective="Check whether the referenced event exists.",
+        primary_target="Google Calendar event for UT Austin Course Starts on August 15, 2026",
+        required_entities=["UT Austin Course Starts"],
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text="Is it on the calendar now?",
+        manual_request_plan=plan,
+    )
+    tool_names = {getattr(tool, "name", "") for tool in agent.tools}
+
+    assert tool_names == {"read_google_calendar_window"}
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Please put Board prep on my schedule for July 23.",
+        "Board prep should appear on July 23 in my calendar.",
+        "Could you make sure the July 23 Board prep item is there?",
+    ],
+)
+def test_chief_semantic_calendar_create_exposes_only_create_and_readback(
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        provider_system="google_calendar",
+        provider_operations=["create", "verify"],
+        primary_target="Board prep",
+        target_type="business_system_context",
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text=request_text,
+        manual_request_plan=plan,
+    )
+
+    assert {getattr(tool, "name", "") for tool in agent.tools} == {
+        "create_google_calendar_event",
+        "read_google_calendar_window",
+    }
+
+
+def test_chief_provider_plan_cannot_be_downgraded_by_supplied_context_words() -> None:
+    request_text = (
+        "Using only these details, make sure Board prep is on my calendar: "
+        "Board prep; July 23, 2026."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        provider_system="google_calendar",
+        provider_operations=["create", "verify"],
+        primary_target="Board prep",
+        target_type="business_system_context",
+    )
+
+    assert chief_of_staff_module._looks_like_operator_supplied_synthesis_request(
+        request_text
+    )
+    assert chief_of_staff_module._chief_direct_supplied_synthesis(
+        request_text,
+        plan,
+    ) is False
+    agent = build_chief_of_staff_agent(
+        request_text=request_text,
+        manual_request_plan=plan,
+    )
+
+    assert {getattr(tool, "name", "") for tool in agent.tools} == {
+        "create_google_calendar_event",
+        "read_google_calendar_window",
+    }
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Who handled our insurance coverage?",
+        "Find the company formation filing date from our stored records.",
+        "Which broker is named in the materials we keep for KNI?",
+    ],
+)
+def test_chief_local_document_plan_uses_precise_tools_across_phrasings(
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="unspecified",
+        provider_operations=["read", "search"],
+        primary_target="KNI company records",
+        target_type="local_document_collection",
+        constraints=["local_only=true", "send_enabled=false"],
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text=request_text,
+        manual_request_plan=plan,
+    )
+
+    assert {getattr(tool, "name", "") for tool in agent.tools} == {
+        "list_kni_document_folder",
+        "list_kni_document_sources",
+        "search_kni_documents",
+        "read_kni_document_file",
+    }
+
+
+def test_chief_script_local_document_selection_uses_llm_plan_not_phrase_match() -> None:
+    script = _load_run_chief_of_staff_script()
+    request_text = "Who handled our coverage?"
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="unspecified",
+        provider_operations=["read", "search"],
+        target_type="local_document_collection",
+    )
+
+    assert local_kni_evidence.looks_like_local_kni_evidence_lookup(request_text) is False
+    assert (
+        script._manual_plan_requests_local_kni_evidence(
+            plan,
+            input_text=request_text,
+        )
+        is True
+    )
+
+
+def test_chief_live_review_diagnostic_preserves_model_output() -> None:
+    script = _load_run_chief_of_staff_script()
+    output = ChiefOfStaffResult(
+        mode="llm",
+        summary="The provider-backed result is available.",
+        synthesis="The provider-backed result is available.",
+    )
+    review = SimpleNamespace(
+        observed_gaps=["Request/output term overlap is low."],
+    )
+
+    preserved = script._with_live_review_diagnostic(output, review)
+
+    assert preserved.summary == output.summary
+    assert preserved.synthesis == output.synthesis
+    assert any(
+        "preserved instead of being replaced" in note
+        for note in preserved.audit_notes
+    )
+
+
+def test_chief_reference_capture_review_uses_llm_intent() -> None:
+    script = _load_run_chief_of_staff_script()
+    output = ChiefOfStaffResult(
+        mode="llm",
+        summary="A reference was captured.",
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="reference-capture",
+        ),
+    )
+    lookup_plan = ManualRequestPlan(
+        source="llm",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        task_objective="context_lookup",
+    )
+    capture_plan = lookup_plan.model_copy(
+        update={
+            "intent": "reference_capture",
+            "task_objective": "reference_capture",
+        }
+    )
+
+    assert (
+        script._semantic_reference_capture_mismatch(
+            lookup_plan,
+            output,
+            input_text="What did we save?",
+        )
+        is True
+    )
+    assert (
+        script._semantic_reference_capture_mismatch(
+            capture_plan,
+            output,
+            input_text="Keep this reference.",
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Is it on the calendar now?",
+        "Can you check whether that event is there?",
+        "Please verify the appointment exists.",
+    ],
+)
+def test_chief_calendar_read_tool_scope_is_stable_across_phrasings(
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        target_type="business_system_context",
+        provider_system="google_calendar",
+        objective="Verify provider state for the referenced event.",
+        primary_target="UT Austin Course Starts",
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text=request_text,
+        manual_request_plan=plan,
+    )
+
+    assert {getattr(tool, "name", "") for tool in agent.tools} == {
+        "read_google_calendar_window"
+    }
+
+
 def test_chief_read_only_plan_exposes_no_internal_write_tools() -> None:
     plan = ManualRequestPlan(
         requested_agent="chief_of_staff",
@@ -222,6 +467,39 @@ def test_chief_read_only_plan_exposes_no_internal_write_tools() -> None:
     assert "create_google_calendar_event" not in tool_names
     assert "google_doc_write" not in tool_names
     assert "publish_slack_summary" not in tool_names
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Put this proof of payment in my personal costs. /tmp/receipt.pdf",
+        "File the attached image under Personal Expenses. /tmp/receipt.pdf",
+    ],
+)
+def test_chief_semantic_receipt_plan_exposes_only_composite_write_tool(
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="airtable_context_agent",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        provider_system="airtable",
+        provider_operations=["create", "attach", "verify"],
+        primary_target="Personal Expenses",
+        target_type="business_system_context",
+        required_entities=["2026 Finance & Tax Tracker"],
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text=request_text,
+        manual_request_plan=plan,
+    )
+    tool_names = {getattr(tool, "name", "") for tool in agent.tools}
+
+    assert tool_names & INTERNAL_WRITE_TOOL_NAMES == {
+        "airtable_create_expense_from_receipt"
+    }
 
 
 def test_chief_of_staff_result_can_carry_structured_durable_handoff() -> None:
@@ -327,6 +605,34 @@ def test_chief_of_staff_specialist_tools_are_default_off(monkeypatch: pytest.Mon
 
     for spec in SPECIALIST_AGENT_SPECS:
         assert specialist_agent_tool_name(spec.route_name) not in tool_names
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "I need a grounded answer on Northstar's evidence.",
+        "Northstar's claims need a careful answer.",
+        "Can you help me understand what is actually supported about Northstar?",
+    ],
+)
+def test_chief_uses_llm_specialist_owner_without_keyword_confirmation(
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="business_research_analyst",
+        intent="company_research",
+        task_objective="entity_research",
+        primary_target="Northstar",
+        target_type="company",
+        requires_live_search=True,
+    )
+
+    assert chief_of_staff_module.chief_of_staff_should_use_specialist_tools(
+        request_text,
+        plan,
+    )
 
 
 def test_chief_of_staff_can_opt_into_all_specialists_as_tools() -> None:
@@ -1804,7 +2110,7 @@ def test_chief_deterministic_handoff_accepts_workitem_capable_specialist_wording
     assert "Saved reference" not in result.summary
 
 
-def test_run_script_falls_back_when_live_sdk_misroutes_search_to_reference_capture(
+def test_run_script_preserves_and_flags_live_search_misroute(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1815,7 +2121,7 @@ def test_run_script_falls_back_when_live_sdk_misroutes_search_to_reference_captu
     plan = ManualRequestPlan(
         source="llm",
         requested_agent="chief_of_staff",
-        target_agent="chief_of_staff",
+        target_agent="business_research_analyst",
         intent="research_brief",
         primary_target="OpenAI mental health work",
         target_type="topic",
@@ -1892,10 +2198,10 @@ def test_run_script_falls_back_when_live_sdk_misroutes_search_to_reference_captu
     output = payload["output"]
     assert captured["sdk_kwargs"]["include_specialist_tools"] is True
     assert captured["sdk_args"][0]["include_specialist_tools"] is True
-    assert output["recommended_route"]["workflow_type"] != "reference-capture"
-    assert "Captured as a reference note" not in output["summary"]
+    assert output["recommended_route"]["workflow_type"] == "reference-capture"
+    assert "Captured as a reference note" in output["summary"]
     assert any(
-        "deterministic Chief of Staff fallback was rendered instead" in note
+        "preserved instead of being replaced" in note
         for note in output["audit_notes"]
     )
     assert payload["original_orchestrator_review"] == {"status": "ok"}
@@ -1961,12 +2267,14 @@ def test_run_script_live_sdk_passes_local_kni_evidence_packet_to_model(
         source="llm",
         requested_agent="chief_of_staff",
         target_agent="chief_of_staff",
-        intent="slack_operations",
+        intent="context_lookup",
         primary_target="CFC insurance broker",
-        target_type="slack_channel",
+        target_type="local_document_collection",
         objective="Identify the CFC insurance broker from local KNI evidence.",
-        task_objective="slack_operations",
-        expected_artifact_type="slack_ops_summary",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_operations=["search", "read"],
+        constraints=["local_only=true", "send_enabled=false"],
     )
 
     class FakeModelConfig:
@@ -2148,12 +2456,14 @@ def test_run_script_preserves_local_kni_live_answer_when_path_is_repaired(
         source="llm",
         requested_agent="chief_of_staff",
         target_agent="chief_of_staff",
-        intent="slack_operations",
+        intent="context_lookup",
         primary_target="formation confirmation department",
-        target_type="slack_channel",
+        target_type="local_document_collection",
         objective="Identify the department from local KNI formation evidence.",
-        task_objective="slack_operations",
-        expected_artifact_type="slack_ops_summary",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_operations=["search", "read"],
+        constraints=["local_only=true", "send_enabled=false"],
     )
 
     class FakeModelConfig:
@@ -2582,13 +2892,13 @@ def test_run_script_omits_provider_tools_for_supplied_note_only_judgment() -> No
         script._chief_of_staff_should_attach_tools(
             "Use only this supplied note and create a Google Doc for my review."
         )
-        is True
+        is False
     )
     assert (
         script._chief_of_staff_should_attach_tools(
             "Do a current source-backed web search for this company."
         )
-        is True
+        is False
     )
     continuation = (
         "chief of staff continue this prior Slack thread. "
@@ -2598,9 +2908,6 @@ def test_run_script_omits_provider_tools_for_supplied_note_only_judgment() -> No
         "Previous result: A bounded answer. "
         "User follow-up: Make that three bullets. "
         "Continue the same agent task. Any approval change remains subject to tool gates."
-    )
-    assert script._chief_tool_scope_text(continuation).startswith(
-        "Use only this supplied note."
     )
     assert script._chief_of_staff_should_attach_tools(continuation) is False
 
@@ -2630,8 +2937,6 @@ def test_supplied_facts_may_name_slack_without_admitting_provider_tools() -> Non
         "Check my Google Calendar for tomorrow's meetings.",
         "Read the latest Gmail thread from the grant team.",
         "Create a Google Doc from this approved summary.",
-        "Post this approved update to Slack.",
-        "Search the KNI repository for the routing contract.",
     ],
 )
 def test_bound_provider_actions_still_admit_chief_tools(operator_text: str) -> None:
@@ -2641,8 +2946,18 @@ def test_bound_provider_actions_still_admit_chief_tools(operator_text: str) -> N
         requested_agent="chief_of_staff",
     )
 
-    assert provider_tool_action_bound(operator_text) is True
     assert script._chief_of_staff_should_attach_tools(operator_text, plan) is True
+
+
+def test_provider_words_without_semantic_plan_never_attach_chief_tools() -> None:
+    script = _load_run_chief_of_staff_script()
+
+    assert (
+        script._chief_of_staff_should_attach_tools(
+            "Airtable, Gmail, Calendar, and Slack are examples in this architecture note."
+        )
+        is False
+    )
 
 
 def test_chief_specialist_tool_routing_ignores_approval_boilerplate() -> None:
@@ -2734,13 +3049,588 @@ def test_run_script_allows_explicit_finance_tracker_airtable_receipt_write() -> 
 def test_run_script_treats_dated_deadline_as_scoped_calendar_write() -> None:
     script = _load_run_chief_of_staff_script()
     request = "CoS add “UT AI Agents application due on July 23rd”"
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        provider_system="google_calendar",
+        provider_operations=["create", "verify"],
+        primary_target="UT AI Agents application due",
+        objective=request,
+    )
 
-    policy = script._live_side_effect_policy(request)
+    policy = script._live_side_effect_policy(request, plan)
 
-    assert script._requests_calendar_write(request) is True
-    assert "one exact Google Calendar action" in policy
-    assert "Verify provider state" in policy
-    assert "Do not mutate Slack, Gmail, Airtable" in policy
+    assert script._requests_calendar_write(request, plan) is True
+    assert "exact Google Calendar operations create, verify" in policy
+    assert "provider read-back" in policy
+    assert "Do not mutate Gmail, Slack, Airtable" in policy
+
+
+def test_run_script_calendar_read_requires_provider_receipt() -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        objective="Check whether the referenced event exists.",
+        primary_target="UT Austin Course Starts",
+    )
+    output = SimpleNamespace(summary="I checked the Calendar.", synthesis="")
+
+    missing = script._payload(
+        mode="live_sdk",
+        live_sdk=True,
+        model={"name": "test"},
+        output=output,
+        input_text="Is it on the calendar now?",
+        manual_request_plan=plan,
+        tool_receipts=[],
+    )
+    verified = script._payload(
+        mode="live_sdk",
+        live_sdk=True,
+        model={"name": "test"},
+        output=output,
+        input_text="Is it on the calendar now?",
+        manual_request_plan=plan,
+        tool_receipts=[
+            {
+                "status": "success",
+                "operation": "read_calendar_window",
+                "events": [
+                    {
+                        "event_id": "event-1",
+                        "title": "UT Austin Course Starts",
+                        "start": "2026-08-15T08:00:00-04:00",
+                    }
+                ],
+            }
+        ],
+    )
+
+    assert missing["status"] == "blocked"
+    assert missing["public_result"]["completion_confirmed"] is False
+    assert missing["block_kind"] == "calendar_provider_verification_required"
+    assert verified["status"] == "done"
+    assert verified["public_result"]["status"] == "completed"
+    assert verified["public_result"]["completion_confirmed"] is True
+    assert verified["human_summary"] == (
+        'Yes - "UT Austin Course Starts" is on your Google Calendar '
+        "on 2026-08-15 at 8:00 AM."
+    )
+
+
+def test_run_script_calendar_dry_run_read_is_not_provider_verification() -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        objective="Check whether the referenced event exists.",
+        primary_target="UT Austin Course Starts",
+    )
+
+    payload = script._payload(
+        mode="live_sdk",
+        live_sdk=True,
+        model={"name": "test"},
+        output=SimpleNamespace(summary="The tool ran.", synthesis=""),
+        input_text="Is it on the calendar now?",
+        manual_request_plan=plan,
+        tool_receipts=[
+            {
+                "status": "dry-run",
+                "operation": "read_calendar_window",
+                "events": [],
+            }
+        ],
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["public_result"]["completion_confirmed"] is False
+    assert payload["block_kind"] == "calendar_provider_verification_required"
+
+
+def test_run_script_calendar_read_reconciles_reordered_title_tokens() -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        objective="Check whether the referenced event exists.",
+        primary_target="Google Calendar event for UT Austin Course Starts on August 15, 2026",
+        required_entities=["UT Austin Course Starts"],
+    )
+
+    payload = script._payload(
+        mode="live_sdk",
+        live_sdk=True,
+        model={"name": "test"},
+        output=SimpleNamespace(summary="I checked the calendar.", synthesis=""),
+        input_text="Is it on the calendar now?",
+        manual_request_plan=plan,
+        tool_receipts=[
+            {
+                "status": "success",
+                "operation": "read_calendar_window",
+                "events": [
+                    {
+                        "event_id": "event-1",
+                        "title": "AI agents & Software Dev Course Starts (UT Austin)",
+                        "start": "2026-08-15T12:00:00-04:00",
+                    }
+                ],
+            }
+        ],
+    )
+
+    assert payload["status"] == "done"
+    assert payload["human_summary"] == (
+        'Yes - "AI agents & Software Dev Course Starts (UT Austin)" is on your '
+        "Google Calendar on 2026-08-15 at 12:00 PM."
+    )
+    assert payload["public_result"]["omit_title"] is True
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (
+            "success",
+            'Yes - "UT Course Orientation Session" is on your Google Calendar '
+            "on 2026-08-08.",
+        ),
+        (
+            "not_found",
+            'No - I did not find an active event matching "UT Course Orientation '
+            'Session" in Google Calendar.',
+        ),
+        (
+            "ambiguous",
+            'I found multiple active events matching "UT Course Orientation Session" '
+            "in Google Calendar. Give me a date or one more title detail and I can "
+            "identify the right one.",
+        ),
+    ],
+)
+def test_run_script_calendar_resolve_receipt_is_provider_verification(
+    status: str,
+    expected: str,
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        objective="Find the date of the referenced orientation session.",
+        primary_target="UT Course Orientation Session",
+        required_entities=["UT Course Orientation Session"],
+    )
+    receipt = {
+        "status": status,
+        "operation": "resolve_calendar_event",
+        "event_reference": "UT Course Orientation Session",
+        "match_count": 1 if status == "success" else 0 if status == "not_found" else 2,
+    }
+    if status == "success":
+        receipt.update(
+            {
+                "title": "UT Course Orientation Session",
+                "start_date": "2026-08-08",
+            }
+        )
+
+    payload = script._payload(
+        mode="live_sdk",
+        live_sdk=True,
+        model={"name": "test"},
+        output=SimpleNamespace(summary="Model answer.", synthesis=""),
+        input_text="What date is the UT Course Orientation Session?",
+        manual_request_plan=plan,
+        tool_receipts=[receipt],
+    )
+
+    assert payload["status"] == "done"
+    assert payload["human_summary"] == expected
+    assert payload["public_result"]["completion_confirmed"] is True
+
+
+def test_run_script_executes_required_calendar_lookup_from_semantic_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        objective="Find the orientation session date.",
+        primary_target="calendar item wrapper",
+        required_entities=["UT Course Orientation Session"],
+    )
+    captured: dict[str, object] = {}
+
+    def fake_resolve(event_reference: str, **kwargs: object) -> dict[str, object]:
+        captured["event_reference"] = event_reference
+        captured.update(kwargs)
+        return {
+            "status": "success",
+            "operation": "resolve_calendar_event",
+            "event_reference": event_reference,
+            "title": event_reference,
+            "start_date": "2026-08-08",
+            "match_count": 1,
+        }
+
+    monkeypatch.setattr(script, "resolve_google_calendar_event_impl", fake_resolve)
+
+    receipt = script._execute_required_calendar_context_lookup(plan)
+
+    assert captured == {
+        "event_reference": "UT Course Orientation Session",
+        "live": True,
+    }
+    assert receipt is not None
+    assert receipt["status"] == "success"
+
+
+def test_run_script_calendar_lookup_falls_back_to_explicit_date_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        objective="Verify the course-start event.",
+        primary_target="UT Austin Course Starts",
+        required_entities=["UT Austin Course Starts"],
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        script,
+        "resolve_google_calendar_event_impl",
+        lambda *_args, **_kwargs: {
+            "status": "not_found",
+            "operation": "resolve_calendar_event",
+            "match_count": 0,
+        },
+    )
+
+    def fake_window(
+        time_min: str,
+        time_max: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        captured.update(
+            {
+                "time_min": time_min,
+                "time_max": time_max,
+                **kwargs,
+            }
+        )
+        return {
+            "status": "success",
+            "operation": "read_calendar_window",
+            "events": [
+                {
+                    "title": "AI agents & Software Dev Course Starts (UT Austin)",
+                    "start": "2026-08-15T12:00:00-04:00",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(script, "read_google_calendar_window_impl", fake_window)
+
+    receipt = script._execute_required_calendar_context_lookup(
+        plan,
+        input_text=(
+            "CoS add UT Austin Course Starts on August 15, 2026. "
+            "Authoritative follow-up: Is it on the calendar now?"
+        ),
+    )
+
+    assert receipt is not None
+    assert receipt["operation"] == "read_calendar_window"
+    assert str(captured["time_min"]).startswith("2026-08-15T00:00:00")
+    assert str(captured["time_max"]).startswith("2026-08-16T00:00:00")
+    assert captured["live"] is True
+
+
+def test_run_script_recovers_required_calendar_receipt_when_model_skips_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        objective="Find the orientation session date.",
+        primary_target="UT Course Orientation Session",
+        required_entities=["UT Course Orientation Session"],
+    )
+    calls: list[str] = []
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_run_chief_of_staff_sdk(
+        *_args: object,
+        **_kwargs: object,
+    ) -> TypedAgentRunResult:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary="I re-checked the event and it is present.",
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="project-context-review",
+                    target_channel="current Slack thread",
+                ),
+            ),
+            raw_result=SimpleNamespace(new_items=[]),
+            live=True,
+        )
+
+    def fake_required_lookup(
+        _manual_plan: object,
+        *,
+        input_text: str = "",
+    ) -> dict[str, object]:
+        calls.append(input_text)
+        return {
+            "status": "success",
+            "operation": "resolve_calendar_event",
+            "event_reference": "UT Course Orientation Session",
+            "match_count": 1,
+            "title": "UT Course Orientation Session",
+            "start_date": "2026-08-22",
+        }
+
+    monkeypatch.setenv(MANUAL_REQUEST_PLAN_ENV, plan.model_dump_json())
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(
+        script,
+        "_execute_required_calendar_context_lookup",
+        fake_required_lookup,
+    )
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--json",
+                "--input",
+                "What date is the UT Course Orientation Session?",
+            ]
+        )
+        == 0
+    )
+
+    payload = _payload(capsys.readouterr().out)
+    assert calls == ["What date is the UT Course Orientation Session?"]
+    assert payload["status"] == "done"
+    assert payload["human_summary"].startswith(
+        'Yes - "UT Course Orientation Session" is on your Google Calendar '
+        "on 2026-08-22."
+    )
+    assert payload["tool_receipts"][0]["operation"] == "resolve_calendar_event"
+
+
+def test_run_script_calendar_write_uses_verified_receipt_for_public_answer() -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        provider_system="google_calendar",
+        objective="Add the event.",
+        primary_target="UT Austin Course Starts",
+    )
+
+    payload = script._payload(
+        mode="live_sdk",
+        live_sdk=True,
+        model={"name": "test"},
+        output=SimpleNamespace(summary="Workflow complete.", synthesis=""),
+        input_text=(
+            "Add UT Austin Course Starts on August 15, 2026 to my Google "
+            "Calendar from 8am to 9am."
+        ),
+        manual_request_plan=plan,
+        tool_receipts=[
+            {
+                "status": "success",
+                "operation": "create_calendar_event",
+                "title": "UT Austin Course Starts",
+                "start_date": "2026-08-15",
+                "start_time": "08:00",
+                "verification": {"passed": True},
+            }
+        ],
+    )
+
+    assert payload["status"] == "done"
+    assert payload["human_summary"] == (
+        'Google Calendar event created and verified: '
+        '"UT Austin Course Starts" on 2026-08-15.'
+    )
+    assert "Workflow complete" not in payload["public_result"]["text"]
+
+
+def test_run_script_uses_write_receipt_preserved_by_sdk_retry_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        provider_system="google_calendar",
+        provider_operations=["update"],
+        objective="Move the event to 4:20 PM and make it 25 minutes.",
+        primary_target="KBA_TEST_CALENDAR natural language canary",
+        required_entities=["KBA_TEST_CALENDAR natural language canary"],
+    )
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_run_chief_of_staff_sdk(
+        *_args: object,
+        **_kwargs: object,
+    ) -> TypedAgentRunResult:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary="The event was updated and verified.",
+            ),
+            raw_result=SimpleNamespace(new_items=[]),
+            live=True,
+            tool_receipts=[
+                {
+                    "status": "success",
+                    "operation": "update_calendar_event",
+                    "event_id": "event-1",
+                    "title": "KBA_TEST_CALENDAR natural language canary",
+                    "start_date": "2026-07-22",
+                    "start_time": "16:20",
+                    "end_time": "16:45",
+                    "verification": {"passed": True},
+                    "tool_name": "update_google_calendar_event",
+                }
+            ],
+        )
+
+    monkeypatch.setenv(MANUAL_REQUEST_PLAN_ENV, plan.model_dump_json())
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--json",
+                "--input",
+                "Actually, start it at 4:20 PM and make it 25 minutes.",
+            ]
+        )
+        == 0
+    )
+
+    payload = _payload(capsys.readouterr().out)
+    assert payload["status"] == "done"
+    assert payload["completion_confirmed"] is True
+    assert payload["side_effects"]["calendar_write_performed"] is True
+    assert payload["human_summary"] == (
+        'Google Calendar event updated and verified: '
+        '"KBA_TEST_CALENDAR natural language canary" on 2026-07-22.'
+    )
+
+
+def test_run_script_extracts_calendar_provider_receipt_from_sdk_result() -> None:
+    script = _load_run_chief_of_staff_script()
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(
+                type="tool_call_output_item",
+                output=json.dumps(
+                    {
+                        "status": "success",
+                        "operation": "create_calendar_event",
+                        "event_id": "event-1",
+                        "title": "UT Austin Course Starts",
+                        "start_date": "2026-08-15",
+                        "verification": {"passed": True},
+                    }
+                ),
+            )
+        ]
+    )
+
+    receipts = script._sdk_tool_receipts(raw_result)
+
+    assert receipts == [
+        {
+            "status": "success",
+            "operation": "create_calendar_event",
+            "event_id": "event-1",
+            "title": "UT Austin Course Starts",
+            "start_date": "2026-08-15",
+            "verification": {"passed": True},
+        }
+    ]
+
+
+def test_run_script_merges_retry_journal_receipt_with_final_sdk_receipts() -> None:
+    script = _load_run_chief_of_staff_script()
+    write_receipt = {
+        "status": "success",
+        "operation": "update_calendar_event",
+        "event_id": "event-1",
+        "verification": {"passed": True},
+    }
+    read_receipt = {
+        "status": "success",
+        "operation": "read_calendar_window",
+        "events": [{"event_id": "event-1"}],
+    }
+
+    merged = script._merge_tool_receipts(
+        [read_receipt],
+        [write_receipt, read_receipt],
+    )
+
+    assert merged == [read_receipt, write_receipt]
 
 
 def test_chief_of_staff_article_reader_is_default_off_until_explicit() -> None:
@@ -5551,9 +6441,9 @@ def test_chief_of_staff_live_business_expense_receipt_uses_llm_tool_path(
     agent = captured["agent"]
     tool_names = {getattr(tool, "name", "") for tool in agent.tools}
     assert "airtable_get_base_schema" in tool_names
-    assert "airtable_write_record" in tool_names
-    assert "airtable_upload_attachment" in tool_names
     assert "airtable_create_expense_from_receipt" in tool_names
+    assert "airtable_write_record" not in tool_names
+    assert "airtable_upload_attachment" not in tool_names
 
 
 def test_chief_of_staff_receipt_typed_input_preserves_pdf_for_openai_model(
@@ -5973,6 +6863,74 @@ def test_chief_of_staff_quality_budget_caps_postposed_only_note_response() -> No
         quality_budget=budget,
         request_text=request,
     ).tools == []
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Using only these details, make sure Board prep is on my calendar.",
+        "Please place Board prep on the calendar from the information above.",
+        "Could you add the supplied Board prep item to my schedule?",
+    ],
+)
+def test_chief_quality_budget_uses_provider_plan_not_response_only_phrasing(
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        provider_system="google_calendar",
+        provider_operations=["create", "verify"],
+        primary_target="Board prep",
+        target_type="business_system_context",
+    )
+
+    budget = chief_of_staff_quality_budget(
+        request_text=request_text,
+        live_sdk=True,
+        manual_request_plan=plan,
+    )
+
+    assert budget.mode == QualityMode.BALANCED
+    assert budget.max_tool_calls == 12
+    assert budget.max_turns == 8
+    assert any("LLM plan" in note for note in budget.notes)
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Turn these supplied facts into a concise note.",
+        "What is the clearest conclusion from the material above?",
+    ],
+)
+def test_chief_quality_budget_semantic_provider_free_plan_is_one_turn(
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="route_request",
+        task_objective="route_or_continue",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_live_search=False,
+        requires_durable_state=False,
+    )
+
+    budget = chief_of_staff_quality_budget(
+        request_text=request_text,
+        live_sdk=True,
+        manual_request_plan=plan,
+    )
+
+    assert budget.mode == QualityMode.FAST
+    assert budget.max_tool_calls == 0
+    assert budget.max_turns == 1
 
 
 def test_chief_of_staff_quality_budget_deep_for_cross_channel_audit() -> None:

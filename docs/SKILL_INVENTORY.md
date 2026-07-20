@@ -38,6 +38,7 @@ bypass source, approval, cost, dry-run, no-send, or no-write gates.
 | `kba-eval-readiness-triage` | Keep | Still owns Promptfoo, Slack eval readiness, trace summaries, route compaction, and no-live SDK eval safety. |
 | `kba-live-sdk-smoke-and-cost` | Keep | Still owns `KEYSTONE_OPENAI_API_KEY`, live SDK smoke, rate-limit, trace, request-cache, and cost telemetry guidance. |
 | `kba-new-agent` | Update now | Kept as the novel-agent workflow; refreshed to include optional LangGraph backend policy while preserving Orchestrator-first execution. |
+| `kba-operational-validation` | Keep | Coordinates realistic direct-agent, WorkItem/LangGraph, provider-lifecycle, cost-bounded live API, and Slack acceptance evidence without replacing narrower implementation skills. |
 | `kba-search-provider-eval` | Keep | Still owns live-search, provider budgets, KBA SearXNG `18080`, extraction, attribution, and no-side-effect live eval rules. |
 | `kba-workitem-orchestrator-ops` | Update now | Kept as the WorkItem/Orchestrator operations workflow; refreshed to name LangGraph as optional orchestration around WorkItems, not canonical business state. |
 

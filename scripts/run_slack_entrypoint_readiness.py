@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the two-probe Slack entrypoint packet without live Slack or models."""
+"""Validate the Slack entrypoint acceptance packet without live Slack or models."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ def main(argv: list[str] | None = None) -> int:
                 "backend": case.backend,
                 "pre_live_status": "ready" if completed.returncode == 0 else "failed",
                 "live_slack_evidence_proven": case.live_slack_evidence_proven,
+                "live_evidence_refs": list(case.live_evidence_refs),
                 "max_openai_requests": case.max_openai_requests,
                 "max_cost_usd": case.max_cost_usd,
                 "proof_nodeids": list(case.proof_nodeids),

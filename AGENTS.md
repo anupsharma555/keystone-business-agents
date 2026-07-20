@@ -88,6 +88,11 @@ inspectable state:
   whose fields contain `KBA_TEST_RECORD`, through the dedicated test-delete tool
   with a separate approval/live flag and read-after-delete verification. No
   ordinary deletes, schema changes, attachment uploads, or silent bulk overwrites.
+  One compensation exception may reconcile an operator-identified accidental
+  duplicate: require the exact intended and duplicate record IDs, prove through
+  provider reads that their expense identity and attachment filename match,
+  correct and verify the intended record first, require the separate duplicate-
+  cleanup live gate, then delete only the duplicate and verify its absence.
 - Use the KNI Finance Operations local app only as a read-only finance
   operations context source unless a separate write integration is approved.
   The canonical local app is
@@ -513,6 +518,9 @@ matching `SKILL.md` before touching repo files.
   debugging live SDK smoke tests, model/provider configuration,
   `KEYSTONE_OPENAI_API_KEY`, SDK sessions, traces, rate limits, budget guards,
   request-cache behavior, or cost telemetry.
+- `codex-skills/kba-operational-validation/SKILL.md`: use when coordinating
+  realistic direct-agent, WorkItem/LangGraph, provider-lifecycle, live API,
+  and Slack acceptance evidence across agent families.
 
 ## Agent Improvement Test Pack
 

@@ -37,10 +37,6 @@ class ManualRequestPlannerInput:
     workflow_context: dict[str, Any] | None = None
 
     def to_prompt(self) -> str:
-        fallback = self.fallback_plan or infer_manual_request_plan(
-            self.request_text,
-            requested_agent=self.requested_agent,
-        )
         requested = self.requested_agent or "not specified"
         context = self.workflow_context or {}
         marked_lifecycle_attention = ""
@@ -56,7 +52,8 @@ class ManualRequestPlannerInput:
                 "canonical verbs. If it requests a lifecycle, restate its stages "
                 "explicitly in objective using create, verify, update when requested, "
                 "verify again, and delete or trash when requested. Use "
-                "intent=business_system_write and the single provider owner. Preserve "
+                "intent=business_system_write, record the ordered normalized stages "
+                "in provider_operations, and select the single provider owner. Preserve "
                 "all no-send, exact-object, and cleanup restrictions. This planning "
                 "hint does not approve or execute any provider write.\n"
             )
@@ -70,8 +67,9 @@ class ManualRequestPlannerInput:
             "Context authority rule: the current operator request is authoritative; "
             "the thread-root operator request may resolve references; historical agent "
             "outputs may be wrong and must never select an owner by themselves.\n\n"
-            "Local fallback plan for reference:\n"
-            f"{fallback.model_dump_json(indent=2)}\n\n"
+            "Interpret the request independently from local keyword or phrase "
+            "classifiers. A local fallback is used only if this model call is "
+            "unavailable and is intentionally not included as planning evidence.\n\n"
             "Return only a valid ManualRequestPlan."
         )
 
@@ -181,6 +179,7 @@ def _compact_manual_planner_context(
     recent = state.get("recent_slack_thread") or nested_slack_context.get("thread_messages") or []
     prior_runs = state.get("prior_agent_runs") or nested_slack_context.get("prior_agent_runs") or []
     current_work_item = state.get("current_work_item")
+    execution_continuation = state.get("execution_continuation")
     compact: dict[str, Any] = {}
     receipt: dict[str, Any] = {
         "policy": "preserve_root_and_latest",
@@ -271,6 +270,18 @@ def _compact_manual_planner_context(
                     ),
                 }
             )
+    if isinstance(execution_continuation, Mapping):
+        compact_continuation = {
+            key: str(execution_continuation.get(key) or "")[:limit]
+            for key, limit in (
+                ("work_item_id", 100),
+                ("provider_affinity", 100),
+                ("prior_request", 2400),
+            )
+            if str(execution_continuation.get(key) or "").strip()
+        }
+        if compact_continuation:
+            compact["execution_continuation"] = compact_continuation
     if len(receipt) > 1:
         compact["context_compaction"] = receipt
     return {key: value for key, value in compact.items() if value}
@@ -357,7 +368,26 @@ def _apply_contextual_route_hint(
 ) -> ManualRequestPlan:
     """Use typed source context as a routing hint, never as write authority."""
 
-    if not workflow_context or not _depends_on_prior_context(request_text):
+    if not workflow_context:
+        return fallback
+    continuation = workflow_context.get("execution_continuation")
+    provider_affinity = (
+        str(continuation.get("provider_affinity") or "").strip().lower()
+        if isinstance(continuation, Mapping)
+        else ""
+    )
+    affinity_owners = {
+        "airtable": "airtable_context_agent",
+        "calendar": "chief_of_staff",
+        "google_calendar": "chief_of_staff",
+        "google calendar": "chief_of_staff",
+        "gmail": "gmail_triage",
+        "google_workspace": "google_workspace_context_agent",
+        "google workspace": "google_workspace_context_agent",
+        "zotero": "zotero_context_agent",
+    }
+    affinity_owner = affinity_owners.get(provider_affinity)
+    if not _depends_on_prior_context(request_text) and affinity_owner is None:
         return fallback
     requested = fallback.requested_agent
     if requested not in {None, "orchestrator", "chief_of_staff"}:
@@ -367,7 +397,7 @@ def _apply_contextual_route_hint(
     owner_candidates = _context_owner_candidates_from_workflow_context(
         workflow_context
     )
-    if len(owner_candidates) > 1:
+    if affinity_owner is None and len(owner_candidates) > 1:
         return fallback.model_copy(
             update={
                 "target_agent": "clarification",
@@ -388,7 +418,7 @@ def _apply_contextual_route_hint(
                 ],
             }
         )
-    target = owner_candidates[0] if owner_candidates else None
+    target = affinity_owner or (owner_candidates[0] if owner_candidates else None)
     if target is None:
         return fallback
     write_requested = bool(
@@ -401,6 +431,7 @@ def _apply_contextual_route_hint(
     )
     updates: dict[str, Any] = {
         "target_agent": target,
+        "workflow": [],
         "rationale": (
             "Prior thread/work-item context identifies the source-owning specialist; "
             "the live planner must interpret the requested change before tool execution."
@@ -419,6 +450,11 @@ def _apply_contextual_route_hint(
         updates.update(
             {
                 "intent": "business_system_write" if write_requested else "context_lookup",
+                "provider_system": {
+                    "airtable_context_agent": "airtable",
+                    "google_workspace_context_agent": "google_workspace",
+                    "zotero_context_agent": "zotero",
+                }[target],
                 "target_type": "business_system_context",
                 "task_objective": (
                     "business_system_write" if write_requested else "context_lookup"
@@ -437,20 +473,46 @@ def _apply_contextual_route_hint(
         updates.update(
             {
                 "intent": "gmail_triage",
+                "provider_system": "gmail",
                 "target_type": "gmail_thread",
                 "task_objective": "gmail_triage",
                 "expected_artifact_type": "gmail_triage_report",
             }
         )
     elif target == "chief_of_staff":
-        updates.update(
-            {
-                "intent": "slack_operations",
-                "target_type": "slack_channel",
-                "task_objective": "slack_operations",
-                "expected_artifact_type": "slack_ops_summary",
-            }
-        )
+        if provider_affinity in {"calendar", "google_calendar", "google calendar"}:
+            updates.update(
+                {
+                    "intent": (
+                        "business_system_write" if write_requested else "context_lookup"
+                    ),
+                    "provider_system": "google_calendar",
+                    "target_type": "business_system_context",
+                    "task_objective": (
+                        "business_system_write" if write_requested else "context_lookup"
+                    ),
+                    "expected_artifact_type": (
+                        "business_system_write_plan"
+                        if write_requested
+                        else "context_summary"
+                    ),
+                    "side_effect_policy": (
+                        "internal_write_approval_required"
+                        if write_requested
+                        else "draft_or_read_only"
+                    ),
+                }
+            )
+        else:
+            updates.update(
+                {
+                    "intent": "slack_operations",
+                    "provider_system": "slack",
+                    "target_type": "slack_channel",
+                    "task_objective": "slack_operations",
+                    "expected_artifact_type": "slack_ops_summary",
+                }
+            )
     elif target == "business_research_analyst":
         updates.update(
             {
@@ -501,16 +563,6 @@ def _context_owner_candidates_from_workflow_context(
             if not isinstance(item, Mapping):
                 continue
             role = str(item.get("role") or "").strip().lower()
-            source_agent = str(item.get("source_agent") or "").strip()
-            if source_agent in {
-                "airtable_context_agent",
-                "google_workspace_context_agent",
-                "zotero_context_agent",
-                "gmail_triage",
-                "chief_of_staff",
-                "business_research_analyst",
-            }:
-                candidates.append(source_agent)
             if role in {"agent", "assistant", "system", "tool"}:
                 continue
             summary = str(item.get("summary") or item.get("text") or "").strip()
@@ -524,6 +576,11 @@ def _context_owner_candidates_from_workflow_context(
     ).strip()
     if thread_root:
         operator_fragments.insert(0, thread_root)
+    continuation = workflow_context.get("execution_continuation")
+    if isinstance(continuation, Mapping):
+        prior_request = str(continuation.get("prior_request") or "").strip()
+        if prior_request:
+            operator_fragments.insert(0, prior_request)
     if operator_fragments:
         candidates.extend(
             _context_owner_candidates(

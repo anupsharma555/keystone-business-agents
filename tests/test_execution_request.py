@@ -27,6 +27,7 @@ def test_slack_followup_keeps_current_request_authoritative_and_prior_state_boun
             "chief of staff continue this prior Slack thread.",
             "Current user request (authoritative): Make that three bullets.",
             "Linked WorkItem: wi_example",
+            "Provider affinity: calendar",
             "Previous request: Summarize the supplied note.",
             "Previous result title: Business Agents Chief of Staff",
             "Previous result: A longer summary.",
@@ -41,6 +42,7 @@ def test_slack_followup_keeps_current_request_authoritative_and_prior_state_boun
     assert request.current_request == "Make that three bullets."
     assert request.requested_agent == "chief_of_staff"
     assert request.continuation.work_item_id == "wi_example"
+    assert request.continuation.provider_affinity == "calendar"
     assert request.continuation.prior_request == "Summarize the supplied note."
     assert request.continuation.prior_result_title == "Business Agents Chief of Staff"
     assert request.continuation.prior_result_summary == "A longer summary."
@@ -102,6 +104,36 @@ def test_slack_followup_planning_text_keeps_prior_context_and_latest_ask_last() 
     assert planning_text.endswith(
         "Authoritative follow-up: Keep only the three bullets with no note after them."
     )
+
+
+def test_provider_followup_planning_text_drops_prior_failed_bot_prose() -> None:
+    request = build_execution_request(
+        "\n".join(
+            [
+                "chief of staff continue this prior Slack thread.",
+                "Provider affinity: calendar",
+                (
+                    "Previous request: CoS add UT Austin Course Starts on August 15, "
+                    "2026 to my Google Calendar."
+                ),
+                "Previous result title: Business Agents WorkItem Failed",
+                "Previous result: No specialist or provider action ran.",
+                "User follow-up: Is it on the calendar now?",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+
+    planning_text = execution_request_planning_text(request)
+
+    assert planning_text.startswith(
+        "CoS add UT Austin Course Starts on August 15, 2026 to my Google Calendar."
+    )
+    assert planning_text.endswith(
+        "Authoritative follow-up: Is it on the calendar now?"
+    )
+    assert "No specialist or provider action ran" not in planning_text
+    assert "WorkItem Failed" not in planning_text
 
 
 def test_neutral_slack_followup_envelope_does_not_synthesize_prior_agent_authority() -> None:
@@ -308,6 +340,29 @@ def test_generated_clarification_prose_cannot_claim_completion() -> None:
     assert result.completion_confirmed is False
     assert payload["completion_confirmed"] is False
     assert payload["slack_display_title"] == "Business Agents Need Input"
+
+
+def test_llm_plan_prevents_cautious_answer_wording_from_becoming_blocker() -> None:
+    payload = {
+        "status": "done",
+        "completion_confirmed": True,
+        "human_summary": (
+            "There is not enough evidence to confirm the broader claim, but the "
+            "provider record confirms the requested date."
+        ),
+        "manual_request_plan": {
+            "source": "llm",
+            "target_agent": "chief_of_staff",
+            "intent": "context_lookup",
+            "missing_required_information": [],
+        },
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "completed"
+    assert result.completion_confirmed is True
+    assert payload["slack_display_title"] == "Business Agents Result Ready"
 
 
 def test_advisory_clarification_metadata_cannot_block_complete_direct_answer() -> None:
