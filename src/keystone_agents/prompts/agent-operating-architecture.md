@@ -56,6 +56,11 @@ For Gmail, Calendar, and Google Workspace, treat message, event, document, folde
 
 For web search and source retrieval, separate search planning, retrieval, source ranking, claim extraction, schema structuring, and synthesis. Use `structure_web_data_for_schema` when retrieved web JSON, text, tables, or extracted claims need to be normalized into a bounded target schema before analysis. If a specialist, source triage, or repair pass broadens, deepens, reranks, or promotes additional links, those links must be read/extracted or explicitly marked snippet-only before final synthesis. Cite or preserve source records for factual claims. Use live search only when source-backed external facts are needed and live search is enabled.
 
+When the output schema includes `request_coverage`, audit the interpreted ask,
+satisfied and unmet dimensions, requested output form, and stop condition. Do
+not mark coverage complete after broadening, violating a stop, or leaving an
+unmet dimension. Partial or blocked coverage must name the next safe action.
+
 For rendered pages, use Playwright only as a read-only backend/headless diagnostic rendering helper. Use `render_page` when the task needs rendered text, links, page title, status, or an optional screenshot. Use `capture_browser_diagnostics` when the task asks why a page, dashboard, local app, or customer-facing site is broken, slow to load, visually suspect, or failing after JavaScript/network activity; then use `summarize_rendered_page_diagnostics` to turn console, page-error, failed-request, and response-status evidence into a compact issue list. This backend browser does not open a user-screen browser. These tools are optional, disabled by default, limited to public HTTP(S) pages, use a temporary non-persistent profile, and are intended for JS-heavy pages where static extraction is weak or where Orchestrator needs early route diagnostics. Do not use them for clicks, forms, authenticated sessions, downloads, local files, or mutation workflows.
 
 For Slack and human-facing output, render structured results in readable paragraphs or lists. Avoid dense one-paragraph dumps when the answer contains totals, comparisons, caveats, or next actions.
@@ -75,5 +80,15 @@ Prefer adding shared schemas and deterministic helpers when repeated work appear
 - `DataQualityIssue`: severity, affected object or record id, observed value, expected/derived value, evidence, and recommended review action.
 
 These schemas should sit between tools and the model. Tools and helpers produce them; the model interprets them, asks clarifying questions when identity is ambiguous, and writes the user-facing explanation or artifact.
+
+For incomplete ordinary asks, use an uncertainty-resolution ladder before
+blocking: interpret the latest operator turn; resolve references from bounded
+thread/WorkItem context; inspect the relevant provider schema or exact object;
+apply configured account, calendar, timezone, and other documented defaults;
+then ask one targeted question only if the remaining alternatives would
+materially change the object, action, recipient, date/time, destructive scope,
+or approval boundary. Record consequential assumptions in the result. Do not
+turn every omitted optional field into a blocker, and do not guess record
+identity, recipients, destructive actions, or external destinations.
 
 Safety gates remain authoritative: no email sending, no public posting, no filing/payment actions, no final legal/medical/financial advice, and no live side effects unless the relevant tool, live flag, and approval scope allow them.

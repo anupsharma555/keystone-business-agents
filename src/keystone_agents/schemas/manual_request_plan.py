@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, Field, field_validator
+
+from keystone_agents.schemas.output_constraints import InterpretedOutputConstraints
 
 ManualTargetAgent = Literal[
     "orchestrator",
@@ -110,6 +112,9 @@ class AskShapePolicy(BaseModel):
     permission_state: PermissionState = "unspecified"
     cost_mode: CostMode = "unspecified"
     stop_condition: str = ""
+    output_constraints: InterpretedOutputConstraints = Field(
+        default_factory=InterpretedOutputConstraints
+    )
 
     @field_validator("source_type_preference", mode="before")
     @classmethod
@@ -137,6 +142,7 @@ class ManualRequestPlan(BaseModel):
     source: str = "heuristic"
     requested_agent: ManualTargetAgent | None = None
     target_agent: ManualTargetAgent = "clarification"
+    workflow: list[ManualTargetAgent] = Field(default_factory=list)
     intent: ManualRequestIntent = "clarification"
     primary_target: str = ""
     target_type: ManualTargetType = "unknown"
@@ -159,6 +165,29 @@ class ManualRequestPlan(BaseModel):
     side_effect_policy: str = "draft_or_read_only"
     rationale: str = ""
     planner_warnings: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "workflow",
+        mode="before",
+    )
+    @classmethod
+    def _clean_workflow(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list | tuple | set) else [value]
+        allowed = set(get_args(ManualTargetAgent))
+        normalized = [
+            str(item or "").strip().lower().replace(" ", "_")
+            for item in values
+        ]
+        return list(
+            dict.fromkeys(
+                item
+                for item in normalized
+                if item in allowed
+                and item not in {"orchestrator", "chief_of_staff", "clarification"}
+            )
+        )
 
     @field_validator(
         "source",

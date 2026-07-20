@@ -78,6 +78,15 @@ from keystone_agents.schemas.email_triage import (
     GmailPriorityGroupedMessage,
     GmailPriorityGroupingResult,
 )
+from keystone_agents.schemas.execution_request import (
+    DirectAgentResponse,
+    DirectAgentResponseInput,
+    ExecutionContinuation,
+    ExecutionEntrypoint,
+    ExecutionPublicResult,
+    ExecutionRequest,
+    ExecutionResultStatus,
+)
 from keystone_agents.schemas.feedback import (
     OUTREACH_REVIEW_FEEDBACK_TAGS,
     SUGGESTED_FEEDBACK_TAGS,
@@ -148,6 +157,10 @@ from keystone_agents.schemas.orchestrator import (
     OrchestratorOutputReview,
     OrchestratorOutputReviewScore,
     OrchestratorResult,
+)
+from keystone_agents.schemas.output_constraints import (
+    InterpretedOutputConstraints,
+    OutputConstraintValidation,
 )
 from keystone_agents.schemas.outreach import (
     ApprovedOutreachDraftingContext,
@@ -240,6 +253,8 @@ OpportunityRecord = ScoutOpportunityRecord
 __all__ = [
     "CompanyProfile",
     "CompanyResearchFocusedBrief",
+    "InterpretedOutputConstraints",
+    "OutputConstraintValidation",
     "CompanyBriefFact",
     "CompanyBriefSourceCitation",
     "ClaimEvidenceRecord",
@@ -289,6 +304,13 @@ __all__ = [
     "GmailMessageEnvelope",
     "GmailPriorityGroupedMessage",
     "GmailPriorityGroupingResult",
+    "ExecutionContinuation",
+    "DirectAgentResponse",
+    "DirectAgentResponseInput",
+    "ExecutionEntrypoint",
+    "ExecutionPublicResult",
+    "ExecutionRequest",
+    "ExecutionResultStatus",
     "EmailStyleProfile",
     "OUTREACH_REVIEW_FEEDBACK_TAGS",
     "SUGGESTED_FEEDBACK_TAGS",
