@@ -340,7 +340,7 @@ def _completed_result_requires_title_omission(
         str(section or "").strip().lower()
         for section in constraints.get("required_sections", [])
         if str(section or "").strip()
-    }
+    } if constraints.get("require_section_headings") is True else set()
     if required_sections.intersection({"title", "heading", "headline"}):
         return False
     scope = str(constraints.get("scope") or "").strip().lower()

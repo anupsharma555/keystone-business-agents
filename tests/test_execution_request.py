@@ -424,6 +424,7 @@ def test_exact_item_contract_keeps_requested_title_section() -> None:
                     "minimum_items": 2,
                     "maximum_items": 2,
                     "required_sections": ["Title"],
+                    "require_section_headings": True,
                 }
             }
         },

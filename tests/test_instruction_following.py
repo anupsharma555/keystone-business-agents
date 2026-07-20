@@ -41,6 +41,7 @@ def test_objective_validator_covers_counts_sections_urls_and_style() -> None:
         minimum_items=2,
         maximum_items=2,
         required_sections=["Evidence"],
+        require_section_headings=True,
         forbidden_phrases=["guaranteed"],
         forbid_em_dash=True,
         include_source_urls=True,
@@ -53,6 +54,41 @@ def test_objective_validator_covers_counts_sections_urls_and_style() -> None:
 
     assert validation.passed is True
     assert validation.item_count == 2
+
+
+def test_required_heading_accepts_markdown_or_inline_content() -> None:
+    constraints = InterpretedOutputConstraints(
+        required_sections=["Evidence"],
+        require_section_headings=True,
+    )
+
+    assert validate_output_constraints(
+        "## Evidence\nSupported fact.", constraints
+    ).passed is True
+    assert validate_output_constraints(
+        "**Evidence:** Supported fact.", constraints
+    ).passed is True
+
+
+def test_advisory_content_components_do_not_become_literal_heading_blockers() -> None:
+    constraints = InterpretedOutputConstraints(
+        interpretation="Cover supported facts, the validation gap, and an internal note.",
+        required_sections=[
+            "Supported claims",
+            "Validation gap",
+            "Internal Slack recommendation",
+        ],
+        require_section_headings=False,
+    )
+
+    validation = validate_output_constraints(
+        "Northstar sells referral-navigation software. Its audited outcomes remain "
+        "unverified, so request source-backed outcome evidence before proceeding.",
+        constraints,
+    )
+
+    assert validation.applicable is False
+    assert validation.passed is True
 
 
 def test_draft_body_scope_measures_draft_without_wrapper_metadata() -> None:

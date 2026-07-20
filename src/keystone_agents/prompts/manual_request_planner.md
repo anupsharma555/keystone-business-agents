@@ -171,7 +171,14 @@ successful LLM plan from request keywords.
 - `gmail_triage` for email, inbox, thread, message, label, or reply-triage
   requests.
 - `outreach_composer` for draft-only outreach, email, LinkedIn, or message
-  writing, but set `requires_approved_context=true`.
+  writing. External email, LinkedIn, customer, partner, or prospect copy must
+  set `requires_approved_context=true`. An internal Slack/team note based only
+  on facts supplied in the current request is provider-free internal
+  composition: set `outreach_channel=internal_slack`, leave `recipient` empty,
+  set `provider_system=unspecified`, keep `provider_operations` and `workflow`
+  empty, set `ask_shape.prior_context_dependency=selected_context`, and set
+  `requires_approved_context=false`. This classifies the artifact only; it does
+  not authorize posting it.
 - `chief_of_staff` with `intent=reference_capture` and
   `target_type=operator_reference` when Anup asks to remember, save, bookmark,
   note, store, or keep a link/reference for future use.
@@ -226,7 +233,9 @@ Populate:
   as `draft_only_for_urgent`, `draft_only_when_reply_needed`, or
   `no_drafts_requested`.
 - For outreach, fill `recipient`, `outreach_channel`, and `tone` when clear.
-  Keep `requires_approved_context=true`.
+  Keep `requires_approved_context=true` for external copy. Use the internal
+  Slack exception above only for operator-returned team copy grounded entirely
+  in selected/supplied context.
 - `requires_live_search=true` for opportunity and business research discovery.
 - `requires_durable_state=true` only for resumable, tracked, checkpointed,
   approval-dependent, or multi-owner work.
@@ -242,14 +251,16 @@ Interpret the operator's response requirements in `ask_shape.output_constraints`
 Reason from the full request rather than matching isolated phrases. Capture the
 intended response scope, exact/maximum/minimum word or sentence limits, item-count
 ranges, required sections, forbidden phrases, em-dash prohibition, visible-source
-requirements, and other style requirements. For wording such as "summarize in 20
+requirements, and other style requirements. Set `require_section_headings=true`
+only when the operator explicitly asks for labeled headings or named sections.
+For wording such as "summarize in 20
 words," use an exact 20-word constraint scoped to the answer; citations may remain
 outside that answer unless the operator explicitly applies the limit to the whole
-response. When the operator asks for two or more distinct named deliverables or
-visible components, preserve each one in `required_sections` using a short
-reader-facing label from the request, even when no exact heading syntax was supplied.
-For example, a decision brief plus a paste-ready internal note should remain two
-separate sections rather than being collapsed into one summary. Do not invent
-sections for ordinary content questions or turn every requested fact into a heading.
+response. Natural multi-part asks such as "assess what is supported, choose the
+validation gap, and write a Slack recommendation" describe content the specialist
+must cover; preserve them in `interpretation`, not as mandatory literal headings.
+Only populate `required_sections` when the operator explicitly requests those
+reader-visible labels. Do not invent sections for ordinary content questions or
+turn every requested fact into a heading.
 Leave fields unspecified when the operator did not request them. These constraints
 are completion criteria for the specialist and final response review.

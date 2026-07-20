@@ -88,6 +88,7 @@ from keystone_agents.instruction_following import (
 )
 from keystone_agents.manual_request import (
     infer_manual_request_plan,
+    is_internal_slack_composition_plan,
     looks_like_stateful_work_request,
     looks_like_supplied_context_synthesis_request,
     positive_capability_text,
@@ -752,9 +753,7 @@ def execute_direct_calendar_action(
         payload = {
             "status": "blocked",
             "block_kind": (
-                "calendar_read_blocked"
-                if plan.operation == "read"
-                else "calendar_write_blocked"
+                "calendar_read_blocked" if plan.operation == "read" else "calendar_write_blocked"
             ),
             "message": str(exc),
             "calendar_action": plan.__dict__,
@@ -788,9 +787,7 @@ def execute_direct_calendar_action(
         "openai_requests": openai_requests,
         "send_enabled": False,
         "side_effects": {
-            "calendar_write_performed": bool(
-                live and passed and plan.operation != "read"
-            ),
+            "calendar_write_performed": bool(live and passed and plan.operation != "read"),
             "email_sent": False,
             "slack_message_posted": False,
         },
@@ -808,9 +805,7 @@ def _direct_calendar_human_summary(
 
     title = str(result.get("title") or plan.title or plan.event_reference).strip()
     start_date = str(
-        result.get("start_date")
-        or plan.start_date
-        or plan.event_reference_date
+        result.get("start_date") or plan.start_date or plan.event_reference_date
     ).strip()
     if plan.operation == "read":
         if result.get("found") is True:
@@ -827,10 +822,7 @@ def _direct_calendar_human_summary(
         "delete": "deleted",
     }.get(plan.operation, "completed")
     date_suffix = f" on {start_date}" if start_date else ""
-    return (
-        f'Google Calendar event {operation} and verified: "{title}"'
-        f"{date_suffix}."
-    )
+    return f'Google Calendar event {operation} and verified: "{title}"{date_suffix}.'
 
 
 def run_direct_calendar_action(
@@ -938,9 +930,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     )
     execution_input_text = (
         planning_input
-        if slack_continuation
-        and planning_input
-        and requested_route == "chief_of_staff"
+        if slack_continuation and planning_input and requested_route == "chief_of_staff"
         else current_input_text
     )
     semantic_input_text = current_input_text
@@ -948,9 +938,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     input_text = (cost_directive.cleaned_text or current_input_text).strip()
     if semantic_input_text != current_input_text:
         semantic_cost_directive = parse_cost_tracking_directive(semantic_input_text)
-        semantic_input_text = (
-            semantic_cost_directive.cleaned_text or semantic_input_text
-        ).strip()
+        semantic_input_text = (semantic_cost_directive.cleaned_text or semantic_input_text).strip()
     else:
         semantic_input_text = input_text
     eval_command_allowed = args.agent is None or _looks_like_explicit_eval_command(input_text)
@@ -971,8 +959,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     calendar_input_text = raw_input if slack_continuation else input_text
     calendar_plan = infer_calendar_action_plan(calendar_input_text)
     calendar_candidate = bool(
-        calendar_plan is not None
-        or is_calendar_action_candidate(calendar_input_text)
+        calendar_plan is not None or is_calendar_action_candidate(calendar_input_text)
     )
     live_search = args.live_search or (live_sdk and cli_default_live_research())
     if live_search and (
@@ -1008,22 +995,18 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     calendar_route_eligible = bool(
         (not live_sdk or live_unowned_calendar_followup)
         and calendar_candidate
-        and requested_route in {
+        and requested_route
+        in {
             None,
             "chief_of_staff",
             "orchestrator",
         }
     )
     preflight_budget_estimate = (
-        1
-        if live_manual_plan
-        else 0
-        if calendar_route_eligible
-        else request_estimate["max"]
+        1 if live_manual_plan else 0 if calendar_route_eligible else request_estimate["max"]
     )
     if args.max_openai_requests is not None and (
-        args.max_openai_requests < 0
-        or preflight_budget_estimate > args.max_openai_requests
+        args.max_openai_requests < 0 or preflight_budget_estimate > args.max_openai_requests
     ):
         return _print_ask_request_budget_blocked(
             json_output=args.json,
@@ -1042,11 +1025,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         )
         direct_workflow_state = _merge_direct_workflow_state(
             direct_workflow_state,
-            {
-                "execution_continuation": (
-                    execution_request.continuation.model_dump(mode="json")
-                )
-            },
+            {"execution_continuation": (execution_request.continuation.model_dump(mode="json"))},
         )
         calendar_input_text = _calendar_continuation_input_text(
             raw_input,
@@ -1065,10 +1044,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         execution_request.continuation.provider_affinity,
     )
     manual_plan = orchestrator_preflight.manual_request_plan
-    if (
-        manual_plan.provider_system != "unspecified"
-        and not manual_plan.requires_live_search
-    ):
+    if manual_plan.provider_system != "unspecified" and not manual_plan.requires_live_search:
         live_search = False
     calendar_semantic_candidate = bool(
         (not live_sdk or live_unowned_calendar_followup)
@@ -1086,9 +1062,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         )
     )
     if calendar_interpretation_eligible:
-        preflight_requests = _orchestrator_preflight_request_count(
-            orchestrator_preflight
-        )
+        preflight_requests = _orchestrator_preflight_request_count(orchestrator_preflight)
         calendar_request_estimate = {
             "min": preflight_requests + (1 if live_sdk else 0),
             "max": preflight_requests + (1 if live_sdk else 0),
@@ -1133,9 +1107,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                     calendar_resolution.plan,
                     live=live_sdk,
                     json_output=args.json,
-                    openai_requests=(
-                        preflight_requests + calendar_resolution.openai_requests
-                    ),
+                    openai_requests=(preflight_requests + calendar_resolution.openai_requests),
                     interpretation_warnings=calendar_resolution.warnings,
                     execution_admission=calendar_admission,
                 )
@@ -1164,9 +1136,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         else None
     )
     if interpreted_bounded_lifecycle:
-        preflight_requests = _orchestrator_preflight_request_count(
-            orchestrator_preflight
-        )
+        preflight_requests = _orchestrator_preflight_request_count(orchestrator_preflight)
         resolved_request_estimate = {
             "min": preflight_requests,
             "max": preflight_requests,
@@ -1186,16 +1156,13 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             effective_live_search=live_search,
         )
     if args.max_openai_requests is not None and (
-        args.max_openai_requests < 0
-        or resolved_request_estimate["max"] > args.max_openai_requests
+        args.max_openai_requests < 0 or resolved_request_estimate["max"] > args.max_openai_requests
     ):
         return _print_ask_request_budget_blocked(
             json_output=args.json,
             requested_limit=args.max_openai_requests,
             estimate=resolved_request_estimate,
-            openai_requests_made=_orchestrator_preflight_request_count(
-                orchestrator_preflight
-            ),
+            openai_requests_made=_orchestrator_preflight_request_count(orchestrator_preflight),
         )
     direct_execution_context = _direct_specialist_execution_context(
         input_text,
@@ -1284,9 +1251,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 workflow_routes[0]
                 if workflow_routes
                 else str(
-                    manual_plan.target_agent
-                    or orchestrator_preflight.route_result.route
-                    or ""
+                    manual_plan.target_agent or orchestrator_preflight.route_result.route or ""
                 ).strip()
                 or None
             )
@@ -1310,8 +1275,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 requested_route=requested_work_item_route,
             )
         if live_sdk and (
-            (mention.explicit and mention.route is not None)
-            or semantic_direct_route is not None
+            (mention.explicit and mention.route is not None) or semantic_direct_route is not None
         ):
             route = (
                 _route_with_manual_plan_advice(str(mention.route), manual_plan)
@@ -1713,7 +1677,9 @@ def _eval_score_save_payload(
         + f" with average {review.average_score}/5."
     )
     if case_dashboard.get("dashboard_case_url"):
-        summary += f" Dashboard: {_slack_link(case_dashboard['dashboard_case_url'], 'case dashboard')}."
+        summary += (
+            f" Dashboard: {_slack_link(case_dashboard['dashboard_case_url'], 'case dashboard')}."
+        )
     elif dashboard.get("dashboard_path"):
         summary += f" Dashboard: {dashboard['dashboard_path']}."
     payload.update(
@@ -1779,11 +1745,7 @@ def _eval_score_template_payload(
             "send_enabled": False,
         }
 
-    case_id = (
-        _extract_eval_template_field(compact, "case")
-        or inferred.get("case_id")
-        or ""
-    )
+    case_id = _extract_eval_template_field(compact, "case") or inferred.get("case_id") or ""
     run_id = _extract_eval_template_field(compact, "run") or inferred.get("run_id", "")
     agent = _extract_eval_template_field(compact, "agent") or inferred.get("agent", "")
     if not case_id:
@@ -1900,9 +1862,7 @@ def _eval_status_payload(
     dashboard = _render_promptfoo_dashboard(database_path)
     case_dashboard = _dashboard_case_link(dashboard, case_id)
     promptfoo = (
-        status.get("latest_promptfoo")
-        if isinstance(status.get("latest_promptfoo"), dict)
-        else None
+        status.get("latest_promptfoo") if isinstance(status.get("latest_promptfoo"), dict) else None
     )
     human = (
         status.get("latest_target_human_review")
@@ -1913,32 +1873,28 @@ def _eval_status_payload(
     if promptfoo:
         promptfoo_state = "pass" if promptfoo.get("success") else "fail"
         promptfoo_text = (
-            f"{promptfoo_state}, score {promptfoo.get('score')}, "
-            f"eval {promptfoo.get('eval_id')}"
+            f"{promptfoo_state}, score {promptfoo.get('score')}, eval {promptfoo.get('eval_id')}"
         )
     human_text = "no saved human review"
     if human:
-        human_text = (
-            f"average {human.get('average_score')}/5, "
-            f"safety {human.get('safety')}"
-        )
+        human_text = f"average {human.get('average_score')}/5, safety {human.get('safety')}"
     summary = (
         f"Eval `{case_id}` status: Promptfoo {promptfoo_text}; "
         f"human review {human_text}; Slack runs {status.get('slack_run_count')}."
     )
     if case_dashboard.get("dashboard_case_url"):
-        summary += f" Dashboard: {_slack_link(case_dashboard['dashboard_case_url'], 'case dashboard')}."
+        summary += (
+            f" Dashboard: {_slack_link(case_dashboard['dashboard_case_url'], 'case dashboard')}."
+        )
     elif dashboard.get("dashboard_path"):
         summary += f" Dashboard: {dashboard['dashboard_path']}."
     review_case = _review_case_link(case_id)
     if review_case.get("review_case_url"):
-        summary += f" Review form: {_slack_link(review_case['review_case_url'], 'score this case')}."
+        summary += (
+            f" Review form: {_slack_link(review_case['review_case_url'], 'score this case')}."
+        )
     latest_run = _latest_slack_eval_run(status)
-    scorecard_request = (
-        "@KNI can you give me a scorecard for this eval?"
-        if case_id
-        else ""
-    )
+    scorecard_request = "@KNI can you give me a scorecard for this eval?" if case_id else ""
     return {
         "mode": "eval_status",
         "status": "done",
@@ -2218,11 +2174,18 @@ def _estimate_ask_openai_requests(
     if not live_sdk:
         return {"min": maximum, "max": maximum, "stages": stages}
     search_enabled = (
-        bool(args.live_search)
-        if effective_live_search is None
-        else bool(effective_live_search)
+        bool(args.live_search) if effective_live_search is None else bool(effective_live_search)
     )
     direct_supplied_route = str(requested_route or args.agent or "").strip()
+    if (
+        manual_plan is not None
+        and manual_plan.source == "llm"
+        and manual_plan.target_agent in _DIRECT_SUPPLIED_RESPONSE_ROUTES
+    ):
+        # The same semantic owner must drive admission, cost estimation, and
+        # execution. An explicit agent mention is routing advice; estimating a
+        # different path can create a false budget blocker before execution.
+        direct_supplied_route = manual_plan.target_agent
     bounded_provider_free_response = bool(
         _manual_plan_is_bounded_provider_free_response(
             manual_plan,
@@ -2248,9 +2211,7 @@ def _estimate_ask_openai_requests(
                 "specialist request. An explicit live-planner override adds one prior "
                 "planning request."
             ),
-            "request_text_sha256": hashlib.sha256(
-                input_text.encode("utf-8")
-            ).hexdigest()[:12],
+            "request_text_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:12],
         }
     if _context_file_is_work_item_source_bundle(args.context_file):
         stages.append("outreach_composer_synthesis")
@@ -2276,13 +2237,9 @@ def _estimate_ask_openai_requests(
             )
         supplied_context_bound = bool(
             deterministic_plan is not None
-            and deterministic_plan.ask_shape.prior_context_dependency
-            == "selected_context"
+            and deterministic_plan.ask_shape.prior_context_dependency == "selected_context"
             or (
-                (
-                    deterministic_plan is None
-                    or deterministic_plan.source != "llm"
-                )
+                (deterministic_plan is None or deterministic_plan.source != "llm")
                 and looks_like_supplied_context_synthesis_request(input_text)
             )
         )
@@ -2343,9 +2300,7 @@ def _estimate_ask_openai_requests(
             and estimated_route == "chief_of_staff"
         )
         if bounded_provider_request and deterministic_plan is not None:
-            stages.append(
-                f"{deterministic_plan.provider_system}_bounded_provider_sdk"
-            )
+            stages.append(f"{deterministic_plan.provider_system}_bounded_provider_sdk")
             # One model turn selects/calls the plan-scoped provider tool; the
             # next synthesizes the verified receipt. Provider calls themselves
             # are not OpenAI requests.
@@ -2447,8 +2402,7 @@ def _estimate_ask_openai_requests(
             maximum += 7
         else:
             stages.extend(
-                f"manager_specialist_step_{index}"
-                for index in range(1, manager_steps + 1)
+                f"manager_specialist_step_{index}" for index in range(1, manager_steps + 1)
             )
             stages.append("final_response_synthesis")
             maximum += manager_steps * 6 + 1
@@ -2505,9 +2459,7 @@ def _apply_continuation_provider_affinity(
     """
 
     plan = preflight.manual_request_plan
-    provider = _CONTINUATION_PROVIDER_SYSTEMS.get(
-        str(provider_affinity or "").strip().lower()
-    )
+    provider = _CONTINUATION_PROVIDER_SYSTEMS.get(str(provider_affinity or "").strip().lower())
     if (
         not provider
         or plan.provider_system != "unspecified"
@@ -2515,11 +2467,7 @@ def _apply_continuation_provider_affinity(
     ):
         return preflight
     return preflight.model_copy(
-        update={
-            "manual_request_plan": plan.model_copy(
-                update={"provider_system": provider}
-            )
-        }
+        update={"manual_request_plan": plan.model_copy(update={"provider_system": provider})}
     )
 
 
@@ -2695,12 +2643,12 @@ def _manual_plan_is_bounded_provider_free_response(
         and not manual_plan.workflow
         and not manual_plan.requires_durable_state
         and not manual_plan.requires_live_search
-        and not manual_plan.requires_approved_context
         and (
-            (
-                manual_plan.provider_system == "unspecified"
-                and not manual_plan.provider_operations
-            )
+            not manual_plan.requires_approved_context
+            or is_internal_slack_composition_plan(manual_plan)
+        )
+        and (
+            (manual_plan.provider_system == "unspecified" and not manual_plan.provider_operations)
             or provider_context_is_already_supplied
         )
         and manual_plan.side_effect_policy == "draft_or_read_only"
@@ -3006,12 +2954,8 @@ def _is_bounded_composite_lifecycle_request(
         normalized,
     )
     creates = bool(re.search(r"\b(?:add|create|make|write|insert)\b", operation_text))
-    updates = bool(
-        re.search(r"\b(?:update|change|modify|revise|edit)\b", operation_text)
-    )
-    removes = bool(
-        re.search(r"\b(?:delete|remove|trash|clean\s*up)\b", operation_text)
-    )
+    updates = bool(re.search(r"\b(?:update|change|modify|revise|edit)\b", operation_text))
+    removes = bool(re.search(r"\b(?:delete|remove|trash|clean\s*up)\b", operation_text))
     if route == "airtable_context_agent":
         return bool(
             re.search(r"\bkba_test_record(?:_[a-z0-9]+)*\b", normalized)
@@ -3176,8 +3120,7 @@ def _preflight_workflow_routes(preflight: OrchestratorPreflight) -> list[str]:
         dict.fromkeys(
             str(route)
             for route in [*plan_routes, *route_result_routes]
-            if str(route) in AGENT_REGISTRY
-            and str(route) not in {"orchestrator", "clarification"}
+            if str(route) in AGENT_REGISTRY and str(route) not in {"orchestrator", "clarification"}
         )
     )
 
@@ -3574,10 +3517,13 @@ def _direct_specialist_execution_context(
 ) -> dict[str, Any]:
     """Project only reference-resolving thread state into a fast direct call."""
 
-    if not workflow_state or not (force_thread_context or (
-        _DIRECT_CONTEXT_REFERENCE_RE.search(input_text)
-        or _DIRECT_CONTEXT_OBJECT_OPERATION_RE.search(input_text)
-    )):
+    if not workflow_state or not (
+        force_thread_context
+        or (
+            _DIRECT_CONTEXT_REFERENCE_RE.search(input_text)
+            or _DIRECT_CONTEXT_OBJECT_OPERATION_RE.search(input_text)
+        )
+    ):
         return {}
 
     context: dict[str, Any] = {"schema": "keystone.direct_specialist_context.v1"}
@@ -3973,9 +3919,7 @@ def _stored_work_item_langgraph_metadata(
             "node_path": list(event.metadata.get("node_path") or []),
             "checkpoint_required": bool(event.metadata.get("checkpoint_required")),
             "checkpoint_reason": str(event.metadata.get("checkpoint_reason") or ""),
-            "graph_completion_review": dict(
-                event.metadata.get("graph_completion_review") or {}
-            ),
+            "graph_completion_review": dict(event.metadata.get("graph_completion_review") or {}),
         }
     return None
 
@@ -4151,7 +4095,9 @@ def _cli_slack_eval_evidence(
     summary: str,
 ) -> dict[str, Any]:
     result_payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else {}
-    work_item = result_payload.get("work_item") if isinstance(result_payload.get("work_item"), dict) else {}
+    work_item = (
+        result_payload.get("work_item") if isinstance(result_payload.get("work_item"), dict) else {}
+    )
     target = work_item.get("target") if isinstance(work_item.get("target"), dict) else {}
     metadata = target.get("metadata") if isinstance(target.get("metadata"), dict) else {}
     slack_context = (
@@ -4168,9 +4114,7 @@ def _cli_slack_eval_evidence(
         else {}
     )
     thread_messages = (
-        slack_context.get("thread_messages")
-        or slack_context_payload.get("thread_messages")
-        or []
+        slack_context.get("thread_messages") or slack_context_payload.get("thread_messages") or []
     )
     message_count = len(thread_messages) if isinstance(thread_messages, list) else 0
     if not message_count and str(slack_context_payload.get("read_context") or "").strip():
@@ -4182,11 +4126,7 @@ def _cli_slack_eval_evidence(
     )
     warnings = [
         str(item)
-        for item in (
-            slack_context.get("warnings")
-            or slack_context_payload.get("warnings")
-            or []
-        )
+        for item in (slack_context.get("warnings") or slack_context_payload.get("warnings") or [])
     ]
     sources = work_item.get("sources") if isinstance(work_item.get("sources"), list) else []
     sdk_usage = _latest_event_metadata(result_payload, "usage")
@@ -4198,9 +4138,7 @@ def _cli_slack_eval_evidence(
         else {}
     )
     retrieval = (
-        result_payload.get("retrieval")
-        if isinstance(result_payload.get("retrieval"), dict)
-        else {}
+        result_payload.get("retrieval") if isinstance(result_payload.get("retrieval"), dict) else {}
     )
     duration_ms = _number_or_none(
         result_payload.get("duration_ms")
@@ -4243,7 +4181,9 @@ def _cli_slack_eval_evidence(
             or ""
         ),
         "source_count": len(sources),
-        "visible_source_count": sum(1 for item in sources if isinstance(item, dict) and item.get("url")),
+        "visible_source_count": sum(
+            1 for item in sources if isinstance(item, dict) and item.get("url")
+        ),
         "sdk_estimated_cost_usd": _number_or_none(
             sdk_cost.get("estimated_usd") or sdk_cost.get("amount_usd")
         ),
@@ -4260,14 +4200,9 @@ def _cli_slack_eval_evidence(
             model.get("provider") or execution_provenance.get("model_provider") or ""
         ),
         "model_name": str(
-            model.get("name")
-            or model.get("model")
-            or execution_provenance.get("model_name")
-            or ""
+            model.get("name") or model.get("model") or execution_provenance.get("model_name") or ""
         ),
-        "run_mode": str(
-            model.get("run_mode") or execution_provenance.get("run_mode") or ""
-        ),
+        "run_mode": str(model.get("run_mode") or execution_provenance.get("run_mode") or ""),
         "search_provider": str(
             retrieval.get("search_provider")
             or retrieval.get("provider")
@@ -4414,12 +4349,11 @@ def _trace_orchestrator_summary_from_payload(payload: dict[str, Any]) -> dict[st
         "blocker_count": preflight_blocker_count or len(blockers),
         "feedback_count": review_feedback_count or len(feedback),
         "selected_route": _clean_eval_scalar(
-            preflight.get("selected_route")
-            or preflight.get("route")
-            or payload.get("route")
-            or ""
+            preflight.get("selected_route") or preflight.get("route") or payload.get("route") or ""
         ),
-        "review_status": _clean_eval_scalar(review.get("status") or review.get("review_status") or ""),
+        "review_status": _clean_eval_scalar(
+            review.get("status") or review.get("review_status") or ""
+        ),
     }
     if any(orchestrator.values()):
         result["orchestrator"] = orchestrator
@@ -4754,9 +4688,7 @@ def _context_agent_dry_run_output(
         )
         return AirtableContextResult(
             mode="deterministic",
-            summary=(
-                _airtable_context_summary(topic_terms, objective)
-            )
+            summary=(_airtable_context_summary(topic_terms, objective))
             if not blocked
             else (
                 "Airtable blocker: record id, field mapping, and approval reference are "
@@ -4771,13 +4703,13 @@ def _context_agent_dry_run_output(
                 if eval_tracker_focus
                 else "requested_airtable_base"
             ),
-            relevant_tables=[
-                expense_receipt_target.table
-            ] if expense_receipt_target is not None else [
-                "Tax Payments"
-            ] if finance_tax_focus else ["Eval tracker"] if eval_tracker_focus else [
-                "requested table"
-            ],
+            relevant_tables=[expense_receipt_target.table]
+            if expense_receipt_target is not None
+            else ["Tax Payments"]
+            if finance_tax_focus
+            else ["Eval tracker"]
+            if eval_tracker_focus
+            else ["requested table"],
             relevant_fields=(
                 finance_expense_receipt_field_hints(expense_receipt_target)
                 if expense_receipt_target is not None
@@ -4861,7 +4793,10 @@ def _context_agent_dry_run_output(
                         if expense_receipt_target is not None
                         else []
                     ),
-                    OperationalContextEntry(key="filter", value=_airtable_context_record_identity(topic_terms, objective)),
+                    OperationalContextEntry(
+                        key="filter",
+                        value=_airtable_context_record_identity(topic_terms, objective),
+                    ),
                 ],
                 rationale="Specialist is read-only; Chief of Staff owns any approved write.",
             ),
@@ -4989,7 +4924,9 @@ def _context_agent_dry_run_output(
                 field_mapping=[
                     OperationalContextEntry(key="folder", value="candidate Drive folder"),
                     OperationalContextEntry(key="doc", value="candidate handoff or SOP Doc"),
-                    OperationalContextEntry(key="sheet_tab", value="candidate tracker tab if relevant"),
+                    OperationalContextEntry(
+                        key="sheet_tab", value="candidate tracker tab if relevant"
+                    ),
                     OperationalContextEntry(key="name", value="target-specific naming convention"),
                 ],
                 rationale="Specialist is read-only; Chief of Staff owns any approved Workspace write.",
@@ -5006,7 +4943,10 @@ def _context_agent_dry_run_output(
                 handoff_ready_context=["topic focus", "candidate folder/doc hints"],
                 missing_context=[*blockers, "live Workspace file listing and content reads"],
                 integration_surfaces=["Google Drive", "Google Docs", "Google Sheets"],
-                follow_up_actions=["run live read if file evidence is needed", "confirm artifact target"],
+                follow_up_actions=[
+                    "run live read if file evidence is needed",
+                    "confirm artifact target",
+                ],
             ),
             sources=[
                 OperationalContextSource(
@@ -5242,7 +5182,7 @@ def _context_agent_dry_run_output(
             ],
             evidence_gaps=[
                 "Preliminary evidence remains unverified until item-level preprint titles, dates, URLs, and source text are read.",
-                "No item-level preprint evidence was read in dry-run mode."
+                "No item-level preprint evidence was read in dry-run mode.",
             ],
             future_directions=[
                 "Run the live preprints context agent for bounded paper/item summaries."
@@ -5413,9 +5353,7 @@ def _workspace_context_topic_terms(request_text: str) -> list[str]:
     if len(terms) >= 2:
         return terms[:8]
     phrase_words = {
-        word
-        for phrase in terms
-        for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
+        word for phrase in terms for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
     }
     workspace_stopwords = {
         "google",
@@ -5459,9 +5397,7 @@ def _airtable_context_topic_terms(request_text: str) -> list[str]:
     if len(terms) >= 3:
         return terms[:8]
     phrase_words = {
-        word
-        for phrase in terms
-        for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
+        word for phrase in terms for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
     }
     airtable_stopwords = {
         "airtable",
@@ -5508,17 +5444,13 @@ def _airtable_context_topic_terms(request_text: str) -> list[str]:
     return terms[:8]
 
 
-def _airtable_context_is_finance_tax_request(
-    topic_terms: list[str], request_text: str
-) -> bool:
+def _airtable_context_is_finance_tax_request(topic_terms: list[str], request_text: str) -> bool:
     haystack = " ".join([str(request_text or "").lower(), *[term.lower() for term in topic_terms]])
     finance_markers = ("finance & tax", "finance and tax", "tax payments", "estimated tax")
     return any(marker in haystack for marker in finance_markers)
 
 
-def _airtable_context_is_eval_tracker_request(
-    topic_terms: list[str], request_text: str
-) -> bool:
+def _airtable_context_is_eval_tracker_request(topic_terms: list[str], request_text: str) -> bool:
     haystack = " ".join([str(request_text or "").lower(), *[term.lower() for term in topic_terms]])
     return "eval_tracker" in haystack or "eval tracker" in haystack
 
@@ -5658,9 +5590,7 @@ def _workspace_context_work_functions(topic_terms: list[str]) -> list[str]:
     return ["workspace context review", "internal handoff"]
 
 
-def _workspace_context_is_eval_artifact_request(
-    topic_terms: list[str], request_text: str
-) -> bool:
+def _workspace_context_is_eval_artifact_request(topic_terms: list[str], request_text: str) -> bool:
     haystack = " ".join([str(request_text or "").lower(), *[term.lower() for term in topic_terms]])
     return (
         "kni ops / evals" in haystack
@@ -5682,9 +5612,7 @@ def _zotero_context_topic_terms(request_text: str) -> list[str]:
     if len(terms) >= 2:
         return terms[:8]
     phrase_words = {
-        word
-        for phrase in terms
-        for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
+        word for phrase in terms for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
     }
     for token in re.findall(r"[a-z][a-z0-9-]{5,}", lower):
         if token in phrase_words:
@@ -5743,9 +5671,7 @@ def _feed_context_topic_terms(request_text: str) -> list[str]:
     if len(terms) >= 3:
         return terms[:8]
     phrase_words = {
-        word
-        for phrase in terms
-        for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
+        word for phrase in terms for word in re.findall(r"[a-z][a-z0-9-]{2,}", phrase.lower())
     }
     for token in re.findall(r"[a-z][a-z0-9-]{5,}", lower):
         if token in phrase_words:
@@ -5866,20 +5792,13 @@ def _strict_requested_display_text(
             *[str(item or "") for item in plan.get("required_terms") or []],
         )
     ).lower()
-    draft_text = str(
-        output.get("draft_reply") or output.get("draft_reply_summary") or ""
-    ).strip()
+    draft_text = str(output.get("draft_reply") or output.get("draft_reply_summary") or "").strip()
     requests_copyable_draft = bool(
         draft_text
-        and (
-            output_form == "draft"
-            or re.search(r"\b(?:draft|write|prepare)\b", objective_text)
-        )
+        and (output_form == "draft" or re.search(r"\b(?:draft|write|prepare)\b", objective_text))
         and re.search(r"\b(?:reply|response)\b", objective_text)
     )
-    precise_output_boundary = bool(
-        stop_condition and output_form in {"brief", "bullets"}
-    )
+    precise_output_boundary = bool(stop_condition and output_form in {"brief", "bullets"})
     if not strict_mode and not precise_output_boundary and not requests_copyable_draft:
         return ""
 
@@ -5938,9 +5857,7 @@ def _strict_requested_display_text(
         )
         if re.search(pattern, requested_field_text)
     }
-    if titles and {"title", "authors", "publication title"}.issubset(
-        requested_zotero_fields
-    ):
+    if titles and {"title", "authors", "publication title"}.issubset(requested_zotero_fields):
         diagnostic_values = {
             str(item.get("key") or "").strip(): str(item.get("value") or "").strip()
             for item in output.get("diagnostics") or []
@@ -5952,10 +5869,7 @@ def _strict_requested_display_text(
                 "Authors: "
                 + (diagnostic_values.get("authors") or "Unavailable in Zotero metadata"),
                 "Publication title: "
-                + (
-                    diagnostic_values.get("publication_title")
-                    or "Unavailable in Zotero metadata"
-                ),
+                + (diagnostic_values.get("publication_title") or "Unavailable in Zotero metadata"),
             )
         )
     if "one" in stop_condition and "zotero" in stop_condition and titles and item_keys:
@@ -5970,11 +5884,7 @@ def _strict_requested_display_text(
                     summary = str(fact["text"]).strip()
                     break
     if not summary:
-        summary = str(
-            output.get("why_it_matters")
-            or output.get("product")
-            or ""
-        ).strip()
+        summary = str(output.get("why_it_matters") or output.get("product") or "").strip()
     if output_form in {"brief", "draft"} and (summary or draft_text):
         if requests_copyable_draft:
             assessment_requested = bool(
@@ -5987,9 +5897,7 @@ def _strict_requested_display_text(
                 )
             )
             assessment = (
-                str(output.get("reasoning") or "").strip()
-                if assessment_requested
-                else summary
+                str(output.get("reasoning") or "").strip() if assessment_requested else summary
             )
             if not assessment:
                 assessment = summary
@@ -6129,11 +6037,7 @@ def _context_agent_record_summary_lines(output: dict[str, object]) -> list[str]:
         if not value and not key:
             continue
         visible_key = "" if _contains_internal_provider_identity(key) else key
-        label = (
-            f"{visible_key}: {value}"
-            if visible_key and value
-            else visible_key or value
-        )
+        label = f"{visible_key}: {value}" if visible_key and value else visible_key or value
         if note:
             label = f"{label} ({note})"
         lines.append(f"  - {label}")
@@ -6168,14 +6072,10 @@ def _context_agent_feed_item_summary_lines(output: dict[str, object]) -> list[st
 def _context_agent_airtable_context_lines(output: dict[str, object]) -> list[str]:
     base_alias = str(output.get("base_alias") or "").strip()
     tables = [
-        str(item).strip()
-        for item in output.get("relevant_tables") or []
-        if str(item).strip()
+        str(item).strip() for item in output.get("relevant_tables") or [] if str(item).strip()
     ][:5]
     fields = [
-        str(item).strip()
-        for item in output.get("relevant_fields") or []
-        if str(item).strip()
+        str(item).strip() for item in output.get("relevant_fields") or [] if str(item).strip()
     ][:8]
     record_identity = str(output.get("recommended_record_identity") or "").strip()
     lines: list[str] = []
@@ -6201,19 +6101,13 @@ def _contains_internal_provider_identity(value: object) -> bool:
 
 def _context_agent_workspace_context_lines(output: dict[str, object]) -> list[str]:
     folders = [
-        str(item).strip()
-        for item in output.get("relevant_folders") or []
-        if str(item).strip()
+        str(item).strip() for item in output.get("relevant_folders") or [] if str(item).strip()
     ][:5]
-    docs = [
-        str(item).strip()
-        for item in output.get("relevant_docs") or []
-        if str(item).strip()
-    ][:5]
+    docs = [str(item).strip() for item in output.get("relevant_docs") or [] if str(item).strip()][
+        :5
+    ]
     sheets = [
-        str(item).strip()
-        for item in output.get("relevant_sheets") or []
-        if str(item).strip()
+        str(item).strip() for item in output.get("relevant_sheets") or [] if str(item).strip()
     ][:5]
     target = str(output.get("recommended_target") or "").strip()
     preview_lines = [
@@ -6241,14 +6135,10 @@ def _context_agent_workspace_context_lines(output: dict[str, object]) -> list[st
 
 def _context_agent_zotero_context_lines(output: dict[str, object]) -> list[str]:
     hints = [
-        str(item).strip()
-        for item in output.get("collection_hints") or []
-        if str(item).strip()
+        str(item).strip() for item in output.get("collection_hints") or [] if str(item).strip()
     ][:5]
     evidence = [
-        str(item).strip()
-        for item in output.get("relevant_evidence") or []
-        if str(item).strip()
+        str(item).strip() for item in output.get("relevant_evidence") or [] if str(item).strip()
     ][:5]
     lines: list[str] = []
     if hints:
@@ -6406,9 +6296,7 @@ def _run_direct_supplied_context_response_live(
     typed_input = DirectAgentResponseInput(
         requested_agent=route,
         original_request=input_text,
-        output_constraints=manual_plan.ask_shape.output_constraints.model_dump(
-            mode="json"
-        ),
+        output_constraints=manual_plan.ask_shape.output_constraints.model_dump(mode="json"),
     )
     result = run_typed_sdk_agent(
         agent=agent,
@@ -6519,12 +6407,10 @@ def _run_ask_context_agent_live(
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
-    provider_context, preacquired_receipts, provider_blocker = (
-        _direct_zotero_provider_preflight(
-            route,
-            input_text,
-            manual_plan=manual_plan,
-        )
+    provider_context, preacquired_receipts, provider_blocker = _direct_zotero_provider_preflight(
+        route,
+        input_text,
+        manual_plan=manual_plan,
     )
     airtable_receipt_context = _direct_airtable_receipt_provider_context(
         route,
@@ -6563,9 +6449,7 @@ def _run_ask_context_agent_live(
                 route,
                 input_text=input_text,
                 manual_plan=manual_plan,
-            )[
-                "compact_instructions"
-            ]
+            )["compact_instructions"]
         ),
     }
     if route == "airtable_context_agent":
@@ -6750,10 +6634,9 @@ def _run_ask_context_agent_live(
         output_payload,
         tool_receipts,
     )
-    candidate_summary = (
-        _verified_context_agent_write_summary(tool_receipts)
-        or _context_agent_human_summary(output_payload, manual_plan)
-    )
+    candidate_summary = _verified_context_agent_write_summary(
+        tool_receipts
+    ) or _context_agent_human_summary(output_payload, manual_plan)
     instruction_resolution = resolve_instruction_following_response(
         candidate_summary,
         original_request=input_text,
@@ -6776,8 +6659,7 @@ def _run_ask_context_agent_live(
             resolved_summary = "\n\n".join(
                 [
                     resolved_summary,
-                    "Open in provider:\n"
-                    + "\n".join(f"- {link}" for link in provider_links),
+                    "Open in provider:\n" + "\n".join(f"- {link}" for link in provider_links),
                 ]
             ).strip()
     payload = {
@@ -7074,16 +6956,11 @@ def _verified_provider_links(
     links: list[str] = []
     for receipt in tool_receipts:
         verification = receipt.get("verification")
-        verified = bool(
-            isinstance(verification, dict) and verification.get("passed") is True
-        )
+        verified = bool(isinstance(verification, dict) and verification.get("passed") is True)
         if not verified or str(receipt.get("status") or "").lower() != "success":
             continue
         link = str(
-            receipt.get("provider_link")
-            or receipt.get("html_link")
-            or receipt.get("url")
-            or ""
+            receipt.get("provider_link") or receipt.get("html_link") or receipt.get("url") or ""
         ).strip()
         if link.startswith("https://") and link not in links:
             links.append(link)
@@ -7240,9 +7117,8 @@ def _direct_airtable_receipt_provider_context(
     if not receipt_path.is_file():
         return ""
     context = finance_expense_receipt_provider_context(target)
-    return (
-        "Selected Slack receipt context for the approved Airtable operation:\n"
-        + json.dumps(context, ensure_ascii=True, sort_keys=True)
+    return "Selected Slack receipt context for the approved Airtable operation:\n" + json.dumps(
+        context, ensure_ascii=True, sort_keys=True
     )
 
 
@@ -7434,9 +7310,7 @@ def _direct_zotero_provider_preflight(
 
     receipt["metadata_projection"] = projection
     receipt["bibliographic_enrichment"] = {
-        key: enrichment.get(key)
-        for key in ("status", "source", "doi")
-        if key in enrichment
+        key: enrichment.get(key) for key in ("status", "source", "doi") if key in enrichment
     }
     normalized_request = " ".join(str(input_text or "").lower().split())
     notes_requested = bool(
@@ -7597,8 +7471,7 @@ def _zotero_ordered_abstract_receipt_blocker(
             receipt
             for receipt in tool_receipts
             if receipt.get("provider_read") is True
-            and receipt.get("selection_rule")
-            == "first_nonempty_abstract_in_provider_order"
+            and receipt.get("selection_rule") == "first_nonempty_abstract_in_provider_order"
         ),
         None,
     )
@@ -7649,9 +7522,7 @@ def _context_agent_public_payload(
     else:
         return public_output, public_receipts
     lifecycle_receipts = [
-        receipt
-        for receipt in tool_receipts
-        if receipt.get("operation") == lifecycle_operation
+        receipt for receipt in tool_receipts if receipt.get("operation") == lifecycle_operation
     ]
     provider_ids = {
         str(receipt.get(identity_field) or "").strip()
@@ -7661,9 +7532,7 @@ def _context_agent_public_payload(
     if not provider_ids:
         return public_output, public_receipts
     identity_label = (
-        "the marked test record"
-        if route == "airtable_context_agent"
-        else "the marked test note"
+        "the marked test record" if route == "airtable_context_agent" else "the marked test note"
     )
     public_output = _replace_context_provider_ids(
         public_output,
@@ -7771,9 +7640,7 @@ def _airtable_receipt_execution_blocker(
         else {"create_expense_from_receipt"}
     )
     receipts = [
-        receipt
-        for receipt in tool_receipts
-        if receipt.get("operation") in expected_operations
+        receipt for receipt in tool_receipts if receipt.get("operation") in expected_operations
     ]
     if not receipts:
         return (
@@ -7862,9 +7729,7 @@ def _airtable_write_execution_blocker(
             tool_receipts=tool_receipts,
         )
     lifecycle_receipts = [
-        receipt
-        for receipt in tool_receipts
-        if receipt.get("operation") == "test_record_lifecycle"
+        receipt for receipt in tool_receipts if receipt.get("operation") == "test_record_lifecycle"
     ]
     if lifecycle_receipts:
         if any(
@@ -7891,9 +7756,7 @@ def _airtable_write_execution_blocker(
             "record identity first."
         )
     write_receipts = [
-        receipt
-        for receipt in tool_receipts
-        if receipt.get("operation") in {"create", "update"}
+        receipt for receipt in tool_receipts if receipt.get("operation") in {"create", "update"}
     ]
     if not write_receipts:
         return (
@@ -7924,8 +7787,7 @@ def _airtable_write_execution_blocker(
         "",
     )
     return reason or (
-        "The Airtable write did not return verified provider mutation and read-back "
-        "evidence."
+        "The Airtable write did not return verified provider mutation and read-back evidence."
     )
 
 
@@ -8023,14 +7885,11 @@ def _verified_context_agent_write_summary(
                 f"{record_id or 'requested record'} in place"
             )
             if duplicate_id:
-                summary += (
-                    f"; duplicate {duplicate_id} was removed and verified absent"
-                )
+                summary += f"; duplicate {duplicate_id} was removed and verified absent"
             return summary + "."
         if operation in {"update", "update record", "update row"}:
             return (
-                f"Updated and provider-verified {target or 'the exact requested record'} "
-                "in place."
+                f"Updated and provider-verified {target or 'the exact requested record'} in place."
             )
         if operation in {
             "create",
@@ -8038,9 +7897,7 @@ def _verified_context_agent_write_summary(
             "create sheet",
             "create note",
         }:
-            return (
-                f"Created and provider-verified {target or 'the exact requested item'}."
-            )
+            return f"Created and provider-verified {target or 'the exact requested item'}."
         return (
             f"Completed and provider-verified the requested {operation} operation"
             + (f" for {target}" if target else "")
@@ -8865,9 +8722,7 @@ def _run_direct_airtable_test_record_lifecycle(
         base_alias="finance_tax_tracker",
         relevant_tables=["Business Expenses"],
         recommended_actions=(
-            []
-            if passed
-            else ["Review the exact blocker and provider receipt before any retry."]
+            [] if passed else ["Review the exact blocker and provider receipt before any retry."]
         ),
         blockers=[] if passed else [summary],
     ).model_dump(mode="json")
@@ -8896,8 +8751,7 @@ def _run_direct_airtable_test_record_lifecycle(
         "openai_requests": _orchestrator_preflight_request_count(orchestrator_preflight),
         "side_effects": {
             "airtable_test_record_created_and_verified": bool(
-                isinstance(verification, dict)
-                and verification.get("create_read_back") is True
+                isinstance(verification, dict) and verification.get("create_read_back") is True
             ),
             "airtable_test_record_absent_after_cleanup": bool(
                 isinstance(verification, dict)
@@ -9021,9 +8875,7 @@ def _run_direct_google_doc_test_lifecycle(
         relevant_docs=[title] if title else [],
         recommended_target=title,
         recommended_actions=(
-            []
-            if passed
-            else ["Review the exact blocker and provider receipt before any retry."]
+            [] if passed else ["Review the exact blocker and provider receipt before any retry."]
         ),
         blockers=[] if passed else [summary],
     ).model_dump(mode="json")
@@ -9052,8 +8904,7 @@ def _run_direct_google_doc_test_lifecycle(
         "openai_requests": _orchestrator_preflight_request_count(orchestrator_preflight),
         "side_effects": {
             "google_doc_created_and_verified": bool(
-                isinstance(verification, dict)
-                and verification.get("create_read_back") is True
+                isinstance(verification, dict) and verification.get("create_read_back") is True
             ),
             "google_doc_trashed_after_cleanup": bool(
                 isinstance(verification, dict)
@@ -9602,8 +9453,7 @@ def _run_ask_script_live(
         interpreted_constraints = output_constraints_from_plan(manual_plan)
         verified_provider_summary = _verified_child_provider_summary(script_payload)
         candidate_summary = (
-            verified_provider_summary
-            or _payload_human_summary(script_payload)
+            verified_provider_summary or _payload_human_summary(script_payload)
             if interpreted_constraints.has_deterministic_requirements()
             else _strict_requested_display_text(output, manual_plan)
             or _payload_human_summary(script_payload)
@@ -9784,9 +9634,7 @@ def _verified_child_provider_summary(payload: object) -> str:
     if payload.get("user_facing_result_verified") is not True:
         return ""
     receipts = payload.get("tool_receipts")
-    if not isinstance(receipts, list) or not any(
-        isinstance(receipt, dict) for receipt in receipts
-    ):
+    if not isinstance(receipts, list) or not any(isinstance(receipt, dict) for receipt in receipts):
         return ""
     public_result = payload.get("public_result")
     if not isinstance(public_result, dict):
@@ -10307,9 +10155,7 @@ def _work_item_langgraph_metadata(outcome) -> dict:
         "checkpoint_required": outcome.checkpoint_required,
         "checkpoint_reason": outcome.checkpoint_reason,
         "checkpoint_key": outcome.checkpoint_key,
-        "node_path": [
-            node for node in outcome.node_path if node != "manager_loop_finalize"
-        ],
+        "node_path": [node for node in outcome.node_path if node != "manager_loop_finalize"],
         "improvements": outcome.improvements,
     }
 
@@ -10567,10 +10413,7 @@ def _print_work_item_result(
     else:
         print(render_work_item_result_text(result))
         if eval_record is not None:
-            print(
-                "Eval record: "
-                f"{eval_record.get('case_id')} / {eval_record.get('run_id')}"
-            )
+            print(f"Eval record: {eval_record.get('case_id')} / {eval_record.get('run_id')}")
             if eval_record.get("dashboard_case_url"):
                 print(f"Eval dashboard: {eval_record.get('dashboard_case_url')}")
             if eval_record.get("review_case_url"):
@@ -10741,9 +10584,7 @@ def _run_agents_list(args: argparse.Namespace) -> int:
 def _run_agents_tools(args: argparse.Namespace) -> int:
     load_settings(force_dotenv=True)
     cards = [
-        card
-        for card in agent_cards()
-        if args.agent == "all" or card["route_name"] == args.agent
+        card for card in agent_cards() if args.agent == "all" or card["route_name"] == args.agent
     ]
     payload = [
         {
@@ -10810,9 +10651,8 @@ def _render_file_search_config_summary(summary: dict[str, Any]) -> str:
     )
     unknown_agents = summary.get("unknown_agents") or []
     if unknown_agents:
-        return (
-            f"{header}\n\n{table}\n\nUnknown agents: "
-            + ", ".join(str(agent) for agent in unknown_agents)
+        return f"{header}\n\n{table}\n\nUnknown agents: " + ", ".join(
+            str(agent) for agent in unknown_agents
         )
     return f"{header}\n\n{table}"
 

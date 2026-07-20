@@ -753,6 +753,7 @@ def _request_coverage_required(manual_plan: dict[str, Any] | None) -> bool:
                 "minimum_items",
                 "maximum_items",
                 "required_sections",
+                "require_section_headings",
                 "forbidden_phrases",
                 "forbid_em_dash",
                 "include_source_urls",

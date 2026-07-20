@@ -23,6 +23,7 @@ class InterpretedOutputConstraints(BaseModel):
     minimum_items: int | None = Field(default=None, ge=0, le=100)
     maximum_items: int | None = Field(default=None, ge=0, le=100)
     required_sections: list[str] = Field(default_factory=list)
+    require_section_headings: bool = False
     forbidden_phrases: list[str] = Field(default_factory=list)
     forbid_em_dash: bool = False
     include_source_urls: bool = False
@@ -74,6 +75,7 @@ class InterpretedOutputConstraints(BaseModel):
             or self.minimum_items is not None
             or self.maximum_items is not None
             or self.required_sections
+            or self.require_section_headings
             or self.forbidden_phrases
             or self.forbid_em_dash
             or self.include_source_urls
@@ -89,7 +91,7 @@ class InterpretedOutputConstraints(BaseModel):
             or self.item_count_mode != "unspecified"
             or self.minimum_items is not None
             or self.maximum_items is not None
-            or self.required_sections
+            or (self.require_section_headings and self.required_sections)
             or self.forbidden_phrases
             or self.forbid_em_dash
             or self.include_source_urls

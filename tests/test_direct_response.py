@@ -7,8 +7,9 @@ import pytest
 
 from keystone_agents import cli
 from keystone_agents.direct_response import build_direct_supplied_response_agent
-from keystone_agents.manual_request import infer_manual_request_plan
+from keystone_agents.manual_request import infer_manual_request_plan, merge_manual_request_plan
 from keystone_agents.schemas.execution_request import DirectAgentResponse
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 
 DIRECT_ROUTES = (
     "chief_of_staff",
@@ -144,6 +145,109 @@ def test_direct_supplied_response_operational_context_never_changes_named_owner(
         PROMPT,
         requested_route="business_research_analyst",
     )
+
+
+def test_internal_slack_copy_uses_two_request_provider_free_lane() -> None:
+    request = (
+        "Outreach Composer: Based only on this fact—Northstar Care has no audited "
+        "outcomes—write one sentence for our internal Slack recommending the next "
+        "step. Don't send email, create a provider draft, or search."
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="outreach_composer")
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        objective="Write one internal Slack recommendation from the supplied fact.",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        outreach_channel="internal_slack",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_approved_context=True,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+        ),
+    )
+    plan = merge_manual_request_plan(fallback, candidate)
+    args = SimpleNamespace(
+        agent=None,
+        context_file="",
+        live_search=False,
+        max_manager_steps=3,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="outreach_composer",
+        manual_plan=plan,
+    )
+
+    assert cli._should_run_direct_supplied_response(
+        request,
+        requested_route="outreach_composer",
+        manual_plan=plan,
+    )
+    assert estimate["max"] == 2
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "outreach_composer_direct_supplied_response_sdk",
+    ]
+
+
+def test_budget_estimate_uses_semantic_owner_when_named_owner_is_revised() -> None:
+    request = (
+        "Outreach Composer: Based only on this fact—Northstar Care has no audited "
+        "outcomes—write one sentence for our internal Slack recommending the next "
+        "step. Don't send email, create a provider draft, or search."
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="outreach_composer")
+    incomplete_candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        objective="Write one internal recommendation from the supplied fact.",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_live_search=False,
+        requires_approved_context=True,
+        side_effect_policy="draft_or_read_only",
+    )
+    plan = merge_manual_request_plan(fallback, incomplete_candidate)
+    args = SimpleNamespace(
+        agent="outreach_composer",
+        context_file="",
+        live_search=False,
+        max_manager_steps=3,
+    )
+
+    assert plan.target_agent == "chief_of_staff"
+    assert cli._route_with_manual_plan_advice("outreach_composer", plan) == "chief_of_staff"
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="outreach_composer",
+        manual_plan=plan,
+    )
+
+    assert estimate["max"] == 2
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "chief_of_staff_direct_supplied_response_sdk",
+    ]
 
 
 def test_direct_supplied_response_reaches_executor_under_one_request_ceiling(

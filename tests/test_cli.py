@@ -10246,14 +10246,13 @@ def test_natural_cos_supplied_note_graph_counts_only_model_backed_stages() -> No
     )
 
     assert estimate["min"] == 3
-    assert estimate["max"] == 4
+    assert estimate["max"] == 3
     assert estimate["stages"] == [
         "manual_request_planner",
         "business_research_analyst_source_provided_deterministic",
         "opportunity_scout_source_provided_deterministic",
         "outreach_composer_sdk",
         "final_response_synthesis",
-        "conditional_instruction_following_repair",
     ]
 
     plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
@@ -10267,6 +10266,7 @@ def test_natural_cos_supplied_note_graph_counts_only_model_backed_stages() -> No
                     "Decision brief",
                     "Paste-ready Slack note",
                 ],
+                "require_section_headings": True,
             }
         )
     )
@@ -10311,14 +10311,13 @@ def test_short_human_cos_stateful_review_fits_shared_five_request_ceiling() -> N
     )
 
     assert estimate["min"] == 3
-    assert estimate["max"] == 4
+    assert estimate["max"] == 3
     assert estimate["stages"] == [
         "manual_request_planner",
         "business_research_analyst_source_provided_deterministic",
         "opportunity_scout_source_provided_deterministic",
         "outreach_composer_sdk",
         "final_response_synthesis",
-        "conditional_instruction_following_repair",
     ]
 
 
@@ -10356,11 +10355,10 @@ def test_natural_cos_supplied_note_without_planner_workflow_stays_bounded() -> N
     )
 
     assert estimate["min"] == 2
-    assert estimate["max"] == 3
+    assert estimate["max"] == 2
     assert estimate["stages"] == [
         "manual_request_planner",
         "chief_of_staff_response_only_sdk",
-        "conditional_instruction_following_repair",
     ]
 
 
