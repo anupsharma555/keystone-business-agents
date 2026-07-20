@@ -209,6 +209,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "modify_gmail_message_state",
             "create_gmail_draft_with_attachment",
             "create_gmail_draft_reply",
+            "gmail_test_draft_lifecycle",
             "send_gmail_test_draft",
             "load_email_style_profile",
             "list_local_context_sources",
@@ -225,7 +226,13 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         live_flags_required=("--live-gmail", "--no-dry-run", "--live-sdk"),
         eval_datasets=("evals/static/gmail_triage_cases.json", "evals/local/gmail_triage.jsonl"),
-        validation_paths=("tests/test_gmail_triage.py", "tests/test_sdk_execution.py"),
+        validation_paths=(
+            "tests/test_gmail_triage.py",
+            "tests/test_sdk_execution.py",
+            "tests/test_request_coverage.py",
+            "tests/test_instruction_following.py",
+            "tests/test_cli.py",
+        ),
         handoff_description=(
             "Classify inbound email, own exact scoped mailbox-state changes, flag risk, "
             "and request drafts only."
@@ -276,7 +283,13 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "evals/static/business_research_analyst_cases.json",
             "evals/local/source_attribution.jsonl",
         ),
-        validation_paths=("tests/test_business_research_analyst.py",),
+        validation_paths=(
+            "tests/test_business_research_analyst.py",
+            "tests/test_source_triage.py",
+            "tests/test_request_coverage.py",
+            "tests/test_instruction_following.py",
+            "tests/test_cli.py",
+        ),
         handoff_description=(
             "Create source-attributed research briefs for companies, institutes, "
             "conferences, topics, Zotero collections, and article collections."
@@ -300,6 +313,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "safety_policy.md",
             "tools.md",
             "opportunity_scout.md",
+            "opportunity_scout_synthesis_compact.md",
         ),
         skills=AGENT_SKILL_NAMES["opportunity_scout"],
         tools=(
@@ -330,19 +344,29 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         live_flags_required=("--live-search", "--no-dry-run", "--live-sdk"),
         eval_datasets=(
             "evals/static/opportunity_scout_cases.json",
+            "evals/static/opportunity_scout_portfolio_cases.json",
             "evals/local/opportunity_scoring.jsonl",
             "evals/local/source_attribution.jsonl",
         ),
         validation_paths=(
             "tests/test_opportunity_scout.py",
+            "tests/test_opportunity_scout_evaluation.py",
             "tests/test_compact_opportunity_assessment.py",
             "tests/test_compact_opportunity_baseline.py",
+            "tests/test_source_triage.py",
+            "tests/test_request_coverage.py",
+            "tests/test_instruction_following.py",
+            "tests/test_cli.py",
         ),
         handoff_description=(
-            "Find and score opportunities, leads, grants, partners, and companies."
+            "Find and score current company and non-company opportunities including "
+            "partners, roles, grants, conferences, workshops, certifications, "
+            "collaborations, consulting, and networking."
         ),
         safety_notes=(
             "No outreach generation",
+            "Closed, expired, stale, irrelevant, or detail-incomplete opportunities are "
+            "withheld from final ranking",
             "Deduplicate before prioritizing",
             "Source-backed scoring required",
             "Single supplied-opportunity asks use the compact review-only assessment schema",
@@ -382,7 +406,12 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "evals/static/outreach_composer_cases.json",
             "evals/local/outreach_copy_constraints.jsonl",
         ),
-        validation_paths=("tests/test_outreach_composer.py",),
+        validation_paths=(
+            "tests/test_outreach_composer.py",
+            "tests/test_request_coverage.py",
+            "tests/test_instruction_following.py",
+            "tests/test_cli.py",
+        ),
         handoff_description=(
             "Create draft-only outreach from approved company or opportunity context."
         ),
@@ -390,6 +419,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "Draft-only behavior",
             "Human approval required",
             "Only approved source-backed context may be used",
+            "Selected-draft revisions preserve typed recipient, CTA, and word-limit constraints",
             "Google Workspace writes require live flags and approval references",
         ),
     ),
@@ -412,12 +442,18 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "airtable_upload_attachment",
             "airtable_link_attachment",
             "airtable_create_expense_from_receipt",
+            "airtable_reconcile_duplicate_expense",
             "airtable_delete_test_record",
             "airtable_test_record_lifecycle",
         ),
         live_flags_required=("--live-sdk",),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
-        validation_paths=("tests/test_agent_registry.py", "tests/test_chief_of_staff.py"),
+        validation_paths=(
+            "tests/test_agent_registry.py",
+            "tests/test_chief_of_staff.py",
+            "tests/test_instruction_following.py",
+            "tests/test_cli.py",
+        ),
         handoff_description=(
             "Read Airtable base, table, field, and candidate record context, perform "
             "direct approved create/update writes, clean up provider-verified test "
@@ -457,6 +493,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "google_doc_read",
             "google_doc_write",
             "google_doc_trash",
+            "google_doc_test_lifecycle",
             "google_drive_list_folder",
             "google_drive_search_files",
             "google_drive_get_file_metadata",
@@ -484,8 +521,11 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         validation_paths=(
             "tests/test_agent_registry.py",
             "tests/test_chief_of_staff.py",
+            "tests/test_google_doc_test_lifecycle.py",
             "tests/test_presentation_index.py",
             "tests/test_presentation_index_runner.py",
+            "tests/test_instruction_following.py",
+            "tests/test_cli.py",
         ),
         handoff_description=(
             "Read scoped Google Drive, Docs, Sheets, and local presentation evidence, "
@@ -494,6 +534,10 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         safety_notes=(
             "Direct writes require live flags and approval references",
+            (
+                "Marked Doc lifecycle cleanup additionally requires "
+                "KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE=true"
+            ),
             "No nested live writes",
             "Chief of Staff owns review and approval handoff when this agent is nested",
             "Drive image/media support is metadata-only until download/OCR tooling is added",
@@ -534,7 +578,12 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         live_flags_required=("--live-sdk",),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
-        validation_paths=("tests/test_agent_registry.py", "tests/test_chief_of_staff.py"),
+        validation_paths=(
+            "tests/test_agent_registry.py",
+            "tests/test_chief_of_staff.py",
+            "tests/test_instruction_following.py",
+            "tests/test_cli.py",
+        ),
         handoff_description=(
             "Read local/API Zotero library, collection, item, article, importer, and "
             "evidence context, perform direct approved Workspace artifact writes or "
@@ -566,7 +615,12 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         tools=("retrieve_rss_announcement_history",),
         live_flags_required=("--live-sdk",),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
-        validation_paths=("tests/test_agent_registry.py", "tests/test_announcement_context_tools.py"),
+        validation_paths=(
+            "tests/test_agent_registry.py",
+            "tests/test_announcement_context_tools.py",
+            "tests/test_instruction_following.py",
+            "tests/test_cli.py",
+        ),
         handoff_description=(
             "Read historical RSS/#announcements article context from canonical local "
             "application data and return advisory themes, opportunity signals, and "
@@ -595,7 +649,12 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         tools=("retrieve_preprint_announcement_history",),
         live_flags_required=("--live-sdk",),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
-        validation_paths=("tests/test_agent_registry.py", "tests/test_announcement_context_tools.py"),
+        validation_paths=(
+            "tests/test_agent_registry.py",
+            "tests/test_announcement_context_tools.py",
+            "tests/test_instruction_following.py",
+            "tests/test_cli.py",
+        ),
         handoff_description=(
             "Read historical preprint/#knowledge-hub context from canonical local "
             "application data and return advisory psychiatry-field themes, opportunity "
@@ -648,12 +707,16 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
     eval_datasets=("evals/local/orchestrator_routing.jsonl", "evals/local/safety_refusals.jsonl"),
     validation_paths=(
         "tests/test_orchestrator.py",
+        "tests/test_manual_request_plan.py",
+        "tests/test_diverse_ask_acceptance.py",
         "tests/test_handoff_contracts.py",
+        "tests/test_handoff_adaptation.py",
         "tests/test_orchestrator_preflight_context.py",
         "tests/test_advanced_manager_live_validation.py",
         "tests/test_workflow_runner.py",
         "tests/test_slack_action_contract.py",
         "tests/test_slack_agent_actions.py",
+        "tests/test_instruction_following.py",
     ),
     handoff_description=(
         "Read raw Keystone requests first, plan or route to the correct specialist, "
@@ -680,6 +743,7 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         "safety_policy.md",
         "tools.md",
         "chief_of_staff.md",
+        "chief_of_staff_supplied_synthesis_compact.md",
     ),
     skills=AGENT_SKILL_NAMES["chief_of_staff"],
     tools=(
@@ -728,7 +792,13 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
     ),
     live_flags_required=("--live-sdk", "KEYSTONE_GOOGLE_CALENDAR_ALLOW_WRITES=true"),
     eval_datasets=(),
-    validation_paths=("tests/test_chief_of_staff.py",),
+    validation_paths=(
+        "tests/test_chief_of_staff.py",
+        "tests/test_calendar_action_interpreter.py",
+        "tests/test_google_calendar_tool.py",
+        "tests/test_cli.py",
+        "tests/test_instruction_following.py",
+    ),
     handoff_description=(
         "Plan read-only KNI Slack operations routing across calendar, Gmail, "
         "business-agent, and Slack runtime workflows, including scoped internal "
@@ -739,6 +809,8 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         "Hosted file search attaches only with explicit vector store configuration",
         "No unscoped public Slack posts",
         "No Gmail sends; Calendar writes require the dedicated exact-event tools and gate",
+        "Live Calendar CRUD requires one structured LLM interpretation before deterministic "
+        "identity, approval, write, and read-back gates",
         "Human approval required before outbound Slack copy is used",
         "Keystone Slack repo access is read-only and secret-filtered",
         "Full article reading is default-off and enabled only by explicit natural-language request",

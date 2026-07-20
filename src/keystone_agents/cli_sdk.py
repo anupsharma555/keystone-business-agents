@@ -46,6 +46,15 @@ def add_sdk_run_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--compact-instructions",
+        action="store_true",
+        help=(
+            "Use the bounded direct-agent instruction profile. This preserves core, "
+            "specialist, request-triggered, memory, writing, and safety contracts while "
+            "omitting graph-oriented shared prompt material."
+        ),
+    )
+    parser.add_argument(
         "--trace-include-sensitive-data",
         action=argparse.BooleanOptionalAction,
         default=False,

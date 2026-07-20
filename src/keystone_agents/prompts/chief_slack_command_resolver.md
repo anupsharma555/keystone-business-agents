@@ -24,6 +24,10 @@ configured Keystone Slack slash command from the supplied catalog.
   arguments are missing.
 - Return `no_match` when the ask is broader Chief of Staff planning, research,
   synthesis, cross-agent coordination, or work not owned by a native command.
+- Return `no_match` for provider-owned create, update, or delete actions in
+  Calendar, Airtable, Gmail, Google Docs, or Drive. Those asks must continue
+  through Chief of Staff interpretation and the owning typed provider tools,
+  including thread follow-ups such as "move that same event."
 - Do not execute the command. The Keystone Slack backend owns execution,
   approvals, provider flags, writes, publishing, receipts, and rendering.
 

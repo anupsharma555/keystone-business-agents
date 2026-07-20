@@ -58,9 +58,15 @@ from keystone_agents.schemas.outreach import (
     OutreachLLMDraftPayload,
     OutreachLLMVariantSetPayload,
     OutreachTemplateContext,
+    SelectedOutreachDraft,
     default_follow_up_date,
 )
-from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
+from keystone_agents.sdk import (
+    Agent,
+    build_sdk_agent,
+    compose_direct_instructions,
+    compose_instructions,
+)
 from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.tools.approval_tool import create_approval_queue_item
@@ -758,6 +764,10 @@ def build_approved_outreach_drafting_context(
     objective: str | None = None,
     blocked_facts: list[str] | None = None,
     revision_request: str | None = None,
+    selected_draft: SelectedOutreachDraft | dict[str, Any] | None = None,
+    revision_max_words: int | None = None,
+    preserve_selected_cta: bool = False,
+    preserve_selected_recipient: bool = True,
     max_variants: int = 1,
 ) -> ApprovedOutreachDraftingContext:
     """Build the typed, approved context envelope for constrained LLM drafting."""
@@ -774,6 +784,13 @@ def build_approved_outreach_drafting_context(
     )
     template_record = _coerce_template_context(outreach_template)
     example_records = _coerce_example_guidance(example_guidance)
+    selected_draft_record = (
+        selected_draft
+        if isinstance(selected_draft, SelectedOutreachDraft)
+        else SelectedOutreachDraft.model_validate(selected_draft)
+        if isinstance(selected_draft, dict)
+        else None
+    )
     approved_style = (
         style_record if style_record is not None and style_record.approved_for_drafting else None
     )
@@ -824,6 +841,10 @@ def build_approved_outreach_drafting_context(
             or "Draft concise, source-backed outreach for external-use approval review."
         ),
         revision_request=_clean_copy(revision_request),
+        selected_draft=selected_draft_record,
+        revision_max_words=revision_max_words,
+        preserve_selected_cta=preserve_selected_cta,
+        preserve_selected_recipient=preserve_selected_recipient,
         max_variants=max_variants,
         outreach_template=template_record,
         example_guidance=example_records,
@@ -1368,6 +1389,28 @@ def compose_outreach_draft_llm_constrained(
     if not email_subject or not email_body:
         raise ValueError("LLM draft must include email_subject and email_body")
 
+    selected_draft = context.selected_draft
+    if context.revision_max_words is not None:
+        word_count = len(email_body.split())
+        if word_count > context.revision_max_words:
+            raise ValueError(
+                "revised email body exceeds the selected revision word limit "
+                f"({word_count} > {context.revision_max_words})"
+            )
+    if context.preserve_selected_cta and selected_draft is not None:
+        revised_copy = "\n".join((email_body, linkedin_note))
+        if selected_draft.cta_text not in revised_copy:
+            raise ValueError("revised draft must preserve the selected CTA exactly")
+    payload_recipient = _clean_copy(str(payload.get("recipient") or ""))
+    if (
+        context.preserve_selected_recipient
+        and selected_draft is not None
+        and selected_draft.recipient
+        and payload_recipient
+        and payload_recipient != selected_draft.recipient
+    ):
+        raise ValueError("revised draft must preserve the selected recipient")
+
     payload_contact_name = _clean_copy(str(payload.get("contact_name") or ""))
     payload_contact_title = _clean_copy(str(payload.get("contact_title") or ""))
     if payload_contact_title and not payload_contact_name:
@@ -1405,7 +1448,20 @@ def compose_outreach_draft_llm_constrained(
     )
     draft = OutreachDraft(
         company_name=_clean_copy(str(payload.get("company_name") or context.company_profile.name)),
-        recipient=_clean_copy(str(payload.get("recipient") or payload_contact_name or "")) or None,
+        recipient=_clean_copy(
+            str(
+                payload.get("recipient")
+                or (selected_draft.recipient if selected_draft is not None else "")
+                or payload_contact_name
+                or (
+                    context.contact_context.contact_name
+                    if context.contact_context is not None
+                    else ""
+                )
+                or ""
+            )
+        )
+        or None,
         contact_name=_clean_copy(
             str(
                 payload_contact_name
@@ -1444,10 +1500,12 @@ def compose_outreach_draft_llm_constrained(
         example_guidance_used=bool(context.example_guidance),
         drafting_mode="llm_constrained",
         revision_request=context.revision_request,
+        revised_from_draft_id=(selected_draft.draft_id if selected_draft is not None else ""),
         draft_policy="normal",
         approved_context_used=True,
         unsupported_claims_flagged=[],
         unsupported_claim_explanations=[],
+        request_coverage=payload.get("request_coverage") or {},
         approval_required=True,
         approval_state="pending",
         approval_scope=ApprovalScope.EXTERNAL_USE.value,
@@ -1474,21 +1532,29 @@ def build_outreach_composer_agent(
     request_text: str = "",
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
+    compact_instructions: bool = False,
 ) -> Agent:
     """Build the outreach composer agent."""
 
-    instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "tools.md",
-        "outreach_composer.md",
-        skill_files=select_agent_skill_names(
-            "outreach_composer",
-            request_text=request_text,
-            context_flags=context_flags,
-            include_all=include_all_skills,
-        ),
+    skill_files = select_agent_skill_names(
+        "outreach_composer",
+        request_text=request_text,
+        context_flags=context_flags,
+        include_all=include_all_skills,
+        compact=compact_instructions,
     )
+    composer = compose_direct_instructions if compact_instructions else compose_instructions
+    prompt_files = (
+        ("keystone_profile.md", "safety_policy.md", "outreach_composer.md")
+        if compact_instructions
+        else (
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "outreach_composer.md",
+        )
+    )
+    instructions = composer(*prompt_files, skill_files=skill_files)
     return build_sdk_agent(
         name="outreach_composer",
         instructions=instructions,
@@ -1551,6 +1617,7 @@ def build_outreach_composer_compact_synthesis_agent(
     request_text: str = "",
     include_all_skills: bool = False,
     include_tools_policy: bool = False,
+    internal_slack_copy: bool = False,
 ) -> Agent:
     """Build a compact structured-output outreach agent for constrained providers."""
 
@@ -1593,7 +1660,8 @@ def build_outreach_composer_compact_synthesis_agent(
                 "Compact synthesis mode: return only company_name, email_subject, "
                 "email_body, linkedin_note, personalization_rationale, source_ids_used, "
                 "reply_recommended, recommended_next_step, additional_information_needed, "
-                "collaboration_ideas, and deferral_reason. Choose source_ids_used only "
+                "collaboration_ideas, deferral_reason, and request_coverage. Choose "
+                "source_ids_used only "
                 "from the approved source IDs in the prompt. Do not include send, approval, "
                 "context, facts_used, or other workflow fields; Python will validate and "
                 "wrap the compact payload into the full OutreachDraft schema."
@@ -1613,6 +1681,37 @@ def build_outreach_composer_compact_synthesis_agent(
                 "such as 'based on our thread,' 'the selected context,' or 'if it would be "
                 "helpful.' State a concrete point plainly."
             ),
+            *(
+                [
+                    (
+                        "Internal Slack recommendation mode overrides the external-reply "
+                        "instructions above. This is an internal decision artifact, not "
+                        "correspondence. Always return a non-empty email_subject and email_body; "
+                        "Python uses email_body as the canonical internal Slack copy. Set "
+                        "reply_recommended=true only to indicate that the requested internal "
+                        "artifact was produced, not that external outreach is recommended. "
+                        "Do not use a greeting, signoff, recipient language, or a generic "
+                        "compare-notes CTA. Directly state the strongest supported opportunity, "
+                        "the most important validation gap, and the next safe action. Include "
+                        "a concise 'What the supplied note supports' section when the raw "
+                        "request provides bounded facts, and distinguish those facts from "
+                        "unverified outcomes, references, implementation evidence, or "
+                        "evaluation claims. Include "
+                        "the retained source URLs visibly in the body when the operator asks "
+                        "for citations. Keep the full email_body under 150 words, including "
+                        "headings and source URLs, so it remains concise and passes the "
+                        "internal artifact validator. Preserve every distinct requested "
+                        "deliverable from the raw request and interpreted output constraints. "
+                        "When the operator asks for a separate paste-ready note or other "
+                        "named component, give it its own visible reader-facing section "
+                        "instead of folding it into the decision brief. Audit those "
+                        "deliverables in request_coverage; use an empty unmet_dimensions "
+                        "list when none are missing. Keep external actions disabled."
+                    )
+                ]
+                if internal_slack_copy
+                else []
+            ),
         ]
     )
     return build_sdk_agent(
@@ -1620,7 +1719,7 @@ def build_outreach_composer_compact_synthesis_agent(
         instructions=instructions,
         output_type=OutreachLLMDraftPayload,
         tools=[],
-        guardrails=keystone_guardrails(),
+        guardrails=keystone_guardrails(internal_artifact=internal_slack_copy),
         model=model,
         handoff_description=(
             "Use for compact, approval-gated draft-only outreach synthesis from "
@@ -1687,6 +1786,7 @@ def run_outreach_composer_sdk(
     context_flags: Mapping[str, bool] | None = None,
     max_turns: int | None = None,
     attach_tools: bool = True,
+    compact_instructions: bool = False,
 ) -> TypedAgentRunResult[OutreachDraft]:
     """Run Outreach Composer through the typed SDK harness."""
 
@@ -1719,6 +1819,7 @@ def run_outreach_composer_sdk(
             include_tools=include_tools,
             request_text=skill_request_text(typed_input),
             context_flags=context_flags,
+            compact_instructions=compact_instructions,
         ),
         typed_input=typed_input,
         output_type=OutreachDraft,

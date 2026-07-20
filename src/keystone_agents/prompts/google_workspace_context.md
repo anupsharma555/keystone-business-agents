@@ -50,6 +50,9 @@ Context or the approved Workspace action handler.
   returns zero or multiple plausible Docs, report the exact blocker instead of
   guessing or summarizing names as if their contents were read.
 - Identify which existing artifact should be read, updated, or avoided.
+- For a read-only request to draft, outline, transform, or preview content from
+  supplied text, put the actual bounded content in `artifact_preview_lines`.
+  Do not claim an outline or draft was produced if those lines are empty.
 - Use Drive metadata search for candidate files, PDFs, and images. When a
   specific file candidate matters, use Drive file metadata reads to verify ID,
   MIME type, URL, modified time, description, size, and image dimensions.
@@ -95,7 +98,10 @@ reads and write-plan recommendations:
   type, modified time, desired slide range/count, speaker-note intent, and
   whether a later non-destructive copy/export is requested.
 - Docs reads/writes: preserve document ID or URL, title, target section,
-  summary purpose, audience, source basis, and approval reference/status.
+  summary purpose, audience, source basis, approval reference/status, and
+  whether the requested content should `append` to or `replace` the body. Use
+  `content_mode=append` for natural asks such as "add this to the notes"; never
+  replace the full body when the operator asked to add or append content.
 - Sheets reads/writes: preserve spreadsheet ID or URL, sheet title, tab name,
   row key, column names, field mapping, append/update/delete-row intent, and
   approval reference/status.

@@ -550,10 +550,37 @@ def keystone_output_guardrail(
     )
 
 
-def keystone_guardrails() -> dict[str, list[Any]]:
+@output_guardrail(name="keystone_internal_artifact_output_safety")
+def keystone_internal_artifact_output_guardrail(
+    ctx: RunContextWrapper[None],
+    agent: Agent,
+    output: Any,
+) -> GuardrailFunctionOutput:
+    """Apply safety checks without treating an internal brief as outbound copy."""
+
+    assessment = assess_text_guardrails(
+        stringify_payload(output),
+        check_outreach_claims=False,
+    )
+    return GuardrailFunctionOutput(
+        output_info={"risk_flags": assessment.risk_flags, "reasons": assessment.reasons},
+        tripwire_triggered=not assessment.allowed,
+    )
+
+
+def keystone_guardrails(
+    *,
+    internal_artifact: bool = False,
+) -> dict[str, list[Any]]:
     """Return SDK-compatible guardrails for agent construction."""
 
     return {
         "input": [keystone_input_guardrail],
-        "output": [keystone_output_guardrail],
+        "output": [
+            (
+                keystone_internal_artifact_output_guardrail
+                if internal_artifact
+                else keystone_output_guardrail
+            )
+        ],
     }

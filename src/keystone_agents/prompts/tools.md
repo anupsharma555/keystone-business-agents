@@ -160,6 +160,16 @@ promising primary URLs have been selected. Slack-facing answers must synthesize
 the findings first, include visible URLs for source-backed claims, and put
 provider diagnostics only in the final metadata section.
 
+Selected-page reads use one shared deterministic extraction ladder. Trafilatura
+is the static baseline; failed, empty, or shallow results may fall back to the
+local Crawl4AI renderer. Firecrawl is a later managed fallback only when it is
+explicitly present in the configured fallback sequence and credentials are
+available. Agents should request source reading based on task needs and evidence
+quality, but must not select or retry paid providers directly. Structured source
+APIs remain preferred for database search interfaces such as ClinicalTrials.gov
+search results when rendered pages return navigation, glossary, or telemetry
+instead of target records; selected individual study records may still be read.
+
 When a WorkItem context pack includes `source_context_status`,
 `source_context_sample`, `source_context_focus`, `source_triage`, or
 `ordered_sources`, treat those fields as the retrieval evidence contract for

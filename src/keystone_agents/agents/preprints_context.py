@@ -8,7 +8,12 @@ from typing import Any
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
 from keystone_agents.guardrails import keystone_guardrails
 from keystone_agents.schemas.operational_context import PreprintsContextResult
-from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
+from keystone_agents.sdk import (
+    Agent,
+    build_sdk_agent,
+    compose_direct_instructions,
+    compose_instructions,
+)
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.tools.announcement_context_tools import (
     retrieve_preprint_announcement_history,
@@ -29,21 +34,29 @@ def build_preprints_context_agent(
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
+    compact_instructions: bool = False,
 ) -> Agent:
     """Build the preprint/#knowledge-hub context specialist."""
 
-    instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "tools.md",
-        "preprints_context.md",
-        skill_files=select_agent_skill_names(
-            "preprints_context_agent",
-            request_text=request_text,
-            context_flags=context_flags,
-            include_all=include_all_skills,
-        ),
+    skill_files = select_agent_skill_names(
+        "preprints_context_agent",
+        request_text=request_text,
+        context_flags=context_flags,
+        include_all=include_all_skills,
+        compact=compact_instructions,
     )
+    composer = compose_direct_instructions if compact_instructions else compose_instructions
+    prompt_files = (
+        ("keystone_profile.md", "safety_policy.md", "preprints_context.md")
+        if compact_instructions
+        else (
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "preprints_context.md",
+        )
+    )
+    instructions = composer(*prompt_files, skill_files=skill_files)
     return build_sdk_agent(
         name="preprints_context_agent",
         instructions=instructions,

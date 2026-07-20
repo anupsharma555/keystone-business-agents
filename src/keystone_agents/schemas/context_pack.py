@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
-from keystone_agents.schemas.handoff_types import HandoffTypeContract, build_handoff_type_contract
+from keystone_agents.schemas.handoff_types import (
+    HandoffAdaptationAssessment,
+    HandoffTypeContract,
+    build_handoff_type_contract,
+)
 from keystone_agents.schemas.manual_request_plan import AskShapePolicy
 from keystone_agents.schemas.work_item import (
     WorkItemApprovalGate,
@@ -19,6 +23,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemStatus,
     WorkItemTarget,
 )
+from keystone_agents.source_triage import SourceTriageSummary
 
 
 class ContextPackReadinessGate(BaseModel):
@@ -82,6 +87,7 @@ class ContextPackBase(BaseModel):
 
     pack_type: str
     handoff_type_contract: HandoffTypeContract = Field(default_factory=HandoffTypeContract)
+    adaptation_assessment: HandoffAdaptationAssessment | None = None
     input_type: str = "keystone_agents.schemas.work_item.WorkItem"
     satisfies_input_type: str = ""
     expected_output_type: str = ""
@@ -92,6 +98,7 @@ class ContextPackBase(BaseModel):
     current_status: WorkItemStatus
     target: WorkItemTarget = Field(default_factory=WorkItemTarget)
     request_text: str = ""
+    constraints: list[str] = Field(default_factory=list)
     ask_shape: AskShapePolicy = Field(default_factory=AskShapePolicy)
     approved_facts: list[WorkItemFact] = Field(default_factory=list)
     source_refs: list[WorkItemSourceRef] = Field(default_factory=list)
@@ -99,7 +106,7 @@ class ContextPackBase(BaseModel):
     source_context_status: dict[str, Any] = Field(default_factory=dict)
     source_context_sample: list[dict[str, Any]] = Field(default_factory=list)
     source_context_focus: dict[str, Any] = Field(default_factory=dict)
-    source_triage: dict[str, Any] = Field(default_factory=dict)
+    source_triage: SourceTriageSummary = Field(default_factory=SourceTriageSummary)
     ordered_sources: list[dict[str, Any]] = Field(default_factory=list)
     selected_artifacts: list[WorkItemArtifactRef] = Field(default_factory=list)
     blockers: list[WorkItemBlocker] = Field(default_factory=list)
@@ -113,6 +120,10 @@ class ContextPackBase(BaseModel):
     relevant_memory_refs: list[MemoryContextRef] = Field(default_factory=list)
     project_context: ProjectContextPack | None = None
     summary: dict[str, Any] = Field(default_factory=dict)
+
+    @field_serializer("source_triage")
+    def _serialize_source_triage(self, value: SourceTriageSummary) -> dict[str, Any]:
+        return value.model_dump(mode="json") if value.has_evidence() else {}
 
 
 class ResearchContextPack(ContextPackBase):
@@ -169,7 +180,6 @@ class OpportunityContextPack(ContextPackBase):
     type_compatibility_status: str = "compatible"
     route: WorkItemRoute = WorkItemRoute.OPPORTUNITY_SCOUT
     objective: str = ""
-    constraints: list[str] = Field(default_factory=list)
     entity_types: list[str] = Field(default_factory=list)
     retrieved_candidates: list[WorkItemArtifactRef] = Field(default_factory=list)
     review_candidates: list[WorkItemArtifactRef] = Field(default_factory=list)

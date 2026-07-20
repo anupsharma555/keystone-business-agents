@@ -440,8 +440,19 @@ def derive_request_autonomy_hint(
     needs_structured = any(term in text for term in _STRUCTURED_ENRICHMENT_TERMS)
     needs_review = any(term in text for term in _SEARCH_REVIEW_TERMS)
 
-    if agent_name == "opportunity_scout" and any(
-        term in text for term in ("role", "roles", "job", "jobs")
+    role_intent_negated = any(
+        phrase in text
+        for phrase in (
+            "not a job",
+            "not a role",
+            "not a job or role",
+            "not a role or job",
+        )
+    )
+    if (
+        agent_name == "opportunity_scout"
+        and not role_intent_negated
+        and any(term in text for term in ("role", "roles", "job", "jobs"))
     ):
         needs_precision = True
         reasons.append("role search requires stricter hard-filter verification")

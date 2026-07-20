@@ -7,6 +7,7 @@ grant permissions, route requests, or execute side effects.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -482,6 +483,7 @@ def explain_agent_skill_selection(
     request_text: str | None = None,
     context_flags: Mapping[str, bool] | None = None,
     include_all: bool = False,
+    compact: bool = False,
 ) -> dict[str, tuple[str, ...]]:
     """Return selected skills with deterministic selection reasons."""
 
@@ -491,13 +493,36 @@ def explain_agent_skill_selection(
         return {skill_name: ("include_all",) for skill_name in AGENT_SKILL_NAMES[agent_name]}
 
     reasons: dict[str, list[str]] = {}
-    for skill_name in CORE_SKILL_NAMES:
-        _add_reason(reasons, skill_name, "core")
-    _add_reason(reasons, SPECIALIST_SKILL_NAMES[agent_name], "specialist")
-    for skill_name in DEFAULT_ROUTE_SKILL_NAMES.get(agent_name, ()):
-        _add_reason(reasons, skill_name, "route_default")
-
     lowered = (request_text or "").lower()
+    compact_action_text = re.sub(
+        r"\b(?:do\s+not|don't|dont|never|without)\s+"
+        r"(?:add|attach|create|delete|draft|edit|modify|post|publish|remove|rename|"
+        r"save|send|share|update|write)\b",
+        "",
+        lowered,
+    )
+    compact_action_requested = bool(
+        re.search(
+            r"\b(?:add|attach|create|delete|draft|edit|modify|post|publish|remove|"
+            r"rename|save|send|share|update|write)\b",
+            compact_action_text,
+        )
+    )
+    keep_compact_action_contracts = bool(
+        agent_name in {"gmail_triage", "outreach_composer"}
+        or compact_action_requested
+    )
+    for skill_name in CORE_SKILL_NAMES:
+        if not compact or (
+            keep_compact_action_contracts
+            and skill_name in {"context_permission_gating", "action_boundary_enforcement"}
+        ):
+            _add_reason(reasons, skill_name, "core")
+    _add_reason(reasons, SPECIALIST_SKILL_NAMES[agent_name], "specialist")
+    if not compact:
+        for skill_name in DEFAULT_ROUTE_SKILL_NAMES.get(agent_name, ()):
+            _add_reason(reasons, skill_name, "route_default")
+
     for skill_name, triggers in CONDITIONAL_SKILL_TRIGGERS.items():
         for trigger in triggers:
             if trigger in lowered:
@@ -521,6 +546,7 @@ def select_agent_skill_names(
     request_text: str | None = None,
     context_flags: Mapping[str, bool] | None = None,
     include_all: bool = False,
+    compact: bool = False,
 ) -> tuple[str, ...]:
     """Select the deterministic runtime skill subset for an agent run.
 
@@ -535,5 +561,6 @@ def select_agent_skill_names(
             request_text=request_text,
             context_flags=context_flags,
             include_all=include_all,
+            compact=compact,
         )
     )

@@ -41,6 +41,8 @@ from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.company_profile import (
     DEFAULT_RESEARCH_DATA_POINT_KEYS,
     ClaimEvidenceRecord,
+    CompanyBriefFact,
+    CompanyBriefSourceCitation,
     CompanyProfile,
     CompanyResearchComparison,
     CompanyResearchFocusedBrief,
@@ -50,7 +52,12 @@ from keystone_agents.schemas.company_profile import (
 )
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
 from keystone_agents.schemas.research import ResearchBrief
-from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
+from keystone_agents.sdk import (
+    Agent,
+    build_sdk_agent,
+    compose_direct_instructions,
+    compose_instructions,
+)
 from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.source_enrichment import (
@@ -425,27 +432,40 @@ def build_business_research_analyst_agent(
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
+    attach_tools: bool = True,
+    compact_instructions: bool = False,
 ) -> Agent:
     """Build the business research analyst agent."""
 
-    instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "tools.md",
-        "local_context.md",
-        "business_research_analyst.md",
-        skill_files=select_agent_skill_names(
-            "business_research_analyst",
-            request_text=request_text,
-            context_flags=context_flags,
-            include_all=include_all_skills,
-        ),
+    skill_files = select_agent_skill_names(
+        "business_research_analyst",
+        request_text=request_text,
+        context_flags=context_flags,
+        include_all=include_all_skills,
+        compact=compact_instructions,
     )
+    composer = compose_direct_instructions if compact_instructions else compose_instructions
+    prompt_files = (
+        ("keystone_profile.md", "safety_policy.md", "business_research_analyst.md")
+        if compact_instructions
+        else (
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "local_context.md",
+            "business_research_analyst.md",
+        )
+    )
+    instructions = composer(*prompt_files, skill_files=skill_files)
     return build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=CompanyProfile,
-        tools=_business_research_analyst_company_profile_tools(tool_tier=tool_tier),
+        tools=(
+            _business_research_analyst_company_profile_tools(tool_tier=tool_tier)
+            if attach_tools
+            else []
+        ),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -545,22 +565,32 @@ def build_business_research_analyst_focused_brief_agent(
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
     attach_tools: bool = True,
+    compact_instructions: bool = False,
 ) -> Agent:
     """Build Business Research Analyst for BR-1 focused brief synthesis."""
 
     if attach_tools:
-        instructions = compose_instructions(
-            "keystone_profile.md",
-            "safety_policy.md",
-            "tools.md",
-            "local_context.md",
-            "business_research_analyst.md",
-            skill_files=select_agent_skill_names(
-                "business_research_analyst",
-                request_text=request_text,
-                include_all=include_all_skills,
-            ),
+        skill_files = select_agent_skill_names(
+            "business_research_analyst",
+            request_text=request_text,
+            include_all=include_all_skills,
+            compact=compact_instructions,
         )
+        composer = (
+            compose_direct_instructions if compact_instructions else compose_instructions
+        )
+        prompt_files = (
+            ("keystone_profile.md", "safety_policy.md", "business_research_analyst.md")
+            if compact_instructions
+            else (
+                "keystone_profile.md",
+                "safety_policy.md",
+                "tools.md",
+                "local_context.md",
+                "business_research_analyst.md",
+            )
+        )
+        instructions = composer(*prompt_files, skill_files=skill_files)
     else:
         instructions = compose_instructions(
             "safety_policy.md",
@@ -594,26 +624,35 @@ def build_business_research_analyst_comparison_agent(
     request_text: str = "",
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
+    attach_tools: bool = True,
+    compact_instructions: bool = False,
 ) -> Agent:
     """Build Business Research Analyst for source-backed company comparison synthesis."""
 
-    instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "tools.md",
-        "local_context.md",
-        "business_research_analyst.md",
-        skill_files=select_agent_skill_names(
-            "business_research_analyst",
-            request_text=request_text,
-            include_all=include_all_skills,
-        ),
+    skill_files = select_agent_skill_names(
+        "business_research_analyst",
+        request_text=request_text,
+        include_all=include_all_skills,
+        compact=compact_instructions,
     )
+    composer = compose_direct_instructions if compact_instructions else compose_instructions
+    prompt_files = (
+        ("keystone_profile.md", "safety_policy.md", "business_research_analyst.md")
+        if compact_instructions
+        else (
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "local_context.md",
+            "business_research_analyst.md",
+        )
+    )
+    instructions = composer(*prompt_files, skill_files=skill_files)
     return build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=CompanyResearchComparison,
-        tools=_business_research_analyst_tools(tool_tier=tool_tier),
+        tools=_business_research_analyst_tools(tool_tier=tool_tier) if attach_tools else [],
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -631,21 +670,29 @@ def build_business_research_analyst_research_brief_agent(
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
     attach_tools: bool = True,
+    compact_instructions: bool = False,
 ) -> Agent:
     """Build the broader Business Research Analyst for non-company research briefs."""
 
-    instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "tools.md",
-        "local_context.md",
-        "business_research_analyst.md",
-        skill_files=select_agent_skill_names(
-            "business_research_analyst",
-            request_text=request_text,
-            include_all=include_all_skills,
-        ),
+    skill_files = select_agent_skill_names(
+        "business_research_analyst",
+        request_text=request_text,
+        include_all=include_all_skills,
+        compact=compact_instructions,
     )
+    composer = compose_direct_instructions if compact_instructions else compose_instructions
+    prompt_files = (
+        ("keystone_profile.md", "safety_policy.md", "business_research_analyst.md")
+        if compact_instructions
+        else (
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "local_context.md",
+            "business_research_analyst.md",
+        )
+    )
+    instructions = composer(*prompt_files, skill_files=skill_files)
     return build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
@@ -703,6 +750,78 @@ def focused_brief_context_from_profile(profile: CompanyProfile) -> str:
         "risks": profile.risks,
     }
     return json.dumps(payload, ensure_ascii=True, sort_keys=True)
+
+
+def focused_brief_from_profile_fixture(
+    profile: CompanyProfile,
+) -> CompanyResearchFocusedBrief:
+    """Render one source-backed company profile into an offline focused brief."""
+
+    source_by_id = {source.source_id: source for source in profile.sources}
+    approved_claims = [
+        claim
+        for claim in profile.claims
+        if claim.approved and claim.source_id in source_by_id and claim.confidence > 0
+    ]
+    data_points = {
+        point.key: point.value
+        for point in profile.research_data_points
+        if point.completed and point.value
+    }
+    traction = [
+        data_points[key]
+        for key in ("research_signals", "funding_growth_signal")
+        if data_points.get(key)
+    ]
+    unknowns = list(
+        dict.fromkeys(
+            [
+                *profile.missing_evidence,
+                *profile.missing_information,
+                *profile.contradictions,
+                *profile.unsupported_claims_flagged,
+                *(
+                    point.missing_reason
+                    for point in profile.research_data_points
+                    if not point.completed
+                ),
+            ]
+        )
+    )
+    leadership = profile.lead_name or "Unknown from supplied sources."
+    if not profile.lead_name:
+        unknowns.append("Leadership identity was not established by the supplied sources.")
+    return CompanyResearchFocusedBrief(
+        company_name=profile.name,
+        product=profile.description or "Unknown from supplied sources.",
+        customers=data_points.get("customer_segment", "Unknown from supplied sources."),
+        traction_signals=" ".join(traction) or "Unknown from supplied sources.",
+        leadership=leadership,
+        why_it_matters=profile.fit_summary
+        or "No source-backed Keystone fit inference supplied.",
+        facts=[
+            CompanyBriefFact(
+                text=claim.claim_text,
+                source_ids=[claim.source_id],
+                confidence=claim.confidence,
+            )
+            for claim in approved_claims
+        ],
+        inferences=[profile.fit_summary] if profile.fit_summary else [],
+        unknowns=list(dict.fromkeys(item for item in unknowns if item)),
+        source_ids_used=list(dict.fromkeys(claim.source_id for claim in approved_claims)),
+        sources=[
+            CompanyBriefSourceCitation(
+                source_id=source.source_id,
+                title=source.title,
+                url=source.url,
+                source_type=source.source_type,
+            )
+            for source in profile.sources
+        ],
+        raw_source_content_included=False,
+        send_enabled=False,
+    )
 
 
 def focused_brief_input_from_profile(
@@ -866,6 +985,8 @@ def run_business_research_analyst_sdk(
     context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    attach_tools: bool = True,
+    compact_instructions: bool = False,
 ) -> TypedAgentRunResult[CompanyProfile]:
     """Run Business Research Analyst through the typed SDK harness."""
 
@@ -886,6 +1007,8 @@ def run_business_research_analyst_sdk(
             request_text=skill_request_text(typed_input),
             context_flags=context_flags,
             tool_tier=resolved_tool_tier,
+            attach_tools=attach_tools,
+            compact_instructions=compact_instructions,
         ),
         typed_input=typed_input_for_run,
         output_type=CompanyProfile,
@@ -905,6 +1028,8 @@ def run_business_research_analyst_focused_brief_sdk(
     session: Any | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    attach_tools: bool = True,
+    compact_instructions: bool = False,
 ) -> TypedAgentRunResult[CompanyResearchFocusedBrief]:
     """Run Business Research Analyst through the SDK for a BR-1 focused brief."""
 
@@ -924,6 +1049,8 @@ def run_business_research_analyst_focused_brief_sdk(
             model=model,
             request_text=skill_request_text(typed_input),
             tool_tier=resolved_tool_tier,
+            attach_tools=attach_tools,
+            compact_instructions=compact_instructions,
         ),
         typed_input=typed_input_for_run,
         output_type=CompanyResearchFocusedBrief,
@@ -944,6 +1071,7 @@ def run_business_research_analyst_research_brief_sdk(
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
     attach_tools: bool = True,
+    compact_instructions: bool = False,
 ) -> TypedAgentRunResult[ResearchBrief]:
     """Run the broader Business Research Analyst through the typed SDK harness."""
 
@@ -964,6 +1092,7 @@ def run_business_research_analyst_research_brief_sdk(
             request_text=skill_request_text(typed_input),
             tool_tier=resolved_tool_tier,
             attach_tools=attach_tools,
+            compact_instructions=compact_instructions,
         ),
         typed_input=typed_input_for_run,
         output_type=ResearchBrief,

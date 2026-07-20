@@ -16,7 +16,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from keystone_agents.agents.orchestrator import run_orchestrator_preflight
 from keystone_agents.automation_inventory import build_automation_inventory_report
-from keystone_agents.eval_runtime_diagnostics import slack_eval_blocker_diagnostics
+from keystone_agents.eval_runtime_diagnostics import (
+    slack_eval_blocker_diagnostics,
+    slack_eval_child_step_summary,
+)
 from keystone_agents.langgraph_workflow import (
     advance_work_item_manager_loop_with_optional_langgraph,
 )
@@ -35,6 +38,7 @@ from keystone_agents.slack_action_contract import (
     RUN_AGENT_TASK_ACTION_ID,
     RUN_AGENT_TASK_BLOCK_ID,
     RUN_AGENT_VIEW_CALLBACK_ID,
+    SLACK_PAYLOAD_MANIFEST_SCHEMA,
     SLACK_SELECTED_CONTEXT_SCHEMA,
     business_agent_action_value,
     slack_agent_feedback_event,
@@ -53,12 +57,40 @@ DEFAULT_SLACK_CONTEXT_DIR = Path("artifacts/slack_contexts")
 
 _MAX_MESSAGE_TEXT_CHARS = 4000
 _MAX_THREAD_MESSAGES = 20
+_MAX_ATTACHMENTS_PER_MESSAGE = 10
 _MAX_SLACK_CONTEXT_WINDOW_DAYS = 7
 _MAX_SLACK_CONTEXT_WINDOW_SECONDS = _MAX_SLACK_CONTEXT_WINDOW_DAYS * 24 * 60 * 60
 _MAX_PRIVATE_METADATA_CHARS = 2800
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _EVAL_CASE_ID_RE = re.compile(
     r"\b(?:eval\s+case|case(?:_id)?)\s*(?:[:=]\s*|\s+)([A-Za-z0-9_.:-]+)",
+    re.IGNORECASE,
+)
+_ATTACHMENT_OBJECT_RE = re.compile(
+    r"\b(?:attachment|attached|upload(?:ed)?|"
+    r"(?:this|that|the)\s+(?:file|document|pdf|image|photo|screenshot|receipt|"
+    r"spreadsheet|csv))\b",
+    re.IGNORECASE,
+)
+_ATTACHMENT_ACTION_RE = re.compile(
+    r"\b(?:add|analy[sz]e|compare|convert|describe|enter|extract|identify|inspect|"
+    r"open|parse|process|read|review|summari[sz]e|transcribe|translate|upload|use|"
+    r"what)\b",
+    re.IGNORECASE,
+)
+_ATTACHMENT_DEICTIC_ACTION_RE = re.compile(
+    r"\b(?:analy[sz]e|describe|extract|inspect|read|review|summari[sz]e|"
+    r"transcribe|translate)\s+(?:this|that|it)\b",
+    re.IGNORECASE,
+)
+_ATTACHMENT_EXCLUSION_RE = re.compile(
+    r"\b(?:(?:ignore|exclude|skip)\s+(?:the\s+)?(?:attachment|attached\s+file|"
+    r"file|document|pdf|image|screenshot|receipt)s?|"
+    r"(?:do\s+not|don't|dont|never)\s+(?:read|use|inspect|analy[sz]e|open|"
+    r"include|process)\s+(?:the\s+)?(?:attachment|attached\s+file|file|document|"
+    r"pdf|image|screenshot|receipt)s?|"
+    r"without\s+(?:using|reading|opening|processing)?\s*(?:the\s+)?"
+    r"(?:attachment|attached\s+file|file|document|pdf|image|screenshot|receipt)s?)\b",
     re.IGNORECASE,
 )
 
@@ -72,6 +104,8 @@ _NEEDS_INPUT_BLOCKER_CODES = {
     "outreach_requires_approved_context",
     "research_context_required",
     "selected_slack_context_required",
+    "slack_attachment_bytes_unavailable",
+    "slack_attachment_not_found",
     "source_bundle_required",
     "source_sufficiency_required",
 }
@@ -86,6 +120,59 @@ class SlackContextMessage(BaseModel):
     text: str = ""
     permalink: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SlackPayloadEntry(BaseModel):
+    """One source text or attachment represented in a Slack context payload."""
+
+    ref: str
+    kind: Literal[
+        "raw_request",
+        "selected_message",
+        "thread_message",
+        "attachment",
+    ]
+    source_message_ts: str = ""
+    media_type: str = ""
+    original_chars: int = 0
+    captured_chars: int = 0
+    original_sha256: str = ""
+    captured_sha256: str = ""
+    truncated: bool = False
+    file_id: str = ""
+    name: str = ""
+    byte_size: int = 0
+    checksum_sha256: str = ""
+    remote_url_present: bool = False
+    materialized_path: str = ""
+    materialization_status: Literal[
+        "not_applicable",
+        "metadata_only",
+        "materialized",
+        "missing",
+        "invalid",
+    ] = "not_applicable"
+    provenance: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class SlackPayloadManifest(BaseModel):
+    """Typed provenance and truncation evidence for selected Slack context."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_: Literal["keystone.slack.payload_manifest.v1"] = Field(
+        default=SLACK_PAYLOAD_MANIFEST_SCHEMA,
+        alias="schema",
+    )
+    raw_request_ref: str = ""
+    thread_root_ref: str = ""
+    current_turn_ref: str = ""
+    entries: list[SlackPayloadEntry] = Field(default_factory=list)
+    truncation_detected: bool = False
+    attachments_present: bool = False
+    attachments_materialized: bool = False
+    warnings: list[str] = Field(default_factory=list)
 
 
 class SlackSelectedMessageContext(BaseModel):
@@ -110,6 +197,7 @@ class SlackSelectedMessageContext(BaseModel):
     prior_agent_runs: list[dict[str, Any]] = Field(default_factory=list)
     thread_fetch_status: Literal["ok", "failed", "not_requested"] = "not_requested"
     warnings: list[str] = Field(default_factory=list)
+    payload_manifest: SlackPayloadManifest = Field(default_factory=SlackPayloadManifest)
     metadata: dict[str, Any] = Field(default_factory=dict)
     eval_metadata: dict[str, Any] = Field(default_factory=dict, alias="eval")
 
@@ -119,6 +207,7 @@ class SlackAgentRunSubmission(BaseModel):
 
     requested_task: str
     context_file_path: str = ""
+    context_file_sha256: str = ""
     context: SlackSelectedMessageContext | None = None
     user_id: str = ""
     user_name: str = ""
@@ -209,6 +298,12 @@ def build_selected_message_context(
     bounded_thread, dropped_old_messages = _ordered_thread_messages_with_policy(
         provided_thread_messages or []
     )
+    payload_manifest = _build_slack_payload_manifest(
+        message,
+        selected_message=selected,
+        raw_thread_messages=provided_thread_messages or [],
+        bounded_thread_messages=bounded_thread,
+    )
     warnings: list[str] = []
     if dropped_old_messages:
         warnings.append(
@@ -221,6 +316,7 @@ def build_selected_message_context(
             f"{_clean_text(thread_fetch_error, max_chars=240)}. "
             "Proceeding with selected message metadata only."
         )
+    warnings.extend(payload_manifest.warnings)
     fetch_status: Literal["ok", "failed", "not_requested"]
     if thread_fetch_error:
         fetch_status = "failed"
@@ -241,6 +337,7 @@ def build_selected_message_context(
         thread_messages=bounded_thread,
         thread_fetch_status=fetch_status,
         warnings=warnings,
+        payload_manifest=payload_manifest,
         metadata={
             "trigger_id": _clean_scalar(payload.get("trigger_id")),
             "response_url_present": bool(payload.get("response_url")),
@@ -269,6 +366,7 @@ def write_selected_message_context_file(
             context.selected_message_ts,
             context.thread_ts,
             context.selected_message.text,
+            _raw_request_manifest_digest(context.payload_manifest),
         ]
     )
     digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:12]
@@ -295,10 +393,47 @@ def write_selected_message_context_file(
     return path
 
 
-def load_selected_message_context_file(path: str | Path) -> SlackSelectedMessageContext:
-    """Read a selected Slack context file."""
+def _file_sha256(path: str | Path) -> str:
+    """Return a full SHA-256 digest for one local context artifact."""
 
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _raw_request_manifest_digest(manifest: SlackPayloadManifest) -> str:
+    for entry in manifest.entries:
+        if entry.ref == manifest.raw_request_ref and entry.kind == "raw_request":
+            return entry.original_sha256
+    return ""
+
+
+def _file_sha256_if_present(path: str | Path) -> str:
+    context_path = Path(path) if path else None
+    if context_path is None:
+        return ""
+    try:
+        if not context_path.is_file():
+            return ""
+        return _file_sha256(context_path)
+    except OSError:
+        return ""
+
+
+def load_selected_message_context_file(
+    path: str | Path,
+    *,
+    expected_sha256: str = "",
+) -> SlackSelectedMessageContext:
+    """Read a selected Slack context file and optionally verify its digest."""
+
+    context_path = Path(path)
+    if expected_sha256:
+        actual_sha256 = _file_sha256(context_path)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                "Slack context file checksum mismatch: "
+                f"expected {expected_sha256}, received {actual_sha256}."
+            )
+    data = json.loads(context_path.read_text(encoding="utf-8"))
     return SlackSelectedMessageContext.model_validate(data)
 
 
@@ -354,9 +489,11 @@ def _run_agent_modal_private_metadata(
     *,
     context_file_path: str | Path = "",
 ) -> str:
+    context_file_sha256 = _file_sha256_if_present(context_file_path)
     metadata = {
         "schema": context.schema_,
         "context_file_path": str(context_file_path) if context_file_path else "",
+        "context_file_sha256": context_file_sha256,
         "selected_context": _modal_embedded_context(context),
         "channel_id": context.channel_id,
         "selected_message_ts": context.selected_message_ts,
@@ -372,6 +509,7 @@ def _run_agent_modal_private_metadata(
     metadata = {
         "schema": context.schema_,
         "context_file_path": str(context_file_path) if context_file_path else "",
+        "context_file_sha256": context_file_sha256,
         "selected_context": _modal_embedded_context(context, include_text=False),
         "channel_id": context.channel_id,
         "selected_message_ts": context.selected_message_ts,
@@ -384,7 +522,11 @@ def _run_agent_modal_private_metadata(
     if len(private_metadata) <= _MAX_PRIVATE_METADATA_CHARS:
         return private_metadata
 
-    metadata = _modal_pointer_metadata(context, context_file_path=context_file_path)
+    metadata = _modal_pointer_metadata(
+        context,
+        context_file_path=context_file_path,
+        context_file_sha256=context_file_sha256,
+    )
     return json.dumps(metadata, ensure_ascii=True, sort_keys=True)
 
 
@@ -392,6 +534,7 @@ def _modal_pointer_metadata(
     context: SlackSelectedMessageContext,
     *,
     context_file_path: str | Path = "",
+    context_file_sha256: str = "",
 ) -> dict[str, Any]:
     """Return the smallest parseable private_metadata payload."""
 
@@ -420,6 +563,7 @@ def _modal_pointer_metadata(
     return {
         "schema": context.schema_,
         "context_file_path": _clean_text(context_file_path, max_chars=1800),
+        "context_file_sha256": context_file_sha256,
         "selected_context": selected_context,
         "channel_id": _metadata_scalar(context.channel_id),
         "selected_message_ts": _metadata_scalar(context.selected_message_ts),
@@ -488,6 +632,7 @@ def parse_run_agent_modal_submission(
     return SlackAgentRunSubmission(
         requested_task=task,
         context_file_path=_clean_scalar(private_metadata.get("context_file_path")),
+        context_file_sha256=_clean_scalar(private_metadata.get("context_file_sha256")),
         context=selected_context,
         user_id=_clean_scalar(user.get("id")),
         user_name=_clean_scalar(user.get("username") or user.get("name")),
@@ -539,8 +684,30 @@ def handle_run_agent_interaction(
                 context_dir=context_dir,
             )
             if resolved_context_path.is_file():
-                selected_context = load_selected_message_context_file(resolved_context_path)
-                context_file_path = str(resolved_context_path)
+                try:
+                    selected_context = load_selected_message_context_file(
+                        resolved_context_path,
+                        expected_sha256=submission.context_file_sha256,
+                    )
+                    context_file_path = str(resolved_context_path)
+                except (OSError, ValueError) as exc:
+                    if selected_context is not None:
+                        selected_context.warnings.append(
+                            "Slack context file was invalid or changed; used embedded modal "
+                            f"context fallback. {_clean_text(exc, max_chars=240)}"
+                        )
+                        context_file_path = str(
+                            write_selected_message_context_file(
+                                selected_context,
+                                directory=context_dir,
+                            )
+                        )
+                    else:
+                        context_warnings.append(
+                            "Slack context file was invalid or changed and no embedded "
+                            "fallback was present."
+                        )
+                        context_file_path = ""
             elif selected_context is not None:
                 selected_context.warnings.append(
                     "Slack context file was unavailable; used embedded modal context fallback."
@@ -554,6 +721,21 @@ def handle_run_agent_interaction(
                 )
                 context_file_path = ""
         if selected_context is not None:
+            _attach_raw_request_to_context(
+                selected_context,
+                submission.requested_task,
+            )
+            context_file_path = str(
+                write_selected_message_context_file(
+                    selected_context,
+                    directory=(
+                        Path(context_file_path).parent
+                        if context_file_path
+                        else context_dir
+                    ),
+                )
+            )
+        if selected_context is not None:
             context_warnings = selected_context.warnings
         if live_search and _request_forbids_live_research(submission.requested_task):
             live_search = False
@@ -562,6 +744,29 @@ def handle_run_agent_interaction(
             feedback_events,
             upstream_callback=feedback_callback,
         )
+        attachment_blocker = _slack_attachment_admission_blocker(
+            submission.requested_task,
+            selected_context,
+        )
+        if attachment_blocker is not None:
+            slack_feedback_callback(
+                "slack_attachment_admission_blocked",
+                {
+                    "request_text": submission.requested_task,
+                    "code": attachment_blocker["code"],
+                    "message": attachment_blocker["message"],
+                    "next_action": attachment_blocker["next_action"],
+                    "send_enabled": False,
+                },
+            )
+            return _blocked_slack_attachment_result(
+                submission=submission,
+                context=selected_context,
+                context_file_path=context_file_path,
+                context_warnings=context_warnings,
+                feedback_events=feedback_events,
+                blocker=attachment_blocker,
+            )
         preflight_session = _slack_context_sdk_session(selected_context, enabled=live_sdk)
         deterministic_plan = infer_manual_request_plan(
             submission.requested_task,
@@ -573,7 +778,7 @@ def handle_run_agent_interaction(
             live_manual_plan=live_sdk,
             session=preflight_session,
             database_url=database_url,
-            workflow_state=_orchestrator_workflow_state_from_slack_context(
+            workflow_state=orchestrator_workflow_state_from_slack_context(
                 selected_context,
                 request_text=submission.requested_task,
                 database_url=database_url,
@@ -968,6 +1173,11 @@ def _slack_eval_evidence(
     sdk_cost = _latest_sdk_cost_from_result(result)
     result_payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else {}
     model = result_payload.get("model") if isinstance(result_payload.get("model"), dict) else {}
+    execution_provenance = (
+        result_payload.get("execution_provenance")
+        if isinstance(result_payload.get("execution_provenance"), dict)
+        else {}
+    )
     retrieval = (
         result_payload.get("retrieval")
         if isinstance(result_payload.get("retrieval"), dict)
@@ -1026,13 +1236,33 @@ def _slack_eval_evidence(
         },
         "response_hash": _hash_text(human_summary) if human_summary else "",
         "response_summary_chars": len(human_summary),
-        "model_provider": str(model.get("provider") or ""),
-        "model_name": str(model.get("name") or model.get("model") or ""),
-        "run_mode": str(model.get("run_mode") or ""),
-        "search_provider": str(retrieval.get("search_provider") or retrieval.get("provider") or ""),
+        "model_provider": str(
+            model.get("provider") or execution_provenance.get("model_provider") or ""
+        ),
+        "model_name": str(
+            model.get("name")
+            or model.get("model")
+            or execution_provenance.get("model_name")
+            or ""
+        ),
+        "run_mode": str(
+            model.get("run_mode") or execution_provenance.get("run_mode") or ""
+        ),
+        "search_provider": str(
+            retrieval.get("search_provider")
+            or retrieval.get("provider")
+            or execution_provenance.get("search_provider")
+            or ""
+        ),
         "search_provider_sequence": [
-            str(item) for item in retrieval.get("search_provider_sequence") or []
+            str(item)
+            for item in (
+                retrieval.get("search_provider_sequence")
+                or execution_provenance.get("search_provider_sequence")
+                or []
+            )
         ],
+        "execution_provenance": execution_provenance,
         "prompt_versions": _trace_prompt_versions(result_payload),
         "prompt_metadata": {
             "source": "slack_action_eval_save",
@@ -1046,6 +1276,9 @@ def _slack_eval_evidence(
     tool_summary = _trace_tool_summary_from_payload(result_payload)
     if tool_summary:
         evidence["tool_summary"] = tool_summary
+    child_steps = slack_eval_child_step_summary(result_payload, tool_summary)
+    if child_steps:
+        evidence["child_step_summary"] = child_steps
     orchestrator_summary = _trace_orchestrator_summary_from_payload(result_payload)
     if orchestrator_summary.get("orchestrator"):
         evidence["orchestrator"] = orchestrator_summary["orchestrator"]
@@ -1439,6 +1672,174 @@ def _blocked_slack_agent_result(
     )
 
 
+def _slack_attachment_admission_blocker(
+    request_text: str,
+    context: SlackSelectedMessageContext | None,
+) -> dict[str, Any] | None:
+    """Return a typed sufficiency blocker when an ask needs unavailable Slack bytes.
+
+    This is deliberately an evidence gate, not an intent router. Orchestrator
+    and the owning specialist still interpret the task whenever the referenced
+    attachment bytes are available.
+    """
+
+    request = " ".join(str(request_text or "").split())
+    if not request or _ATTACHMENT_EXCLUSION_RE.search(request):
+        return None
+    manifest = context.payload_manifest if context is not None else None
+    attachments_present = bool(manifest and manifest.attachments_present)
+    explicitly_attachment_dependent = bool(
+        _ATTACHMENT_ACTION_RE.search(request)
+        and _ATTACHMENT_OBJECT_RE.search(request)
+    )
+    deictic_attachment_dependent = bool(
+        attachments_present and _ATTACHMENT_DEICTIC_ACTION_RE.search(request)
+    )
+    if not explicitly_attachment_dependent and not deictic_attachment_dependent:
+        return None
+    if not attachments_present:
+        message = (
+            "The request refers to an attached file, but the selected Slack context "
+            "contains no attachment metadata."
+        )
+        return {
+            "code": "slack_attachment_not_found",
+            "message": message,
+            "next_action": (
+                "Select the Slack message or thread that contains the file, then rerun "
+                "this same request."
+            ),
+            "attachment_entries": [],
+        }
+    if manifest is not None and manifest.attachments_materialized:
+        return None
+    attachment_entries = [
+        {
+            "ref": entry.ref,
+            "name": entry.name,
+            "media_type": entry.media_type,
+            "byte_size": entry.byte_size,
+            "materialization_status": entry.materialization_status,
+        }
+        for entry in (manifest.entries if manifest is not None else [])
+        if entry.kind == "attachment"
+    ]
+    message = (
+        "The request depends on a Slack attachment, but one or more files were not "
+        "available as checksum-verified local bytes."
+    )
+    return {
+        "code": "slack_attachment_bytes_unavailable",
+        "message": message,
+        "next_action": (
+            "Materialize the authenticated Slack file locally with its SHA-256 checksum, "
+            "then retry this same request without rephrasing it."
+        ),
+        "attachment_entries": attachment_entries,
+    }
+
+
+def _blocked_slack_attachment_result(
+    *,
+    submission: SlackAgentRunSubmission,
+    context: SlackSelectedMessageContext | None,
+    context_file_path: str,
+    context_warnings: list[str],
+    feedback_events: list[dict[str, Any]],
+    blocker: dict[str, Any],
+) -> SlackAgentActionResult:
+    """Return an operator-readable pre-model Slack attachment admission block."""
+
+    request_hash = _hash_text(submission.requested_task)
+    blocker_code = str(blocker.get("code") or "slack_attachment_bytes_unavailable")
+    blocker_message = str(blocker.get("message") or "").strip()
+    next_action = str(blocker.get("next_action") or "").strip()
+    run_provenance = {
+        "schema": "keystone.slack.agent_run_provenance.v1",
+        "context_validated": False,
+        "validation_errors": [blocker_code],
+        "work_item_id": "",
+        "route": "orchestrator",
+        "status": "blocked",
+        "requested_task_hash": request_hash,
+        "context_fingerprint": _hash_text(
+            json.dumps(
+                {
+                    "channel_id": _context_value(context, "channel_id"),
+                    "request_hash": request_hash,
+                    "selected_message_ts": _context_value(context, "selected_message_ts"),
+                    "thread_ts": _context_value(context, "thread_ts"),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+        ),
+        "source_channel_id": _context_value(context, "channel_id"),
+        "source_message_ts": _context_value(context, "selected_message_ts"),
+        "source_thread_ts": _context_value(context, "thread_ts"),
+        "selected_message_ts": _context_value(context, "selected_message_ts"),
+        "context_file_path": context_file_path,
+    }
+    blocker_payload = {
+        "code": blocker_code,
+        "message": blocker_message,
+        "severity": "blocker",
+        "resolved": False,
+    }
+    human_summary = f"{blocker_message} {next_action}".strip()
+    result_payload = {
+        "mode": "blocked",
+        "status": "blocked",
+        "route": "orchestrator",
+        "request_text": submission.requested_task,
+        "send_enabled": False,
+        "block_kind": "context",
+        "block_reason": blocker_message,
+        "blockers": [blocker_payload],
+        "next_action": {
+            "action": "materialize_slack_attachment",
+            "agent": "orchestrator",
+            "description": next_action,
+            "requires_approval": False,
+        },
+        "attachment_manifest": {
+            "schema": SLACK_PAYLOAD_MANIFEST_SCHEMA,
+            "attachments_present": bool(
+                context is not None and context.payload_manifest.attachments_present
+            ),
+            "attachments_materialized": bool(
+                context is not None and context.payload_manifest.attachments_materialized
+            ),
+            "entries": list(blocker.get("attachment_entries") or []),
+        },
+        "retry": {
+            "same_request_supported": True,
+            "context_file_path": context_file_path,
+        },
+        "slack_run_provenance": run_provenance,
+        "human_summary": human_summary,
+        "output": {
+            "status": "blocked",
+            "blocker_code": blocker_code,
+            "message": blocker_message,
+            "next_action": next_action,
+        },
+    }
+    _attach_operator_display_fields(result_payload, result=None)
+    return SlackAgentActionResult(
+        stage="work_item",
+        callback_id=RUN_AGENT_VIEW_CALLBACK_ID,
+        context_file_path=context_file_path,
+        work_item=None,
+        route="orchestrator",
+        status="blocked",
+        warnings=context_warnings,
+        feedback_events=feedback_events,
+        run_provenance=run_provenance,
+        result=result_payload,
+    )
+
+
 def _build_feedback_collector(
     feedback_events: list[dict[str, Any]],
     *,
@@ -1486,7 +1887,7 @@ def _context_value(context: SlackSelectedMessageContext | None, field: str) -> s
     return str(getattr(context, field, "") or "").strip()
 
 
-def _orchestrator_workflow_state_from_slack_context(
+def orchestrator_workflow_state_from_slack_context(
     context: SlackSelectedMessageContext | None,
     *,
     request_text: str = "",
@@ -1505,6 +1906,7 @@ def _orchestrator_workflow_state_from_slack_context(
             "thread_fetch_status": context.thread_fetch_status,
             "permalink": context.permalink,
             "warnings": context.warnings,
+            "payload_manifest": _compact_payload_manifest(context.payload_manifest),
         },
         "recent_slack_thread": [
             {
@@ -1512,7 +1914,7 @@ def _orchestrator_workflow_state_from_slack_context(
                 "source_agent": message.user_id or message.username,
                 "summary": _clean_text(message.text, max_chars=320),
             }
-            for message in _thread_messages_for_prompt(context)[:8]
+            for message in _thread_messages_for_prompt(context)[-8:]
             if message.text
         ],
         "slack_thread_transcript": _slack_thread_transcript(
@@ -1520,7 +1922,7 @@ def _orchestrator_workflow_state_from_slack_context(
             latest_request=request_text,
         ),
         "prior_agent_runs": [
-            _compact_prior_agent_run(item) for item in context.prior_agent_runs[:5]
+            _compact_prior_agent_run(item) for item in context.prior_agent_runs[-5:]
         ],
     }
     if _should_include_channel_automation_context(request_text):
@@ -1531,6 +1933,26 @@ def _orchestrator_workflow_state_from_slack_context(
         if automations:
             state["channel_automations"] = automations
     return state
+
+
+def _compact_payload_manifest(manifest: SlackPayloadManifest) -> dict[str, Any]:
+    return {
+        "schema": manifest.schema_,
+        "raw_request_ref": manifest.raw_request_ref,
+        "thread_root_ref": manifest.thread_root_ref,
+        "current_turn_ref": manifest.current_turn_ref,
+        "truncation_detected": manifest.truncation_detected,
+        "attachments_present": manifest.attachments_present,
+        "attachments_materialized": manifest.attachments_materialized,
+        "entry_count": len(manifest.entries),
+        "warnings": manifest.warnings[:5],
+    }
+
+
+# Compatibility alias for callers that imported the earlier private helper.
+_orchestrator_workflow_state_from_slack_context = (
+    orchestrator_workflow_state_from_slack_context
+)
 
 
 def _slack_query_prompt_for_submission(
@@ -1786,17 +2208,285 @@ def _message_from_payload(
     fallback_ts: str = "",
     fallback_permalink: str = "",
 ) -> SlackContextMessage:
+    original_text = _clean_unbounded_text(message.get("text"))
+    captured_text = _clean_text(original_text, max_chars=_MAX_MESSAGE_TEXT_CHARS)
     return SlackContextMessage(
         ts=_clean_scalar(message.get("ts") or fallback_ts),
         user_id=_clean_scalar(message.get("user") or message.get("bot_id")),
         username=_clean_scalar(message.get("username") or message.get("user_name")),
-        text=_clean_text(message.get("text"), max_chars=_MAX_MESSAGE_TEXT_CHARS),
+        text=captured_text,
         permalink=_clean_scalar(message.get("permalink") or fallback_permalink),
         metadata={
             "type": _clean_scalar(message.get("type")),
             "subtype": _clean_scalar(message.get("subtype")),
+            "original_text_chars": len(original_text),
+            "captured_text_chars": len(captured_text),
+            "original_text_sha256": _sha256_text(original_text),
+            "captured_text_sha256": _sha256_text(captured_text),
+            "text_truncated": len(captured_text) < len(original_text),
         },
     )
+
+
+def _build_slack_payload_manifest(
+    selected_raw_message: dict[str, Any],
+    *,
+    selected_message: SlackContextMessage,
+    raw_thread_messages: list[dict[str, Any]],
+    bounded_thread_messages: list[SlackContextMessage],
+) -> SlackPayloadManifest:
+    entries: list[SlackPayloadEntry] = []
+    warnings: list[str] = []
+    selected_ref = _message_payload_ref(
+        "selected",
+        selected_message.ts,
+        fallback="message",
+    )
+    entries.append(
+        _text_payload_entry(
+            ref=selected_ref,
+            kind="selected_message",
+            source_message_ts=selected_message.ts,
+            original_text=selected_raw_message.get("text"),
+            captured_text=selected_message.text,
+        )
+    )
+    entries.extend(
+        _attachment_payload_entries(
+            selected_raw_message,
+            ref_prefix=selected_ref,
+            source_message_ts=selected_message.ts,
+            warnings=warnings,
+        )
+    )
+
+    raw_thread_by_ts: dict[str, dict[str, Any]] = {}
+    for raw_message in raw_thread_messages:
+        if not isinstance(raw_message, dict):
+            continue
+        message_ts = _clean_scalar(raw_message.get("ts"))
+        if message_ts and message_ts not in raw_thread_by_ts:
+            raw_thread_by_ts[message_ts] = raw_message
+
+    for index, thread_message in enumerate(bounded_thread_messages, start=1):
+        if thread_message.ts and thread_message.ts == selected_message.ts:
+            continue
+        raw_message = raw_thread_by_ts.get(thread_message.ts, {})
+        thread_ref = _message_payload_ref(
+            "thread",
+            thread_message.ts,
+            fallback=str(index),
+        )
+        entries.append(
+            _text_payload_entry(
+                ref=thread_ref,
+                kind="thread_message",
+                source_message_ts=thread_message.ts,
+                original_text=raw_message.get("text", thread_message.text),
+                captured_text=thread_message.text,
+            )
+        )
+        entries.extend(
+            _attachment_payload_entries(
+                raw_message,
+                ref_prefix=thread_ref,
+                source_message_ts=thread_message.ts,
+                warnings=warnings,
+            )
+        )
+
+    truncated_entries = [entry for entry in entries if entry.truncated]
+    attachment_entries = [entry for entry in entries if entry.kind == "attachment"]
+    if truncated_entries:
+        warnings.append(
+            "Slack context contains truncated message text; consult payload_manifest "
+            "lengths and hashes before treating the captured text as complete."
+        )
+    if attachment_entries and any(
+        entry.materialization_status != "materialized" for entry in attachment_entries
+    ):
+        warnings.append(
+            "Slack attachment metadata was captured, but one or more attachment files "
+            "were not checksum-verified local context."
+        )
+    return SlackPayloadManifest(
+        thread_root_ref=selected_ref,
+        current_turn_ref=selected_ref,
+        entries=entries,
+        truncation_detected=bool(truncated_entries),
+        attachments_present=bool(attachment_entries),
+        attachments_materialized=bool(attachment_entries)
+        and all(
+            entry.materialization_status == "materialized"
+            for entry in attachment_entries
+        ),
+        warnings=_dedupe_strings(warnings),
+    )
+
+
+def _message_payload_ref(prefix: str, ts: str, *, fallback: str) -> str:
+    stable_id = re.sub(r"[^0-9A-Za-z_.-]+", "-", ts or fallback).strip("-")
+    return f"slack:{prefix}:{stable_id}:text"
+
+
+def _text_payload_entry(
+    *,
+    ref: str,
+    kind: Literal["raw_request", "selected_message", "thread_message"],
+    source_message_ts: str,
+    original_text: Any,
+    captured_text: Any,
+) -> SlackPayloadEntry:
+    original = _clean_unbounded_text(original_text)
+    captured = _clean_unbounded_text(captured_text)
+    return SlackPayloadEntry(
+        ref=ref,
+        kind=kind,
+        source_message_ts=source_message_ts,
+        media_type="text/plain",
+        original_chars=len(original),
+        captured_chars=len(captured),
+        original_sha256=_sha256_text(original),
+        captured_sha256=_sha256_text(captured),
+        truncated=len(captured) < len(original),
+        materialization_status="not_applicable",
+        provenance="slack_operator_input" if kind == "raw_request" else "slack_message",
+    )
+
+
+def _attachment_payload_entries(
+    raw_message: dict[str, Any],
+    *,
+    ref_prefix: str,
+    source_message_ts: str,
+    warnings: list[str],
+) -> list[SlackPayloadEntry]:
+    raw_files = raw_message.get("files")
+    if not isinstance(raw_files, list):
+        return []
+    entries: list[SlackPayloadEntry] = []
+    files = [item for item in raw_files if isinstance(item, dict)]
+    if len(files) > _MAX_ATTACHMENTS_PER_MESSAGE:
+        warnings.append(
+            "Slack attachment metadata was limited to "
+            f"{_MAX_ATTACHMENTS_PER_MESSAGE} files for one message."
+        )
+    for index, file_payload in enumerate(files[:_MAX_ATTACHMENTS_PER_MESSAGE], start=1):
+        file_id = _clean_scalar(file_payload.get("id"))
+        name = _clean_scalar(file_payload.get("name") or file_payload.get("title"))
+        materialized_path = _clean_text(
+            file_payload.get("materialized_path") or file_payload.get("local_path"),
+            max_chars=1800,
+        )
+        supplied_checksum = _clean_scalar(
+            file_payload.get("checksum_sha256") or file_payload.get("sha256")
+        ).lower()
+        checksum_valid = bool(re.fullmatch(r"[0-9a-f]{64}", supplied_checksum))
+        entry_warnings: list[str] = []
+        if materialized_path and checksum_valid:
+            local_file = Path(materialized_path).expanduser()
+            if not local_file.is_file():
+                materialization_status = "missing"
+                entry_warnings.append(
+                    "Attachment materialization path does not contain a readable local file."
+                )
+            else:
+                try:
+                    actual_checksum = _sha256_file(local_file)
+                    actual_size = local_file.stat().st_size
+                except OSError:
+                    materialization_status = "invalid"
+                    entry_warnings.append(
+                        "Attachment materialization file could not be read for verification."
+                    )
+                else:
+                    declared_size = _nonnegative_int(file_payload.get("size"))
+                    size_matches = not declared_size or declared_size == actual_size
+                    checksum_matches = actual_checksum == supplied_checksum
+                    if checksum_matches and size_matches:
+                        materialization_status = "materialized"
+                    else:
+                        materialization_status = "invalid"
+                        if not checksum_matches:
+                            entry_warnings.append(
+                                "Attachment local bytes do not match the supplied SHA-256 "
+                                "checksum."
+                            )
+                        if not size_matches:
+                            entry_warnings.append(
+                                "Attachment local byte size does not match Slack metadata."
+                            )
+        elif materialized_path or supplied_checksum:
+            materialization_status = "invalid"
+            entry_warnings.append(
+                "Attachment materialization requires both a local path and a valid "
+                "SHA-256 checksum."
+            )
+        else:
+            materialization_status = "metadata_only"
+        byte_size = _nonnegative_int(file_payload.get("size"))
+        attachment_id = file_id or re.sub(r"[^0-9A-Za-z_.-]+", "-", name).strip("-")
+        attachment_id = attachment_id or str(index)
+        remote_url_present = any(
+            bool(file_payload.get(field))
+            for field in (
+                "url_private",
+                "url_private_download",
+                "permalink",
+                "permalink_public",
+            )
+        )
+        entries.append(
+            SlackPayloadEntry(
+                ref=f"{ref_prefix}:attachment:{attachment_id}",
+                kind="attachment",
+                source_message_ts=source_message_ts,
+                media_type=_clean_scalar(
+                    file_payload.get("mimetype") or file_payload.get("filetype")
+                ),
+                file_id=file_id,
+                name=name,
+                byte_size=byte_size,
+                checksum_sha256=supplied_checksum if checksum_valid else "",
+                remote_url_present=remote_url_present,
+                materialized_path=materialized_path,
+                materialization_status=materialization_status,
+                provenance="slack_file_metadata",
+                warnings=entry_warnings,
+            )
+        )
+    return entries
+
+
+def _attach_raw_request_to_context(
+    context: SlackSelectedMessageContext,
+    requested_task: str,
+) -> None:
+    manifest = context.payload_manifest
+    raw_request_ref = "slack:modal:raw-request"
+    raw_request_entry = _text_payload_entry(
+        ref=raw_request_ref,
+        kind="raw_request",
+        source_message_ts="",
+        original_text=requested_task,
+        captured_text=requested_task,
+    )
+    manifest.entries = [
+        entry for entry in manifest.entries if entry.ref != raw_request_ref
+    ] + [raw_request_entry]
+    manifest.raw_request_ref = raw_request_ref
+    manifest.current_turn_ref = raw_request_ref
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(item for item in values if item))
 
 
 def _eval_metadata_from_payload(
@@ -1967,8 +2657,24 @@ def _metadata_scalar(value: Any) -> str:
 
 
 def _clean_text(value: Any, *, max_chars: int) -> str:
-    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = _CONTROL_CHAR_RE.sub("", text).strip()
+    text = _clean_unbounded_text(value)
     if len(text) <= max_chars:
         return text
     return f"{text[: max_chars - 3].rstrip()}..."
+
+
+def _clean_unbounded_text(value: Any) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    return _CONTROL_CHAR_RE.sub("", text).strip()
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

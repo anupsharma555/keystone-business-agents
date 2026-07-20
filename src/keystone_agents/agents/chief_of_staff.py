@@ -13,7 +13,16 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from keystone_agents.agent_tool_policy import (
+    AIRTABLE_WRITE_ALLOWED_TOOLS,
+    CALENDAR_WRITE_TOOL_NAMES,
+    GOOGLE_WORKSPACE_WRITE_TOOLS,
+    INTERNAL_WRITE_TOOL_NAMES,
+    PUBLISH_TOOL_NAMES,
+    tool_name_for_policy,
+)
 from keystone_agents.automation_inventory import build_automation_inventory_report
+from keystone_agents.calendar_actions import infer_calendar_action_plan
 from keystone_agents.config import parse_bool
 from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.finance_expense_receipts import (
@@ -27,7 +36,10 @@ from keystone_agents.local_kni_evidence import (
     build_local_kni_evidence_packet_for_query,
     looks_like_local_kni_evidence_lookup,
 )
-from keystone_agents.manual_request import infer_manual_request_plan
+from keystone_agents.manual_request import (
+    infer_manual_request_plan,
+    looks_like_supplied_context_synthesis_request,
+)
 from keystone_agents.memory import (
     build_chief_of_staff_memory_context,
     chief_of_staff_memory_item,
@@ -61,6 +73,7 @@ from keystone_agents.sdk import (
     Agent,
     build_model_settings,
     build_sdk_agent,
+    compose_direct_instructions,
     compose_instructions,
     load_prompt,
 )
@@ -240,8 +253,6 @@ def _chief_text_has_positive_specialist_marker(text: str) -> bool:
         "company research",
         "opportunity scout",
         "opportunity search",
-        "grant",
-        "rfp",
         "gmail",
         "email thread",
         "inbox",
@@ -284,6 +295,13 @@ def _chief_text_has_positive_specialist_marker(text: str) -> bool:
     )
     if any(marker in text for marker in cross_agent_markers):
         return True
+    if re.search(
+        r"\b(?:grants?|rfps?)\b"
+        r"(?:\s+(?:opportunity|program|funding|application|deadline|search))?\b"
+        r"(?!\s+approval\b)",
+        text,
+    ):
+        return True
     next_action_markers = ("what should we do next", "next best action", "prioritize")
     operating_surfaces = ("research", "opportunit", "outreach", "gmail", "email", "company")
     return any(marker in text for marker in next_action_markers) and any(
@@ -294,6 +312,7 @@ def _chief_text_has_positive_specialist_marker(text: str) -> bool:
 def _chief_of_staff_tools(
     request_text: str = "",
     *,
+    manual_request_plan: ManualRequestPlan | None = None,
     specialist_tools: list[Any] | None = None,
 ) -> list[Any]:
     tools = [
@@ -349,12 +368,67 @@ def _chief_of_staff_tools(
     ]
     if explicit_full_article_read_requested(request_text):
         tools.append(read_linked_article)
+    tools = _scope_chief_write_tools(
+        tools,
+        request_text=request_text,
+        manual_request_plan=manual_request_plan,
+    )
     if _local_kni_document_context_requested(request_text):
         return tools
     return append_configured_file_search_tools(
         "chief_of_staff",
         tools,
     )
+
+
+def _scope_chief_write_tools(
+    tools: list[Any],
+    *,
+    request_text: str,
+    manual_request_plan: ManualRequestPlan | None,
+) -> list[Any]:
+    """Attach only writes owned by the interpreted structured-system request."""
+
+    if manual_request_plan is None:
+        return tools
+    allowed_writes: set[str] = set()
+    semantic_context = " ".join(
+        [
+            request_text,
+            manual_request_plan.objective,
+            manual_request_plan.primary_target,
+            manual_request_plan.rationale,
+            " ".join(manual_request_plan.constraints),
+        ]
+    ).lower()
+    calendar_plan = infer_calendar_action_plan(request_text)
+    if calendar_plan is not None:
+        allowed_writes.update(CALENDAR_WRITE_TOOL_NAMES)
+    elif manual_request_plan.intent == "business_system_write":
+        if "calendar" in semantic_context:
+            allowed_writes.update(CALENDAR_WRITE_TOOL_NAMES)
+        elif (
+            manual_request_plan.target_agent == "airtable_context_agent"
+            or "airtable" in semantic_context
+        ):
+            allowed_writes.update(AIRTABLE_WRITE_ALLOWED_TOOLS)
+        elif (
+            manual_request_plan.target_agent == "google_workspace_context_agent"
+            or re.search(
+                r"\b(?:google\s+(?:workspace|drive|docs?|sheets?)|kniops)\b",
+                semantic_context,
+            )
+        ):
+            allowed_writes.update(GOOGLE_WORKSPACE_WRITE_TOOLS)
+    blocked_writes = INTERNAL_WRITE_TOOL_NAMES | PUBLISH_TOOL_NAMES
+    return [
+        tool
+        for tool in tools
+        if (
+            (name := tool_name_for_policy(tool)) not in blocked_writes
+            or name in allowed_writes
+        )
+    ]
 
 
 def build_chief_slack_command_resolver_agent(
@@ -534,6 +608,26 @@ def resolve_high_confidence_chief_slack_command(
         rationale="Unique high-confidence match from the configured Slack command catalog.",
         confidence="high",
     )
+
+
+def chief_slack_command_resolution_is_applicable(request_text: str) -> bool:
+    """Keep native-command resolution from intercepting provider-owned actions."""
+
+    text = " ".join(str(request_text or "").split()).strip()
+    if not text:
+        return False
+    if infer_calendar_action_plan(text) is not None:
+        return False
+    plan = infer_manual_request_plan(text, requested_agent="chief_of_staff")
+    if plan.intent == "business_system_write":
+        return False
+    if plan.target_agent in {
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "gmail_triage",
+    }:
+        return False
+    return True
 
 
 def _local_kni_document_context_requested(request_text: str) -> bool:
@@ -785,31 +879,47 @@ def _chief_of_staff_sdk_input_for_request(
     """Make Slack follow-up intent explicit before rendering the SDK prompt."""
 
     latest_request = _latest_slack_followup_request(raw_request_text)
-    if not latest_request:
-        return _with_finance_expense_receipt_context(typed_input, str(raw_request_text or ""))
+    active_request = latest_request or str(raw_request_text or "")
+    if not latest_request and not _looks_like_operator_supplied_synthesis_request(active_request):
+        return _with_finance_expense_receipt_context(typed_input, active_request)
 
     data: dict[str, Any]
     if isinstance(typed_input, Mapping):
         data = dict(typed_input)
     else:
         data = {"request": str(typed_input or "")}
-    data["request"] = latest_request
-    data["latest_operator_request"] = latest_request
-    data["raw_slack_thread_request"] = raw_request_text
-    data["request_priority_instruction"] = (
-        "Answer latest_operator_request directly. Use raw_slack_thread_request, "
-        "previous requests, prior results, and Slack thread context only as background. "
-        "Do not repeat stale prior-run conclusions unless they are necessary to answer "
-        "the latest operator request, and label Slack-observed state separately from "
-        "verified current repo/runtime state."
-    )
-    if re.search(r"\b(checklist|ordered|steps?|next\s+\d+|next\s+three)\b", latest_request, re.I):
+    data["request"] = active_request
+    if latest_request:
+        data["latest_operator_request"] = latest_request
+        data["raw_slack_thread_request"] = raw_request_text
+        data["request_priority_instruction"] = (
+            "Answer latest_operator_request directly. Use raw_slack_thread_request, "
+            "previous requests, prior results, and Slack thread context only as background. "
+            "Do not repeat stale prior-run conclusions unless they are necessary to answer "
+            "the latest operator request, and label Slack-observed state separately from "
+            "verified current repo/runtime state."
+        )
+    if _looks_like_operator_supplied_synthesis_request(active_request):
+        data["direct_supplied_context_instruction"] = (
+            "This is a complete, provider-free direct-answer request over facts supplied "
+            "by the operator. Answer from those facts in the requested shape. Do not call "
+            "tools, search, select a Slack command, or ask which workflow to use. Put the "
+            "human answer in summary; use project-context-review with an empty command and "
+            "current-thread target. Keep approval_required and human_review_required true "
+            "to satisfy the current Chief output contract, while leaving all sends, posts, "
+            "and writes disabled. Leave sources empty unless a source was actually used."
+        )
+    if re.search(
+        r"\b(checklist|ordered|steps?|next\s+\d+|next\s+three)\b",
+        active_request,
+        re.I,
+    ):
         data["response_shape_instruction"] = (
             "The latest request asks for a checklist. Keep summary to one direct "
             "sentence and put the checklist items in recommended_actions in the "
             "requested order. Each action should be specific enough to run or verify."
         )
-    return _with_finance_expense_receipt_context(data, latest_request)
+    return _with_finance_expense_receipt_context(data, active_request)
 
 
 def _with_finance_expense_receipt_context(
@@ -911,7 +1021,11 @@ def _manual_plan_allows_finance_tracker_shortcut(
     request_text: str,
 ) -> bool:
     del request_text
-    if plan.target_agent not in {"chief_of_staff", "orchestrator"}:
+    if plan.target_agent not in {
+        "chief_of_staff",
+        "orchestrator",
+        "airtable_context_agent",
+    }:
         return False
     planner_text = " ".join(
         str(part or "")
@@ -3912,6 +4026,96 @@ def _memory_source_refs(records: list[Any]) -> list[ChiefOfStaffSourceRef]:
     return refs
 
 
+def _looks_like_operator_supplied_synthesis_request(text: str) -> bool:
+    """Identify a complete direct-answer ask over explicitly supplied material."""
+
+    return looks_like_supplied_context_synthesis_request(text)
+
+
+def _operator_supplied_synthesis_items(text: str, *, desired_count: int) -> list[str]:
+    """Extract explicit semicolon/newline facts for the deterministic safe fallback."""
+
+    raw = str(text or "").strip()
+    if ":" not in raw:
+        return []
+    material = raw.split(":", 1)[1].strip()
+    material = re.split(
+        r"\n(?:Prior result for context|Authoritative follow-up):",
+        material,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    material = re.split(
+        r"(?:^|[.!?]\s+)(?:do\s+not|don't|dont|never|no\s+web\s+search|"
+        r"make\s+no\s+changes?|perform\s+no\s+changes?)\b",
+        material,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    candidates = re.split(r"\s*;\s*|\n\s*(?:[-*]\s*)?", material)
+    items: list[str] = []
+    for candidate in candidates:
+        cleaned = " ".join(candidate.strip(" \t-*").split()).strip(" .")
+        if not cleaned:
+            continue
+        cleaned = re.sub(r"^(?:and\s+)", "", cleaned, flags=re.I)
+        cleaned = cleaned[0].upper() + cleaned[1:] if cleaned else cleaned
+        if cleaned and cleaned[-1] not in ".!?":
+            cleaned += "."
+        if cleaned and cleaned not in items:
+            items.append(cleaned)
+    return items[: max(1, desired_count)]
+
+
+def _plan_operator_supplied_synthesis_request(
+    text: str,
+    *,
+    manual_request_plan: ManualRequestPlan,
+) -> ChiefOfStaffResult | None:
+    """Return a useful read-only fallback instead of an unrelated Slack route."""
+
+    if not _looks_like_operator_supplied_synthesis_request(text):
+        return None
+    items = _operator_supplied_synthesis_items(
+        text,
+        desired_count=manual_request_plan.desired_count,
+    )
+    if not items:
+        return None
+    summary = "\n".join(f"- {item}" for item in items)
+    return ChiefOfStaffResult(
+        mode="deterministic",
+        intent=text,
+        summary=summary,
+        synthesis=summary,
+        target_channels=["current-thread"],
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="project-context-review",
+            command_text="",
+            target_channel="current-thread",
+            rationale=(
+                "The operator supplied the complete evidence boundary and requested "
+                "a read-only direct answer."
+            ),
+            requires_live_connector=False,
+            requires_human_approval_before_post=True,
+        ),
+        recommended_actions=[],
+        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        sources=[],
+        context_sources_considered=["operator_supplied_context"],
+        repo_context_used=[],
+        audit_notes=[
+            "Deterministic supplied-context fallback used after preserving the requested shape.",
+            "No search, provider read, provider write, Slack post, or external action was attempted.",
+        ],
+    )
+
+
 def _plan_natural_language_operating_intent(
     text: str, *, database_url: str | None = None
 ) -> ChiefOfStaffResult | None:
@@ -4718,6 +4922,15 @@ def plan_chief_of_staff_request(
             _plan_business_artifact_write_request(text),
             action="allowed_business_artifact_write_plan",
         )
+    supplied_context_synthesis = _plan_operator_supplied_synthesis_request(
+        active_text,
+        manual_request_plan=request_plan,
+    )
+    if supplied_context_synthesis is not None:
+        return planned(
+            supplied_context_synthesis,
+            action="allowed_operator_supplied_synthesis",
+        )
     if _looks_like_web_search_brief_request(active_text):
         return planned(
             _plan_web_search_brief_request(active_text),
@@ -5423,6 +5636,7 @@ def build_chief_of_staff_agent(
     include_specialist_tools: bool | None = None,
     specialist_tool_mode: SpecialistToolMode = "read_plan",
     request_text: str = "",
+    manual_request_plan: ManualRequestPlan | None = None,
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     attach_tools: bool = True,
@@ -5434,17 +5648,28 @@ def build_chief_of_staff_agent(
         request_text=request_text,
         live_sdk=False,
     )
-    instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "tools.md",
-        "chief_of_staff.md",
-        skill_files=select_agent_skill_names(
-            "chief_of_staff",
-            request_text=request_text,
-            context_flags=context_flags,
-            include_all=include_all_skills,
-        ),
+    direct_supplied_synthesis = _looks_like_operator_supplied_synthesis_request(
+        request_text
+    )
+    instructions = (
+        compose_direct_instructions(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "chief_of_staff_supplied_synthesis_compact.md",
+        )
+        if direct_supplied_synthesis
+        else compose_instructions(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "chief_of_staff.md",
+            skill_files=select_agent_skill_names(
+                "chief_of_staff",
+                request_text=request_text,
+                context_flags=context_flags,
+                include_all=include_all_skills,
+            ),
+        )
     )
     resolved_include_specialist_tools = (
         include_specialist_tools
@@ -5460,13 +5685,22 @@ def build_chief_of_staff_agent(
         if resolved_include_specialist_tools
         else []
     )
+    resolved_attach_tools = bool(
+        attach_tools
+        and not direct_supplied_synthesis
+        and budget.max_tool_calls != 0
+    )
     return build_sdk_agent(
         name="chief_of_staff",
         instructions=instructions,
         output_type=ChiefOfStaffResult,
         tools=(
-            _chief_of_staff_tools(request_text, specialist_tools=specialist_tools)
-            if attach_tools
+            _chief_of_staff_tools(
+                request_text,
+                manual_request_plan=manual_request_plan,
+                specialist_tools=specialist_tools,
+            )
+            if resolved_attach_tools
             else []
         ),
         guardrails=keystone_guardrails(),
@@ -5625,6 +5859,7 @@ def run_chief_of_staff_sdk(
             include_specialist_tools=include_specialist_tools,
             specialist_tool_mode=specialist_tool_mode,
             request_text=request_text,
+            manual_request_plan=request_plan,
             context_flags=context_flags,
             attach_tools=attach_tools,
         ),
@@ -5645,10 +5880,29 @@ def run_chief_of_staff_sdk(
         f"Chief of Staff quality budget used: {budget.mode.value}; "
         f"max_turns={budget.max_turns}; reasoning_effort={budget.reasoning_effort}."
     )
-    audit_notes = list(result.output.audit_notes)
+    output = result.output
+    if _looks_like_operator_supplied_synthesis_request(active_request_text):
+        output = output.model_copy(
+            update={
+                "recommended_route": ChiefOfStaffRouteRecommendation(
+                    workflow_type="project-context-review",
+                    command_text="",
+                    target_channel="current-thread",
+                    rationale=(
+                        "The operator supplied sufficient context for a direct "
+                        "provider-free answer."
+                    ),
+                    requires_live_connector=False,
+                    requires_human_approval_before_post=True,
+                ),
+                "durable_handoff": None,
+                "context_handoffs": [],
+            }
+        )
+    audit_notes = list(output.audit_notes)
     if note not in audit_notes:
         audit_notes.append(note)
-    return replace(result, output=result.output.model_copy(update={"audit_notes": audit_notes}))
+    return replace(result, output=output.model_copy(update={"audit_notes": audit_notes}))
 
 
 def render_chief_of_staff_result(result: ChiefOfStaffResult) -> str:

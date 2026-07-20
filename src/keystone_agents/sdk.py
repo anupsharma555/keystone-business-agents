@@ -412,6 +412,10 @@ SHARED_PRE_RUN_PROMPTS = (
     "operator_context.md",
     "local_context.md",
 )
+DIRECT_SHARED_PRE_RUN_PROMPTS = (
+    "memory_policy.md",
+    "writing_style.md",
+)
 TOutput = TypeVar("TOutput")
 PROMPT_METADATA_FIELDS = frozenset(
     {
@@ -600,8 +604,88 @@ def build_sqlite_session(
     if database_path:
         path = Path(database_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        return SQLiteSession(session_id, str(path), session_settings=settings)
-    return SQLiteSession(session_id, session_settings=settings)
+        session = SQLiteSession(session_id, str(path))
+    else:
+        session = SQLiteSession(session_id)
+    if settings is None:
+        return session
+    return _ToolPairSafeBoundedSession(session, settings)
+
+
+class _ToolPairSafeBoundedSession:
+    """Bound local history without separating function calls from their outputs.
+
+    The SDK's raw item-count limit can start a history suffix on a
+    ``function_call_output`` item while its matching ``function_call`` is just
+    outside the window. Responses API requests reject that malformed history.
+    This adapter widens the suffix only enough to retain matching calls.
+    """
+
+    def __init__(self, session: Any, settings: Any) -> None:
+        self._session = session
+        self.session_settings = settings
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+    async def get_items(self, limit: int | None = None) -> list[Any]:
+        resolved_limit = limit if limit is not None else self.session_settings.limit
+        scan_limit = (
+            None
+            if resolved_limit is None
+            else max(resolved_limit * 4, resolved_limit + 32)
+        )
+        items = await self._session.get_items(limit=scan_limit)
+        if resolved_limit is None or resolved_limit >= len(items):
+            return items
+        return _tool_pair_safe_history_suffix(items, resolved_limit)
+
+
+def _tool_pair_safe_history_suffix(items: list[Any], limit: int) -> list[Any]:
+    """Return a recent suffix whose function outputs have matching calls."""
+
+    if limit <= 0:
+        return []
+    start = max(0, len(items) - limit)
+    call_positions = {
+        str(item.get("call_id") or ""): index
+        for index, item in enumerate(items)
+        if isinstance(item, Mapping)
+        and item.get("type") == "function_call"
+        and item.get("call_id")
+    }
+    while True:
+        suffix_call_ids = {
+            str(item.get("call_id") or "")
+            for item in items[start:]
+            if isinstance(item, Mapping)
+            and item.get("type") == "function_call"
+            and item.get("call_id")
+        }
+        missing_positions = [
+            call_positions[call_id]
+            for item in items[start:]
+            if isinstance(item, Mapping)
+            and item.get("type") == "function_call_output"
+            and (call_id := str(item.get("call_id") or ""))
+            and call_id not in suffix_call_ids
+            and call_id in call_positions
+        ]
+        if not missing_positions:
+            return [
+                item
+                for item in items[start:]
+                if not (
+                    isinstance(item, Mapping)
+                    and item.get("type") == "function_call_output"
+                    and item.get("call_id")
+                    and str(item["call_id"]) not in suffix_call_ids
+                )
+            ]
+        widened_start = min(missing_positions)
+        if widened_start >= start:
+            return items[start:]
+        start = widened_start
 
 
 def validate_sandbox_sdk_available() -> bool:
@@ -904,6 +988,19 @@ def compose_instructions(
         filename = prompt_file if prompt_file.endswith(".md") else f"{prompt_file}.md"
         sections.append(f"<!-- {filename} -->\n{load_prompt(filename).strip()}")
     return "\n\n".join(sections)
+
+
+def compose_direct_instructions(
+    *prompt_files: str,
+    skill_files: Sequence[str] = (),
+) -> str:
+    """Compose a compact direct-call prompt while preserving shared policy."""
+
+    return compose_instructions(
+        *prompt_files,
+        skill_files=skill_files,
+        shared_prompt_files=DIRECT_SHARED_PRE_RUN_PROMPTS,
+    )
 
 
 def _split_guardrails(guardrails: GuardrailSpec) -> tuple[list[Any], list[Any]]:

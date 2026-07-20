@@ -40,8 +40,17 @@ def infer_opportunity_search_plan(
     if _broad_intent(lowered):
         return _broad_search_plan(plan)
 
+    if _grant_only_intent(lowered):
+        return _grant_only_search_plan(plan)
+
     if _formal_opportunity_intent(lowered):
         return _formal_opportunity_search_plan(plan)
+
+    if _industry_services_intent(lowered):
+        return _industry_services_search_plan(plan)
+
+    if _professional_development_intent(lowered):
+        return _professional_development_search_plan(plan)
 
     if _github_repository_intent(lowered):
         plan.target_entity_types = ["github_repository"]
@@ -128,11 +137,18 @@ def infer_opportunity_search_plan(
         return plan
 
     if _role_intent(lowered):
-        plan.target_entity_types = ["company"]
+        plan.target_entity_types = ["role"]
         plan.objectives = ["hiring", "advisory"]
         plan.must_include_terms = ["role", "hiring", "remote", "clinical strategy"]
-        plan.exclude_entity_types = ["conference", "grant_program", "trial"]
-        plan.strict_targeting = False
+        plan.exclude_entity_types = [
+            "company",
+            "conference",
+            "grant_program",
+            "trial",
+            "researcher",
+            "institute",
+        ]
+        plan.strict_targeting = True
         return plan
 
     plan.target_entity_types = ["company"]
@@ -163,6 +179,8 @@ def _broad_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearchPlan:
         "presentation_opportunity",
         "journal_article_call",
         "contract_opportunity",
+        "advisory",
+        "funding",
     ]
     plan.must_include_terms = [
         "behavioral health",
@@ -172,8 +190,189 @@ def _broad_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearchPlan:
         "conference",
         "RFP",
         "special issue",
+        "workshop",
+        "certification",
+        "fellowship",
+        "networking",
+        "advisory board",
     ]
     plan.strict_targeting = False
+    plan.lanes = [
+        OpportunitySearchLane(
+            lane_type="conference_speaking",
+            target_entity_type="conference",
+            objective="presentation_opportunity",
+            acceptance_criteria=["current event or active call with a source-visible action path"],
+        ),
+        OpportunitySearchLane(
+            lane_type="workshop_training",
+            target_entity_type="conference",
+            objective="presentation_opportunity",
+            acceptance_criteria=[
+                "specific current workshop, training, teaching, or facilitation opportunity"
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="certification_professional_development",
+            target_entity_type="institute",
+            objective="advisory",
+            acceptance_criteria=[
+                "specific credential or professional-development program with enrollment "
+                "or cycle details"
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="grant_fellowship",
+            target_entity_type="grant_program",
+            objective="funding",
+            acceptance_criteria=[
+                "specific active grant or fellowship with status, timing, and eligibility evidence"
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="industry_collaboration",
+            target_entity_type="company",
+            objective="research_collaboration",
+            acceptance_criteria=[
+                "specific external partner, pilot, sponsored-research, or advisory path"
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="consulting_advisory",
+            target_entity_type="company",
+            objective="advisory",
+            acceptance_criteria=[
+                "specific consulting, fractional, expert, workshop-facilitation, or advisory need"
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="networking_community",
+            target_entity_type="conference",
+            objective="research_collaboration",
+            acceptance_criteria=[
+                "specific current professional community, networking event, or introduction path"
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="contract_procurement",
+            target_entity_type="contract_rfp",
+            objective="contract_opportunity",
+            acceptance_criteria=["specific active solicitation or procurement path"],
+        ),
+    ]
+    return plan
+
+
+def _professional_development_search_plan(
+    plan: OpportunitySearchPlan,
+) -> OpportunitySearchPlan:
+    plan.target_entity_types = ["conference", "institute"]
+    plan.objectives = ["presentation_opportunity", "advisory", "research_collaboration"]
+    plan.must_include_terms = [
+        "workshop",
+        "training",
+        "certification",
+        "professional development",
+        "networking",
+        "membership",
+        "remote",
+        "virtual",
+    ]
+    plan.strict_targeting = True
+    plan.lanes = [
+        OpportunitySearchLane(
+            lane_type="workshop_training",
+            target_entity_type="conference",
+            objective="presentation_opportunity",
+            acceptance_criteria=["specific current workshop or training with access details"],
+        ),
+        OpportunitySearchLane(
+            lane_type="certification_professional_development",
+            target_entity_type="institute",
+            objective="advisory",
+            acceptance_criteria=["specific current program with enrollment or cycle details"],
+        ),
+        OpportunitySearchLane(
+            lane_type="networking_community",
+            target_entity_type="conference",
+            objective="research_collaboration",
+            acceptance_criteria=["specific current community or event with a joining path"],
+        ),
+    ]
+    return plan
+
+
+def _industry_services_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearchPlan:
+    plan.target_entity_types = ["company", "institute"]
+    plan.objectives = ["research_collaboration", "advisory"]
+    plan.must_include_terms = [
+        "industry collaboration",
+        "pilot",
+        "consulting",
+        "advisory board",
+        "facilitation",
+    ]
+    plan.strict_targeting = False
+    plan.lanes = [
+        OpportunitySearchLane(
+            lane_type="industry_collaboration",
+            target_entity_type="company",
+            objective="research_collaboration",
+            acceptance_criteria=[
+                "specific active external partner, pilot, sponsored-research, or advisory path"
+            ],
+        ),
+        OpportunitySearchLane(
+            lane_type="consulting_advisory",
+            target_entity_type="company",
+            objective="advisory",
+            acceptance_criteria=[
+                "specific current consulting, expert, facilitation, fractional, or advisory need"
+            ],
+        ),
+    ]
+    return plan
+
+
+def _grant_only_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearchPlan:
+    plan.target_entity_types = ["grant_program"]
+    plan.objectives = ["funding"]
+    plan.must_include_terms = [
+        "grant",
+        "funding opportunity",
+        "deadline",
+        "eligibility",
+        "open",
+    ]
+    plan.exclude_entity_types = [
+        "company",
+        "contract_rfp",
+        "conference",
+        "role",
+        "researcher",
+        "institute",
+        "trial",
+    ]
+    plan.strict_targeting = True
+    plan.lanes = [
+        OpportunitySearchLane(
+            lane_type="grant_funding",
+            target_entity_type="grant_program",
+            objective="funding",
+            required_fields=[
+                "title",
+                "funder",
+                "deadline_or_status",
+                "eligibility",
+                "source_url",
+            ],
+            acceptance_criteria=[
+                "specific active grant, NOFO, FOA, RFA, SBIR/STTR, or funding program",
+                "must verify current status or cycle timing",
+                "must preserve business eligibility gaps instead of assuming qualification",
+            ],
+        )
+    ]
     return plan
 
 
@@ -389,6 +588,61 @@ def _mixed_meeting_grant_intent(lowered: str) -> bool:
         and funding
         and any(marker in lowered for marker in ("1 ", "one ", "exactly", "each", " and "))
     )
+
+
+def _professional_development_intent(lowered: str) -> bool:
+    markers = (
+        "workshop",
+        "training",
+        "certification",
+        "certificate",
+        "professional development",
+        "networking",
+        "professional community",
+        "professional society",
+    )
+    return sum(1 for marker in markers if marker in lowered) >= 2
+
+
+def _industry_services_intent(lowered: str) -> bool:
+    collaboration_markers = (
+        "industry-sponsored collaboration",
+        "industry collaboration",
+        "collaboration",
+        "pilot",
+        "sponsored research",
+        "external partner",
+    )
+    advisory_markers = (
+        "consulting",
+        "consultant",
+        "advisory board",
+        "advisory-board",
+        "facilitation",
+        "facilitator",
+        "fractional",
+    )
+    return any(marker in lowered for marker in collaboration_markers) and any(
+        marker in lowered for marker in advisory_markers
+    )
+
+
+def _grant_only_intent(lowered: str) -> bool:
+    if not any(marker in lowered for marker in ("grant", "grants", "funding opportunity")):
+        return False
+    other_lane_markers = (
+        "conference",
+        "meeting",
+        "workshop",
+        "contract",
+        "rfp",
+        "procurement",
+        "pilot",
+        "collaboration",
+        "speaker",
+        "call for papers",
+    )
+    return not any(marker in lowered for marker in other_lane_markers)
 
 
 def _conference_intent(lowered: str) -> bool:
@@ -629,7 +883,16 @@ def _broad_intent(lowered: str) -> bool:
         "institute",
         "company",
     )
-    return (
+    explicit_portfolio_request = any(
+        marker in lowered
+        for marker in (
+            "broad range of current",
+            "broad range of opportunities",
+            "broad opportunity portfolio",
+            "opportunities across all",
+        )
+    )
+    return explicit_portfolio_request or (
         any(marker in lowered for marker in broad_markers)
         and sum(1 for marker in lane_markers if marker in lowered) >= 2
     )

@@ -92,6 +92,12 @@ For Zotero collections or local article collections:
   selected evidence means, then summarize the source data, Keystone relevance,
   uncertainty, and recommended follow-up. Do not turn the detailed summary into
   route metadata, provider counts, a source list, or a generic link list.
+- When the Orchestrator supplies interpreted output constraints, treat them as
+  completion criteria derived from the raw request. Produce the constrained
+  user-facing answer in the output schema rather than relying on deterministic
+  renderers to shorten or reshape research fields. A narrow answer may omit the
+  standard Detailed Summary while retaining required source visibility outside
+  the constrained answer scope.
 - For deep/source-backed web retrieval, base the narrative summary on
   read/extracted content from selected links when available. Do not treat search
   snippets, source titles, or provider-result rows as page-level evidence.

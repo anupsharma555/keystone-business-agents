@@ -9,7 +9,9 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
+from keystone_agents.schemas.request_coverage import RequestCoverage
 from keystone_agents.schemas.work_item import WorkflowRunResult
+from keystone_agents.source_triage import SourceTriageSummary
 from keystone_agents.visible_sources import append_visible_source_urls_to_text
 
 
@@ -44,6 +46,9 @@ class UserFacingResponseSynthesisInput(BaseModel):
     provider_results: list[dict[str, Any]] = Field(default_factory=list)
     source_context_notes: list[str] = Field(default_factory=list)
     source_triage_notes: list[str] = Field(default_factory=list)
+    source_triage: list[SourceTriageSummary] = Field(default_factory=list)
+    request_coverage: list[RequestCoverage] = Field(default_factory=list)
+    request_coverage_required: bool = False
     blockers: list[dict[str, Any]] = Field(default_factory=list)
     next_action: dict[str, Any] | None = None
     manual_plan: dict[str, Any] | None = None
@@ -75,6 +80,10 @@ class UserFacingResponseSynthesisInput(BaseModel):
                 "- provider_results are search-lane candidates, not verified extracted claims unless they also appear in sources or artifact source refs. Use them to explain recall, precision, and follow-up search direction when requested.",
                 "- Treat source_context_notes as a hard pre-synthesis warning about whether identified web links were actually read/extracted before synthesis.",
                 "- Treat source_triage_notes as the source-selection contract for Answer and the Detailed Summary. Retained sources may support claims, rejected sources must not support claims, and deepen sources require page reading/extraction before detailed factual summary.",
+                "- Treat request_coverage as the specialist audit of the interpreted ask. If it is partial or blocked, present a precise partial answer or blocker and its next safe action, not a complete result.",
+                "- If request_coverage_required=true but no assessed coverage is present, do not claim that exact filters, requested output form, or stop conditions were verified.",
+                "- Treat manual_plan.ask_shape.output_constraints as the LLM planner's interpreted completion contract. Reason from it together with the raw request and satisfy its response scope, counts, sections, source visibility, forbidden content, and style requirements.",
+                "- When output_constraints requests a narrow answer-only response, put the compliant response in answer and leave synthesis and optional sections empty unless the request explicitly requires them. Shared Detailed Summary defaults must not override a narrower operator ask.",
                 "- If source_triage_notes says broaden/deepen is recommended, state what is missing or thin before making strong conclusions; use retained sources first and avoid padding with weak adjacent sources.",
                 "- If source_context_notes says extracted page evidence is missing, do not write a detailed factual synthesis from provider snippets alone; state the limitation and recommend reading/extracting the relevant URLs.",
                 "- If source_context_notes says selected sources do not match the request focus, do not treat broad or adjacent sources as answering the focused ask; state the mismatch and use focused provider candidates only as follow-up targets unless they were extracted.",
@@ -203,6 +212,9 @@ def _user_response_synthesis_input(
         provider_results=response_synthesis_provider_results(result),
         source_context_notes=response_synthesis_source_context_notes(result),
         source_triage_notes=response_synthesis_source_triage_notes(result),
+        source_triage=response_synthesis_source_triage(result),
+        request_coverage=response_synthesis_request_coverage(result),
+        request_coverage_required=_request_coverage_required(result.manual_request_plan),
         blockers=[
             {
                 "code": blocker.code,
@@ -231,7 +243,7 @@ def response_synthesis_sources(result: WorkflowRunResult) -> list[dict[str, Any]
         url = str(source.get("url") or "").strip()
         title = str(source.get("title") or "").strip()
         source_id = str(source.get("source_id") or "").strip()
-        if not url or url in seen_urls:
+        if not url or url in seen_urls or _is_internal_fixture_url(url):
             return
         if (
             (source_id and source_id in triage_filter["rejected_ids"])
@@ -491,7 +503,12 @@ def response_synthesis_ordered_sources(result: WorkflowRunResult) -> list[dict[s
             for index, item in enumerate(ordered[:12], start=1)
             if isinstance(item, dict)
         ]
-        normalized = [item for item in normalized if item.get("url")]
+        normalized = [
+            item
+            for item in normalized
+            if item.get("url")
+            and not _is_internal_fixture_url(str(item.get("url") or ""))
+        ]
         if normalized:
             return normalized
     return [
@@ -516,6 +533,12 @@ def _compact_ordered_source(source: dict[str, Any], *, fallback_index: int) -> d
         "supported_claim": str(source.get("supported_claim") or "")[:360],
         "evidence_excerpt": str(source.get("evidence_excerpt") or "")[:700],
     }
+
+
+def _is_internal_fixture_url(url: str) -> bool:
+    """Keep synthetic test/source identifiers out of user-facing source lists."""
+
+    return str(url or "").strip().lower().startswith("fixture://")
 
 
 def response_synthesis_provider_results(result: WorkflowRunResult) -> list[dict[str, Any]]:
@@ -618,12 +641,9 @@ def response_synthesis_source_triage_notes(result: WorkflowRunResult) -> list[st
     """Return compact source-selection notes for final answer synthesis."""
 
     notes: list[str] = []
-    for diagnostics in _result_retrieval_diagnostics(result):
-        triage = diagnostics.get("source_triage")
-        if not isinstance(triage, dict):
-            continue
-        action = str(triage.get("recommended_action") or "").strip()
-        counts = triage.get("decision_counts")
+    for triage in response_synthesis_source_triage(result):
+        action = triage.recommended_action.strip()
+        counts = triage.decision_counts
         parts: list[str] = []
         if isinstance(counts, dict):
             for key in ("retain", "review", "deepen", "reject"):
@@ -631,10 +651,8 @@ def response_synthesis_source_triage_notes(result: WorkflowRunResult) -> list[st
                 if value:
                     parts.append(f"{key}: {int(value)}")
         count_text = ", ".join(parts)
-        needs_more = bool(triage.get("needs_broaden_or_deepen"))
-        gaps = [
-            str(item).strip() for item in (triage.get("recall_gaps") or []) if str(item).strip()
-        ][:3]
+        needs_more = triage.needs_broaden_or_deepen
+        gaps = triage.recall_gaps[:3]
         if action or count_text or needs_more or gaps:
             note = "Source triage"
             if action:
@@ -647,6 +665,108 @@ def response_synthesis_source_triage_notes(result: WorkflowRunResult) -> list[st
                 note += "; gaps: " + "; ".join(gaps)
             notes.append(note)
     return list(dict.fromkeys(notes))[:4]
+
+
+def response_synthesis_source_triage(result: WorkflowRunResult) -> list[SourceTriageSummary]:
+    """Return deduplicated typed source-selection contracts for final synthesis."""
+
+    summaries: list[SourceTriageSummary] = []
+    seen: set[str] = set()
+    for diagnostics in _result_retrieval_diagnostics(result):
+        summary = SourceTriageSummary.from_payload(diagnostics.get("source_triage"))
+        if not summary.has_evidence():
+            continue
+        key = summary.model_dump_json(exclude_defaults=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        summaries.append(summary)
+    return summaries[:4]
+
+
+def response_synthesis_request_coverage(result: WorkflowRunResult) -> list[RequestCoverage]:
+    """Collect validated specialist request-coverage envelopes from bounded results."""
+
+    candidates: list[Any] = []
+    for artifact in [*result.artifact_refs, *result.work_item.artifact_refs]:
+        if isinstance(artifact.metadata, dict):
+            candidates.extend(_nested_values_for_key(artifact.metadata, "request_coverage"))
+    for nested in result.nested_specialist_results:
+        if isinstance(nested, dict):
+            candidates.extend(_nested_values_for_key(nested, "request_coverage"))
+    coverage_rows: list[RequestCoverage] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            coverage = RequestCoverage.model_validate(candidate)
+        except (TypeError, ValueError):
+            continue
+        key = coverage.model_dump_json(exclude_defaults=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        coverage_rows.append(coverage)
+    return coverage_rows[:6]
+
+
+def _nested_values_for_key(
+    value: Any,
+    key: str,
+    *,
+    depth: int = 0,
+) -> list[Any]:
+    if depth > 4:
+        return []
+    found: list[Any] = []
+    if isinstance(value, dict):
+        if key in value:
+            found.append(value[key])
+        for nested in value.values():
+            if isinstance(nested, dict | list):
+                found.extend(_nested_values_for_key(nested, key, depth=depth + 1))
+    elif isinstance(value, list):
+        for nested in value[:12]:
+            if isinstance(nested, dict | list):
+                found.extend(_nested_values_for_key(nested, key, depth=depth + 1))
+    return found
+
+
+def _request_coverage_required(manual_plan: dict[str, Any] | None) -> bool:
+    if not isinstance(manual_plan, dict):
+        return False
+    ask_shape = manual_plan.get("ask_shape")
+    if not isinstance(ask_shape, dict):
+        return False
+    output_constraints = ask_shape.get("output_constraints")
+    output_constraints_explicit = bool(
+        isinstance(output_constraints, dict)
+        and any(
+            output_constraints.get(key) not in (None, "", [], False, "unspecified")
+            for key in (
+                "interpretation",
+                "scope",
+                "word_count_mode",
+                "word_count",
+                "sentence_count_mode",
+                "sentence_count",
+                "item_count_mode",
+                "minimum_items",
+                "maximum_items",
+                "required_sections",
+                "forbidden_phrases",
+                "forbid_em_dash",
+                "include_source_urls",
+                "style_requirements",
+            )
+        )
+    )
+    return bool(
+        str(ask_shape.get("stop_condition") or "").strip()
+        or output_constraints_explicit
+        or str(ask_shape.get("strict_filter_mode") or "")
+        not in {"", "unspecified"}
+        or str(ask_shape.get("output_form") or "") not in {"", "unspecified"}
+    )
 
 
 def response_synthesis_metadata_lines(result: WorkflowRunResult) -> list[str]:

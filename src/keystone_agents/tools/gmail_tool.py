@@ -2526,6 +2526,36 @@ def create_gmail_draft_with_attachment(
 
 
 @function_tool(**keystone_tool_guardrail_kwargs())
+def gmail_test_draft_lifecycle(
+    marker: str,
+    expected_account: str,
+    recipient: str,
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Create, verify, update, and remove one exact KBA_TEST_DRAFT provider draft.
+
+    This is a no-send validation tool. Python requires the exact marker, account,
+    recipient, scoped approval, dedicated test-delete gate, same-draft read-back,
+    and verified provider absence after cleanup.
+    """
+
+    from keystone_agents.gmail_triage.draft_actions import (
+        execute_gmail_test_draft_lifecycle,
+    )
+
+    return _json(
+        execute_gmail_test_draft_lifecycle(
+            GmailTool(live=live),
+            marker=marker,
+            expected_account=expected_account,
+            recipient=recipient,
+            approval_reference=approval_reference,
+        )
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
 def send_gmail_test_draft(
     draft_id: str,
     expected_account: str,

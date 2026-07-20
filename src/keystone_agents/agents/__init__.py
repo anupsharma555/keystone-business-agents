@@ -13,9 +13,13 @@ from keystone_agents.agents.business_research_analyst import (
     build_business_research_analyst_agent,
     build_business_research_analyst_focused_brief_agent,
     build_business_research_analyst_research_brief_agent,
+    focused_brief_from_profile_fixture,
     run_business_research_analyst_focused_brief_sdk,
     run_business_research_analyst_research_brief_sdk,
     run_business_research_analyst_sdk,
+)
+from keystone_agents.agents.calendar_action_interpreter import (
+    build_calendar_action_interpreter_agent,
 )
 from keystone_agents.agents.chief_of_staff import (
     build_chief_of_staff_agent,
@@ -25,6 +29,7 @@ from keystone_agents.agents.chief_of_staff import (
 from keystone_agents.agents.gmail_triage import (
     build_gmail_priority_grouping_agent,
     build_gmail_triage_agent,
+    group_gmail_envelopes_fixture,
     run_gmail_priority_grouping_sdk,
     run_gmail_triage_sdk,
 )
@@ -54,6 +59,7 @@ from keystone_agents.agents.web_query_planner import build_web_query_planner_age
 
 __all__ = [
     "build_business_research_analyst_agent",
+    "build_calendar_action_interpreter_agent",
     "build_chief_of_staff_agent",
     "AgentSpec",
     "AGENT_REGISTRY",
@@ -64,8 +70,10 @@ __all__ = [
     "list_agent_specs",
     "build_business_research_analyst_focused_brief_agent",
     "build_business_research_analyst_research_brief_agent",
+    "focused_brief_from_profile_fixture",
     "build_gmail_triage_agent",
     "build_gmail_priority_grouping_agent",
+    "group_gmail_envelopes_fixture",
     "build_opportunity_scout_agent",
     "build_opportunity_search_planner_agent",
     "build_web_query_planner_agent",
