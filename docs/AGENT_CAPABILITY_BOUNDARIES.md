@@ -29,6 +29,32 @@ readiness, record identity, external-write scope, and side-effect blocking.
 WorkItems, context packs, approval records, artifact refs, source refs, audit
 events, and renderer metadata remain canonical business state.
 
+## Ownership Reconciliation
+
+Semantic planning proposes ownership; one shared Python resolver reconciles that
+proposal for direct and WorkItem/graph execution.
+
+For an unnamed `@KNI` or Orchestrator request, the semantic plan may choose the
+owner or Chief-managed workflow. For an explicitly named agent, reassignment
+requires two agreeing signals:
+
+1. a capability-specific semantic intent; and
+2. bounded positive evidence in the current operator instruction, such as an
+   operation bound to the provider/object, a capability-specific requested
+   artifact, or an explicit multi-owner sequence.
+
+Provider names in supplied facts, quoted examples, negative constraints,
+time-pressure context, and generic words such as `meeting`, `now`, `review`, or
+`test` may shape context or output but cannot change ownership. If the planner
+and bounded evidence disagree, the named owner remains selected and ordinary
+execution continues; the disagreement must not become a clarification,
+WorkItem, graph, approval, or missing-context blocker.
+
+Typed controls, exact provider identity, safety gates, and approval checks remain
+deterministic. This ownership rule does not prevent a real Gmail, Calendar,
+Airtable, Workspace, Slack, browser-diagnostics, or multi-owner request from
+delegating to its supported owner.
+
 ## Orchestrator R/W/M
 
 ### Read

@@ -166,6 +166,14 @@ def _preflight_memo_payload(preflight: Mapping[str, Any]) -> dict[str, Any]:
     route_result = preflight.get("route_result")
     if not isinstance(route_result, Mapping):
         route_result = {}
+    manual_plan = preflight.get("manual_request_plan")
+    if not isinstance(manual_plan, Mapping):
+        manual_plan = {}
+    requires_live_search = (
+        bool(manual_plan.get("requires_live_search"))
+        if "requires_live_search" in manual_plan
+        else None
+    )
     return {
         "raw_request": preflight.get("request_text"),
         "manual_request_plan": preflight.get("manual_request_plan"),
@@ -178,7 +186,11 @@ def _preflight_memo_payload(preflight: Mapping[str, Any]) -> dict[str, Any]:
         "orchestrator_rationale": route_result.get("rationale"),
         "orchestrator_refused": route_result.get("refused"),
         "orchestrator_stop_reason": route_result.get("stop_reason"),
-        "temporal_depth_policy": temporal_depth_policy(str(preflight.get("request_text") or "")),
+        "temporal_depth_policy": temporal_depth_policy(
+            str(preflight.get("request_text") or ""),
+            provider_system=str(manual_plan.get("provider_system") or "unspecified"),
+            requires_live_search=requires_live_search,
+        ),
         "source_visibility_requirement": (
             "If the specialist answer includes source-backed external facts, current "
             "claims, dates, deadlines, rates, filings, policies, company facts, roles, "

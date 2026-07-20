@@ -62,6 +62,15 @@ When claiming live behavior was measured, inspect the relevant evidence:
 - Operator-provided platform actual cost only when the operator supplies it for
   the matching run/window.
 
+Always report three request values separately:
+
+- Ceiling: the configured maximum allowed for the command.
+- Estimate: conservative preflight minimum/maximum before execution.
+- Actual: requests recorded by the completed or blocked run.
+
+A route estimated above its ceiling may block before any model call and report
+`actual=0`.
+
 ## Rate Limit Handling
 
 - Treat HTTP 429 as recoverable throttle.

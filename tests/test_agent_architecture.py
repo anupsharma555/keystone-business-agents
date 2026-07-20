@@ -16,6 +16,7 @@ from keystone_agents.agents.outreach_composer import build_outreach_composer_age
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
 from keystone_agents.schemas.company_profile import CompanyProfile
 from keystone_agents.schemas.email_triage import EmailTriageResult
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.orchestrator import OrchestratorResult
 from keystone_agents.schemas.outreach import OutreachDraft
@@ -288,6 +289,39 @@ def test_airtable_receipt_create_exposes_only_composite_lifecycle_tool() -> None
             "Read the PDF, map receipt-backed fields to Personal Expenses, attach the "
             "PDF, and verify the created record and attachment. /tmp/receipt.pdf"
         ),
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {"airtable_create_expense_from_receipt"}
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Put this proof of payment with my personal cost entry. /tmp/receipt.pdf",
+        "File the attached image under personal expenses. /tmp/receipt.pdf",
+    ],
+)
+def test_airtable_semantic_receipt_plan_selects_same_tool_across_phrasings(
+    request_text: str,
+) -> None:
+    from keystone_agents.agents.airtable_context import build_airtable_context_agent
+
+    manual_plan = ManualRequestPlan(
+        source="llm",
+        target_agent="airtable_context_agent",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        provider_system="airtable",
+        provider_operations=["create", "attach", "verify"],
+        primary_target="Personal Expenses",
+        target_type="business_system_context",
+        required_entities=["2026 Finance & Tax Tracker"],
+    )
+    agent = build_airtable_context_agent(
+        request_text=request_text,
+        manual_plan=manual_plan,
         tool_tier="internal_write",
         compact_instructions=True,
     )

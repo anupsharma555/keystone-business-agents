@@ -555,6 +555,52 @@ def test_llm_first_calendar_thread_note_append_does_not_require_phrase_parser(
     assert resolution.openai_requests == 1
 
 
+def test_semantic_calendar_thread_read_does_not_require_phrase_parser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = (
+        "chief of staff continue this prior Slack thread. "
+        "Provider affinity: calendar "
+        "Previous request: CoS add UT Austin Course Starts on August 15, 2026 "
+        "to my Google Calendar. Can add it at 8am-9am. "
+        "Previous result title: Business Agents WorkItem Failed "
+        "Previous result: No specialist or provider action ran. "
+        "User follow-up: Is it on the calendar now? "
+        "Continue the same agent task."
+    )
+    assert infer_calendar_action_plan(request, today=date(2026, 7, 20)) is None
+    assert is_calendar_action_candidate(request) is False
+    monkeypatch.setattr(
+        interpreter,
+        "run_typed_sdk_agent",
+        lambda **kwargs: SimpleNamespace(
+            output=CalendarActionInterpretation(
+                operation="read",
+                operation_source_text="Is it on the calendar now?",
+                event_reference="UT Austin Course Starts",
+                event_reference_source_text="UT Austin Course Starts",
+                start_date="2026-08-15",
+                date_source_text="August 15, 2026",
+            )
+        ),
+    )
+
+    resolution = interpreter.resolve_calendar_action_plan(
+        request,
+        None,
+        semantic_candidate=True,
+        live=True,
+        today=date(2026, 7, 20),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.plan.complete is True
+    assert resolution.plan.operation == "read"
+    assert resolution.plan.event_reference == "UT Austin Course Starts"
+    assert resolution.plan.start_date == "2026-08-15"
+    assert resolution.openai_requests == 1
+
+
 @pytest.mark.parametrize(
     (
         "request_text",

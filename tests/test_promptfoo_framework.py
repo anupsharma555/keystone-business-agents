@@ -97,6 +97,48 @@ def _side_effects(**overrides: object) -> dict[str, object]:
     return payload
 
 
+def test_database_inventory_contract_excludes_review_prose_and_preserves_scores() -> None:
+    human_scores = _review_scores(accuracy=5)
+    orchestrator_scores = _review_scores(relevance=5)
+    case = {
+        "case_id": "inventory_001",
+        "display_case_id": "inventory_001",
+        "agent": "business_research_analyst",
+        "human_average": 4.1,
+        "human_scores": human_scores,
+        "human_notes": "Detailed reviewer comment stays out of inventory.",
+        "orchestrator_judge_average": 4.2,
+        "orchestrator_judge_scores": orchestrator_scores,
+        "orchestrator_judge_notes": "Detailed rationale stays out of inventory.",
+        "orchestrator_judge_run_comment": "Full comment stays out.",
+        "user_input": "Full prompt stays in exports and case bundles.",
+        "response_text": "Full response stays in detail surfaces.",
+        "review_url": "/review?case=inventory_001",
+        "case_bundle_url": "/api/eval-case-bundle?case=inventory_001",
+    }
+    contract = eval_dashboard_module._database_inventory_contract([case])
+    export_row = eval_dashboard_module.dashboard_case_export_rows({"cases": [case]})[0]
+
+    row = contract["rows"][0]
+    assert contract["schema"] == "keystone.eval.database_inventory.v1"
+    assert contract["read_only"] is True
+    assert row["human_scores"] == human_scores
+    assert row["orchestrator_judge_scores"] == orchestrator_scores
+    assert row["review_url"].startswith("/review")
+    assert row["case_bundle_url"].startswith("/api/eval-case-bundle")
+    assert {
+        "user_input",
+        "response_text",
+        "human_notes",
+        "orchestrator_judge_notes",
+        "orchestrator_judge_run_comment",
+    }.isdisjoint(row)
+    assert export_row["prompt"] == "Full prompt stays in exports and case bundles."
+    assert export_row["latest_response"] == "Full response stays in detail surfaces."
+    assert export_row["human_notes"] == "Detailed reviewer comment stays out of inventory."
+    assert export_row["orchestrator_judge_notes"] == "Detailed rationale stays out of inventory."
+
+
 def _bool_or_none_for_test(value: object) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -2115,6 +2157,21 @@ def test_slack_eval_run_records_joined_manual_run_summary_without_api(tmp_path) 
                 "failed_tool_call_count": 1,
                 "tool_names": ["search_web", "extract_page"],
             },
+            "child_step_summary": [
+                {
+                    "step_index": 1,
+                    "category": "orchestration",
+                    "name": "advance_started",
+                    "status": "started",
+                },
+                {
+                    "step_index": 2,
+                    "category": "tool",
+                    "name": "search_web",
+                    "status": "completed",
+                    "request_count": 1,
+                },
+            ],
             "approval": {"approval_required": True, "status": "blocked", "send_enabled": False},
             "side_effects": {"external_write_performed": False},
             "retry_state": {"retry_count": 2, "status": "backoff_exhausted"},
@@ -2158,6 +2215,9 @@ def test_slack_eval_run_records_joined_manual_run_summary_without_api(tmp_path) 
     assert manual["metadata"]["model"]["has_model_config"] is True
     assert manual["metadata"]["tooling"]["tool_call_count"] == 3
     assert manual["metadata"]["tooling"]["failed_tool_call_count"] == 1
+    assert manual["metadata"]["child_steps"]["count"] == 2
+    assert manual["metadata"]["child_steps"]["timeline"][1]["name"] == "search_web"
+    assert manual["metadata"]["child_steps"]["raw_payloads_included"] is False
     assert manual["metadata"]["retrieval"]["search_provider"] == "searxng"
     assert manual["metadata"]["retrieval"]["search_provider_sequence"] == ["searxng", "agents-web-search"]
     assert manual["metadata"]["retrieval"]["web_extraction_issue_count"] == 1
@@ -2215,18 +2275,136 @@ def test_slack_eval_run_records_joined_manual_run_summary_without_api(tmp_path) 
     assert readiness["duration"]["status"] == "complete"
     assert readiness["model"]["status"] == "complete"
     assert readiness["tooling"]["status"] == "complete"
+    assert readiness["child_steps"]["status"] == "complete"
     assert readiness["retrieval"]["status"] == "complete"
     assert readiness["orchestrator"]["status"] == "complete"
     assert readiness["prompt_version"]["status"] == "complete"
     assert readiness["cost"]["status"] == "complete"
     assert readiness["api_sdk_summary"]["status"] == "attention"
     assert manual_event["field_readiness"]["missing"] == ["API SDK summary"]
-    slack_ledger = next(item for item in dashboard_payload(database_path=database_path)["run_ledger"] if item["source"] == "slack")
+    slack_ledger = next(
+        item
+        for item in dashboard_payload(database_path=database_path)["run_ledger"]
+        if item["source"] == "slack"
+    )
     assert slack_ledger["trace_agentic_summary"]["signal"] == "1 failed tool call"
     assert "trace 1 failed tool call" in slack_ledger["details"]
     assert trace["sdk_run_summary_count"] == 0
     assert quality_checks["trace_run_summaries"]["status"] == "pending"
     assert "Manual no-API summaries" in quality_checks["trace_run_summaries"]["detail"]
+
+
+def test_blocked_slack_eval_trace_exposes_blocker_or_flags_missing_metadata(tmp_path) -> None:
+    database_path = tmp_path / "evals.sqlite"
+    record_slack_eval_run(
+        case_id="blocked_with_diagnostics_001",
+        run_id="wi_blocked_with_diagnostics",
+        agent="chief_of_staff",
+        status="blocked",
+        warning_count=0,
+        evidence={
+            "blocker_diagnostics": {
+                "schema": "keystone.slack.eval_blocker_diagnostics.v1",
+                "diagnostic_category": "workflow_blocker",
+                "block_kind": "work_item_blocker",
+                "block_reason": "Selected Slack context is required.",
+                "blocker_count": 1,
+                "blocker_codes": ["selected_context_required"],
+                "readiness_gate_names": ["selected_context_readiness"],
+                "next_action": {
+                    "action": "select_context",
+                    "description": "Select one Slack thread.",
+                },
+            }
+        },
+        database_path=database_path,
+    )
+    record_slack_eval_run(
+        case_id="blocked_without_diagnostics_001",
+        run_id="wi_blocked_without_diagnostics",
+        agent="chief_of_staff",
+        status="blocked",
+        warning_count=0,
+        database_path=database_path,
+    )
+
+    events = list_eval_trace_events(database_path=database_path, limit=10)
+    with_packet = next(
+        event
+        for event in events
+        if event["group_id"] == "blocked_with_diagnostics_001"
+    )
+    without_packet = next(
+        event
+        for event in events
+        if event["group_id"] == "blocked_without_diagnostics_001"
+    )
+    categories = {
+        item["key"]: item["count"]
+        for item in dashboard_payload(database_path=database_path)["trace_summary"][
+            "diagnostic_category_counts"
+        ]
+    }
+
+    assert with_packet["metadata"]["blocker"]["block_kind"] == "work_item_blocker"
+    assert with_packet["metadata"]["blocker"]["blocker_codes"] == [
+        "selected_context_required"
+    ]
+    assert with_packet["metadata"]["blocker"]["next_action"]["action"] == (
+        "select_context"
+    )
+    assert with_packet["metadata"]["diagnostic_summary"]["has_blocker_metadata"] is True
+    assert without_packet["metadata"]["diagnostic_summary"][
+        "blocked_without_diagnostics"
+    ] is True
+    assert categories["workflow_blocker"] == 1
+    assert categories["missing_blocker_metadata"] == 1
+
+
+def test_manual_trace_provenance_requirements_follow_resolved_run_mode(tmp_path) -> None:
+    database_path = tmp_path / "evals.sqlite"
+    record_slack_eval_run(
+        case_id="fixture_provenance_001",
+        run_id="wi_fixture_provenance",
+        agent="chief_of_staff",
+        status="done",
+        run_mode="fixture",
+        database_path=database_path,
+    )
+    record_slack_eval_run(
+        case_id="missing_provenance_001",
+        run_id="wi_missing_provenance",
+        agent="chief_of_staff",
+        status="done",
+        database_path=database_path,
+    )
+    record_slack_eval_run(
+        case_id="live_sdk_missing_model_001",
+        run_id="wi_live_sdk_missing_model",
+        agent="chief_of_staff",
+        status="done",
+        run_mode="live_sdk",
+        database_path=database_path,
+    )
+    record_slack_eval_run(
+        case_id="live_search_missing_provider_001",
+        run_id="wi_live_search_missing_provider",
+        agent="business_research_analyst",
+        status="done",
+        run_mode="live_search",
+        database_path=database_path,
+    )
+
+    categories = {
+        item["key"]: item["count"]
+        for item in dashboard_payload(database_path=database_path)["trace_summary"][
+            "diagnostic_category_counts"
+        ]
+    }
+
+    assert categories["missing_execution_provenance"] == 1
+    assert categories["missing_model_metadata"] == 1
+    assert categories["missing_retrieval_metadata"] == 1
 
 
 def test_slack_eval_run_save_is_idempotent_for_same_run_id(tmp_path) -> None:
@@ -2520,7 +2698,22 @@ def test_backfill_slack_manual_run_summaries_refreshes_stale_diagnostics(tmp_pat
     assert manual["metadata"]["diagnostic_contract"]["schema"] == "keystone.eval_run_diagnostics.v1"
     assert manual["metadata"]["model"]["provider"] == "openai"
     assert manual["metadata"]["retrieval"]["search_provider"] == "searxng"
-    assert trace["diagnostic_category_counts"] == []
+    assert trace["diagnostic_category_counts"] == [
+        {
+            "key": "missing_execution_provenance",
+            "label": "Missing execution provenance",
+            "severity": "fail",
+            "count": 1,
+            "detail": "Run summary lacks the resolved fixture/live SDK/live search mode.",
+        },
+        {
+            "key": "missing_child_step_metadata",
+            "label": "Missing child-step metadata",
+            "severity": "warn",
+            "count": 1,
+            "detail": "Run summary lacks the bounded WorkItem/tool execution timeline.",
+        },
+    ]
 
 
 def test_trace_summary_counts_full_database_while_recent_rows_are_bounded(tmp_path) -> None:
@@ -2974,6 +3167,31 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
     assert "latestRunAt" not in prompt_rows_script.group(1)
     assert "evidence" not in prompt_rows_script.group(1)
     assert "Slack not run" not in prompt_rows_script.group(1)
+    database_rows_script = re.search(
+        r"function renderDatabaseRows\(\) \{(.*?)async function verifyLocalRefreshEndpoints",
+        html,
+        re.DOTALL,
+    )
+    assert database_rows_script is not None
+    assert "databaseInventory.rows" in database_rows_script.group(1)
+    assert "item.user_input" not in database_rows_script.group(1)
+    assert "item.response_text" not in database_rows_script.group(1)
+    assert "item.human_notes" not in database_rows_script.group(1)
+    assert "orchestrator_judge_run_comment" not in database_rows_script.group(1)
+    assert "Review form" in database_rows_script.group(1)
+    assert "Case bundle" in database_rows_script.group(1)
+    database_header = re.search(
+        r'<section id="view-database".*?<thead>(.*?)</thead>',
+        html,
+        re.DOTALL,
+    )
+    assert database_header is not None
+    assert "Human accuracy" in database_header.group(1)
+    assert "Orchestrator accuracy" in database_header.group(1)
+    assert "<th>Prompt</th>" not in database_header.group(1)
+    assert "<th>Latest response</th>" not in database_header.group(1)
+    assert "<th>Review notes</th>" not in database_header.group(1)
+    assert "<th>Details</th>" in database_header.group(1)
     assert "workflow-stage-bar" in html
     assert "Source checks" in html
     assert "Thread preview" in html
@@ -3087,7 +3305,7 @@ def test_eval_dashboard_renders_promptfoo_slack_and_human_state(tmp_path) -> Non
         item["key"]: item["count"] for item in data["trace_summary"]["diagnostic_category_counts"]
     }
     assert trace_diagnostics["missing_diagnostic_contract"] == 1
-    assert trace_diagnostics["missing_model_metadata"] == 1
+    assert trace_diagnostics["missing_execution_provenance"] == 1
     assert data["trace_summary"]["diagnostic_followups"]
     assert data["trace_summary"]["diagnostic_case_rollups"]
     assert data["trace_summary"]["effective_sensitive_capture"] is False

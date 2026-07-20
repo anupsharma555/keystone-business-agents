@@ -164,15 +164,24 @@ Website extraction is separate from search:
 ```bash
 KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true
 KEYSTONE_WEBSITE_EXTRACTOR=trafilatura
-KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=crawl4ai
+KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=crawl4ai,firecrawl
+KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN=2
 KEYSTONE_AGENT_HTML_REVIEW=true
 KEYSTONE_AGENT_HTML_REVIEW_MAX_PAGES=2
 KEYSTONE_ENABLE_SOURCE_API_ENRICHMENT=false
 ```
 
-The extractor supports `trafilatura`, `crawl4ai`, and `firecrawl`. It should only process
-selected URLs, convert extracted text into source-backed claim candidates, and
-remain disabled by default.
+The extractor supports `trafilatura`, `crawl4ai`, and `firecrawl`. The shared
+pipeline routes known JS-heavy search, career, job-board, and directory URLs to
+Crawl4AI first. Ordinary pages keep Trafilatura first and use Crawl4AI only when
+the primary result fails or is shallow. It does not run all extractors in
+parallel. Firecrawl runs only when it is explicitly listed in the
+comma-separated fallback setting and its per-run call cap is greater than zero.
+ClinicalTrials.gov search-result interfaces stay out of the general extractor
+ladder in favor of structured enrichment; selected study-record URLs remain
+eligible for normal source reading.
+It should only process selected URLs, convert extracted text into source-backed
+claim candidates, and remain disabled by default.
 Agent HTML review is an optional second pass over already retrieved page text.
 Use it for weak/no-claim extractions, keep the page cap low, and retain the
 original URL-backed source record as the canonical evidence container.

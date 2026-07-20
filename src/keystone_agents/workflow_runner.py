@@ -45,7 +45,7 @@ from keystone_agents.finance_expense_receipts import (
     extract_finance_receipt_evidence,
     infer_finance_expense_receipt_target,
 )
-from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
+from keystone_agents.gmail_triage.execution_plan import resolve_gmail_execution_plan
 from keystone_agents.instruction_following import (
     instruction_following_blocker_text,
     resolve_instruction_following_response,
@@ -87,6 +87,9 @@ from keystone_agents.operator_failures import redact_operator_text
 from keystone_agents.orchestrator.routing import (
     looks_like_send_side_effect,
     looks_like_thread_local_draft_request,
+)
+from keystone_agents.provider_side_effect_policy import (
+    semantic_provider_side_effect_policy,
 )
 from keystone_agents.quality_budget import (
     AgentQualityBudget,
@@ -455,6 +458,39 @@ def _manual_request_plan_dict(value: Any) -> dict[str, Any] | None:
         payload = value.model_dump(mode="json")
         return payload if isinstance(payload, dict) else None
     return value if isinstance(value, dict) else None
+
+
+def _manual_request_plan_model(value: Any) -> ManualRequestPlan | None:
+    if isinstance(value, ManualRequestPlan):
+        return value
+    payload = _manual_request_plan_dict(value)
+    if payload is None:
+        return None
+    try:
+        return ManualRequestPlan.model_validate(payload)
+    except (TypeError, ValueError):
+        # Stored WorkItems may carry legacy planner intent names. Preserve the
+        # original payload for the specialist while declining to treat it as a
+        # current typed-plan routing decision.
+        return None
+
+
+def _manual_plan_requests_local_kni_evidence(
+    value: Any,
+    *,
+    request_text: str,
+) -> bool:
+    """Use typed LLM context selection; retain phrase fallback offline."""
+
+    plan = _manual_request_plan_model(value)
+    if plan is not None and plan.source == "llm":
+        return bool(
+            plan.target_agent == "chief_of_staff"
+            and plan.intent == "context_lookup"
+            and plan.target_type == "local_document_collection"
+            and plan.provider_system == "unspecified"
+        )
+    return looks_like_local_kni_evidence_lookup(request_text)
 
 
 def _attach_inferred_manual_request_plan(
@@ -9452,7 +9488,11 @@ def _advance_gmail_triage(
     store: SQLiteStore | None,
 ) -> WorkflowRunResult:
     effective_request_text = _effective_work_item_request_text(request, work_item)
-    gmail_plan = infer_gmail_execution_plan(effective_request_text, source="work_item")
+    gmail_plan = resolve_gmail_execution_plan(
+        effective_request_text,
+        manual_plan=request.manual_request_plan,
+        source="work_item",
+    )
     inline_fixture = _inline_gmail_fixture_from_request(
         effective_request_text
     ) or _gmail_fixture_from_work_item_context(work_item)
@@ -11424,7 +11464,13 @@ def _chief_workflow_requests_marked_airtable_test_lifecycle(request_text: str) -
     return has_marker_scope and has_create and has_update and has_cleanup and same_object_scope
 
 
-def _chief_workflow_side_effect_policy(request_text: str) -> str:
+def _chief_workflow_side_effect_policy(
+    request_text: str,
+    manual_request_plan: object | None = None,
+) -> str:
+    semantic_policy = semantic_provider_side_effect_policy(manual_request_plan)
+    if semantic_policy is not None:
+        return semantic_policy
     if _chief_workflow_requests_marked_airtable_test_lifecycle(request_text):
         return (
             "The authenticated operator request approves one exact marked Airtable test "
@@ -11495,8 +11541,9 @@ def _advance_chief_of_staff(
         request_text,
         live=request.live_search,
     )
-    local_kni_lookup = looks_like_local_kni_evidence_lookup(
-        f"{focused_request_text}\n{request_text}"
+    local_kni_lookup = _manual_plan_requests_local_kni_evidence(
+        request.manual_request_plan,
+        request_text=f"{focused_request_text}\n{request_text}",
     )
     local_kni_evidence_packet = (
         build_local_kni_evidence_packet_for_query(focused_request_text)
@@ -11521,7 +11568,13 @@ def _advance_chief_of_staff(
             WorkItemRoute.CHIEF_OF_STAFF.value
         ),
         "approval_reference": _chief_workflow_approval_reference(request_text),
-        "side_effect_policy": _chief_workflow_side_effect_policy(request_text),
+        "manual_request_plan": _manual_request_plan_dict(
+            request.manual_request_plan
+        ),
+        "side_effect_policy": _chief_workflow_side_effect_policy(
+            request_text,
+            request.manual_request_plan,
+        ),
     }
     include_specialist_tools = chief_of_staff_should_use_specialist_tools(
         request_text,
@@ -11544,6 +11597,7 @@ def _advance_chief_of_staff(
                 session=sdk_session,
                 quality_mode=quality_mode_from_cost_profile(request.cost_profile),
                 force_sdk_interpretation=True,
+                manual_request_plan=request.manual_request_plan,
                 context_flags=_slack_query_context_flags(request),
                 include_specialist_tools=include_specialist_tools,
             )

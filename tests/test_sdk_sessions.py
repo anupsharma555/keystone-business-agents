@@ -348,6 +348,58 @@ def test_bounded_sdk_session_keeps_function_call_with_output(tmp_path: Path) -> 
     assert items[0]["call_id"] == items[1]["call_id"]
 
 
+def test_bounded_sdk_session_keeps_reasoning_with_function_call_and_output(
+    tmp_path: Path,
+) -> None:
+    spec = resolve_sdk_session_spec(
+        scope="slack",
+        components=("T123", "C456", "thread-reasoning"),
+        enabled=True,
+        database_path=str(tmp_path / "sessions.sqlite3"),
+        history_limit=6,
+    )
+    session = build_sdk_session(spec)
+    assert session is not None
+    asyncio.run(
+        session.add_items(
+            [
+                {"role": "user", "content": "check the calendar"},
+                {"type": "reasoning", "id": "rs_calendar_1", "summary": []},
+                {
+                    "type": "function_call",
+                    "id": "fc_calendar_1",
+                    "name": "calendar_lookup",
+                    "call_id": "call_calendar_1",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_calendar_1",
+                    "output": "{}",
+                },
+                {"type": "reasoning", "id": "rs_calendar_2", "summary": []},
+                {"type": "message", "role": "assistant", "content": []},
+                {"role": "user", "content": "is it there now?"},
+                {"type": "reasoning", "id": "rs_calendar_3", "summary": []},
+                {"type": "message", "role": "assistant", "content": []},
+            ]
+        )
+    )
+
+    items = asyncio.run(session.get_items())
+
+    assert [item.get("type") or item.get("role") for item in items] == [
+        "reasoning",
+        "function_call",
+        "function_call_output",
+        "reasoning",
+        "message",
+        "user",
+        "reasoning",
+        "message",
+    ]
+
+
 def test_non_chief_ask_can_still_opt_into_session() -> None:
     args = Namespace(
         sdk_session=True,

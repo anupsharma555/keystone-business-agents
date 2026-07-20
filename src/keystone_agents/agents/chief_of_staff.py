@@ -30,6 +30,7 @@ from keystone_agents.finance_expense_receipts import (
     finance_expense_receipt_provider_context,
     infer_finance_expense_receipt_target,
     match_receipt_evidence_to_airtable_fields,
+    resolve_finance_expense_receipt_target,
 )
 from keystone_agents.guardrails import keystone_guardrails
 from keystone_agents.local_kni_evidence import (
@@ -185,6 +186,22 @@ def chief_of_staff_should_use_specialist_tools(
     """Return true when Chief of Staff should consult specialist agents as tools."""
 
     plan = _coerce_manual_request_plan(manual_request_plan)
+    if plan is not None and plan.source == "llm":
+        specialist_routes = {
+            "gmail_triage",
+            "business_research_analyst",
+            "opportunity_scout",
+            "outreach_composer",
+            "airtable_context_agent",
+            "google_workspace_context_agent",
+            "zotero_context_agent",
+            "rss_context_agent",
+            "preprints_context_agent",
+        }
+        return bool(
+            plan.target_agent in specialist_routes
+            or any(route in specialist_routes for route in plan.workflow)
+        )
     text = _chief_positive_specialist_request_text(request_text)
     if plan is not None and plan.intent in {
         "company_research",
@@ -315,6 +332,40 @@ def _chief_of_staff_tools(
     manual_request_plan: ManualRequestPlan | None = None,
     specialist_tools: list[Any] | None = None,
 ) -> list[Any]:
+    if (
+        manual_request_plan is not None
+        and manual_request_plan.provider_system == "google_calendar"
+    ):
+        calendar_tools = [read_google_calendar_window]
+        if manual_request_plan.intent == "business_system_write":
+            operation_tools = {
+                "create": create_google_calendar_event,
+                "update": update_google_calendar_event,
+                "delete": delete_google_calendar_event,
+            }
+            selected_operations = (
+                manual_request_plan.provider_operations
+                if manual_request_plan.source == "llm"
+                and manual_request_plan.provider_operations
+                else list(operation_tools)
+            )
+            calendar_tools.extend(
+                operation_tools[operation]
+                for operation in selected_operations
+                if operation in operation_tools
+            )
+        return calendar_tools
+    if _chief_plan_requests_local_kni_documents(
+        manual_request_plan,
+        request_text=request_text,
+    ):
+        return [
+            list_kni_document_folder,
+            list_kni_document_sources,
+            search_kni_documents,
+            read_kni_document_file,
+        ]
+
     tools = [
         list_chief_of_staff_context_sources,
         list_slack_slash_commands,
@@ -373,8 +424,6 @@ def _chief_of_staff_tools(
         request_text=request_text,
         manual_request_plan=manual_request_plan,
     )
-    if _local_kni_document_context_requested(request_text):
-        return tools
     return append_configured_file_search_tools(
         "chief_of_staff",
         tools,
@@ -392,33 +441,37 @@ def _scope_chief_write_tools(
     if manual_request_plan is None:
         return tools
     allowed_writes: set[str] = set()
-    semantic_context = " ".join(
-        [
-            request_text,
-            manual_request_plan.objective,
-            manual_request_plan.primary_target,
-            manual_request_plan.rationale,
-            " ".join(manual_request_plan.constraints),
-        ]
-    ).lower()
-    calendar_plan = infer_calendar_action_plan(request_text)
-    if calendar_plan is not None:
+    if (
+        manual_request_plan.provider_system == "google_calendar"
+        and manual_request_plan.intent == "business_system_write"
+    ):
         allowed_writes.update(CALENDAR_WRITE_TOOL_NAMES)
     elif manual_request_plan.intent == "business_system_write":
-        if "calendar" in semantic_context:
-            allowed_writes.update(CALENDAR_WRITE_TOOL_NAMES)
-        elif (
-            manual_request_plan.target_agent == "airtable_context_agent"
-            or "airtable" in semantic_context
-        ):
-            allowed_writes.update(AIRTABLE_WRITE_ALLOWED_TOOLS)
-        elif (
-            manual_request_plan.target_agent == "google_workspace_context_agent"
-            or re.search(
-                r"\b(?:google\s+(?:workspace|drive|docs?|sheets?)|kniops)\b",
-                semantic_context,
+        if manual_request_plan.provider_system == "airtable":
+            receipt_target = resolve_finance_expense_receipt_target(
+                request_text,
+                manual_plan=manual_request_plan,
             )
-        ):
+            if receipt_target is not None and receipt_target.operation == "create":
+                allowed_writes.add("airtable_create_expense_from_receipt")
+            elif receipt_target is not None and receipt_target.operation == "update":
+                allowed_writes.update(
+                    {
+                        "airtable_write_record",
+                        "airtable_reconcile_duplicate_expense",
+                    }
+                )
+            elif manual_request_plan.source == "llm":
+                operations = set(manual_request_plan.provider_operations)
+                if "create" in operations or "update" in operations:
+                    allowed_writes.add("airtable_write_record")
+                if "attach" in operations:
+                    allowed_writes.update(
+                        {"airtable_upload_attachment", "airtable_link_attachment"}
+                    )
+            else:
+                allowed_writes.update(AIRTABLE_WRITE_ALLOWED_TOOLS)
+        elif manual_request_plan.provider_system == "google_workspace":
             allowed_writes.update(GOOGLE_WORKSPACE_WRITE_TOOLS)
     blocked_writes = INTERNAL_WRITE_TOOL_NAMES | PUBLISH_TOOL_NAMES
     return [
@@ -632,6 +685,23 @@ def chief_slack_command_resolution_is_applicable(request_text: str) -> bool:
 
 def _local_kni_document_context_requested(request_text: str) -> bool:
     return looks_like_local_kni_evidence_lookup(request_text)
+
+
+def _chief_plan_requests_local_kni_documents(
+    manual_request_plan: ManualRequestPlan | None,
+    *,
+    request_text: str,
+) -> bool:
+    """Use the LLM's typed local-document target; retain an offline fallback."""
+
+    if manual_request_plan is not None and manual_request_plan.source == "llm":
+        return bool(
+            manual_request_plan.target_agent == "chief_of_staff"
+            and manual_request_plan.intent == "context_lookup"
+            and manual_request_plan.target_type == "local_document_collection"
+            and manual_request_plan.provider_system == "unspecified"
+        )
+    return _local_kni_document_context_requested(request_text)
 
 
 def _looks_like_local_kni_document_lookup_request(request_text: str) -> bool:
@@ -4032,6 +4102,38 @@ def _looks_like_operator_supplied_synthesis_request(text: str) -> bool:
     return looks_like_supplied_context_synthesis_request(text)
 
 
+def _chief_direct_supplied_synthesis(
+    request_text: str,
+    manual_request_plan: ManualRequestPlan | None,
+) -> bool:
+    """Use plan semantics for live requests; keep phrase matching as fallback."""
+
+    if manual_request_plan is None or manual_request_plan.source != "llm":
+        return _looks_like_operator_supplied_synthesis_request(request_text)
+    return bool(
+        manual_request_plan.provider_system == "unspecified"
+        and not manual_request_plan.provider_operations
+        and not manual_request_plan.requires_live_search
+        and not manual_request_plan.requires_durable_state
+        and manual_request_plan.ask_shape.prior_context_dependency
+        in {"none", "selected_context", "unspecified"}
+    )
+
+
+def _chief_semantic_tools_required(
+    manual_request_plan: ManualRequestPlan | None,
+) -> bool:
+    return bool(
+        manual_request_plan is not None
+        and manual_request_plan.source == "llm"
+        and (
+            manual_request_plan.provider_system != "unspecified"
+            or manual_request_plan.provider_operations
+            or manual_request_plan.workflow
+        )
+    )
+
+
 def _operator_supplied_synthesis_items(text: str, *, desired_count: int) -> list[str]:
     """Extract explicit semicolon/newline facts for the deterministic safe fallback."""
 
@@ -4887,7 +4989,16 @@ def plan_chief_of_staff_request(
             _plan_finance_tracker_request(active_text, live=False),
             action="allowed_finance_tracker_shortcut",
         )
-    if _looks_like_local_kni_document_lookup_request(active_text):
+    if (
+        _chief_plan_requests_local_kni_documents(
+            request_plan,
+            request_text=active_text,
+        )
+        and (
+            request_plan.source == "llm"
+            or _looks_like_local_kni_document_lookup_request(active_text)
+        )
+    ):
         return planned(
             _plan_local_kni_document_lookup_request(active_text),
             action="allowed_local_kni_document_lookup",
@@ -5647,9 +5758,11 @@ def build_chief_of_staff_agent(
         quality_mode,
         request_text=request_text,
         live_sdk=False,
+        manual_request_plan=manual_request_plan,
     )
-    direct_supplied_synthesis = _looks_like_operator_supplied_synthesis_request(
-        request_text
+    direct_supplied_synthesis = _chief_direct_supplied_synthesis(
+        request_text,
+        manual_request_plan,
     )
     instructions = (
         compose_direct_instructions(
@@ -5688,7 +5801,10 @@ def build_chief_of_staff_agent(
     resolved_attach_tools = bool(
         attach_tools
         and not direct_supplied_synthesis
-        and budget.max_tool_calls != 0
+        and (
+            budget.max_tool_calls != 0
+            or _chief_semantic_tools_required(manual_request_plan)
+        )
     )
     return build_sdk_agent(
         name="chief_of_staff",
@@ -5851,6 +5967,7 @@ def run_chief_of_staff_sdk(
         quality_mode,
         request_text=request_text,
         live_sdk=live,
+        manual_request_plan=request_plan,
     )
     result = run_typed_sdk_agent(
         agent=build_chief_of_staff_agent(
@@ -5881,7 +5998,7 @@ def run_chief_of_staff_sdk(
         f"max_turns={budget.max_turns}; reasoning_effort={budget.reasoning_effort}."
     )
     output = result.output
-    if _looks_like_operator_supplied_synthesis_request(active_request_text):
+    if _chief_direct_supplied_synthesis(active_request_text, request_plan):
         output = output.model_copy(
             update={
                 "recommended_route": ChiefOfStaffRouteRecommendation(

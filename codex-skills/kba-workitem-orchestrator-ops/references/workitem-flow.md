@@ -40,6 +40,16 @@ them as the canonical business state unless the repo architecture changes.
 - Approval scripts: `scripts/list_approvals.py`, `scripts/update_approval.py`,
   `scripts/handle_slack_approval_action.py`.
 
+## Backend Selection
+
+- Bounded direct: one specialist owner, no durable handoff/checkpoint, one
+  synthesis and validation pass.
+- WorkItem manager loop: ambiguous or stateful work, cross-agent ownership,
+  approval pauses, continuation, or review/repair.
+- Optional LangGraph: the same WorkItem contract when the validated plan needs
+  explicit multistage graph execution. LangGraph is not separate routing or
+  permission authority.
+
 ## Safe Commands
 
 Dry-run natural-language ask:

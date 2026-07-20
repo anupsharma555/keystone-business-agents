@@ -18,11 +18,11 @@ AdmissionMode = Literal[
 class ExecutionAdmission:
     """Explain why a request may bypass or continue past semantic planning.
 
-    Provider words and action verbs are evidence, not authority. Natural
-    language reaches a provider action only when the shared semantic plan and a
-    bounded provider-action detector agree. Exact typed controls may bypass
-    semantic planning because their operation and target were established by
-    the control contract rather than inferred from prose.
+    Provider words and action verbs are not authority. Natural language reaches
+    a provider action only when the shared semantic plan names the provider,
+    owner, and supported intent. Exact typed controls may bypass semantic
+    planning because their operation and target were established by the control
+    contract rather than inferred from prose.
     """
 
     mode: AdmissionMode
@@ -46,12 +46,12 @@ def admit_provider_action(
     ),
     typed_control: bool = False,
 ) -> ExecutionAdmission:
-    """Require two independent signals before natural-language provider work.
+    """Admit provider work from semantic meaning, then validate exact scope.
 
-    ``provider_action_bound`` comes from a narrow deterministic detector that
-    proves an operation is attached to the provider object. ``semantic_plan``
-    comes from the shared interpretation layer. A provider handler may request
-    missing action fields only after both agree.
+    ``provider_action_bound`` is retained as diagnostic compatibility metadata;
+    it cannot veto or grant execution. Provider handlers validate required
+    fields, exact object identity, approval/live gates, and receipts after this
+    semantic admission.
     """
 
     clean_provider = str(provider or "").strip()
@@ -72,26 +72,30 @@ def admit_provider_action(
 
     plan_intent = str(getattr(semantic_plan, "intent", "") or "").strip()
     plan_agent = str(getattr(semantic_plan, "target_agent", "") or "").strip()
+    plan_provider = str(
+        getattr(semantic_plan, "provider_system", "") or ""
+    ).strip()
     positive_intent = bool(
         semantic_plan is not None
+        and plan_provider == clean_provider
         and plan_intent in allowed_intents
         and plan_agent in allowed_agents
     )
-    admitted = bool(provider_action_bound and positive_intent)
+    admitted = positive_intent
     if admitted:
         reason = (
-            "Shared semantic planning established a provider-write intent and "
-            "the bounded detector established an action tied to this provider."
+            "Shared semantic planning established the matching provider, owner, "
+            "and intent. Exact fields and provider receipts remain deterministic."
         )
-    elif not provider_action_bound:
+    elif semantic_plan is None:
         reason = (
-            "No provider-bound operation was established; continue through shared "
-            "semantic execution without a provider-field blocker."
+            "No semantic plan established provider work; continue through shared "
+            "interpretation without a provider-field blocker."
         )
     else:
         reason = (
-            "Provider-action wording alone is not execution authority; the shared "
-            "semantic plan did not establish the matching provider-write intent."
+            "The semantic plan did not establish the matching provider, owner, "
+            "and intent; request wording alone cannot grant provider execution."
         )
     return ExecutionAdmission(
         mode="provider_action" if admitted else "semantic_planning",

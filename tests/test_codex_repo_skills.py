@@ -13,6 +13,7 @@ EXPECTED_SKILLS = {
     "kba-search-provider-eval",
     "kba-workitem-orchestrator-ops",
     "kba-live-sdk-smoke-and-cost",
+    "kba-operational-validation",
 }
 LOCAL_PATH_PREFIXES = (
     "AGENTS.md",

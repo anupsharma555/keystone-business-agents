@@ -12,7 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -72,12 +72,13 @@ from keystone_agents.finance_expense_receipts import (
     finance_expense_receipt_field_hints,
     finance_expense_receipt_provider_context,
     infer_finance_expense_receipt_target,
+    resolve_finance_expense_receipt_target,
 )
 from keystone_agents.gmail_triage.draft_actions import (
     GMAIL_TEST_DRAFT_MARKER,
     execute_gmail_test_draft_lifecycle,
 )
-from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
+from keystone_agents.gmail_triage.execution_plan import resolve_gmail_execution_plan
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
 from keystone_agents.instruction_following import (
     instruction_following_blocker_text,
@@ -111,7 +112,11 @@ from keystone_agents.reporting import (
     render_work_item_result_text,
     sensitive_text_summary,
 )
-from keystone_agents.run import extract_sdk_usage, run_typed_sdk_agent
+from keystone_agents.run import (
+    extract_sdk_usage,
+    run_typed_sdk_agent,
+    sdk_input_from_typed_input,
+)
 from keystone_agents.schemas.approval import (
     ApprovalQueueItem,
     ApprovalQueueStatus,
@@ -677,7 +682,7 @@ def execute_direct_calendar_action(
                 }
                 return payload
             lookup_status = str(calendar_lookup.get("status") or "")
-            if lookup_status == "not_found":
+            if lookup_status == "not_found" and plan.operation != "read":
                 raise GoogleCalendarError(
                     f'No active Calendar event matched "{plan.event_reference}". '
                     "Name the event more specifically or include its date."
@@ -688,9 +693,22 @@ def execute_direct_calendar_action(
                     "Include the event date or a more specific title."
                 )
             resolved_event_id = str(calendar_lookup.get("event_id") or "")
-            if not resolved_event_id:
+            if plan.operation != "read" and not resolved_event_id:
                 raise GoogleCalendarError("Calendar event lookup returned no exact identity.")
-        if plan.operation == "create":
+        if plan.operation == "read":
+            found = bool(calendar_lookup and calendar_lookup.get("status") == "success")
+            result = {
+                **(calendar_lookup or {}),
+                "status": "success",
+                "operation": "read_calendar_event",
+                "found": found,
+                "verification": {
+                    "status": "verified_present" if found else "verified_absent",
+                    "passed": True,
+                },
+                "send_enabled": False,
+            }
+        elif plan.operation == "create":
             result = create_google_calendar_event_impl(
                 plan.title,
                 plan.start_date,
@@ -733,7 +751,11 @@ def execute_direct_calendar_action(
     except (GoogleCalendarError, RuntimeError, ValueError) as exc:
         payload = {
             "status": "blocked",
-            "block_kind": "calendar_write_blocked",
+            "block_kind": (
+                "calendar_read_blocked"
+                if plan.operation == "read"
+                else "calendar_write_blocked"
+            ),
             "message": str(exc),
             "calendar_action": plan.__dict__,
             "selected_agent": "chief_of_staff",
@@ -745,24 +767,70 @@ def execute_direct_calendar_action(
         return payload
 
     passed = bool((result.get("verification") or {}).get("passed"))
+    human_summary = _direct_calendar_human_summary(plan, result)
     payload = {
         "status": "done" if passed else str(result.get("status") or "failed"),
-        "mode": "live_calendar" if live else "dry_run",
+        "mode": (
+            "live_calendar_read"
+            if live and plan.operation == "read"
+            else "live_calendar"
+            if live
+            else "dry_run"
+        ),
         "selected_agent": "chief_of_staff",
         "route": "chief_of_staff",
         "input": input_text,
         "calendar_action": plan.__dict__,
         "calendar_lookup": calendar_lookup,
         "tool_receipt": result,
+        "human_summary": human_summary,
+        "slack_display_text": human_summary,
         "openai_requests": openai_requests,
         "send_enabled": False,
         "side_effects": {
-            "calendar_write_performed": bool(live and passed),
+            "calendar_write_performed": bool(
+                live and passed and plan.operation != "read"
+            ),
             "email_sent": False,
             "slack_message_posted": False,
         },
     }
+    if live:
+        attach_execution_public_result(payload)
     return payload
+
+
+def _direct_calendar_human_summary(
+    plan: CalendarActionPlan,
+    result: dict[str, Any],
+) -> str:
+    """Render a verified Calendar result without exposing workflow metadata."""
+
+    title = str(result.get("title") or plan.title or plan.event_reference).strip()
+    start_date = str(
+        result.get("start_date")
+        or plan.start_date
+        or plan.event_reference_date
+    ).strip()
+    if plan.operation == "read":
+        if result.get("found") is True:
+            date_suffix = f" on {start_date}" if start_date else ""
+            return f'Yes - "{title}" is on your Google Calendar{date_suffix}.'
+        date_suffix = f" on {start_date}" if start_date else ""
+        return (
+            f'No - I did not find an active event named "{title}"'
+            f"{date_suffix} on your Google Calendar."
+        )
+    operation = {
+        "create": "created",
+        "update": "updated",
+        "delete": "deleted",
+    }.get(plan.operation, "completed")
+    date_suffix = f" on {start_date}" if start_date else ""
+    return (
+        f'Google Calendar event {operation} and verified: "{title}"'
+        f"{date_suffix}."
+    )
 
 
 def run_direct_calendar_action(
@@ -868,13 +936,14 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         or execution_request.requested_agent
         or (mention.route if mention.explicit else None)
     )
-    semantic_input_text = (
+    execution_input_text = (
         planning_input
         if slack_continuation
         and planning_input
         and requested_route == "chief_of_staff"
         else current_input_text
     )
+    semantic_input_text = current_input_text
     cost_directive = parse_cost_tracking_directive(current_input_text)
     input_text = (cost_directive.cleaned_text or current_input_text).strip()
     if semantic_input_text != current_input_text:
@@ -932,8 +1001,15 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     # Semantic interpretation is a single bounded request. Do not block that
     # planner call using the unresolved worst-case manager/graph estimate.
     # Recompute and enforce the actual route ceiling immediately after preflight.
+    live_unowned_calendar_followup = bool(
+        live_sdk
+        and slack_continuation
+        and args.agent is None
+        and not execution_request.requested_agent_explicit
+    )
     calendar_route_eligible = bool(
-        calendar_candidate
+        (not live_sdk or live_unowned_calendar_followup)
+        and calendar_candidate
         and requested_route in {
             None,
             "chief_of_staff",
@@ -966,6 +1042,19 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             direct_workflow_state,
             _slack_continuation_workflow_state(raw_input),
         )
+        direct_workflow_state = _merge_direct_workflow_state(
+            direct_workflow_state,
+            {
+                "execution_continuation": (
+                    execution_request.continuation.model_dump(mode="json")
+                )
+            },
+        )
+        calendar_input_text = _calendar_continuation_input_text(
+            raw_input,
+            direct_workflow_state,
+        )
+        calendar_plan = infer_calendar_action_plan(calendar_input_text)
     orchestrator_preflight = run_orchestrator_preflight(
         semantic_input_text,
         requested_agent=requested_route,
@@ -973,14 +1062,32 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         database_url=args.database_url,
         workflow_state=direct_workflow_state,
     )
-    manual_plan = orchestrator_preflight.manual_request_plan
-    calendar_admission = admit_provider_action(
-        provider="google_calendar",
-        provider_action_bound=calendar_route_eligible,
-        semantic_plan=manual_plan,
-        allowed_agents={"chief_of_staff"},
+    orchestrator_preflight = _apply_continuation_provider_affinity(
+        orchestrator_preflight,
+        execution_request.continuation.provider_affinity,
     )
-    if calendar_admission.can_execute_provider_action:
+    manual_plan = orchestrator_preflight.manual_request_plan
+    if (
+        manual_plan.provider_system != "unspecified"
+        and not manual_plan.requires_live_search
+    ):
+        live_search = False
+    calendar_semantic_candidate = bool(
+        (not live_sdk or live_unowned_calendar_followup)
+        and manual_plan.source == "llm"
+        and manual_plan.provider_system == "google_calendar"
+        and manual_plan.target_agent == "chief_of_staff"
+        and manual_plan.intent in {"business_system_write", "context_lookup"}
+    )
+    calendar_interpretation_eligible = bool(
+        calendar_semantic_candidate
+        or (
+            calendar_route_eligible
+            and manual_plan.target_agent == "chief_of_staff"
+            and manual_plan.intent == "business_system_write"
+        )
+    )
+    if calendar_interpretation_eligible:
         preflight_requests = _orchestrator_preflight_request_count(
             orchestrator_preflight
         )
@@ -1011,20 +1118,29 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         calendar_resolution = resolve_calendar_action_plan(
             calendar_input_text,
             calendar_plan,
+            semantic_candidate=calendar_semantic_candidate,
             live=live_sdk,
         )
         if calendar_resolution.plan is not None:
-            return run_direct_calendar_action(
-                calendar_input_text,
-                calendar_resolution.plan,
-                live=live_sdk,
-                json_output=args.json,
-                openai_requests=(
-                    preflight_requests + calendar_resolution.openai_requests
-                ),
-                interpretation_warnings=calendar_resolution.warnings,
-                execution_admission=calendar_admission,
+            calendar_admission = admit_provider_action(
+                provider="google_calendar",
+                provider_action_bound=True,
+                semantic_plan=manual_plan,
+                allowed_agents={"chief_of_staff"},
+                allowed_intents={"business_system_write", "context_lookup"},
             )
+            if calendar_admission.can_execute_provider_action:
+                return run_direct_calendar_action(
+                    calendar_input_text,
+                    calendar_resolution.plan,
+                    live=live_sdk,
+                    json_output=args.json,
+                    openai_requests=(
+                        preflight_requests + calendar_resolution.openai_requests
+                    ),
+                    interpretation_warnings=calendar_resolution.warnings,
+                    execution_admission=calendar_admission,
+                )
     interpreted_lifecycle_route = str(manual_plan.target_agent or "").strip()
     interpreted_lifecycle_scope = _interpreted_lifecycle_scope_text(
         input_text,
@@ -1041,6 +1157,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         and _is_bounded_composite_lifecycle_request(
             interpreted_lifecycle_route,
             input_text=interpreted_lifecycle_scope,
+            manual_plan=manual_plan,
         )
     )
     semantic_direct_route = (
@@ -1176,7 +1293,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 or None
             )
             return _run_ask_work_item(
-                semantic_input_text,
+                execution_input_text,
                 database_url=args.database_url,
                 live_search=live_search,
                 live_sdk=live_sdk,
@@ -1224,7 +1341,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 )
             return _run_ask_specialist_live(
                 route,
-                semantic_input_text if route == "chief_of_staff" else input_text,
+                execution_input_text if route == "chief_of_staff" else input_text,
                 json_output=args.json,
                 manual_plan=manual_plan,
                 orchestrator_preflight=orchestrator_preflight,
@@ -1257,7 +1374,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 execution_context=direct_execution_context,
             )
         return _run_ask_work_item(
-            semantic_input_text,
+            execution_input_text,
             database_url=args.database_url,
             live_search=live_search,
             live_sdk=live_sdk,
@@ -1333,7 +1450,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 )
         return _run_ask_specialist_live(
             route,
-            semantic_input_text if route == "chief_of_staff" else input_text,
+            execution_input_text if route == "chief_of_staff" else input_text,
             json_output=args.json,
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
@@ -1350,7 +1467,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         )
     return _print_ask_dry_run(
         route,
-        semantic_input_text if route == "chief_of_staff" else input_text,
+        execution_input_text if route == "chief_of_staff" else input_text,
         json_output=args.json,
         manual_plan=manual_plan,
         orchestrator_preflight=orchestrator_preflight,
@@ -1415,6 +1532,29 @@ def _slack_continuation_workflow_state(text: str) -> dict[str, Any]:
     if not prior_runs:
         return {}
     return {"prior_agent_runs": prior_runs[-4:]}
+
+
+def _calendar_continuation_input_text(
+    raw_input: str,
+    workflow_state: Mapping[str, Any],
+) -> str:
+    """Give Calendar interpretation the human thread root, not stale bot prose."""
+
+    root_request = _bounded_redacted_text(
+        workflow_state.get("slack_thread_root"),
+        max_chars=2400,
+    )
+    current_request = _latest_slack_operator_request(raw_input)
+    if not root_request or not current_request:
+        return raw_input
+    return "\n".join(
+        (
+            "business agents continue this prior Slack thread.",
+            f"Previous request: {root_request}",
+            f"User follow-up: {current_request}",
+            "Continue the same agent task.",
+        )
+    )
 
 
 def _route_from_slack_result_label(value: str) -> str:
@@ -2085,10 +2225,20 @@ def _estimate_ask_openai_requests(
         else bool(effective_live_search)
     )
     direct_supplied_route = str(requested_route or args.agent or "").strip()
-    if _is_direct_supplied_response_request(
-        input_text,
-        requested_route=direct_supplied_route,
-    ):
+    bounded_provider_free_response = bool(
+        _manual_plan_is_bounded_provider_free_response(
+            manual_plan,
+            route=direct_supplied_route,
+        )
+        or (
+            manual_plan is None
+            and _is_direct_supplied_response_request(
+                input_text,
+                requested_route=direct_supplied_route,
+            )
+        )
+    )
+    if bounded_provider_free_response:
         stages.append(f"{direct_supplied_route}_direct_supplied_response_sdk")
         maximum += 1
         return {
@@ -2127,11 +2277,15 @@ def _estimate_ask_openai_requests(
                 deterministic_plan,
             )
         supplied_context_bound = bool(
-            looks_like_supplied_context_synthesis_request(input_text)
+            deterministic_plan is not None
+            and deterministic_plan.ask_shape.prior_context_dependency
+            == "selected_context"
             or (
-                deterministic_plan is not None
-                and deterministic_plan.ask_shape.prior_context_dependency
-                == "selected_context"
+                (
+                    deterministic_plan is None
+                    or deterministic_plan.source != "llm"
+                )
+                and looks_like_supplied_context_synthesis_request(input_text)
             )
         )
         bounded_supplied_workflow = bool(
@@ -2157,14 +2311,48 @@ def _estimate_ask_openai_requests(
             original_route == "chief_of_staff"
             and direct_specialist_route
             and (
-                not _is_multi_operation_business_system_request(input_text)
+                not _manual_plan_has_multiple_provider_mutations(
+                    deterministic_plan,
+                    input_text=input_text,
+                )
                 or _is_bounded_composite_lifecycle_request(
                     estimated_route,
                     input_text=input_text,
+                    manual_plan=deterministic_plan,
                 )
             )
         )
-        if bounded_supplied_workflow and deterministic_plan is not None:
+        bounded_provider_request = bool(
+            deterministic_plan is not None
+            and deterministic_plan.provider_system != "unspecified"
+            and deterministic_plan.intent
+            in {"context_lookup", "business_system_write", "gmail_triage"}
+            and not deterministic_plan.requires_live_search
+            and not search_enabled
+            and len(deterministic_plan.workflow) <= 1
+            and (
+                not _manual_plan_has_multiple_provider_mutations(
+                    deterministic_plan,
+                    input_text=input_text,
+                )
+                or _is_bounded_composite_lifecycle_request(
+                    estimated_route,
+                    input_text=input_text,
+                    manual_plan=deterministic_plan,
+                )
+            )
+            and original_route == "chief_of_staff"
+            and estimated_route == "chief_of_staff"
+        )
+        if bounded_provider_request and deterministic_plan is not None:
+            stages.append(
+                f"{deterministic_plan.provider_system}_bounded_provider_sdk"
+            )
+            # One model turn selects/calls the plan-scoped provider tool; the
+            # next synthesizes the verified receipt. Provider calls themselves
+            # are not OpenAI requests.
+            maximum += 2
+        elif bounded_supplied_workflow and deterministic_plan is not None:
             for route in deterministic_plan.workflow:
                 if route in {
                     "business_research_analyst",
@@ -2179,9 +2367,23 @@ def _estimate_ask_openai_requests(
         elif (
             original_route == "chief_of_staff"
             and estimated_route == "chief_of_staff"
+            and deterministic_plan is not None
+            and deterministic_plan.provider_system != "unspecified"
+            and not deterministic_plan.requires_live_search
+            and not search_enabled
+        ):
+            stages.append("chief_of_staff_bounded_provider_sdk")
+            maximum += 4
+        elif (
+            original_route == "chief_of_staff"
+            and estimated_route == "chief_of_staff"
             and (
                 bounded_supplied_chief_response
-                or is_bounded_chief_response_only_request(input_text)
+                or (
+                    deterministic_plan is not None
+                    and deterministic_plan.source != "llm"
+                    and is_bounded_chief_response_only_request(input_text)
+                )
             )
         ):
             stages.append("chief_of_staff_response_only_sdk")
@@ -2194,6 +2396,7 @@ def _estimate_ask_openai_requests(
             if estimated_route == "gmail_triage" and _is_bounded_composite_lifecycle_request(
                 estimated_route,
                 input_text=input_text,
+                manual_plan=deterministic_plan,
             ):
                 stages.append("gmail_test_draft_lifecycle_provider")
             else:
@@ -2202,6 +2405,7 @@ def _estimate_ask_openai_requests(
                     estimated_route,
                     input_text=input_text,
                     live_search=search_enabled,
+                    manual_plan=deterministic_plan,
                 )
         else:
             stages.append(f"{estimated_route}_sdk")
@@ -2277,6 +2481,48 @@ def _estimate_ask_openai_requests(
         ),
         "request_text_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:12],
     }
+
+
+_CONTINUATION_PROVIDER_SYSTEMS = {
+    "calendar": "google_calendar",
+    "google_calendar": "google_calendar",
+    "gmail": "gmail",
+    "airtable": "airtable",
+    "google_workspace": "google_workspace",
+    "zotero": "zotero",
+    "slack": "slack",
+}
+
+
+def _apply_continuation_provider_affinity(
+    preflight: OrchestratorPreflight,
+    provider_affinity: str,
+) -> OrchestratorPreflight:
+    """Preserve typed provider continuity without interpreting request phrases.
+
+    Slack supplies this affinity from the prior provider-owned thread. It may
+    fill an unspecified provider on a semantically compatible plan, but it
+    cannot override a provider chosen by the planner, change the task intent,
+    grant write approval, or force a specialist owner.
+    """
+
+    plan = preflight.manual_request_plan
+    provider = _CONTINUATION_PROVIDER_SYSTEMS.get(
+        str(provider_affinity or "").strip().lower()
+    )
+    if (
+        not provider
+        or plan.provider_system != "unspecified"
+        or plan.intent not in {"context_lookup", "business_system_write", "gmail_triage"}
+    ):
+        return preflight
+    return preflight.model_copy(
+        update={
+            "manual_request_plan": plan.model_copy(
+                update={"provider_system": provider}
+            )
+        }
+    )
 
 
 def _is_bounded_gmail_research_reply_graph(text: str, *, manager_steps: int) -> bool:
@@ -2423,37 +2669,85 @@ def _is_direct_supplied_response_request(
     )
 
 
+def _manual_plan_is_bounded_provider_free_response(
+    manual_plan: ManualRequestPlan | None,
+    *,
+    route: str,
+) -> bool:
+    """Classify post-plan direct answers without inspecting request wording."""
+
+    if manual_plan is None or manual_plan.source != "llm":
+        return False
+    provider_context_is_already_supplied = bool(
+        manual_plan.provider_operations
+        and set(manual_plan.provider_operations) <= {"read"}
+        and manual_plan.ask_shape.source_type_preference
+        and all(
+            re.search(
+                r"\b(?:attached|local|file|image|pdf|document)\b",
+                str(source_type or ""),
+                re.IGNORECASE,
+            )
+            for source_type in manual_plan.ask_shape.source_type_preference
+        )
+    )
+    return bool(
+        manual_plan.target_agent == route
+        and not manual_plan.workflow
+        and not manual_plan.requires_durable_state
+        and not manual_plan.requires_live_search
+        and not manual_plan.requires_approved_context
+        and (
+            (
+                manual_plan.provider_system == "unspecified"
+                and not manual_plan.provider_operations
+            )
+            or provider_context_is_already_supplied
+        )
+        and manual_plan.side_effect_policy == "draft_or_read_only"
+        and manual_plan.intent
+        not in {
+            "blocked_send",
+            "business_system_write",
+            "clarification",
+            "continue_work_item",
+        }
+    )
+
+
+def _should_run_direct_supplied_response(
+    input_text: str,
+    *,
+    requested_route: str,
+    manual_plan: ManualRequestPlan | None,
+) -> bool:
+    """Let a live semantic plan decide whether tools/providers are unnecessary."""
+
+    if manual_plan is not None and manual_plan.source == "llm":
+        return _manual_plan_is_bounded_provider_free_response(
+            manual_plan,
+            route=requested_route,
+        )
+    return _is_direct_supplied_response_request(
+        input_text,
+        requested_route=requested_route,
+    )
+
+
 def _skip_live_manual_plan_for_request(
     input_text: str,
     *,
     requested_route: str | None,
 ) -> bool:
-    """Avoid pre-gate model planning for bounded requests with deterministic plans."""
+    """Skip semantic planning only for the explicit bounded SDK smoke harness.
 
-    if _ask_request_is_bounded_live_sdk_smoke(input_text):
-        return True
-    if _is_direct_supplied_response_request(
-        input_text,
-        requested_route=requested_route,
-    ):
-        # The owning specialist still interprets the complete operator ask.
-        # A separate planner adds no missing context, but consumes the only
-        # request in the bounded direct-response profile.
-        return True
-    if str(requested_route or "").strip() == "opportunity_scout":
-        # Direct Scout requests already retain deterministic Orchestrator
-        # preflight plus the typed OpportunitySearchPlan. Other direct agents
-        # keep one live planner request so LLM interpretation precedes tool use.
-        return True
-    if infer_finance_expense_receipt_target(input_text) is None:
-        return False
-    route = str(requested_route or "").strip()
-    return route in {
-        "",
-        "airtable_context_agent",
-        "chief_of_staff",
-        "orchestrator",
-    }
+    Ordinary natural-language requests always receive the shared LLM plan,
+    including supplied-context answers, direct specialist asks, and receipt
+    operations. Their wording must not select a deterministic bypass.
+    """
+
+    del requested_route
+    return _ask_request_is_bounded_live_sdk_smoke(input_text)
 
 
 def _ask_request_is_bounded_live_sdk_smoke(input_text: str) -> bool:
@@ -2481,10 +2775,15 @@ def _direct_specialist_request_estimate(
     *,
     input_text: str,
     live_search: bool,
+    manual_plan: ManualRequestPlan | None = None,
 ) -> int:
     """Estimate one direct specialist without charging for a manager graph."""
 
-    profile = _direct_specialist_runtime_profile(route, input_text=input_text)
+    profile = _direct_specialist_runtime_profile(
+        route,
+        input_text=input_text,
+        manual_plan=manual_plan,
+    )
     plan = profile["manual_plan"]
     normalized = str(profile["normalized_request"])
     if profile["compact_instructions"]:
@@ -2498,13 +2797,21 @@ def _direct_specialist_request_estimate(
             # The ordered provider read is acquired before the specialist call.
             return 1
         if plan.intent == "business_system_write":
-            if _is_bounded_composite_lifecycle_request(route, input_text=input_text):
+            if _is_bounded_composite_lifecycle_request(
+                route,
+                input_text=input_text,
+                manual_plan=plan,
+            ):
                 # One guarded provider helper owns the complete marked lifecycle;
                 # reserve one model turn for the call and one for synthesis.
                 return 2
             if (
                 route == "airtable_context_agent"
-                and infer_finance_expense_receipt_target(input_text) is not None
+                and resolve_finance_expense_receipt_target(
+                    input_text,
+                    manual_plan=plan,
+                )
+                is not None
             ):
                 # The composite receipt tool performs schema acquisition,
                 # field mapping, create, attachment, and read-back in one tool
@@ -2527,32 +2834,53 @@ def _direct_specialist_runtime_profile(
     route: str,
     *,
     input_text: str,
+    manual_plan: ManualRequestPlan | None = None,
 ) -> dict[str, Any]:
     """Resolve prompt/tool depth from ask shape after the owning route is known."""
 
-    plan = infer_manual_request_plan(input_text, requested_agent=route)
+    plan = manual_plan or infer_manual_request_plan(input_text, requested_agent=route)
     normalized = " ".join(str(input_text or "").lower().split())
+    semantic_authority = plan.source == "llm"
     deep_request = bool(
-        re.search(
-            r"\b(?:deep|comprehensive|exhaustive|multi-stage|full landscape|"
-            r"all available sources|systematic review)\b",
-            normalized,
+        plan.ask_shape.evidence_depth == "deep"
+        or (
+            not semantic_authority
+            and re.search(
+                r"\b(?:deep|comprehensive|exhaustive|multi-stage|full landscape|"
+                r"all available sources|systematic review)\b",
+                normalized,
+            )
         )
     )
     bounded_composite_lifecycle = _is_bounded_composite_lifecycle_request(
         route,
         input_text=input_text,
+        manual_plan=plan,
     )
-    multi_operation = (
-        _is_multi_operation_business_system_request(input_text)
+    multi_operation = bool(
+        (
+            len(
+                {
+                    operation
+                    for operation in plan.provider_operations
+                    if operation in {"create", "update", "delete", "attach"}
+                }
+            )
+            > 1
+            if semantic_authority
+            else _is_multi_operation_business_system_request(input_text)
+        )
         and not bounded_composite_lifecycle
     )
     thread_followup = bool(
         plan.ask_shape.prior_context_dependency not in {"", "unspecified"}
-        or re.search(
-            r"\b(?:same|this|that|previous|prior|current)\b.{0,80}"
-            r"\b(?:article|record|event|thread|email|document|file|item)\b",
-            normalized,
+        or (
+            not semantic_authority
+            and re.search(
+                r"\b(?:same|this|that|previous|prior|current)\b.{0,80}"
+                r"\b(?:article|record|event|thread|email|document|file|item)\b",
+                normalized,
+            )
         )
     )
     compact = bool(
@@ -2587,10 +2915,15 @@ def _append_compact_direct_flag(
     *,
     route: str,
     input_text: str,
+    manual_plan: ManualRequestPlan | None = None,
 ) -> None:
     """Select the compact child profile only for a bounded direct ask."""
 
-    profile = _direct_specialist_runtime_profile(route, input_text=input_text)
+    profile = _direct_specialist_runtime_profile(
+        route,
+        input_text=input_text,
+        manual_plan=manual_plan,
+    )
     if profile["compact_instructions"]:
         command.append("--compact-instructions")
 
@@ -2605,6 +2938,25 @@ def _is_multi_operation_business_system_request(text: str) -> bool:
         bool(re.search(r"\b(?:delete|remove)\b", normalized)),
     )
     return sum(operation_families) > 1
+
+
+def _manual_plan_has_multiple_provider_mutations(
+    manual_plan: ManualRequestPlan | None,
+    *,
+    input_text: str,
+) -> bool:
+    if manual_plan is not None and manual_plan.source == "llm":
+        return (
+            len(
+                {
+                    operation
+                    for operation in manual_plan.provider_operations
+                    if operation in {"create", "update", "delete", "attach"}
+                }
+            )
+            > 1
+        )
+    return _is_multi_operation_business_system_request(input_text)
 
 
 def _is_marked_provider_lifecycle_planning_candidate(input_text: str) -> bool:
@@ -2624,10 +2976,51 @@ def _is_marked_provider_lifecycle_planning_candidate(input_text: str) -> bool:
     )
 
 
-def _is_bounded_composite_lifecycle_request(route: str, *, input_text: str) -> bool:
-    """Recognize guarded test lifecycles already owned by one typed helper."""
+def _is_bounded_composite_lifecycle_request(
+    route: str,
+    *,
+    input_text: str,
+    manual_plan: ManualRequestPlan | None = None,
+) -> bool:
+    """Recognize one guarded lifecycle without re-parsing an LLM plan.
+
+    Exact KBA_TEST markers remain deterministic object-identity gates. When a
+    live semantic plan is available, its structured provider operations decide
+    whether the lifecycle helper applies. Phrase recognition is retained only
+    for dry-run and planner-unavailable compatibility.
+    """
 
     normalized = " ".join(str(input_text or "").lower().split())
+    if manual_plan is not None and manual_plan.source == "llm":
+        provider_by_route = {
+            "airtable_context_agent": "airtable",
+            "google_workspace_context_agent": "google_workspace",
+            "gmail_triage": "gmail",
+            "zotero_context_agent": "zotero",
+        }
+        required_operations = {
+            "airtable_context_agent": {"create", "update", "delete"},
+            "google_workspace_context_agent": {"create", "delete"},
+            "gmail_triage": {"create", "update", "delete"},
+            "zotero_context_agent": {"create", "update", "delete"},
+        }
+        marker_by_route = {
+            "airtable_context_agent": r"\bkba_test_record(?:_[a-z0-9]+)*\b",
+            "google_workspace_context_agent": r"\bkba_test_doc(?:_[a-z0-9]+)*\b",
+            "gmail_triage": r"\bkba_test_draft(?:_[a-z0-9]+)*\b",
+            "zotero_context_agent": r"\bkba_test_note(?:_[a-z0-9]+)*\b",
+        }
+        required = required_operations.get(route)
+        marker = marker_by_route.get(route)
+        return bool(
+            required
+            and marker
+            and manual_plan.target_agent == route
+            and manual_plan.intent == "business_system_write"
+            and manual_plan.provider_system == provider_by_route.get(route)
+            and required.issubset(set(manual_plan.provider_operations))
+            and re.search(marker, normalized)
+        )
     # Body copy is data, not an operation request. Excluding it prevents words
     # such as "set" or "update" inside a quoted test body from changing the
     # selected lifecycle.
@@ -2693,6 +3086,7 @@ def _run_bounded_provider_lifecycle_after_preflight(
     if not _is_bounded_composite_lifecycle_request(
         route,
         input_text=lifecycle_scope_text or input_text,
+        manual_plan=manual_plan,
     ):
         return None
     if route == "airtable_context_agent":
@@ -2727,9 +3121,11 @@ def _interpreted_lifecycle_scope_text(
     input_text: str,
     manual_plan: ManualRequestPlan | None,
 ) -> str:
-    """Combine raw wording with schema-light LLM interpretation for exact gating."""
+    """Return object-identity text; structured LLM fields carry operations."""
 
     if manual_plan is None:
+        return str(input_text or "")
+    if manual_plan.source == "llm":
         return str(input_text or "")
     parts = [
         str(input_text or ""),
@@ -2815,12 +3211,12 @@ def _preflight_requires_work_item(
     *,
     request_text: str = "",
 ) -> bool:
-    """Require durable state for explicit resumability or multi-owner work."""
+    """Use durable state only when the semantic plan or workflow requires it."""
 
-    effective_request = str(request_text or preflight.request_text or "").strip()
+    del request_text
     return bool(
         len(_preflight_workflow_routes(preflight)) > 1
-        or looks_like_stateful_work_request(effective_request)
+        or preflight.manual_request_plan.requires_durable_state
     )
 
 
@@ -4367,8 +4763,9 @@ def _context_agent_dry_run_output(
     )
     if route == "airtable_context_agent":
         topic_terms = _airtable_context_topic_terms(objective)
-        expense_receipt_target = infer_finance_expense_receipt_target(
-            _finance_receipt_context_input(objective, execution_context)
+        expense_receipt_target = resolve_finance_expense_receipt_target(
+            _finance_receipt_context_input(objective, execution_context),
+            manual_plan=manual_plan,
         )
         finance_tax_focus = _airtable_context_is_finance_tax_request(topic_terms, objective)
         eval_tracker_focus = _airtable_context_is_eval_tracker_request(topic_terms, objective)
@@ -5923,9 +6320,10 @@ def _run_ask_specialist_live(
     database_url: str | None = None,
 ) -> int:
     load_settings(force_dotenv=True)
-    if _is_direct_supplied_response_request(
+    if _should_run_direct_supplied_response(
         input_text,
         requested_route=route,
+        manual_plan=manual_plan,
     ):
         return _run_direct_supplied_context_response_live(
             route,
@@ -6147,6 +6545,7 @@ def _run_ask_context_agent_live(
     airtable_receipt_context = _direct_airtable_receipt_provider_context(
         route,
         input_text,
+        manual_plan=manual_plan,
         execution_context=execution_context,
     )
     if airtable_receipt_context:
@@ -6176,11 +6575,17 @@ def _run_ask_context_agent_live(
             input_text=input_text,
         ),
         "compact_instructions": bool(
-            _direct_specialist_runtime_profile(route, input_text=input_text)[
+            _direct_specialist_runtime_profile(
+                route,
+                input_text=input_text,
+                manual_plan=manual_plan,
+            )[
                 "compact_instructions"
             ]
         ),
     }
+    if route == "airtable_context_agent":
+        build_kwargs["manual_plan"] = manual_plan
     if route == "zotero_context_agent" and provider_context:
         # Provider acquisition is already complete. Keep this synthesis turn
         # tool-free; later thread follow-ups rebuild the agent with its Zotero
@@ -6200,6 +6605,7 @@ def _run_ask_context_agent_live(
         route,
         input_text=input_text,
         live_search=False,
+        manual_plan=manual_plan,
     )
     if direct_turn_limit < turn_policy.max_turns:
         turn_policy = SDKTurnPolicy(
@@ -6268,9 +6674,14 @@ def _run_ask_context_agent_live(
                 "blocked by the tool boundary."
             )
         sdk_input_text = "\n\n".join(sdk_input_parts)
+        sdk_input = sdk_input_from_typed_input(
+            sdk_input_text,
+            live=True,
+            provider=model_config.provider,
+        )
         raw_result, output = run_typed_sdk_sync(
             agent,
-            sdk_input_text,
+            sdk_input,
             output_type,
             live=True,
             session=build_sdk_session(sdk_session_spec) if sdk_session_spec else None,
@@ -6498,7 +6909,10 @@ def _direct_airtable_allowed_operation(
         return ""
     if _chief_workflow_requests_marked_airtable_test_lifecycle(input_text):
         return ""
-    receipt_target = infer_finance_expense_receipt_target(input_text)
+    receipt_target = resolve_finance_expense_receipt_target(
+        input_text,
+        manual_plan=manual_plan,
+    )
     if receipt_target is not None:
         if receipt_target.operation == "create":
             return "create"
@@ -6797,14 +7211,16 @@ def _direct_airtable_receipt_provider_context(
     route: str,
     input_text: str,
     *,
+    manual_plan: ManualRequestPlan | None = None,
     execution_context: dict[str, Any] | None,
 ) -> str:
     """Expose one selected Slack receipt path to the bounded Airtable write tool."""
 
     if route != "airtable_context_agent":
         return ""
-    target = infer_finance_expense_receipt_target(
-        _finance_receipt_context_input(input_text, execution_context)
+    target = resolve_finance_expense_receipt_target(
+        _finance_receipt_context_input(input_text, execution_context),
+        manual_plan=manual_plan,
     )
     if target is None or not target.receipt_local_path:
         return ""
@@ -7311,9 +7727,12 @@ def _airtable_receipt_execution_blocker(
         return ""
     if manual_plan is None or manual_plan.intent != "business_system_write":
         return ""
-    if infer_finance_expense_receipt_target(input_text) is None:
+    target = resolve_finance_expense_receipt_target(
+        input_text,
+        manual_plan=manual_plan,
+    )
+    if target is None:
         return ""
-    target = infer_finance_expense_receipt_target(input_text)
     operation = target.operation if target is not None else "create"
     if operation == "read":
         return ""
@@ -7400,7 +7819,13 @@ def _airtable_write_execution_blocker(
         return ""
     if manual_plan is None or manual_plan.intent != "business_system_write":
         return ""
-    if infer_finance_expense_receipt_target(input_text) is not None:
+    if (
+        resolve_finance_expense_receipt_target(
+            input_text,
+            manual_plan=manual_plan,
+        )
+        is not None
+    ):
         return _airtable_receipt_execution_blocker(
             route,
             input_text,
@@ -7611,6 +8036,7 @@ def _run_ask_company_research_live(
         profile = _direct_specialist_runtime_profile(
             "business_research_analyst",
             input_text=input_text,
+            manual_plan=manual_plan,
         )
         if profile["compact_instructions"]:
             target = (manual_plan.primary_target if manual_plan else "") or input_text[:120]
@@ -7695,6 +8121,7 @@ def _run_ask_company_research_live(
         command,
         route="business_research_analyst",
         input_text=input_text,
+        manual_plan=manual_plan,
     )
     if company_url:
         command.extend(["--company-url", company_url])
@@ -7761,10 +8188,16 @@ def _run_ask_chief_of_staff_live(
         "--input",
         input_text,
         "--live-sdk",
-        "--live-search",
-        "--live-search-plan",
         "--json",
     ]
+    if manual_plan is not None and manual_plan.requires_live_search:
+        command.extend(["--live-search", "--live-search-plan"])
+    if (
+        manual_plan is not None
+        and manual_plan.provider_system != "unspecified"
+        and not manual_plan.requires_live_search
+    ):
+        command.extend(["--quality", "fast"])
     return _run_ask_script_live(
         "chief_of_staff",
         input_text,
@@ -7800,6 +8233,7 @@ def _run_ask_opportunity_scout_live(
         profile = _direct_specialist_runtime_profile(
             "opportunity_scout",
             input_text=input_text,
+            manual_plan=manual_plan,
         )
         if profile["compact_instructions"]:
             command = [
@@ -7862,6 +8296,7 @@ def _run_ask_opportunity_scout_live(
         command,
         route="opportunity_scout",
         input_text=input_text,
+        manual_plan=manual_plan,
     )
     return _run_ask_script_live(
         "opportunity_scout",
@@ -7892,6 +8327,7 @@ def _run_ask_gmail_triage_live(
     if _is_bounded_composite_lifecycle_request(
         "gmail_triage",
         input_text=input_text,
+        manual_plan=manual_plan,
     ):
         return _run_direct_gmail_test_draft_lifecycle(
             input_text,
@@ -7900,7 +8336,10 @@ def _run_ask_gmail_triage_live(
             orchestrator_preflight=orchestrator_preflight,
             database_url=database_url,
         )
-    gmail_plan = infer_gmail_execution_plan(input_text)
+    gmail_plan = resolve_gmail_execution_plan(
+        input_text,
+        manual_plan=manual_plan,
+    )
     thread_execution_text = specialist_execution_context_text(execution_context)
     if gmail_plan.operation == "update_draft" and not (
         gmail_plan.draft_subject_hint or gmail_plan.draft_recipient_hint
@@ -7996,6 +8435,7 @@ def _run_ask_gmail_triage_live(
             command,
             route="gmail_triage",
             input_text=input_text,
+            manual_plan=manual_plan,
         )
         if gmail_plan.draft_subject_hint:
             command.extend(["--draft-subject-hint", gmail_plan.draft_subject_hint])
@@ -8034,9 +8474,53 @@ def _run_ask_gmail_triage_live(
             command,
             route="gmail_triage",
             input_text=input_text,
+            manual_plan=manual_plan,
         )
         if gmail_plan.gmail_query:
             command.extend(["--gmail-query", gmail_plan.gmail_query])
+        return _run_ask_script_live(
+            "gmail_triage",
+            input_text,
+            command,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
+            agent_execution_plan=gmail_plan.model_dump(mode="json"),
+            cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
+        )
+    if (
+        gmail_plan.operation in {"single_message_triage", "thread_summary"}
+        and gmail_plan.live_read_required
+        and explicit_fixture_path is None
+        and inline_fixture is None
+        and not thread_execution_text
+    ):
+        command = [
+            sys.executable,
+            "scripts/run_gmail_triage.py",
+            "--live-gmail",
+            "--allow-inbox",
+            "--no-dry-run",
+            "--live-sdk",
+            "--json",
+            "--request",
+            input_text,
+            "--max-messages",
+            str(gmail_plan.max_messages),
+        ]
+        if gmail_plan.operation == "thread_summary":
+            command.append("--thread-summary")
+        if gmail_plan.gmail_query:
+            command.extend(["--gmail-query", gmail_plan.gmail_query])
+        _append_compact_direct_flag(
+            command,
+            route="gmail_triage",
+            input_text=input_text,
+            manual_plan=manual_plan,
+        )
         return _run_ask_script_live(
             "gmail_triage",
             input_text,
@@ -8075,6 +8559,7 @@ def _run_ask_gmail_triage_live(
             command,
             route="gmail_triage",
             input_text=input_text,
+            manual_plan=manual_plan,
         )
         if gmail_plan.create_gmail_drafts:
             expected_account = _configured_gmail_draft_account()
@@ -8200,6 +8685,7 @@ def _run_ask_gmail_triage_live(
         command,
         route="gmail_triage",
         input_text=input_text,
+        manual_plan=manual_plan,
     )
     if inline_fixture is not None and explicit_fixture_path is None:
         if inline_fixture.subject:
@@ -8845,6 +9331,7 @@ def _run_ask_outreach_composer_live(
         command,
         route="outreach_composer",
         input_text=input_text,
+        manual_plan=manual_plan,
     )
     return _run_ask_script_live(
         "outreach_composer",
@@ -9084,18 +9571,28 @@ def _run_ask_script_live(
         human_summary = _payload_human_summary(script_payload)
     else:
         interpreted_constraints = output_constraints_from_plan(manual_plan)
+        verified_provider_summary = _verified_child_provider_summary(script_payload)
         candidate_summary = (
-            _payload_human_summary(script_payload)
+            verified_provider_summary
+            or _payload_human_summary(script_payload)
             if interpreted_constraints.has_deterministic_requirements()
             else _strict_requested_display_text(output, manual_plan)
             or _payload_human_summary(script_payload)
         )
+        if verified_provider_summary:
+            candidate_summary = verified_provider_summary
         instruction_resolution = resolve_instruction_following_response(
             candidate_summary,
             original_request=input_text,
             manual_plan=manual_plan,
             bounded_evidence=json.dumps(
-                output if output is not None else script_payload,
+                (
+                    script_payload
+                    if verified_provider_summary
+                    else output
+                    if output is not None
+                    else script_payload
+                ),
                 ensure_ascii=True,
                 sort_keys=True,
             ),
@@ -9248,6 +9745,34 @@ def _payload_human_summary(payload: object) -> str:
         if isinstance(nested, str) and nested.strip():
             return nested.strip()
     return ""
+
+
+def _verified_child_provider_summary(payload: object) -> str:
+    """Return receipt-backed child copy before unverified nested model prose."""
+
+    if not isinstance(payload, dict):
+        return ""
+    if payload.get("user_facing_result_verified") is not True:
+        return ""
+    receipts = payload.get("tool_receipts")
+    if not isinstance(receipts, list) or not any(
+        isinstance(receipt, dict) for receipt in receipts
+    ):
+        return ""
+    public_result = payload.get("public_result")
+    if not isinstance(public_result, dict):
+        return ""
+    if (
+        public_result.get("completion_confirmed") is not True
+        or str(public_result.get("status") or "") != "completed"
+    ):
+        return ""
+    if (
+        public_result.get("provider_write_attempted") is True
+        and public_result.get("provider_receipt_verified") is not True
+    ):
+        return ""
+    return _payload_human_summary(payload)
 
 
 def _payload_retrieval_diagnostics(payload: object) -> dict[str, object]:

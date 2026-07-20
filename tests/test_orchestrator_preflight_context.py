@@ -455,3 +455,24 @@ def test_preflight_memo_includes_temporal_depth_policy() -> None:
     assert {"latest", "2026"}.issubset(set(policy["trigger_terms"]))
     assert policy["independent_validation"] == "required_when_available"
     assert "not enough evidence yet" in policy["completion_rule"]
+
+
+def test_preflight_memo_does_not_treat_calendar_now_as_web_freshness() -> None:
+    env = orchestrator_preflight_env(
+        {
+            "request_text": "Is it on the calendar now?",
+            "advisory_only": True,
+            "execution_allowed": True,
+            "manual_request_plan": {
+                "provider_system": "google_calendar",
+                "requires_live_search": False,
+            },
+            "route_result": {"route": "chief_of_staff", "refused": False},
+        }
+    )
+
+    preflight = json.loads(env[ORCHESTRATOR_PREFLIGHT_ENV])
+    policy = preflight["preflight_memo"]["temporal_depth_policy"]
+
+    assert policy["temporal_intent"] is False
+    assert policy["trigger_terms"] == []
