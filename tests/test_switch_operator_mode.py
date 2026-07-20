@@ -52,6 +52,8 @@ def test_dry_run_profile_updates_known_keys_and_preserves_unrelated_content(tmp_
     assert "KEYSTONE_ENABLE_LIVE_CRM=false" in text
     assert "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=false" in text
     assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
+    assert "KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=crawl4ai,firecrawl" in text
+    assert "KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN=0" in text
     assert "SEARXNG_BASE_URL=http://127.0.0.1:18080" in text
     assert "KEYSTONE_SEARXNG_TRANSIENT=true" in text
     assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text
@@ -92,6 +94,8 @@ def test_live_test_profile_replaces_existing_serper_default_with_searxng(tmp_pat
     assert "SEARCH_PROVIDER=searxng" in text
     assert "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true" in text
     assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
+    assert "KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=crawl4ai,firecrawl" in text
+    assert "KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN=1" in text
     assert "SEARXNG_BASE_URL=http://127.0.0.1:18080" in text
     assert "KEYSTONE_SEARXNG_TRANSIENT=true" in text
     assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text
@@ -116,6 +120,8 @@ def test_live_test_profile_can_explicitly_select_exa(tmp_path) -> None:
     assert "SEARCH_PROVIDER=exa" in text
     assert "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true" in text
     assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
+    assert "KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=crawl4ai,firecrawl" in text
+    assert "KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN=1" in text
     assert "SEARXNG_BASE_URL=http://127.0.0.1:18080" in text
     assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text
     assert "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN=2" in text
@@ -141,6 +147,8 @@ def test_full_live_profile_creates_missing_env_file_with_expected_values(tmp_pat
     assert "KEYSTONE_ENABLE_LIVE_CRM=false" in text
     assert "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true" in text
     assert "KEYSTONE_WEBSITE_EXTRACTOR=trafilatura" in text
+    assert "KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=crawl4ai,firecrawl" in text
+    assert "KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN=1" in text
     assert "SEARXNG_BASE_URL=http://127.0.0.1:18080" in text
     assert "KEYSTONE_SEARXNG_TRANSIENT=true" in text
     assert "KEYSTONE_EXA_SEARCH_FALLBACK=true" in text

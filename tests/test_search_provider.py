@@ -124,6 +124,20 @@ class SearxngMixedSafetyResponse:
         }
 
 
+class SearxngUnavailableEnginesResponse:
+    status_code = 200
+
+    def json(self) -> dict[str, object]:
+        return {
+            "results": [],
+            "unresponsive_engines": [
+                ["brave", "Suspended: too many requests"],
+                ["duckduckgo", "CAPTCHA"],
+                ["google", "Suspended: CAPTCHA"],
+            ],
+        }
+
+
 class ExaSearchResponse:
     status_code = 200
 
@@ -583,6 +597,27 @@ def test_searxng_provider_reports_request_endpoint_and_exception_type(
     assert "http://127.0.0.1:18080/search" in message
     assert "ConnectionError" in message
     assert "connection refused" in message
+
+
+def test_searxng_provider_treats_zero_results_with_unavailable_engines_as_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "keystone_agents.tools.search_provider.requests.get",
+        lambda *_args, **_kwargs: SearxngUnavailableEnginesResponse(),
+    )
+    provider = SearxngSearchProvider(
+        live=True,
+        base_url="http://127.0.0.1:18080",
+        timeout_seconds=2.0,
+    )
+
+    with pytest.raises(SearxngSearchError, match="search engines were unavailable") as excinfo:
+        provider.search_web("clinical AI virtual workshop 2026", num_results=3)
+
+    message = str(excinfo.value)
+    assert "brave (Suspended: too many requests)" in message
+    assert "duckduckgo (CAPTCHA)" in message
 
 
 def test_searxng_structured_search_passes_categories_time_language_and_page(

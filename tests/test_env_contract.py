@@ -25,6 +25,11 @@ def test_env_contract_lists_child_runtime_keys_with_safety_metadata() -> None:
     assert by_name["KNI_BUSINESS_AGENTS_LANGGRAPH"]["secret"] is False
     assert by_name["SEARXNG_BASE_URL"]["category"] == "search"
     assert by_name["KEYSTONE_ORCHESTRATOR_MODEL"]["category"] == "model"
+    assert by_name["AIRTABLE_ALLOW_TEST_DELETES"]["category"] == "safety"
+    assert (
+        by_name["KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE"]["category"]
+        == "safety"
+    )
     assert "read environment values" in contract["notes"][0]
 
 

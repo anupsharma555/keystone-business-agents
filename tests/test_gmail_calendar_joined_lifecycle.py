@@ -83,6 +83,7 @@ def test_joined_gmail_calendar_lifecycle_verifies_and_cleans_up(monkeypatch) -> 
         query="bounded event query",
         max_messages=5,
         calendar_id="primary",
+        today=date(2026, 7, 11),
     )
 
     assert result["status"] == "pass"

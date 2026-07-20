@@ -46,57 +46,57 @@ SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "89486fa423c7635bf00d80387ad5b207e2e9da7d5427af2effe938c8946cd4e9",
-        "tool_names_sha256": "b97b3dda055d85e98d851db73b3015000dca0c65fb172be0e1f60fa6e2b14e42",
-        "output_schema_sha256": "519be6127e040ff904066e7dd8efe671ce88a3c4c527bdcb730a6e5f131d3345",
+        "instructions_sha256": "6128f9275b9cca7432ccc7e3cb467440daf867cd975e2388e2e02ac65a4dfcce",
+        "tool_names_sha256": "ee36d9e7d7f2340fc94887c18d726abe4ce97e82f18d0b5ce189a04b8268f8ea",
+        "output_schema_sha256": "e1a026effe1e04882613026e7e6a2e27da7de6c51e1dde08289c88462866e4f5",
     },
     "business_research_analyst": {
-        "instructions_sha256": "5df1682344565f30f7f93c73ee96af46484d3bab6867affe9d2e0a3e87a01c71",
+        "instructions_sha256": "aded6ce64c12396f51327dc9f4ccba2f8ee99581fd99b3996f3455f3acde7b25",
         "tool_names_sha256": "a9f26c0e0237174742fdc53f1c4e7ce5c8936f492b353f5ef6e3adfb4c34a35e",
-        "output_schema_sha256": "b8218a333d85d2f3850203f5ee48b7ec535a6f924a8851c513f1f2b2afeef6e0",
+        "output_schema_sha256": "2692dd7ff8ec994408d46ce397c174fa115bf7cf19453cbe6a4a4ad5d303667d",
     },
     "opportunity_scout": {
-        "instructions_sha256": "f87f46790d41cd896e056d98877b0b0dd188b7374dbe798ee7094a82bacb8567",
+        "instructions_sha256": "926aa43649ab9c1f49097eba991c1886cea5e655f215fb3833613df6019a001a",
         "tool_names_sha256": "ace37ad8d7eef4c988ac31f6848c03a502b9dfb1efe502400c1720e9cc194ce1",
-        "output_schema_sha256": "eea0e07dc95ce476794bae691207f241c160ab5e5e22c18036030f137ce907fc",
+        "output_schema_sha256": "4af554b78c7f1ed345bf17c96c42e83198632aa244f5989bdf4c9e26cfa4bc5d",
     },
     "outreach_composer": {
-        "instructions_sha256": "0bcf141203edda855b958029c11ddffd0d4dc0c32dc71847eb4ee48bf165bc4f",
+        "instructions_sha256": "06ca698ce0d301e0ba783b16c9b8c3d7c6bafa873035ff5436e3b1defcee96af",
         "tool_names_sha256": "6092ed57d03b82170c380457199725a537ab0d16cf199a5393920a1b096815fe",
-        "output_schema_sha256": "167da45f0bb07c0a255c4115b52e9510272a22cc1c479abe9e97c88693d44b34",
+        "output_schema_sha256": "3f8204f88ba20d29b12d01686c2a7bb7e08b036464d23fcac49dc35570d81ea4",
     },
     "airtable_context_agent": {
-        "instructions_sha256": "c111ee36dbcf0dffe496def016046b2d1b2eabc15e911dbec19e48b555583c5a",
-        "tool_names_sha256": "ed16e9723a4e18dfc9651d0320d9cd10e9056b06dce5c60a9c5f0044ab36b998",
+        "instructions_sha256": "eb3fac4ad1e1c8fbfaa34e97efbf8482ee015854fcd426c3c5958adbec098b6c",
+        "tool_names_sha256": "c82ec575dd75a80622321d7595728b610434f9792e5d6816c326f18aded20866",
         "output_schema_sha256": "7d4017a4e6833b52f2c408fe16352594a5fa2b393e740433a25b77b2934c4984",
     },
     "google_workspace_context_agent": {
-        "instructions_sha256": "d1955f30061601e2c4a21f138041f62328892f18b49ebc02e7746050e53a2631",
-        "tool_names_sha256": "37563d600dab82f4c57154b5a74f90272db02e509bba9f0e117659d0149a8aae",
-        "output_schema_sha256": "1b82a4db79f4e9f017351bafb57dbad7399b5c05e6e7ba528d97abbe7f1be506",
+        "instructions_sha256": "c41e05475f1a84d1c6778d3ceb6a3c00ab36331ecc658e8f45082148464bbfc9",
+        "tool_names_sha256": "de65bc3bd0d7a52816c8aa81108ba89fc9c3ac1f230b83ac92348d8646cb8f00",
+        "output_schema_sha256": "0867caddb9fe5c3340ac958ea02ddb62d972f31d5f164f9fbc722d55386c55c8",
     },
     "zotero_context_agent": {
-        "instructions_sha256": "e111db03587d6d74f3b12a5ab47d67bab65195c4fdf0bd5fbd10da6be1614a07",
-        "tool_names_sha256": "a75e6b6a2d3991af1d02b9d4ffc7af2ba89e240791382ca696117959176455c4",
+        "instructions_sha256": "5341ee5d81d3d9a03fa80eaeabd4aa71a5d4e0dac931ef1775a9440a09e11216",
+        "tool_names_sha256": "157efe138d475b9b0eb13961c0e598b47f58037480732babd614b98019ecc526",
         "output_schema_sha256": "efa1b731da05cfd915b319d730cf84019d76dd22d0a5f199818546deedac5bb8",
     },
     "rss_context_agent": {
-        "instructions_sha256": "b7763763edeb1ca0ac72358383cba19a67e1d363a00d6af2411657fba029d41c",
+        "instructions_sha256": "df23697a6e76f3866a8bb86f9b240541b67bcd7f6588815178f32eb0e1f28496",
         "tool_names_sha256": "f31fcf99ce67500ab85ceb6130f6c81c8fdeea9668c82ffd10eaf4862b47a55f",
         "output_schema_sha256": "c81421b84589b67baca97d6ae5bc0a8468adbe9bd3b10d1c13639a3148d68936",
     },
     "preprints_context_agent": {
-        "instructions_sha256": "09202172bff8e756ae3549a4455d20ee58a036396284bd28faae6a9df1de9eee",
+        "instructions_sha256": "1607a2db59ead8ac7850f0c747741c7bd7519c12f8ca5cabee469b5f8653cc48",
         "tool_names_sha256": "985bb3e5f395ac4fdab0e2243e450e60eaeab20c34646431415a94dbbb9bef08",
         "output_schema_sha256": "0c360ba87ef900bd5c658029374a445b6c14c22b9067207d8b7ad083c4b1d702",
     },
     "orchestrator": {
-        "instructions_sha256": "f8fc7e4111c8fe465b76b08ec81e128c9ab4e9a4ba757ec9c46e5d5994e54cbf",
+        "instructions_sha256": "ccdb00b9b3d488edbbc80d66e510e7505ece919c4dce0ceab9c4b667d60329c9",
         "tool_names_sha256": "d1452b1d9a45ccd89c167d726fc4d4cdf612b8834f6616f7e08524efa4ae0817",
         "output_schema_sha256": "98f0e154658a465df86c498fbf9b1a6c84028fbd02eedef97d1549ef5b5887e7",
     },
     "chief_of_staff": {
-        "instructions_sha256": "66cd0a1f8e8ef855fb66b16a13372795dfbddea426146e0fbd85d44409727196",
+        "instructions_sha256": "77945a69bc9131be7f61c5a2a30e041c963c3a318c9afd4066fe1407e6113b30",
         "tool_names_sha256": "5d10d910810cfa07005226805bbaf378f7420af4d3133d8d88d9db8667f804ff",
         "output_schema_sha256": "c172f11e63550cf751d67a22c72020c661cf35d7a9f6b118274dd7ffdea1e5b9",
     },
@@ -272,6 +272,7 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
         "google_doc_read",
         "google_doc_write",
         "google_doc_trash",
+        "google_doc_test_lifecycle",
         "google_drive_list_folder",
         "google_drive_search_files",
         "google_drive_get_file_metadata",
@@ -300,6 +301,7 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
         "read_local_context_file",
         "zotero_resolve_collection_context",
         "zotero_resolve_article_context",
+        "zotero_list_cached_items",
         "zotero_read_api_metadata",
         "zotero_import_article_with_backend",
         "zotero_write_test_note",
@@ -343,6 +345,7 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     assert tool_tier_for_name("delete_google_calendar_event") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("google_doc_write") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("google_doc_trash") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("google_doc_test_lifecycle") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("presentation_extract_slide_copy_local") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("presentation_delete_test_artifact_local") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("zotero_import_article_with_backend") == ToolTier.INTERNAL_WRITE
@@ -555,6 +558,130 @@ def test_registered_agent_static_prefix_fingerprints_are_stable(monkeypatch) -> 
         assert "<!-- repo_runtime_policy.md -->" in str(first_agent.instructions)
         assert "<!-- AGENTS.md -->" not in str(first_agent.instructions)
         assert "<!-- safety_policy.md -->" in str(first_agent.instructions)
+
+
+@pytest.mark.parametrize(
+    ("route", "source_prompt"),
+    [
+        ("airtable_context_agent", "airtable_context.md"),
+        ("google_workspace_context_agent", "google_workspace_context.md"),
+        ("zotero_context_agent", "zotero_context.md"),
+        ("rss_context_agent", "rss_context.md"),
+        ("preprints_context_agent", "preprints_context.md"),
+    ],
+)
+def test_context_agents_have_compact_direct_instruction_profiles(
+    route: str,
+    source_prompt: str,
+) -> None:
+    full = AGENT_REGISTRY[route].build_agent(request_text="read one exact source")
+    compact = AGENT_REGISTRY[route].build_agent(
+        request_text="read one exact source",
+        tool_tier="core_read",
+        compact_instructions=True,
+    )
+    full_text = str(full.instructions)
+    compact_text = str(compact.instructions)
+
+    assert len(compact_text) < len(full_text) * 0.55
+    assert "<!-- memory_policy.md -->" in compact_text
+    assert "<!-- writing_style.md -->" in compact_text
+    assert "<!-- safety_policy.md -->" in compact_text
+    assert f"<!-- {source_prompt} -->" in compact_text
+    assert "<!-- tools.md -->" not in compact_text
+    assert "<!-- slack-posting-rules.md -->" not in compact_text
+
+
+def test_direct_zotero_read_catalog_is_request_scoped() -> None:
+    article = AGENT_REGISTRY["zotero_context_agent"].build_agent(
+        request_text="For the same Zotero article, read its notes and attached PDF.",
+        tool_tier="core_read",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(article) == {
+        "zotero_read_api_metadata",
+        "zotero_resolve_article_context",
+        "zotero_read_item_children",
+        "zotero_read_pdf_attachment_text",
+    }
+
+
+def test_direct_google_workspace_read_catalog_is_request_scoped() -> None:
+    doc = AGENT_REGISTRY["google_workspace_context_agent"].build_agent(
+        request_text="Read one exact Google Doc and summarize it.",
+        tool_tier="core_read",
+        compact_instructions=True,
+    )
+    sheet = AGENT_REGISTRY["google_workspace_context_agent"].build_agent(
+        request_text="Read one exact Google Sheet table and summarize its rows.",
+        tool_tier="core_read",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(doc) == {
+        "google_drive_search_files",
+        "google_drive_get_file_metadata",
+        "google_doc_read",
+    }
+    assert _tool_names(sheet) == {
+        "google_drive_search_files",
+        "google_sheet_list",
+        "google_sheet_read_table",
+    }
+
+
+def test_direct_google_workspace_write_catalog_is_target_and_operation_scoped() -> None:
+    doc = AGENT_REGISTRY["google_workspace_context_agent"].build_agent(
+        request_text="Update one exact Google Doc after reading its current content.",
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+    sheet = AGENT_REGISTRY["google_workspace_context_agent"].build_agent(
+        request_text="Append one approved row to an exact Google Sheet.",
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(doc) == {
+        "google_drive_search_files",
+        "google_drive_get_file_metadata",
+        "google_doc_read",
+        "google_doc_write",
+    }
+    assert _tool_names(sheet) == {
+        "google_drive_search_files",
+        "google_sheet_list",
+        "google_sheet_read_table",
+        "google_sheet_append_rows",
+    }
+
+
+def test_direct_zotero_write_catalog_preserves_native_mutation_boundary() -> None:
+    ordinary_note = AGENT_REGISTRY["zotero_context_agent"].build_agent(
+        request_text="Add a note to this exact Zotero article.",
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+    test_lifecycle = AGENT_REGISTRY["zotero_context_agent"].build_agent(
+        request_text=(
+            "Create, revise, and remove one marked KBA_TEST_NOTE Zotero note lifecycle."
+        ),
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(ordinary_note) == {
+        "zotero_read_api_metadata",
+        "zotero_resolve_article_context",
+        "zotero_read_item_children",
+    }
+    assert "zotero_write_test_note" not in _tool_names(ordinary_note)
+    assert _tool_names(test_lifecycle) == {
+        "zotero_read_api_metadata",
+        "zotero_read_item_children",
+        "zotero_test_note_lifecycle",
+    }
 
 
 def test_orchestrator_registry_declares_read_only_specialist_tools() -> None:

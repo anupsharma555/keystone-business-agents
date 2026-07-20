@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -317,6 +318,26 @@ def test_database_initializes_expected_tables(tmp_path) -> None:
     store = SQLiteStore(_database_url(tmp_path))
 
     assert EXPECTED_TABLES <= store.table_names()
+
+
+def test_managed_connection_closes_file_backed_connection(tmp_path) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+
+    with store.managed_connection() as connection:
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connection.execute("SELECT 1")
+
+
+def test_store_context_closes_persistent_memory_connection() -> None:
+    with SQLiteStore(":memory:") as store:
+        connection = store.connect()
+        assert store.table_names()
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connection.execute("SELECT 1")
 
 
 def test_announcement_feed_items_dedupe_by_publication_id_and_query(tmp_path) -> None:
@@ -674,7 +695,7 @@ def test_contact_storage_redacts_secrets_and_sensitive_personal_notes(tmp_path) 
     )
 
     contact = store.list_contacts(company_name="NeuroFlow")[0]
-    with sqlite3.connect(store.path) as connection:
+    with closing(sqlite3.connect(store.path)) as connection:
         dump = "\n".join(connection.iterdump())
 
     assert "Patient Jane Doe" not in contact.notes
@@ -764,7 +785,7 @@ def test_approval_records_redact_source_agent_notes_and_risk_flags(tmp_path) -> 
         source_agent="agent-secret=SHOULD_NOT_APPEAR_333333333",
     )
 
-    with sqlite3.connect(store.path) as connection:
+    with closing(sqlite3.connect(store.path)) as connection:
         dump = "\n".join(connection.iterdump())
 
     assert "SHOULD_NOT_APPEAR" not in dump
@@ -875,7 +896,7 @@ def test_storage_tool_records_blocked_tool_event(tmp_path) -> None:
 
     events = tool.list_tool_events(status="error")
     event = events[0]
-    with sqlite3.connect(tool.store.path) as connection:
+    with closing(sqlite3.connect(tool.store.path)) as connection:
         dump = "\n".join(connection.iterdump())
 
     assert len(events) == 1
@@ -964,7 +985,7 @@ def test_agent_run_step_logs_save_and_query_redacted_summaries(tmp_path) -> None
 
     logs = store.list_agent_run_logs(run_id="pipeline-run-1")
     log = logs[0]
-    with sqlite3.connect(store.path) as connection:
+    with closing(sqlite3.connect(store.path)) as connection:
         dump = "\n".join(connection.iterdump())
 
     assert row_id == 1
@@ -1004,7 +1025,7 @@ def test_storage_audit_hashes_body_like_fields_and_redacts_secret_strings(tmp_pa
     )
 
     log = store.list_agent_run_logs(run_id="hygiene-run-1")[0]
-    with sqlite3.connect(store.path) as connection:
+    with closing(sqlite3.connect(store.path)) as connection:
         dump = "\n".join(connection.iterdump())
 
     assert "content_hash" in log["input_summary"]
@@ -1036,7 +1057,7 @@ def test_failed_agent_run_step_log_redacts_error_and_payload(tmp_path) -> None:
     )
 
     log = store.list_agent_run_logs(status="error")[0]
-    with sqlite3.connect(store.path) as connection:
+    with closing(sqlite3.connect(store.path)) as connection:
         dump = "\n".join(connection.iterdump())
 
     assert log["status"] == "error"
@@ -1083,7 +1104,7 @@ def test_tool_events_save_and_query_redacted_summaries(tmp_path) -> None:
 
     events = store.list_tool_events(run_id="run-123")
     event = events[0]
-    with sqlite3.connect(store.path) as connection:
+    with closing(sqlite3.connect(store.path)) as connection:
         dump = "\n".join(connection.iterdump())
 
     assert row_id == 1
@@ -1127,7 +1148,7 @@ def test_no_secrets_are_saved(tmp_path) -> None:
         snippet="secret=SHOULD_NOT_APPEAR_000000000",
     )
 
-    with sqlite3.connect(store.path) as connection:
+    with closing(sqlite3.connect(store.path)) as connection:
         dump = "\n".join(connection.iterdump())
 
     assert "SHOULD_NOT_APPEAR" not in dump
@@ -1169,7 +1190,7 @@ def test_email_storage_summarizes_body_and_draft_reply(tmp_path) -> None:
     )
 
     triage_json = json.loads(store.fetch_all("emails")[0]["triage_json"])
-    with sqlite3.connect(store.path) as connection:
+    with closing(sqlite3.connect(store.path)) as connection:
         dump = "\n".join(connection.iterdump())
 
     assert "body" not in triage_json
@@ -1199,7 +1220,7 @@ def test_outreach_draft_stores_redacted_full_body_for_approval(tmp_path) -> None
 
     row = store.fetch_all("outreach_drafts")[0]
     draft_json = json.loads(row["draft_json"])
-    with sqlite3.connect(store.path) as connection:
+    with closing(sqlite3.connect(store.path)) as connection:
         dump = "\n".join(connection.iterdump())
 
     assert "approval artifact" in OUTREACH_EMAIL_BODY_STORAGE_NOTE

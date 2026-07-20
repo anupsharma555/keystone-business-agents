@@ -239,6 +239,65 @@ def test_company_live_retrieval_defaults_to_searxng_with_hosted_parallel_lane(
     assert ladder["browserless"]["use_frequency"] == "eval_only"
 
 
+def test_company_live_retrieval_quick_profile_limits_queries_and_skips_page_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    queries_seen: list[str] = []
+
+    class FakeProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            queries_seen.append(query)
+            return [
+                SearchResult(
+                    title="Abridge clinical documentation",
+                    link="https://www.abridge.com/",
+                    snippet="Abridge provides ambient clinical documentation software.",
+                    source="searxng",
+                )
+            ]
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "_extract_company_website_inputs",
+        lambda **_kwargs: pytest.fail("quick retrieval must not extract selected pages"),
+    )
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "false")
+
+    profile, metadata = live_retrieval.retrieve_company_profile_live(
+        company="Abridge",
+        request_text="Who is Abridge? Summarize the company in 20 words.",
+        requested_provider="searxng",
+        max_results=2,
+        agents_web_search_parallel=False,
+        tavily_search_fallback=False,
+        exa_search_fallback=False,
+        extract_selected_pages=False,
+        max_queries=2,
+        settings_loader=lambda: SimpleNamespace(
+            search_provider="searxng",
+            serper_enabled=False,
+            website_extractor="trafilatura",
+        ),
+        query_builder=lambda _company, _url: ["query one", "query two", "query three"],
+        search_provider_builder=lambda provider=None, *, live=False: FakeProvider(),
+        profile_builder=lambda **_kwargs: CompanyProfile(
+            name="Abridge",
+            website="https://www.abridge.com/",
+            description="Ambient clinical documentation software.",
+        ),
+    )
+
+    assert profile.name == "Abridge"
+    assert queries_seen == ["query one", "query two"]
+    assert metadata["search_queries"] == ["query one", "query two"]
+    assert metadata["search_deepening_provider_sequence"] == []
+    assert metadata["deepening_search_used"] is False
+    assert metadata["website_extraction"]["mode"] == "skipped_quick_retrieval"
+    assert metadata["timing"]["website_extraction_count"] == 0
+
+
 def test_company_live_retrieval_uses_shared_exa_cap_across_expanded_queries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -716,6 +775,7 @@ def test_company_live_retrieval_can_fallback_to_firecrawl(
 
     monkeypatch.setenv("KEYSTONE_ENABLE_WEBSITE_EXTRACTION", "true")
     monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", "firecrawl")
+    monkeypatch.setenv("KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN", "1")
     monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES", "1")
     monkeypatch.setattr(
         live_retrieval,
@@ -746,6 +806,8 @@ def test_company_live_retrieval_can_fallback_to_firecrawl(
     )
 
     assert metadata["website_extraction"]["page_count"] == 1
+    assert metadata["website_extraction"]["firecrawl_call_cap"] == 1
+    assert metadata["website_extraction"]["firecrawl_calls_attempted"] == 1
     assert profile.description == "firecrawl"
 
 
@@ -773,6 +835,7 @@ def test_company_live_retrieval_skips_failed_website_extraction_page(
 
     monkeypatch.setenv("KEYSTONE_ENABLE_WEBSITE_EXTRACTION", "true")
     monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", "firecrawl")
+    monkeypatch.setenv("KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN", "1")
     monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES", "1")
     monkeypatch.setattr(
         live_retrieval,
@@ -802,6 +865,7 @@ def test_company_live_retrieval_skips_failed_website_extraction_page(
 
     assert profile.description == "website_inputs=0"
     assert metadata["website_extraction"]["page_count"] == 0
+    assert metadata["website_extraction"]["firecrawl_calls_attempted"] == 1
     assert (
         "fallback firecrawl: fallback provider unavailable"
         in metadata["website_extraction"]["errors"][0]

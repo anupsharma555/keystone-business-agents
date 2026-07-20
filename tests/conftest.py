@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,9 @@ LOCAL_HOSTS = {"", "0.0.0.0", "127.0.0.1", "::1", "localhost", None}
 
 os.environ.setdefault("PYTHON_DOTENV_DISABLED", "1")
 os.environ.setdefault("KEYSTONE_TEST_MODE", "1")
+_TEST_STATE_DIRECTORY = tempfile.TemporaryDirectory(prefix="kba-pytest-state-")
+_TEST_DATABASE_PATH = Path(_TEST_STATE_DIRECTORY.name) / "keystone_agents.db"
+os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DATABASE_PATH}"
 
 LIVE_ENV_KEYS = (
     "KEYSTONE_LIVE_MODE",
@@ -37,6 +41,7 @@ LIVE_ENV_KEYS = (
     "KEYSTONE_ENABLE_WEBSITE_EXTRACTION",
     "KEYSTONE_WEBSITE_EXTRACTOR",
     "KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK",
+    "KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN",
     "KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES",
 )
 

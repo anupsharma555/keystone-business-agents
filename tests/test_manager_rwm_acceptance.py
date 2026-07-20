@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
@@ -11,6 +14,7 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefSpecialistToolInput,
 )
 from keystone_agents.schemas.orchestrator import OrchestratorResult
+from scripts import run_chief_of_staff as chief_script
 
 
 def _orchestrate(request: str) -> OrchestratorResult:
@@ -183,3 +187,71 @@ def test_chief_schema_blocks_unscoped_post_and_direct_send() -> None:
             slack_post_policy="requires_human_review",
             slack_target_channel="general",
         )
+
+
+def test_chief_calendar_completion_preserves_slack_renderer_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = SimpleNamespace(
+        operation="update",
+        title="",
+        event_reference="KBA_TEST_CALENDAR_COS_0718",
+        start_date="",
+        start_time="15:00",
+        end_time="15:30",
+        description="revised through the same natural Slack thread",
+    )
+    monkeypatch.setattr(
+        chief_script,
+        "execute_direct_calendar_action",
+        lambda *_args, **_kwargs: {
+            "status": "done",
+            "calendar_action": vars(plan),
+            "calendar_lookup": {
+                "title": "KBA_TEST_CALENDAR_COS_0718",
+                "start_date": "2026-07-24",
+            },
+            "tool_receipt": {
+                "operation": "update",
+                "title": "KBA_TEST_CALENDAR_COS_0718",
+                "start_date": "2026-07-24",
+                "start_time": "15:00",
+                "end_time": "15:30",
+                "event_id": "event-test-id",
+                "html_link": "https://calendar.example.test/event",
+                "verification": {"passed": True},
+            },
+            "side_effects": {"calendar_write_performed": True},
+        },
+    )
+
+    exit_code = chief_script._run_interpreted_calendar_action(
+        input_text="move that same event and revise its note",
+        plan=plan,
+        json_output=True,
+        openai_requests=1,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["output"]["summary"].startswith(
+        "Updated KBA_TEST_CALENDAR_COS_0718"
+    )
+    assert payload["output"]["recommended_route"]["workflow_type"] == (
+        "calendar-action-complete"
+    )
+    recommended_actions = payload["output"]["recommended_actions"]
+    assert "event-test-id" not in json.dumps(recommended_actions)
+    assert "calendar.example.test" not in json.dumps(recommended_actions)
+    assert recommended_actions == [
+        (
+            'Calendar note verified from the requested update: '
+            '"revised through the same natural Slack thread".'
+        ),
+        "The existing event was modified; no duplicate event was created.",
+    ]
+    assert payload["tool_receipt"]["verification"]["passed"] is True
+    assert payload["tool_receipt"]["event_id"] == "event-test-id"
+    assert payload["tool_receipt"]["html_link"] == "https://calendar.example.test/event"
+    assert payload["usage"]["requests"] == 1

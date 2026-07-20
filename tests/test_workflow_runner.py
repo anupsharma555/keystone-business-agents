@@ -24,6 +24,7 @@ from keystone_agents.orchestrator.preflight_context import compact_orchestrator_
 from keystone_agents.quality_budget import QualityMode
 from keystone_agents.reporting import render_work_item_result_text
 from keystone_agents.schemas.approval import ApprovalQueueStatus, ApprovalState
+from keystone_agents.schemas.automation import ChiefOfStaffWriteRequest
 from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
@@ -50,6 +51,7 @@ from keystone_agents.schemas.work_item import (
     WorkItem,
     WorkItemApprovalGate,
     WorkItemArtifactRef,
+    WorkItemEvent,
     WorkItemKind,
     WorkItemNextAction,
     WorkItemRoute,
@@ -72,6 +74,150 @@ from keystone_agents.work_items import (
     set_next_action,
 )
 from keystone_agents.workflow_runner import advance_work_item, advance_work_item_manager_loop
+
+
+def test_workitem_context_pack_preserves_llm_plan_constraints() -> None:
+    request_text = (
+        "Find current behavioral-health AI opportunities relevant to KNI; "
+        "do not draft outreach or write externally."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="opportunity_scout",
+    ).model_copy(
+        update={
+            "source": "llm",
+            "constraints": [
+                "current",
+                "behavioral health",
+                "KNI relevance",
+                "source backed",
+                "do not draft outreach",
+                "do not write externally",
+            ],
+        }
+    )
+    work_item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="Find KNI opportunities",
+        request_text=request_text,
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        target=WorkItemTarget(name="KNI opportunities"),
+    )
+
+    updated = workflow_runner._apply_manual_request_plan(
+        work_item,
+        plan.model_dump(mode="json"),
+    )
+    context_pack = build_context_pack_for_route(
+        updated,
+        WorkItemRoute.OPPORTUNITY_SCOUT,
+    )
+
+    assert updated.target.metadata["manual_constraints"] == plan.constraints
+    assert context_pack.constraints == plan.constraints
+    assert context_pack.ask_shape.permission_state == plan.ask_shape.permission_state
+
+
+def test_cos_workflow_plan_applies_primary_target_to_work_item_state() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Research: CoS, evaluate the company and coordinate the work",
+        request_text="CoS, NeuroFlow is a company I want to evaluate.",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        target=WorkItemTarget(
+            name="CoS, NeuroFlow is a company I want to evaluate."
+        ),
+    )
+
+    updated = workflow_runner._apply_manual_request_plan(
+        work_item,
+        {
+            "target_agent": "chief_of_staff",
+            "primary_target": "NeuroFlow",
+            "target_type": "company",
+            "workflow": [
+                "business_research_analyst",
+                "opportunity_scout",
+                "outreach_composer",
+            ],
+        },
+    )
+
+    assert updated.target.name == "NeuroFlow"
+    assert updated.title == "Research: NeuroFlow"
+
+
+def test_execution_provenance_prefers_recorded_model_and_retrieval_usage(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'provenance.db'}"
+    store = SQLiteStore(database_url)
+    work_item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Research provenance",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+    )
+    store.save_work_item(work_item)
+    store.save_work_item_event(
+        work_item.id,
+        WorkItemEvent(
+            event_type="workflow_sdk_usage",
+            summary="Private model summary must not enter execution steps.",
+            metadata={
+                "usage": {"requests": 2, "cache_hit_rate": 0.25},
+                "cost": {
+                    "estimated_usd": 0.01,
+                    "pricing_provider": "openai",
+                    "pricing_model": "gpt-5.4-mini",
+                }
+            },
+        ),
+    )
+    store.save_work_item_event(
+        work_item.id,
+        WorkItemEvent(
+            event_type="workflow_retrieval_usage",
+            metadata={
+                "provider_summary": "searxng+agents-web-search",
+                "used_providers": ["searxng", "agents-web-search"],
+            },
+        ),
+    )
+    result = WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.IN_PROGRESS,
+        advanced=True,
+    )
+
+    enriched = workflow_runner._attach_execution_provenance(
+        result,
+        request=WorkflowRunRequest(
+            request_text="research provenance",
+            database_url=database_url,
+            live_sdk=True,
+            live_search=True,
+        ),
+        store=store,
+    )
+
+    provenance = enriched.execution_provenance
+    assert provenance.run_mode == "live_sdk_search"
+    assert provenance.model_provider == "openai"
+    assert provenance.model_name == "gpt-5.4-mini"
+    assert provenance.model_source == "workflow_sdk_usage"
+    assert provenance.search_provider == "searxng+agents-web-search"
+    assert provenance.search_provider_sequence == ["searxng", "agents-web-search"]
+    assert provenance.search_source == "workflow_retrieval_usage"
+    assert [step.name for step in enriched.execution_steps] == [
+        "workflow_sdk_usage",
+        "workflow_retrieval_usage",
+    ]
+    assert enriched.execution_steps[0].category == "model"
+    assert enriched.execution_steps[0].request_count == 2
+    assert enriched.execution_steps[0].estimated_cost_usd == 0.01
+    assert enriched.execution_steps[0].cache_hit_rate == 0.25
+    assert enriched.execution_steps[1].category == "retrieval"
+    assert "Private model summary" not in str(enriched.execution_steps)
 
 
 def test_workspace_lifecycle_plan_preserves_provider_write_contract(tmp_path: Path) -> None:
@@ -174,6 +320,16 @@ def test_chief_workflow_passes_receipt_write_policy_to_live_sdk(
                     workflow_type="artifact-write-plan",
                     target_channel="ai-agents-workflow",
                 ),
+                write_requests=[
+                    ChiefOfStaffWriteRequest(
+                        destination="airtable",
+                        title="Personal Expenses receipt",
+                        metadata=(
+                            "Approval reference: chief-of-staff-workitem:test; "
+                            "receipt path: /tmp/example-business-cards-receipt.pdf"
+                        ),
+                    )
+                ],
             ),
             raw_result=None,
             live=True,
@@ -198,6 +354,21 @@ def test_chief_workflow_passes_receipt_write_policy_to_live_sdk(
         sdk_input["side_effect_policy"]
     )
     assert captured["kwargs"]["force_sdk_interpretation"] is True
+    assert result.artifact_refs[0].metadata["write_requests"][0]["metadata"] == {
+        "text": (
+            "Approval reference: chief-of-staff-workitem:test; "
+            "receipt path: /tmp/example-business-cards-receipt.pdf"
+        )
+    }
+
+
+def test_chief_write_request_metadata_preserves_json_objects() -> None:
+    assert workflow_runner._chief_write_request_metadata(
+        '{"owner_agent":"airtable_context_agent","requires_provider_readback":true}'
+    ) == {
+        "owner_agent": "airtable_context_agent",
+        "requires_provider_readback": True,
+    }
 
 
 def _database_url(tmp_path: Path) -> str:
@@ -390,6 +561,62 @@ def test_manual_plan_route_preserves_gmail_before_follow_on_research() -> None:
     )
 
     assert route == WorkItemRoute.GMAIL_TRIAGE
+
+
+def test_manual_plan_route_preserves_chief_advisory_coordination() -> None:
+    request_text = (
+        "Use Google Workspace Context as an advisory specialist to decide where an "
+        "internal review artifact should live. Do not create files."
+    )
+
+    route = workflow_runner._route_from_manual_plan(
+        {
+            "requested_agent": "chief_of_staff",
+            "target_agent": "google_workspace_context_agent",
+            "intent": "context_lookup",
+        },
+        request_text=request_text,
+        live_sdk=True,
+    )
+
+    assert route == WorkItemRoute.CHIEF_OF_STAFF
+
+
+def test_manual_plan_route_rejects_unbounded_named_owner_override() -> None:
+    request_text = (
+        "I’m heading into a meeting. Using only these facts, return two bullets "
+        "about why decorative Slack titles should be suppressed."
+    )
+
+    route = workflow_runner._route_from_manual_plan(
+        {
+            "requested_agent": "business_research_analyst",
+            "target_agent": "chief_of_staff",
+            "intent": "route_request",
+            "objective": request_text,
+        },
+        request_text=request_text,
+        live_sdk=True,
+    )
+
+    assert route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+
+
+def test_manual_plan_route_keeps_real_slack_operation_handoff() -> None:
+    request_text = "Review our Slack workflow status and recommend next actions."
+
+    route = workflow_runner._route_from_manual_plan(
+        {
+            "requested_agent": "outreach_composer",
+            "target_agent": "chief_of_staff",
+            "intent": "slack_operations",
+            "objective": request_text,
+        },
+        request_text=request_text,
+        live_sdk=True,
+    )
+
+    assert route == WorkItemRoute.CHIEF_OF_STAFF
 
 
 def test_configured_test_recipient_alias_resolves_to_internal_exact_recipient(
@@ -1733,6 +1960,23 @@ def test_business_research_source_provided_handoff_fallback_uses_bold_sections()
     assert "\nDetailed Summary\n" not in updated.human_summary
 
 
+def test_thread_local_outreach_sdk_failure_keeps_guardrail_reason() -> None:
+    exc = RuntimeError("Guardrail triggered tripwire")
+    exc.guardrail_result = SimpleNamespace(
+        output=SimpleNamespace(
+            output_info={
+                "risk_flags": ["unsupported_claim"],
+                "reasons": ["unsupported outreach claim: customers"],
+            }
+        )
+    )
+
+    detail = workflow_runner._thread_local_outreach_sdk_failure_detail(exc)
+
+    assert "risk_flags=unsupported_claim" in detail
+    assert "unsupported outreach claim: customers" in detail
+
+
 def test_live_user_facing_synthesis_failure_preserves_substantive_specialist_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2609,6 +2853,50 @@ def test_slack_history_context_promotes_visible_links_as_ordered_sources() -> No
     assert "Link 1 appeared" in link_sources[0].supported_claim
 
 
+def test_slack_history_context_preserves_structured_root_and_speaker_roles() -> None:
+    work_item = WorkItem(
+        id="wi_slack_context_roles",
+        kind=WorkItemKind.WEEKLY_SCAN,
+        title="Review supplied thread facts",
+        request_text="Return the same three bullets.",
+    )
+
+    updated = workflow_runner._apply_slack_history_context(
+        work_item,
+        {
+            "schema": "keystone.slack.history_context.v1",
+            "channel_id": "C123",
+            "thread_ts": "1770000000.000100",
+            "thread_root_request": (
+                "CoS, using only these facts, return exactly three bullets."
+            ),
+            "thread_messages": [
+                {
+                    "ts": "1770000000.000100",
+                    "role": "operator",
+                    "source_agent": "UUSER",
+                    "text": "CoS, using only these facts, return exactly three bullets.",
+                },
+                {
+                    "ts": "1770000000.000200",
+                    "role": "agent",
+                    "source_agent": "kni",
+                    "text": "A stale research-oriented answer.",
+                },
+            ],
+            "read_context": "Slack thread history digest.",
+        },
+        context_file_path="/tmp/slack-context.json",
+    )
+
+    slack_context = updated.target.metadata["slack_context"]
+    assert slack_context["thread_root_request"].startswith("CoS, using only")
+    assert [item["role"] for item in slack_context["thread_messages"]] == [
+        "operator",
+        "agent",
+    ]
+
+
 def test_chief_link_followup_summarizes_ordered_slack_source_without_new_search(
     monkeypatch,
 ) -> None:
@@ -3385,6 +3673,40 @@ def test_source_provided_business_research_accepts_approved_inline_diligence_que
     assert "diag_" not in result.human_summary
 
 
+def test_source_provided_business_research_accepts_supplied_read_only_note_wording(
+    tmp_path: Path,
+) -> None:
+    prompt = (
+        "CoS, here is a supplied read-only note—NeuroFlow provides behavioral-health "
+        "care-navigation software, works with health plans, and reports an outcomes "
+        "measurement program. First assess what the note establishes, then decide the "
+        "most credible advisory or research opportunity and the single validation gap. "
+        "Use whoever is needed. Do not search the web, write provider records, send "
+        "email, or post anywhere. Return one combined brief."
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=prompt,
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=False,
+            live_sdk=False,
+        )
+    )
+
+    assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.status == WorkItemStatus.IN_PROGRESS
+    assert result.blockers == []
+    assert result.artifact_refs[0].metadata["source_provided"] is True
+    source_facts = result.artifact_refs[0].metadata["source_refs"][0]["key_facts"]
+    assert any("care-navigation software" in fact for fact in source_facts)
+    assert any("health plans" in fact for fact in source_facts)
+    assert all("First assess" not in fact for fact in source_facts)
+    assert "fixture input identifies" not in result.human_summary.lower()
+
+
 def test_source_provided_business_research_fallback_uses_provided_workflow_context(
     tmp_path: Path,
 ) -> None:
@@ -3655,6 +3977,29 @@ def test_source_provided_business_research_market_caveat_is_mode_neutral() -> No
     assert "provided context" in summary
     assert "fixture" not in summary.lower()
     assert "dry run" not in summary.lower()
+
+
+def test_negative_capabilities_are_not_manager_loop_stages() -> None:
+    request = (
+        "Return three bullets from the supplied facts. "
+        "Do not research, assess opportunities, draft outreach, or write records."
+    )
+
+    assert workflow_runner._manager_loop_requests_research(request) is False
+    assert workflow_runner._manager_loop_requests_opportunity_assessment(request) is False
+    assert workflow_runner._manager_loop_requests_outreach_draft(request) is False
+    assert workflow_runner._manager_loop_requests_opportunity_record(request) is False
+
+
+def test_contrast_clause_retains_positive_manager_loop_stage() -> None:
+    request = (
+        "Do not search or change provider records, but draft one internal Slack "
+        "message from these supplied facts."
+    )
+
+    assert workflow_runner._manager_loop_requests_research(request) is False
+    assert workflow_runner._manager_loop_requests_opportunity_record(request) is False
+    assert workflow_runner._manager_loop_requests_outreach_draft(request) is True
 
 
 def test_business_research_investment_prediction_block_is_sectioned_and_reviewable(
@@ -4660,6 +5005,226 @@ def test_manager_loop_marks_single_step_artifact_done_with_optional_next_action(
     assert result.next_action is not None
     assert result.next_action.action == "review_opportunities"
     assert result.status == WorkItemStatus.DONE
+
+
+def test_planner_workflow_advances_done_step_to_next_distinct_owner() -> None:
+    request = WorkflowRunRequest(
+        request_text="Review the evidence, prioritize the gap, and draft an internal update.",
+        manual_request_plan={
+            "target_agent": "chief_of_staff",
+            "workflow": [
+                "business_research_analyst",
+                "opportunity_scout",
+                "outreach_composer",
+            ],
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="Internal review",
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        ),
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary="The evidence review is complete.",
+    )
+
+    advanced = workflow_runner._apply_planned_workflow_continuation(
+        result,
+        original_request=request,
+        completed_steps=[
+            {
+                "route": "business_research_analyst",
+                "status": "done",
+            }
+        ],
+        store=None,
+    )
+
+    assert advanced.status == WorkItemStatus.IN_PROGRESS
+    assert advanced.next_action is not None
+    assert advanced.next_action.action == "continue_planned_workflow"
+    assert advanced.next_action.agent == WorkItemRoute.OPPORTUNITY_SCOUT
+
+
+def test_planner_workflow_does_not_bypass_blocker_or_approval_boundary() -> None:
+    request = WorkflowRunRequest(
+        manual_request_plan={
+            "workflow": [
+                "business_research_analyst",
+                "outreach_composer",
+            ],
+        }
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="Blocked review",
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        ),
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.NEEDS_APPROVAL,
+        advanced=True,
+        next_action=WorkItemNextAction(
+            action="approve_external_use",
+            agent=WorkItemRoute.OUTREACH_COMPOSER,
+            requires_approval=True,
+        ),
+        human_summary="Approval is required.",
+    )
+
+    unchanged = workflow_runner._apply_planned_workflow_continuation(
+        result,
+        original_request=request,
+        completed_steps=[],
+        store=None,
+    )
+
+    assert unchanged.status == WorkItemStatus.NEEDS_APPROVAL
+    assert unchanged.next_action is not None
+    assert unchanged.next_action.action == "approve_external_use"
+
+
+def test_goal_based_cos_workflow_uses_packet_target_and_internal_slack_copy(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "CoS, using the approved Northstar Behavioral Analytics packet, review what "
+        "is known and unknown, "
+        "identify the highest-value advisory opportunity and validation gap, then "
+        "draft a concise internal Slack recommendation for my review. Use supplied "
+        "materials only. Do not search the web, create provider records, send email, "
+        "or post."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            context_file_path=str(
+                Path(__file__).parent
+                / "fixtures"
+                / "graph_research_to_draft_source_bundle.json"
+            ),
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            manual_request_plan=plan.model_dump(mode="json"),
+            live_sdk=False,
+            live_search=False,
+            save=True,
+        ),
+        max_steps=3,
+    )
+
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.work_item.target.name == "Northstar Behavioral Analytics"
+    assert result.human_summary.startswith("*Recommendation:*")
+    assert "*Most important validation gap:*" in result.human_summary
+    assert "*Sources:*" not in result.human_summary
+    assert "fixture://graph-source/company-brief" not in result.human_summary
+    assert "Hi," not in result.human_summary
+    assert "Email draft" not in result.human_summary
+    assert {
+        artifact.title
+        for artifact in result.work_item.artifact_refs
+        if artifact.artifact_type == "opportunity"
+    } == {"Northstar Behavioral Analytics"}
+    assert result.work_item.artifact_refs[-1].source_agent == "outreach_composer"
+    assert result.work_item.artifact_refs[-1].metadata["internal_slack_copy"] is True
+    assert result.work_item.artifact_refs[-1].summary.startswith("*Recommendation:*")
+    assert "*Most important validation gap:*" in result.work_item.artifact_refs[-1].summary
+    assert (
+        result.work_item.artifact_refs[-1].metadata["request_coverage"]["status"]
+        == "unassessed"
+    )
+    assert workflow_runner._result_has_canonical_outreach_draft(result) is False
+
+
+def test_internal_slack_llm_copy_is_compacted_before_shared_draft_validation() -> None:
+    long_context = " ".join(["supported evidence context"] * 70)
+    payload = {
+        "email_subject": "Internal recommendation: NeuroFlow",
+        "email_body": (
+            "*Recommendation:*\nPrioritize a bounded evidence-readiness review.\n\n"
+            f"*Why it may fit:*\n{long_context}\n\n"
+            "*Most important validation gap:*\nVerify named deployments and outcomes.\n\n"
+            "*Next safe action:*\nConfirm the decision owner.\n\n"
+            "*Sources:*\nhttps://example.test/neuroflow"
+        ),
+        "source_ids_used": ["source:test"],
+    }
+
+    compact = workflow_runner._compact_internal_slack_llm_payload(payload)
+
+    assert len(compact["email_body"].split()) <= 170
+    assert compact["email_body"].startswith("*Recommendation:*")
+    assert "https://example.test/neuroflow" in compact["email_body"]
+    assert compact["source_ids_used"] == ["source:test"]
+
+
+def test_internal_slack_artifact_is_public_contract_not_generic_research_synthesis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="outreach_draft",
+        artifact_id="internal-slack-1",
+        source_agent="outreach_composer",
+        title="Harbor Bridge decision brief",
+        summary=(
+            "Decision brief\n\n"
+            "The supplied note supports an early advisory fit.\n\n"
+            "Paste-ready internal Slack note\n\n"
+            "Harbor Bridge is directionally relevant but not yet validated.\n\n"
+            "fixture://source-provided/slack-context"
+        ),
+        metadata={"internal_slack_copy": True},
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.OUTREACH,
+            title="Harbor Bridge review",
+            request_text="Return a decision brief and paste-ready internal Slack note.",
+            current_route=WorkItemRoute.OUTREACH_COMPOSER,
+            artifact_refs=[artifact],
+        ),
+        route=WorkItemRoute.OUTREACH_COMPOSER,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="Internal workflow metadata.",
+    )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "synthesize_user_facing_work_item_response_sdk_result",
+        lambda *_args, **_kwargs: pytest.fail(
+            "canonical internal Slack artifacts must not use generic research synthesis"
+        ),
+    )
+
+    updated = workflow_runner._maybe_synthesize_user_facing_response(
+        result,
+        request=WorkflowRunRequest(
+            request_text=result.work_item.request_text,
+            live_sdk=True,
+        ),
+        sdk_session=None,
+        store=None,
+    )
+
+    assert updated.human_summary.startswith("Decision brief")
+    assert "Paste-ready internal Slack note" in updated.human_summary
+    assert "fixture://" not in updated.human_summary
+    assert "Detailed Summary" not in updated.human_summary
+    assert (
+        "Canonical internal Slack artifact returned without generic "
+        "research-response recasting."
+    ) in updated.audit_notes
 
 
 def test_manager_loop_repairs_done_opportunity_packet_after_authoritative_review_failure(
@@ -6470,6 +7035,56 @@ def test_manager_loop_allows_source_provided_opportunity_direction_without_live_
     }
 
 
+def test_exact_business_research_summary_does_not_suggest_unrequested_followups(
+    tmp_path: Path,
+) -> None:
+    prompt = (
+        "Summarize Example Health in exactly 2 sentences using fixture context only. "
+        "Read-only; no live search or external tools."
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=prompt,
+            database_url=_database_url(tmp_path),
+            save=True,
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "business_research_analyst",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "Example Health",
+                "target_type": "company",
+                "task_objective": "source_research",
+                "expected_artifact_type": "source_summary",
+                "ask_shape": {
+                    "strict_filter_mode": "exact",
+                    "output_form": "brief",
+                    "permission_state": "read_only",
+                    "stop_condition": "Stop after exactly two sentences.",
+                },
+            },
+        ),
+        max_steps=1,
+    )
+
+    assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.next_action is None
+    assert result.work_item.next_action is None
+    assert "scout matching opportunities" not in result.human_summary.lower()
+
+
+def test_inline_gmail_fixture_accepts_plain_sanitized_email_after_label() -> None:
+    fixture = workflow_runner._inline_gmail_fixture_from_request(
+        "Triage this sanitized email: Can we meet Tuesday at 2 PM to discuss the project? "
+        "Return a one-sentence summary and whether a reply is needed. Read-only; no Gmail access."
+    )
+
+    assert fixture is not None
+    assert fixture.body == "Can we meet Tuesday at 2 PM to discuss the project?"
+    assert fixture.subject == "Manual Gmail triage request"
+
+
 def test_manager_loop_stops_before_repeating_specialist_for_orchestrator_workflow(
     tmp_path: Path,
 ) -> None:
@@ -8186,6 +8801,8 @@ def test_advance_work_item_zotero_article_live_sdk_synthesizes_extracted_page(
         assert "randomized pivotal trial" in prompt
         assert kwargs["live"] is True
         assert kwargs["tool_tier"] == "deep_retrieval"
+        assert kwargs["attach_tools"] is False
+        assert kwargs["compact_instructions"] is True
         output = ResearchBrief(
             target_name="NCT06976697 Lindus/Sooma trial",
             target_type="zotero_article",
@@ -10546,6 +11163,13 @@ def test_live_work_item_runs_user_facing_response_synthesis(
     class FakeSynthesis:
         title = "Big Health summary"
         answer = "Big Health is a digital mental health company with source-backed context."
+        synthesis = (
+            "The bounded profile describes Big Health's digital mental health context "
+            "and keeps the result read-only."
+        )
+        source_evidence = []
+        terms = []
+        recommended_actions = []
         key_points = ["Deterministic profile and contact artifacts were created."]
         caveats = ["No outreach was sent."]
         next_step = "Review the profile before drafting anything."
@@ -11789,6 +12413,47 @@ def test_chief_of_staff_handoff_to_business_research_executes_next_agent(
     assert "Example Health" in result.human_summary
     assert "diag_" not in result.human_summary
     assert "Manager loop steps:" not in result.human_summary
+
+
+def test_chief_uses_prior_natural_workflow_without_copyable_slack_checkpoint(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "CoS, I have five minutes before a partnership discussion. Here is all I know: "
+        "Harbor Bridge Health sells behavioral-health care-navigation software to "
+        "health plans and says it tracks referral completion and care engagement, but "
+        "it has not shared audited outcomes, customer references, implementation data, "
+        "or an evaluation design. Give me one decision brief: what is actually "
+        "supported, the strongest potential KNI advisory or research fit, the single "
+        "validation question that should come first, and a short internal Slack note I "
+        "can paste to the team. Use only this note; do not search, create or modify "
+        "anything, draft or send email, or post anywhere else."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+
+    result = workflow_runner._advance_work_item_one_step(
+        WorkflowRunRequest(
+            request_text=request_text,
+            requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=False,
+            live_search=False,
+            manual_request_plan=plan.model_dump(mode="json"),
+        ),
+        synthesize_user_response=False,
+    )
+
+    assert workflow_runner.looks_like_thread_local_draft_request(request_text)
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert result.status == WorkItemStatus.IN_PROGRESS
+    assert result.next_action is not None
+    assert result.next_action.action == "run_business_research"
+    assert result.next_action.agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.next_action.requires_approval is False
 
 
 def test_chief_of_staff_negated_business_research_handoff_stays_review_only(

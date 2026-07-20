@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+from types import ModuleType
+from urllib.error import HTTPError
+from urllib.request import Request
 
 import pytest
 
@@ -19,7 +23,13 @@ from keystone_agents.tools.internal_data_tools import (
     google_sheet_read_table,
 )
 from keystone_agents.tools.zotero_context_tools import (
+    project_zotero_item_metadata,
+    read_latest_zotero_journal_abstract_metadata,
+    read_latest_zotero_journal_metadata,
+    zotero_list_cached_items,
     zotero_read_api_metadata,
+    zotero_read_item_children,
+    zotero_read_pdf_attachment_text,
     zotero_resolve_collection_context,
 )
 
@@ -327,6 +337,20 @@ def test_zotero_context_read_tools_return_collection_and_api_handoff_context(
     )
     monkeypatch.setenv("KEYSTONE_ZOTERO_IMPORT_CACHE", str(cache_dir))
 
+    listed = _loads(zotero_list_cached_items(limit=1))
+    assert listed["status"] == "success"
+    assert listed["item_count"] == 1
+    assert listed["items"] == [
+        {
+            "item_key": "ITEM1",
+            "title": "Measurement-based care AI evaluation",
+            "item_type": "journalArticle",
+            "date": "2026",
+            "doi": "10.1000/context",
+            "url": "https://example.org/context-paper",
+        }
+    ]
+
     collection = _loads(
         zotero_resolve_collection_context(
             "KNI Collections",
@@ -372,6 +396,7 @@ def test_zotero_api_metadata_can_plan_latest_top_level_item_read() -> None:
             direction="desc",
             top_level_only=True,
             item_type="journalArticle",
+            require_abstract=True,
             live=False,
         )
     )
@@ -384,7 +409,191 @@ def test_zotero_api_metadata_can_plan_latest_top_level_item_read() -> None:
         "direction": "desc",
         "itemType": "journalArticle",
     }
+    assert api["selection_rule"] == "first_nonempty_abstract_in_provider_order"
+    assert api["provider_order"] == {
+        "sort": "dateAdded",
+        "direction": "desc",
+        "top_level_only": True,
+        "item_type": "journalArticle",
+    }
+    assert api["require_abstract"] is True
     assert api["send_enabled"] is False
+
+
+def test_zotero_api_metadata_selects_first_ordered_item_with_stored_abstract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                [
+                    {
+                        "key": "NO_ABSTRACT",
+                        "data": {
+                            "title": "Newest without an abstract",
+                            "dateAdded": "2026-07-13T12:00:00Z",
+                            "abstractNote": "",
+                        },
+                    },
+                    {
+                        "key": "WITH_ABSTRACT",
+                        "data": {
+                            "title": "Newest article with a stored abstract",
+                            "dateAdded": "2026-07-12T12:00:00Z",
+                            "abstractNote": "Stored abstract evidence.",
+                        },
+                    },
+                ]
+            ).encode("utf-8")
+
+    captured: dict[str, object] = {}
+
+    def _urlopen(request: object, timeout: int) -> _Response:
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "keystone_agents.tools.zotero_context_tools.urlopen",
+        _urlopen,
+    )
+
+    api = _loads(
+        zotero_read_api_metadata(
+            library_id="12345",
+            sort="dateAdded",
+            direction="desc",
+            top_level_only=True,
+            item_type="journalArticle",
+            require_abstract=True,
+            live=True,
+        )
+    )
+
+    assert api["status"] == "success"
+    assert api["provider_read"] is True
+    assert api["item_count"] == 1
+    assert api["selected_item_title"] == "Newest article with a stored abstract"
+    assert api["selected_item_has_abstract"] is True
+    assert api["selected_item_date_added"] == "2026-07-12T12:00:00Z"
+    assert api["items"][0]["key"] == "WITH_ABSTRACT"  # type: ignore[index]
+    assert captured["timeout"] == 30
+
+
+def test_zotero_api_metadata_recovers_stale_configured_user_library_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class _Response:
+        def __init__(self, payload: object) -> None:
+            self.payload = payload
+
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self.payload).encode("utf-8")
+
+    def _urlopen(request: Request, timeout: int) -> _Response:
+        assert timeout == 30
+        url = request.full_url
+        calls.append(url)
+        if "/users/stale/items" in url:
+            raise HTTPError(url, 403, "Forbidden", hdrs=None, fp=None)
+        if url.endswith("/keys/current"):
+            return _Response(
+                {
+                    "userID": 24680,
+                    "access": {"user": {"library": True, "write": False}},
+                }
+            )
+        assert "/users/24680/items" in url
+        return _Response(
+            [
+                {
+                    "key": "ITEM1",
+                    "data": {"title": "Authorized library item", "abstractNote": "Evidence."},
+                }
+            ]
+        )
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "stale")
+    monkeypatch.setattr("keystone_agents.tools.zotero_context_tools.urlopen", _urlopen)
+
+    payload = _loads(zotero_read_api_metadata(live=True))
+
+    assert payload["status"] == "success"
+    assert payload["selected_item_title"] == "Authorized library item"
+    assert payload["library_id_resolution"] == (
+        "api_key_current_user_after_configured_403"
+    )
+    assert len(calls) == 3
+
+
+def test_zotero_api_metadata_does_not_redirect_explicit_or_group_library(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def _urlopen(request: Request, timeout: int) -> object:
+        assert timeout == 30
+        url = request.full_url
+        calls.append(url)
+        raise HTTPError(url, 403, "Forbidden", hdrs=None, fp=None)
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "configured")
+    monkeypatch.setattr("keystone_agents.tools.zotero_context_tools.urlopen", _urlopen)
+
+    with pytest.raises(HTTPError):
+        zotero_read_api_metadata(library_id="explicit", live=True)
+    with pytest.raises(HTTPError):
+        zotero_read_api_metadata(library_type="group", live=True)
+
+    assert len(calls) == 2
+    assert not any("/keys/current" in url for url in calls)
+
+
+def test_zotero_api_metadata_requires_verified_user_library_access_on_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {"userID": 24680, "access": {"user": {"library": False}}}
+            ).encode("utf-8")
+
+    def _urlopen(request: Request, timeout: int) -> _Response:
+        assert timeout == 30
+        url = request.full_url
+        if url.endswith("/keys/current"):
+            return _Response()
+        raise HTTPError(url, 403, "Forbidden", hdrs=None, fp=None)
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "stale")
+    monkeypatch.setattr("keystone_agents.tools.zotero_context_tools.urlopen", _urlopen)
+
+    with pytest.raises(RuntimeError, match="cannot read its user library"):
+        zotero_read_api_metadata(live=True)
 
 
 def test_zotero_api_metadata_rejects_unbounded_sort_controls() -> None:
@@ -394,8 +603,233 @@ def test_zotero_api_metadata_rejects_unbounded_sort_controls() -> None:
     with pytest.raises(ValueError, match="direction requires"):
         zotero_read_api_metadata(library_id="12345", direction="desc", live=False)
 
+
+def test_latest_zotero_abstract_helper_uses_exact_provider_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_read(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return json.dumps({"status": "success", "provider_read": True, "items": []})
+
+    monkeypatch.setattr(
+        "keystone_agents.tools.zotero_context_tools.zotero_read_api_metadata",
+        fake_read,
+    )
+
+    payload = read_latest_zotero_journal_abstract_metadata()
+
+    assert payload["provider_read"] is True
+    assert captured == {
+        "limit": 100,
+        "sort": "dateAdded",
+        "direction": "desc",
+        "top_level_only": True,
+        "item_type": "journalArticle",
+        "require_abstract": True,
+        "live": True,
+    }
+
+
+def test_latest_zotero_journal_helper_does_not_require_abstract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_read(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return json.dumps({"status": "success", "provider_read": True, "items": []})
+
+    monkeypatch.setattr(
+        "keystone_agents.tools.zotero_context_tools.zotero_read_api_metadata",
+        fake_read,
+    )
+
+    payload = read_latest_zotero_journal_metadata()
+
+    assert payload["provider_read"] is True
+    assert captured == {
+        "limit": 1,
+        "sort": "dateAdded",
+        "direction": "desc",
+        "top_level_only": True,
+        "item_type": "journalArticle",
+        "require_abstract": False,
+        "live": True,
+    }
+
     with pytest.raises(ValueError, match="item_type must be one of"):
         zotero_read_api_metadata(library_id="12345", item_type="attachment", live=False)
+
+
+def test_zotero_metadata_projection_preserves_requested_provider_fields() -> None:
+    projection = project_zotero_item_metadata(
+        {
+            "key": "ITEM1",
+            "version": 7,
+            "data": {
+                "itemType": "journalArticle",
+                "title": "A structured article",
+                "creators": [{"firstName": "Ada", "lastName": "Lovelace"}],
+                "publicationTitle": "Journal of Structured Context",
+                "abstractNote": "Stored abstract.",
+                "DOI": "10.1000/example",
+            },
+        },
+        request_text="Return the title, authors, publication title, abstract, and DOI.",
+    )
+
+    assert projection["fields"] == {
+        "title": "A structured article",
+        "authors": ["Ada Lovelace"],
+        "abstract": "Stored abstract.",
+        "publication_title": "Journal of Structured Context",
+        "doi": "10.1000/example",
+    }
+    assert projection["missing_requested_fields"] == []
+    assert projection["provider_field_map"]["authors"] == "creators"
+    assert projection["provider_field_map"]["publication_title"] == "publicationTitle"
+
+
+def test_zotero_broad_metadata_projection_retains_bounded_unknown_provider_fields() -> None:
+    projection = project_zotero_item_metadata(
+        {
+            "key": "ITEM1",
+            "data": {
+                "itemType": "journalArticle",
+                "title": "A structured article",
+                "customFutureField": "Provider value",
+            },
+        },
+        request_text="Return all available metadata for this article.",
+    )
+
+    assert "customFutureField" in projection["available_provider_field_names"]
+    assert projection["provider_fields"]["customFutureField"] == "Provider value"
+
+
+def test_zotero_item_children_dry_run_is_parent_scoped() -> None:
+    payload = _loads(zotero_read_item_children(parent_item_key="PARENT1", live=False))
+
+    assert payload["status"] == "dry-run"
+    assert payload["parent_item_key"] == "PARENT1"
+    assert payload["supported_child_types"] == ["note", "attachment"]
+    assert payload["zotero_write_supported"] is False
+
+
+def test_zotero_item_children_projects_notes_and_pdf_attachments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "123")
+    monkeypatch.setattr(
+        "keystone_agents.tools.zotero_context_tools._read_zotero_api_json",
+        lambda *_args, **_kwargs: [
+            {
+                "key": "NOTE1",
+                "data": {
+                    "itemType": "note",
+                    "parentItem": "PARENT1",
+                    "note": "<p>Important stored note.</p>",
+                },
+            },
+            {
+                "key": "PDF1",
+                "data": {
+                    "itemType": "attachment",
+                    "parentItem": "PARENT1",
+                    "filename": "article.pdf",
+                    "contentType": "application/pdf",
+                },
+            },
+        ],
+    )
+
+    payload = _loads(zotero_read_item_children(parent_item_key="PARENT1", live=True))
+
+    assert payload["status"] == "success"
+    assert payload["note_count"] == 1
+    assert payload["attachment_count"] == 1
+    assert payload["children"][0]["note"] == "<p>Important stored note.</p>"  # type: ignore[index]
+    assert payload["children"][0]["note_text"] == "Important stored note."  # type: ignore[index]
+    assert payload["children"][1]["item_key"] == "PDF1"  # type: ignore[index]
+
+
+def test_zotero_pdf_read_verifies_parent_and_returns_bounded_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Page:
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def extract_text(self) -> str:
+            return self._text
+
+    class _Reader:
+        def __init__(self, _stream: object) -> None:
+            self.pages = [_Page("First page."), _Page("Second page.")]
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "123")
+    monkeypatch.setattr(
+        "keystone_agents.tools.zotero_context_tools._read_zotero_api_json",
+        lambda *_args, **_kwargs: {
+            "data": {
+                "itemType": "attachment",
+                "parentItem": "PARENT1",
+                "filename": "article.pdf",
+                "contentType": "application/pdf",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.zotero_context_tools._read_zotero_api_bytes",
+        lambda *_args, **_kwargs: (b"%PDF-test", "application/pdf"),
+    )
+    fake_pypdf = ModuleType("pypdf")
+    fake_pypdf.PdfReader = _Reader  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+    payload = _loads(
+        zotero_read_pdf_attachment_text(
+            parent_item_key="PARENT1",
+            attachment_item_key="PDF1",
+            max_pages=1,
+            max_chars=1000,
+            live=True,
+        )
+    )
+
+    assert payload["status"] == "success"
+    assert payload["text"] == "First page."
+    assert payload["page_count"] == 2
+    assert payload["pages_read"] == 1
+    assert payload["truncated"] is True
+    assert payload["file_persisted"] is False
+
+
+def test_zotero_pdf_read_rejects_parent_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "123")
+    monkeypatch.setattr(
+        "keystone_agents.tools.zotero_context_tools._read_zotero_api_json",
+        lambda *_args, **_kwargs: {
+            "data": {
+                "itemType": "attachment",
+                "parentItem": "OTHER",
+                "filename": "article.pdf",
+                "contentType": "application/pdf",
+            }
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="does not belong"):
+        zotero_read_pdf_attachment_text(
+            parent_item_key="PARENT1",
+            attachment_item_key="PDF1",
+            live=True,
+        )
 
 
 def test_zotero_context_can_resolve_kni_cache_from_linked_slack_env(

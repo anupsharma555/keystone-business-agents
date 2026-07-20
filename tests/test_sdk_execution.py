@@ -43,6 +43,7 @@ from keystone_agents.agents.business_research_analyst import (
 from keystone_agents.agents.chief_of_staff import (
     build_chief_of_staff_agent,
     build_chief_slack_command_resolver_agent,
+    chief_slack_command_resolution_is_applicable,
     resolve_high_confidence_chief_slack_command,
     run_chief_of_staff_sdk,
     validate_chief_slack_command_resolution,
@@ -57,8 +58,11 @@ from keystone_agents.agents.google_workspace_context import (
     build_google_workspace_context_agent,
 )
 from keystone_agents.agents.opportunity_scout import (
+    apply_opportunity_scout_synthesis,
     build_opportunity_scout_agent,
+    build_opportunity_scout_synthesis_agent,
     run_opportunity_scout_sdk,
+    scout_opportunities_fixture,
 )
 from keystone_agents.agents.orchestrator import (
     review_specialist_output_llm,
@@ -115,7 +119,10 @@ from keystone_agents.schemas.operational_context import (
     RssContextResult,
     ZoteroContextResult,
 )
-from keystone_agents.schemas.opportunity import OpportunityScoutResult
+from keystone_agents.schemas.opportunity import (
+    OpportunityScoutResult,
+    OpportunityScoutSynthesis,
+)
 from keystone_agents.schemas.orchestrator import OrchestratorOutputReview, OrchestratorResult
 from keystone_agents.schemas.outreach import OutreachDraft
 from keystone_agents.sdk import Runner, build_local_run_config, build_sqlite_session
@@ -159,6 +166,66 @@ RUNTIME_MODEL_ENV_VARS = (
     "KEYSTONE_SDK_SESSION_DB",
     "KEYSTONE_SDK_SESSION_HISTORY_LIMIT",
 )
+
+
+@pytest.mark.parametrize(
+    ("full_agent", "compact_agent", "specialist_prompt"),
+    [
+        (
+            lambda: build_business_research_analyst_agent(),
+            lambda: build_business_research_analyst_agent(
+                request_text="Summarize one supplied source.",
+                attach_tools=False,
+                compact_instructions=True,
+            ),
+            "business_research_analyst.md",
+        ),
+        (
+            lambda: build_opportunity_scout_agent(),
+            lambda: build_opportunity_scout_agent(
+                request_text="Assess one supplied opportunity.",
+                attach_tools=False,
+                compact_instructions=True,
+            ),
+            "opportunity_scout.md",
+        ),
+        (
+            lambda: build_gmail_triage_agent(),
+            lambda: build_gmail_triage_agent(
+                include_tools=False,
+                request_text="Summarize one selected email without modifying Gmail.",
+                compact_instructions=True,
+            ),
+            "gmail_triage.md",
+        ),
+        (
+            lambda: build_outreach_composer_agent(),
+            lambda: build_outreach_composer_agent(
+                include_tools=False,
+                request_text="Draft one reply from approved context and do not send.",
+                compact_instructions=True,
+            ),
+            "outreach_composer.md",
+        ),
+    ],
+)
+def test_direct_specialist_compact_profiles_preserve_contracts_without_graph_bloat(
+    full_agent,
+    compact_agent,
+    specialist_prompt: str,
+) -> None:
+    full = full_agent()
+    compact = compact_agent()
+    instructions = str(compact.instructions)
+
+    assert len(instructions) < len(str(full.instructions)) * 0.6
+    assert compact.tools == []
+    assert "<!-- memory_policy.md -->" in instructions
+    assert "<!-- writing_style.md -->" in instructions
+    assert "<!-- safety_policy.md -->" in instructions
+    assert f"<!-- {specialist_prompt} -->" in instructions
+    assert "specialist_contracts/SKILL.md -->" in instructions
+    assert "<!-- tools.md -->" not in instructions
 
 
 def _clear_runtime_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1065,6 +1132,56 @@ def test_run_typed_sdk_agent_retries_live_rate_limit_once(
     assert sleeps == [2.0]
     assert result.output.summary == "Recovered after retry."
     assert result.request_cache["rate_limit_retries"] == 1
+
+
+def test_run_typed_sdk_agent_retries_live_structured_output_once_without_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object | None] = []
+    original_session = object()
+
+    class ModelBehaviorError(Exception):
+        pass
+
+    class FakeAgent:
+        name = "gmail_triage"
+        model = "gpt-test"
+
+    def fake_run_typed_sdk_sync(
+        *_args: Any,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], ChiefOfStaffResult]:
+        calls.append(kwargs.get("session"))
+        if len(calls) == 1:
+            raise ModelBehaviorError("structured output did not match the schema")
+        return (
+            {"fake": True},
+            ChiefOfStaffResult(
+                mode="llm",
+                summary="Recovered with valid structured output.",
+                audit_notes=[],
+            ),
+        )
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(
+        "keystone_agents.run.enforce_agent_run_budget",
+        lambda **_kwargs: {"enforced": False},
+    )
+
+    result = run_typed_sdk_agent(
+        agent=FakeAgent(),
+        typed_input={"request": "summarize and draft a reply"},
+        output_type=ChiefOfStaffResult,
+        live=True,
+        config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+        session=original_session,
+    )
+
+    assert calls == [original_session, None]
+    assert result.output.summary == "Recovered with valid structured output."
+    assert result.request_cache["structured_output_retries"] == 1
+    assert result.request_cache["structured_output_retry_session_reset"] is True
 
 
 def test_run_typed_sdk_agent_preserves_explicit_local_pdf_and_image_inputs(
@@ -2018,6 +2135,95 @@ def test_retrieved_sdk_synthesis_harness_validates_and_audits(
     assert model.calls
 
 
+def test_retrieved_sdk_synthesis_finalizes_before_return_and_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_model_env(monkeypatch)
+    raw_context = {
+        "subject": "Potential consulting project",
+        "body": "Could we discuss consulting support?",
+        "message_id": "fake-message-1",
+    }
+    model = FakeModel(outputs=[[_structured_message(_email_triage_payload())]])
+    storage = FakeStorage()
+
+    outcome = run_retrieved_sdk_synthesis(
+        agent=build_gmail_triage_agent(),
+        output_type=EmailTriageResult,
+        retrieve=lambda: raw_context,
+        normalize=lambda value: GmailTriageSDKInput(**value),
+        finalize_output=lambda retrieved, output: {
+            "subject": retrieved["subject"],
+            "category": output.category,
+        },
+        input_summary="finalizer test",
+        run_config=build_local_run_config(FakeProvider(model)),
+        save=True,
+        storage=storage,
+    )
+
+    assert outcome.output == {
+        "subject": raw_context["subject"],
+        "category": outcome.output["category"],
+    }
+    assert storage.agent_runs[0]["output"]["result"] == outcome.output
+
+
+def test_opportunity_scout_compact_sdk_replay_returns_full_verified_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_model_env(monkeypatch)
+    retrieved = scout_opportunities_fixture(
+        fixture=Path(__file__).parent / "fixtures/opportunity_scout_high_confidence_sources.json",
+        max_results=1,
+    )
+    record = retrieved.records[0]
+    record_key = record.canonical_entity_key or record.company_name
+    compact_payload = {
+        "decisions": [
+            {
+                "record_key": record_key,
+                "include": True,
+                "why_now_signal": "Verified evidence supports action in the current window.",
+                "keystone_fit_reason": (
+                    "The opportunity fits KNI's evidence-evaluation capabilities."
+                ),
+                "recommended_next_step": (
+                    "Review official requirements and prepare an internal go/no-go note."
+                ),
+                "missing_evidence": [],
+            }
+        ],
+        "audit_summary": "One verified opportunity is ready for operator review.",
+        "constraint_relaxation_suggestion": "",
+        "outreach_generated": False,
+    }
+    model = FakeModel(outputs=[[_structured_message(compact_payload)]])
+
+    outcome = run_retrieved_sdk_synthesis(
+        agent=build_opportunity_scout_synthesis_agent(max_results=1),
+        output_type=OpportunityScoutSynthesis,
+        retrieve=lambda: retrieved,
+        normalize=lambda result: OpportunityScoutSDKInput(
+            topic=result.topic,
+            max_results=1,
+            context=json.dumps(result.model_dump(mode="json"), ensure_ascii=True),
+        ),
+        finalize_output=apply_opportunity_scout_synthesis,
+        input_summary="compact opportunity replay",
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    assert isinstance(outcome.output, OpportunityScoutResult)
+    assert len(outcome.output.records) == 1
+    assert outcome.output.records[0].sources == record.sources
+    assert outcome.output.records[0].recommended_next_step == compact_payload["decisions"][0][
+        "recommended_next_step"
+    ]
+    assert outcome.output.outreach_generated is False
+    assert model.calls
+
+
 def test_retrieved_sdk_synthesis_records_prompt_cache_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2631,6 +2837,7 @@ def test_outreach_compact_sdk_keeps_approval_objects_deterministic(
         "additional_information_needed": [],
         "collaboration_ideas": [],
         "deferral_reason": "",
+        "request_coverage": result.output.request_coverage.model_dump(mode="json"),
     }
     assert evidence["output"] == result.output.model_dump(mode="json")
     assert evidence["usage"] == result.usage
@@ -3269,6 +3476,33 @@ def test_high_confidence_manifest_match_resolves_preprints_without_model() -> No
         "/kni-preprints-digest depression digital biomarkers"
     )
     assert resolved.confidence == "high"
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        (
+            "move that same KBA_TEST_CALENDAR_COS_0718 event to 3:00-3:30 PM "
+            "and change its note"
+        ),
+        "update that same Airtable expense record",
+        "create a Google Doc in Drive and verify it",
+        "create a Gmail draft to myself and do not send it",
+    ],
+)
+def test_chief_native_command_resolver_does_not_intercept_provider_actions(
+    request_text: str,
+) -> None:
+    assert chief_slack_command_resolution_is_applicable(request_text) is False
+
+
+def test_chief_native_command_resolver_still_admits_native_automation_asks() -> None:
+    assert (
+        chief_slack_command_resolution_is_applicable(
+            "do a preprints run for depression digital biomarkers"
+        )
+        is True
+    )
 
 
 def test_gmail_fake_model_selects_attachment_draft_tool_for_explicit_ask(

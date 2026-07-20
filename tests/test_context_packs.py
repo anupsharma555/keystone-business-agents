@@ -63,6 +63,37 @@ def test_context_packs_preserve_manual_plan_ask_shape() -> None:
     assert context.ask_shape.output_form == "table"
     assert context.ask_shape.source_type_preference == ["selected"]
     assert context.ask_shape.stop_condition == "return_zero_without_broadening_if_no_exact_match"
+    assert context.adaptation_assessment is not None
+    assert context.adaptation_assessment.status == "compatible"
+    assert context.adaptation_assessment.missing_required_fields == []
+
+
+def test_all_specialist_context_packs_preserve_manual_plan_constraints() -> None:
+    constraints = [
+        "current",
+        "source backed",
+        "do not draft outreach",
+        "do not write externally",
+    ]
+    work_item = WorkItem(
+        id="wi_manual_constraints",
+        title="Preserve planner constraints",
+        request_text="Use the interpreted request constraints.",
+        kind=WorkItemKind.OPPORTUNITY,
+        target=WorkItemTarget(
+            name="KNI opportunities",
+            metadata={"manual_constraints": constraints},
+        ),
+    )
+
+    for route in (
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        WorkItemRoute.OPPORTUNITY_SCOUT,
+        WorkItemRoute.OUTREACH_COMPOSER,
+        WorkItemRoute.GMAIL_TRIAGE,
+    ):
+        pack = build_context_pack_for_route(work_item, route)
+        assert pack.constraints == constraints
 
 
 def _save_memory(store: SQLiteStore, **overrides) -> int:
@@ -89,6 +120,9 @@ def test_research_context_pack_requires_target() -> None:
     pack = build_research_context_pack(item)
 
     assert pack.ready is False
+    assert pack.source_triage.has_evidence() is False
+    assert pack.adaptation_assessment is None
+    assert pack.model_dump(mode="json")["source_triage"] == {}
     assert pack.can_synthesize is False
     assert pack.readiness_gates[0].name == "research_target_readiness"
     assert pack.readiness_gates[0].blockers[0].code == "missing_research_target"
@@ -508,13 +542,16 @@ def test_context_pack_carries_source_triage_for_specialist_reasoning() -> None:
 
     pack = build_context_pack_for_route(item, WorkItemRoute.BUSINESS_RESEARCH_ANALYST)
 
-    assert pack.source_triage["recommended_action"] == ("broaden_or_deepen_before_final_synthesis")
-    assert pack.source_triage["needs_broaden_or_deepen"] is True
-    assert pack.source_triage["decision_counts"] == {"deepen": 1, "reject": 1}
-    assert pack.source_triage["deepen_source_ids"] == ["source:1"]
-    assert pack.source_triage["rejected_source_ids"] == ["source:2"]
-    assert pack.source_triage["decisions"][0]["decision"] == "deepen"
-    assert pack.source_triage["recall_gaps"] == ["missing expected source lane: press_news"]
+    assert pack.source_triage.recommended_action == (
+        "broaden_or_deepen_before_final_synthesis"
+    )
+    assert pack.source_triage.needs_broaden_or_deepen is True
+    assert pack.source_triage.decision_counts == {"deepen": 1, "reject": 1}
+    assert pack.source_triage.deepen_source_ids == ["source:1"]
+    assert pack.source_triage.rejected_source_ids == ["source:2"]
+    assert pack.source_triage.decisions[0].decision == "deepen"
+    assert pack.source_triage.recall_gaps == ["missing expected source lane: press_news"]
+    assert pack.model_dump(mode="json")["source_triage"]["decisions"][0]["decision"] == "deepen"
 
 
 def test_research_context_pack_hydrates_approved_prompt_safe_company_memory(tmp_path) -> None:

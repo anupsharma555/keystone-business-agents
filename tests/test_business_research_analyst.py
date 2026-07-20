@@ -15,6 +15,7 @@ from keystone_agents.agents.business_research_analyst import (
     compare_company_profiles_for_decision,
     comparison_input_from_result,
     dedupe_and_rank_sources,
+    focused_brief_from_profile_fixture,
     focused_brief_input_from_profile,
     load_contact_context,
     load_crm_account_context,
@@ -404,6 +405,42 @@ def test_curebase_like_fixture_scores_high_for_trial_tech_and_evidence_generatio
     assert profile.evidence_generation_need >= 70
     assert profile.consulting_fit_score >= 70
     assert profile.sources
+
+
+def test_diverse_company_partnership_fixture_returns_complete_source_backed_brief() -> None:
+    profile = research_company_fixture(
+        company_name="Curebase",
+        fixture_json=FIXTURES / "sample_company_curebase.json",
+    )
+
+    brief = focused_brief_from_profile_fixture(profile)
+    markdown = render_company_focused_brief(brief)
+    source_ids = {source.source_id for source in brief.sources}
+
+    assert brief.company_name == "Curebase"
+    assert brief.brief_purpose == "partnership_or_advisory_relevance"
+    assert brief.product
+    assert brief.customers
+    assert brief.why_it_matters == profile.fit_summary
+    assert brief.facts
+    assert all(set(fact.source_ids) <= source_ids for fact in brief.facts)
+    assert set(brief.source_ids_used) <= source_ids
+    assert brief.unknowns
+    assert "## Why It May Matter" in markdown
+    assert "## Sources" in markdown
+    assert brief.raw_source_content_included is False
+    assert brief.send_enabled is False
+
+    review_brief = focused_brief_from_profile_fixture(
+        profile.model_copy(
+            update={
+                "contradictions": ["Supplied sources conflict on current customer scope."],
+                "unsupported_claims_flagged": ["Unbacked funding claim requires review."],
+            }
+        )
+    )
+    assert "Supplied sources conflict on current customer scope." in review_brief.unknowns
+    assert "Unbacked funding claim requires review." in review_brief.unknowns
 
 
 def test_complete_fixture_research_data_points_are_source_backed() -> None:

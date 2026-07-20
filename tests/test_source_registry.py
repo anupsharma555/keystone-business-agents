@@ -85,3 +85,26 @@ def test_required_source_lanes_are_intent_aware() -> None:
         "grants_funding",
         "procurement_rfp",
     )
+
+
+def test_professional_development_lanes_do_not_expand_to_company_news() -> None:
+    lanes = required_source_lanes_for_opportunity(
+        request_text=(
+            "find current remote workshops, certifications, or networking communities "
+            "in clinical AI or psychiatry"
+        ),
+        target_entity_types=("conference", "institute"),
+        objectives=("presentation_opportunity", "advisory", "research_collaboration"),
+    )
+
+    assert lanes == ("conference_events", "people_institutions")
+    assert "company_site" not in lanes
+    assert "press_news" not in lanes
+
+
+def test_certificate_program_source_is_classified_as_people_institutions() -> None:
+    assert "people_institutions" in classify_source_lanes(
+        url="https://ecornell.cornell.edu/certificates/",
+        title="Online Certificates - eCornell - Cornell University",
+        snippet="Online AI in healthcare certificate enrollment.",
+    )

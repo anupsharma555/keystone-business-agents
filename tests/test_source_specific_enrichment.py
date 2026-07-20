@@ -67,6 +67,11 @@ def test_crossref_enrichment_removes_presentation_suffix_from_doi() -> None:
             json=lambda: {
                 "message": {
                     "title": ["Interoperability article"],
+                    "author": [
+                        {"given": "Ada", "family": "Lovelace"},
+                        {"name": "Example Consortium"},
+                    ],
+                    "container-title": ["Journal of Interoperability"],
                     "publisher": "Example Publisher",
                     "type": "journal-article",
                 }
@@ -84,3 +89,7 @@ def test_crossref_enrichment_removes_presentation_suffix_from_doi() -> None:
     assert requested_urls == ["https://api.crossref.org/works/10.3389/fmed.2026.1736785"]
     assert result.status == "success"
     assert result.metadata["doi"] == "10.3389/fmed.2026.1736785"
+    assert result.metadata["authors"] == ["Ada Lovelace", "Example Consortium"]
+    assert result.metadata["publication_title"] == "Journal of Interoperability"
+    assert "Authors: Ada Lovelace; Example Consortium" in result.structured_facts
+    assert "Container: Journal of Interoperability" in result.structured_facts

@@ -8,9 +8,14 @@ from keystone_agents.retrieval_policy import (
     build_provider_sequence,
     build_provider_use_ladder,
     coerce_retrieval_autonomy_hint,
+    derive_request_autonomy_hint,
 )
 from keystone_agents.schemas.retrieval import RetrievalHint
-from keystone_agents.tools.search_provider import SearchProviderError, SearchResult
+from keystone_agents.tools.search_provider import (
+    SearchProviderError,
+    SearchResult,
+    SearxngSearchProvider,
+)
 
 
 def _assessment(
@@ -40,6 +45,15 @@ def _assessment(
 
 def test_build_provider_sequence_defaults_to_searxng_only() -> None:
     assert build_provider_sequence(requested_provider=None) == ("searxng",)
+
+
+def test_negated_role_wording_does_not_add_role_precision_reason() -> None:
+    hint = derive_request_autonomy_hint(
+        agent_name="opportunity_scout",
+        request_text=("Find a current grant or fellowship. This is not a job or role search."),
+    )
+
+    assert "role search requires stricter hard-filter verification" not in hint.reasons
 
 
 def test_build_provider_sequence_respects_configured_primary_override() -> None:
@@ -529,6 +543,62 @@ def test_hybrid_search_provider_degrades_when_all_sequential_providers_fail() ->
     ]
 
 
+def test_hybrid_provider_falls_back_after_searxng_engine_suspension(
+    monkeypatch,
+) -> None:
+    class DegradedSearxngResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {
+                "results": [],
+                "unresponsive_engines": [
+                    ["brave", "Suspended: too many requests"],
+                    ["duckduckgo", "CAPTCHA"],
+                ],
+            }
+
+    class BackupProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Clinical AI Virtual Workshop",
+                    link="https://example.test/clinical-ai-workshop",
+                    snippet="Registration is open for a current virtual workshop.",
+                    source="exa",
+                )
+            ]
+
+    monkeypatch.setattr(
+        "keystone_agents.tools.search_provider.requests.get",
+        lambda *_args, **_kwargs: DegradedSearxngResponse(),
+    )
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng", "exa"),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=False,
+        ),
+        provider_factory=lambda provider_name: (
+            SearxngSearchProvider(live=True, base_url="http://127.0.0.1:18080")
+            if provider_name == "searxng"
+            else BackupProvider()
+        ),
+    )
+
+    results = provider.search_web("clinical AI virtual workshop 2026", num_results=3)
+    telemetry = provider.telemetry()
+
+    assert [result.source for result in results] == ["exa"]
+    assert telemetry["search_providers_attempted"] == ["searxng", "exa"]
+    assert telemetry["search_providers_used"] == ["exa"]
+    assert telemetry["provider_error_fallback_used"] is True
+    assert telemetry["search_provider_errors"][0]["provider"] == "searxng"
+    assert telemetry["search_provider_errors"][0]["error_type"] == "SearxngSearchError"
+
+
 def test_hybrid_search_provider_runs_deepening_provider_only_after_weak_fast_results() -> None:
     calls: list[str] = []
 
@@ -689,10 +759,7 @@ def test_hybrid_search_provider_deepens_when_structured_enrichment_is_needed() -
     assert telemetry["provider_usage"]["tavily"]["credits_used"] == 1
     assert telemetry["search_queries"][-1].endswith("leadership partnerships customers")
     assert telemetry["provider_queries"]["tavily"] == [
-        (
-            "Mentavi Health leadership official primary sources "
-            "leadership partnerships customers"
-        )
+        ("Mentavi Health leadership official primary sources leadership partnerships customers")
     ]
 
 

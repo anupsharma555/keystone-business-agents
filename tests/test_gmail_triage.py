@@ -13,6 +13,7 @@ import pytest
 from keystone_agents.agents.gmail_triage import (
     EmailFixture,
     build_gmail_triage_agent,
+    group_gmail_envelopes_fixture,
     run_gmail_triage_fixture,
     triage_email_fixture,
     triage_gmail_message_envelope,
@@ -68,6 +69,24 @@ def test_consulting_inquiry_creates_draft_and_requires_approval() -> None:
     assert "Keystone/Draft Pending Approval" in result.recommended_labels
     assert "Keystone/Action Required" in result.recommended_labels
     assert result.style_profile_used is False
+
+
+def test_optional_reply_draft_does_not_claim_the_email_requires_a_response() -> None:
+    result = EmailTriageResult(
+        category="vendor",
+        confidence=0.9,
+        reasoning="The message is informational and a response is optional.",
+        needs_reply=False,
+        recommended_action="Offer one optional reply for human review.",
+        draft_reply="Thanks for sharing this. What is the best eligibility starting point?",
+        draft_created=False,
+        approval_required=True,
+    )
+
+    assert result.needs_reply is False
+    assert result.draft_reply
+    assert result.draft_created is False
+    assert result.approval_required is True
 
 
 def test_gmail_draft_can_use_approved_email_style_profile() -> None:
@@ -373,6 +392,66 @@ def test_priority_grouping_output_normalizes_em_dash_text() -> None:
 
     _assert_no_em_dash(result.model_dump(mode="json"))
     assert "Received - thanks." in str(result.urgent[0].draft_reply)
+
+
+def test_bounded_weekly_gmail_fixture_grouping_prioritizes_every_message_without_mutation() -> None:
+    envelopes = [
+        GmailMessageEnvelope(
+            message_id="msg-security",
+            thread_id="thread-security",
+            received_at="2026-07-12T12:00:00Z",
+            sender_name="Security Team",
+            sender_email="security@example.com",
+            subject="Unexpected credential reset request",
+            normalized_body="Reset your password at http://bit.ly/login-reset immediately.",
+            suspicious_signals=["shortened URL requires security review"],
+        ),
+        GmailMessageEnvelope(
+            message_id="msg-consulting",
+            thread_id="thread-consulting",
+            received_at="2026-07-11T15:00:00Z",
+            sender_name="Clinical Operations Lead",
+            sender_email="lead@example.com",
+            subject="Consulting support",
+            normalized_body=(
+                "Could Keystone advise on our clinical operations workflow this month?"
+            ),
+        ),
+        GmailMessageEnvelope(
+            message_id="msg-newsletter",
+            thread_id="thread-newsletter",
+            received_at="2026-07-10T09:00:00Z",
+            sender_name="Industry Digest",
+            sender_email="digest@example.com",
+            subject="Weekly behavioral health newsletter",
+            normalized_body="This week's industry roundup and webinar links.",
+        ),
+    ]
+
+    result = group_gmail_envelopes_fixture(
+        envelopes,
+        operator_request="Review recent email and tell me what needs follow-up this week.",
+        lookback_days=7,
+        source_label="INBOX",
+    )
+
+    grouped = [*result.urgent, *result.important, *result.can_wait, *result.ignore]
+    assert result.request_summary.endswith("follow-up this week.")
+    assert result.lookback_days == 7
+    assert result.source_message_count == 3
+    assert [message.message_id for message in grouped] == [
+        "msg-security",
+        "msg-consulting",
+        "msg-newsletter",
+    ]
+    assert "security" in result.urgent[0].risk_flags
+    assert result.important[0].needs_reply is True
+    assert result.ignore[0].category == "newsletter"
+    assert all(message.draft_reply is None for message in grouped)
+    assert all(message.draft_created is False for message in grouped)
+    assert all(message.send_enabled is False for message in grouped)
+    assert result.send_enabled is False
+    assert result.live_side_effects_enabled is False
 
 
 def test_build_gmail_triage_agent_returns_sdk_agent_like_object() -> None:
@@ -1204,6 +1283,164 @@ def test_priority_grouping_live_query_skips_guardrail_blocked_messages(
     envelopes = cli._live_gmail_envelopes_for_priority_grouping(args)
 
     assert [envelope.message_id for envelope in envelopes] == ["safe"]
+
+
+def test_priority_grouping_search_page_guardrail_falls_back_to_per_message_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import argparse
+
+    import scripts.run_gmail_triage as cli
+    from keystone_agents.sdk import ToolGuardrailViolation
+
+    class FakeLiveGmail:
+        def __init__(self, live: bool) -> None:
+            assert live is True
+
+        def search_message_summaries(self, **_kwargs: object) -> list[dict[str, object]]:
+            raise ToolGuardrailViolation("one metadata summary was unsafe")
+
+        def list_recent_messages(self, **_kwargs: object) -> list[dict[str, str]]:
+            return [
+                {"id": "blocked", "threadId": "thread-blocked"},
+                {"id": "safe", "threadId": "thread-safe"},
+            ]
+
+        def batch_get_messages(
+            self,
+            message_ids: list[str],
+            *,
+            skip_blocked: bool = False,
+        ) -> list[dict[str, object]]:
+            assert message_ids == ["blocked", "safe"]
+            assert skip_blocked is True
+            return [
+                {
+                    "id": "safe",
+                    "threadId": "thread-safe",
+                    "from": "Alex <alex@example.com>",
+                    "subject": "Clinical AI collaboration",
+                    "body": "Would Keystone be open to comparing notes next week?",
+                }
+            ]
+
+        def get_thread(self, thread_id: str) -> dict[str, object]:
+            raise AssertionError(f"thread expansion was not needed: {thread_id}")
+
+    monkeypatch.setattr(cli, "GmailTool", FakeLiveGmail)
+    args = argparse.Namespace(
+        label_filter=None,
+        allow_inbox=True,
+        gmail_query="newer_than:3d",
+        lookback_days=3,
+        max_messages=10,
+    )
+
+    envelopes = cli._live_gmail_envelopes_for_priority_grouping(args)
+
+    assert [envelope.message_id for envelope in envelopes] == ["safe"]
+
+
+def test_live_sdk_message_resolution_expands_exact_subject_to_all_mail() -> None:
+    import scripts.run_gmail_triage as cli
+
+    calls: list[tuple[str | None, str, int]] = []
+
+    class FakeGmail:
+        def list_recent_messages(
+            self,
+            *,
+            label: str | None,
+            max_results: int,
+            query: str,
+        ) -> list[dict[str, str]]:
+            calls.append((label, query, max_results))
+            if label is None:
+                return [{"id": "message-1", "threadId": "thread-1"}]
+            return []
+
+    query = 'subject:"Why Healthtech Needs a New Kind of Product Leader"'
+    refs, diagnostics = cli._resolve_live_sdk_message_refs(
+        FakeGmail(),
+        request_text=(
+            'Find the Gmail email with subject "Why Healthtech Needs a New Kind '
+            'of Product Leader" and draft a reply here.'
+        ),
+        label="INBOX",
+        query=query,
+        max_results=1,
+    )
+
+    assert refs == [{"id": "message-1", "threadId": "thread-1"}]
+    assert calls == [
+        ("INBOX", query, 5),
+        (None, query, 5),
+    ]
+    assert diagnostics["candidate_count"] == 1
+    assert diagnostics["provider_write"] is False
+
+
+def test_live_sdk_message_resolution_deduplicates_relaxed_matches_by_thread() -> None:
+    import scripts.run_gmail_triage as cli
+
+    calls: list[tuple[str | None, str]] = []
+
+    class FakeGmail:
+        def list_recent_messages(
+            self,
+            *,
+            label: str | None,
+            max_results: int,
+            query: str,
+        ) -> list[dict[str, str]]:
+            del max_results
+            calls.append((label, query))
+            if "subject:healthtech" in query:
+                return [
+                    {"id": "message-new", "threadId": "thread-1"},
+                    {"id": "message-old", "threadId": "thread-1"},
+                ]
+            return []
+
+    refs, diagnostics = cli._resolve_live_sdk_message_refs(
+        FakeGmail(),
+        request_text=(
+            'Find the Gmail email with subject "Why Healthtech Needs a New Kind '
+            'of Product Leader" and draft a reply here.'
+        ),
+        label="INBOX",
+        query='subject:"Why Healthtech Needs a New Kind of Product Leader"',
+        max_results=1,
+    )
+
+    assert refs == [{"id": "message-new", "threadId": "thread-1"}]
+    assert len(calls) == 3
+    assert diagnostics["attempts"][-1]["scope"] == "all_mail_relaxed_subject"
+
+
+def test_live_sdk_message_resolution_returns_safe_no_match_blocker() -> None:
+    import scripts.run_gmail_triage as cli
+
+    class FakeGmail:
+        def list_recent_messages(self, **_kwargs: object) -> list[dict[str, str]]:
+            return []
+
+    with pytest.raises(cli.GmailTargetResolutionError) as exc_info:
+        cli._resolve_live_sdk_message_refs(
+            FakeGmail(),
+            request_text='Find the Gmail email with subject "Missing Example".',
+            label="INBOX",
+            query='subject:"Missing Example"',
+            max_results=1,
+        )
+
+    payload = exc_info.value.payload
+    assert payload["status"] == "blocked"
+    assert payload["block_kind"] == "gmail_target_not_found"
+    assert payload["retrieval_diagnostics"]["provider_read"] is True
+    assert payload["retrieval_diagnostics"]["provider_write"] is False
+    assert len(payload["retrieval_diagnostics"]["attempts"]) == 3
+    assert "message-" not in json.dumps(payload)
 
 
 def test_priority_grouping_live_retrieval_uses_staged_search_batch_and_thread(
