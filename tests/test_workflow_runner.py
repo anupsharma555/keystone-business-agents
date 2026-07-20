@@ -6076,6 +6076,103 @@ def test_stop_after_opportunity_packet_skips_false_research_stage_blocker() -> N
     assert "manager_loop_research_not_completed" not in {blocker.code for blocker in blockers}
 
 
+def test_live_semantic_plan_prevents_incidental_words_from_creating_stage_blockers() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Direct supplied-context answer",
+        request_text="Return a concise answer.",
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+    )
+    result = workflow_runner.WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary="Three concise bullets.",
+    )
+    request = WorkflowRunRequest(
+        request_text=(
+            "Use the supplied discussion about research, opportunity workflows, draft "
+            "outreach, Gmail context, CRM writes, and scorecards to return three bullets."
+        ),
+        manual_request_plan={
+            "source": "llm",
+            "target_agent": "chief_of_staff",
+            "intent": "route_request",
+            "task_objective": "route_or_continue",
+            "expected_artifact_type": "none",
+            "requires_durable_state": False,
+        },
+    )
+
+    blockers = workflow_runner._manager_loop_missing_stage_blockers(
+        original_request=request,
+        result=result,
+        loop_steps=[
+            {
+                "route": WorkItemRoute.CHIEF_OF_STAFF.value,
+                "status": WorkItemStatus.DONE.value,
+                "advanced": True,
+            }
+        ],
+    )
+
+    assert blockers == []
+
+
+def test_live_semantic_workflow_requires_stages_without_keyword_support() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Tracked review",
+        request_text="Handle this review.",
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+    )
+    result = workflow_runner.WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary="Initial review complete.",
+    )
+    request = WorkflowRunRequest(
+        request_text="Handle this review.",
+        manual_request_plan={
+            "source": "llm",
+            "target_agent": "chief_of_staff",
+            "intent": "route_request",
+            "task_objective": "route_or_continue",
+            "expected_artifact_type": "none",
+            "requires_durable_state": True,
+            "workflow": [
+                WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                WorkItemRoute.OUTREACH_COMPOSER.value,
+            ],
+        },
+    )
+
+    blocker_codes = {
+        blocker.code
+        for blocker in workflow_runner._manager_loop_missing_stage_blockers(
+            original_request=request,
+            result=result,
+            loop_steps=[
+                {
+                    "route": WorkItemRoute.CHIEF_OF_STAFF.value,
+                    "status": WorkItemStatus.DONE.value,
+                    "advanced": True,
+                }
+            ],
+        )
+    }
+
+    assert {
+        "manager_loop_research_not_completed",
+        "manager_loop_opportunity_not_created",
+        "manager_loop_outreach_not_drafted",
+    } <= blocker_codes
+
+
 def test_formal_opportunity_gate_note_counts_existing_filtered_candidates() -> None:
     scout_result = OpportunityScoutResult(
         topic="behavioral health AI grants",

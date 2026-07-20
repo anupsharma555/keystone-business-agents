@@ -63,7 +63,6 @@ from keystone_agents.local_kni_evidence import (
 from keystone_agents.manual_request import (
     infer_manual_request_plan,
     looks_like_supplied_context_synthesis_request,
-    named_output_deliverable_sections,
     positive_capability_text,
     request_forbids_live_research,
     resolve_manual_request_owner,
@@ -473,6 +472,50 @@ def _manual_request_plan_model(value: Any) -> ManualRequestPlan | None:
         # original payload for the specialist while declining to treat it as a
         # current typed-plan routing decision.
         return None
+
+
+def _llm_plan_requests_route(
+    value: Any,
+    route: WorkItemRoute,
+) -> bool | None:
+    """Return semantic stage ownership, or ``None`` when phrase fallback is needed.
+
+    A live LLM plan is the authority for which specialist stages the operator
+    requested.  Returning ``False`` is intentional: once meaning has been
+    interpreted, incidental words in the raw request must not add another
+    workflow stage or completion blocker.
+    """
+
+    plan = _manual_request_plan_model(value)
+    if plan is None or plan.source != "llm":
+        return None
+    requested_routes = {plan.target_agent, *plan.workflow}
+    if route.value in requested_routes:
+        return True
+    intents_by_route = {
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST: {
+            "company_research",
+            "research_brief",
+        },
+        WorkItemRoute.OPPORTUNITY_SCOUT: {
+            "opportunity_search",
+            "opportunity_to_outreach_loop",
+        },
+        WorkItemRoute.OUTREACH_COMPOSER: {
+            "outreach_draft",
+            "opportunity_to_outreach_loop",
+        },
+        WorkItemRoute.GMAIL_TRIAGE: {"gmail_triage"},
+    }
+    if plan.intent in intents_by_route.get(route, set()):
+        return True
+    artifacts_by_route = {
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST: {"research_brief", "source_summary"},
+        WorkItemRoute.OPPORTUNITY_SCOUT: {"opportunity_record", "contact_candidates"},
+        WorkItemRoute.OUTREACH_COMPOSER: {"outreach_draft"},
+        WorkItemRoute.GMAIL_TRIAGE: {"gmail_triage_report"},
+    }
+    return plan.expected_artifact_type in artifacts_by_route.get(route, set())
 
 
 def _manual_plan_requests_local_kni_evidence(
@@ -3448,7 +3491,13 @@ def _operator_requested_manager_continuation(
 def _manager_loop_mentions_next_agent(
     padded_normalized_text: str,
     next_action_agent: WorkItemRoute | None,
+    *,
+    manual_request_plan: Any = None,
 ) -> bool:
+    if next_action_agent is not None:
+        semantic = _llm_plan_requests_route(manual_request_plan, next_action_agent)
+        if semantic is not None:
+            return semantic
     if next_action_agent == WorkItemRoute.OPPORTUNITY_SCOUT:
         return _manager_continuation_has_marker(
             padded_normalized_text,
@@ -4455,15 +4504,53 @@ def _manager_loop_missing_stage_blockers(
     text = " ".join(str(original_request.request_text or "").lower().split())
     if not text:
         return []
+    semantic_plan = _manual_request_plan_model(original_request.manual_request_plan)
+    llm_plan = (
+        semantic_plan
+        if semantic_plan is not None and semantic_plan.source == "llm"
+        else None
+    )
+    research_requested = _manager_loop_requests_research(
+        text,
+        manual_request_plan=original_request.manual_request_plan,
+    )
+    opportunity_requested = bool(
+        _manager_loop_requests_opportunity_record(
+            text,
+            manual_request_plan=original_request.manual_request_plan,
+        )
+        or _manager_loop_requests_opportunity_assessment(
+            text,
+            manual_request_plan=original_request.manual_request_plan,
+        )
+    )
+    outreach_requested = _manager_loop_requests_outreach_draft(
+        text,
+        manual_request_plan=original_request.manual_request_plan,
+    )
+    gmail_requested = _llm_plan_requests_route(
+        original_request.manual_request_plan,
+        WorkItemRoute.GMAIL_TRIAGE,
+    )
+    if gmail_requested is None:
+        gmail_requested = bool(
+            "gmail context" in text
+            or "check recent gmail" in text
+            or "email context" in text
+        )
     routes = {str(step.get("route") or "") for step in loop_steps}
     artifact_types = {artifact.artifact_type for artifact in result.work_item.artifact_refs}
     stop_after_opportunity_packet = (
         WorkItemRoute.OPPORTUNITY_SCOUT.value in routes
-        and _request_stops_after_opportunity_packet(text)
+        and (
+            opportunity_requested and not outreach_requested
+            if llm_plan is not None
+            else _request_stops_after_opportunity_packet(text)
+        )
     )
     blockers: list[WorkItemBlocker] = []
     if (
-        "gmail context" in text or "check recent gmail" in text or "email context" in text
+        gmail_requested
     ) and WorkItemRoute.GMAIL_TRIAGE.value not in routes:
         blockers.append(
             WorkItemBlocker(
@@ -4476,7 +4563,7 @@ def _manager_loop_missing_stage_blockers(
             )
         )
     if (
-        _manager_loop_requests_research(text)
+        research_requested
         and not stop_after_opportunity_packet
         and not _chief_source_brief_satisfies_research_request(result)
         and WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value not in routes
@@ -4493,10 +4580,7 @@ def _manager_loop_missing_stage_blockers(
             )
         )
     if (
-        (
-            _manager_loop_requests_opportunity_record(text)
-            or _manager_loop_requests_opportunity_assessment(text)
-        )
+        opportunity_requested
         and WorkItemRoute.OPPORTUNITY_SCOUT.value not in routes
         and "opportunity_record" not in artifact_types
     ):
@@ -4511,12 +4595,16 @@ def _manager_loop_missing_stage_blockers(
         )
     gmail_only_draft_request = (
         WorkItemRoute.GMAIL_TRIAGE.value in routes
-        and not _manager_loop_requests_research(text)
-        and not _manager_loop_requests_opportunity_record(text)
-        and not re.search(r"\b(?:outreach|linkedin)\b", text, flags=re.I)
+        and not research_requested
+        and not opportunity_requested
+        and (
+            not outreach_requested
+            if llm_plan is not None
+            else not re.search(r"\b(?:outreach|linkedin)\b", text, flags=re.I)
+        )
     )
     if (
-        _manager_loop_requests_outreach_draft(text)
+        outreach_requested
         and not gmail_only_draft_request
         and WorkItemRoute.OUTREACH_COMPOSER.value not in routes
         and "outreach_draft" not in artifact_types
@@ -4535,10 +4623,18 @@ def _manager_loop_missing_stage_blockers(
         request_text=text,
         result=result,
         artifact_types=artifact_types,
+        requires_current_provider_evidence=(
+            llm_plan.requires_live_search if llm_plan is not None else None
+        ),
     )
     if current_opportunity_blocker is not None:
         blockers.append(current_opportunity_blocker)
-    if looks_like_send_side_effect(text):
+    send_requested = (
+        llm_plan.intent == "blocked_send"
+        if llm_plan is not None
+        else looks_like_send_side_effect(text)
+    )
+    if send_requested:
         blockers.append(
             WorkItemBlocker(
                 code="manager_loop_send_blocked",
@@ -4549,7 +4645,10 @@ def _manager_loop_missing_stage_blockers(
                 ),
             )
         )
-    if _manager_loop_requests_crm_write(text):
+    if _manager_loop_requests_crm_write(
+        text,
+        manual_request_plan=original_request.manual_request_plan,
+    ):
         blockers.append(
             WorkItemBlocker(
                 code="manager_loop_crm_write_blocked",
@@ -4561,8 +4660,10 @@ def _manager_loop_missing_stage_blockers(
             )
         )
     if (
-        "score the workflow" in text or "scorecard" in text or "score the" in text
-    ) and "chief_of_staff_plan" not in artifact_types:
+        llm_plan is None
+        and ("score the workflow" in text or "scorecard" in text or "score the" in text)
+        and "chief_of_staff_plan" not in artifact_types
+    ):
         blockers.append(
             WorkItemBlocker(
                 code="manager_loop_scorecard_not_generated",
@@ -4580,6 +4681,7 @@ def _manager_loop_current_opportunity_evidence_blocker(
     request_text: str,
     result: WorkflowRunResult,
     artifact_types: set[str],
+    requires_current_provider_evidence: bool | None = None,
 ) -> WorkItemBlocker | None:
     """Reject fixture-only completion for current or active opportunity discovery."""
 
@@ -4616,14 +4718,15 @@ def _manager_loop_current_opportunity_evidence_blocker(
     )
     if has_explicit_supplied_opportunity_bundle:
         return None
-    requires_current_provider_evidence = bool(
-        re.search(
-            r"\b(?:active|currently open|current|recent|latest|deadline|sponsor|"
-            r"eligibility|grant|rfp|request for proposals?|call for proposals?)\b",
-            request_text,
-            flags=re.I,
+    if requires_current_provider_evidence is None:
+        requires_current_provider_evidence = bool(
+            re.search(
+                r"\b(?:active|currently open|current|recent|latest|deadline|sponsor|"
+                r"eligibility|grant|rfp|request for proposals?|call for proposals?)\b",
+                request_text,
+                flags=re.I,
+            )
         )
-    )
     if not requires_current_provider_evidence:
         return None
 
@@ -4664,7 +4767,17 @@ def _chief_source_brief_satisfies_research_request(result: WorkflowRunResult) ->
     return False
 
 
-def _manager_loop_requests_research(normalized_text: str) -> bool:
+def _manager_loop_requests_research(
+    normalized_text: str,
+    *,
+    manual_request_plan: Any = None,
+) -> bool:
+    semantic = _llm_plan_requests_route(
+        manual_request_plan,
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+    )
+    if semantic is not None:
+        return semantic
     normalized_text = positive_capability_text(normalized_text)
     context_reference = re.sub(
         r"\b(?:same|attached|provided|current|existing)\s+company\s+research\s+brief\b",
@@ -4706,7 +4819,17 @@ def _manager_loop_requests_research(normalized_text: str) -> bool:
     )
 
 
-def _manager_loop_requests_opportunity_record(normalized_text: str) -> bool:
+def _manager_loop_requests_opportunity_record(
+    normalized_text: str,
+    *,
+    manual_request_plan: Any = None,
+) -> bool:
+    semantic = _llm_plan_requests_route(
+        manual_request_plan,
+        WorkItemRoute.OPPORTUNITY_SCOUT,
+    )
+    if semantic is not None:
+        return semantic
     normalized_text = positive_capability_text(normalized_text)
     scrubbed = re.sub(
         r"\b(?:do not|don't|dont|never|no|without)\b[^.\n]{0,160}"
@@ -4733,7 +4856,17 @@ def _manager_loop_requests_opportunity_record(normalized_text: str) -> bool:
     ) or bool(re.search(r"\bopportunity record\b", scrubbed, flags=re.I))
 
 
-def _manager_loop_requests_opportunity_assessment(normalized_text: str) -> bool:
+def _manager_loop_requests_opportunity_assessment(
+    normalized_text: str,
+    *,
+    manual_request_plan: Any = None,
+) -> bool:
+    semantic = _llm_plan_requests_route(
+        manual_request_plan,
+        WorkItemRoute.OPPORTUNITY_SCOUT,
+    )
+    if semantic is not None:
+        return semantic
     # A routing/classification question may name an opportunity lane without
     # asking Opportunity Scout to assess an opportunity. Remove that meta-level
     # enumeration before applying execution-stage detection.
@@ -4768,7 +4901,17 @@ def _manager_loop_requests_opportunity_assessment(normalized_text: str) -> bool:
     )
 
 
-def _manager_loop_requests_outreach_draft(normalized_text: str) -> bool:
+def _manager_loop_requests_outreach_draft(
+    normalized_text: str,
+    *,
+    manual_request_plan: Any = None,
+) -> bool:
+    semantic = _llm_plan_requests_route(
+        manual_request_plan,
+        WorkItemRoute.OUTREACH_COMPOSER,
+    )
+    if semantic is not None:
+        return semantic
     normalized_text = positive_capability_text(normalized_text)
     scrubbed_text = re.sub(
         r"\b(?:do not|don't|dont|never|no|without)\b"
@@ -4843,9 +4986,19 @@ def _manager_loop_requests_outreach_draft(normalized_text: str) -> bool:
     )
 
 
-def _gmail_triage_requests_outreach_handoff(normalized_text: str) -> bool:
+def _gmail_triage_requests_outreach_handoff(
+    normalized_text: str,
+    *,
+    manual_request_plan: Any = None,
+) -> bool:
     """Keep simple Gmail reply help direct unless the operator names a handoff."""
 
+    semantic = _llm_plan_requests_route(
+        manual_request_plan,
+        WorkItemRoute.OUTREACH_COMPOSER,
+    )
+    if semantic is not None:
+        return semantic
     return _manager_loop_requests_outreach_draft(normalized_text) and bool(
         re.search(
             r"\b(?:outreach\s+composer|draft(?:ing)?\s+specialist)\b",
@@ -4855,7 +5008,17 @@ def _gmail_triage_requests_outreach_handoff(normalized_text: str) -> bool:
     )
 
 
-def _manager_loop_requests_crm_write(normalized_text: str) -> bool:
+def _manager_loop_requests_crm_write(
+    normalized_text: str,
+    *,
+    manual_request_plan: Any = None,
+) -> bool:
+    plan = _manual_request_plan_model(manual_request_plan)
+    if plan is not None and plan.source == "llm":
+        # Provider-specific typed execution gates own writes. A generic CRM
+        # phrase detector must not reinterpret an Airtable/finance request as
+        # an unsupported CRM mutation after semantic planning.
+        return False
     lowered = " ".join(str(normalized_text or "").lower().split())
     if "airtable" in lowered and any(
         marker in lowered
@@ -9537,9 +9700,13 @@ def _advance_gmail_triage(
         )
     if inline_fixture is not None and _gmail_plan_allows_inline_read_only_triage(gmail_plan):
         triage = triage_email_fixture(inline_fixture)
-        research_requested = _manager_loop_requests_research(effective_request_text)
+        research_requested = _manager_loop_requests_research(
+            effective_request_text,
+            manual_request_plan=request.manual_request_plan,
+        )
         outreach_handoff_requested = _gmail_triage_requests_outreach_handoff(
-            effective_request_text
+            effective_request_text,
+            manual_request_plan=request.manual_request_plan,
         )
         approved_reply_objective = str(
             work_item.target.metadata.get("reply_objective") or ""
@@ -9856,8 +10023,14 @@ def _try_live_gmail_thread_retrieval(
         reverse=True,
     )
     selected = summaries[0]
-    draft_requested = _manager_loop_requests_outreach_draft(request.request_text)
-    research_requested = _manager_loop_requests_research(request.request_text)
+    draft_requested = _manager_loop_requests_outreach_draft(
+        request.request_text,
+        manual_request_plan=request.manual_request_plan,
+    )
+    research_requested = _manager_loop_requests_research(
+        request.request_text,
+        manual_request_plan=request.manual_request_plan,
+    )
     gmail_research_target = (
         _gmail_thread_research_target(selected) if research_requested else ""
     )
@@ -13390,7 +13563,11 @@ def _advance_research(
         manual_request_plan=request.manual_request_plan,
     )
     outreach_requested = (
-        _manager_loop_requests_outreach_draft(combined_request_text) and not planning_only
+        _manager_loop_requests_outreach_draft(
+            combined_request_text,
+            manual_request_plan=request.manual_request_plan,
+        )
+        and not planning_only
     )
     selected_context_outreach = bool(
         outreach_requested and selected_artifacts(work_item, "gmail_triage_report")
@@ -13456,11 +13633,18 @@ def _advance_research(
     )
     padded_request_text = f" {' '.join(combined_request_text.lower().split())} "
     opportunity_requested = (
-        _manager_loop_requests_opportunity_record(combined_request_text)
-        or _manager_loop_requests_opportunity_assessment(combined_request_text)
+        _manager_loop_requests_opportunity_record(
+            combined_request_text,
+            manual_request_plan=request.manual_request_plan,
+        )
+        or _manager_loop_requests_opportunity_assessment(
+            combined_request_text,
+            manual_request_plan=request.manual_request_plan,
+        )
         or _manager_loop_mentions_next_agent(
             padded_request_text,
             WorkItemRoute.OPPORTUNITY_SCOUT,
+            manual_request_plan=request.manual_request_plan,
         )
     )
     next_agent = (
@@ -13666,7 +13850,10 @@ def _source_provided_business_research_result(
         bundle_text=bundle_text,
         fixture_url=fixture_source.url,
     )
-    draft_requested = _manager_loop_requests_outreach_draft(request_text)
+    draft_requested = _manager_loop_requests_outreach_draft(
+        request_text,
+        manual_request_plan=request.manual_request_plan,
+    )
     artifact = WorkItemArtifactRef(
         artifact_type="company_profile",
         artifact_id=f"source-provided-business-research:{work_item.id}",
@@ -15789,17 +15976,25 @@ def _advance_opportunity(
         manual_request_plan=request.manual_request_plan,
     )
     outreach_requested = (
-        _manager_loop_requests_outreach_draft(combined_request_text) and not planning_only
+        _manager_loop_requests_outreach_draft(
+            combined_request_text,
+            manual_request_plan=request.manual_request_plan,
+        )
+        and not planning_only
     )
     padded_request_text = f" {' '.join(combined_request_text.lower().split())} "
     company_research_already_attached = any(
         artifact.artifact_type == "company_profile" for artifact in work_item.artifact_refs
     )
     research_requested = (not company_research_already_attached) and (
-        _manager_loop_requests_research(combined_request_text)
+        _manager_loop_requests_research(
+            combined_request_text,
+            manual_request_plan=request.manual_request_plan,
+        )
         or _manager_loop_mentions_next_agent(
             padded_request_text,
             WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            manual_request_plan=request.manual_request_plan,
         )
     )
     next_agent = (
@@ -19046,18 +19241,8 @@ def _internal_slack_recommendation_fallback(
         f"Treat {target} as a plausible "
         f"{opportunity_type or 'KNI advisory or research'} opportunity, pending validation."
     )
-    requested_sections = named_output_deliverable_sections(request_text)
-    primary_heading = requested_sections[0] if requested_sections else "Recommendation"
-    slack_heading = next(
-        (
-            section
-            for section in requested_sections
-            if "slack" in section.lower()
-        ),
-        "",
-    )
     lines = [
-        f"*{primary_heading}:*",
+        "*Recommendation:*",
         recommendation,
         "",
         "*What the supplied note supports:*",
@@ -19076,21 +19261,6 @@ def _internal_slack_recommendation_fallback(
         "*Next safe action:*",
         f"- {next_step}",
     ]
-    if slack_heading:
-        paste_ready_note = " ".join(
-            [
-                recommendation,
-                f"The most important validation gap is {gap.rstrip('.').lower()}.",
-                f"Next: {next_step}",
-            ]
-        )
-        lines.extend(
-            [
-                "",
-                f"*{slack_heading}:*",
-                _compact_outreach_summary_text(paste_ready_note),
-            ]
-        )
     if source_urls:
         lines.extend(
             [

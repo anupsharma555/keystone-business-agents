@@ -185,8 +185,10 @@ def resolve_slack_query_prompt(
 
     detected_route = _default_route_for_kind(detected)
     target_route = _safe_target_route(prompt_input.target_route) or detected_route
+    semantic_plan = _semantic_manual_plan(prompt_input)
     if (
-        target_route != detected_route
+        semantic_plan is None
+        and target_route != detected_route
         and detected_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
         and _explicit_business_research_requested(request_text)
     ):
@@ -200,7 +202,6 @@ def resolve_slack_query_prompt(
         }
 
     context_flags = _context_flags_for_kind(detected)
-    semantic_plan = _semantic_manual_plan(prompt_input)
     requires_approved_context = (
         bool(semantic_plan.get("requires_approved_context"))
         if semantic_plan is not None

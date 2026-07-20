@@ -493,6 +493,11 @@ def test_langgraph_manager_loop_runs_distinct_next_specialist_edge(tmp_path: Pat
                 "target_agent": "business_research_analyst",
                 "intent": "company_research",
                 "primary_target": "NeuroFlow",
+                "workflow": [
+                    "business_research_analyst",
+                    "opportunity_scout",
+                ],
+                "requires_durable_state": True,
             },
         ),
         manager_loop=True,
@@ -703,9 +708,9 @@ def test_natural_cos_decision_brief_completes_planned_graph_without_post_checkpo
     assert opportunity.metadata["source_provided"] is True
     assert outreach.artifact_type == "outreach_draft"
     assert outreach.metadata["internal_slack_copy"] is True
-    assert result.human_summary.startswith("*Decision brief:*")
+    assert result.human_summary.startswith("*Recommendation:*")
     assert "*What the supplied note supports:*" in result.human_summary
-    assert "*Internal Slack note:*" in result.human_summary
+    assert "*Most important validation gap:*" in result.human_summary
     assert "care-navigation software" in result.human_summary
     assert result.human_summary.count("*Next safe action:*") == 1
     assert "Email draft" not in result.human_summary
@@ -769,8 +774,8 @@ def test_resumable_approved_facts_internal_slack_recommendation_is_not_external_
     assert result.work_item.id.startswith("wi_")
     assert internal_artifact.metadata["internal_slack_copy"] is True
     assert "outreach_requires_approved_context" not in blocker_codes
-    assert result.human_summary.startswith("*Assessment:*")
-    assert "*Paste-ready internal Slack recommendation:*" in result.human_summary
+    assert result.human_summary.startswith("*Recommendation:*")
+    assert "*Most important validation gap:*" in result.human_summary
     assert "Northstar Care" in result.human_summary
     assert "referral-navigation software" in result.human_summary
     assert "track this as a resumable" not in result.human_summary.lower()
@@ -830,8 +835,8 @@ def test_short_human_cos_stateful_review_completes_same_graph_contract(
         "Northstar Care sells referral-navigation software but has no audited outcomes."
     ]
     assert result.work_item.artifact_refs[-1].metadata["internal_slack_copy"] is True
-    assert result.human_summary.startswith("*Assessment:*")
-    assert "*Paste-ready internal Slack recommendation:*" in result.human_summary
+    assert result.human_summary.startswith("*Recommendation:*")
+    assert "*Most important validation gap:*" in result.human_summary
     assert "Track this review" not in result.human_summary
     assert "*Answer:*" not in result.human_summary
     assert "*Detailed Summary:*" not in result.human_summary
@@ -1023,6 +1028,11 @@ def test_langgraph_manager_loop_emits_graph_feedback_events(tmp_path: Path) -> N
                 "target_agent": "business_research_analyst",
                 "intent": "company_research",
                 "primary_target": "NeuroFlow",
+                "workflow": [
+                    "business_research_analyst",
+                    "opportunity_scout",
+                ],
+                "requires_durable_state": True,
             },
         ),
         manager_loop=True,
@@ -1556,6 +1566,12 @@ def test_backend_selected_manager_loop_uses_graph_for_research_opportunity_outre
                 "target_agent": "business_research_analyst",
                 "intent": "company_research",
                 "primary_target": "NeuroFlow",
+                "workflow": [
+                    "business_research_analyst",
+                    "opportunity_scout",
+                    "outreach_composer",
+                ],
+                "requires_durable_state": True,
             },
         ),
         max_steps=3,
@@ -3448,6 +3464,12 @@ def test_langgraph_manager_loop_routes_opportunity_to_outreach_gate_when_request
                 "target_agent": "business_research_analyst",
                 "intent": "company_research",
                 "primary_target": "NeuroFlow",
+                "workflow": [
+                    "business_research_analyst",
+                    "opportunity_scout",
+                    "outreach_composer",
+                ],
+                "requires_durable_state": True,
             },
         ),
         manager_loop=True,
@@ -7612,6 +7634,55 @@ def test_negated_capabilities_do_not_make_request_graph_worthy() -> None:
     )
 
     assert should_use_langgraph_for_work_item(request, manager_loop=True) is False
+
+
+@pytest.mark.parametrize(
+    ("request_text", "requires_durable_state", "workflow", "expected"),
+    [
+        (
+            "Give me the answer now; the background mentions workflow, handoff, and approval.",
+            False,
+            [],
+            False,
+        ),
+        (
+            "Handle this review and keep it available for later.",
+            True,
+            [],
+            True,
+        ),
+        (
+            "Take care of the supplied review.",
+            True,
+            [
+                WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                WorkItemRoute.OPPORTUNITY_SCOUT.value,
+            ],
+            True,
+        ),
+    ],
+)
+def test_live_semantic_plan_owns_graph_selection_across_natural_phrasings(
+    request_text: str,
+    requires_durable_state: bool,
+    workflow: list[str],
+    expected: bool,
+) -> None:
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        manual_request_plan={
+            "source": "llm",
+            "target_agent": "chief_of_staff",
+            "intent": "route_request",
+            "task_objective": "route_or_continue",
+            "expected_artifact_type": "none",
+            "requires_durable_state": requires_durable_state,
+            "workflow": workflow,
+        },
+    )
+
+    assert should_use_langgraph_for_work_item(request, manager_loop=True) is expected
+    assert should_use_langgraph_for_work_item(request, manager_loop=False) is expected
 
 
 def test_langgraph_work_item_thread_id_is_stable() -> None:

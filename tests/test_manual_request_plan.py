@@ -22,6 +22,7 @@ from keystone_agents.gmail_triage.execution_plan import (
 )
 from keystone_agents.manual_request import (
     infer_manual_request_plan,
+    is_internal_slack_composition_plan,
     is_single_owner_gmail_reply_request,
     looks_like_stateful_work_request,
     looks_like_supplied_context_synthesis_request,
@@ -31,7 +32,7 @@ from keystone_agents.manual_request import (
 )
 from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
 from keystone_agents.schemas.approval import ApprovalState
-from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 from keystone_agents.schemas.output_constraints import InterpretedOutputConstraints
 from keystone_agents.test_pack_specs import get_test_pack_spec
 
@@ -296,11 +297,15 @@ def test_explicit_agent_workflow_is_diagnostic_advice_not_required_for_same_plan
     natural = infer_manual_request_plan(natural_request, requested_agent="chief_of_staff")
     explicit = infer_manual_request_plan(explicit_request, requested_agent="chief_of_staff")
 
-    assert natural.workflow == explicit.workflow == [
-        "business_research_analyst",
-        "opportunity_scout",
-        "outreach_composer",
-    ]
+    assert (
+        natural.workflow
+        == explicit.workflow
+        == [
+            "business_research_analyst",
+            "opportunity_scout",
+            "outreach_composer",
+        ]
+    )
 
 
 def test_llm_workflow_survives_merge_for_chief_of_staff_front_door() -> None:
@@ -399,8 +404,7 @@ def test_manual_plan_preserves_exact_sentence_summary_stop_shape() -> None:
 
 def test_manual_plan_preserves_requested_summary_word_limit() -> None:
     plan = infer_manual_request_plan(
-        "Provide the exact title and summarize the stored abstract in no more than "
-        "50 words.",
+        "Provide the exact title and summarize the stored abstract in no more than 50 words.",
         requested_agent="zotero_context_agent",
     )
 
@@ -438,13 +442,11 @@ def test_llm_interpreted_output_constraints_override_heuristic_fallback() -> Non
     )
     candidate = fallback.model_copy(deep=True)
     candidate.source = "llm"
-    candidate.ask_shape.output_constraints = (
-        candidate.ask_shape.output_constraints.model_copy(
-            update={
-                "interpretation": "maximum 20-word answer because the operator used it as a cap",
-                "word_count_mode": "maximum",
-            }
-        )
+    candidate.ask_shape.output_constraints = candidate.ask_shape.output_constraints.model_copy(
+        update={
+            "interpretation": "maximum 20-word answer because the operator used it as a cap",
+            "word_count_mode": "maximum",
+        }
     )
 
     merged = merge_manual_request_plan(fallback, candidate)
@@ -454,14 +456,15 @@ def test_llm_interpreted_output_constraints_override_heuristic_fallback() -> Non
     assert "because the operator" in merged.ask_shape.output_constraints.interpretation
 
 
-def test_manual_planner_prompt_preserves_distinct_named_deliverables() -> None:
+def test_manual_planner_prompt_distinguishes_content_from_explicit_headings() -> None:
     prompt = Path("src/keystone_agents/prompts/manual_request_planner.md").read_text(
         encoding="utf-8"
     )
     normalized = " ".join(prompt.split())
 
-    assert "two or more distinct named deliverables" in normalized
-    assert "decision brief plus a paste-ready internal note" in normalized
+    assert "require_section_headings=true" in normalized
+    assert "describe content the specialist must cover" in normalized
+    assert "preserve them in `interpretation`, not as mandatory literal headings" in normalized
     assert "Do not invent sections for ordinary content questions" in normalized
 
 
@@ -528,8 +531,7 @@ def test_manual_planner_context_keeps_newest_messages_and_raw_slack_fields() -> 
                 for index in range(10)
             ],
             "prior_agent_runs": [
-                {"id": f"run-{index}", "route": "chief_of_staff"}
-                for index in range(7)
+                {"id": f"run-{index}", "route": "chief_of_staff"} for index in range(7)
             ],
         }
     )
@@ -553,9 +555,7 @@ def test_manual_planner_context_preserves_thread_root_and_latest_correction() ->
         + "\nLATEST: actually use the Gmail draft and do not send it."
     )
 
-    context = _compact_manual_planner_context(
-        {"slack_thread_transcript": transcript}
-    )
+    context = _compact_manual_planner_context({"slack_thread_transcript": transcript})
     bounded = context["slack_thread_transcript"]
 
     assert len(bounded) <= 6000
@@ -604,10 +604,7 @@ def test_manual_planner_context_preserves_exact_current_workitem_identity() -> N
 
     serialized = json.dumps(context, sort_keys=True)
     assert context["current_work_item"]["target"]["external_id"] == "draftExact123"
-    assert (
-        context["current_work_item"]["selected_artifacts"][0]["artifact_id"]
-        == "draftExact123"
-    )
+    assert context["current_work_item"]["selected_artifacts"][0]["artifact_id"] == "draftExact123"
     assert context["current_work_item"]["next_action"]["action"] == "revise_draft"
     assert context["context_compaction"]["work_item_identity_expanded"] is True
     assert context["context_compaction"]["selected_artifacts_retained"] == 1
@@ -739,10 +736,7 @@ def test_typed_provider_affinity_routes_fully_named_followup_without_phrase_depe
     assert plan.intent == intent
     assert plan.provider_system == provider_system
     assert plan.workflow == []
-    assert not any(
-        "did not contain enough information" in item
-        for item in plan.planner_warnings
-    )
+    assert not any("did not contain enough information" in item for item in plan.planner_warnings)
 
 
 def test_current_request_explicit_source_beats_prior_thread_source() -> None:
@@ -798,16 +792,12 @@ def test_historical_agent_output_cannot_select_owner_over_operator_root_and_curr
                 {
                     "role": "operator",
                     "source_agent": "UUSER",
-                    "summary": (
-                        "CoS, using only these facts, give me exactly three bullets."
-                    ),
+                    "summary": ("CoS, using only these facts, give me exactly three bullets."),
                 },
                 {
                     "role": "agent",
                     "source_agent": "kni",
-                    "summary": (
-                        "Business Research Analyst article summary from a stale route."
-                    ),
+                    "summary": ("Business Research Analyst article summary from a stale route."),
                 },
                 {
                     "role": "operator",
@@ -832,9 +822,7 @@ def test_orchestrator_preflight_uses_context_before_underspecified_modify_blocke
                 "1. operator: Create a marked Airtable record.\n"
                 "2. agent: Airtable record created and provider verified."
             ),
-            "recent_slack_thread": [
-                {"summary": "Airtable record created and provider verified."}
-            ],
+            "recent_slack_thread": [{"summary": "Airtable record created and provider verified."}],
         },
     )
 
@@ -855,9 +843,7 @@ def test_manual_planner_reads_thread_evidence_from_nested_slack_context() -> Non
                     "1. operator: One exact Zotero article was resolved.\n"
                     "2. agent: Zotero article KBA_TEST_ARTICLE is the current target."
                 ),
-                "thread_messages": [
-                    {"text": "One exact Zotero article was resolved."}
-                ],
+                "thread_messages": [{"text": "One exact Zotero article was resolved."}],
             }
         },
     )
@@ -1677,9 +1663,7 @@ def test_manual_plan_does_not_treat_single_record_fields_as_item_count() -> None
     assert merged.ask_shape.output_constraints.minimum_items is None
     assert merged.ask_shape.output_constraints.maximum_items is None
     assert merged.ask_shape.output_constraints.item_count_mode == "unspecified"
-    assert merged.ask_shape.output_constraints.style_requirements == [
-        "exact fields only"
-    ]
+    assert merged.ask_shape.output_constraints.style_requirements == ["exact fields only"]
     assert cli._strict_requested_display_text(
         {
             "article_titles": ["Selected article"],
@@ -1746,8 +1730,7 @@ def test_provider_action_prohibitions_cannot_become_forbidden_output_phrases() -
     candidate.ask_shape.output_form = "draft"
     candidate.ask_shape.output_constraints = InterpretedOutputConstraints(
         interpretation=(
-            "Return a brief reply suggestion based on the selected thread without "
-            "modifying Gmail."
+            "Return a brief reply suggestion based on the selected thread without modifying Gmail."
         ),
         scope="draft_body",
         forbidden_phrases=["draft", "send", "label", "archive"],
@@ -1766,26 +1749,21 @@ def test_provider_action_prohibitions_cannot_become_forbidden_output_phrases() -
 
 def test_explicit_quoted_forbidden_output_phrase_remains_enforceable() -> None:
     request = (
-        'Give me exactly two bullets. Do not use the phrase "workflow metadata" '
-        "in the answer."
+        'Give me exactly two bullets. Do not use the phrase "workflow metadata" in the answer.'
     )
     fallback = infer_manual_request_plan(request, requested_agent="chief_of_staff")
     candidate = fallback.model_copy(deep=True)
     candidate.source = "llm"
-    candidate.ask_shape.output_constraints = (
-        candidate.ask_shape.output_constraints.model_copy(
-            update={
-                "forbidden_phrases": ["workflow metadata", "routing"],
-                "style_requirements": ["concise"],
-            }
-        )
+    candidate.ask_shape.output_constraints = candidate.ask_shape.output_constraints.model_copy(
+        update={
+            "forbidden_phrases": ["workflow metadata", "routing"],
+            "style_requirements": ["concise"],
+        }
     )
 
     merged = merge_manual_request_plan(fallback, candidate)
 
-    assert merged.ask_shape.output_constraints.forbidden_phrases == [
-        "workflow metadata"
-    ]
+    assert merged.ask_shape.output_constraints.forbidden_phrases == ["workflow metadata"]
     assert merged.ask_shape.output_constraints.minimum_items == 2
     assert merged.ask_shape.output_constraints.maximum_items == 2
 
@@ -1939,10 +1917,7 @@ def test_slack_correction_negated_capabilities_do_not_select_outreach() -> None:
             "Correct the previous response; keep exactly its three requested bullet "
             "points and no extra note. Never search or write anything."
         ),
-        (
-            "Reformat the answer above as three bullets only. Don't call tools or "
-            "create a draft."
-        ),
+        ("Reformat the answer above as three bullets only. Don't call tools or create a draft."),
     ],
 )
 def test_prior_response_transformations_route_to_chief_without_blocking(
@@ -1980,10 +1955,7 @@ def test_llm_cannot_turn_negated_drafting_boundary_into_outreach_route() -> None
 
     assert merged.target_agent == "chief_of_staff"
     assert merged.intent == "route_request"
-    assert any(
-        "Removed outreach drafting" in warning
-        for warning in merged.planner_warnings
-    )
+    assert any("Removed outreach drafting" in warning for warning in merged.planner_warnings)
 
 
 def test_negative_capabilities_never_become_required_owner_or_context() -> None:
@@ -2197,8 +2169,7 @@ def test_negated_capability_scope_is_not_positive_owner_evidence(
             "chief_of_staff",
         ),
         (
-            "Without searching, draft one internal Slack message from these "
-            "approved facts.",
+            "Without searching, draft one internal Slack message from these approved facts.",
             "outreach_composer",
         ),
         (
@@ -2279,10 +2250,7 @@ def test_chief_finance_summary_without_named_provider_stays_with_chief() -> None
 
 def test_chief_named_airtable_finance_read_delegates_to_context_owner() -> None:
     plan = infer_manual_request_plan(
-        (
-            "Chief of Staff, read the Airtable financial tracker and summarize "
-            "the current quarter."
-        ),
+        ("Chief of Staff, read the Airtable financial tracker and summarize the current quarter."),
         requested_agent="chief_of_staff",
     )
 
@@ -2304,8 +2272,7 @@ def test_llm_intent_owner_contract_repairs_internal_mismatch() -> None:
 
     assert merged.target_agent == "business_research_analyst"
     assert any(
-        "structured intent/provider contract" in warning
-        for warning in merged.planner_warnings
+        "structured intent/provider contract" in warning for warning in merged.planner_warnings
     )
 
 
@@ -2438,9 +2405,7 @@ def test_manual_plan_routes_operational_planning_to_chief_of_staff(
     assert plan.target_agent == "chief_of_staff"
     assert plan.intent == expected_intent
     assert plan.task_objective == (
-        "slack_operations"
-        if expected_intent == "slack_operations"
-        else "route_or_continue"
+        "slack_operations" if expected_intent == "slack_operations" else "route_or_continue"
     )
     assert plan.expected_artifact_type == (
         "slack_ops_summary" if expected_intent == "slack_operations" else "none"
@@ -3286,8 +3251,7 @@ def test_cli_live_opportunity_scout_uses_script_retrieval_path(monkeypatch, caps
     assert "--live-search" in captured["command"]
     assert captured["command"][captured["command"].index("--max-results") + 1] == "2"
     assert captured["command"][captured["command"].index("--topic") + 1] == (
-        "Find 2 U.S.-relevant academic institutes. Use live SDK and live search. "
-        "No outreach."
+        "Find 2 U.S.-relevant academic institutes. Use live SDK and live search. No outreach."
     )
     assert "--live-search-plan" not in captured["command"]
 
@@ -3470,9 +3434,7 @@ def test_cos_gmail_read_and_slack_copy_delegates_to_one_gmail_owner() -> None:
     assert plan.workflow == []
     assert execution.operation == "draft_reply"
     assert execution.read_scope == "thread"
-    assert execution.gmail_query == (
-        'subject:"Why Healthtech Needs a New Kind of Product Leader"'
-    )
+    assert execution.gmail_query == ('subject:"Why Healthtech Needs a New Kind of Product Leader"')
     assert execution.create_gmail_drafts is False
     assert execution.draft_replies_in_output is True
 
@@ -3553,25 +3515,23 @@ def test_llm_plan_keeps_gmail_read_and_slack_copy_with_one_owner() -> None:
     assert merged.workflow == []
 
 
-def test_llm_plan_preserves_only_grounded_multi_deliverable_sections() -> None:
+def test_llm_plan_preserves_only_grounded_explicit_heading_requirements() -> None:
     request = (
-        "CoS, give me a decision brief and a separate paste-ready internal Slack "
+        "CoS, use headings named Decision brief and Paste-ready internal Slack "
         "note using only this supplied context."
     )
     fallback = infer_manual_request_plan(request, requested_agent="chief_of_staff")
-    candidate_constraints = (
-        fallback.ask_shape.output_constraints.model_copy(
-            update={
-                "interpretation": (
-                    "Return a decision brief and a separate paste-ready internal "
-                    "Slack note."
-                ),
-                "required_sections": [
-                    "Decision brief",
-                    "Paste-ready internal Slack note",
-                ],
-            }
-        )
+    candidate_constraints = fallback.ask_shape.output_constraints.model_copy(
+        update={
+            "interpretation": (
+                "Return a decision brief and a separate paste-ready internal Slack note."
+            ),
+            "required_sections": [
+                "Decision brief",
+                "Paste-ready internal Slack note",
+            ],
+            "require_section_headings": True,
+        }
     )
     candidate = fallback.model_copy(
         update={
@@ -3588,6 +3548,7 @@ def test_llm_plan_preserves_only_grounded_multi_deliverable_sections() -> None:
         "Decision brief",
         "Paste-ready internal Slack note",
     ]
+    assert merged.ask_shape.output_constraints.require_section_headings is True
 
     ungrounded = candidate.model_copy(
         update={
@@ -3608,10 +3569,8 @@ def test_llm_plan_preserves_only_grounded_multi_deliverable_sections() -> None:
 
     ungrounded_merged = merge_manual_request_plan(fallback, ungrounded)
 
-    assert ungrounded_merged.ask_shape.output_constraints.required_sections == [
-        "Decision brief",
-        "Paste-ready internal Slack note",
-    ]
+    assert ungrounded_merged.ask_shape.output_constraints.required_sections == []
+    assert ungrounded_merged.ask_shape.output_constraints.require_section_headings is False
 
 
 def test_llm_chief_plan_can_collapse_heuristic_graph_for_supplied_context() -> None:
@@ -3633,8 +3592,7 @@ def test_llm_chief_plan_can_collapse_heuristic_graph_for_supplied_context() -> N
             "requires_live_search": False,
             "side_effect_policy": "draft_or_read_only",
             "rationale": (
-                "The operator supplied sufficient context for one read-only Chief "
-                "response."
+                "The operator supplied sufficient context for one read-only Chief response."
             ),
         }
     )
@@ -3647,6 +3605,67 @@ def test_llm_chief_plan_can_collapse_heuristic_graph_for_supplied_context() -> N
     assert merged.target_agent == "chief_of_staff"
     assert merged.workflow == []
     assert merged.requires_approved_context is False
+
+
+def test_llm_internal_slack_copy_is_not_treated_as_external_outreach() -> None:
+    request = (
+        "Outreach Composer: Based only on this fact—Northstar Care has no audited "
+        "outcomes—write one sentence for our internal Slack recommending the next "
+        "step. Don't send email, create a provider draft, or search."
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="outreach_composer")
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        objective="Write one internal Slack recommendation from the supplied fact.",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        outreach_channel="internal_slack",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_approved_context=True,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+        ),
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert is_internal_slack_composition_plan(merged) is True
+    assert merged.requires_approved_context is False
+    assert merged.provider_system == "unspecified"
+    assert merged.provider_operations == []
+
+
+def test_llm_external_outreach_still_requires_approved_context() -> None:
+    fallback = infer_manual_request_plan(
+        "Draft a concise email to Maya about Northstar Care.",
+        requested_agent="outreach_composer",
+    )
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        objective="Draft an external email.",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        recipient="Maya",
+        outreach_channel="email",
+        requires_approved_context=False,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(permission_state="draft_only"),
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert is_internal_slack_composition_plan(merged) is False
+    assert merged.requires_approved_context is True
 
 
 def test_resumable_supplied_context_uses_typed_durable_state_not_forced_workflow() -> None:
@@ -3679,13 +3698,11 @@ def test_resumable_supplied_context_uses_typed_durable_state_not_forced_workflow
     assert merged.requires_durable_state is True
     assert merged.requires_live_search is False
     assert merged.requires_approved_context is False
-    assert merged.ask_shape.output_constraints.required_sections == [
-        "Assessment",
-        "Paste-ready internal Slack recommendation",
-    ]
+    assert merged.ask_shape.output_constraints.required_sections == []
+    assert merged.ask_shape.output_constraints.require_section_headings is False
 
 
-def test_named_multi_part_deliverables_become_output_sections_not_routes() -> None:
+def test_natural_multi_part_deliverables_do_not_become_literal_heading_contracts() -> None:
     request = (
         "Give me one decision brief covering what is supported and the first "
         "validation question, and a short internal Slack note I can paste to the team."
@@ -3693,10 +3710,8 @@ def test_named_multi_part_deliverables_become_output_sections_not_routes() -> No
 
     plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
 
-    assert plan.ask_shape.output_constraints.required_sections == [
-        "Decision brief",
-        "Internal Slack note",
-    ]
+    assert plan.ask_shape.output_constraints.required_sections == []
+    assert plan.ask_shape.output_constraints.require_section_headings is False
     assert plan.intent == "route_request"
 
 
@@ -3741,10 +3756,8 @@ def test_short_human_cos_stateful_review_accepts_llm_direct_durable_plan() -> No
     assert plan.ask_shape.prior_context_dependency == "selected_context"
     assert looks_like_supplied_context_synthesis_request(request) is True
     assert looks_like_stateful_work_request(request) is True
-    assert plan.ask_shape.output_constraints.required_sections == [
-        "Assessment",
-        "Paste-ready internal Slack recommendation",
-    ]
+    assert plan.ask_shape.output_constraints.required_sections == []
+    assert plan.ask_shape.output_constraints.require_section_headings is False
     candidate = plan.model_copy(
         update={
             "source": "llm",
@@ -4042,6 +4055,8 @@ def test_cli_live_outreach_backend_fixture_request_stops_at_preflight(monkeypatc
     assert output["requires_approved_context"] is True
     assert output["send_enabled"] is False
     assert captured == {}
+
+
 def test_internal_ai_agents_workflow_message_mutation_routes_to_chief() -> None:
     plan = infer_manual_request_plan(
         "Post a marked test update in ai-agents-workflow, edit the same message, then delete it.",

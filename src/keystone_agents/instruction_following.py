@@ -194,9 +194,12 @@ def validate_output_constraints(
             satisfied.append(f"maximum item count {constraints.maximum_items}")
 
     response_lower = response_text.lower()
-    for section in constraints.required_sections:
+    for section in (
+        constraints.required_sections if constraints.require_section_headings else []
+    ):
         if not re.search(
-            rf"(?im)^\s*(?:\*{{0,2}}){re.escape(section)}\s*:?(?:\*{{0,2}})\s*$",
+            rf"(?im)^\s*(?:[#>]{{1,6}}\s*)?(?:\*{{0,2}})"
+            rf"{re.escape(section)}\s*:?(?:\*{{0,2}})(?:\s+.+)?$",
             response_text,
         ):
             violations.append(f"missing required section: {section}")

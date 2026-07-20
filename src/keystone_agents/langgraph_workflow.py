@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from keystone_agents.manual_request import positive_capability_text
 from keystone_agents.schemas.approval import ApprovalState
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
@@ -142,6 +143,18 @@ def should_use_langgraph_for_work_item(
 
     if request.work_item_id:
         return True
+    semantic_plan = _semantic_manual_request_plan(request.manual_request_plan)
+    if semantic_plan is not None:
+        if _manager_loop_request_is_planning_only(
+            request.request_text,
+            manual_request_plan=request.manual_request_plan,
+        ):
+            return False
+        return bool(
+            semantic_plan.requires_durable_state
+            or len(semantic_plan.workflow) > 1
+            or semantic_plan.intent == "continue_work_item"
+        )
     normalized = " ".join(
         positive_capability_text(request.request_text or "").lower().split()
     )
@@ -172,6 +185,21 @@ def should_use_langgraph_for_work_item(
         or _request_mentions_chief_coordination_edge(normalized)
         or _request_mentions_chief_multistage_workflow(normalized)
     )
+
+
+def _semantic_manual_request_plan(value: Any) -> ManualRequestPlan | None:
+    """Return a valid live semantic plan without falling back to request words."""
+
+    if isinstance(value, ManualRequestPlan):
+        plan = value
+    elif isinstance(value, dict):
+        try:
+            plan = ManualRequestPlan.model_validate(value)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    return plan if plan.source == "llm" else None
 
 
 def _request_has_graph_worthy_single_step_boundary(normalized: str) -> bool:

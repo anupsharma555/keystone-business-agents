@@ -450,9 +450,7 @@ def infer_manual_request_plan(
         intent=intent,
         primary_target=inferred_primary_target,
         target_type=(
-            "topic"
-            if workflow and inferred_target_type == "unknown"
-            else inferred_target_type
+            "topic" if workflow and inferred_target_type == "unknown" else inferred_target_type
         ),
         provider_system=_provider_system_for_plan(
             text,
@@ -488,9 +486,7 @@ def infer_manual_request_plan(
         tone=_tone(text) if intent == "outreach_draft" else "",
         requires_live_search=_requires_live_search_for_plan(text, target_agent=target_agent),
         requires_approved_context=intent in {"outreach_draft", "blocked_send"},
-        requires_durable_state=bool(
-            len(workflow) > 1 or looks_like_stateful_work_request(text)
-        ),
+        requires_durable_state=bool(len(workflow) > 1 or looks_like_stateful_work_request(text)),
         side_effect_policy=(
             "internal_write_approval_required"
             if intent == "business_system_write"
@@ -644,10 +640,7 @@ def _infer_goal_workflow(text: str) -> list[ManualTargetAgent]:
         if match is not None:
             ordered.append((match.start(), route))
     workflow = list(dict.fromkeys(route for _, route in sorted(ordered)))
-    if (
-        is_single_owner_gmail_reply_request(text)
-        and "gmail_triage" in workflow
-    ):
+    if is_single_owner_gmail_reply_request(text) and "gmail_triage" in workflow:
         # Gmail Triage owns both the bounded provider read and reply copy. A
         # Slack-thread-only draft is an output field, not a second Outreach
         # deliverable. Explicit research or another context source still keeps
@@ -815,7 +808,9 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
             else "selected_context"
             if selected_context
             else "required"
-            if re.search(r"\b(?:prior|previous|earlier|above) (?:context|thread|result|work)\b", lower)
+            if re.search(
+                r"\b(?:prior|previous|earlier|above) (?:context|thread|result|work)\b", lower
+            )
             else "unspecified"
         ),
         permission_state=(
@@ -836,46 +831,6 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
         ),
         stop_condition=stop_condition,
         output_constraints=_interpreted_output_constraints(text),
-    )
-
-
-def named_output_deliverable_sections(text: str) -> list[str]:
-    """Return high-confidence section labels for explicitly separate deliverables.
-
-    This is a response-shape helper, not an intent or routing classifier. It only
-    becomes authoritative when the operator names at least two reader-facing
-    components. Substantive interpretation remains with the planner/specialist.
-    """
-
-    normalized = " ".join(str(text or "").split())
-    lower = normalized.lower()
-    sections: list[str] = []
-    if re.search(r"\bdecision\s+brief\b", lower):
-        sections.append("Decision brief")
-    assessment_is_separate = bool(
-        re.search(r"\bpreserve\s+the\s+assessment\b", lower)
-        or re.search(
-            r"\bassess\b.{0,180}\b(?:and|then)\s+"
-            r"(?:prepare|draft|write|produce|return|give)\b",
-            lower,
-        )
-    )
-    if assessment_is_separate:
-        sections.append("Assessment")
-    slack_component = re.search(
-        r"\b(?P<paste>paste[- ]ready\s+)?"
-        r"(?:(?:short|concise)\s+)?(?:internal\s+)?slack\s+"
-        r"(?P<kind>note|recommendation|update|message|copy)\b",
-        lower,
-    )
-    if slack_component:
-        kind = slack_component.group("kind")
-        prefix = "Paste-ready internal" if slack_component.group("paste") else "Internal"
-        sections.append(f"{prefix} Slack {kind}")
-    return (
-        list(dict.fromkeys(sections))[:10]
-        if len(set(sections)) >= 2
-        else []
     )
 
 
@@ -924,9 +879,7 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         """
 
         raw_count = match.group("count").lower()
-        parsed_count = (
-            int(raw_count) if raw_count.isdigit() else _COUNT_WORDS.get(raw_count)
-        )
+        parsed_count = int(raw_count) if raw_count.isdigit() else _COUNT_WORDS.get(raw_count)
         if parsed_count != 1:
             return True
         matched_text = match.group(0)
@@ -943,9 +896,7 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         return bool(response_shape_verb or trailing_only)
 
     authoritative_item_exact = (
-        item_exact
-        if item_exact and item_match_has_response_shape_authority(item_exact)
-        else None
+        item_exact if item_exact and item_match_has_response_shape_authority(item_exact) else None
     )
 
     def count_mode(label: str) -> str:
@@ -958,23 +909,13 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         return "maximum"
 
     required_sections: list[str] = []
-    section_match = re.search(
-        r"\breturn\s+exactly\s*:\s*(?P<sections>[^.\n]+)", normalized, re.I
-    )
+    section_match = re.search(r"\breturn\s+exactly\s*:\s*(?P<sections>[^.\n]+)", normalized, re.I)
     if section_match:
         required_sections = [
             item.strip(" -*`\t")
             for item in re.split(r",|\band\b", section_match.group("sections"), flags=re.I)
             if item.strip(" -*`\t")
         ][:10]
-    required_sections = list(
-        dict.fromkeys(
-            [
-                *required_sections,
-                *named_output_deliverable_sections(normalized),
-            ]
-        )
-    )[:10]
     forbidden_phrases = list(
         dict.fromkeys(
             match.group("phrase").strip()
@@ -997,9 +938,7 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
     if authoritative_item_exact and not item_range:
         raw_item_count = authoritative_item_exact.group("count").lower()
         parsed_item_count = (
-            int(raw_item_count)
-            if raw_item_count.isdigit()
-            else _COUNT_WORDS.get(raw_item_count)
+            int(raw_item_count) if raw_item_count.isdigit() else _COUNT_WORDS.get(raw_item_count)
         )
         singular_word_recommendation = bool(
             raw_item_count == "one"
@@ -1018,7 +957,13 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         or re.search(r"\b(?:no|do not use|avoid)\s+em\s+dashes?\b", lower)
         or re.search(r"\b(?:cite|include|show|provide)\b[^.]{0,60}\b(?:urls?|links?)\b", lower)
     )
-    scope = "answer" if word_match or sentence_match else "entire_response" if explicit else "unspecified"
+    scope = (
+        "answer"
+        if word_match or sentence_match
+        else "entire_response"
+        if explicit
+        else "unspecified"
+    )
     interpretation_parts: list[str] = []
     if word_match:
         interpretation_parts.append(
@@ -1034,9 +979,7 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
             f"-{maximum_items if maximum_items is not None else 'unbounded'}"
         )
     if required_sections:
-        interpretation_parts.append(
-            "required sections: " + ", ".join(required_sections)
-        )
+        interpretation_parts.append("required sections: " + ", ".join(required_sections))
     return InterpretedOutputConstraints(
         interpretation="; ".join(interpretation_parts),
         scope=scope,
@@ -1058,10 +1001,9 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         minimum_items=minimum_items,
         maximum_items=maximum_items,
         required_sections=required_sections,
+        require_section_headings=bool(required_sections),
         forbidden_phrases=forbidden_phrases,
-        forbid_em_dash=bool(
-            re.search(r"\b(?:no|do not use|avoid)\s+em\s+dashes?\b", lower)
-        ),
+        forbid_em_dash=bool(re.search(r"\b(?:no|do not use|avoid)\s+em\s+dashes?\b", lower)),
         include_source_urls=bool(
             re.search(r"\b(?:cite|include|show|provide)\b[^.]{0,60}\b(?:urls?|links?)\b", lower)
         ),
@@ -1120,24 +1062,33 @@ def _merge_ask_shape_policy(
             else:
                 candidate_values[count_field] = base_count
                 if candidate_values.get(mode_field) == "unspecified":
-                    candidate_values[mode_field] = getattr(
-                        base_constraints, mode_field
-                    )
+                    candidate_values[mode_field] = getattr(base_constraints, mode_field)
         grounded_required_sections = _grounded_planner_required_sections(
             request_text,
             candidate_constraints.required_sections,
+        )
+        retained_required_sections = list(
+            dict.fromkeys(
+                [
+                    *base_constraints.required_sections,
+                    *grounded_required_sections,
+                ]
+            )
         )
         candidate_values.update(
             {
                 "item_count_mode": base_constraints.item_count_mode,
                 "minimum_items": base_constraints.minimum_items,
                 "maximum_items": base_constraints.maximum_items,
-                "required_sections": list(
-                    dict.fromkeys(
-                        [
-                            *base_constraints.required_sections,
-                            *grounded_required_sections,
-                        ]
+                "required_sections": retained_required_sections,
+                "require_section_headings": bool(
+                    retained_required_sections
+                    and (
+                        base_constraints.require_section_headings
+                        or (
+                            candidate_constraints.require_section_headings
+                            and grounded_required_sections
+                        )
                     )
                 ),
                 "forbidden_phrases": list(base_constraints.forbidden_phrases),
@@ -1179,7 +1130,9 @@ def _grounded_planner_required_sections(
     """Accept semantic section labels only when the operator named their substance."""
 
     cleaned_sections = list(
-        dict.fromkeys(str(section or "").strip() for section in sections if str(section or "").strip())
+        dict.fromkeys(
+            str(section or "").strip() for section in sections if str(section or "").strip()
+        )
     )[:10]
     if len(cleaned_sections) < 2:
         return []
@@ -1227,9 +1180,7 @@ def merge_manual_request_plan(
         if base.intent in preserved_intents and (
             plan.intent != base.intent or plan.target_agent != base.target_agent
         ):
-            warnings = list(
-                dict.fromkeys([*base.planner_warnings, *plan.planner_warnings])
-            )
+            warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
             warnings.append(
                 "Ignored non-LLM override that converted a protected manual request "
                 "into a different route."
@@ -1241,9 +1192,7 @@ def merge_manual_request_plan(
                 }
             )
         if _candidate_uses_explicitly_forbidden_capability(base, plan):
-            warnings = list(
-                dict.fromkeys([*base.planner_warnings, *plan.planner_warnings])
-            )
+            warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
             warnings.append(
                 "Ignored non-LLM override that treated an explicitly forbidden "
                 "capability as positive routing evidence."
@@ -1255,9 +1204,7 @@ def merge_manual_request_plan(
                 }
             )
         if _candidate_turns_constraint_into_prerequisite_or_blocker(base, plan):
-            warnings = list(
-                dict.fromkeys([*base.planner_warnings, *plan.planner_warnings])
-            )
+            warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
             warnings.append(
                 "Ignored non-LLM override that turned a negative execution constraint "
                 "into a prerequisite, clarification, or workflow blocker."
@@ -1274,14 +1221,8 @@ def merge_manual_request_plan(
             and base.requested_agent == "chief_of_staff"
             and plan.target_agent in _CONTEXT_AGENT_TARGETS
         )
-        if (
-            explicit_agent
-            and plan.target_agent != base.target_agent
-            and not contextual_delegation
-        ):
-            warnings = list(
-                dict.fromkeys([*base.planner_warnings, *plan.planner_warnings])
-            )
+        if explicit_agent and plan.target_agent != base.target_agent and not contextual_delegation:
+            warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
             warnings.append(
                 "Ignored non-LLM override that rerouted an explicit named-agent request."
             )
@@ -1295,14 +1236,17 @@ def merge_manual_request_plan(
         plan = _normalize_llm_plan_contract(plan)
         plan = _repair_structurally_invalid_llm_plan(base, plan)
         plan = _prune_forbidden_llm_capabilities(base, plan)
+        # Normalization can expose a second structural contradiction (for
+        # example, pruning a forbidden workflow can make the remaining owner
+        # incompatible with the intent). Run the bounded repair pipeline to a
+        # second fixed-point pass; this is schema repair, not phrase routing.
         plan = _normalize_llm_plan_contract(plan)
         plan = _repair_structurally_invalid_llm_plan(base, plan)
         plan = _prune_forbidden_llm_capabilities(base, plan)
     candidate_values = plan.model_dump(mode="json")
     if (
         not llm_interpretation
-        and
-        candidate_values.get("provider_system") == "unspecified"
+        and candidate_values.get("provider_system") == "unspecified"
         and base.provider_system != "unspecified"
     ):
         candidate_values["provider_system"] = base.provider_system
@@ -1329,9 +1273,7 @@ def merge_manual_request_plan(
         merged.required_entities = list(
             dict.fromkeys([*base.required_entities, *merged.required_entities])
         )
-        merged.required_terms = list(
-            dict.fromkeys([*base.required_terms, *merged.required_terms])
-        )
+        merged.required_terms = list(dict.fromkeys([*base.required_terms, *merged.required_terms]))
     # A live LLM plan owns mailbox meaning and scope. The fallback parser may
     # populate these fields only when no LLM interpretation exists. Preserve
     # the explicit no-provider-draft boundary as a safety constraint even when
@@ -1343,13 +1285,10 @@ def merge_manual_request_plan(
             merged.lookback_days = base.lookback_days
         if base.draft_policy:
             merged.draft_policy = base.draft_policy
-    elif (
-        base.draft_policy == "no_drafts_requested"
-        and (
-            merged.provider_system == "gmail"
-            or merged.target_agent == "gmail_triage"
-            or merged.intent == "gmail_triage"
-        )
+    elif base.draft_policy == "no_drafts_requested" and (
+        merged.provider_system == "gmail"
+        or merged.target_agent == "gmail_triage"
+        or merged.intent == "gmail_triage"
     ):
         merged.draft_policy = "no_drafts_requested"
         merged.provider_operations = [
@@ -1366,8 +1305,7 @@ def merge_manual_request_plan(
     base_workflow = list(base.workflow)
     candidate_workflow = list(merged.workflow)
     supplied_context_chief_resolution = bool(
-        not llm_interpretation
-        and _candidate_resolves_supplied_context_with_chief(base, plan)
+        not llm_interpretation and _candidate_resolves_supplied_context_with_chief(base, plan)
     )
     if (
         supplied_context_chief_resolution
@@ -1396,7 +1334,15 @@ def merge_manual_request_plan(
     if not llm_interpretation and base.desired_count != 1:
         merged.desired_count = base.desired_count
     merged.desired_count = max(1, min(10, merged.desired_count or base.desired_count))
-    if base.target_agent == "outreach_composer" or merged.target_agent == "outreach_composer":
+    if is_internal_slack_composition_plan(merged):
+        # Internal copy is a draft artifact returned to the operator, not an
+        # external outreach action. The selected facts are already the bounded
+        # context, so external-claim approval must not become an execution
+        # prerequisite.
+        merged.requires_approved_context = False
+    elif merged.target_agent == "outreach_composer" or (
+        not llm_interpretation and base.target_agent == "outreach_composer"
+    ):
         merged.requires_approved_context = True
     elif supplied_context_chief_resolution:
         merged.requires_approved_context = False
@@ -1406,6 +1352,30 @@ def merge_manual_request_plan(
         else "draft_or_read_only"
     )
     return merged
+
+
+def is_internal_slack_composition_plan(plan: ManualRequestPlan) -> bool:
+    """Return whether a typed plan only composes internal Slack copy.
+
+    This deliberately interprets the planner's structured channel, provider,
+    context, and side-effect fields. It does not inspect the original request
+    or grant permission to post the resulting draft.
+    """
+
+    channel = re.sub(r"[\s-]+", "_", str(plan.outreach_channel or "").strip().lower())
+    return bool(
+        plan.target_agent == "outreach_composer"
+        and channel in {"slack_only", "internal_slack", "internal_team_slack"}
+        and not plan.recipient
+        and plan.intent in {"route_request", "outreach_draft"}
+        and not plan.workflow
+        and not plan.requires_durable_state
+        and not plan.requires_live_search
+        and plan.provider_system == "unspecified"
+        and not plan.provider_operations
+        and plan.ask_shape.prior_context_dependency != "required"
+        and plan.side_effect_policy == "draft_or_read_only"
+    )
 
 
 def _normalize_llm_plan_contract(candidate: ManualRequestPlan) -> ManualRequestPlan:
@@ -1481,10 +1451,7 @@ def _repair_structurally_invalid_llm_plan(
     updates: dict[str, Any] = {}
     warnings = list(candidate.planner_warnings)
     ungrounded_clarification = bool(
-        (
-            candidate.target_agent == "clarification"
-            or candidate.intent == "clarification"
-        )
+        (candidate.target_agent == "clarification" or candidate.intent == "clarification")
         and not candidate.missing_required_information
     )
     unowned_route_only = bool(
@@ -1516,9 +1483,7 @@ def _repair_structurally_invalid_llm_plan(
         if operations & {"create", "update", "delete", "attach"}:
             recovered_intent: ManualRequestIntent = "business_system_write"
             recovered_task: ManualTaskObjective = "business_system_write"
-            recovered_artifact: ManualExpectedArtifactType = (
-                "business_system_write_plan"
-            )
+            recovered_artifact: ManualExpectedArtifactType = "business_system_write_plan"
         elif candidate.provider_system != "unspecified" and operations <= {
             "read",
             "search",
@@ -1560,9 +1525,7 @@ def _repair_structurally_invalid_llm_plan(
         and "requires_approved_context" not in updates
     ):
         updates["requires_approved_context"] = False
-        warnings.append(
-            "Removed an approval-context prerequisite from a non-outreach plan."
-        )
+        warnings.append("Removed an approval-context prerequisite from a non-outreach plan.")
 
     if len(candidate.workflow) > 1 and not candidate.requires_durable_state:
         updates["requires_durable_state"] = True
@@ -1635,12 +1598,8 @@ def _prune_forbidden_llm_capabilities(
             updates.update(
                 {
                     "intent": "context_lookup" if provider_read else "route_request",
-                    "task_objective": (
-                        "context_lookup" if provider_read else "route_or_continue"
-                    ),
-                    "expected_artifact_type": (
-                        "context_summary" if provider_read else "none"
-                    ),
+                    "task_objective": ("context_lookup" if provider_read else "route_or_continue"),
+                    "expected_artifact_type": ("context_summary" if provider_read else "none"),
                     "side_effect_policy": "draft_or_read_only",
                 }
             )
@@ -1651,14 +1610,16 @@ def _prune_forbidden_llm_capabilities(
             negative_scopes,
         )
     )
-    if draft_forbidden and (
-        candidate.target_agent == "outreach_composer"
-        or "outreach_composer" in candidate.workflow
-        or candidate.intent in {"outreach_draft", "opportunity_to_outreach_loop"}
+    if (
+        draft_forbidden
+        and not is_internal_slack_composition_plan(candidate)
+        and (
+            candidate.target_agent == "outreach_composer"
+            or "outreach_composer" in candidate.workflow
+            or candidate.intent in {"outreach_draft", "opportunity_to_outreach_loop"}
+        )
     ):
-        remaining_workflow = [
-            route for route in candidate.workflow if route != "outreach_composer"
-        ]
+        remaining_workflow = [route for route in candidate.workflow if route != "outreach_composer"]
         updates.update(
             {
                 "target_agent": (
@@ -1708,10 +1669,14 @@ def _candidate_uses_explicitly_forbidden_capability(
     if not negative_scopes:
         return False
     if (
-        candidate.target_agent == "outreach_composer"
-        or "outreach_composer" in candidate.workflow
-        or candidate.intent in {"outreach_draft", "opportunity_to_outreach_loop"}
-    ) and re.search(r"\b(?:draft|drafting|compose|write|prepare)\b", negative_scopes):
+        not is_internal_slack_composition_plan(candidate)
+        and (
+            candidate.target_agent == "outreach_composer"
+            or "outreach_composer" in candidate.workflow
+            or candidate.intent in {"outreach_draft", "opportunity_to_outreach_loop"}
+        )
+        and re.search(r"\b(?:draft|drafting|compose|write|prepare)\b", negative_scopes)
+    ):
         return True
     if candidate.intent == "business_system_write" and re.search(
         r"\b(?:add|append|attach|change|create|delete|edit|modify|remove|save|"
@@ -1748,10 +1713,7 @@ def _candidate_turns_constraint_into_prerequisite_or_blocker(
         or base.intent in {"clarification", "blocked_send"}
     ):
         return False
-    if (
-        candidate.target_agent == "clarification"
-        or candidate.intent == "clarification"
-    ):
+    if candidate.target_agent == "clarification" or candidate.intent == "clarification":
         return True
     if _candidate_resolves_supplied_context_with_chief(base, candidate):
         return False
@@ -1831,9 +1793,8 @@ def _semantic_target_agent(
             if requested_agent in {"chief_of_staff", "orchestrator"}
             else "chief_of_staff"
         )
-    if (
-        requested_agent in {None, "orchestrator", "chief_of_staff"}
-        and is_calendar_action_candidate(route_text)
+    if requested_agent in {None, "orchestrator", "chief_of_staff"} and is_calendar_action_candidate(
+        route_text
     ):
         # Calendar action admission is a provider-bound routing hint. It keeps
         # a complete Calendar mutation with the Chief control plane before the
@@ -1843,25 +1804,25 @@ def _semantic_target_agent(
         return "business_research_analyst"
     if _looks_like_unnamed_company_set_discovery(route_text):
         return "opportunity_scout"
-    if (
-        requested_agent in {None, "orchestrator", "chief_of_staff"}
-        and _looks_like_supplied_context_synthesis_request(route_text)
-    ):
+    if requested_agent in {
+        None,
+        "orchestrator",
+        "chief_of_staff",
+    } and _looks_like_supplied_context_synthesis_request(route_text):
         return "chief_of_staff"
-    if (
-        requested_agent in {None, "orchestrator", "chief_of_staff"}
-        and _looks_like_prior_response_transformation_request(route_text)
-    ):
+    if requested_agent in {
+        None,
+        "orchestrator",
+        "chief_of_staff",
+    } and _looks_like_prior_response_transformation_request(route_text):
         return "chief_of_staff"
-    if (
-        requested_agent in {None, "orchestrator", "chief_of_staff"}
-        and _looks_like_internal_handoff_request(route_text)
-    ):
+    if requested_agent in {
+        None,
+        "orchestrator",
+        "chief_of_staff",
+    } and _looks_like_internal_handoff_request(route_text):
         return "chief_of_staff"
-    if (
-        requested_agent == "chief_of_staff"
-        and is_single_owner_gmail_reply_request(route_text)
-    ):
+    if requested_agent == "chief_of_staff" and is_single_owner_gmail_reply_request(route_text):
         # Chief remains the operator-facing manager, while the one specialist
         # that can read the selected thread and synthesize reply copy owns
         # execution.
@@ -1876,19 +1837,20 @@ def _semantic_target_agent(
             requested_agent=None,
             honor_text_agent_mentions=False,
         )
-        if (
-            inferred_owner not in {requested_agent, "clarification", "orchestrator"}
-            and _owner_reassignment_supported(
-                requested_agent=requested_agent,
-                candidate_agent=inferred_owner,
-                request=request,
-                text=task_text,
-                candidate_intent=_intent_for_target(
-                    inferred_owner,
-                    task_text,
-                    workflow_allowed=False,
-                ),
-            )
+        if inferred_owner not in {
+            requested_agent,
+            "clarification",
+            "orchestrator",
+        } and _owner_reassignment_supported(
+            requested_agent=requested_agent,
+            candidate_agent=inferred_owner,
+            request=request,
+            text=task_text,
+            candidate_intent=_intent_for_target(
+                inferred_owner,
+                task_text,
+                workflow_allowed=False,
+            ),
         ):
             # Explicit specialist mentions are routing advice, not ownership.
             # Re-evaluate the task without that mention and delegate only when
@@ -1959,7 +1921,9 @@ def _semantic_target_agent(
         and not _looks_like_discovery_outreach_workflow(route_text)
     ):
         return "outreach_composer"
-    if looks_like_send_side_effect(text) and not _looks_like_discovery_outreach_workflow(route_text):
+    if looks_like_send_side_effect(text) and not _looks_like_discovery_outreach_workflow(
+        route_text
+    ):
         return "clarification"
     if _company_comparison_target(text):
         return "business_research_analyst"
@@ -2195,8 +2159,7 @@ def _has_clear_task_ownership(
     context_owner = _business_context_target_agent(route_text)
     if agent in _CONTEXT_AGENT_TARGETS:
         return bool(
-            context_owner == agent
-            and _looks_like_explicit_business_context_operation(route_text)
+            context_owner == agent and _looks_like_explicit_business_context_operation(route_text)
         )
     if agent == "gmail_triage":
         return bool(
@@ -2364,22 +2327,12 @@ def _owner_reassignment_supported(
 
     supported_intents: dict[ManualTargetAgent, frozenset[ManualRequestIntent]] = {
         "gmail_triage": frozenset({"gmail_triage"}),
-        "business_research_analyst": frozenset(
-            {"company_research", "research_brief"}
-        ),
-        "opportunity_scout": frozenset(
-            {"opportunity_search", "opportunity_to_outreach_loop"}
-        ),
+        "business_research_analyst": frozenset({"company_research", "research_brief"}),
+        "opportunity_scout": frozenset({"opportunity_search", "opportunity_to_outreach_loop"}),
         "outreach_composer": frozenset({"outreach_draft", "blocked_send"}),
-        "airtable_context_agent": frozenset(
-            {"context_lookup", "business_system_write"}
-        ),
-        "google_workspace_context_agent": frozenset(
-            {"context_lookup", "business_system_write"}
-        ),
-        "zotero_context_agent": frozenset(
-            {"context_lookup", "business_system_write"}
-        ),
+        "airtable_context_agent": frozenset({"context_lookup", "business_system_write"}),
+        "google_workspace_context_agent": frozenset({"context_lookup", "business_system_write"}),
+        "zotero_context_agent": frozenset({"context_lookup", "business_system_write"}),
         "rss_context_agent": frozenset({"context_lookup"}),
         "preprints_context_agent": frozenset({"context_lookup"}),
     }
@@ -2414,10 +2367,7 @@ def resolve_manual_request_owner(
     if candidate == requested:
         return requested
     evidence_text = str(request_text if request_text is not None else plan.objective)
-    if (
-        requested == "chief_of_staff"
-        and chief_advisory_coordination_requested(evidence_text)
-    ):
+    if requested == "chief_of_staff" and chief_advisory_coordination_requested(evidence_text):
         return requested
     if _owner_reassignment_supported(
         requested_agent=requested,
@@ -2536,7 +2486,9 @@ def _looks_like_contact_discovery_request(text: str) -> bool:
         )
     )
     has_drafting = bool(
-        re.search(r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,80}\b(?:email|message|outreach)\b", lower)
+        re.search(
+            r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,80}\b(?:email|message|outreach)\b", lower
+        )
     )
     return has_discovery and has_contact and not has_drafting
 
@@ -2782,8 +2734,7 @@ def _looks_like_explicit_business_context_operation(text: str) -> bool:
 
     normalized = " ".join(str(text or "").lower().split())
     return bool(
-        _business_context_target_agent(normalized)
-        and provider_tool_action_bound(normalized)
+        _business_context_target_agent(normalized) and provider_tool_action_bound(normalized)
     )
 
 
@@ -3144,10 +3095,7 @@ def _strip_operational_clauses(text: str) -> str:
 
 def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetType:
     lower = text.lower()
-    if (
-        target_agent == "chief_of_staff"
-        and looks_like_local_kni_evidence_lookup(text)
-    ):
+    if target_agent == "chief_of_staff" and looks_like_local_kni_evidence_lookup(text):
         return "local_document_collection"
     if _looks_like_supplied_context_synthesis_request(text) and not (
         target_agent == "business_research_analyst" and looks_like_company(text)
@@ -3271,9 +3219,7 @@ def _task_objective(
         return "outreach_draft"
     if intent == "slack_operations":
         return "slack_operations"
-    if target_agent == "business_research_analyst" and _looks_like_contact_discovery_request(
-        text
-    ):
+    if target_agent == "business_research_analyst" and _looks_like_contact_discovery_request(text):
         return "contact_discovery"
     if intent == "opportunity_to_outreach_loop":
         return "opportunity_discovery"
@@ -3510,16 +3456,17 @@ def _company_profile_target(text: str) -> str:
         if (
             candidate
             and _plausible_company_profile_target(candidate)
-            and candidate.lower() not in {
-            "company",
-            "the company",
-            "this company",
-            "it",
-            "this",
-            "that",
-            "them",
-            "they",
-            "their",
+            and candidate.lower()
+            not in {
+                "company",
+                "the company",
+                "this company",
+                "it",
+                "this",
+                "that",
+                "them",
+                "they",
+                "their",
             }
         ):
             return candidate
@@ -3642,7 +3589,9 @@ def _constraints(text: str) -> list[str]:
 def _looks_like_comparison_format_constraint(lower: str) -> bool:
     """Return true for requested comparison output, not test/control wording."""
 
-    if re.search(r"\b(?:comparison|compare)\s+(?:smoke|test|run|control|variant|variants)\b", lower):
+    if re.search(
+        r"\b(?:comparison|compare)\s+(?:smoke|test|run|control|variant|variants)\b", lower
+    ):
         return False
     if re.search(r"\b(?:table|matrix|side[- ]by[- ]side)\b", lower):
         return True

@@ -220,6 +220,26 @@ def test_live_semantic_plan_does_not_fall_back_to_raw_phrase_authority() -> None
     assert selection is None
 
 
+def test_live_semantic_target_is_not_overridden_by_explicit_research_words() -> None:
+    selection = resolve_slack_query_prompt(
+        build_slack_query_prompt_input(
+            raw_request="Business Research is discussed here; return the Chief's review.",
+            target_route=WorkItemRoute.CHIEF_OF_STAFF,
+            manual_plan={
+                "source": "llm",
+                "target_agent": "chief_of_staff",
+                "intent": "research_brief",
+                "task_objective": "source_research",
+                "expected_artifact_type": "research_brief",
+            },
+        )
+    )
+
+    assert selection is not None
+    assert selection.kind == SlackQueryPromptKind.RESEARCH_SUMMARY
+    assert selection.target_route == WorkItemRoute.CHIEF_OF_STAFF
+
+
 def test_live_semantic_plan_owns_approval_context_hint() -> None:
     selection = resolve_slack_query_prompt(
         build_slack_query_prompt_input(
