@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -16,8 +17,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from keystone_agents.agent_mentions import parse_agent_mention
+from keystone_agents.agent_mentions import AgentMention, parse_agent_mention
 from keystone_agents.agent_registry import AGENT_REGISTRY, agent_cards
+from keystone_agents.agents.calendar_action_interpreter import resolve_calendar_action_plan
 from keystone_agents.agents.chief_of_staff import (
     plan_chief_of_staff_request,
 )
@@ -34,7 +36,11 @@ from keystone_agents.automation_inventory import (
     ensure_default_automation_inventory,
     render_automation_inventory_markdown,
 )
-from keystone_agents.calendar_actions import CalendarActionPlan, infer_calendar_action_plan
+from keystone_agents.calendar_actions import (
+    CalendarActionPlan,
+    infer_calendar_action_plan,
+    is_calendar_action_candidate,
+)
 from keystone_agents.child_process import run_isolated_child_process
 from keystone_agents.cli_sdk import add_sdk_session_arguments
 from keystone_agents.config import (
@@ -45,16 +51,48 @@ from keystone_agents.config import (
 )
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.costing import estimate_usage_cost
-from keystone_agents.eval_runtime_diagnostics import slack_eval_blocker_diagnostics
+from keystone_agents.direct_response import build_direct_supplied_response_agent
+from keystone_agents.eval_runtime_diagnostics import (
+    slack_eval_blocker_diagnostics,
+    slack_eval_child_step_summary,
+)
 from keystone_agents.evals import generate_eval_report, run_static_evals
+from keystone_agents.execution_admission import (
+    ExecutionAdmission,
+    admit_provider_action,
+)
+from keystone_agents.execution_request import (
+    attach_execution_public_result,
+    build_execution_request,
+    execution_request_planning_text,
+    latest_slack_operator_request,
+)
 from keystone_agents.file_search import local_file_search_config_summary
 from keystone_agents.finance_expense_receipts import (
     finance_expense_receipt_field_hints,
+    finance_expense_receipt_provider_context,
     infer_finance_expense_receipt_target,
+)
+from keystone_agents.gmail_triage.draft_actions import (
+    GMAIL_TEST_DRAFT_MARKER,
+    execute_gmail_test_draft_lifecycle,
 )
 from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
-from keystone_agents.manual_request import infer_manual_request_plan
+from keystone_agents.instruction_following import (
+    instruction_following_blocker_text,
+    interpreted_output_constraints_text,
+    output_constraints_from_plan,
+    resolve_instruction_following_response,
+)
+from keystone_agents.manual_request import (
+    infer_manual_request_plan,
+    looks_like_stateful_work_request,
+    looks_like_supplied_context_synthesis_request,
+    positive_capability_text,
+    request_forbids_live_research,
+    resolve_manual_request_owner,
+)
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
 from keystone_agents.operator_failures import (
@@ -64,19 +102,26 @@ from keystone_agents.operator_failures import (
 from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
     orchestrator_preflight_env,
+    specialist_execution_context_text,
 )
 from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
+from keystone_agents.quality_budget import is_bounded_chief_response_only_request
 from keystone_agents.reporting import (
     render_markdown_table,
     render_work_item_result_text,
     sensitive_text_summary,
 )
-from keystone_agents.run import extract_sdk_usage
+from keystone_agents.run import extract_sdk_usage, run_typed_sdk_agent
 from keystone_agents.schemas.approval import (
     ApprovalQueueItem,
     ApprovalQueueStatus,
     ApprovalScope,
     ApprovalState,
+)
+from keystone_agents.schemas.email_triage import EmailTriageResult
+from keystone_agents.schemas.execution_request import (
+    DirectAgentResponse,
+    DirectAgentResponseInput,
 )
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.operational_context import (
@@ -100,7 +145,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemStatus,
 )
 from keystone_agents.sdk import run_typed_sdk_sync
-from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
+from keystone_agents.sdk_run_policy import SDKTurnPolicy, resolve_sdk_turn_policy
 from keystone_agents.sdk_sessions import (
     SDKSessionSpec,
     build_sdk_session,
@@ -117,6 +162,7 @@ from keystone_agents.slack_action_contract import (
     business_agent_action_value,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env, redact_secrets
+from keystone_agents.tools.gmail_tool import GmailTool
 from keystone_agents.tools.google_calendar_tool import (
     GoogleCalendarError,
     create_google_calendar_event_impl,
@@ -125,11 +171,24 @@ from keystone_agents.tools.google_calendar_tool import (
     update_google_calendar_event_impl,
 )
 from keystone_agents.tools.internal_data_tools import (
+    AIRTABLE_ALLOWED_OPERATION_ENV,
     AIRTABLE_LIVE_READS_ENV,
     GOOGLE_WORKSPACE_LIVE_READS_ENV,
+    airtable_test_record_lifecycle_impl,
+    google_doc_test_lifecycle_impl,
 )
 from keystone_agents.tools.slack_tool import SlackTool, slack_review_message_from_approval_item
 from keystone_agents.tools.storage_tool import StorageTool
+from keystone_agents.tools.zotero_context_tools import (
+    enrich_zotero_bibliographic_metadata,
+    project_zotero_item_metadata,
+    read_latest_zotero_journal_abstract_metadata,
+    read_latest_zotero_journal_metadata,
+    read_zotero_api_key_capabilities,
+    zotero_creator_names,
+    zotero_read_item_children,
+    zotero_read_pdf_attachment_text,
+)
 from keystone_agents.work_items import (
     approve_artifact_context,
     attach_artifact,
@@ -561,14 +620,15 @@ def _agent_display_name(route: str) -> str:
     return spec.agent_name if spec is not None else route
 
 
-def _run_direct_calendar_action(
+def execute_direct_calendar_action(
     input_text: str,
     plan: CalendarActionPlan,
     *,
     live: bool,
-    json_output: bool,
-) -> int:
-    """Execute a complete single-step Calendar request without graph or model latency."""
+    openai_requests: int = 0,
+    interpretation_warnings: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Execute one validated Calendar request without entering a workflow graph."""
 
     if not plan.complete:
         missing = ", ".join(plan.blockers)
@@ -578,10 +638,12 @@ def _run_direct_calendar_action(
             "message": f"Calendar action needs only: {missing}.",
             "calendar_action": plan.__dict__,
             "selected_agent": "chief_of_staff",
-            "openai_requests": 0,
+            "openai_requests": openai_requests,
             "send_enabled": False,
         }
-        return _print_direct_calendar_payload(payload, json_output=json_output)
+        if interpretation_warnings:
+            payload["interpretation_warnings"] = list(interpretation_warnings)
+        return payload
 
     approval_reference = (
         "calendar-direct:" + hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:16]
@@ -592,6 +654,7 @@ def _run_direct_calendar_action(
         if plan.operation != "create" and not resolved_event_id:
             calendar_lookup = resolve_google_calendar_event_impl(
                 plan.event_reference,
+                start_date=plan.event_reference_date or plan.start_date,
                 calendar_id=plan.calendar_id,
                 live=live,
             )
@@ -604,7 +667,7 @@ def _run_direct_calendar_action(
                     "input": input_text,
                     "calendar_action": plan.__dict__,
                     "calendar_lookup": calendar_lookup,
-                    "openai_requests": 0,
+                    "openai_requests": openai_requests,
                     "send_enabled": False,
                     "side_effects": {
                         "calendar_write_performed": False,
@@ -612,7 +675,7 @@ def _run_direct_calendar_action(
                         "slack_message_posted": False,
                     },
                 }
-                return _print_direct_calendar_payload(payload, json_output=json_output)
+                return payload
             lookup_status = str(calendar_lookup.get("status") or "")
             if lookup_status == "not_found":
                 raise GoogleCalendarError(
@@ -632,19 +695,31 @@ def _run_direct_calendar_action(
                 plan.title,
                 plan.start_date,
                 description=plan.description,
+                end_date=plan.end_date,
+                repeat_each_day=plan.repeat_each_day,
                 calendar_id=plan.calendar_id,
                 timezone=plan.timezone,
+                start_time=plan.start_time,
+                end_time=plan.end_time,
                 approval_reference=approval_reference,
                 live=live,
             )
         elif plan.operation == "update":
+            update_start_date = plan.start_date
+            if plan.start_time and not update_start_date:
+                update_start_date = plan.event_reference_date or str(
+                    (calendar_lookup or {}).get("start_date") or ""
+                )
             result = update_google_calendar_event_impl(
                 resolved_event_id,
                 title=plan.title,
-                start_date=plan.start_date,
+                start_date=update_start_date,
                 description=plan.description,
                 calendar_id=plan.calendar_id,
                 timezone=plan.timezone,
+                start_time=plan.start_time,
+                end_time=plan.end_time,
+                append_description=plan.append_description,
                 approval_reference=approval_reference,
                 live=live,
             )
@@ -662,10 +737,12 @@ def _run_direct_calendar_action(
             "message": str(exc),
             "calendar_action": plan.__dict__,
             "selected_agent": "chief_of_staff",
-            "openai_requests": 0,
+            "openai_requests": openai_requests,
             "send_enabled": False,
         }
-        return _print_direct_calendar_payload(payload, json_output=json_output)
+        if interpretation_warnings:
+            payload["interpretation_warnings"] = list(interpretation_warnings)
+        return payload
 
     passed = bool((result.get("verification") or {}).get("passed"))
     payload = {
@@ -677,7 +754,7 @@ def _run_direct_calendar_action(
         "calendar_action": plan.__dict__,
         "calendar_lookup": calendar_lookup,
         "tool_receipt": result,
-        "openai_requests": 0,
+        "openai_requests": openai_requests,
         "send_enabled": False,
         "side_effects": {
             "calendar_write_performed": bool(live and passed),
@@ -685,6 +762,28 @@ def _run_direct_calendar_action(
             "slack_message_posted": False,
         },
     }
+    return payload
+
+
+def run_direct_calendar_action(
+    input_text: str,
+    plan: CalendarActionPlan,
+    *,
+    live: bool,
+    json_output: bool,
+    openai_requests: int = 0,
+    interpretation_warnings: tuple[str, ...] = (),
+    execution_admission: ExecutionAdmission | None = None,
+) -> int:
+    payload = execute_direct_calendar_action(
+        input_text,
+        plan,
+        live=live,
+        openai_requests=openai_requests,
+        interpretation_warnings=interpretation_warnings,
+    )
+    if execution_admission is not None:
+        payload["execution_admission"] = execution_admission.__dict__
     return _print_direct_calendar_payload(payload, json_output=json_output)
 
 
@@ -706,17 +805,17 @@ def _print_direct_calendar_payload(payload: dict[str, Any], *, json_output: bool
 
 
 def _route_with_manual_plan_advice(route: str, manual_plan: ManualRequestPlan) -> str:
-    planned = str(manual_plan.target_agent or "").strip()
-    if (
-        str(manual_plan.requested_agent or "").strip() == "gmail_triage"
-        and str(manual_plan.intent or "").strip() == "gmail_triage"
-    ):
-        return "gmail_triage"
-    if planned in {"", "orchestrator", "clarification"}:
+    requested_route = str(manual_plan.requested_agent or "").strip()
+    if requested_route in {"", "orchestrator", "clarification"}:
+        requested_route = route
+    resolved = resolve_manual_request_owner(
+        requested_route,
+        manual_plan,
+        request_text=manual_plan.objective,
+    )
+    if resolved not in AGENT_REGISTRY:
         return route
-    if planned not in AGENT_REGISTRY:
-        return route
-    return planned
+    return resolved
 
 
 def _run_ask(args: argparse.Namespace) -> int:
@@ -732,10 +831,59 @@ def _run_live_ask_with_environment(args: argparse.Namespace) -> int:
 
 def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     raw_input = _ask_input(args)
-    mention = parse_agent_mention(raw_input, allow_bare_context_agents=True)
-    input_text = raw_input if args.agent else mention.input_text
-    cost_directive = parse_cost_tracking_directive(input_text)
-    input_text = (cost_directive.cleaned_text or input_text).strip()
+    slack_context_input = _context_file_is_slack_context(args.context_file)
+    execution_request = build_execution_request(
+        raw_input,
+        requested_agent=args.agent,
+        slack_context_input=slack_context_input,
+    )
+    slack_continuation = execution_request.entrypoint == "slack_followup"
+    operator_input = execution_request.current_request
+    planning_input = execution_request_planning_text(execution_request)
+    mention = _parse_ask_agent_mention(
+        operator_input,
+        slack_context_input=slack_context_input,
+        slack_continuation=slack_continuation,
+    )
+    if (
+        args.agent is None
+        and execution_request.requested_agent_explicit
+        and execution_request.requested_agent in AGENT_REGISTRY
+    ):
+        mention = AgentMention(
+            route=execution_request.requested_agent,
+            agent_name=_agent_display_name(execution_request.requested_agent),
+            input_text=execution_request.current_request,
+            explicit=True,
+        )
+    current_input_text = (
+        operator_input
+        if args.agent
+        else mention.input_text
+        if mention.explicit
+        else execution_request.current_request
+    )
+    requested_route = (
+        args.agent
+        or execution_request.requested_agent
+        or (mention.route if mention.explicit else None)
+    )
+    semantic_input_text = (
+        planning_input
+        if slack_continuation
+        and planning_input
+        and requested_route == "chief_of_staff"
+        else current_input_text
+    )
+    cost_directive = parse_cost_tracking_directive(current_input_text)
+    input_text = (cost_directive.cleaned_text or current_input_text).strip()
+    if semantic_input_text != current_input_text:
+        semantic_cost_directive = parse_cost_tracking_directive(semantic_input_text)
+        semantic_input_text = (
+            semantic_cost_directive.cleaned_text or semantic_input_text
+        ).strip()
+    else:
+        semantic_input_text = input_text
     eval_command_allowed = args.agent is None or _looks_like_explicit_eval_command(input_text)
     if not _promptfoo_agent_eval_mode() and eval_command_allowed:
         eval_score_save = _eval_score_save_payload(input_text, context_file_path=args.context_file)
@@ -751,22 +899,15 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         if eval_status is not None:
             return _print_eval_status(eval_status, json_output=args.json)
     live_sdk = _ask_live_sdk_enabled(args, input_text=input_text)
-    requested_route = args.agent or (mention.route if mention.explicit else None)
-    calendar_plan = infer_calendar_action_plan(input_text)
-    if calendar_plan is not None and requested_route in {
-        None,
-        "chief_of_staff",
-        "orchestrator",
-    }:
-        return _run_direct_calendar_action(
-            input_text,
-            calendar_plan,
-            live=live_sdk,
-            json_output=args.json,
-        )
+    calendar_input_text = raw_input if slack_continuation else input_text
+    calendar_plan = infer_calendar_action_plan(calendar_input_text)
+    calendar_candidate = bool(
+        calendar_plan is not None
+        or is_calendar_action_candidate(calendar_input_text)
+    )
     live_search = args.live_search or (live_sdk and cli_default_live_research())
     if live_search and (
-        _request_forbids_live_research(input_text)
+        _request_forbids_live_research(semantic_input_text)
         or _context_file_is_work_item_source_bundle(args.context_file)
     ):
         live_search = False
@@ -775,42 +916,232 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     )
     live_manual_plan = live_manual_plan_requested and not (
         live_sdk
-        and _skip_live_manual_plan_for_request(input_text, requested_route=requested_route)
+        and _skip_live_manual_plan_for_request(
+            semantic_input_text,
+            requested_route=requested_route,
+        )
     )
     request_estimate = _estimate_ask_openai_requests(
         args,
-        input_text=input_text,
+        input_text=semantic_input_text,
         live_sdk=live_sdk,
         live_manual_plan=live_manual_plan,
+        requested_route=requested_route,
+        effective_live_search=live_search,
+    )
+    # Semantic interpretation is a single bounded request. Do not block that
+    # planner call using the unresolved worst-case manager/graph estimate.
+    # Recompute and enforce the actual route ceiling immediately after preflight.
+    calendar_route_eligible = bool(
+        calendar_candidate
+        and requested_route in {
+            None,
+            "chief_of_staff",
+            "orchestrator",
+        }
+    )
+    preflight_budget_estimate = (
+        1
+        if live_manual_plan
+        else 0
+        if calendar_route_eligible
+        else request_estimate["max"]
     )
     if args.max_openai_requests is not None and (
-        args.max_openai_requests < 0 or request_estimate["max"] > args.max_openai_requests
+        args.max_openai_requests < 0
+        or preflight_budget_estimate > args.max_openai_requests
     ):
         return _print_ask_request_budget_blocked(
             json_output=args.json,
             requested_limit=args.max_openai_requests,
             estimate=request_estimate,
         )
+    direct_workflow_state = _orchestrator_workflow_state_from_cli_context(
+        context_file_path=args.context_file,
+        request_text=input_text,
+        database_url=args.database_url,
+    )
+    if slack_continuation:
+        direct_workflow_state = _merge_direct_workflow_state(
+            direct_workflow_state,
+            _slack_continuation_workflow_state(raw_input),
+        )
     orchestrator_preflight = run_orchestrator_preflight(
-        input_text,
+        semantic_input_text,
         requested_agent=requested_route,
         live_manual_plan=live_manual_plan,
         database_url=args.database_url,
+        workflow_state=direct_workflow_state,
     )
     manual_plan = orchestrator_preflight.manual_request_plan
+    calendar_admission = admit_provider_action(
+        provider="google_calendar",
+        provider_action_bound=calendar_route_eligible,
+        semantic_plan=manual_plan,
+        allowed_agents={"chief_of_staff"},
+    )
+    if calendar_admission.can_execute_provider_action:
+        preflight_requests = _orchestrator_preflight_request_count(
+            orchestrator_preflight
+        )
+        calendar_request_estimate = {
+            "min": preflight_requests + (1 if live_sdk else 0),
+            "max": preflight_requests + (1 if live_sdk else 0),
+            "stages": [
+                *(["manual_request_planner"] if preflight_requests else []),
+                *(["calendar_action_interpreter"] if live_sdk else []),
+            ],
+        }
+        if args.max_openai_requests is not None and (
+            args.max_openai_requests < 0
+            or calendar_request_estimate["max"] > args.max_openai_requests
+        ):
+            return _print_ask_request_budget_blocked(
+                json_output=args.json,
+                requested_limit=args.max_openai_requests,
+                estimate=calendar_request_estimate,
+                openai_requests_made=preflight_requests,
+            )
+        if _preflight_blocks_execution(orchestrator_preflight):
+            return _print_ask_preflight_blocked(
+                input_text,
+                json_output=args.json,
+                orchestrator_preflight=orchestrator_preflight,
+            )
+        calendar_resolution = resolve_calendar_action_plan(
+            calendar_input_text,
+            calendar_plan,
+            live=live_sdk,
+        )
+        if calendar_resolution.plan is not None:
+            return run_direct_calendar_action(
+                calendar_input_text,
+                calendar_resolution.plan,
+                live=live_sdk,
+                json_output=args.json,
+                openai_requests=(
+                    preflight_requests + calendar_resolution.openai_requests
+                ),
+                interpretation_warnings=calendar_resolution.warnings,
+                execution_admission=calendar_admission,
+            )
+    interpreted_lifecycle_route = str(manual_plan.target_agent or "").strip()
+    interpreted_lifecycle_scope = _interpreted_lifecycle_scope_text(
+        input_text,
+        manual_plan,
+    )
+    interpreted_bounded_lifecycle = bool(
+        live_sdk
+        and interpreted_lifecycle_route
+        in {
+            "airtable_context_agent",
+            "google_workspace_context_agent",
+            "gmail_triage",
+        }
+        and _is_bounded_composite_lifecycle_request(
+            interpreted_lifecycle_route,
+            input_text=interpreted_lifecycle_scope,
+        )
+    )
+    semantic_direct_route = (
+        _bounded_direct_route_from_preflight(orchestrator_preflight)
+        if args.agent is None and not mention.explicit
+        else None
+    )
+    if interpreted_bounded_lifecycle:
+        preflight_requests = _orchestrator_preflight_request_count(
+            orchestrator_preflight
+        )
+        resolved_request_estimate = {
+            "min": preflight_requests,
+            "max": preflight_requests,
+            "stages": [
+                "manual_request_planner",
+                f"{interpreted_lifecycle_route}_typed_lifecycle_provider",
+            ],
+        }
+    else:
+        resolved_request_estimate = _estimate_ask_openai_requests(
+            args,
+            input_text=semantic_input_text,
+            live_sdk=live_sdk,
+            live_manual_plan=live_manual_plan,
+            requested_route=requested_route or semantic_direct_route,
+            manual_plan=manual_plan,
+            effective_live_search=live_search,
+        )
+    if args.max_openai_requests is not None and (
+        args.max_openai_requests < 0
+        or resolved_request_estimate["max"] > args.max_openai_requests
+    ):
+        return _print_ask_request_budget_blocked(
+            json_output=args.json,
+            requested_limit=args.max_openai_requests,
+            estimate=resolved_request_estimate,
+            openai_requests_made=_orchestrator_preflight_request_count(
+                orchestrator_preflight
+            ),
+        )
+    direct_execution_context = _direct_specialist_execution_context(
+        input_text,
+        workflow_state=direct_workflow_state,
+        force_thread_context=slack_continuation,
+    )
     if _preflight_blocks_execution(orchestrator_preflight):
         return _print_ask_preflight_blocked(
             input_text,
             json_output=args.json,
             orchestrator_preflight=orchestrator_preflight,
         )
+    if (
+        manual_plan.target_agent == "clarification"
+        or orchestrator_preflight.route_result.route == "clarification"
+    ):
+        clarification = (
+            orchestrator_preflight.route_result.clarification_request
+            or orchestrator_preflight.route_result.stop_reason
+            or "Please provide the missing item, target, or requested change."
+        )
+        return _print_ask_clarification(
+            "orchestrator",
+            input_text,
+            clarification,
+            json_output=args.json,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            extra={
+                "status": "needs_input",
+                "route": "clarification",
+                "block_kind": "clarification_required",
+            },
+        )
+    if live_sdk:
+        lifecycle_route = interpreted_lifecycle_route
+        if lifecycle_route not in {
+            "airtable_context_agent",
+            "google_workspace_context_agent",
+            "gmail_triage",
+        }:
+            lifecycle_route = str(requested_route or semantic_direct_route or "").strip()
+        lifecycle_exit_code = _run_bounded_provider_lifecycle_after_preflight(
+            lifecycle_route,
+            input_text,
+            lifecycle_scope_text=interpreted_lifecycle_scope,
+            context_text=raw_input,
+            json_output=args.json,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            database_url=args.database_url,
+        )
+        if lifecycle_exit_code is not None:
+            return lifecycle_exit_code
     if args.agent is None:
         if _should_run_opportunity_to_outreach_loop(
             manual_plan,
             explicit_route=mention.route if mention.explicit else None,
         ):
             return _run_ask_opportunity_to_outreach_loop(
-                input_text,
+                semantic_input_text,
                 live_search=live_search,
                 live_sdk=live_sdk,
                 json_output=args.json,
@@ -825,11 +1156,53 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                     args,
                     route="orchestrator",
                     default_enabled=False,
+                    context_file_path=args.context_file,
                 ),
                 cost_tracking_requested=cost_directive.requested,
             )
-        if live_sdk and mention.explicit and mention.route is not None:
-            route = _route_with_manual_plan_advice(str(mention.route), manual_plan)
+        if _preflight_requires_work_item(
+            orchestrator_preflight,
+            request_text=semantic_input_text,
+        ):
+            workflow_routes = _preflight_workflow_routes(orchestrator_preflight)
+            requested_work_item_route = (
+                workflow_routes[0]
+                if workflow_routes
+                else str(
+                    manual_plan.target_agent
+                    or orchestrator_preflight.route_result.route
+                    or ""
+                ).strip()
+                or None
+            )
+            return _run_ask_work_item(
+                semantic_input_text,
+                database_url=args.database_url,
+                live_search=live_search,
+                live_sdk=live_sdk,
+                live_rss_slack_read=args.live_rss_slack_read,
+                max_results=args.max_results,
+                max_manager_steps=args.max_manager_steps,
+                json_output=args.json,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                context_file_path=args.context_file,
+                sdk_session_enabled=args.sdk_session,
+                sdk_session_id=args.sdk_session_id,
+                sdk_session_db_path=args.sdk_session_db,
+                sdk_session_history_limit=args.sdk_session_history_limit,
+                cost_tracking_requested=cost_directive.requested,
+                requested_route=requested_work_item_route,
+            )
+        if live_sdk and (
+            (mention.explicit and mention.route is not None)
+            or semantic_direct_route is not None
+        ):
+            route = (
+                _route_with_manual_plan_advice(str(mention.route), manual_plan)
+                if mention.explicit and mention.route is not None
+                else str(semantic_direct_route)
+            )
             if manual_plan.intent == "browser_diagnostics" and manual_plan.target_agent in {
                 "chief_of_staff",
                 "orchestrator",
@@ -846,11 +1219,12 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                         args,
                         route="orchestrator",
                         default_enabled=False,
+                        context_file_path=args.context_file,
                     ),
                 )
             return _run_ask_specialist_live(
                 route,
-                input_text,
+                semantic_input_text if route == "chief_of_staff" else input_text,
                 json_output=args.json,
                 manual_plan=manual_plan,
                 orchestrator_preflight=orchestrator_preflight,
@@ -858,12 +1232,21 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                     args,
                     route=route,
                     default_enabled=_ask_route_session_default(route),
+                    context_file_path=args.context_file,
                 ),
+                execution_context=direct_execution_context,
+                context_file_path=args.context_file,
                 cost_tracking_requested=cost_directive.requested,
                 database_url=args.database_url,
             )
-        if mention.explicit and mention.route in CONTEXT_AGENT_ROUTES:
-            route = str(mention.route)
+        if mention.explicit and (
+            mention.route in CONTEXT_AGENT_ROUTES
+            or (
+                mention.route in {"chief_of_staff", "orchestrator"}
+                and manual_plan.target_agent in CONTEXT_AGENT_ROUTES
+            )
+        ):
+            route = str(manual_plan.target_agent)
             return _print_ask_dry_run(
                 route,
                 input_text,
@@ -871,9 +1254,10 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 manual_plan=manual_plan,
                 orchestrator_preflight=orchestrator_preflight,
                 database_url=args.database_url,
+                execution_context=direct_execution_context,
             )
         return _run_ask_work_item(
-            input_text,
+            semantic_input_text,
             database_url=args.database_url,
             live_search=live_search,
             live_sdk=live_sdk,
@@ -921,6 +1305,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 args,
                 route="orchestrator",
                 default_enabled=False,
+                context_file_path=args.context_file,
             ),
             cost_tracking_requested=cost_directive.requested,
         )
@@ -942,12 +1327,13 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                         args,
                         route="orchestrator",
                         default_enabled=False,
+                        context_file_path=args.context_file,
                     ),
                     cost_tracking_requested=cost_directive.requested,
                 )
         return _run_ask_specialist_live(
             route,
-            input_text,
+            semantic_input_text if route == "chief_of_staff" else input_text,
             json_output=args.json,
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
@@ -955,18 +1341,138 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 args,
                 route=route,
                 default_enabled=_ask_route_session_default(route),
+                context_file_path=args.context_file,
             ),
+            execution_context=direct_execution_context,
+            context_file_path=args.context_file,
             cost_tracking_requested=cost_directive.requested,
             database_url=args.database_url,
         )
     return _print_ask_dry_run(
         route,
-        input_text,
+        semantic_input_text if route == "chief_of_staff" else input_text,
         json_output=args.json,
         manual_plan=manual_plan,
         orchestrator_preflight=orchestrator_preflight,
         database_url=args.database_url,
+        execution_context=direct_execution_context,
     )
+
+
+def _parse_ask_agent_mention(
+    operator_input: str,
+    *,
+    slack_context_input: bool,
+    slack_continuation: bool,
+) -> AgentMention:
+    """Parse a recovered Slack ask without dropping a newest bare agent switch."""
+
+    return parse_agent_mention(
+        operator_input,
+        allow_bare_context_agents=True,
+        allow_bare_agent_aliases=slack_context_input or slack_continuation,
+    )
+
+
+def _latest_slack_operator_request(text: str) -> str:
+    """Compatibility wrapper around the canonical entrypoint normalizer."""
+
+    return latest_slack_operator_request(text)
+
+
+def _slack_continuation_workflow_state(text: str) -> dict[str, Any]:
+    """Recover bounded prior-result identity when Slack omits a context file."""
+
+    raw = html.unescape(str(text or "").strip())
+    if "continue this prior slack thread" not in raw.lower():
+        return {}
+    prior_runs: list[dict[str, str]] = []
+    pattern = re.compile(
+        r"Previous result title:\s*(.*?)\s+Previous result:\s*(.*?)"
+        r"(?=\s+(?:User follow-up:|Previous result title:)|$)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for index, match in enumerate(pattern.finditer(raw), start=1):
+        result_label = _bounded_redacted_text(match.group(1), max_chars=180)
+        summary = _bounded_redacted_text(match.group(2), max_chars=900)
+        if not result_label and not summary:
+            continue
+        route = _route_from_slack_result_label(result_label)
+        object_title = _object_title_from_slack_result(summary)
+        prior_runs.append(
+            {
+                key: value
+                for key, value in {
+                    "id": f"slack-envelope-{index}",
+                    "route": route,
+                    "status": "completed",
+                    "title": object_title or result_label,
+                    "summary": summary,
+                }.items()
+                if value
+            }
+        )
+    if not prior_runs:
+        return {}
+    return {"prior_agent_runs": prior_runs[-4:]}
+
+
+def _route_from_slack_result_label(value: str) -> str:
+    normalized = " ".join(str(value or "").lower().split())
+    route_markers = (
+        ("zotero", "zotero_context_agent"),
+        ("gmail", "gmail_triage"),
+        ("opportunity", "opportunity_scout"),
+        ("outreach", "outreach_composer"),
+        ("company research", "business_research_analyst"),
+        ("business research", "business_research_analyst"),
+        ("google workspace", "google_workspace_context_agent"),
+        ("calendar", "chief_of_staff"),
+        ("chief of staff", "chief_of_staff"),
+    )
+    return next((route for marker, route in route_markers if marker in normalized), "")
+
+
+def _object_title_from_slack_result(value: str) -> str:
+    match = re.search(
+        r"(?:^|\s)Title:\s*(.*?)(?=\s+(?:Summary:|Abstract summary:)|$)",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+    return _bounded_redacted_text(match.group(1), max_chars=240) if match else ""
+
+
+def _merge_direct_workflow_state(
+    primary: dict[str, Any],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge continuation evidence without replacing richer Slack context."""
+
+    if not fallback:
+        return primary
+    merged = dict(primary or {})
+    for key, value in fallback.items():
+        if key == "prior_agent_runs" and isinstance(value, list):
+            existing = merged.get(key)
+            combined = [*(existing if isinstance(existing, list) else []), *value]
+            deduped: list[Any] = []
+            seen: set[tuple[str, str, str]] = set()
+            for item in combined:
+                if not isinstance(item, dict):
+                    continue
+                identity = (
+                    str(item.get("route") or ""),
+                    str(item.get("title") or ""),
+                    str(item.get("summary") or ""),
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                deduped.append(item)
+            merged[key] = deduped[-5:]
+        elif key not in merged:
+            merged[key] = value
+    return merged
 
 
 def _eval_score_save_payload(
@@ -1560,34 +2066,150 @@ def _estimate_ask_openai_requests(
     input_text: str,
     live_sdk: bool,
     live_manual_plan: bool,
+    requested_route: str | None = None,
+    manual_plan: ManualRequestPlan | None = None,
+    effective_live_search: bool | None = None,
 ) -> dict[str, Any]:
-    if not live_sdk:
+    if not live_sdk and not live_manual_plan:
         return {"min": 0, "max": 0, "stages": []}
     stages: list[str] = []
     maximum = 0
     if live_manual_plan:
         stages.append("manual_request_planner")
         maximum += 1
+    if not live_sdk:
+        return {"min": maximum, "max": maximum, "stages": stages}
+    search_enabled = (
+        bool(args.live_search)
+        if effective_live_search is None
+        else bool(effective_live_search)
+    )
+    direct_supplied_route = str(requested_route or args.agent or "").strip()
+    if _is_direct_supplied_response_request(
+        input_text,
+        requested_route=direct_supplied_route,
+    ):
+        stages.append(f"{direct_supplied_route}_direct_supplied_response_sdk")
+        maximum += 1
+        return {
+            "min": maximum,
+            "max": maximum,
+            "stages": stages,
+            "note": (
+                "Complete supplied-context transformations use one schema-constrained "
+                "specialist request. An explicit live-planner override adds one prior "
+                "planning request."
+            ),
+            "request_text_sha256": hashlib.sha256(
+                input_text.encode("utf-8")
+            ).hexdigest()[:12],
+        }
     if _context_file_is_work_item_source_bundle(args.context_file):
         stages.append("outreach_composer_synthesis")
         maximum += 1
-    elif args.agent is not None:
-        estimated_route = str(args.agent)
+    elif requested_route or args.agent is not None or manual_plan is not None:
+        original_route = str(
+            requested_route
+            or args.agent
+            or (manual_plan.requested_agent if manual_plan is not None else "")
+            or (manual_plan.target_agent if manual_plan is not None else "")
+        )
+        estimated_route = original_route
+        deterministic_plan = manual_plan
         if estimated_route != "orchestrator":
-            deterministic_plan = infer_manual_request_plan(
-                input_text,
-                requested_agent=estimated_route,
-            )
+            if deterministic_plan is None:
+                deterministic_plan = infer_manual_request_plan(
+                    input_text,
+                    requested_agent=estimated_route,
+                )
             estimated_route = _route_with_manual_plan_advice(
                 estimated_route,
                 deterministic_plan,
             )
-        stages.append(f"{estimated_route}_sdk")
-        maximum += resolve_sdk_turn_policy(
-            estimated_route,
-            request_text=input_text,
-            live_search=bool(args.live_search),
-        ).max_turns
+        supplied_context_bound = bool(
+            looks_like_supplied_context_synthesis_request(input_text)
+            or (
+                deterministic_plan is not None
+                and deterministic_plan.ask_shape.prior_context_dependency
+                == "selected_context"
+            )
+        )
+        bounded_supplied_workflow = bool(
+            original_route == "chief_of_staff"
+            and deterministic_plan is not None
+            and len(deterministic_plan.workflow) > 1
+            and supplied_context_bound
+            and not deterministic_plan.requires_live_search
+            and not search_enabled
+            and deterministic_plan.side_effect_policy == "draft_or_read_only"
+        )
+        bounded_supplied_chief_response = bool(
+            original_route == "chief_of_staff"
+            and estimated_route == "chief_of_staff"
+            and supplied_context_bound
+            and deterministic_plan is not None
+            and not deterministic_plan.requires_live_search
+            and not search_enabled
+            and deterministic_plan.side_effect_policy == "draft_or_read_only"
+        )
+        direct_specialist_route = estimated_route in _DIRECT_SPECIALIST_ROUTES
+        delegated_chief_request = (
+            original_route == "chief_of_staff"
+            and direct_specialist_route
+            and (
+                not _is_multi_operation_business_system_request(input_text)
+                or _is_bounded_composite_lifecycle_request(
+                    estimated_route,
+                    input_text=input_text,
+                )
+            )
+        )
+        if bounded_supplied_workflow and deterministic_plan is not None:
+            for route in deterministic_plan.workflow:
+                if route in {
+                    "business_research_analyst",
+                    "opportunity_scout",
+                }:
+                    stages.append(f"{route}_source_provided_deterministic")
+                    continue
+                stages.append(f"{route}_sdk")
+                maximum += 1
+            stages.append("final_response_synthesis")
+            maximum += 1
+        elif (
+            original_route == "chief_of_staff"
+            and estimated_route == "chief_of_staff"
+            and (
+                bounded_supplied_chief_response
+                or is_bounded_chief_response_only_request(input_text)
+            )
+        ):
+            stages.append("chief_of_staff_response_only_sdk")
+            maximum += 1
+        elif (
+            original_route != "orchestrator"
+            and direct_specialist_route
+            and (original_route != "chief_of_staff" or delegated_chief_request)
+        ):
+            if estimated_route == "gmail_triage" and _is_bounded_composite_lifecycle_request(
+                estimated_route,
+                input_text=input_text,
+            ):
+                stages.append("gmail_test_draft_lifecycle_provider")
+            else:
+                stages.append(f"{estimated_route}_direct_sdk")
+                maximum += _direct_specialist_request_estimate(
+                    estimated_route,
+                    input_text=input_text,
+                    live_search=search_enabled,
+                )
+        else:
+            stages.append(f"{estimated_route}_sdk")
+            maximum += resolve_sdk_turn_policy(
+                estimated_route,
+                request_text=input_text,
+                live_search=search_enabled,
+            ).max_turns
     else:
         manager_steps = max(1, int(args.max_manager_steps or 1))
         if _is_bounded_gmail_recommendation_graph(
@@ -1628,11 +2250,31 @@ def _estimate_ask_openai_requests(
             )
             stages.append("final_response_synthesis")
             maximum += manager_steps * 6 + 1
+    constraint_plan = manual_plan or infer_manual_request_plan(
+        input_text,
+        requested_agent=str(requested_route or args.agent or "orchestrator"),
+    )
+    constraints = output_constraints_from_plan(constraint_plan)
+    if constraints.has_deterministic_requirements():
+        stages.append("conditional_instruction_following_repair")
+        maximum += 1
+    direct_specialist = any(stage.endswith("_direct_sdk") for stage in stages)
+    mandatory_stage_count = sum(
+        stage != "conditional_instruction_following_repair"
+        and not stage.endswith("_provider")
+        and not stage.endswith("_deterministic")
+        for stage in stages
+    )
     return {
-        "min": len(stages),
+        "min": mandatory_stage_count,
         "max": maximum,
         "stages": stages,
-        "note": "Maximum uses configured SDK turn limits; provider retries are a stop event.",
+        "note": (
+            "Direct specialist estimate counts model turns only; bounded provider tool "
+            "calls are not OpenAI requests, and provider retries are a stop event."
+            if direct_specialist
+            else "Maximum uses configured SDK turn limits; provider retries are a stop event."
+        ),
         "request_text_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:12],
     }
 
@@ -1712,17 +2354,28 @@ def _print_ask_request_budget_blocked(
     json_output: bool,
     requested_limit: int,
     estimate: dict[str, Any],
+    openai_requests_made: int = 0,
 ) -> int:
+    requests_made = max(0, int(openai_requests_made))
+    if requests_made:
+        message = (
+            f"The live command used {requests_made} bounded planning request"
+            f"{'' if requests_made == 1 else 's'}, then stopped because the resolved "
+            "execution path would exceed the declared per-command ceiling. No "
+            "specialist or provider action ran."
+        )
+    else:
+        message = (
+            "The live command stopped before any model or provider action because "
+            "its estimated request count exceeds the declared per-command ceiling."
+        )
     payload = {
         "status": "blocked",
         "block_kind": "openai_request_budget_exceeded",
-        "message": (
-            "The live command was blocked before any model call because its estimated "
-            "request count exceeds the declared per-command ceiling."
-        ),
+        "message": message,
         "requested_limit": requested_limit,
         "estimated_requests": estimate,
-        "openai_requests_made": 0,
+        "openai_requests_made": requests_made,
         "send_enabled": False,
     }
     if json_output:
@@ -1736,6 +2389,40 @@ def _print_ask_request_budget_blocked(
     return 2
 
 
+_DIRECT_SUPPLIED_RESPONSE_ROUTES = frozenset(
+    {
+        "business_research_analyst",
+        "opportunity_scout",
+        "outreach_composer",
+        "gmail_triage",
+    }
+)
+
+
+def _is_direct_supplied_response_request(
+    input_text: str,
+    *,
+    requested_route: str | None,
+) -> bool:
+    """Identify a complete, provider-free transformation owned by one named agent."""
+
+    route = str(requested_route or "").strip()
+    if route not in _DIRECT_SUPPLIED_RESPONSE_ROUTES:
+        return False
+    if not looks_like_supplied_context_synthesis_request(input_text):
+        return False
+    if looks_like_stateful_work_request(input_text):
+        return False
+    plan = infer_manual_request_plan(input_text, requested_agent=route)
+    return bool(
+        plan.intent == "route_request"
+        and plan.task_objective == "route_or_continue"
+        and not plan.workflow
+        and not plan.requires_live_search
+        and not plan.requires_approved_context
+    )
+
+
 def _skip_live_manual_plan_for_request(
     input_text: str,
     *,
@@ -1745,10 +2432,28 @@ def _skip_live_manual_plan_for_request(
 
     if _ask_request_is_bounded_live_sdk_smoke(input_text):
         return True
+    if _is_direct_supplied_response_request(
+        input_text,
+        requested_route=requested_route,
+    ):
+        # The owning specialist still interprets the complete operator ask.
+        # A separate planner adds no missing context, but consumes the only
+        # request in the bounded direct-response profile.
+        return True
+    if str(requested_route or "").strip() == "opportunity_scout":
+        # Direct Scout requests already retain deterministic Orchestrator
+        # preflight plus the typed OpportunitySearchPlan. Other direct agents
+        # keep one live planner request so LLM interpretation precedes tool use.
+        return True
     if infer_finance_expense_receipt_target(input_text) is None:
         return False
     route = str(requested_route or "").strip()
-    return route in {"", "chief_of_staff", "orchestrator"}
+    return route in {
+        "",
+        "airtable_context_agent",
+        "chief_of_staff",
+        "orchestrator",
+    }
 
 
 def _ask_request_is_bounded_live_sdk_smoke(input_text: str) -> bool:
@@ -1760,6 +2465,280 @@ def _ask_request_is_bounded_live_sdk_smoke(input_text: str) -> bool:
     )
 
 
+_DIRECT_SPECIALIST_ROUTES = frozenset(
+    {
+        "business_research_analyst",
+        "opportunity_scout",
+        "gmail_triage",
+        "outreach_composer",
+        *CONTEXT_AGENT_ROUTES,
+    }
+)
+
+
+def _direct_specialist_request_estimate(
+    route: str,
+    *,
+    input_text: str,
+    live_search: bool,
+) -> int:
+    """Estimate one direct specialist without charging for a manager graph."""
+
+    profile = _direct_specialist_runtime_profile(route, input_text=input_text)
+    plan = profile["manual_plan"]
+    normalized = str(profile["normalized_request"])
+    if profile["compact_instructions"]:
+        if route == "opportunity_scout" and _request_forbids_live_research(input_text):
+            # The compact supplied-evidence adapter performs one tool-free synthesis.
+            return 1
+        if route == "zotero_context_agent" and bool(
+            "abstract" in normalized
+            and re.search(r"\b(?:latest|most\s+recent(?:ly)?\s+added)\b", normalized)
+        ):
+            # The ordered provider read is acquired before the specialist call.
+            return 1
+        if plan.intent == "business_system_write":
+            if _is_bounded_composite_lifecycle_request(route, input_text=input_text):
+                # One guarded provider helper owns the complete marked lifecycle;
+                # reserve one model turn for the call and one for synthesis.
+                return 2
+            if (
+                route == "airtable_context_agent"
+                and infer_finance_expense_receipt_target(input_text) is not None
+            ):
+                # The composite receipt tool performs schema acquisition,
+                # field mapping, create, attachment, and read-back in one tool
+                # call. Reserve one model turn for the call and one for synthesis.
+                return 2
+            # Allow a separate target/schema read, mutation, and final synthesis.
+            return 3
+        # One model request may select a bounded read tool; the second synthesizes
+        # its result. Provider calls do not count as OpenAI requests.
+        return 2
+    policy_max = resolve_sdk_turn_policy(
+        route,
+        request_text=input_text,
+        live_search=live_search,
+    ).max_turns
+    return min(policy_max, 4)
+
+
+def _direct_specialist_runtime_profile(
+    route: str,
+    *,
+    input_text: str,
+) -> dict[str, Any]:
+    """Resolve prompt/tool depth from ask shape after the owning route is known."""
+
+    plan = infer_manual_request_plan(input_text, requested_agent=route)
+    normalized = " ".join(str(input_text or "").lower().split())
+    deep_request = bool(
+        re.search(
+            r"\b(?:deep|comprehensive|exhaustive|multi-stage|full landscape|"
+            r"all available sources|systematic review)\b",
+            normalized,
+        )
+    )
+    bounded_composite_lifecycle = _is_bounded_composite_lifecycle_request(
+        route,
+        input_text=input_text,
+    )
+    multi_operation = (
+        _is_multi_operation_business_system_request(input_text)
+        and not bounded_composite_lifecycle
+    )
+    thread_followup = bool(
+        plan.ask_shape.prior_context_dependency not in {"", "unspecified"}
+        or re.search(
+            r"\b(?:same|this|that|previous|prior|current)\b.{0,80}"
+            r"\b(?:article|record|event|thread|email|document|file|item)\b",
+            normalized,
+        )
+    )
+    compact = bool(
+        plan.desired_count <= 3
+        and plan.ask_shape.ask_breadth != "broad"
+        and not deep_request
+        and not multi_operation
+    )
+    if not compact:
+        request_class = "deep_or_multistage"
+    elif bounded_composite_lifecycle or plan.intent == "business_system_write":
+        request_class = "bounded_write"
+    elif thread_followup:
+        request_class = "thread_followup"
+    else:
+        request_class = "bounded_read"
+    return {
+        "route": route,
+        "request_class": request_class,
+        "compact_instructions": compact,
+        "manual_plan": plan,
+        "normalized_request": normalized,
+        "deep_request": deep_request,
+        "multi_operation": multi_operation,
+        "bounded_composite_lifecycle": bounded_composite_lifecycle,
+        "thread_followup": thread_followup,
+    }
+
+
+def _append_compact_direct_flag(
+    command: list[str],
+    *,
+    route: str,
+    input_text: str,
+) -> None:
+    """Select the compact child profile only for a bounded direct ask."""
+
+    profile = _direct_specialist_runtime_profile(route, input_text=input_text)
+    if profile["compact_instructions"]:
+        command.append("--compact-instructions")
+
+
+def _is_multi_operation_business_system_request(text: str) -> bool:
+    """Keep create/update/delete lifecycles out of the low-latency single-action lane."""
+
+    normalized = " ".join(positive_capability_text(text).lower().split())
+    operation_families = (
+        bool(re.search(r"\b(?:add|create|insert)\b", normalized)),
+        bool(re.search(r"\b(?:update|change|modify|revise|edit|set)\b", normalized)),
+        bool(re.search(r"\b(?:delete|remove)\b", normalized)),
+    )
+    return sum(operation_families) > 1
+
+
+def _is_marked_provider_lifecycle_planning_candidate(input_text: str) -> bool:
+    """Allow one semantic-planning turn before choosing a guarded test helper.
+
+    This is an admission hint only. The interpreted plan must still select the
+    provider owner and satisfy the exact typed lifecycle contract before any
+    provider action can run.
+    """
+
+    normalized = " ".join(str(input_text or "").lower().split())
+    return bool(
+        re.search(
+            r"\bkba_test_(?:record|doc|draft)(?:_[a-z0-9]+)*\b",
+            normalized,
+        )
+    )
+
+
+def _is_bounded_composite_lifecycle_request(route: str, *, input_text: str) -> bool:
+    """Recognize guarded test lifecycles already owned by one typed helper."""
+
+    normalized = " ".join(str(input_text or "").lower().split())
+    # Body copy is data, not an operation request. Excluding it prevents words
+    # such as "set" or "update" inside a quoted test body from changing the
+    # selected lifecycle.
+    operation_text = re.sub(
+        r"\bbody\s*[\"“][^\"”]*[\"”]",
+        "body",
+        normalized,
+    )
+    creates = bool(re.search(r"\b(?:add|create|make|write|insert)\b", operation_text))
+    updates = bool(
+        re.search(r"\b(?:update|change|modify|revise|edit)\b", operation_text)
+    )
+    removes = bool(
+        re.search(r"\b(?:delete|remove|trash|clean\s*up)\b", operation_text)
+    )
+    if route == "airtable_context_agent":
+        return bool(
+            re.search(r"\bkba_test_record(?:_[a-z0-9]+)*\b", normalized)
+            and creates
+            and updates
+            and removes
+        )
+    if route == "zotero_context_agent":
+        return bool(
+            re.search(r"\bkba_test_note(?:_[a-z0-9]+)*\b", normalized)
+            and re.search(r"\bnotes?\b", normalized)
+            and creates
+            and updates
+            and removes
+        )
+    if route == "google_workspace_context_agent":
+        return bool(
+            re.search(r"\bkba_test_doc(?:_[a-z0-9]+)*\b", normalized)
+            and re.search(r"\b(?:google\s+docs?|documents?)\b", normalized)
+            and creates
+            and removes
+            and not updates
+        )
+    if route == "gmail_triage":
+        return bool(
+            re.search(r"\bkba_test_draft(?:_[a-z0-9]+)*\b", normalized)
+            and re.search(r"\b(?:gmail\s+)?drafts?\b", normalized)
+            and creates
+            and updates
+            and removes
+        )
+    return False
+
+
+def _run_bounded_provider_lifecycle_after_preflight(
+    route: str,
+    input_text: str,
+    *,
+    lifecycle_scope_text: str = "",
+    context_text: str,
+    json_output: bool,
+    manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None,
+    database_url: str | None,
+) -> int | None:
+    """Bind an interpreted marked lifecycle to its owning typed provider helper."""
+
+    if not _is_bounded_composite_lifecycle_request(
+        route,
+        input_text=lifecycle_scope_text or input_text,
+    ):
+        return None
+    if route == "airtable_context_agent":
+        return _run_direct_airtable_test_record_lifecycle(
+            input_text,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            database_url=database_url,
+        )
+    if route == "google_workspace_context_agent":
+        return _run_direct_google_doc_test_lifecycle(
+            input_text,
+            context_text=context_text,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            database_url=database_url,
+        )
+    if route == "gmail_triage":
+        return _run_direct_gmail_test_draft_lifecycle(
+            input_text,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            database_url=database_url,
+        )
+    return None
+
+
+def _interpreted_lifecycle_scope_text(
+    input_text: str,
+    manual_plan: ManualRequestPlan | None,
+) -> str:
+    """Combine raw wording with schema-light LLM interpretation for exact gating."""
+
+    if manual_plan is None:
+        return str(input_text or "")
+    parts = [
+        str(input_text or ""),
+        str(manual_plan.objective or ""),
+        *[str(item or "") for item in manual_plan.constraints],
+    ]
+    return "\n".join(part.strip() for part in parts if part.strip())
+
+
 def _sdk_session_spec_for_ask(
     args: argparse.Namespace,
     *,
@@ -1768,8 +2747,16 @@ def _sdk_session_spec_for_ask(
     context_file_path: str = "",
 ) -> SDKSessionSpec:
     context_scope = context_file_session_components(context_file_path)
+    history_limit = getattr(args, "sdk_session_history_limit", None)
+    if route in {*CONTEXT_AGENT_ROUTES, "chief_of_staff", "gmail_triage"} and context_scope is None:
+        default_enabled = False
     if context_scope is not None:
         scope, components = context_scope
+        if history_limit is None:
+            # The typed Slack context already carries the root request and recent
+            # thread turns. Keep only a small continuity tail so stale bot output
+            # cannot dominate the authoritative operator context or token budget.
+            history_limit = 6
     else:
         scope = "ask"
         components = default_cli_ask_session_components(route)
@@ -1779,17 +2766,62 @@ def _sdk_session_spec_for_ask(
         enabled=getattr(args, "sdk_session", None),
         explicit_session_id=str(getattr(args, "sdk_session_id", "") or ""),
         database_path=str(getattr(args, "sdk_session_db", "") or ""),
-        history_limit=getattr(args, "sdk_session_history_limit", None),
+        history_limit=history_limit,
         default_enabled=default_enabled,
     )
 
 
 def _ask_route_session_default(route: str) -> bool:
-    return route == "chief_of_staff"
+    return route in {*CONTEXT_AGENT_ROUTES, "chief_of_staff", "gmail_triage"}
 
 
 def _preflight_blocks_execution(preflight: OrchestratorPreflight) -> bool:
     return not bool(preflight.execution_allowed)
+
+
+def _bounded_direct_route_from_preflight(
+    preflight: OrchestratorPreflight,
+) -> str | None:
+    """Select direct execution only for one-owner work after semantic preflight."""
+
+    plan = preflight.manual_request_plan
+    if plan.intent in {"continue_work_item", "opportunity_to_outreach_loop"}:
+        return None
+    if len(_preflight_workflow_routes(preflight)) > 1:
+        return None
+    route = str(plan.target_agent or preflight.route_result.route or "").strip()
+    if route in {*_DIRECT_SPECIALIST_ROUTES, "chief_of_staff"}:
+        return route
+    return None
+
+
+def _preflight_workflow_routes(preflight: OrchestratorPreflight) -> list[str]:
+    """Return the validated ordered owners produced by semantic preflight."""
+
+    plan_routes = list(getattr(preflight.manual_request_plan, "workflow", []) or [])
+    route_result_routes = list(preflight.route_result.workflow or [])
+    return list(
+        dict.fromkeys(
+            str(route)
+            for route in [*plan_routes, *route_result_routes]
+            if str(route) in AGENT_REGISTRY
+            and str(route) not in {"orchestrator", "clarification"}
+        )
+    )
+
+
+def _preflight_requires_work_item(
+    preflight: OrchestratorPreflight,
+    *,
+    request_text: str = "",
+) -> bool:
+    """Require durable state for explicit resumability or multi-owner work."""
+
+    effective_request = str(request_text or preflight.request_text or "").strip()
+    return bool(
+        len(_preflight_workflow_routes(preflight)) > 1
+        or looks_like_stateful_work_request(effective_request)
+    )
 
 
 def _orchestrator_preflight_payload(
@@ -1980,6 +3012,309 @@ def _context_file_is_slack_context(context_file_path: str) -> bool:
         return False
     schema = str(data.get("schema") or data.get("schema_") or "").strip()
     return schema.startswith("keystone.slack.")
+
+
+def _orchestrator_workflow_state_from_cli_context(
+    *,
+    context_file_path: str = "",
+    request_text: str = "",
+    database_url: str | None = None,
+    work_item: WorkItem | None = None,
+) -> dict[str, Any]:
+    """Build bounded preflight context before the WorkItem runner mutates state."""
+
+    state: dict[str, Any] = {}
+    if work_item is not None:
+        state["current_work_item"] = _planner_current_work_item_context(work_item)
+        metadata = work_item.target.metadata if isinstance(work_item.target.metadata, dict) else {}
+        slack_context = metadata.get("slack_context")
+        if isinstance(slack_context, dict) and slack_context:
+            state["slack_context"] = slack_context
+            if slack_context.get("thread_transcript"):
+                state["slack_thread_transcript"] = slack_context["thread_transcript"]
+            if isinstance(slack_context.get("thread_messages"), list):
+                state["recent_slack_thread"] = slack_context["thread_messages"]
+            if isinstance(slack_context.get("prior_agent_runs"), list):
+                state["prior_agent_runs"] = slack_context["prior_agent_runs"]
+
+    if not _context_file_is_slack_context(context_file_path):
+        return state
+    try:
+        payload = json.loads(Path(context_file_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return state
+    if not isinstance(payload, dict):
+        return state
+
+    schema = str(payload.get("schema") or payload.get("schema_") or "").strip()
+    if schema == "keystone.slack.selected_message_context.v1":
+        from keystone_agents.slack_actions import (
+            SlackSelectedMessageContext,
+            orchestrator_workflow_state_from_slack_context,
+        )
+
+        selected_context = SlackSelectedMessageContext.model_validate(payload)
+        slack_state = orchestrator_workflow_state_from_slack_context(
+            selected_context,
+            request_text=request_text,
+            database_url=database_url,
+        )
+        return _merge_direct_workflow_state(slack_state, state)
+
+    slack_context = {
+        key: payload.get(key)
+        for key in (
+            "channel_id",
+            "channel_name",
+            "selected_message_ts",
+            "thread_ts",
+            "thread_fetch_status",
+            "permalink",
+        )
+        if payload.get(key)
+    }
+    if slack_context:
+        state["slack_context"] = slack_context
+    thread_root = str(payload.get("thread_root_request") or "").strip()
+    if thread_root:
+        state["slack_thread_root"] = thread_root[:2400]
+    transcript = str(
+        payload.get("slack_thread_transcript")
+        or payload.get("thread_transcript")
+        or payload.get("read_context")
+        or ""
+    ).strip()
+    if transcript:
+        state["slack_thread_transcript"] = transcript[:6000]
+    thread_messages = payload.get("thread_messages")
+    if isinstance(thread_messages, list):
+        state["recent_slack_thread"] = thread_messages[-8:]
+    prior_runs = payload.get("prior_agent_runs")
+    if isinstance(prior_runs, list):
+        state["prior_agent_runs"] = prior_runs[-5:]
+    return state
+
+
+def _planner_current_work_item_context(work_item: WorkItem) -> dict[str, Any]:
+    """Expose exact bounded WorkItem identity for same-object planner follow-ups."""
+
+    target = {
+        key: value
+        for key, value in {
+            "name": _bounded_redacted_text(work_item.target.name, max_chars=240),
+            "object_type": _bounded_redacted_text(
+                work_item.target.object_type,
+                max_chars=100,
+            ),
+            "external_id": _bounded_redacted_text(
+                work_item.target.external_id,
+                max_chars=180,
+            ),
+        }.items()
+        if value
+    }
+    selected_artifacts = [
+        {
+            key: value
+            for key, value in {
+                "artifact_type": _bounded_redacted_text(
+                    artifact.artifact_type,
+                    max_chars=100,
+                ),
+                "artifact_id": _bounded_redacted_text(
+                    artifact.artifact_id,
+                    max_chars=180,
+                ),
+                "source_agent": _bounded_redacted_text(
+                    artifact.source_agent,
+                    max_chars=100,
+                ),
+                "title": _bounded_redacted_text(artifact.title, max_chars=240),
+                "summary": _bounded_redacted_text(artifact.summary, max_chars=480),
+            }.items()
+            if value
+        }
+        for artifact in work_item.artifact_refs
+        if artifact.selected
+    ][-3:]
+    next_action = (
+        {
+            key: value
+            for key, value in {
+                "action": _bounded_redacted_text(
+                    work_item.next_action.action,
+                    max_chars=100,
+                ),
+                "agent": (
+                    work_item.next_action.agent.value
+                    if work_item.next_action.agent is not None
+                    else ""
+                ),
+                "description": _bounded_redacted_text(
+                    work_item.next_action.description,
+                    max_chars=480,
+                ),
+            }.items()
+            if value
+        }
+        if work_item.next_action is not None
+        else {}
+    )
+    return {
+        key: value
+        for key, value in {
+            "id": _bounded_redacted_text(work_item.id, max_chars=100),
+            "kind": work_item.kind.value,
+            "status": work_item.status.value,
+            "route": work_item.current_route.value,
+            "title": _bounded_redacted_text(work_item.title, max_chars=240),
+            "prior_request": _bounded_redacted_text(
+                work_item.request_text,
+                max_chars=1200,
+                keep_tail=True,
+            ),
+            "target": target,
+            "selected_artifacts": selected_artifacts,
+            "next_action": next_action,
+        }.items()
+        if value not in ("", {}, [])
+    }
+
+
+_DIRECT_CONTEXT_REFERENCE_RE = re.compile(
+    r"\b(?:this|that|these|those|it|same|above|previous|prior|earlier|current)\b",
+    re.IGNORECASE,
+)
+_DIRECT_CONTEXT_OBJECT_OPERATION_RE = re.compile(
+    r"\b(?:add|append|attach|change|delete|edit|modify|move|remove|rename|reply|"
+    r"reschedule|revise|update)\b[^.\n]{0,120}\b(?:abstract|article|comment|"
+    r"description|document|draft|email|event|field|file|item|metadata|note|"
+    r"record|row|thread)\b",
+    re.IGNORECASE,
+)
+
+
+def _direct_specialist_execution_context(
+    input_text: str,
+    *,
+    workflow_state: dict[str, Any] | None,
+    force_thread_context: bool = False,
+) -> dict[str, Any]:
+    """Project only reference-resolving thread state into a fast direct call."""
+
+    if not workflow_state or not (force_thread_context or (
+        _DIRECT_CONTEXT_REFERENCE_RE.search(input_text)
+        or _DIRECT_CONTEXT_OBJECT_OPERATION_RE.search(input_text)
+    )):
+        return {}
+
+    context: dict[str, Any] = {"schema": "keystone.direct_specialist_context.v1"}
+    slack_context = workflow_state.get("slack_context")
+    if isinstance(slack_context, dict):
+        scope = {
+            key: _bounded_redacted_text(slack_context.get(key), max_chars=180)
+            for key in ("channel_id", "channel_name", "selected_message_ts", "thread_ts")
+            if _bounded_redacted_text(slack_context.get(key), max_chars=180)
+        }
+        if scope:
+            context["slack_scope"] = scope
+
+    thread_root = _bounded_redacted_text(
+        workflow_state.get("slack_thread_root"),
+        max_chars=2200,
+    )
+    if thread_root:
+        context["thread_root_request"] = thread_root
+
+    current_normalized = " ".join(str(input_text or "").split())
+    recent = workflow_state.get("recent_slack_thread")
+    if isinstance(recent, list):
+        messages: list[dict[str, str]] = []
+        for item in recent[-6:]:
+            if not isinstance(item, dict):
+                continue
+            summary = _bounded_redacted_text(
+                item.get("summary") or item.get("text"),
+                max_chars=480,
+            )
+            if not summary or " ".join(summary.split()) == current_normalized:
+                continue
+            compact = {
+                key: value
+                for key, value in {
+                    "id": _bounded_redacted_text(item.get("id") or item.get("ts"), max_chars=100),
+                    "source_agent": _bounded_redacted_text(
+                        item.get("source_agent") or item.get("user_id"),
+                        max_chars=120,
+                    ),
+                    "role": _bounded_redacted_text(
+                        item.get("role"),
+                        max_chars=20,
+                    ),
+                    "summary": summary,
+                }.items()
+                if value
+            }
+            if compact:
+                messages.append(compact)
+        if messages:
+            context["recent_thread_messages"] = messages
+
+    prior_runs = workflow_state.get("prior_agent_runs")
+    if isinstance(prior_runs, list):
+        runs: list[dict[str, str]] = []
+        for item in prior_runs[-4:]:
+            if not isinstance(item, dict):
+                continue
+            compact = {
+                key: value
+                for key, value in {
+                    key: _bounded_redacted_text(item.get(key), max_chars=480)
+                    for key in ("id", "route", "status", "object_id", "title", "summary")
+                }.items()
+                if value
+            }
+            if compact:
+                runs.append(compact)
+        if runs:
+            context["prior_agent_runs"] = runs
+
+    transcript = _bounded_redacted_text(
+        workflow_state.get("slack_thread_transcript"),
+        max_chars=2400,
+        keep_tail=True,
+    )
+    if transcript:
+        context["thread_transcript_tail"] = transcript
+
+    return context if len(context) > 1 else {}
+
+
+def _finance_receipt_context_input(
+    input_text: str,
+    execution_context: dict[str, Any] | None,
+) -> str:
+    """Join only bounded selected-thread context needed to resolve a receipt file."""
+
+    bounded_context = specialist_execution_context_text(execution_context)
+    if not bounded_context:
+        return input_text
+    return f"{input_text}\n\n{bounded_context}"
+
+
+def _bounded_redacted_text(
+    value: object,
+    *,
+    max_chars: int,
+    keep_tail: bool = False,
+) -> str:
+    redacted = redact_secrets(str(value or ""))
+    text = " ".join(str(redacted or "").replace("\x00", "").split())
+    if len(text) <= max_chars:
+        return text
+    if keep_tail:
+        return text[-max_chars:].lstrip()
+    return text[:max_chars].rstrip()
 
 
 def _context_file_is_work_item_source_bundle(context_file_path: str) -> bool:
@@ -2174,6 +3509,7 @@ def _run_ask_work_item(
     sdk_session_db_path: str = "",
     sdk_session_history_limit: int | None = None,
     cost_tracking_requested: bool = False,
+    requested_route: str | None = None,
 ) -> int:
     try:
         if live_search and _request_forbids_live_research(input_text):
@@ -2195,6 +3531,7 @@ def _run_ask_work_item(
             live_sdk=live_sdk,
             live_rss_slack_read=live_rss_slack_read,
             max_results=max_results,
+            requested_route=requested_route,
             manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
             orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
             context_file_path=context_file_path,
@@ -2483,6 +3820,11 @@ def _cli_slack_eval_evidence(
     sdk_usage = _latest_event_metadata(result_payload, "usage")
     sdk_cost = _latest_event_metadata(result_payload, "cost")
     model = result_payload.get("model") if isinstance(result_payload.get("model"), dict) else {}
+    execution_provenance = (
+        result_payload.get("execution_provenance")
+        if isinstance(result_payload.get("execution_provenance"), dict)
+        else {}
+    )
     retrieval = (
         result_payload.get("retrieval")
         if isinstance(result_payload.get("retrieval"), dict)
@@ -2542,13 +3884,33 @@ def _cli_slack_eval_evidence(
         },
         "response_hash": _hash_text(summary) if summary else "",
         "response_summary_chars": len(summary),
-        "model_provider": str(model.get("provider") or ""),
-        "model_name": str(model.get("name") or model.get("model") or ""),
-        "run_mode": str(model.get("run_mode") or ""),
-        "search_provider": str(retrieval.get("search_provider") or retrieval.get("provider") or ""),
+        "model_provider": str(
+            model.get("provider") or execution_provenance.get("model_provider") or ""
+        ),
+        "model_name": str(
+            model.get("name")
+            or model.get("model")
+            or execution_provenance.get("model_name")
+            or ""
+        ),
+        "run_mode": str(
+            model.get("run_mode") or execution_provenance.get("run_mode") or ""
+        ),
+        "search_provider": str(
+            retrieval.get("search_provider")
+            or retrieval.get("provider")
+            or execution_provenance.get("search_provider")
+            or ""
+        ),
         "search_provider_sequence": [
-            str(item) for item in retrieval.get("search_provider_sequence") or []
+            str(item)
+            for item in (
+                retrieval.get("search_provider_sequence")
+                or execution_provenance.get("search_provider_sequence")
+                or []
+            )
         ],
+        "execution_provenance": execution_provenance,
         "prompt_versions": _trace_prompt_versions(result_payload),
         "prompt_metadata": {
             "source": "cli_slack_context_eval_save",
@@ -2560,6 +3922,9 @@ def _cli_slack_eval_evidence(
     tool_summary = _trace_tool_summary_from_payload(result_payload)
     if tool_summary:
         evidence["tool_summary"] = tool_summary
+    child_steps = slack_eval_child_step_summary(result_payload, tool_summary)
+    if child_steps:
+        evidence["child_step_summary"] = child_steps
     orchestrator_summary = _trace_orchestrator_summary_from_payload(result_payload)
     if orchestrator_summary.get("orchestrator"):
         evidence["orchestrator"] = orchestrator_summary["orchestrator"]
@@ -2877,9 +4242,15 @@ def _print_ask_dry_run(
     manual_plan: ManualRequestPlan | None = None,
     orchestrator_preflight: OrchestratorPreflight | None = None,
     database_url: str | None = None,
+    execution_context: dict[str, Any] | None = None,
 ) -> int:
     agent = AGENT_REGISTRY[route].build_agent()
-    context_agent_output = _context_agent_dry_run_output(route, input_text, manual_plan)
+    context_agent_output = _context_agent_dry_run_output(
+        route,
+        input_text,
+        manual_plan,
+        execution_context=execution_context,
+    )
     chief_of_staff_output = (
         plan_chief_of_staff_request(
             input_text,
@@ -2921,7 +4292,7 @@ def _print_ask_dry_run(
         "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
         "output_type": output_type,
         "output": output_payload,
-        "human_summary": _context_agent_human_summary(output_payload)
+        "human_summary": _context_agent_human_summary(output_payload, manual_plan)
         if context_agent_output is not None
         else "",
         "blockers": _context_agent_blocker_messages(output_payload),
@@ -2976,6 +4347,8 @@ def _context_agent_dry_run_output(
     route: str,
     input_text: str,
     manual_plan: ManualRequestPlan | None,
+    *,
+    execution_context: dict[str, Any] | None = None,
 ) -> (
     AirtableContextResult
     | GoogleWorkspaceContextResult
@@ -2994,7 +4367,9 @@ def _context_agent_dry_run_output(
     )
     if route == "airtable_context_agent":
         topic_terms = _airtable_context_topic_terms(objective)
-        expense_receipt_target = infer_finance_expense_receipt_target(objective)
+        expense_receipt_target = infer_finance_expense_receipt_target(
+            _finance_receipt_context_input(objective, execution_context)
+        )
         finance_tax_focus = _airtable_context_is_finance_tax_request(topic_terms, objective)
         eval_tracker_focus = _airtable_context_is_eval_tracker_request(topic_terms, objective)
         blockers = (
@@ -3281,9 +4656,43 @@ def _context_agent_dry_run_output(
         topic_terms = _zotero_context_topic_terms(objective)
         validation_focus = _zotero_context_is_validation_collection_request(topic_terms, objective)
         topic_focus = ", ".join(topic_terms[:4]) if topic_terms else "the requested Zotero topic"
+        normalized_objective = " ".join(objective.lower().split())
+        pdf_attachment_requested = bool(
+            "pdf" in normalized_objective
+            and re.search(r"\b(?:add|attach|upload|link)\b", normalized_objective)
+        )
+        ordinary_note_requested = bool(
+            re.search(r"\bnotes?\b", normalized_objective)
+            and re.search(
+                r"\b(?:add|append|change|create|delete|edit|modify|remove|update|write)\b",
+                normalized_objective,
+            )
+            and "kba_test_note" not in normalized_objective
+        )
+        mutation_blockers: list[str] = []
+        if pdf_attachment_requested:
+            mutation_blockers.append(
+                "Ordinary Zotero PDF attachment is not supported by the current tool "
+                "contract. Add a bounded exact-item PDF attachment tool with approval, "
+                "file validation, provider read-back, and exact child-item verification."
+            )
+        if ordinary_note_requested:
+            mutation_blockers.append(
+                "Ordinary Zotero child-note creation or modification is not supported by "
+                "the current tool contract. Add a bounded exact-item note tool with "
+                "approval, version preconditions, and provider read-back verification."
+            )
+        mutation_summary = (
+            "The LLM/manual plan correctly selected Zotero Context as the source owner and "
+            "classified this as a business-system write. The requested mutation is blocked "
+            "at the tool boundary, not at natural-language interpretation. "
+            if mutation_blockers
+            else ""
+        )
         return ZoteroContextResult(
             mode="deterministic",
-            summary=(
+            summary=mutation_summary
+            + (
                 (
                     "Zotero read-only context dry-run recognized the behavioral-health AI "
                     "validation collection criteria, including title, authors, year, DOI, "
@@ -3325,7 +4734,16 @@ def _context_agent_dry_run_output(
                 "Search collection metadata before citing items.",
                 "Return collection and item identifiers only after local Zotero records are read.",
                 "Keep this pass read-only and preserve citation-gap caveats.",
+                *(
+                    [
+                        "Implement and validate the missing exact-item Zotero mutation tool "
+                        "before retrying this provider write."
+                    ]
+                    if mutation_blockers
+                    else []
+                ),
             ],
+            blockers=mutation_blockers,
             approval_needs=[
                 "Scoped approval before creating any Workspace artifact from Zotero context"
             ],
@@ -3994,7 +5412,36 @@ def _context_agent_output_has_blockers(output: object) -> bool:
 def _context_agent_blocker_messages(output: object) -> list[dict[str, str]]:
     if not isinstance(output, dict):
         return []
-    return [{"message": str(item)} for item in output.get("blockers") or [] if str(item)]
+    messages: list[dict[str, str]] = []
+    for item in output.get("blockers") or []:
+        message = (
+            str(item.get("message") or "").strip()
+            if isinstance(item, dict)
+            else str(item or "").strip()
+        )
+        if message:
+            messages.append({"message": message})
+    return messages
+
+
+def _context_agent_public_blockers(
+    output: object,
+    *,
+    execution_blocker: str = "",
+) -> list[dict[str, str]]:
+    """Return stable public blocker objects without hashing nested mappings."""
+
+    candidates = _context_agent_blocker_messages(output)
+    if execution_blocker.strip():
+        candidates.append({"message": execution_blocker.strip()})
+    messages = list(
+        dict.fromkeys(
+            str(item.get("message") or "").strip()
+            for item in candidates
+            if str(item.get("message") or "").strip()
+        )
+    )
+    return [{"message": message} for message in messages]
 
 
 def _context_agent_blocked_write_attempts(
@@ -4020,10 +5467,186 @@ def _context_agent_blocked_write_attempts(
     return []
 
 
-def _context_agent_human_summary(output: object) -> str:
+def _strict_requested_display_text(
+    output: object,
+    manual_plan: ManualRequestPlan | dict[str, object] | None,
+) -> str:
+    """Render exact narrow asks without adding generic workflow sections."""
+
+    if not isinstance(output, dict) or not manual_plan:
+        return ""
+    plan = (
+        manual_plan.model_dump(mode="json")
+        if isinstance(manual_plan, ManualRequestPlan)
+        else manual_plan
+    )
+    ask_shape = plan.get("ask_shape")
+    if not isinstance(ask_shape, dict):
+        return ""
+    strict_mode = str(ask_shape.get("strict_filter_mode") or "") in {"exact", "strict"}
+    stop_condition = str(ask_shape.get("stop_condition") or "").lower()
+    output_form = str(ask_shape.get("output_form") or "")
+    objective_text = " ".join(
+        (
+            str(plan.get("objective") or ""),
+            stop_condition,
+            *[str(item or "") for item in plan.get("required_terms") or []],
+        )
+    ).lower()
+    draft_text = str(
+        output.get("draft_reply") or output.get("draft_reply_summary") or ""
+    ).strip()
+    requests_copyable_draft = bool(
+        draft_text
+        and (
+            output_form == "draft"
+            or re.search(r"\b(?:draft|write|prepare)\b", objective_text)
+        )
+        and re.search(r"\b(?:reply|response)\b", objective_text)
+    )
+    precise_output_boundary = bool(
+        stop_condition and output_form in {"brief", "bullets"}
+    )
+    if not strict_mode and not precise_output_boundary and not requests_copyable_draft:
+        return ""
+
+    if output.get("blockers") or output.get("approval_needs") or output.get("evidence_gaps"):
+        objective_text = str(plan.get("objective") or "").lower()
+        requested_zotero_identity = all(
+            re.search(pattern, objective_text)
+            for pattern in (r"\btitle\b", r"\bauthors?\b", r"\bpublication\s+title\b")
+        )
+        diagnostic_values = {
+            str(item.get("key") or "").strip(): str(item.get("value") or "").strip()
+            for item in output.get("diagnostics") or []
+            if isinstance(item, dict) and str(item.get("key") or "").strip()
+        }
+        verified_identity_fields = bool(
+            output.get("article_titles")
+            and diagnostic_values.get("authors")
+            and diagnostic_values.get("publication_title")
+        )
+        if not (requested_zotero_identity and verified_identity_fields):
+            return ""
+
+    preview_lines = [
+        str(item).strip()
+        for item in output.get("artifact_preview_lines") or []
+        if str(item).strip()
+    ]
+    if output_form == "bullets" and preview_lines:
+        return "\n".join(
+            line if re.match(r"^[-*]\s+", line) else f"- {line}" for line in preview_lines
+        )
+
+    titles = [str(item).strip() for item in output.get("article_titles") or [] if str(item).strip()]
+    item_keys = [
+        str(item).strip() for item in output.get("zotero_item_keys") or [] if str(item).strip()
+    ]
+    output_constraints = ask_shape.get("output_constraints")
+    constraint_interpretation = (
+        str(output_constraints.get("interpretation") or "")
+        if isinstance(output_constraints, dict)
+        else ""
+    )
+    requested_field_text = " ".join(
+        [
+            str(plan.get("objective") or ""),
+            constraint_interpretation,
+            *[str(item or "") for item in plan.get("required_terms") or []],
+        ]
+    ).lower()
+    requested_zotero_fields = {
+        field
+        for field, pattern in (
+            ("title", r"\btitle\b"),
+            ("authors", r"\bauthors?\b"),
+            ("publication title", r"\bpublication\s+title\b"),
+        )
+        if re.search(pattern, requested_field_text)
+    }
+    if titles and {"title", "authors", "publication title"}.issubset(
+        requested_zotero_fields
+    ):
+        diagnostic_values = {
+            str(item.get("key") or "").strip(): str(item.get("value") or "").strip()
+            for item in output.get("diagnostics") or []
+            if isinstance(item, dict) and str(item.get("key") or "").strip()
+        }
+        return "\n".join(
+            (
+                f"Title: {titles[0]}",
+                "Authors: "
+                + (diagnostic_values.get("authors") or "Unavailable in Zotero metadata"),
+                "Publication title: "
+                + (
+                    diagnostic_values.get("publication_title")
+                    or "Unavailable in Zotero metadata"
+                ),
+            )
+        )
+    if "one" in stop_condition and "zotero" in stop_condition and titles and item_keys:
+        return f"Title: {titles[0]}\nItem key: {item_keys[0]}"
+
+    summary = str(output.get("answer") or output.get("summary") or "").strip()
+    if not summary:
+        facts = output.get("facts")
+        if isinstance(facts, list):
+            for fact in facts:
+                if isinstance(fact, dict) and str(fact.get("text") or "").strip():
+                    summary = str(fact["text"]).strip()
+                    break
+    if not summary:
+        summary = str(
+            output.get("why_it_matters")
+            or output.get("product")
+            or ""
+        ).strip()
+    if output_form in {"brief", "draft"} and (summary or draft_text):
+        if requests_copyable_draft:
+            assessment_requested = bool(
+                re.search(
+                    r"\b(?:assess|decide|explain|tell\s+me)\b[^.]{0,80}"
+                    r"\b(?:whether|what|why|merit|warrant|reply|response)\b"
+                    r"|\b(?:merits?|warrants?|needs?|requires?)\b[^.]{0,40}"
+                    r"\b(?:reply|response)\b",
+                    objective_text,
+                )
+            )
+            assessment = (
+                str(output.get("reasoning") or "").strip()
+                if assessment_requested
+                else summary
+            )
+            if not assessment:
+                assessment = summary
+            return "\n\n".join(
+                item
+                for item in (
+                    assessment,
+                    f"*Draft response:*\n{draft_text}",
+                )
+                if item
+            )
+        if "reply" in stop_condition and isinstance(output.get("needs_reply"), bool):
+            reply = "Yes" if output["needs_reply"] else "No"
+            return f"{summary}\nReply needed: {reply}."
+        if titles and "title" in requested_zotero_fields:
+            return f"Title: {titles[0]}\nSummary: {summary}"
+        return summary
+    return ""
+
+
+def _context_agent_human_summary(
+    output: object,
+    manual_plan: ManualRequestPlan | dict[str, object] | None = None,
+) -> str:
     if not isinstance(output, dict):
         return ""
-    summary = str(output.get("summary") or "").strip()
+    strict_display = _strict_requested_display_text(output, manual_plan)
+    if strict_display:
+        return strict_display
+    summary = str(output.get("answer") or output.get("summary") or "").strip()
     approval_needs = [
         str(item).strip() for item in output.get("approval_needs") or [] if str(item).strip()
     ]
@@ -4220,7 +5843,15 @@ def _context_agent_workspace_context_lines(output: dict[str, object]) -> list[st
         if str(item).strip()
     ][:5]
     target = str(output.get("recommended_target") or "").strip()
+    preview_lines = [
+        str(item).strip()
+        for item in output.get("artifact_preview_lines") or []
+        if str(item).strip()
+    ][:12]
     lines: list[str] = []
+    if preview_lines:
+        lines.append("- Draft artifact preview:")
+        lines.extend(f"  - {item}" for item in preview_lines)
     if target:
         lines.append(f"- Candidate target: {target}")
     if folders:
@@ -4286,10 +5917,25 @@ def _run_ask_specialist_live(
     manual_plan: ManualRequestPlan | None = None,
     orchestrator_preflight: OrchestratorPreflight | None = None,
     sdk_session_spec: SDKSessionSpec | None = None,
+    execution_context: dict[str, Any] | None = None,
+    context_file_path: str = "",
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
     load_settings(force_dotenv=True)
+    if _is_direct_supplied_response_request(
+        input_text,
+        requested_route=route,
+    ):
+        return _run_direct_supplied_context_response_live(
+            route,
+            input_text,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_spec=sdk_session_spec,
+            database_url=database_url,
+        )
     if route == "business_research_analyst":
         return _run_ask_company_research_live(
             input_text,
@@ -4297,6 +5943,8 @@ def _run_ask_specialist_live(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
+            context_file_path=context_file_path,
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
         )
@@ -4307,6 +5955,8 @@ def _run_ask_specialist_live(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
+            context_file_path=context_file_path,
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
         )
@@ -4317,6 +5967,8 @@ def _run_ask_specialist_live(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
+            context_file_path=context_file_path,
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
         )
@@ -4327,6 +5979,8 @@ def _run_ask_specialist_live(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
+            context_file_path=context_file_path,
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
         )
@@ -4337,6 +5991,8 @@ def _run_ask_specialist_live(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
+            context_file_path=context_file_path,
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
         )
@@ -4348,11 +6004,129 @@ def _run_ask_specialist_live(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
         )
     else:
         raise SystemExit(f"Unsupported agent route: {route}")
+
+
+def _run_direct_supplied_context_response_live(
+    route: str,
+    input_text: str,
+    *,
+    json_output: bool,
+    manual_plan: ManualRequestPlan,
+    orchestrator_preflight: OrchestratorPreflight | None,
+    sdk_session_spec: SDKSessionSpec | None,
+    database_url: str | None,
+) -> int:
+    """Run the explicitly named specialist once without tools or domain blockers."""
+
+    agent = build_direct_supplied_response_agent(route, request_text=input_text)
+    typed_input = DirectAgentResponseInput(
+        requested_agent=route,
+        original_request=input_text,
+        output_constraints=manual_plan.ask_shape.output_constraints.model_dump(
+            mode="json"
+        ),
+    )
+    result = run_typed_sdk_agent(
+        agent=agent,
+        typed_input=typed_input,
+        output_type=DirectAgentResponse,
+        live=True,
+        session=build_sdk_session(sdk_session_spec) if sdk_session_spec else None,
+        workflow_name=f"keystone.ask.{route}.direct_response",
+        trace_metadata={
+            "agent": route,
+            "entrypoint": "cli.ask",
+            "mode": "live_sdk_direct_response",
+            "tool_admission": "none",
+        },
+        max_turns=1,
+    )
+    instruction_resolution = resolve_instruction_following_response(
+        result.output.answer,
+        original_request=input_text,
+        manual_plan=manual_plan,
+        bounded_evidence=input_text,
+        live=True,
+    )
+    passed = instruction_resolution.validation.passed
+    answer = (
+        instruction_resolution.response_text
+        if passed
+        else instruction_following_blocker_text(instruction_resolution.validation)
+    )
+    payload: dict[str, Any] = {
+        "mode": "live_sdk",
+        "selected_agent": route,
+        "agent_name": _agent_display_name(route),
+        "input": input_text,
+        "status": "completed" if passed else "blocked",
+        "block_kind": "" if passed else "instruction_following_constraint_failed",
+        "send_enabled": False,
+        "completion_confirmed": passed,
+        "manual_request_plan": manual_plan.model_dump(mode="json"),
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+        "output_type": "DirectAgentResponse",
+        "output": {"answer": answer, "summary": answer, "send_enabled": False},
+        "human_summary": answer,
+        "slack_display_text": answer,
+        "display_text": answer,
+        "summary": answer,
+        "instruction_following": instruction_resolution.metadata(),
+        "usage": result.usage,
+        "cost": result.cost,
+        "budget_guard": result.budget_guard,
+        "request_cache": result.request_cache,
+        "model": {
+            "provider": get_runtime_agent_model_config(
+                getattr(agent, "name", route),
+                model_override=getattr(agent, "model", None),
+            ).provider,
+            "name": str(getattr(agent, "model", "") or ""),
+            "run_mode": "live_sdk",
+        },
+        "model_execution": {
+            "provider": get_runtime_agent_model_config(
+                getattr(agent, "name", route),
+                model_override=getattr(agent, "model", None),
+            ).provider,
+            "model": str(getattr(agent, "model", "") or ""),
+            "run_mode": "live_sdk",
+            "usage_available": True,
+            "cost_available": True,
+        },
+        "tool_admission": {
+            "admitted": False,
+            "tool_count": len(list(getattr(agent, "tools", []) or [])),
+            "reason": "complete_provider_free_supplied_context",
+        },
+        "side_effects": {
+            "external_write_performed": False,
+            "email_sent": False,
+            "slack_message_posted": False,
+        },
+    }
+    attach_execution_public_result(payload)
+    try:
+        run_id = SQLiteStore(database_url or database_url_from_env()).save_agent_run(
+            agent_name=route,
+            input_payload={"request_text": input_text, "route": route},
+            input_summary=input_text[:500],
+            output=payload,
+            model=f"sdk-live:{getattr(agent, 'model', '') or route}",
+            dry_run=False,
+            status="success" if passed else "blocked",
+        )
+        payload["agent_run_id"] = run_id
+        attach_execution_public_result(payload)
+    except Exception as exc:  # pragma: no cover - diagnostic metadata only
+        payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
+    return _print_ask_live_payload(payload, json_output=json_output)
 
 
 def _run_ask_context_agent_live(
@@ -4363,11 +6137,56 @@ def _run_ask_context_agent_live(
     manual_plan: ManualRequestPlan | None = None,
     orchestrator_preflight: OrchestratorPreflight | None = None,
     sdk_session_spec: SDKSessionSpec | None = None,
+    execution_context: dict[str, Any] | None = None,
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
+    provider_context, preacquired_receipts, provider_blocker = (
+        _direct_zotero_provider_preflight(route, input_text)
+    )
+    airtable_receipt_context = _direct_airtable_receipt_provider_context(
+        route,
+        input_text,
+        execution_context=execution_context,
+    )
+    if airtable_receipt_context:
+        provider_context = "\n\n".join(
+            item for item in (provider_context, airtable_receipt_context) if item
+        )
+    if provider_blocker:
+        return _print_ask_clarification(
+            route,
+            input_text,
+            provider_blocker,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            extra={
+                "status": "blocked",
+                "block_kind": "zotero_provider_read_failed",
+                "tool_receipts": preacquired_receipts,
+                "send_enabled": False,
+            },
+        )
     spec = AGENT_REGISTRY[route]
-    agent = spec.build_agent(request_text=input_text)
+    build_kwargs: dict[str, Any] = {
+        "request_text": input_text,
+        "tool_tier": _direct_context_agent_tool_tier(
+            manual_plan,
+            input_text=input_text,
+        ),
+        "compact_instructions": bool(
+            _direct_specialist_runtime_profile(route, input_text=input_text)[
+                "compact_instructions"
+            ]
+        ),
+    }
+    if route == "zotero_context_agent" and provider_context:
+        # Provider acquisition is already complete. Keep this synthesis turn
+        # tool-free; later thread follow-ups rebuild the agent with its Zotero
+        # read tools when they need new metadata.
+        build_kwargs["attach_tools"] = False
+    agent = spec.build_agent(**build_kwargs)
     model_config = get_runtime_agent_model_config(
         getattr(agent, "name", None),
         model_override=getattr(agent, "model", None),
@@ -4377,6 +6196,17 @@ def _run_ask_context_agent_live(
         request_text=input_text,
         live_search=False,
     )
+    direct_turn_limit = _direct_specialist_request_estimate(
+        route,
+        input_text=input_text,
+        live_search=False,
+    )
+    if direct_turn_limit < turn_policy.max_turns:
+        turn_policy = SDKTurnPolicy(
+            agent_name=turn_policy.agent_name,
+            max_turns=direct_turn_limit,
+            source=f"direct_single_action:{turn_policy.source}",
+        )
     output_type = spec.resolve_output_schema()
     live_read_env_names = {
         "airtable_context_agent": AIRTABLE_LIVE_READS_ENV,
@@ -4386,11 +6216,23 @@ def _run_ask_context_agent_live(
     previous_live_reads = os.environ.get(live_read_env_name) if live_read_env_name else None
     operator_approval_env = "KEYSTONE_AIRTABLE_OPERATOR_APPROVAL_REFERENCE"
     previous_operator_approval = os.environ.get(operator_approval_env)
+    previous_airtable_operation = os.environ.get(AIRTABLE_ALLOWED_OPERATION_ENV)
+    airtable_allowed_operation = (
+        _direct_airtable_allowed_operation(manual_plan, input_text=input_text)
+        if route == "airtable_context_agent"
+        else ""
+    )
     if route == "airtable_context_agent" and (
-        _chief_workflow_requests_marked_airtable_test_lifecycle(input_text)
+        (manual_plan is not None and manual_plan.intent == "business_system_write")
+        or _chief_workflow_requests_marked_airtable_test_lifecycle(input_text)
     ):
         request_hash = hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:16]
         os.environ[operator_approval_env] = f"airtable-direct:{request_hash}"
+    if route == "airtable_context_agent":
+        if airtable_allowed_operation:
+            os.environ[AIRTABLE_ALLOWED_OPERATION_ENV] = airtable_allowed_operation
+        else:
+            os.environ.pop(AIRTABLE_ALLOWED_OPERATION_ENV, None)
     zotero_approval_env = "KEYSTONE_ZOTERO_OPERATOR_APPROVAL_REFERENCE"
     previous_zotero_approval = os.environ.get(zotero_approval_env)
     if (
@@ -4403,15 +6245,29 @@ def _run_ask_context_agent_live(
     if live_read_env_name:
         os.environ[live_read_env_name] = "true"
     try:
-        sdk_input_text = input_text
+        sdk_input_parts = [input_text]
+        interpreted_constraints = interpreted_output_constraints_text(manual_plan)
+        if interpreted_constraints:
+            sdk_input_parts.append(interpreted_constraints)
+        bounded_context = specialist_execution_context_text(execution_context)
+        if bounded_context:
+            sdk_input_parts.append(bounded_context)
+        if provider_context:
+            sdk_input_parts.append(provider_context)
         if manual_plan is not None and manual_plan.intent == "business_system_write":
-            sdk_input_text = (
-                f"{input_text}\n\n"
+            sdk_input_parts.append(
                 "Authenticated direct execution context: this exact scoped provider "
                 "write is approved for the selected specialist. Call the matching "
                 "typed tool with live=true. Reuse the process-local operator approval "
                 "reference; do not request duplicate approval or downgrade to preview."
             )
+        if airtable_allowed_operation:
+            sdk_input_parts.append(
+                "Airtable generic write scope: `airtable_write_record` may use only "
+                f"operation={airtable_allowed_operation!r}. Any other operation is "
+                "blocked by the tool boundary."
+            )
+        sdk_input_text = "\n\n".join(sdk_input_parts)
         raw_result, output = run_typed_sdk_sync(
             agent,
             sdk_input_text,
@@ -4436,12 +6292,39 @@ def _run_ask_context_agent_live(
             os.environ.pop(operator_approval_env, None)
         else:
             os.environ[operator_approval_env] = previous_operator_approval
+        if previous_airtable_operation is None:
+            os.environ.pop(AIRTABLE_ALLOWED_OPERATION_ENV, None)
+        else:
+            os.environ[AIRTABLE_ALLOWED_OPERATION_ENV] = previous_airtable_operation
         if previous_zotero_approval is None:
             os.environ.pop(zotero_approval_env, None)
         else:
             os.environ[zotero_approval_env] = previous_zotero_approval
     output_payload = output.model_dump(mode="json")
-    tool_receipts = _context_agent_tool_receipts(raw_result)
+    _reconcile_context_agent_answer_fields(route, input_text, output_payload)
+    tool_receipts = [*preacquired_receipts, *_context_agent_tool_receipts(raw_result)]
+    _reconcile_context_agent_metadata_projection(output_payload, tool_receipts)
+    provider_receipt_blocker = _zotero_ordered_abstract_receipt_blocker(
+        route,
+        input_text,
+        tool_receipts,
+    )
+    airtable_write_blocker = _airtable_write_execution_blocker(
+        route,
+        input_text,
+        manual_plan=manual_plan,
+        tool_receipts=tool_receipts,
+    )
+    if provider_receipt_blocker:
+        output_payload["summary"] = provider_receipt_blocker
+        output_payload["blockers"] = list(
+            dict.fromkeys(
+                [
+                    *[str(item) for item in output_payload.get("blockers") or []],
+                    provider_receipt_blocker,
+                ]
+            )
+        )
     external_write_performed = _context_agent_external_write_performed(tool_receipts)
     _reconcile_context_agent_executed_write_plan(output_payload, tool_receipts)
     review = review_specialist_output(
@@ -4472,9 +6355,46 @@ def _run_ask_context_agent_live(
         output_payload,
         tool_receipts,
     )
+    candidate_summary = (
+        _verified_context_agent_write_summary(tool_receipts)
+        or _context_agent_human_summary(output_payload, manual_plan)
+    )
+    instruction_resolution = resolve_instruction_following_response(
+        candidate_summary,
+        original_request=input_text,
+        manual_plan=manual_plan,
+        bounded_evidence=json.dumps(public_output_payload, ensure_ascii=True, sort_keys=True),
+        live=True,
+    )
+    resolved_summary = (
+        instruction_resolution.response_text
+        if instruction_resolution.validation.passed
+        else instruction_following_blocker_text(instruction_resolution.validation)
+    )
+    execution_blocker = provider_receipt_blocker or airtable_write_blocker
+    provider_links: list[str] = []
+    if execution_blocker:
+        resolved_summary = execution_blocker
+    else:
+        provider_links = _verified_provider_links(tool_receipts)
+        if provider_links:
+            resolved_summary = "\n\n".join(
+                [
+                    resolved_summary,
+                    "Open in provider:\n"
+                    + "\n".join(f"- {link}" for link in provider_links),
+                ]
+            ).strip()
     payload = {
         "mode": "live_sdk",
-        "status": "done",
+        "status": "blocked" if execution_blocker else "done",
+        "block_kind": (
+            "zotero_provider_read_required"
+            if provider_receipt_blocker
+            else "airtable_write_unverified"
+            if airtable_write_blocker
+            else ""
+        ),
         "selected_agent": route,
         "route": route,
         "agent_name": _agent_display_name(route),
@@ -4489,8 +6409,13 @@ def _run_ask_context_agent_live(
         "orchestrator_review": review_payload,
         "output": public_output_payload,
         "tool_receipts": public_tool_receipts,
-        "human_summary": _context_agent_human_summary(output_payload),
-        "blockers": _context_agent_blocker_messages(output_payload),
+        "verified_provider_links": provider_links,
+        "human_summary": resolved_summary,
+        "instruction_following": instruction_resolution.metadata(),
+        "blockers": _context_agent_public_blockers(
+            output_payload,
+            execution_blocker=execution_blocker,
+        ),
         "side_effects": {
             "schema": "keystone.promptfoo.side_effects.v1",
             "email_sent": False,
@@ -4508,7 +6433,7 @@ def _run_ask_context_agent_live(
                 tool_receipts=tool_receipts,
             ),
             "approval_ref": ",".join(approval_references),
-            "evidence_complete": True,
+            "evidence_complete": not bool(execution_blocker),
         },
     }
     usage = extract_sdk_usage(raw_result)
@@ -4537,12 +6462,206 @@ def _run_ask_context_agent_live(
             output=payload,
             model=f"sdk-live:{model_config.model}",
             dry_run=False,
-            status="success",
+            status="blocked" if execution_blocker else "success",
         )
         payload["agent_run_id"] = run_id
+        public_result = payload.get("public_result")
+        if isinstance(public_result, dict):
+            public_result["run_id"] = str(run_id)
     except Exception as exc:  # pragma: no cover - diagnostic metadata only
         payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
     return _print_ask_live_payload(payload, json_output=json_output)
+
+
+def _direct_context_agent_tool_tier(
+    manual_plan: ManualRequestPlan | None,
+    *,
+    input_text: str = "",
+) -> str:
+    """Attach only the source tools needed by a bounded direct context call."""
+
+    if (
+        manual_plan is not None and manual_plan.intent == "business_system_write"
+    ) or _chief_workflow_requests_marked_airtable_test_lifecycle(input_text):
+        return "internal_write"
+    return "core_read"
+
+
+def _direct_airtable_allowed_operation(
+    manual_plan: ManualRequestPlan | None,
+    *,
+    input_text: str,
+) -> str:
+    """Return the exact generic Airtable mutation admitted by the operator ask."""
+
+    if manual_plan is None or manual_plan.intent != "business_system_write":
+        return ""
+    if _chief_workflow_requests_marked_airtable_test_lifecycle(input_text):
+        return ""
+    receipt_target = infer_finance_expense_receipt_target(input_text)
+    if receipt_target is not None:
+        if receipt_target.operation == "create":
+            return "create"
+        if receipt_target.operation == "update":
+            return "update"
+        return ""
+    actionable = re.sub(
+        r"\b(?:do\s+not|don't|dont|never|without)\b[^.;\n]*",
+        " ",
+        str(input_text or ""),
+        flags=re.I,
+    )
+    if re.search(r"\b(?:reconcile|deduplicate|merge\s+duplicates?)\b", actionable, re.I):
+        return "update"
+    creates = bool(re.search(r"\b(?:add|create|insert|make)\b", actionable, re.I))
+    updates = bool(
+        re.search(r"\b(?:update|change|modify|revise|edit|set|correct)\b", actionable, re.I)
+    )
+    if creates and not updates:
+        return "create"
+    if updates and not creates:
+        return "update"
+    return ""
+
+
+def _reconcile_context_agent_answer_fields(
+    route: str,
+    input_text: str,
+    output: dict[str, Any],
+) -> None:
+    """Promote substantive model evidence when a strict answer lands in the wrong field."""
+
+    normalized_request = " ".join(str(input_text or "").lower().split())
+    if route != "zotero_context_agent" or "abstract" not in normalized_request:
+        return
+    if not output.get("article_titles"):
+        return
+    summary = " ".join(str(output.get("summary") or "").split())
+    procedural_summary = bool(
+        re.search(
+            r"\b(?:selected|identified|found)\b.*\b(?:summari[sz]ed|summary)\b",
+            summary,
+            re.IGNORECASE,
+        )
+        or re.search(
+            r"\b(?:summary|response)\b.*\b(?:word limit|requested format|constrained)\b",
+            summary,
+            re.IGNORECASE,
+        )
+    )
+    if summary and not procedural_summary:
+        return
+    evidence = output.get("relevant_evidence")
+    if not isinstance(evidence, list):
+        return
+    for item in evidence:
+        candidate = " ".join(str(item or "").split())
+        candidate_lower = candidate.lower()
+        if not candidate or "abstract" not in candidate_lower:
+            continue
+        if not re.search(
+            r"\babstract\b.*\b(?:reports?|finds?|describes?|shows?|concludes?|"
+            r"examines?|reviews?|evaluates?|assesses?|investigates?)\b",
+            candidate_lower,
+        ):
+            continue
+        output["summary"] = candidate
+        diagnostics = output.get("diagnostics")
+        if isinstance(diagnostics, list):
+            diagnostics.append(
+                {
+                    "key": "canonical_summary_field",
+                    "value": "relevant_evidence",
+                    "note": (
+                        "Promoted the specialist's substantive abstract synthesis into "
+                        "the canonical summary field."
+                    ),
+                }
+            )
+        return
+
+
+def _reconcile_context_agent_metadata_projection(
+    output: dict[str, Any],
+    tool_receipts: list[dict[str, object]],
+) -> None:
+    """Preserve schema-aware provider fields through model synthesis and rendering."""
+
+    projection = next(
+        (
+            receipt.get("metadata_projection")
+            for receipt in tool_receipts
+            if isinstance(receipt.get("metadata_projection"), dict)
+        ),
+        None,
+    )
+    if not isinstance(projection, dict):
+        return
+    fields = projection.get("fields")
+    if not isinstance(fields, dict):
+        return
+    title = str(fields.get("title") or "").strip()
+    if title and not output.get("article_titles"):
+        output["article_titles"] = [title]
+    diagnostics = output.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        diagnostics = []
+        output["diagnostics"] = diagnostics
+    by_key = {
+        str(item.get("key") or "").strip(): item
+        for item in diagnostics
+        if isinstance(item, dict) and str(item.get("key") or "").strip()
+    }
+    for field in projection.get("requested_fields") or []:
+        clean_field = str(field or "").strip()
+        if clean_field in {"", "title"}:
+            continue
+        value = fields.get(clean_field)
+        rendered_value = (
+            "; ".join(str(item).strip() for item in value if str(item).strip())
+            if isinstance(value, list)
+            else str(value or "").strip()
+        )
+        entry = by_key.get(clean_field)
+        if entry is None:
+            diagnostics.append(
+                {
+                    "key": clean_field,
+                    "value": rendered_value,
+                    "note": (
+                        "Projected from the schema-aware provider context."
+                        if rendered_value
+                        else "The requested field was unavailable in provider metadata."
+                    ),
+                }
+            )
+        elif rendered_value:
+            entry["value"] = rendered_value
+            entry["note"] = "Projected from the schema-aware provider context."
+
+
+def _verified_provider_links(
+    tool_receipts: list[dict[str, object]],
+) -> list[str]:
+    """Return clickable links only from provider-verified successful receipts."""
+
+    links: list[str] = []
+    for receipt in tool_receipts:
+        verification = receipt.get("verification")
+        verified = bool(
+            isinstance(verification, dict) and verification.get("passed") is True
+        )
+        if not verified or str(receipt.get("status") or "").lower() != "success":
+            continue
+        link = str(
+            receipt.get("provider_link")
+            or receipt.get("html_link")
+            or receipt.get("url")
+            or ""
+        ).strip()
+        if link.startswith("https://") and link not in links:
+            links.append(link)
+    return links[:5]
 
 
 def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
@@ -4579,6 +6698,11 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
                     "create_read_back",
                     "same_record_update_read_back",
                     "record_absent_after_cleanup",
+                    "attachment_read_back",
+                    "updated_period",
+                    "attachment_filenames",
+                    "duplicate_provider_deleted",
+                    "duplicate_record_absent_after",
                     "same_note_update_read_back",
                     "note_absent_after_cleanup",
                     "item_key_match",
@@ -4618,6 +6742,8 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
                 "operation",
                 "table",
                 "record_id",
+                "duplicate_record_id",
+                "target_estimated_tax_period",
                 "item_key",
                 "parent_item_key",
                 "document_id",
@@ -4636,6 +6762,13 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
                 "query",
                 "mime_type",
                 "item_count",
+                "provider_read",
+                "provider_order",
+                "selection_rule",
+                "require_abstract",
+                "selected_item_title",
+                "selected_item_has_abstract",
+                "selected_item_date_added",
                 "char_count",
                 "truncated",
                 "slide_number",
@@ -4648,6 +6781,7 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
                 "derived_copy_created",
                 "approval_reference",
                 "required_marker",
+                "reason",
                 "send_enabled",
             )
             if key in parsed
@@ -4657,6 +6791,397 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
         if receipt:
             receipts.append(receipt)
     return receipts[:12]
+
+
+def _direct_airtable_receipt_provider_context(
+    route: str,
+    input_text: str,
+    *,
+    execution_context: dict[str, Any] | None,
+) -> str:
+    """Expose one selected Slack receipt path to the bounded Airtable write tool."""
+
+    if route != "airtable_context_agent":
+        return ""
+    target = infer_finance_expense_receipt_target(
+        _finance_receipt_context_input(input_text, execution_context)
+    )
+    if target is None or not target.receipt_local_path:
+        return ""
+    receipt_path = Path(target.receipt_local_path)
+    if not receipt_path.is_file():
+        return ""
+    context = finance_expense_receipt_provider_context(target)
+    return (
+        "Selected Slack receipt context for the approved Airtable operation:\n"
+        + json.dumps(context, ensure_ascii=True, sort_keys=True)
+    )
+
+
+def _direct_zotero_provider_preflight(
+    route: str,
+    input_text: str,
+) -> tuple[str, list[dict[str, object]], str]:
+    """Acquire required ordered Zotero evidence before the synthesis model call."""
+
+    normalized = " ".join(str(input_text or "").lower().split())
+    write_requested = bool(
+        route == "zotero_context_agent"
+        and re.search(
+            r"\b(?:create|add|make|write|edit|update|change|revise|delete|remove)\b",
+            normalized,
+        )
+        and re.search(r"\b(?:note|item|article|collection)\b", normalized)
+    )
+    if write_requested:
+        try:
+            capabilities = read_zotero_api_key_capabilities()
+        except Exception as exc:
+            return (
+                "",
+                [
+                    {
+                        "status": "error",
+                        "provider_read": False,
+                        "operation": "verify_api_key_capabilities",
+                        "error_type": type(exc).__name__,
+                    }
+                ],
+                (
+                    "The configured Zotero API key was rejected by Zotero's "
+                    "/keys/current capability check. Replace or re-authorize the key "
+                    "before retrying; no Zotero data was modified."
+                ),
+            )
+        receipt = {
+            key: capabilities.get(key)
+            for key in (
+                "status",
+                "provider_read",
+                "operation",
+                "user_id_present",
+                "user_library",
+                "user_files",
+                "user_notes",
+                "user_write",
+                "send_enabled",
+            )
+        }
+        if (
+            capabilities.get("status") != "success"
+            or capabilities.get("provider_read") is not True
+            or capabilities.get("user_id_present") is not True
+            or capabilities.get("user_library") is not True
+            or capabilities.get("user_write") is not True
+        ):
+            return (
+                "",
+                [receipt],
+                (
+                    "The configured Zotero API key does not grant user-library write "
+                    "access. Enable library write permission or replace the key before "
+                    "retrying; no Zotero data was modified."
+                ),
+            )
+        return (
+            "Configured Zotero API key capability check passed for the approved write.",
+            [receipt],
+            "",
+        )
+
+    latest_journal_requested = bool(
+        route == "zotero_context_agent"
+        and "zotero" in normalized
+        and re.search(r"\b(?:journal\s+article|article)\b", normalized)
+        and re.search(r"\b(?:latest|most\s+recent(?:ly)?\s+added)\b", normalized)
+    )
+    if not latest_journal_requested:
+        return "", [], ""
+    require_abstract = "abstract" in normalized
+    try:
+        payload = (
+            read_latest_zotero_journal_abstract_metadata()
+            if require_abstract
+            else read_latest_zotero_journal_metadata(require_abstract=False)
+        )
+    except Exception as exc:
+        return (
+            "",
+            [{"status": "error", "provider_read": False, "error_type": type(exc).__name__}],
+            (
+                "The live Zotero metadata read failed before synthesis. No cached result "
+                "was substituted and no Zotero data was modified."
+            ),
+        )
+
+    receipt = {
+        key: payload.get(key)
+        for key in (
+            "status",
+            "provider_read",
+            "provider_order",
+            "selection_rule",
+            "require_abstract",
+            "item_count",
+            "selected_item_title",
+            "selected_item_has_abstract",
+            "selected_item_date_added",
+        )
+        if key in payload
+    }
+    items = payload.get("items")
+    item = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
+    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    title = str(data.get("title") or payload.get("selected_item_title") or "").strip()
+    abstract = str(data.get("abstractNote") or "").strip()
+    item_key = str(item.get("key") or data.get("key") or "").strip()
+    if (
+        payload.get("status") != "success"
+        or payload.get("provider_read") is not True
+        or not title
+        or (require_abstract and not abstract)
+        or not item_key
+    ):
+        return (
+            "",
+            [receipt],
+            (
+                "The live Zotero provider read did not return one identifiable journal "
+                + (
+                    "article with a stored abstract in the required ordering."
+                    if require_abstract
+                    else "article in the required ordering."
+                )
+            ),
+        )
+
+    projection = project_zotero_item_metadata(item, request_text=input_text)
+    projected_fields = projection.get("fields")
+    fields = projected_fields if isinstance(projected_fields, dict) else {}
+    requested_fields = set(projection.get("requested_fields") or [])
+    enrichment: dict[str, Any] = {}
+    doi = str(fields.get("doi") or data.get("DOI") or "").strip()
+    missing_bibliographic_fields = {
+        field
+        for field in ("authors", "publication_title")
+        if field in requested_fields and fields.get(field) in (None, "", [], {})
+    }
+    if missing_bibliographic_fields and doi:
+        try:
+            enrichment = enrich_zotero_bibliographic_metadata(
+                doi=doi,
+                title=title,
+                item_key=item_key,
+            )
+        except Exception as exc:  # pragma: no cover - live provider diagnostic
+            enrichment = {"status": "error", "error_type": type(exc).__name__}
+        if enrichment.get("status") == "success":
+            for field in missing_bibliographic_fields:
+                value = enrichment.get(field)
+                if value not in (None, "", [], {}):
+                    fields[field] = value
+            projection["missing_requested_fields"] = [
+                field
+                for field in projection.get("requested_fields") or []
+                if fields.get(field) in (None, "", [], {})
+            ]
+            projection["enrichment_source"] = "crossref_doi_metadata"
+
+    receipt["metadata_projection"] = projection
+    receipt["bibliographic_enrichment"] = {
+        key: enrichment.get(key)
+        for key in ("status", "source", "doi")
+        if key in enrichment
+    }
+    normalized_request = " ".join(str(input_text or "").lower().split())
+    notes_requested = bool(
+        re.search(
+            r"\b(?:read|show|list|include|summari[sz]e|what)\b[^.]{0,80}\bnotes?\b"
+            r"|\bnotes?\b[^.]{0,80}\b(?:attached|associated|stored|say|contain)\b",
+            normalized_request,
+        )
+    )
+    attachments_requested = bool(
+        re.search(
+            r"\b(?:read|show|list|include|inspect|summari[sz]e)\b[^.]{0,80}"
+            r"\b(?:attachments?|pdfs?)\b|\b(?:attachments?|pdfs?)\b[^.]{0,80}"
+            r"\b(?:attached|associated|stored|available|contain)\b",
+            normalized_request,
+        )
+    )
+    child_context: dict[str, Any] = {}
+    child_receipts: list[dict[str, object]] = []
+    if notes_requested or attachments_requested:
+        try:
+            child_payload = json.loads(
+                zotero_read_item_children(
+                    parent_item_key=item_key,
+                    limit=50,
+                    live=True,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - live provider diagnostic
+            child_payload = {"status": "error", "error_type": type(exc).__name__}
+        if isinstance(child_payload, dict):
+            children = child_payload.get("children")
+            bounded_children = children if isinstance(children, list) else []
+            child_context = {
+                "schema": "keystone.zotero_item_children_context.v1",
+                "children": bounded_children,
+                "note_count": child_payload.get("note_count", 0),
+                "attachment_count": child_payload.get("attachment_count", 0),
+            }
+            child_receipts.append(
+                {
+                    "status": child_payload.get("status"),
+                    "provider_read": child_payload.get("provider_read", False),
+                    "operation": "read_item_children",
+                    "note_count": child_payload.get("note_count", 0),
+                    "attachment_count": child_payload.get("attachment_count", 0),
+                }
+            )
+            pdf_text_requested = bool(
+                attachments_requested
+                and re.search(r"\b(?:read|extract|summari[sz]e|review)\b", normalized_request)
+                and re.search(r"\bpdf\b|\bfull\s+text\b|\bpaper\b", normalized_request)
+                and not re.search(
+                    r"\b(?:do\s+not|don't|without)\b[^.]{0,40}\b(?:pdf|full\s+text)\b",
+                    normalized_request,
+                )
+            )
+            pdf_children = [
+                child
+                for child in bounded_children
+                if isinstance(child, dict)
+                and child.get("item_type") == "attachment"
+                and (
+                    str(child.get("content_type") or "").lower() == "application/pdf"
+                    or str(child.get("filename") or "").lower().endswith(".pdf")
+                )
+            ]
+            pdf_child = pdf_children[0] if len(pdf_children) == 1 else None
+            if pdf_text_requested and len(pdf_children) != 1:
+                child_context["pdf_selection"] = {
+                    "status": "not_found" if not pdf_children else "ambiguous",
+                    "candidate_count": len(pdf_children),
+                    "message": (
+                        "No PDF attachment was available for the selected article."
+                        if not pdf_children
+                        else "Multiple PDF attachments were available; name one attachment."
+                    ),
+                }
+            if pdf_text_requested and isinstance(pdf_child, dict):
+                try:
+                    pdf_payload = json.loads(
+                        zotero_read_pdf_attachment_text(
+                            parent_item_key=item_key,
+                            attachment_item_key=str(pdf_child.get("item_key") or ""),
+                            max_pages=25,
+                            max_chars=50000,
+                            live=True,
+                        )
+                    )
+                except Exception as exc:  # pragma: no cover - live provider diagnostic
+                    pdf_payload = {"status": "error", "error_type": type(exc).__name__}
+                if isinstance(pdf_payload, dict):
+                    child_context["selected_pdf"] = pdf_payload
+                    child_receipts.append(
+                        {
+                            "status": pdf_payload.get("status"),
+                            "provider_read": pdf_payload.get("provider_read", False),
+                            "operation": "read_pdf_attachment_text",
+                            "page_count": pdf_payload.get("page_count", 0),
+                            "pages_read": pdf_payload.get("pages_read", 0),
+                            "char_count": pdf_payload.get("char_count", 0),
+                            "truncated": pdf_payload.get("truncated", False),
+                            "file_persisted": False,
+                        }
+                    )
+    context = {
+        "schema": (
+            "keystone.zotero_ordered_abstract_context.v1"
+            if require_abstract
+            else "keystone.zotero_ordered_journal_context.v1"
+        ),
+        "selection_rule": payload.get("selection_rule"),
+        "provider_order": payload.get("provider_order"),
+        "item_key": item_key,
+        "title": title,
+        "date_added": str(data.get("dateAdded") or ""),
+        "doi": doi,
+        "url": str(data.get("url") or ""),
+        "authors": fields.get("authors") or zotero_creator_names(data.get("creators")),
+        "publication_title": str(
+            fields.get("publication_title") or data.get("publicationTitle") or ""
+        ),
+        "journal_abbreviation": str(data.get("journalAbbreviation") or ""),
+        "publication_date": str(data.get("date") or ""),
+        "volume": str(data.get("volume") or ""),
+        "issue": str(data.get("issue") or ""),
+        "pages": str(data.get("pages") or ""),
+        "stored_abstract": _bounded_redacted_text(abstract, max_chars=12000),
+        "metadata_projection": projection,
+        "child_context": child_context,
+    }
+    return (
+        "Authenticated read-only Zotero provider evidence for synthesis:\n"
+        + json.dumps(context, ensure_ascii=True, sort_keys=True),
+        [receipt, *child_receipts],
+        "",
+    )
+
+
+def _zotero_ordered_abstract_receipt_blocker(
+    route: str,
+    input_text: str,
+    tool_receipts: list[dict[str, object]],
+) -> str:
+    """Require live provider evidence for ordered Zotero abstract selection asks."""
+
+    normalized = " ".join(str(input_text or "").lower().split())
+    requires_ordered_abstract = bool(
+        route == "zotero_context_agent"
+        and "zotero" in normalized
+        and "abstract" in normalized
+        and re.search(r"\b(?:latest|most\s+recent(?:ly)?\s+added)\b", normalized)
+    )
+    if not requires_ordered_abstract:
+        return ""
+    provider_receipt = next(
+        (
+            receipt
+            for receipt in tool_receipts
+            if receipt.get("provider_read") is True
+            and receipt.get("selection_rule")
+            == "first_nonempty_abstract_in_provider_order"
+        ),
+        None,
+    )
+    if provider_receipt is None:
+        return (
+            "The requested Zotero result was not verified by a live, ordered provider "
+            "metadata read; cached context was not accepted as a substitute."
+        )
+    provider_order = provider_receipt.get("provider_order")
+    expected_order = {
+        "sort": "dateAdded",
+        "direction": "desc",
+        "top_level_only": True,
+        "item_type": "journalArticle",
+    }
+    if not isinstance(provider_order, dict) or any(
+        provider_order.get(key) != value for key, value in expected_order.items()
+    ):
+        return (
+            "The Zotero provider read did not verify the required top-level journal "
+            "article ordering by dateAdded descending."
+        )
+    if (
+        str(provider_receipt.get("status") or "").lower() == "success"
+        and provider_receipt.get("selected_item_has_abstract") is not True
+    ):
+        return "The selected Zotero provider item did not contain a stored abstract."
+    return ""
 
 
 def _context_agent_public_payload(
@@ -4762,8 +7287,191 @@ def _context_agent_external_write_performed(
 
     return any(
         _context_agent_receipt_is_write(receipt)
-        and receipt.get("status") == "success"
+        and (
+            receipt.get("status") == "success"
+            or (
+                receipt.get("status") in {"partial", "verification_failed"}
+                and bool(str(receipt.get("record_id") or "").strip())
+            )
+        )
         for receipt in tool_receipts
+    )
+
+
+def _airtable_receipt_execution_blocker(
+    route: str,
+    input_text: str,
+    *,
+    manual_plan: ManualRequestPlan | None,
+    tool_receipts: list[dict[str, object]],
+) -> str:
+    """Require authoritative create-and-attachment verification for direct receipt asks."""
+
+    if route != "airtable_context_agent":
+        return ""
+    if manual_plan is None or manual_plan.intent != "business_system_write":
+        return ""
+    if infer_finance_expense_receipt_target(input_text) is None:
+        return ""
+    target = infer_finance_expense_receipt_target(input_text)
+    operation = target.operation if target is not None else "create"
+    if operation == "read":
+        return ""
+    expected_operations = (
+        {"update", "reconcile_duplicate_expense"}
+        if operation == "update"
+        else {"create_expense_from_receipt"}
+    )
+    receipts = [
+        receipt
+        for receipt in tool_receipts
+        if receipt.get("operation") in expected_operations
+    ]
+    if not receipts:
+        return (
+            "The approved Airtable receipt operation was not executed. No verified "
+            "record-and-attachment receipt was returned."
+        )
+    if operation == "update" and any(
+        receipt.get("operation") == "update"
+        and receipt.get("status") == "success"
+        and bool(str(receipt.get("record_id") or "").strip())
+        and isinstance(receipt.get("verification"), dict)
+        and receipt["verification"].get("passed") is True
+        and receipt["verification"].get("record_id_match") is True
+        and not receipt["verification"].get("mismatched_fields")
+        for receipt in receipts
+    ):
+        return ""
+    if operation == "update" and any(
+        receipt.get("operation") == "reconcile_duplicate_expense"
+        and receipt.get("status") == "success"
+        and bool(str(receipt.get("record_id") or "").strip())
+        and bool(str(receipt.get("duplicate_record_id") or "").strip())
+        and isinstance(receipt.get("verification"), dict)
+        and receipt["verification"].get("passed") is True
+        and receipt["verification"].get("record_id_match") is True
+        and receipt["verification"].get("updated_period") is True
+        and receipt["verification"].get("attachment_read_back") is True
+        and receipt["verification"].get("duplicate_provider_deleted") is True
+        and receipt["verification"].get("duplicate_record_absent_after") is True
+        for receipt in receipts
+    ):
+        return ""
+    if operation == "create" and any(
+        receipt.get("status") == "success"
+        and isinstance(receipt.get("verification"), dict)
+        and receipt["verification"].get("passed") is True
+        and receipt["verification"].get("create_read_back") is True
+        and receipt["verification"].get("attachment_read_back") is True
+        for receipt in receipts
+    ):
+        return ""
+    if any(receipt.get("status") == "partial" for receipt in receipts):
+        return (
+            "The Airtable receipt operation partially completed but did not verify both "
+            "the created record and attachment. Do not retry blindly; inspect the exact "
+            "provider record first to avoid a duplicate expense."
+        )
+    reason = next(
+        (
+            str(receipt.get("reason") or "").strip()
+            for receipt in receipts
+            if str(receipt.get("reason") or "").strip()
+        ),
+        "",
+    )
+    return reason or (
+        "The Airtable receipt operation did not return verified record-and-attachment "
+        "read-back evidence."
+    )
+
+
+def _airtable_write_execution_blocker(
+    route: str,
+    input_text: str,
+    *,
+    manual_plan: ManualRequestPlan | None,
+    tool_receipts: list[dict[str, object]],
+) -> str:
+    """Require a successful typed mutation and provider read-back for direct writes."""
+
+    if route != "airtable_context_agent":
+        return ""
+    if manual_plan is None or manual_plan.intent != "business_system_write":
+        return ""
+    if infer_finance_expense_receipt_target(input_text) is not None:
+        return _airtable_receipt_execution_blocker(
+            route,
+            input_text,
+            manual_plan=manual_plan,
+            tool_receipts=tool_receipts,
+        )
+    lifecycle_receipts = [
+        receipt
+        for receipt in tool_receipts
+        if receipt.get("operation") == "test_record_lifecycle"
+    ]
+    if lifecycle_receipts:
+        if any(
+            receipt.get("status") == "success"
+            and isinstance(receipt.get("verification"), dict)
+            and receipt["verification"].get("passed") is True
+            and receipt["verification"].get("create_read_back") is True
+            and receipt["verification"].get("same_record_update_read_back") is True
+            and receipt["verification"].get("record_absent_after_cleanup") is True
+            for receipt in lifecycle_receipts
+        ):
+            return ""
+        reason = next(
+            (
+                str(receipt.get("reason") or receipt.get("failure") or "").strip()
+                for receipt in lifecycle_receipts
+                if str(receipt.get("reason") or receipt.get("failure") or "").strip()
+            ),
+            "",
+        )
+        return reason or (
+            "The Airtable test-record lifecycle did not verify create, same-record "
+            "update, and cleanup absence. Do not retry blindly; inspect the provider "
+            "record identity first."
+        )
+    write_receipts = [
+        receipt
+        for receipt in tool_receipts
+        if receipt.get("operation") in {"create", "update"}
+    ]
+    if not write_receipts:
+        return (
+            "The approved Airtable write was not executed. No typed provider mutation "
+            "receipt was returned."
+        )
+    if any(
+        receipt.get("status") == "success"
+        and isinstance(receipt.get("verification"), dict)
+        and receipt["verification"].get("passed") is True
+        and receipt["verification"].get("record_id_match") is True
+        and bool(str(receipt.get("record_id") or "").strip())
+        for receipt in write_receipts
+    ):
+        return ""
+    if any(bool(str(receipt.get("record_id") or "").strip()) for receipt in write_receipts):
+        return (
+            "The Airtable provider mutation returned a record ID but read-after-write "
+            "verification did not pass. Do not retry blindly; inspect that exact record "
+            "first to avoid a duplicate or conflicting update."
+        )
+    reason = next(
+        (
+            str(receipt.get("reason") or "").strip()
+            for receipt in write_receipts
+            if str(receipt.get("reason") or "").strip()
+        ),
+        "",
+    )
+    return reason or (
+        "The Airtable write did not return verified provider mutation and read-back "
+        "evidence."
     )
 
 
@@ -4786,6 +7494,8 @@ def _context_agent_receipt_is_write(receipt: dict[str, object]) -> bool:
         "create_note",
         "update_note",
         "link_attachment",
+        "create_expense_from_receipt",
+        "reconcile_duplicate_expense",
         "extract_slide_copy",
         "delete_test_slide_artifact",
     }
@@ -4813,9 +7523,76 @@ def _reconcile_context_agent_executed_write_plan(
             break
     write_plan = output_payload.get("write_plan")
     if not verified_write or not isinstance(write_plan, dict):
-        return
-    write_plan["live_write_allowed_for_specialist"] = True
-    write_plan["approval_reference_needed"] = False
+        if not verified_write:
+            return
+    if isinstance(write_plan, dict):
+        write_plan["live_write_allowed_for_specialist"] = True
+        write_plan["approval_reference_needed"] = False
+    contradiction = re.compile(
+        r"\b(?:not|never|cannot|can't|did\s+not|was\s+not|were\s+not)\b"
+        r"[^.;\n]{0,120}\b(?:execute|executed|write|written|create|created|"
+        r"update|updated|delete|deleted|reconcile|reconciled|verify|verified)\b"
+        r"|\b(?:approval|write)\b[^.;\n]{0,80}\b(?:still|required|blocked)\b",
+        re.I,
+    )
+    for field in ("blockers", "approval_needs", "evidence_gaps"):
+        values = output_payload.get(field)
+        if not isinstance(values, list):
+            continue
+        output_payload[field] = [
+            item for item in values if not contradiction.search(str(item or ""))
+        ]
+
+
+def _verified_context_agent_write_summary(
+    tool_receipts: list[dict[str, object]],
+) -> str:
+    """Render verified provider execution from receipts, not model speculation."""
+
+    for receipt in reversed(tool_receipts):
+        verification = receipt.get("verification")
+        if not (
+            receipt.get("status") == "success"
+            and isinstance(verification, dict)
+            and verification.get("passed") is True
+            and _context_agent_receipt_is_write(receipt)
+        ):
+            continue
+        operation = str(receipt.get("operation") or "write").replace("_", " ")
+        table = str(receipt.get("table") or "").strip()
+        record_id = str(receipt.get("record_id") or "").strip()
+        duplicate_id = str(receipt.get("duplicate_record_id") or "").strip()
+        target = " ".join(part for part in (table, record_id) if part).strip()
+        if operation == "reconcile duplicate expense":
+            summary = (
+                f"Reconciled and provider-verified the exact Airtable expense record "
+                f"{record_id or 'requested record'} in place"
+            )
+            if duplicate_id:
+                summary += (
+                    f"; duplicate {duplicate_id} was removed and verified absent"
+                )
+            return summary + "."
+        if operation in {"update", "update record", "update row"}:
+            return (
+                f"Updated and provider-verified {target or 'the exact requested record'} "
+                "in place."
+            )
+        if operation in {
+            "create",
+            "create expense from receipt",
+            "create sheet",
+            "create note",
+        }:
+            return (
+                f"Created and provider-verified {target or 'the exact requested item'}."
+            )
+        return (
+            f"Completed and provider-verified the requested {operation} operation"
+            + (f" for {target}" if target else "")
+            + "."
+        )
+    return ""
 
 
 def _run_ask_company_research_live(
@@ -4825,10 +7602,46 @@ def _run_ask_company_research_live(
     manual_plan: ManualRequestPlan | None,
     orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
-    cost_tracking_requested: bool,
+    execution_context: dict[str, Any] | None = None,
+    context_file_path: str = "",
+    cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
     if _request_forbids_live_research(input_text):
+        profile = _direct_specialist_runtime_profile(
+            "business_research_analyst",
+            input_text=input_text,
+        )
+        if profile["compact_instructions"]:
+            target = (manual_plan.primary_target if manual_plan else "") or input_text[:120]
+            command = [
+                sys.executable,
+                "scripts/run_company_research.py",
+                "--company",
+                target.strip(),
+                "--request-text",
+                input_text,
+                "--inline-source-context",
+                input_text,
+                "--no-live-search",
+                "--no-dry-run",
+                "--live-sdk",
+                "--focused-brief",
+                "--compact-instructions",
+                "--json",
+            ]
+            return _run_ask_script_live(
+                "business_research_analyst",
+                input_text,
+                command,
+                json_output=json_output,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                sdk_session_spec=sdk_session_spec,
+                execution_context=execution_context,
+                cost_tracking_requested=cost_tracking_requested,
+                database_url=database_url,
+            )
         return _run_ask_work_item(
             input_text,
             database_url=database_url,
@@ -4839,6 +7652,7 @@ def _run_ask_company_research_live(
             max_manager_steps=3,
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
+            context_file_path=context_file_path,
             sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
             sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
             sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
@@ -4857,6 +7671,7 @@ def _run_ask_company_research_live(
         )
     company_url = _manual_plan_url_target(manual_plan)
     company_name = _company_name_for_url_target(target.strip()) if company_url else target.strip()
+    quick_retrieval = _direct_company_research_quick_retrieval(manual_plan)
     command = [
         sys.executable,
         "scripts/run_company_research.py",
@@ -4865,14 +7680,22 @@ def _run_ask_company_research_live(
         "--request-text",
         input_text,
         "--max-results",
-        "5",
+        "2" if quick_retrieval else "5",
         "--live-search",
-        "--live-search-plan",
         "--no-dry-run",
         "--live-sdk",
         "--focused-brief",
         "--json",
     ]
+    if quick_retrieval:
+        command.append("--quick-retrieval")
+    else:
+        command.append("--live-search-plan")
+    _append_compact_direct_flag(
+        command,
+        route="business_research_analyst",
+        input_text=input_text,
+    )
     if company_url:
         command.extend(["--company-url", company_url])
     return _run_ask_script_live(
@@ -4883,9 +7706,28 @@ def _run_ask_company_research_live(
         manual_plan=manual_plan,
         orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
+        execution_context=execution_context,
         cost_tracking_requested=cost_tracking_requested,
         database_url=database_url,
     )
+
+
+def _direct_company_research_quick_retrieval(
+    manual_plan: ManualRequestPlan | None,
+) -> bool:
+    """Use a narrow evidence profile only when the interpreted ask requests it."""
+
+    if manual_plan is None:
+        return False
+    ask_shape = manual_plan.ask_shape
+    if ask_shape.evidence_depth == "quick" or ask_shape.cost_mode == "minimize":
+        return True
+    constraints = output_constraints_from_plan(manual_plan)
+    if constraints.word_count is not None:
+        return constraints.word_count <= 100
+    stop_condition = str(ask_shape.stop_condition or "")
+    match = re.search(r"\bstop_after_([1-9]\d{0,3})_word_summary\b", stop_condition)
+    return bool(match and int(match.group(1)) <= 100)
 
 
 def _manual_plan_url_target(manual_plan: ManualRequestPlan | None) -> str:
@@ -4908,7 +7750,9 @@ def _run_ask_chief_of_staff_live(
     manual_plan: ManualRequestPlan | None,
     orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
-    cost_tracking_requested: bool,
+    execution_context: dict[str, Any] | None = None,
+    context_file_path: str = "",
+    cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
     command = [
@@ -4929,34 +7773,14 @@ def _run_ask_chief_of_staff_live(
         manual_plan=manual_plan,
         orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
+        execution_context=execution_context,
         cost_tracking_requested=cost_tracking_requested,
         database_url=database_url,
     )
 
 
 def _request_forbids_live_research(text: str) -> bool:
-    normalized = " ".join(str(text or "").lower().split())
-    if not normalized:
-        return False
-    return bool(
-        re.search(
-            r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\b"
-            r"[^.;\n]{0,180}\b"
-            r"(?:web\s+search|live\s+web|external\s+(?:search|research|tools?)|"
-            r"browser\s+automation|research\s+externally)\b",
-            normalized,
-        )
-        or re.search(
-            r"\b(?:web\s+search|live\s+web|live\s+search|external\s+(?:search|research|tools?))"
-            r"\b[^.;\n]{0,80}\b(?:not\s+approved|not\s+allowed|disabled|off)\b",
-            normalized,
-        )
-        or re.search(
-            r"\b(?:using|use)\s+only\b[^.;\n]{0,160}"
-            r"\b(?:selected\s+)?(?:thread|email|gmail)\b",
-            normalized,
-        )
-    )
+    return request_forbids_live_research(text)
 
 
 def _run_ask_opportunity_scout_live(
@@ -4966,11 +7790,45 @@ def _run_ask_opportunity_scout_live(
     manual_plan: ManualRequestPlan | None,
     orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
-    cost_tracking_requested: bool,
+    execution_context: dict[str, Any] | None = None,
+    context_file_path: str = "",
+    cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
     max_results = manual_plan.desired_count if manual_plan else 3
     if _request_forbids_live_research(input_text):
+        profile = _direct_specialist_runtime_profile(
+            "opportunity_scout",
+            input_text=input_text,
+        )
+        if profile["compact_instructions"]:
+            command = [
+                sys.executable,
+                "scripts/run_compact_opportunity_assessment.py",
+                "--request-text",
+                input_text,
+                "--inline-source-context",
+                input_text,
+                "--model",
+                get_runtime_agent_model_config("opportunity_scout").model,
+                "--max-openai-requests",
+                "1",
+                "--budget-usd",
+                "0.10",
+                "--no-save-output",
+            ]
+            return _run_ask_script_live(
+                "opportunity_scout",
+                input_text,
+                command,
+                json_output=json_output,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                sdk_session_spec=sdk_session_spec,
+                execution_context=execution_context,
+                cost_tracking_requested=cost_tracking_requested,
+                database_url=database_url,
+            )
         return _run_ask_work_item(
             input_text,
             database_url=database_url,
@@ -4981,26 +7839,30 @@ def _run_ask_opportunity_scout_live(
             max_manager_steps=3,
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
+            context_file_path=context_file_path,
             sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
             sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
             sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
             sdk_session_history_limit=sdk_session_spec.history_limit if sdk_session_spec else None,
             cost_tracking_requested=cost_tracking_requested,
         )
-    target = (manual_plan.primary_target if manual_plan else "") or input_text
     command = [
         sys.executable,
         "scripts/run_opportunity_scout.py",
         "--topic",
-        target,
+        input_text,
         "--max-results",
         str(max(1, min(10, max_results))),
         "--live-search",
-        "--live-search-plan",
         "--no-dry-run",
         "--live-sdk",
         "--json",
     ]
+    _append_compact_direct_flag(
+        command,
+        route="opportunity_scout",
+        input_text=input_text,
+    )
     return _run_ask_script_live(
         "opportunity_scout",
         input_text,
@@ -5009,6 +7871,7 @@ def _run_ask_opportunity_scout_live(
         manual_plan=manual_plan,
         orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
+        execution_context=execution_context,
         cost_tracking_requested=cost_tracking_requested,
         database_url=database_url,
     )
@@ -5021,10 +7884,43 @@ def _run_ask_gmail_triage_live(
     manual_plan: ManualRequestPlan | None,
     orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
-    cost_tracking_requested: bool,
+    execution_context: dict[str, Any] | None = None,
+    context_file_path: str = "",
+    cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
+    if _is_bounded_composite_lifecycle_request(
+        "gmail_triage",
+        input_text=input_text,
+    ):
+        return _run_direct_gmail_test_draft_lifecycle(
+            input_text,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            database_url=database_url,
+        )
     gmail_plan = infer_gmail_execution_plan(input_text)
+    thread_execution_text = specialist_execution_context_text(execution_context)
+    if gmail_plan.operation == "update_draft" and not (
+        gmail_plan.draft_subject_hint or gmail_plan.draft_recipient_hint
+    ):
+        resolved_subject = _direct_context_object_title(
+            execution_context,
+            preferred_route="gmail_triage",
+        )
+        if resolved_subject:
+            gmail_plan = gmail_plan.model_copy(
+                update={
+                    "source": "orchestrator_thread_context",
+                    "draft_subject_hint": resolved_subject,
+                    "planner_warnings": [],
+                    "rationale": (
+                        f"{gmail_plan.rationale} The bounded direct-call context resolved "
+                        "the draft subject before exact provider matching."
+                    ),
+                }
+            )
     explicit_fixture_path = _gmail_direct_fixture_path(input_text)
     inline_fixture = _inline_gmail_fixture_from_request(input_text)
     if inline_fixture is not None and _gmail_inline_request_needs_work_item_graph(input_text):
@@ -5038,6 +7934,7 @@ def _run_ask_gmail_triage_live(
             max_manager_steps=3,
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
+            context_file_path=context_file_path,
             sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
             sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
             sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
@@ -5095,6 +7992,11 @@ def _run_ask_gmail_triage_live(
             "--expected-account",
             expected_account,
         ]
+        _append_compact_direct_flag(
+            command,
+            route="gmail_triage",
+            input_text=input_text,
+        )
         if gmail_plan.draft_subject_hint:
             command.extend(["--draft-subject-hint", gmail_plan.draft_subject_hint])
         if gmail_plan.draft_recipient_hint:
@@ -5107,6 +8009,7 @@ def _run_ask_gmail_triage_live(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
             agent_execution_plan=gmail_plan.model_dump(mode="json"),
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
@@ -5127,6 +8030,11 @@ def _run_ask_gmail_triage_live(
             "--max-messages",
             str(gmail_plan.max_messages),
         ]
+        _append_compact_direct_flag(
+            command,
+            route="gmail_triage",
+            input_text=input_text,
+        )
         if gmail_plan.gmail_query:
             command.extend(["--gmail-query", gmail_plan.gmail_query])
         return _run_ask_script_live(
@@ -5137,6 +8045,7 @@ def _run_ask_gmail_triage_live(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
             agent_execution_plan=gmail_plan.model_dump(mode="json"),
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
@@ -5162,6 +8071,11 @@ def _run_ask_gmail_triage_live(
             "--max-messages",
             "1",
         ]
+        _append_compact_direct_flag(
+            command,
+            route="gmail_triage",
+            input_text=input_text,
+        )
         if gmail_plan.create_gmail_drafts:
             expected_account = _configured_gmail_draft_account()
             if not expected_account:
@@ -5196,6 +8110,7 @@ def _run_ask_gmail_triage_live(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
             agent_execution_plan=gmail_plan.model_dump(mode="json"),
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
@@ -5204,6 +8119,7 @@ def _run_ask_gmail_triage_live(
         gmail_plan.operation == "draft_reply"
         and explicit_fixture_path is None
         and inline_fixture is None
+        and not thread_execution_text
     ):
         return _print_ask_clarification(
             "gmail_triage",
@@ -5244,6 +8160,18 @@ def _run_ask_gmail_triage_live(
             tmp.write(inline_fixture.body)
             temp_path = Path(tmp.name)
         selected_fixture = str(temp_path)
+    elif thread_execution_text:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".txt",
+            prefix="keystone-gmail-thread-context-",
+            delete=False,
+        ) as tmp:
+            tmp.write("Subject: Selected Slack thread Gmail context\n\n")
+            tmp.write(thread_execution_text)
+            temp_path = Path(tmp.name)
+        selected_fixture = str(temp_path)
     else:
         with tempfile.NamedTemporaryFile(
             "w",
@@ -5268,6 +8196,11 @@ def _run_ask_gmail_triage_live(
         "--live-sdk",
         "--json",
     ]
+    _append_compact_direct_flag(
+        command,
+        route="gmail_triage",
+        input_text=input_text,
+    )
     if inline_fixture is not None and explicit_fixture_path is None:
         if inline_fixture.subject:
             command.extend(["--subject", inline_fixture.subject])
@@ -5286,6 +8219,7 @@ def _run_ask_gmail_triage_live(
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
             sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
             agent_execution_plan=gmail_plan.model_dump(mode="json"),
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
@@ -5296,6 +8230,510 @@ def _run_ask_gmail_triage_live(
                 temp_path.unlink()
             except OSError:
                 pass
+
+
+_PUBLIC_LIFECYCLE_RECEIPT_PRIVATE_KEYS = frozenset(
+    {
+        "approval_reference",
+        "document_id",
+        "draft_id",
+        "message_id",
+        "record_id",
+        "thread_id",
+        "url",
+        "provider_link",
+    }
+)
+
+
+def _public_lifecycle_receipt(value: object) -> object:
+    """Keep provider verification visible without publishing object identifiers."""
+
+    if isinstance(value, dict):
+        return {
+            str(key): _public_lifecycle_receipt(item)
+            for key, item in value.items()
+            if str(key) not in _PUBLIC_LIFECYCLE_RECEIPT_PRIVATE_KEYS
+        }
+    if isinstance(value, list):
+        return [_public_lifecycle_receipt(item) for item in value]
+    return value
+
+
+def _provider_lifecycle_approval_reference(route: str, input_text: str) -> str:
+    digest = hashlib.sha256(str(input_text).strip().encode("utf-8")).hexdigest()[:16]
+    scope = str(route or "provider").replace("_context_agent", "").replace("_", "-")
+    return f"operator-command:{scope}-test-lifecycle:{digest}"
+
+
+def _persist_direct_provider_lifecycle_run(
+    *,
+    route: str,
+    input_text: str,
+    payload: dict[str, object],
+    internal_receipt: dict[str, Any],
+    passed: bool,
+    database_url: str | None,
+) -> None:
+    """Persist the full local audit receipt while keeping the public payload redacted."""
+
+    stored_payload = dict(payload)
+    stored_payload["tool_receipt"] = internal_receipt
+    try:
+        run_id = SQLiteStore(database_url or database_url_from_env()).save_agent_run(
+            agent_name=route,
+            input_payload={"request_text": input_text, "route": route},
+            input_summary=input_text[:500],
+            output=stored_payload,
+            model="direct-provider-after-orchestrator-preflight",
+            dry_run=False,
+            status="success" if passed else "blocked",
+        )
+        payload["agent_run_id"] = run_id
+    except Exception as exc:  # pragma: no cover - diagnostic metadata only
+        payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _run_direct_airtable_test_record_lifecycle(
+    input_text: str,
+    *,
+    json_output: bool,
+    manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None,
+    database_url: str | None,
+) -> int:
+    """Execute one guarded Airtable test-record lifecycle after interpretation."""
+
+    approval_reference = _provider_lifecycle_approval_reference(
+        "airtable_context_agent",
+        input_text,
+    )
+    try:
+        result = airtable_test_record_lifecycle_impl(
+            table="Business Expenses",
+            base_alias="finance_tax_tracker",
+            approval_reference=approval_reference,
+            live=True,
+        )
+    except (RuntimeError, ValueError) as exc:
+        result = {
+            "status": "blocked",
+            "operation": "test_record_lifecycle",
+            "failure": str(exc),
+            "verification": {"passed": False},
+            "send_enabled": False,
+        }
+    verification = result.get("verification")
+    passed = bool(
+        result.get("status") == "success"
+        and isinstance(verification, dict)
+        and verification.get("passed") is True
+        and verification.get("create_read_back") is True
+        and verification.get("same_record_update_read_back") is True
+        and verification.get("record_absent_after_cleanup") is True
+    )
+    if passed:
+        summary = (
+            "Airtable test-record lifecycle completed: one marked record was created "
+            "and read back, updated in place and read back again, then deleted and "
+            "verified absent. No schema or other record was changed."
+        )
+    else:
+        summary = str(result.get("failure") or "").strip() or (
+            "The Airtable test-record lifecycle did not verify create, same-record "
+            "update, and cleanup absence. Inspect the local provider receipt before "
+            "any retry."
+        )
+    operator_output = AirtableContextResult(
+        mode="deterministic",
+        summary=summary,
+        base_alias="finance_tax_tracker",
+        relevant_tables=["Business Expenses"],
+        recommended_actions=(
+            []
+            if passed
+            else ["Review the exact blocker and provider receipt before any retry."]
+        ),
+        blockers=[] if passed else [summary],
+    ).model_dump(mode="json")
+    payload: dict[str, object] = {
+        "mode": "live_sdk",
+        "status": "done" if passed else "blocked",
+        "block_kind": "" if passed else "airtable_test_record_lifecycle_unverified",
+        "selected_agent": "airtable_context_agent",
+        "route": "airtable_context_agent",
+        "agent_name": _agent_display_name("airtable_context_agent"),
+        "output_type": "AirtableContextResult",
+        "output": operator_output,
+        "input": input_text,
+        "send_enabled": False,
+        "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+        "human_summary": summary,
+        "slack_display_title": (
+            "Business Agents Airtable Test Lifecycle Complete"
+            if passed
+            else "Business Agents Airtable Test Lifecycle Blocked"
+        ),
+        "slack_display_text": summary,
+        "tool_receipt": _public_lifecycle_receipt(result),
+        "provider_identity_redacted": True,
+        "openai_requests": _orchestrator_preflight_request_count(orchestrator_preflight),
+        "side_effects": {
+            "airtable_test_record_created_and_verified": bool(
+                isinstance(verification, dict)
+                and verification.get("create_read_back") is True
+            ),
+            "airtable_test_record_absent_after_cleanup": bool(
+                isinstance(verification, dict)
+                and verification.get("record_absent_after_cleanup") is True
+            ),
+            "slack_message_posted": False,
+        },
+    }
+    _persist_direct_provider_lifecycle_run(
+        route="airtable_context_agent",
+        input_text=input_text,
+        payload=payload,
+        internal_receipt=result,
+        passed=passed,
+        database_url=database_url,
+    )
+    return _print_ask_live_payload(payload, json_output=json_output)
+
+
+def _google_doc_lifecycle_scope(
+    input_text: str,
+    *,
+    context_text: str,
+) -> tuple[str, str, str]:
+    """Resolve exact marked Doc scope, including a prior body named as "same body"."""
+
+    combined = f"{input_text}\n{context_text}"
+    marker_match = re.search(
+        r"\bKBA_TEST_DOC(?:_[A-Za-z0-9]+)*\b",
+        input_text,
+        re.IGNORECASE,
+    ) or re.search(
+        r"\bKBA_TEST_DOC(?:_[A-Za-z0-9]+)*\b",
+        context_text,
+        re.IGNORECASE,
+    )
+    body_matches = re.findall(
+        r"\b(?:body|sentence|text|content)"
+        r"(?:\s+(?:is|says?|reads?|that\s+says))?\s*:?\s*"
+        r"[\"“'‘]([^\"”'’]+)[\"”'’]",
+        combined,
+        flags=re.IGNORECASE,
+    )
+    title = marker_match.group(0).upper() if marker_match else ""
+    body = " ".join(body_matches[-1].split()) if body_matches else ""
+    folder = "KNIOps" if re.search(r"\bKNIOps\b", combined, re.IGNORECASE) else ""
+    return title, body, folder
+
+
+def _run_direct_google_doc_test_lifecycle(
+    input_text: str,
+    *,
+    context_text: str,
+    json_output: bool,
+    manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None,
+    database_url: str | None,
+) -> int:
+    """Execute one guarded Google Doc lifecycle after interpretation."""
+
+    title, body_text, folder_path = _google_doc_lifecycle_scope(
+        input_text,
+        context_text=context_text,
+    )
+    approval_reference = _provider_lifecycle_approval_reference(
+        "google_workspace_context_agent",
+        input_text,
+    )
+    if not title or not body_text or not folder_path:
+        result: dict[str, Any] = {
+            "status": "blocked",
+            "operation": "test_doc_lifecycle",
+            "failure": (
+                "The Google Doc test lifecycle needs an exact KBA_TEST_DOC title, "
+                "bounded body text, and the KNIOps folder. A thread follow-up may "
+                "refer to the same body when the earlier request contains it."
+            ),
+            "verification": {"passed": False},
+            "send_enabled": False,
+        }
+    else:
+        try:
+            result = google_doc_test_lifecycle_impl(
+                title,
+                body_text,
+                folder_path=folder_path,
+                approval_reference=approval_reference,
+                live=True,
+            )
+        except (RuntimeError, ValueError) as exc:
+            result = {
+                "status": "blocked",
+                "operation": "test_doc_lifecycle",
+                "failure": str(exc),
+                "verification": {"passed": False},
+                "send_enabled": False,
+            }
+    verification = result.get("verification")
+    passed = bool(
+        result.get("status") == "success"
+        and isinstance(verification, dict)
+        and verification.get("passed") is True
+        and verification.get("create_read_back") is True
+        and verification.get("document_trashed_after_cleanup") is True
+    )
+    if passed:
+        summary = (
+            "Google Doc test lifecycle completed: the exact marked document was "
+            "created in KNIOps and read back, then that same document was moved to "
+            "Drive trash and verified trashed."
+        )
+    else:
+        summary = str(result.get("failure") or "").strip() or (
+            "The Google Doc test lifecycle did not verify both creation and cleanup. "
+            "Inspect the local provider receipt before any retry."
+        )
+    operator_output = GoogleWorkspaceContextResult(
+        mode="deterministic",
+        summary=summary,
+        relevant_folders=[folder_path] if folder_path else [],
+        relevant_docs=[title] if title else [],
+        recommended_target=title,
+        recommended_actions=(
+            []
+            if passed
+            else ["Review the exact blocker and provider receipt before any retry."]
+        ),
+        blockers=[] if passed else [summary],
+    ).model_dump(mode="json")
+    payload: dict[str, object] = {
+        "mode": "live_sdk",
+        "status": "done" if passed else "blocked",
+        "block_kind": "" if passed else "google_doc_test_lifecycle_unverified",
+        "selected_agent": "google_workspace_context_agent",
+        "route": "google_workspace_context_agent",
+        "agent_name": _agent_display_name("google_workspace_context_agent"),
+        "output_type": "GoogleWorkspaceContextResult",
+        "output": operator_output,
+        "input": input_text,
+        "send_enabled": False,
+        "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+        "human_summary": summary,
+        "slack_display_title": (
+            "Business Agents Google Doc Test Lifecycle Complete"
+            if passed
+            else "Business Agents Google Doc Test Lifecycle Blocked"
+        ),
+        "slack_display_text": summary,
+        "tool_receipt": _public_lifecycle_receipt(result),
+        "provider_identity_redacted": True,
+        "openai_requests": _orchestrator_preflight_request_count(orchestrator_preflight),
+        "side_effects": {
+            "google_doc_created_and_verified": bool(
+                isinstance(verification, dict)
+                and verification.get("create_read_back") is True
+            ),
+            "google_doc_trashed_after_cleanup": bool(
+                isinstance(verification, dict)
+                and verification.get("document_trashed_after_cleanup") is True
+            ),
+            "slack_message_posted": False,
+        },
+    }
+    _persist_direct_provider_lifecycle_run(
+        route="google_workspace_context_agent",
+        input_text=input_text,
+        payload=payload,
+        internal_receipt=result,
+        passed=passed,
+        database_url=database_url,
+    )
+    return _print_ask_live_payload(payload, json_output=json_output)
+
+
+def _run_direct_gmail_test_draft_lifecycle(
+    input_text: str,
+    *,
+    json_output: bool,
+    manual_plan: ManualRequestPlan | None,
+    orchestrator_preflight: OrchestratorPreflight | None,
+    database_url: str | None,
+) -> int:
+    """Execute one exact marked Gmail draft lifecycle after LLM preflight."""
+
+    account = _configured_gmail_draft_account()
+    marker_match = re.search(
+        r"\bKBA_TEST_DRAFT(?:_[A-Za-z0-9]+)*\b",
+        input_text,
+        re.IGNORECASE,
+    )
+    marker = marker_match.group(0).upper() if marker_match else ""
+    if not account or not marker:
+        return _print_ask_clarification(
+            "gmail_triage",
+            input_text,
+            (
+                "The Gmail test-draft lifecycle requires a configured draft account "
+                f"and an exact {GMAIL_TEST_DRAFT_MARKER} marker."
+            ),
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            extra={
+                "status": "blocked",
+                "block_kind": "gmail_test_draft_scope_missing",
+                "send_enabled": False,
+            },
+        )
+    approval_reference = _gmail_operator_approval_reference(input_text)
+    try:
+        result = execute_gmail_test_draft_lifecycle(
+            GmailTool(live=True),
+            marker=marker,
+            expected_account=account,
+            recipient=account,
+            approval_reference=approval_reference,
+        )
+    except (RuntimeError, ValueError) as exc:
+        result = {
+            "status": "blocked",
+            "operation": "test_draft_lifecycle",
+            "failure": str(exc),
+            "verification": {"passed": False},
+            "sent": False,
+            "send_enabled": False,
+        }
+    verification = result.get("verification")
+    passed = bool(
+        result.get("status") == "success"
+        and isinstance(verification, dict)
+        and verification.get("passed") is True
+        and verification.get("create_read_back") is True
+        and verification.get("same_draft_update_read_back") is True
+        and verification.get("draft_absent_after_cleanup") is True
+    )
+    if passed:
+        summary = (
+            "Gmail test draft lifecycle completed: the marked draft was created, "
+            "read back, updated in place, read back again, deleted, and verified absent. "
+            "No email was sent."
+        )
+    else:
+        summary = str(result.get("failure") or "").strip() or (
+            "The Gmail test-draft lifecycle did not verify create, same-draft update, "
+            "and cleanup absence. Do not retry blindly; inspect the exact provider "
+            "draft identity first."
+        )
+    operator_output = EmailTriageResult(
+        subject=marker or GMAIL_TEST_DRAFT_MARKER,
+        category="unrelated",
+        confidence=1.0,
+        priority="low",
+        summary=summary,
+        reasoning=(
+            "This result reports a bounded marked Gmail test-draft provider lifecycle; "
+            "it does not classify or send an inbound email."
+        ),
+        needs_reply=False,
+        recommended_action=(
+            "No further provider action is required."
+            if passed
+            else "Review the exact blocker and provider receipt before any retry."
+        ),
+        triage_limitations=[
+            "This is a provider lifecycle receipt, not an inbound-email triage result."
+        ],
+        draft_reply=None,
+        draft_created=False,
+        approval_required=False,
+        requires_human_review=not passed,
+    ).model_dump(mode="json")
+    payload: dict[str, object] = {
+        "mode": "live_sdk",
+        "status": "done" if passed else "blocked",
+        "block_kind": "" if passed else "gmail_test_draft_lifecycle_unverified",
+        "selected_agent": "gmail_triage",
+        "route": "gmail_triage",
+        "agent_name": _agent_display_name("gmail_triage"),
+        "output_type": "EmailTriageResult",
+        "output": operator_output,
+        "input": input_text,
+        "send_enabled": False,
+        "manual_request_plan": manual_plan.model_dump(mode="json") if manual_plan else None,
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+        "human_summary": summary,
+        "slack_display_title": (
+            "Business Agents Gmail Draft Test Lifecycle Complete"
+            if passed
+            else "Business Agents Gmail Draft Test Lifecycle Blocked"
+        ),
+        "slack_display_text": summary,
+        "tool_receipt": _public_lifecycle_receipt(result),
+        "provider_identity_redacted": True,
+        "openai_requests": _orchestrator_preflight_request_count(orchestrator_preflight),
+        "side_effects": {
+            "gmail_draft_created": passed,
+            "gmail_draft_absent_after_cleanup": bool(
+                isinstance(verification, dict)
+                and verification.get("draft_absent_after_cleanup") is True
+            ),
+            "email_sent": False,
+            "slack_message_posted": False,
+        },
+    }
+    _persist_direct_provider_lifecycle_run(
+        route="gmail_triage",
+        input_text=input_text,
+        payload=payload,
+        internal_receipt=result,
+        passed=passed,
+        database_url=database_url,
+    )
+    return _print_ask_live_payload(payload, json_output=json_output)
+
+
+def _orchestrator_preflight_request_count(
+    preflight: OrchestratorPreflight | None,
+) -> int:
+    payload = compact_orchestrator_preflight_payload(preflight)
+    events = payload.get("sdk_usage_events") if isinstance(payload, dict) else None
+    total = 0
+    for event in events if isinstance(events, list) else []:
+        usage = event.get("usage") if isinstance(event, dict) else None
+        if isinstance(usage, dict):
+            total += int(usage.get("requests") or 0)
+    return total
+
+
+def _direct_context_object_title(
+    execution_context: dict[str, Any] | None,
+    *,
+    preferred_route: str,
+) -> str:
+    """Resolve a prior typed object title without exposing or guessing provider IDs."""
+
+    if not execution_context:
+        return ""
+    prior_runs = execution_context.get("prior_agent_runs")
+    if not isinstance(prior_runs, list):
+        return ""
+    for item in reversed(prior_runs):
+        if not isinstance(item, dict):
+            continue
+        title = _bounded_redacted_text(item.get("title"), max_chars=240)
+        if not title:
+            continue
+        route = str(item.get("route") or "")
+        if route in {"", preferred_route}:
+            return title
+    return ""
 
 
 def _gmail_query_has_specific_target(query: str) -> bool:
@@ -5355,7 +8793,9 @@ def _run_ask_outreach_composer_live(
     manual_plan: ManualRequestPlan | None,
     orchestrator_preflight: OrchestratorPreflight | None,
     sdk_session_spec: SDKSessionSpec | None,
-    cost_tracking_requested: bool,
+    execution_context: dict[str, Any] | None = None,
+    context_file_path: str = "",
+    cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
     outreach_plan = infer_outreach_execution_plan(input_text)
@@ -5370,6 +8810,7 @@ def _run_ask_outreach_composer_live(
             max_manager_steps=3,
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
+            context_file_path=context_file_path,
             sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
             sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
             sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
@@ -5400,6 +8841,11 @@ def _run_ask_outreach_composer_live(
         "--include-follow-up-schedule",
         "--use-example-rag",
     ]
+    _append_compact_direct_flag(
+        command,
+        route="outreach_composer",
+        input_text=input_text,
+    )
     return _run_ask_script_live(
         "outreach_composer",
         input_text,
@@ -5408,6 +8854,7 @@ def _run_ask_outreach_composer_live(
         manual_plan=manual_plan,
         orchestrator_preflight=orchestrator_preflight,
         sdk_session_spec=sdk_session_spec,
+        execution_context=execution_context,
         agent_execution_plan=outreach_plan.model_dump(mode="json"),
         cost_tracking_requested=cost_tracking_requested,
         database_url=database_url,
@@ -5454,17 +8901,21 @@ def _run_ask_script_live(
     manual_plan: ManualRequestPlan | None,
     orchestrator_preflight: OrchestratorPreflight | None = None,
     sdk_session_spec: SDKSessionSpec | None = None,
+    execution_context: dict[str, Any] | None = None,
     agent_execution_plan: dict[str, object] | None = None,
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
     env = None
-    child_env = orchestrator_preflight_env(orchestrator_preflight)
+    child_env = orchestrator_preflight_env(
+        orchestrator_preflight,
+        execution_context=execution_context,
+    )
     if sdk_session_spec is not None:
         child_env = {**child_env, **sdk_session_env(sdk_session_spec)}
     if child_env:
         env = {**os.environ, **child_env}
-    timeout_seconds = _child_agent_timeout_seconds()
+    timeout_seconds = _child_agent_timeout_seconds(route=route)
     try:
         completed = run_isolated_child_process(
             command,
@@ -5498,6 +8949,13 @@ def _run_ask_script_live(
                 "next_step": failure.next_step,
             },
         }
+        _persist_ask_script_failure(
+            payload,
+            route=route,
+            input_text=input_text,
+            database_url=database_url,
+            error_kind=failure.kind,
+        )
         _print_ask_live_payload(payload, json_output=json_output)
         return 1
     if completed.returncode != 0:
@@ -5535,6 +8993,13 @@ def _run_ask_script_live(
                 "next_step": failure.next_step,
             },
         }
+        _persist_ask_script_failure(
+            payload,
+            route=route,
+            input_text=input_text,
+            database_url=database_url,
+            error_kind=failure.kind,
+        )
         _print_ask_live_payload(payload, json_output=json_output)
         return int(completed.returncode) or 1
     try:
@@ -5569,6 +9034,13 @@ def _run_ask_script_live(
                 "next_step": failure.next_step,
             },
         }
+        _persist_ask_script_failure(
+            payload,
+            route=route,
+            input_text=input_text,
+            database_url=database_url,
+            error_kind=failure.kind,
+        )
         _print_ask_live_payload(payload, json_output=json_output)
         return 1
     output = script_payload.get("output") if isinstance(script_payload, dict) else None
@@ -5599,7 +9071,48 @@ def _run_ask_script_live(
         "output": output if output is not None else script_payload,
         "script_payload": script_payload,
     }
-    human_summary = _payload_human_summary(script_payload)
+    script_status = str(script_payload.get("status") or "").strip().lower()
+    if script_status in {"blocked", "clarification_required", "needs_input"}:
+        payload["status"] = "blocked"
+        payload["block_kind"] = str(
+            script_payload.get("block_kind") or script_payload.get("reason_code") or "blocked"
+        )
+    if script_status in {"blocked", "clarification_required", "needs_input"}:
+        # Provider no-match and ambiguity are already safe terminal outcomes.
+        # Do not spend a repair-model request trying to force normal answer-shape
+        # constraints onto a blocker.
+        human_summary = _payload_human_summary(script_payload)
+    else:
+        interpreted_constraints = output_constraints_from_plan(manual_plan)
+        candidate_summary = (
+            _payload_human_summary(script_payload)
+            if interpreted_constraints.has_deterministic_requirements()
+            else _strict_requested_display_text(output, manual_plan)
+            or _payload_human_summary(script_payload)
+        )
+        instruction_resolution = resolve_instruction_following_response(
+            candidate_summary,
+            original_request=input_text,
+            manual_plan=manual_plan,
+            bounded_evidence=json.dumps(
+                output if output is not None else script_payload,
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            live=True,
+        )
+        human_summary = (
+            instruction_resolution.response_text
+            if instruction_resolution.validation.passed
+            else instruction_following_blocker_text(instruction_resolution.validation)
+        )
+        payload["instruction_following"] = instruction_resolution.metadata()
+        if (
+            instruction_resolution.validation.applicable
+            and not instruction_resolution.validation.passed
+        ):
+            payload["status"] = "blocked"
+            payload["block_kind"] = "instruction_following_constraint_failed"
     if human_summary:
         payload["human_summary"] = human_summary
         payload["slack_display_text"] = human_summary
@@ -5621,6 +9134,7 @@ def _run_ask_script_live(
     retrieval_diagnostics = _payload_retrieval_diagnostics(script_payload)
     if retrieval_diagnostics:
         payload["retrieval_diagnostics"] = retrieval_diagnostics
+    attach_execution_public_result(payload)
     try:
         model_name = ""
         model_payload = payload.get("model") if isinstance(payload.get("model"), dict) else {}
@@ -5633,7 +9147,7 @@ def _run_ask_script_live(
             output=payload,
             model=f"sdk-live:{model_name or route}",
             dry_run=False,
-            status="success",
+            status="blocked" if payload.get("status") == "blocked" else "success",
         )
         payload["agent_run_id"] = run_id
     except Exception as exc:  # pragma: no cover - diagnostic metadata only
@@ -5641,17 +9155,55 @@ def _run_ask_script_live(
     return _print_ask_live_payload(payload, json_output=json_output)
 
 
-def _child_agent_timeout_seconds() -> float:
-    raw = os.getenv("KEYSTONE_CHILD_AGENT_TIMEOUT_SECONDS") or os.getenv(
-        "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS"
-    )
-    if not raw:
-        return 180.0
+def _persist_ask_script_failure(
+    payload: dict[str, Any],
+    *,
+    route: str,
+    input_text: str,
+    database_url: str | None,
+    error_kind: str,
+) -> None:
+    """Persist redacted child diagnostics when the caller supplied local storage."""
+
+    if not database_url:
+        return
     try:
-        value = float(raw)
+        run_id = SQLiteStore(database_url).save_agent_run(
+            agent_name=route,
+            input_payload={"request_text": input_text, "route": route},
+            input_summary=input_text[:500],
+            output=payload,
+            model=f"child-error:{route}",
+            dry_run=False,
+            status="error",
+            error=str(error_kind or "child_process_failed"),
+        )
+        payload["agent_run_id"] = run_id
+    except Exception as exc:  # pragma: no cover - diagnostics must not mask failure
+        payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _child_agent_timeout_seconds(*, route: str = "") -> float:
+    explicit_child_timeout = os.getenv("KEYSTONE_CHILD_AGENT_TIMEOUT_SECONDS")
+    raw = explicit_child_timeout or os.getenv("KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS")
+    if not raw:
+        value = 180.0
+    else:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 180.0
+    value = min(max(value, 1.0), 1800.0)
+    if explicit_child_timeout or route != "opportunity_scout":
+        return value
+
+    retrieval_raw = os.getenv("KEYSTONE_OPPORTUNITY_RETRIEVAL_DEADLINE_SECONDS", "90")
+    try:
+        retrieval_deadline = float(retrieval_raw)
     except ValueError:
-        return 180.0
-    return min(max(value, 1.0), 1800.0)
+        retrieval_deadline = 90.0
+    retrieval_deadline = min(max(retrieval_deadline, 1.0), 600.0)
+    return min(max(value, retrieval_deadline + 60.0), 1800.0)
 
 
 def _payload_send_enabled(payload: object) -> bool:
@@ -5767,6 +9319,7 @@ def _print_ask_clarification(
 
 
 def _print_ask_live_payload(payload: dict[str, object], *, json_output: bool) -> int:
+    attach_execution_public_result(payload)
     if json_output:
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
@@ -6086,6 +9639,12 @@ def _run_work_items_advance(args: argparse.Namespace) -> int:
             requested_agent=preflight_requested_agent,
             live_manual_plan=bool(args.live_sdk),
             database_url=args.database_url,
+            workflow_state=_orchestrator_workflow_state_from_cli_context(
+                context_file_path=args.context_file,
+                request_text=input_text,
+                database_url=args.database_url,
+                work_item=existing_work_item,
+            ),
         )
         manual_plan = orchestrator_preflight.manual_request_plan
         if _preflight_blocks_execution(orchestrator_preflight):
@@ -6420,8 +9979,25 @@ def _print_work_item_result(
     eval_record: dict[str, object] | None = None,
     execution_metadata: dict[str, object] | None = None,
 ) -> int:
+    result = _shape_work_item_result_for_requested_output(result)
+    result, user_facing_result_verified = _ensure_work_item_user_facing_summary(result)
     if json_output:
         payload = result.model_dump(mode="json")
+        completion_confirmed = bool(
+            user_facing_result_verified
+            and str(getattr(result.status, "value", result.status)) == "done"
+            and not result.blockers
+        )
+        payload["user_facing_result_verified"] = user_facing_result_verified
+        payload["completion_confirmed"] = completion_confirmed
+        payload["slack_display_title"] = (
+            "Business Agents Result Ready"
+            if completion_confirmed
+            else "Business Agents Completion Not Confirmed"
+        )
+        payload["slack_display_text"] = result.human_summary
+        payload["display_text"] = result.human_summary
+        payload["summary"] = result.human_summary
         if graph_metadata is not None:
             payload["_langgraph"] = graph_metadata
         if execution_metadata is not None:
@@ -6432,6 +10008,7 @@ def _print_work_item_result(
                 str(payload.get("human_summary") or ""),
                 eval_record=eval_record,
             )
+        attach_execution_public_result(payload)
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
         print(render_work_item_result_text(result))
@@ -6450,6 +10027,89 @@ def _print_work_item_result(
             if graph_metadata["checkpoint_required"]:
                 print(f"Graph checkpoint: {graph_metadata['checkpoint_reason']}")
     return 0
+
+
+def _ensure_work_item_user_facing_summary(result: Any) -> tuple[Any, bool]:
+    """Reject workflow metadata as a substitute for a user-facing result."""
+
+    summary = " ".join(str(getattr(result, "human_summary", "") or "").split())
+    metadata_only = not summary or bool(
+        re.fullmatch(
+            r"(?:business agents\s+)?(?:work\s*item\s+)?"
+            r"(?:command\s+)?(?:completed|complete|ready|done)[.!]?",
+            summary,
+            flags=re.I,
+        )
+    )
+    if not metadata_only:
+        return result, True
+    blocker_messages = [
+        " ".join(str(getattr(blocker, "message", "") or "").split())
+        for blocker in list(getattr(result, "blockers", []) or [])
+        if str(getattr(blocker, "message", "") or "").strip()
+    ]
+    if blocker_messages:
+        replacement = (
+            "I could not complete the requested work. "
+            f"{blocker_messages[0]} Completion is not confirmed."
+        )
+    else:
+        replacement = (
+            "I could not verify a user-facing result for this run. Completion is "
+            "not confirmed; review the agent trace before relying on it."
+        )
+    return result.model_copy(update={"human_summary": replacement}), False
+
+
+def _shape_work_item_result_for_requested_output(result: Any) -> Any:
+    """Apply an exact narrow WorkItem display contract after synthesis."""
+
+    plan = getattr(result, "manual_request_plan", None)
+    if not isinstance(plan, dict):
+        return result
+    ask_shape = plan.get("ask_shape")
+    if not isinstance(ask_shape, dict):
+        return result
+    if str(ask_shape.get("strict_filter_mode") or "") not in {"exact", "strict"}:
+        return result
+    stop_condition = str(ask_shape.get("stop_condition") or "")
+    if stop_condition != "stop_after_exact_requested_sentence_count":
+        return result
+    request_text = str(getattr(getattr(result, "work_item", None), "request_text", "") or "")
+    count_match = re.search(r"\bexactly\s+(\d+)\s+sentences?\b", request_text, re.I)
+    if count_match is None or int(count_match.group(1)) != 2:
+        return result
+    work_item = getattr(result, "work_item", None)
+    sources = list(getattr(work_item, "sources", []) or []) if work_item is not None else []
+    claims: list[str] = []
+    for source in sources:
+        supported_claim = str(getattr(source, "supported_claim", "") or "").strip()
+        key_facts = list(getattr(source, "key_facts", []) or [])
+        for claim in [supported_claim, *key_facts]:
+            cleaned = _ensure_terminal_punctuation(str(claim or "").strip())
+            if cleaned != "." and cleaned not in claims:
+                claims.append(cleaned)
+    if not claims:
+        return result
+    first_sentence = claims[0]
+    if len(claims) > 1:
+        second_sentence = claims[1]
+    else:
+        second_sentence = (
+            "No additional company details are supported by the bounded evidence supplied "
+            "for this run."
+        )
+    shaped = result.model_copy(
+        update={
+            "human_summary": f"{first_sentence} {second_sentence}",
+            "next_action": None,
+        }
+    )
+    if work_item is not None:
+        shaped = shaped.model_copy(
+            update={"work_item": work_item.model_copy(update={"next_action": None})}
+        )
+    return shaped
 
 
 def _append_eval_thread_guidance_to_summary(

@@ -1,0 +1,205 @@
+{
+  "schema": "keystone.semantic_routing_variations.v1",
+  "groups": [
+    {
+      "id": "airtable_test_record_lifecycle",
+      "expected": {
+        "target_agent": "airtable_context_agent",
+        "intent": "business_system_write",
+        "provider": "airtable",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "internal_write_approval_required",
+        "primary_target": "KBA_TEST_RECORD_EQUIVALENCE",
+        "objective": "Create KBA_TEST_RECORD_EQUIVALENCE in Airtable, verify it, update that same record, verify it again, delete it, and verify absence.",
+        "constraints": [
+          "exact marked test record only",
+          "provider read-back after each mutation",
+          "cleanup and absence verification required"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Airtable context agent create KBA_TEST_RECORD_EQUIVALENCE, verify it, update that record, verify it again, then delete it and confirm it is gone."
+        },
+        {
+          "form": "chief delegation",
+          "prompt": "@KNI CoS create the marked Airtable record KBA_TEST_RECORD_EQUIVALENCE, check it, revise the same record, check it again, and clean it up."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI In Airtable, KBA_TEST_RECORD_EQUIVALENCE should be created and checked, then revised and checked again, before being deleted with absence confirmed."
+        },
+        {
+          "form": "lifecycle shorthand",
+          "prompt": "@KNI CoS take KBA_TEST_RECORD_EQUIVALENCE through its approved Airtable lifecycle and verify cleanup."
+        },
+        {
+          "form": "polite question",
+          "prompt": "@KNI Could Airtable Context put in KBA_TEST_RECORD_EQUIVALENCE, confirm it, change the same item, reconfirm it, and remove only that test item?"
+        }
+      ]
+    },
+    {
+      "id": "google_doc_test_lifecycle",
+      "expected": {
+        "target_agent": "google_workspace_context_agent",
+        "intent": "business_system_write",
+        "provider": "google_workspace",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "internal_write_approval_required",
+        "primary_target": "KBA_TEST_DOC_EQUIVALENCE",
+        "objective": "Create Google Doc KBA_TEST_DOC_EQUIVALENCE in KNIOps with body \"Semantic routing validation.\", verify it, move that same document to trash, and verify trashed state.",
+        "constraints": [
+          "exact marked test document only",
+          "KNIOps destination",
+          "provider create read-back",
+          "trash verification required"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Google Workspace Context create KBA_TEST_DOC_EQUIVALENCE in KNIOps with body \"Semantic routing validation.\", verify it, then trash that Doc and confirm trashed state."
+        },
+        {
+          "form": "chief delegation",
+          "prompt": "@KNI CoS create the marked Google Doc KBA_TEST_DOC_EQUIVALENCE in KNIOps with body \"Semantic routing validation.\", check it, and clean up that same Doc in trash."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI In KNIOps, Google Doc KBA_TEST_DOC_EQUIVALENCE with body \"Semantic routing validation.\" should be created and checked, then moved to trash with that state confirmed."
+        },
+        {
+          "form": "lifecycle shorthand",
+          "prompt": "@KNI CoS take the marked KNIOps Doc KBA_TEST_DOC_EQUIVALENCE with body \"Semantic routing validation.\" through its approved create-and-trash lifecycle and verify cleanup."
+        },
+        {
+          "form": "polite question",
+          "prompt": "@KNI Could Google Workspace Context make KBA_TEST_DOC_EQUIVALENCE in KNIOps with body \"Semantic routing validation.\", confirm it, and trash only that same test file?"
+        }
+      ]
+    },
+    {
+      "id": "gmail_test_draft_lifecycle",
+      "expected": {
+        "target_agent": "gmail_triage",
+        "intent": "business_system_write",
+        "provider": "gmail",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "internal_write_approval_required",
+        "primary_target": "KBA_TEST_DRAFT_EQUIVALENCE",
+        "objective": "Create Gmail draft KBA_TEST_DRAFT_EQUIVALENCE without sending, verify it, update that same draft, verify it again, delete it, and verify absence.",
+        "constraints": [
+          "exact marked test draft only",
+          "do not send",
+          "provider read-back after each mutation",
+          "cleanup and absence verification required"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Gmail triage create KBA_TEST_DRAFT_EQUIVALENCE without sending, verify it, update that draft, verify again, then delete it and confirm it is gone."
+        },
+        {
+          "form": "chief delegation",
+          "prompt": "@KNI CoS create the marked Gmail draft KBA_TEST_DRAFT_EQUIVALENCE, check it, revise the same draft, check again, and clean it up; do not send."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI In Gmail, KBA_TEST_DRAFT_EQUIVALENCE should be drafted without sending and checked, revised and checked again, then removed with absence confirmed."
+        },
+        {
+          "form": "lifecycle shorthand",
+          "prompt": "@KNI CoS take marked Gmail draft KBA_TEST_DRAFT_EQUIVALENCE through its approved lifecycle and verify cleanup, with no send."
+        },
+        {
+          "form": "thread-style shorthand",
+          "prompt": "@KNI Gmail triage put KBA_TEST_DRAFT_EQUIVALENCE in drafts, make sure it is there, change that same one, recheck it, then remove only it; never send."
+        }
+      ]
+    },
+    {
+      "id": "opportunity_discovery",
+      "expected": {
+        "target_agent": "opportunity_scout",
+        "intent": "opportunity_search",
+        "provider": "shared_retrieval",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "behavioral-health AI opportunities relevant to KNI",
+        "objective": "Identify current behavioral-health AI opportunities relevant to KNI and return only source-backed matches.",
+        "constraints": [
+          "current",
+          "behavioral health",
+          "KNI relevance",
+          "source backed",
+          "no outreach or CRM write"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI OS find current behavioral-health AI opportunities relevant to KNI and cite the sources."
+        },
+        {
+          "form": "named delegation",
+          "prompt": "@KNI Please have Opportunity Scout identify current behavioral-health AI opportunities that fit KNI."
+        },
+        {
+          "form": "question",
+          "prompt": "@KNI What current behavioral-health AI opportunities appear relevant to KNI based on source evidence?"
+        },
+        {
+          "form": "object first",
+          "prompt": "@KNI Current behavioral-health AI opportunities for KNI: which source-backed ones are worth reviewing?"
+        },
+        {
+          "form": "passive request",
+          "prompt": "@KNI A source-backed set of current behavioral-health AI opportunities relevant to KNI is needed; do not draft outreach or save them."
+        }
+      ]
+    },
+    {
+      "id": "chief_operational_prioritization",
+      "expected": {
+        "target_agent": "chief_of_staff",
+        "intent": "route_request",
+        "provider": "internal_operating_context",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "current KNI operations",
+        "objective": "Review current KNI operations and prioritize the most important next actions for a time-limited operator.",
+        "constraints": [
+          "current operating evidence",
+          "ranked next actions",
+          "read only",
+          "no external side effects"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI CoS audit current operations and tell me what matters next."
+        },
+        {
+          "form": "named delegation",
+          "prompt": "@KNI Please have Chief of Staff review current KNI operations and prioritize the next actions."
+        },
+        {
+          "form": "time-limited question",
+          "prompt": "@KNI With limited time, what current KNI operational issue should I handle next?"
+        },
+        {
+          "form": "object first",
+          "prompt": "@KNI Current KNI operations: what are the most important next actions and why?"
+        },
+        {
+          "form": "passive request",
+          "prompt": "@KNI A read-only priority review of current KNI operations is needed, with the most important next actions first."
+        }
+      ]
+    }
+  ]
+}

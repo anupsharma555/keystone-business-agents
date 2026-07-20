@@ -229,6 +229,7 @@ class GoogleWorkspaceContextResult(BaseModel):
     relevant_docs: list[str] = Field(default_factory=list)
     relevant_sheets: list[str] = Field(default_factory=list)
     recommended_target: str = ""
+    artifact_preview_lines: list[str] = Field(default_factory=list)
     recommended_actions: list[str] = Field(default_factory=list)
     direct_write_supported: bool = True
     executed_write_results: list[OperationalContextEntry] = Field(default_factory=list)
@@ -263,6 +264,7 @@ class GoogleWorkspaceContextResult(BaseModel):
         "relevant_files",
         "relevant_docs",
         "relevant_sheets",
+        "artifact_preview_lines",
         "recommended_actions",
         "media_context_limitations",
         "blockers",

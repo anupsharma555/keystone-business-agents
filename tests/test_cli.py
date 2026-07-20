@@ -8,21 +8,32 @@ from types import SimpleNamespace
 import pytest
 
 import keystone_agents.cli as cli
+from keystone_agents.calendar_actions import CalendarActionPlan
 from keystone_agents.cli import main
-from keystone_agents.manual_request import infer_manual_request_plan
+from keystone_agents.instruction_following import InstructionFollowingRepairOutput
+from keystone_agents.manual_request import (
+    infer_manual_request_plan,
+    merge_manual_request_plan,
+)
 from keystone_agents.orchestrator.preflight_context import (
     MANUAL_REQUEST_PLAN_ENV,
     ORCHESTRATOR_PREFLIGHT_ENV,
     ORCHESTRATOR_ROUTE_RESULT_ENV,
 )
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 from keystone_agents.schemas.operational_context import ZoteroContextResult
+from keystone_agents.schemas.output_constraints import InterpretedOutputConstraints
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
     WorkItem,
+    WorkItemArtifactRef,
     WorkItemKind,
+    WorkItemNextAction,
     WorkItemRoute,
+    WorkItemSourceRef,
     WorkItemStatus,
+    WorkItemTarget,
 )
 from keystone_agents.sdk import ToolGuardrailViolation
 from keystone_agents.storage.sqlite_store import SQLiteStore
@@ -33,6 +44,38 @@ from promptfoo.eval_database import (
     record_slack_eval_run,
 )
 from promptfoo.human_review import list_human_reviews
+
+
+def test_verified_provider_links_excludes_unverified_or_non_https_receipts() -> None:
+    links = cli._verified_provider_links(
+        [
+            {
+                "status": "success",
+                "provider_link": "https://airtable.com/app1/rec1",
+                "verification": {"passed": True},
+            },
+            {
+                "status": "verification_failed",
+                "provider_link": "https://calendar.test/unverified",
+                "verification": {"passed": False},
+            },
+            {
+                "status": "success",
+                "url": "local://not-clickable",
+                "verification": {"passed": True},
+            },
+            {
+                "status": "success",
+                "html_link": "https://calendar.test/event",
+                "verification": {"passed": True},
+            },
+        ]
+    )
+
+    assert links == [
+        "https://airtable.com/app1/rec1",
+        "https://calendar.test/event",
+    ]
 
 
 def _fake_orchestrator_preflight(
@@ -59,6 +102,215 @@ def _fake_orchestrator_preflight(
     )
 
 
+@pytest.mark.parametrize(
+    "route",
+    [
+        "business_research_analyst",
+        "opportunity_scout",
+        "gmail_triage",
+        "outreach_composer",
+        "chief_of_staff",
+    ],
+)
+def test_direct_specialist_routes_share_one_llm_constraint_repair(
+    route,
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent=route,
+        ask_shape=AskShapePolicy(
+            output_constraints=InterpretedOutputConstraints(
+                interpretation="exact five-word answer",
+                scope="answer",
+                word_count_mode="exact",
+                word_count=5,
+            )
+        ),
+    )
+
+    monkeypatch.setattr(
+        cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "output_type": "TestOutput",
+                    "send_enabled": False,
+                    "human_summary": "This response is much too long for the request.",
+                    "output": {"summary": "Bounded specialist evidence."},
+                }
+            ),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.instruction_following.run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=InstructionFollowingRepairOutput(
+                response_text="Agents follow natural instructions accurately."
+            ),
+            usage={},
+            cost={},
+            request_cache={},
+        ),
+    )
+
+    exit_code = cli._run_ask_script_live(
+        route,
+        "Answer this in exactly five words.",
+        ["unused-child-command"],
+        json_output=True,
+        manual_plan=plan,
+        database_url=f"sqlite:///{tmp_path / f'{route}.db'}",
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["human_summary"] == "Agents follow natural instructions accurately."
+    assert payload["instruction_following"]["repair_attempted"] is True
+    assert payload["instruction_following"]["repair_succeeded"] is True
+
+
+def test_direct_specialist_provider_blocker_skips_llm_constraint_repair(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="gmail_triage",
+        ask_shape=AskShapePolicy(
+            output_constraints=InterpretedOutputConstraints(
+                interpretation="one useful point",
+                scope="entire_response",
+                item_count_mode="exact",
+                minimum_items=1,
+                maximum_items=1,
+            )
+        ),
+    )
+    summary = (
+        "I checked the connected Gmail mailbox using exact and relaxed subject "
+        "searches, but found no matching message. No mailbox data was changed."
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "status": "blocked",
+                    "block_kind": "gmail_target_not_found",
+                    "send_enabled": False,
+                    "human_summary": summary,
+                    "output_type": "GmailClarificationResult",
+                    "output": {"status": "blocked", "summary": summary},
+                }
+            ),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_instruction_following_response",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider blockers must not spend an instruction-repair request"
+        ),
+    )
+
+    exit_code = cli._run_ask_script_live(
+        "gmail_triage",
+        "Find the selected email and make one useful point.",
+        ["unused-child-command"],
+        json_output=True,
+        manual_plan=plan,
+        database_url=f"sqlite:///{tmp_path / 'gmail-blocked.db'}",
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "blocked"
+    assert payload["block_kind"] == "gmail_target_not_found"
+    assert payload["human_summary"] == summary
+    assert "instruction_following" not in payload
+
+
+@pytest.mark.parametrize(
+    ("route", "output_type"),
+    [
+        ("airtable_context_agent", cli.AirtableContextResult),
+        ("google_workspace_context_agent", cli.GoogleWorkspaceContextResult),
+        ("zotero_context_agent", cli.ZoteroContextResult),
+        ("rss_context_agent", cli.RssContextResult),
+        ("preprints_context_agent", cli.PreprintsContextResult),
+    ],
+)
+def test_context_agent_routes_share_one_llm_constraint_repair(
+    route,
+    output_type,
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent=route,
+        target_agent=route,
+        ask_shape=AskShapePolicy(
+            output_constraints=InterpretedOutputConstraints(
+                interpretation="exact five-word answer",
+                scope="answer",
+                word_count_mode="exact",
+                word_count=5,
+            )
+        ),
+    )
+    prompts: list[str] = []
+
+    def fake_run_typed_sdk_sync(_agent, prompt, _schema, **_kwargs):
+        prompts.append(prompt)
+        return (
+            SimpleNamespace(final_output=None, usage=None, new_items=[]),
+            output_type(
+                mode="llm",
+                summary="This context response is deliberately much too long.",
+            ),
+        )
+
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(
+        "keystone_agents.instruction_following.run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=InstructionFollowingRepairOutput(
+                response_text="Agents follow natural instructions accurately."
+            ),
+            usage={},
+            cost={},
+            request_cache={},
+        ),
+    )
+
+    exit_code = cli._run_ask_context_agent_live(
+        route,
+        "Answer this in exactly five words.",
+        json_output=True,
+        manual_plan=plan,
+        database_url=f"sqlite:///{tmp_path / f'{route}.db'}",
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "Interpreted response constraints from Orchestrator planning" in prompts[0]
+    assert payload["human_summary"] == "Agents follow natural instructions accurately."
+    assert payload["instruction_following"]["repair_attempted"] is True
+    assert payload["instruction_following"]["repair_succeeded"] is True
+
+
 def test_cli_health_smoke(capsys) -> None:
     exit_code = main(["health", "--database-url", ":memory:"])
 
@@ -78,6 +330,64 @@ def test_manual_plan_advice_preserves_gmail_as_first_stage() -> None:
     )
 
     assert cli._route_with_manual_plan_advice("orchestrator", plan) == "gmail_triage"
+
+
+def test_manual_plan_advice_hands_incompatible_scout_ask_to_research_owner() -> None:
+    plan = infer_manual_request_plan(
+        "who is Abridge and summarize the company in 20 words.",
+        requested_agent="opportunity_scout",
+    )
+
+    assert cli._route_with_manual_plan_advice("opportunity_scout", plan) == (
+        "business_research_analyst"
+    )
+
+
+def test_manual_plan_advice_preserves_chief_advisory_coordination() -> None:
+    prompt = (
+        "Use Airtable Context and Google Workspace Context as read-only advisors to "
+        "design a handoff table. Do not write records or create files."
+    )
+    plan = infer_manual_request_plan(prompt, requested_agent="chief_of_staff").model_copy(
+        update={"target_agent": "airtable_context_agent"}
+    )
+
+    assert cli._route_with_manual_plan_advice("chief_of_staff", plan) == "chief_of_staff"
+
+
+@pytest.mark.parametrize(
+    ("requested_agent", "prompt", "expected_owner"),
+    [
+        (
+            "business_research_analyst",
+            "Find current remote psychiatry grant opportunities.",
+            "opportunity_scout",
+        ),
+        (
+            "opportunity_scout",
+            "Triage my unread Gmail messages from today.",
+            "gmail_triage",
+        ),
+        (
+            "gmail_triage",
+            "Draft a LinkedIn outreach note using approved facts.",
+            "outreach_composer",
+        ),
+        (
+            "outreach_composer",
+            "Review our Slack workflow status and recommend next actions.",
+            "chief_of_staff",
+        ),
+    ],
+)
+def test_manual_plan_advice_executes_clear_owner_not_wrong_named_specialist(
+    requested_agent: str,
+    prompt: str,
+    expected_owner: str,
+) -> None:
+    plan = infer_manual_request_plan(prompt, requested_agent=requested_agent)
+
+    assert cli._route_with_manual_plan_advice(requested_agent, plan) == expected_owner
 
 
 def test_cli_promptfoo_agent_eval_mode_disables_eval_helpers(monkeypatch) -> None:
@@ -123,6 +433,118 @@ def test_cli_langgraph_helper_preserves_manager_step_limit(monkeypatch) -> None:
     assert captured["max_manager_steps"] == 1
 
 
+def test_live_cos_multi_owner_plan_uses_work_item_without_named_specialists(
+    monkeypatch,
+) -> None:
+    request = (
+        "CoS, using these approved facts: direct tasks have one owner and tracked "
+        "multi-step work preserves state. Review the architecture tradeoff, prioritize "
+        "the largest validation gap, and draft an internal Slack update for my review. "
+        "Do not search, send email, or post."
+    )
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text, *, requested_agent=None, **_kwargs):
+        plan = infer_manual_request_plan(request_text, requested_agent=requested_agent)
+        routed = cli.route_request(request_text, manual_plan=plan)
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent=requested_agent,
+            advisory_only=True,
+            selected_agent=str(routed.route),
+            execution_allowed=True,
+            manual_request_plan=plan,
+            route_result=routed,
+        )
+
+    def fake_work_item(input_text: str, **kwargs: object) -> int:
+        captured["input_text"] = input_text
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_work_item)
+    monkeypatch.setattr(
+        cli,
+        "_run_ask_specialist_live",
+        lambda *_args, **_kwargs: pytest.fail(
+            "multi-owner Chief ask must not run as one direct specialist"
+        ),
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--max-openai-requests",
+            "20",
+            "--json",
+            f"@KNI {request}",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["input_text"] == request.removeprefix("CoS, ")
+    assert captured["requested_route"] == "business_research_analyst"
+    assert captured["manual_plan"].workflow == [
+        "business_research_analyst",
+        "opportunity_scout",
+        "outreach_composer",
+    ]
+
+
+def test_metadata_only_work_item_summary_is_not_reported_as_completion(
+    capsys,
+) -> None:
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="Internal architecture review",
+        ),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary="WorkItem command completed.",
+    )
+
+    exit_code = cli._print_work_item_result(result, json_output=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["user_facing_result_verified"] is False
+    assert payload["completion_confirmed"] is False
+    assert payload["slack_display_title"] == "Business Agents Completion Not Confirmed"
+    assert "Completion is not confirmed" in payload["slack_display_text"]
+    assert "WorkItem command completed" not in payload["slack_display_text"]
+
+
+def test_substantive_done_work_item_summary_is_verified_for_slack(
+    capsys,
+) -> None:
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="Internal architecture review",
+        ),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary=(
+            "The architecture keeps simple tasks direct and uses tracked state only "
+            "when several owners must contribute."
+        ),
+    )
+
+    exit_code = cli._print_work_item_result(result, json_output=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["user_facing_result_verified"] is True
+    assert payload["completion_confirmed"] is True
+    assert payload["slack_display_title"] == "Business Agents Result Ready"
+    assert payload["slack_display_text"] == payload["human_summary"]
+
+
 def test_cli_init_db_uses_explicit_database_url(tmp_path: Path, capsys) -> None:
     database_path = tmp_path / "keystone.db"
 
@@ -165,6 +587,325 @@ def test_cli_ask_routes_unmentioned_input_through_work_item(tmp_path: Path, caps
     assert "Route: business_research_analyst" in output
     assert "Manual plan: business_research_analyst / company_research" in output
     assert "Artifacts: company_profile:" in output
+
+
+def test_cli_genuine_clarification_returns_direct_public_result_without_workitem(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'clarification.db'}"
+
+    exit_code = main(
+        [
+            "ask",
+            "--no-live-sdk",
+            "--no-live-manual-plan",
+            "--json",
+            "--database-url",
+            database_url,
+            "do",
+            "that",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "needs_input"
+    assert payload["route"] == "clarification"
+    assert payload["public_result"]["status"] == "needs_input"
+    assert "work_item" not in payload
+    assert "route_not_supported_in_workitem_phase" not in json.dumps(payload)
+
+
+def test_cli_preflight_receives_selected_slack_thread_before_work_item_execution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context_file = tmp_path / "slack-zotero-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.selected_message_context.v1",
+                "source": "test",
+                "channel_id": "C123",
+                "channel_name": "ai-agents-workflow",
+                "selected_message_ts": "1715366400.000100",
+                "thread_ts": "1715366400.000100",
+                "selected_message": {
+                    "ts": "1715366400.000100",
+                    "user_id": "U123",
+                    "text": "One exact Zotero article, KBA_TEST_ARTICLE, was resolved.",
+                },
+                "thread_messages": [
+                    {
+                        "ts": "1715366400.000100",
+                        "user_id": "U123",
+                        "text": "One exact Zotero article, KBA_TEST_ARTICLE, was resolved.",
+                    }
+                ],
+                "thread_fetch_status": "ok",
+            }
+        ),
+        encoding="utf-8",
+    )
+    actual_preflight = cli.run_orchestrator_preflight
+    captured: dict[str, object] = {}
+
+    def capture_preflight(request_text, **kwargs):
+        captured["workflow_state"] = kwargs.get("workflow_state")
+        result = actual_preflight(request_text, **kwargs)
+        captured["manual_plan"] = result.manual_request_plan
+        return result
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", capture_preflight)
+
+    exit_code = main(
+        [
+            "ask",
+            "--context-file",
+            str(context_file),
+            "@KNI CoS Attach this PDF to the article.",
+        ]
+    )
+
+    assert exit_code == 0
+    workflow_state = captured["workflow_state"]
+    assert isinstance(workflow_state, dict)
+    assert "KBA_TEST_ARTICLE" in str(workflow_state["slack_thread_transcript"])
+    plan = captured["manual_plan"]
+    assert isinstance(plan, ManualRequestPlan)
+    assert plan.target_agent == "zotero_context_agent"
+    assert plan.intent == "business_system_write"
+
+
+def test_cli_live_manual_plan_only_honors_openai_request_ceiling(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "run_orchestrator_preflight",
+        lambda *_args, **_kwargs: pytest.fail("preflight should be blocked before a model call"),
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-manual-plan",
+            "--max-openai-requests",
+            "0",
+            "--json",
+            "@KNI CoS Add this link to the notes.",
+        ]
+    )
+
+    assert exit_code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["block_kind"] == "openai_request_budget_exceeded"
+    assert payload["estimated_requests"] == {
+        "max": 1,
+        "min": 1,
+        "stages": ["manual_request_planner"],
+    }
+
+
+def test_live_manual_plan_gets_one_request_before_resolved_route_budget(
+    monkeypatch,
+) -> None:
+    request = (
+        "Without searching or using provider tools, use only these two facts: "
+        "negative constraints narrow execution, and the offline suite passes. "
+        "Give me exactly two short bullets. Do not draft outreach or modify records."
+    )
+    fallback = infer_manual_request_plan(request)
+    bad_live_candidate = fallback.model_copy(
+        update={
+            "source": "llm",
+            "target_agent": "clarification",
+            "intent": "clarification",
+            "task_objective": "clarification",
+        }
+    )
+    calls: list[str] = []
+    specialist_calls: list[str] = []
+
+    def fake_preflight(request_text, **_kwargs):
+        calls.append(request_text)
+        merged = merge_manual_request_plan(fallback, bad_live_candidate)
+        route_result = cli.route_request(request_text, manual_plan=merged)
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent=merged.requested_agent,
+            selected_agent=merged.target_agent,
+            manual_request_plan=merged,
+            route_result=route_result,
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    def fake_specialist(route, *_args, **_kwargs):
+        specialist_calls.append(route)
+        return 0
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", fake_specialist)
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--live-manual-plan",
+            "--max-openai-requests",
+            "5",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [request]
+    assert specialist_calls == ["chief_of_staff"]
+
+
+def test_resolved_live_workflow_is_authoritative_for_post_planner_budget(
+    monkeypatch,
+) -> None:
+    request = (
+        "CoS, use the supplied company note to prepare the coordinated decision brief "
+        "and a copyable internal note. Do not search or use provider tools."
+    )
+    resolved_plan = infer_manual_request_plan(
+        (
+            "CoS, use only this note. Give me what is supported, the strongest "
+            "potential KNI advisory or research fit, the single validation question "
+            "that should come first, and a short internal Slack note I can paste. "
+            "Do not search or post."
+        ),
+        requested_agent="chief_of_staff",
+    ).model_copy(
+        update={
+            "source": "llm",
+            "objective": request,
+        }
+    )
+    assert resolved_plan.workflow == [
+        "business_research_analyst",
+        "opportunity_scout",
+        "outreach_composer",
+    ]
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text, **_kwargs):
+        route_result = cli.route_request(request_text, manual_plan=resolved_plan)
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent="chief_of_staff",
+            selected_agent="chief_of_staff",
+            manual_request_plan=resolved_plan,
+            route_result=route_result,
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    def fake_work_item(input_text, **kwargs):
+        captured["input_text"] = input_text
+        captured["manual_plan"] = kwargs["manual_plan"]
+        return 0
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_work_item)
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--live-manual-plan",
+            "--live-search",
+            "--max-openai-requests",
+            "5",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["manual_plan"] is resolved_plan
+
+
+def test_budget_message_reports_planner_request_before_resolved_route_block(
+    capsys,
+) -> None:
+    exit_code = cli._print_ask_request_budget_blocked(
+        json_output=True,
+        requested_limit=5,
+        estimate={
+            "min": 2,
+            "max": 7,
+            "stages": ["manual_request_planner", "business_research_analyst_sdk"],
+        },
+        openai_requests_made=1,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload["openai_requests_made"] == 1
+    assert "used 1 bounded planning request" in payload["message"]
+    assert "before any model call" not in payload["message"]
+    assert "No specialist or provider action ran" in payload["message"]
+
+
+def test_live_semantic_preflight_can_narrow_unnamed_ask_to_direct_specialist(
+    monkeypatch,
+    capsys,
+) -> None:
+    request = "Look into NeuroFlow and tell me whether it is relevant to KNI."
+    calls: dict[str, object] = {}
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="business_research_analyst",
+        intent="company_research",
+        primary_target="NeuroFlow",
+        target_type="company",
+        objective="Research NeuroFlow and assess its relevance to KNI.",
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+    )
+    route_result = cli.route_request(request, manual_plan=plan)
+
+    def fake_preflight(request_text, **kwargs):
+        calls["preflight"] = {"request_text": request_text, **kwargs}
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            selected_agent="business_research_analyst",
+            manual_request_plan=plan,
+            route_result=route_result,
+        )
+
+    def fake_direct(route, input_text, **kwargs):
+        calls["direct"] = {"route": route, "input_text": input_text, **kwargs}
+        return 0
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", fake_direct)
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--max-openai-requests",
+            "8",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == ""
+    assert calls["preflight"]["live_manual_plan"] is True
+    assert calls["direct"]["route"] == "business_research_analyst"
+    assert calls["direct"]["manual_plan"] is plan
 
 
 def test_cli_ask_json_reports_actual_execution_and_graph_metadata(
@@ -1734,6 +2475,60 @@ def test_cli_airtable_context_infers_finance_expense_receipt_target(
     assert payload["side_effects"]["external_write_performed"] is False
 
 
+def test_cli_airtable_context_resolves_selected_slack_receipt_path(
+    capsys,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    receipt = tmp_path / "Receipt-example.pdf"
+    receipt.write_bytes(b"%PDF-1.4\n% bounded test receipt\n")
+    context_file = tmp_path / "slack-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C_TEST",
+                "thread_ts": "1783972624.677569",
+                "request_ts": "1783972624.677569",
+                "read_context": f"Slack attachment materialized locally: {receipt}",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "airtable_context_agent",
+            "--context-file",
+            str(context_file),
+            "--json",
+            "add this attached receipt as exactly one personal expense in Airtable",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    mapping = {
+        item["key"]: item["value"]
+        for item in payload["output"]["write_plan"]["field_mapping"]
+    }
+    assert mapping["receipt_local_path"] == str(receipt)
+    assert payload["selected_agent"] == "airtable_context_agent"
+    provider_context = cli._direct_airtable_receipt_provider_context(
+        "airtable_context_agent",
+        "add this attached receipt as exactly one personal expense in Airtable",
+        execution_context={
+            "schema": "keystone.direct_specialist_context.v1",
+            "thread_transcript_tail": f"Slack attachment materialized locally: {receipt}",
+        },
+    )
+    assert str(receipt) in provider_context
+    assert "airtable_target_table" in provider_context
+
+
 def test_airtable_context_dry_run_keeps_named_tracker_expense_target() -> None:
     output = cli._context_agent_dry_run_output(
         "airtable_context_agent",
@@ -1782,6 +2577,200 @@ def test_chief_calendar_fast_path_infers_defaults_without_model_or_graph(
     assert "manual_request_plan" not in payload
 
 
+def test_named_cos_calendar_mention_uses_direct_path_without_model_or_graph(
+    capsys,
+) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "--no-live-sdk",
+            "--json",
+            "@KNI",
+            "CoS",
+            "create a calendar event called KBA_TEST_CALENDAR_DIRECT on July 21, 2026",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_agent"] == "chief_of_staff"
+    assert payload["route"] == "chief_of_staff"
+    assert payload["calendar_action"]["operation"] == "create"
+    assert payload["calendar_action"]["title"] == "KBA_TEST_CALENDAR_DIRECT"
+    assert payload["calendar_action"]["start_date"] == "2026-07-21"
+    assert payload["tool_receipt"]["status"] == "dry-run"
+    assert payload["openai_requests"] == 0
+    assert "manual_request_plan" not in payload
+
+
+def test_named_cos_dated_deadline_uses_calendar_path_without_calendar_keyword(
+    capsys,
+) -> None:
+    exit_code = main(
+        [
+            "ask",
+            "--no-live-sdk",
+            "--json",
+            "@KNI",
+            "CoS",
+            "add “UT AI Agents application due on July 23rd”",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["route"] == "chief_of_staff"
+    assert payload["calendar_action"]["operation"] == "create"
+    assert payload["calendar_action"]["title"] == (
+        "UT AI Agents application due on July 23rd"
+    )
+    assert payload["calendar_action"]["start_date"] == "2026-07-23"
+    assert payload["calendar_action"]["all_day"] is True
+    assert payload["tool_receipt"]["status"] == "dry-run"
+
+
+def test_incidental_meeting_context_falls_through_to_shared_chief_planning(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = (
+        "I have 30 seconds before a meeting. Using only these three facts, give me "
+        "exactly three short bullets—what changed, why it matters, and what still "
+        "needs live proof: negative constraints remove forbidden capabilities "
+        "instead of blocking feasible work; a complete answer must not be labeled "
+        "Need Input unless information is genuinely missing; the repaired offline "
+        "boundary passes. Do not search, call tools or providers, draft messages, "
+        "create or modify records, or include workflow or routing metadata."
+    )
+
+    def fail_calendar_interpretation(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("Incidental meeting context must not enter Calendar interpretation.")
+
+    monkeypatch.setattr(
+        cli,
+        "resolve_calendar_action_plan",
+        fail_calendar_interpretation,
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--no-live-sdk",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["route"] == "chief_of_staff"
+    assert "calendar_action" not in payload
+    assert payload["output"]["recommended_route"]["workflow_type"] == (
+        "project-context-review"
+    )
+
+
+def test_calendar_provider_action_runs_only_after_shared_preflight(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    request = "create a calendar event called KBA_TEST_ORDER on July 21, 2026"
+
+    def record_preflight(request_text: str, **kwargs: object) -> object:
+        events.append("orchestrator_preflight")
+        return _fake_orchestrator_preflight(request_text, **kwargs)
+
+    original_resolver = cli.resolve_calendar_action_plan
+
+    def record_calendar_resolution(*args: object, **kwargs: object) -> object:
+        assert events == ["orchestrator_preflight"]
+        events.append("calendar_action_interpreter")
+        return original_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", record_preflight)
+    monkeypatch.setattr(
+        cli,
+        "resolve_calendar_action_plan",
+        record_calendar_resolution,
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--no-live-sdk",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert events == ["orchestrator_preflight", "calendar_action_interpreter"]
+    assert payload["execution_admission"]["mode"] == "provider_action"
+    assert payload["execution_admission"]["positive_intent"] is True
+    assert payload["tool_receipt"]["status"] == "dry-run"
+
+
+def test_provider_action_detector_cannot_veto_semantic_plan(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Using only these facts, return one short internal summary."
+
+    def route_request_plan(request_text: str, **_kwargs: object) -> object:
+        plan = infer_manual_request_plan(
+            request_text,
+            requested_agent="chief_of_staff",
+        ).model_copy(
+            update={
+                "target_agent": "chief_of_staff",
+                "intent": "route_request",
+                "side_effect_policy": "draft_or_read_only",
+            }
+        )
+        result = cli.route_request(request_text, manual_plan=plan)
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            execution_allowed=True,
+            manual_request_plan=plan,
+            route_result=result,
+        )
+
+    monkeypatch.setattr(cli, "is_calendar_action_candidate", lambda _text: True)
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", route_request_plan)
+    monkeypatch.setattr(
+        cli,
+        "resolve_calendar_action_plan",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Provider detector must not override the shared semantic plan."
+        ),
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--no-live-sdk",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["manual_request_plan"]["intent"] == "route_request"
+    assert "calendar_action" not in payload
+
+
 def test_chief_calendar_fast_path_executes_complete_live_write_immediately(
     capsys,
     monkeypatch: pytest.MonkeyPatch,
@@ -1802,6 +2791,15 @@ def test_chief_calendar_fast_path_executes_complete_live_write_immediately(
         }
 
     monkeypatch.setattr(cli, "create_google_calendar_event_impl", fake_create)
+    monkeypatch.setattr(
+        cli,
+        "resolve_calendar_action_plan",
+        lambda input_text, plan, **kwargs: SimpleNamespace(
+            plan=plan,
+            openai_requests=1,
+            warnings=(),
+        ),
+    )
     exit_code = main(
         [
             "ask",
@@ -1817,10 +2815,62 @@ def test_chief_calendar_fast_path_executes_complete_live_write_immediately(
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "done"
-    assert payload["openai_requests"] == 0
+    assert payload["openai_requests"] == 1
     assert payload["side_effects"]["calendar_write_performed"] is True
     assert captured["live"] is True
     assert str(captured["approval_reference"]).startswith("calendar-direct:")
+
+
+def test_chief_calendar_fast_path_forwards_timed_event_fields_to_writer(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_create(title: str, start_date: str, **kwargs: object) -> dict[str, object]:
+        captured.update({"title": title, "start_date": start_date, **kwargs})
+        return {
+            "status": "success",
+            "operation": "create_calendar_event",
+            "event_id": "kba-calendar-timed-event",
+            "title": title,
+            "start_date": start_date,
+            "start_time": kwargs.get("start_time"),
+            "html_link": "https://calendar.test/event",
+            "verification": {"status": "verified", "passed": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "create_google_calendar_event_impl", fake_create)
+    monkeypatch.setattr(
+        cli,
+        "resolve_calendar_action_plan",
+        lambda input_text, plan, **kwargs: SimpleNamespace(
+            plan=plan,
+            openai_requests=1,
+            warnings=(),
+        ),
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--live-sdk",
+            "--json",
+            "schedule a calendar meeting on July 14th, 2026 at 2pm titled "
+            "Livestream with Corey Ching and Peter Steinberger",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["status"] == "done"
+    assert payload["openai_requests"] == 1
+    assert captured["start_time"] == "14:00"
+    assert captured["end_time"] == "15:00"
+    assert captured["timezone"] == "America/New_York"
 
 
 def test_chief_calendar_fast_path_resolves_natural_update_reference(
@@ -1856,6 +2906,15 @@ def test_chief_calendar_fast_path_resolves_natural_update_reference(
 
     monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
     monkeypatch.setattr(cli, "update_google_calendar_event_impl", fake_update)
+    monkeypatch.setattr(
+        cli,
+        "resolve_calendar_action_plan",
+        lambda input_text, plan, **kwargs: SimpleNamespace(
+            plan=plan,
+            openai_requests=1,
+            warnings=(),
+        ),
+    )
 
     exit_code = main(
         [
@@ -1872,7 +2931,7 @@ def test_chief_calendar_fast_path_resolves_natural_update_reference(
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "done"
-    assert payload["openai_requests"] == 0
+    assert payload["openai_requests"] == 1
     assert payload["calendar_action"]["event_id"] == ""
     assert payload["calendar_action"]["event_reference"] == (
         "Frontiers in Human Dynamics paper Due Date"
@@ -1881,6 +2940,211 @@ def test_chief_calendar_fast_path_resolves_natural_update_reference(
     assert captured["event_id"] == "kba-calendar-event"
     assert captured["update"]["description"] == "submit the final paper"
     assert captured["update"]["live"] is True
+
+
+def test_named_cos_calendar_delete_resolves_exact_event_and_verifies_absence(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_resolve(event_reference: str, **kwargs: object) -> dict[str, object]:
+        captured.update({"event_reference": event_reference, "lookup": kwargs})
+        return {
+            "status": "success",
+            "operation": "resolve_calendar_event",
+            "event_reference": event_reference,
+            "event_id": "kba-calendar-delete-event",
+            "title": "KBA_TEST_CALENDAR_DIRECT",
+            "start_date": "2026-07-21",
+            "match_count": 1,
+        }
+
+    def fake_delete(event_id: str, **kwargs: object) -> dict[str, object]:
+        captured.update({"event_id": event_id, "delete": kwargs})
+        return {
+            "status": "success",
+            "operation": "delete_calendar_event",
+            "event_id": event_id,
+            "title": "KBA_TEST_CALENDAR_DIRECT",
+            "start_date": "2026-07-21",
+            "verification": {
+                "status": "verified_absent",
+                "passed": True,
+            },
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
+    monkeypatch.setattr(cli, "delete_google_calendar_event_impl", fake_delete)
+    monkeypatch.setattr(
+        cli,
+        "resolve_calendar_action_plan",
+        lambda input_text, plan, **kwargs: SimpleNamespace(
+            plan=plan,
+            openai_requests=1,
+            warnings=(),
+        ),
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--json",
+            "@KNI",
+            "CoS",
+            "remove the KBA_TEST_CALENDAR_DIRECT calendar event on July 21, 2026",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "done"
+    assert payload["selected_agent"] == "chief_of_staff"
+    assert payload["route"] == "chief_of_staff"
+    assert payload["openai_requests"] == 1
+    assert payload["calendar_action"]["operation"] == "delete"
+    assert payload["calendar_lookup"]["match_count"] == 1
+    assert payload["tool_receipt"]["verification"]["passed"] is True
+    assert captured["event_id"] == "kba-calendar-delete-event"
+    assert captured["delete"]["live"] is True
+
+
+def test_chief_calendar_thread_time_update_uses_prior_event_date(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_resolve(event_reference: str, **kwargs: object) -> dict[str, object]:
+        captured.update({"event_reference": event_reference, "lookup": kwargs})
+        return {
+            "status": "success",
+            "operation": "resolve_calendar_event",
+            "event_reference": event_reference,
+            "event_id": "kba-calendar-thread-event",
+            "title": "Livestream with Corey Ching and Peter Steinberger",
+            "start_date": "2026-07-14",
+            "match_count": 1,
+        }
+
+    def fake_update(event_id: str, **kwargs: object) -> dict[str, object]:
+        captured.update({"event_id": event_id, "update": kwargs})
+        return {
+            "status": "success",
+            "operation": "update_calendar_event",
+            "event_id": event_id,
+            "title": "Livestream with Corey Ching and Peter Steinberger",
+            "start_date": "2026-07-14",
+            "start_time": "14:00",
+            "all_day": False,
+            "verification": {"status": "verified", "passed": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
+    monkeypatch.setattr(cli, "update_google_calendar_event_impl", fake_update)
+    monkeypatch.setattr(
+        cli,
+        "resolve_calendar_action_plan",
+        lambda input_text, plan, **kwargs: SimpleNamespace(
+            plan=plan,
+            openai_requests=1,
+            warnings=(),
+        ),
+    )
+    request = (
+        "chief of staff continue this prior Slack thread. "
+        "Previous request: CoS schedule a calendar meeting on July 14th at 2pm titled "
+        "\u201cLivestream with Corey Ching and Peter Steinberger\u201d "
+        "Previous result title: Previous result: not available "
+        "User follow-up: Move this event from all-day to 2pm-3pm. "
+        "Continue the same agent task."
+    )
+
+    exit_code = main(
+        ["ask", "--agent", "chief_of_staff", "--live-sdk", "--json", request]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "done"
+    assert captured["event_reference"] == (
+        "Livestream with Corey Ching and Peter Steinberger"
+    )
+    assert captured["lookup"]["start_date"] == "2026-07-14"
+    assert captured["update"]["start_date"] == "2026-07-14"
+    assert captured["update"]["start_time"] == "14:00"
+    assert captured["update"]["end_time"] == "15:00"
+
+
+def test_chief_calendar_thread_note_uses_llm_first_candidate_and_append(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    url = "https://example.test/thread/123"
+    plan = CalendarActionPlan(
+        operation="update",
+        description=url,
+        append_description=True,
+        event_reference="Partner livestream",
+        event_reference_date="2026-07-14",
+        all_day=False,
+        complete=True,
+    )
+
+    def fake_interpret(input_text: str, fallback, **kwargs: object) -> SimpleNamespace:
+        captured["fallback"] = fallback
+        return SimpleNamespace(plan=plan, openai_requests=1, warnings=())
+
+    def fake_resolve(event_reference: str, **kwargs: object) -> dict[str, object]:
+        return {
+            "status": "success",
+            "event_reference": event_reference,
+            "event_id": "kba-calendar-note-event",
+            "title": "Partner livestream",
+            "start_date": "2026-07-14",
+            "match_count": 1,
+        }
+
+    def fake_update(event_id: str, **kwargs: object) -> dict[str, object]:
+        captured.update({"event_id": event_id, "update": kwargs})
+        return {
+            "status": "success",
+            "operation": "update_calendar_event",
+            "event_id": event_id,
+            "title": "Partner livestream",
+            "start_date": "2026-07-14",
+            "description_present": True,
+            "description_mode": "append",
+            "verification": {"status": "verified", "passed": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "resolve_calendar_action_plan", fake_interpret)
+    monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
+    monkeypatch.setattr(cli, "update_google_calendar_event_impl", fake_update)
+    request = (
+        "chief of staff continue this prior Slack thread. "
+        "Previous request: schedule a calendar event on July 14 titled Partner livestream "
+        "Previous result title: Calendar event updated "
+        "Previous result: provider verification passed "
+        f"User follow-up: Add this link to the notes: {url} "
+        "Continue the same agent task."
+    )
+
+    exit_code = main(
+        ["ask", "--agent", "chief_of_staff", "--live-sdk", "--json", request]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "done"
+    assert captured["fallback"] is None
+    assert captured["update"]["description"] == url
+    assert captured["update"]["append_description"] is True
 
 
 def test_chief_calendar_natural_update_dry_run_previews_lookup_without_write(
@@ -1906,40 +3170,15 @@ def test_chief_calendar_natural_update_dry_run_previews_lookup_without_write(
     assert payload["openai_requests"] == 0
 
 
-def test_cli_no_live_chief_receipt_command_returns_bounded_write_plan(
+def test_cli_no_live_chief_receipt_command_returns_direct_airtable_write_plan(
     capsys,
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
-
     receipt_path = tmp_path / "example-business-cards-receipt.pdf"
     receipt_path.write_bytes(b"%PDF-1.4\nreceipt fixture")
 
-    def fake_extract(path: str) -> FinanceReceiptEvidence:
-        return FinanceReceiptEvidence(
-            source_path=str(path),
-            filename=Path(path).name,
-            content_read=True,
-            extraction_method="fixture",
-            vendor="Example Print Inc.",
-            receipt_date="2026-06-28",
-            order_number="1002003",
-            description="Business Cards",
-            quantity="50",
-            subtotal="31.00",
-            shipping="45.80",
-            total="76.80",
-            currency="USD",
-            payment_summary="credit card ending in 0000",
-            estimated_tax_periods="Q3",
-        )
-
     monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
-    monkeypatch.setattr(
-        "keystone_agents.workflow_runner.extract_finance_receipt_evidence",
-        fake_extract,
-    )
 
     exit_code = main(
         [
@@ -1976,19 +3215,19 @@ def test_cli_no_live_chief_receipt_command_returns_bounded_write_plan(
     human_summary = payload["human_summary"]
     assert exit_code == 0
     assert payload["status"] == "done"
-    assert payload["route"] == "chief_of_staff"
+    assert payload["route"] == "airtable_context_agent"
     assert payload["manual_request_plan"]["intent"] == "business_system_write"
     assert payload["manual_request_plan"]["target_type"] == "business_system_context"
     assert "Read-only only" not in human_summary
     assert "finance_tax_tracker" in human_summary
     assert "Business Expenses" in human_summary
-    assert "Example Print Inc." in human_summary
-    assert "Q3" in human_summary
-    assert "76.80" in human_summary
-    assert "airtable_create_expense_from_receipt" in human_summary
-    assert payload["next_action"]["requires_approval"] is True
-    assert payload["artifact_refs"][0]["metadata"]["send_enabled"] is False
-    assert payload["artifact_refs"][0]["metadata"]["slack_post_allowed"] is False
+    assert payload["output"]["write_plan"]["operation"] == (
+        "airtable_specialist_create_from_receipt_after_schema_and_approval"
+    )
+    assert payload["output"]["write_plan"]["target"] == (
+        "finance_tax_tracker / Business Expenses"
+    )
+    assert payload["side_effects"]["external_write_performed"] is False
 
 
 def test_cli_ask_chief_of_staff_outputs_deterministic_plan(capsys) -> None:
@@ -2313,6 +3552,7 @@ def test_cli_ask_agent_override_auto_live_sdk_in_live_mode(
     assert "scripts/run_company_research.py" in calls[0]
     assert "--live-sdk" in calls[0]
     assert "--live-search-plan" in calls[0]
+    assert "--compact-instructions" in calls[0]
 
 
 def test_cli_live_finance_receipt_write_skips_live_manual_planner(
@@ -2336,26 +3576,14 @@ def test_cli_live_finance_receipt_write_skips_live_manual_planner(
             **kwargs,
         )
 
-    def fake_run(command, **_kwargs):
-        captured["command"] = command
-        return SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps(
-                {
-                    "output_type": "ChiefOfStaffResult",
-                    "send_enabled": False,
-                    "human_summary": "blocked before model/tool call",
-                    "output": {
-                        "summary": "blocked before model/tool call",
-                        "send_enabled": False,
-                    },
-                }
-            ),
-            stderr="",
-        )
+    def fake_specialist(route, input_text, **kwargs):
+        captured["route"] = route
+        captured["input_text"] = input_text
+        captured["manual_plan"] = kwargs["manual_plan"]
+        return 0
 
     monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_run_orchestrator_preflight)
-    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", fake_specialist)
 
     exit_code = main(
         [
@@ -2386,13 +3614,13 @@ def test_cli_live_finance_receipt_write_skips_live_manual_planner(
         ]
     )
 
-    payload = json.loads(capsys.readouterr().out)
     assert exit_code == 0
     assert captured["live_manual_plan"] is False
-    assert "scripts/run_chief_of_staff.py" in captured["command"]
-    assert "--live-sdk" in captured["command"]
-    assert payload["manual_request_plan"]["intent"] == "business_system_write"
-    assert payload["manual_request_plan"]["target_type"] == "business_system_context"
+    assert captured["route"] == "airtable_context_agent"
+    assert "example-business-cards-receipt.pdf" in str(captured["input_text"])
+    plan = captured["manual_plan"]
+    assert plan.intent == "business_system_write"
+    assert plan.target_type == "business_system_context"
 
 
 def test_cli_bounded_smoke_suppresses_live_manual_planner_and_live_search(
@@ -2424,42 +3652,22 @@ def test_cli_bounded_smoke_suppresses_live_manual_planner_and_live_search(
             **kwargs,
         )
 
-    def fake_advance_work_item_manager_loop(request, **_kwargs):
-        captured["request"] = request
-        item = WorkItem(
-            kind=WorkItemKind.COMPANY_RESEARCH,
-            title="Research: NeuroFlow",
-            request_text=request.request_text,
-            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
-            status=WorkItemStatus.DONE,
-        )
-        return WorkflowRunResult(
-            work_item=item,
-            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
-            status=WorkItemStatus.DONE,
-            advanced=True,
-            human_summary="Business Research completed.",
-            manual_request_plan=request.manual_request_plan,
-            orchestrator_preflight=request.orchestrator_preflight,
-        )
+    def fake_direct(route, input_text, **kwargs):
+        captured["direct"] = {"route": route, "input_text": input_text, **kwargs}
+        return 0
 
     monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_run_orchestrator_preflight)
-    monkeypatch.setattr(
-        "keystone_agents.langgraph_workflow.advance_work_item_manager_loop_with_optional_langgraph",
-        fake_advance_work_item_manager_loop,
-    )
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", fake_direct)
 
     exit_code = main(["ask", "--live-search", "--live-sdk", "--json", prompt])
 
-    payload = json.loads(capsys.readouterr().out)
-    request = captured["request"]
     assert exit_code == 0
+    assert capsys.readouterr().out == ""
     assert captured["live_manual_plan"] is False
-    assert request.live_search is False
-    assert request.live_sdk is True
-    assert request.manual_request_plan["target_agent"] == "business_research_analyst"
-    assert request.manual_request_plan["requires_live_search"] is False
-    assert payload["route"] == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    assert cli._request_forbids_live_research(prompt) is True
+    direct = captured["direct"]
+    assert direct["route"] == "business_research_analyst"
+    assert direct["manual_plan"].requires_live_search is False
 
 
 def test_cli_ask_agent_override_promotes_child_human_summary(
@@ -2596,19 +3804,21 @@ def test_cli_live_outreach_inline_context_uses_work_item_runner(
     assert "Approved evidence" in str(captured["input_text"])
 
 
-def test_cli_live_opportunity_scout_no_external_context_uses_work_item_runner(
+def test_cli_live_opportunity_scout_no_external_context_uses_direct_inline_synthesis(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     captured: dict[str, object] = {}
     database_url = f"sqlite:///{tmp_path / 'opportunity-inline.db'}"
 
-    def fake_run_ask_work_item(input_text, **kwargs):
+    def fake_run_ask_script_live(route, input_text, command, **kwargs):
+        captured["route"] = route
         captured["input_text"] = input_text
+        captured["command"] = command
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_run_ask_work_item", fake_run_ask_work_item)
+    monkeypatch.setattr(cli, "_run_ask_script_live", fake_run_ask_script_live)
 
     exit_code = cli._run_ask_opportunity_scout_live(
         "opportunity scout agent: diagnostic case diag_opp. Use only this sanitized "
@@ -2624,26 +3834,32 @@ def test_cli_live_opportunity_scout_no_external_context_uses_work_item_runner(
     )
 
     assert exit_code == 0
+    assert captured["route"] == "opportunity_scout"
     assert captured["database_url"] == database_url
-    assert captured["live_search"] is False
-    assert captured["live_sdk"] is True
     assert captured["cost_tracking_requested"] is True
     assert "Cedar Grove Pediatrics" in str(captured["input_text"])
+    command = captured["command"]
+    assert "scripts/run_compact_opportunity_assessment.py" in command
+    assert "--inline-source-context" in command
+    assert "--no-save-output" in command
+    assert command[command.index("--max-openai-requests") + 1] == "1"
 
 
-def test_cli_live_business_research_no_external_context_uses_work_item_runner(
+def test_cli_live_business_research_no_external_context_uses_direct_inline_synthesis(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     captured: dict[str, object] = {}
     database_url = f"sqlite:///{tmp_path / 'business-research-inline.db'}"
 
-    def fake_run_ask_work_item(input_text, **kwargs):
+    def fake_run_ask_script_live(route, input_text, command, **kwargs):
+        captured["route"] = route
         captured["input_text"] = input_text
+        captured["command"] = command
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_run_ask_work_item", fake_run_ask_work_item)
+    monkeypatch.setattr(cli, "_run_ask_script_live", fake_run_ask_script_live)
 
     exit_code = cli._run_ask_company_research_live(
         "business research analyst agent: diagnostic case diag_bra. Use only this "
@@ -2660,11 +3876,87 @@ def test_cli_live_business_research_no_external_context_uses_work_item_runner(
     )
 
     assert exit_code == 0
+    assert captured["route"] == "business_research_analyst"
     assert captured["database_url"] == database_url
-    assert captured["live_search"] is False
-    assert captured["live_sdk"] is True
     assert captured["cost_tracking_requested"] is True
     assert "Northstar Sleep Lab" in str(captured["input_text"])
+    command = captured["command"]
+    assert "--inline-source-context" in command
+    assert command[command.index("--inline-source-context") + 1] == captured["input_text"]
+    assert "--no-live-search" in command
+    assert "--compact-instructions" in command
+    assert "--focused-brief" in command
+
+
+def test_company_research_inline_context_is_one_user_provided_source() -> None:
+    import scripts.run_company_research as company_cli
+
+    evidence = "Northstar Sleep Lab is considering an internal dashboard review."
+    args = company_cli.build_parser().parse_args(
+        [
+            "--company",
+            "Northstar Sleep Lab",
+            "--inline-source-context",
+            evidence,
+            "--no-live-search",
+        ]
+    )
+
+    profile, metadata = company_cli._retrieve_company_profile(args)
+
+    assert profile.name == "Northstar Sleep Lab"
+    assert profile.description == evidence
+    assert profile.evidence == [evidence]
+    assert len(profile.sources) == 1
+    assert profile.sources[0].source_type == "user_provided"
+    assert profile.sources[0].url == "operator://inline-company-context"
+    assert metadata["mode"] == "inline_context"
+    assert metadata["live_search"] is False
+
+
+def test_company_research_quick_retrieval_receives_raw_operator_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_company_research as company_cli
+
+    captured: dict[str, object] = {}
+
+    def fake_retrieve_company_profile_live(**kwargs: object):
+        captured.update(kwargs)
+        return company_cli.CompanyProfile(name="Abridge"), {"mode": "live_search"}
+
+    monkeypatch.setattr(
+        company_cli,
+        "retrieve_company_profile_live",
+        fake_retrieve_company_profile_live,
+    )
+    monkeypatch.setattr(
+        company_cli,
+        "require_cli_live_confirmation",
+        lambda **_kwargs: None,
+    )
+    request_text = "Who is Abridge? Summarize the company in 20 words."
+    args = company_cli.build_parser().parse_args(
+        [
+            "--company",
+            "Abridge",
+            "--request-text",
+            request_text,
+            "--live-search",
+            "--no-dry-run",
+            "--quick-retrieval",
+        ]
+    )
+
+    company_cli._retrieve_company_profile(args)
+
+    assert captured["request_text"] == request_text
+    assert captured["max_results"] == 5
+    assert captured["agents_web_search_max_calls"] == 1
+    assert captured["tavily_search_fallback"] is False
+    assert captured["exa_search_fallback"] is False
+    assert captured["extract_selected_pages"] is False
+    assert captured["max_queries"] == 2
 
 
 def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
@@ -2767,8 +4059,8 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
         "gateway_mode": False,
         "sdk_turn_policy": {
             "agent_name": "airtable_context_agent",
-            "max_turns": 6,
-            "source": "fixed_default",
+            "max_turns": 2,
+            "source": "direct_single_action:fixed_default",
         },
     }
     assert payload["usage"] == {
@@ -2793,7 +4085,7 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
             "live": True,
             "live_reads_env": "true",
             "operator_approval": None,
-            "max_turns": 6,
+            "max_turns": 2,
         }
     ]
     assert os.environ.get(cli.AIRTABLE_LIVE_READS_ENV) is None
@@ -2874,6 +4166,21 @@ def test_marked_zotero_lifecycle_receives_process_local_operator_approval(
         "KEYSTONE_ZOTERO_OPERATOR_APPROVAL_REFERENCE",
         raising=False,
     )
+    monkeypatch.setattr(
+        cli,
+        "read_zotero_api_key_capabilities",
+        lambda: {
+            "status": "success",
+            "provider_read": True,
+            "operation": "verify_api_key_capabilities",
+            "user_id_present": True,
+            "user_library": True,
+            "user_files": True,
+            "user_notes": True,
+            "user_write": True,
+            "send_enabled": False,
+        },
+    )
     monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
     monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
 
@@ -2890,6 +4197,1295 @@ def test_marked_zotero_lifecycle_receives_process_local_operator_approval(
     assert str(captured["prompt"]).startswith(request)
     assert "Call the matching typed tool with live=true" in str(captured["prompt"])
     assert os.environ.get("KEYSTONE_ZOTERO_OPERATOR_APPROVAL_REFERENCE") is None
+
+
+def test_direct_context_agent_receives_bounded_thread_identity_for_followup(
+    monkeypatch,
+    capsys,
+) -> None:
+    captured: dict[str, str] = {}
+    request = "Add this link to the notes: https://example.test/thread/123"
+    execution_context = {
+        "schema": "keystone.direct_specialist_context.v1",
+        "prior_agent_runs": [
+            {
+                "route": "zotero_context_agent",
+                "object_id": "ITEM123",
+                "title": "Example article",
+            }
+        ],
+    }
+
+    def fake_run_typed_sdk_sync(_agent, prompt, _output_type, **_kwargs):
+        captured["prompt"] = prompt
+        return (
+            SimpleNamespace(final_output=None, usage=None, new_items=[]),
+            ZoteroContextResult(summary="Prepared the scoped note update."),
+        )
+
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
+
+    exit_code = cli._run_ask_context_agent_live(
+        "zotero_context_agent",
+        request,
+        json_output=True,
+        execution_context=execution_context,
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["input"] == request
+    assert captured["prompt"].startswith(request)
+    assert "ITEM123" in captured["prompt"]
+    assert "current operator request is authoritative" in captured["prompt"]
+
+
+def test_direct_airtable_receipt_live_prompt_includes_selected_attachment(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    captured: dict[str, object] = {}
+    receipt = tmp_path / "Receipt-example.pdf"
+    receipt.write_bytes(b"%PDF-1.4\n% bounded test receipt\n")
+    request = "add this attached receipt as exactly one personal expense in Airtable"
+    plan = infer_manual_request_plan(request, requested_agent="airtable_context_agent")
+
+    def fake_run_typed_sdk_sync(agent, prompt, _output_type, **_kwargs):
+        captured["prompt"] = prompt
+        captured["tool_names"] = {
+            str(getattr(tool, "name", "") or getattr(tool, "__name__", ""))
+            for tool in agent.tools or []
+        }
+        return (
+            SimpleNamespace(final_output=None, usage=None, new_items=[]),
+            cli.AirtableContextResult(
+                mode="llm",
+                summary="Prepared one receipt-backed personal expense create.",
+                base_alias="finance_tax_tracker",
+                relevant_tables=["Personal Expenses"],
+            ),
+        )
+
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
+
+    exit_code = cli._run_ask_context_agent_live(
+        "airtable_context_agent",
+        request,
+        json_output=True,
+        manual_plan=plan,
+        execution_context={
+            "schema": "keystone.direct_specialist_context.v1",
+            "thread_transcript_tail": f"Slack attachment materialized locally: {receipt}",
+        },
+    )
+
+    assert exit_code == 0
+    json.loads(capsys.readouterr().out)
+    assert str(receipt) in str(captured["prompt"])
+    assert "airtable_target_table" in str(captured["prompt"])
+    assert captured["tool_names"] == {"airtable_create_expense_from_receipt"}
+
+
+def test_direct_airtable_followup_update_receives_thread_record_identity(
+    monkeypatch,
+    capsys,
+) -> None:
+    captured: dict[str, object] = {}
+    request = (
+        "In Airtable, update the Description field on this personal expense to "
+        "'Linear Basic - direct-call verification 2026-07-13', and verify the same record."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="airtable_context_agent")
+
+    def fake_run_typed_sdk_sync(agent, prompt, _output_type, **kwargs):
+        captured["prompt"] = prompt
+        captured["max_turns"] = kwargs.get("max_turns")
+        captured["operator_approval"] = os.environ.get(
+            "KEYSTONE_AIRTABLE_OPERATOR_APPROVAL_REFERENCE"
+        )
+        captured["tool_names"] = {
+            str(getattr(tool, "name", "") or getattr(tool, "__name__", ""))
+            for tool in agent.tools or []
+        }
+        return (
+            SimpleNamespace(final_output=None, usage=None, new_items=[]),
+            cli.AirtableContextResult(
+                mode="llm",
+                summary="Prepared the exact Personal Expenses update.",
+                base_alias="finance_tax_tracker",
+                relevant_tables=["Personal Expenses"],
+            ),
+        )
+
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
+
+    exit_code = cli._run_ask_context_agent_live(
+        "airtable_context_agent",
+        request,
+        json_output=True,
+        manual_plan=plan,
+        execution_context={
+            "schema": "keystone.direct_specialist_context.v1",
+            "thread_transcript_tail": (
+                "Prior verified Airtable result: table Personal Expenses; "
+                "record ID recSyntheticReceipt; record and attachment read-back passed."
+            ),
+        },
+    )
+
+    assert exit_code == 0
+    json.loads(capsys.readouterr().out)
+    assert plan.intent == "business_system_write"
+    assert "recSyntheticReceipt" in str(captured["prompt"])
+    assert "Call the matching typed tool with live=true" in str(captured["prompt"])
+    assert str(captured["operator_approval"]).startswith("airtable-direct:")
+    assert captured["max_turns"] == 3
+    assert "airtable_write_record" in captured["tool_names"]
+    assert "airtable_get_base_schema" in captured["tool_names"]
+
+
+def test_direct_specialist_context_is_selective_bounded_and_redacted() -> None:
+    workflow_state = {
+        "slack_context": {"channel_id": "C123", "thread_ts": "1783965218.778179"},
+        "recent_slack_thread": [
+            {
+                "id": "1",
+                "source_agent": "zotero_context_agent",
+                "summary": "Resolved Example article as ITEM123 with api_key=secret-value.",
+            }
+        ],
+        "prior_agent_runs": [
+            {
+                "route": "zotero_context_agent",
+                "status": "success",
+                "object_id": "ITEM123",
+                "title": "Example article",
+            }
+        ],
+        "slack_thread_transcript": "Resolved Example article as ITEM123.",
+    }
+
+    assert (
+        cli._direct_specialist_execution_context(
+            "Read the most recently added Zotero abstract.",
+            workflow_state=workflow_state,
+        )
+        == {}
+    )
+
+    context = cli._direct_specialist_execution_context(
+        "Add this link to the notes.",
+        workflow_state=workflow_state,
+    )
+    serialized = json.dumps(context, sort_keys=True)
+    assert context["schema"] == "keystone.direct_specialist_context.v1"
+    assert "ITEM123" in serialized
+    assert "secret-value" not in serialized
+    assert len(serialized) < 5000
+
+    forced_context = cli._direct_specialist_execution_context(
+        "The path is /private/tmp/receipt.pdf.",
+        workflow_state=workflow_state,
+        force_thread_context=True,
+    )
+    assert forced_context["slack_scope"]["thread_ts"] == "1783965218.778179"
+    assert "ITEM123" in json.dumps(forced_context, sort_keys=True)
+
+
+def test_workitem_preflight_context_expands_exact_current_target_identity() -> None:
+    work_item = WorkItem(
+        id="wi_exact_gmail_draft",
+        kind=WorkItemKind.GMAIL_THREAD,
+        title="Revise the selected Gmail draft",
+        request_text="Create the marked draft without sending it.",
+        current_route=WorkItemRoute.GMAIL_TRIAGE,
+        target=WorkItemTarget(
+            name="KBA_TEST_DRAFT_EXACT",
+            object_type="gmail_draft",
+            external_id="draftExact123",
+        ),
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="gmail_draft",
+                artifact_id="draftExact123",
+                source_agent="gmail_triage",
+                title="KBA_TEST_DRAFT_EXACT",
+                summary="Provider read-back verified the exact marked draft.",
+                selected=True,
+            )
+        ],
+        next_action=WorkItemNextAction(
+            action="revise_draft",
+            agent=WorkItemRoute.GMAIL_TRIAGE,
+            description="Revise only the selected draft and verify the same ID.",
+        ),
+    )
+
+    state = cli._orchestrator_workflow_state_from_cli_context(work_item=work_item)
+
+    assert state["current_work_item"]["target"] == {
+        "name": "KBA_TEST_DRAFT_EXACT",
+        "object_type": "gmail_draft",
+        "external_id": "draftExact123",
+    }
+    assert state["current_work_item"]["selected_artifacts"][0]["artifact_id"] == (
+        "draftExact123"
+    )
+    assert state["current_work_item"]["next_action"]["action"] == "revise_draft"
+    assert "metadata" not in state["current_work_item"]
+
+
+def test_slack_context_file_does_not_replace_current_workitem_identity(
+    tmp_path: Path,
+) -> None:
+    context_path = tmp_path / "selected-slack-context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.selected_message_context.v1",
+                "channel_id": "C123",
+                "channel_name": "ai-agents-workflow",
+                "selected_message_ts": "1715366400.000100",
+                "thread_ts": "1715366400.000100",
+                "selected_message": {
+                    "ts": "1715366400.000100",
+                    "user_id": "U123",
+                    "text": "Revise the same draft.",
+                },
+                "thread_messages": [
+                    {
+                        "ts": "1715366400.000100",
+                        "user_id": "U123",
+                        "text": "Revise the same draft.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    work_item = WorkItem(
+        id="wi_exact_gmail_draft",
+        kind=WorkItemKind.GMAIL_THREAD,
+        title="Revise exact draft",
+        current_route=WorkItemRoute.GMAIL_TRIAGE,
+        target=WorkItemTarget(
+            name="KBA_TEST_DRAFT_EXACT",
+            object_type="gmail_draft",
+            external_id="draftExact123",
+        ),
+    )
+
+    state = cli._orchestrator_workflow_state_from_cli_context(
+        context_file_path=str(context_path),
+        request_text="Make it shorter, and do not send.",
+        work_item=work_item,
+    )
+
+    assert state["slack_context"]["channel_id"] == "C123"
+    assert state["recent_slack_thread"][0]["summary"] == "Revise the same draft."
+    assert state["current_work_item"]["target"]["external_id"] == "draftExact123"
+
+
+def test_slack_history_context_preserves_root_and_speaker_roles_for_direct_and_graph_paths(
+    tmp_path: Path,
+) -> None:
+    context_path = tmp_path / "slack-history-context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1770000000.000100",
+                "request_ts": "1770000000.000400",
+                "thread_root_request": (
+                    "CoS, using only these facts, return exactly three bullets."
+                ),
+                "thread_messages": [
+                    {
+                        "ts": "1770000000.000100",
+                        "role": "operator",
+                        "source_agent": "UUSER",
+                        "text": "CoS, using only these facts, return exactly three bullets.",
+                    },
+                    {
+                        "ts": "1770000000.000200",
+                        "role": "agent",
+                        "source_agent": "kni",
+                        "text": "Business Research Analyst article summary from a stale route.",
+                    },
+                ],
+                "read_context": "Slack thread history digest with bounded history.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = cli._orchestrator_workflow_state_from_cli_context(
+        context_file_path=str(context_path),
+        request_text="CoS, fix the reply using my original request.",
+    )
+    direct_context = cli._direct_specialist_execution_context(
+        "Fix the same reply.",
+        workflow_state=state,
+        force_thread_context=True,
+    )
+    preflight = cli.run_orchestrator_preflight(
+        "CoS, fix the reply using my original request.",
+        requested_agent="chief_of_staff",
+        workflow_state=state,
+    )
+
+    assert state["slack_thread_root"].startswith("CoS, using only these facts")
+    assert state["recent_slack_thread"][0]["role"] == "operator"
+    assert state["recent_slack_thread"][1]["role"] == "agent"
+    assert direct_context["thread_root_request"] == state["slack_thread_root"]
+    assert direct_context["recent_thread_messages"][1]["role"] == "agent"
+    assert cli._bounded_direct_route_from_preflight(preflight) == "chief_of_staff"
+    assert cli._preflight_requires_work_item(preflight) is False
+
+
+def test_resumable_supplied_context_requires_work_item_even_if_planner_selects_one_owner() -> None:
+    request = (
+        "CoS, track this as a resumable internal review. Use only these approved "
+        "facts: Northstar Care sells referral-navigation software; it has not supplied "
+        "audited outcomes or an evaluation design. Assess what is supported and "
+        "prepare a paste-ready internal Slack recommendation. Preserve the assessment "
+        "and recommendation together so I can revise it later. Do not search or use "
+        "provider tools."
+    )
+    preflight = cli.run_orchestrator_preflight(
+        request,
+        requested_agent="chief_of_staff",
+    )
+    one_owner_plan = preflight.manual_request_plan.model_copy(
+        update={
+            "target_agent": "chief_of_staff",
+            "workflow": [],
+        }
+    )
+    one_owner_preflight = preflight.model_copy(
+        update={
+            "request_text": request,
+            "manual_request_plan": one_owner_plan,
+            "route_result": preflight.route_result.model_copy(
+                update={
+                    "route": "chief_of_staff",
+                    "workflow": ["chief_of_staff"],
+                }
+            ),
+        }
+    )
+
+    assert cli._preflight_requires_work_item(one_owner_preflight) is True
+
+
+def test_mixed_slack_thread_correction_stays_direct_chief_instead_of_workitem(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context_path = tmp_path / "mixed-slack-history.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1770000000.000100",
+                "request_ts": "1770000000.000400",
+                "thread_root_request": (
+                    "CoS, using only these facts, give me exactly three bullets: "
+                    "one shared envelope; separate backends; verified receipts."
+                ),
+                "thread_messages": [
+                    {
+                        "ts": "1770000000.000100",
+                        "role": "operator",
+                        "source_agent": "UUSER",
+                        "text": (
+                            "CoS, using only these facts, give me exactly three bullets."
+                        ),
+                    },
+                    {
+                        "ts": "1770000000.000200",
+                        "role": "agent",
+                        "source_agent": "kni",
+                        "text": (
+                            "Business Research Analyst article summary from a stale route."
+                        ),
+                    },
+                ],
+                "read_context": "Slack thread history digest with the same messages.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    envelope = "\n".join(
+        [
+            "business agents continue this prior Slack thread.",
+            "Previous request: CoS give me the same three bullets. *Sent using*",
+            "Previous result: Business Research Analyst article summary.",
+            (
+                "User follow-up: CoS, fix the last reply and give me only the same "
+                "three bullets. *Sent using*"
+            ),
+            (
+                "Continue the same agent task, treating the current user request as "
+                "authoritative."
+            ),
+        ]
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_specialist(route, input_text, **kwargs):
+        captured["route"] = route
+        captured["input_text"] = input_text
+        captured["execution_context"] = kwargs.get("execution_context")
+        return 0
+
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", fake_run_specialist)
+    database_url = f"sqlite:///{tmp_path / 'mixed-thread.db'}"
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--no-live-manual-plan",
+            "--json",
+            "--database-url",
+            database_url,
+            "--context-file",
+            str(context_path),
+            envelope,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["route"] == "chief_of_staff"
+    assert captured["input_text"] == (
+        "CoS give me the same three bullets.\n"
+        "Prior result for context: Business Research Analyst article summary.\n"
+        "Authoritative follow-up: fix the last reply and give me only the same "
+        "three bullets."
+    )
+    execution_context = captured["execution_context"]
+    assert isinstance(execution_context, dict)
+    assert execution_context["thread_root_request"].startswith(
+        "CoS, using only these facts"
+    )
+    assert SQLiteStore(database_url).list_work_items() == []
+
+
+def test_slack_context_agents_keep_thread_scoped_sdk_continuity(tmp_path: Path) -> None:
+    context_path = tmp_path / "slack-context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.selected_message_context.v1",
+                "team_id": "T123",
+                "channel_id": "C123",
+                "thread_ts": "1783967611.595449",
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        sdk_session=None,
+        sdk_session_id="",
+        sdk_session_db="",
+        sdk_session_history_limit=None,
+    )
+
+    slack_spec = cli._sdk_session_spec_for_ask(
+        args,
+        route="zotero_context_agent",
+        default_enabled=cli._ask_route_session_default("zotero_context_agent"),
+        context_file_path=str(context_path),
+    )
+    cli_spec = cli._sdk_session_spec_for_ask(
+        args,
+        route="zotero_context_agent",
+        default_enabled=cli._ask_route_session_default("zotero_context_agent"),
+    )
+
+    assert slack_spec.enabled is True
+    assert slack_spec.scope == "slack"
+    assert slack_spec.history_limit == 6
+    assert cli_spec.enabled is False
+
+
+def test_direct_gmail_followup_uses_bounded_thread_context_without_graph(
+    monkeypatch,
+    capsys,
+) -> None:
+    captured: dict[str, object] = {}
+    execution_context = {
+        "schema": "keystone.direct_specialist_context.v1",
+        "recent_thread_messages": [
+            {
+                "source_agent": "operator",
+                "summary": "From: Taylor. Subject: Pilot review. Can Tuesday work?",
+            }
+        ],
+    }
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs.get("env")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"output": {"summary": "Drafted a reply from selected context."}}
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
+
+    exit_code = cli._run_ask_gmail_triage_live(
+        "Draft a reply to this email confirming Tuesday works. Do not send.",
+        json_output=True,
+        manual_plan=None,
+        orchestrator_preflight=None,
+        sdk_session_spec=None,
+        execution_context=execution_context,
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["output"]["summary"] == "Drafted a reply from selected context."
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "scripts/run_gmail_triage.py" in command
+    assert "--fixture" in command
+    assert "--no-live-gmail" in command
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "KEYSTONE_SPECIALIST_EXECUTION_CONTEXT_JSON" in env
+
+
+def test_direct_gmail_update_resolves_subject_only_from_matching_prior_route() -> None:
+    context = {
+        "prior_agent_runs": [
+            {"route": "zotero_context_agent", "title": "Wrong source title"},
+            {"route": "gmail_triage", "title": "Pilot review draft"},
+        ]
+    }
+
+    assert (
+        cli._direct_context_object_title(context, preferred_route="gmail_triage")
+        == "Pilot review draft"
+    )
+    assert cli._direct_context_object_title(context, preferred_route="chief_of_staff") == ""
+
+
+def test_zotero_latest_abstract_preacquires_provider_evidence_before_synthesis(
+    monkeypatch,
+    capsys,
+) -> None:
+    request = (
+        "Use Zotero to select the most recently added journal article with a stored "
+        "abstract. Provide its exact title and summarize the abstract."
+    )
+
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "read_latest_zotero_journal_abstract_metadata",
+        lambda: {
+            "status": "success",
+            "provider_read": True,
+            "provider_order": {
+                "sort": "dateAdded",
+                "direction": "desc",
+                "top_level_only": True,
+                "item_type": "journalArticle",
+            },
+            "selection_rule": "first_nonempty_abstract_in_provider_order",
+            "require_abstract": True,
+            "item_count": 1,
+            "selected_item_title": "Provider article",
+            "selected_item_has_abstract": True,
+            "selected_item_date_added": "2026-07-12T12:00:00Z",
+            "items": [
+                {
+                    "key": "ITEM123",
+                    "data": {
+                        "title": "Provider article",
+                        "dateAdded": "2026-07-12T12:00:00Z",
+                        "creators": [
+                            {"firstName": "Amina", "lastName": "Researcher"},
+                            {"name": "Clinical AI Consortium"},
+                        ],
+                        "publicationTitle": "Journal of Clinical AI",
+                        "journalAbbreviation": "J Clin AI",
+                        "date": "2026",
+                        "abstractNote": "Provider abstract evidence.",
+                    },
+                }
+            ],
+        },
+    )
+
+    def fake_run_typed_sdk_sync(_agent, prompt, _output_type, **_kwargs):
+        captured["tool_count"] = str(len(_agent.tools or []))
+        captured["prompt"] = prompt
+        return (
+            SimpleNamespace(final_output=None, usage=None, new_items=[]),
+            ZoteroContextResult(
+                summary="Provider abstract evidence.",
+                article_titles=["Provider article"],
+            ),
+        )
+
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
+
+    exit_code = cli._run_ask_context_agent_live(
+        "zotero_context_agent",
+        request,
+        json_output=True,
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "done"
+    assert payload["block_kind"] == ""
+    assert payload["side_effects"]["evidence_complete"] is True
+    assert "Provider abstract evidence" in captured["prompt"]
+    assert "Amina Researcher" in captured["prompt"]
+    assert "Clinical AI Consortium" in captured["prompt"]
+    assert "Journal of Clinical AI" in captured["prompt"]
+    assert captured["tool_count"] == "0"
+    assert payload["tool_receipts"][0]["provider_read"] is True
+
+
+def test_zotero_latest_journal_metadata_preacquires_requested_fields(
+    monkeypatch,
+    capsys,
+) -> None:
+    request = (
+        "Use Zotero to select the most recently added journal article. Return only "
+        "its exact title, authors, and publication title. Do not use web search, "
+        "full text, or modify Zotero."
+    )
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "read_latest_zotero_journal_metadata",
+        lambda **_kwargs: {
+            "status": "success",
+            "provider_read": True,
+            "provider_order": {
+                "sort": "dateAdded",
+                "direction": "desc",
+                "top_level_only": True,
+                "item_type": "journalArticle",
+            },
+            "selection_rule": "provider_order",
+            "require_abstract": False,
+            "item_count": 1,
+            "selected_item_title": "Newest provider article",
+            "selected_item_date_added": "2026-07-13T12:00:00Z",
+            "items": [
+                {
+                    "key": "ITEM456",
+                    "data": {
+                        "title": "Newest provider article",
+                        "dateAdded": "2026-07-13T12:00:00Z",
+                        "creators": [
+                            {"firstName": "Amina", "lastName": "Researcher"},
+                            {"name": "Clinical AI Consortium"},
+                        ],
+                        "publicationTitle": "Journal of Clinical AI",
+                    },
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "read_latest_zotero_journal_abstract_metadata",
+        lambda: (_ for _ in ()).throw(AssertionError("abstract-only read must not run")),
+    )
+
+    def fake_run_typed_sdk_sync(agent, prompt, _output_type, **_kwargs):
+        captured["tool_count"] = str(len(agent.tools or []))
+        captured["prompt"] = prompt
+        return (
+            SimpleNamespace(final_output=None, usage=None, new_items=[]),
+            ZoteroContextResult(
+                summary=(
+                    "Title: Newest provider article\n"
+                    "Authors: Amina Researcher; Clinical AI Consortium\n"
+                    "Publication: Journal of Clinical AI"
+                ),
+                article_titles=["Newest provider article"],
+            ),
+        )
+
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
+
+    exit_code = cli._run_ask_context_agent_live(
+        "zotero_context_agent",
+        request,
+        json_output=True,
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "done"
+    assert payload["block_kind"] == ""
+    assert payload["side_effects"]["evidence_complete"] is True
+    assert "Amina Researcher" in captured["prompt"]
+    assert "Clinical AI Consortium" in captured["prompt"]
+    assert "Journal of Clinical AI" in captured["prompt"]
+    assert captured["tool_count"] == "0"
+    assert payload["tool_receipts"][0]["provider_read"] is True
+    assert payload["tool_receipts"][0]["require_abstract"] is False
+
+
+def test_zotero_latest_article_preflight_preserves_notes_and_attachment_identity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "read_latest_zotero_journal_metadata",
+        lambda **_kwargs: {
+            "status": "success",
+            "provider_read": True,
+            "provider_order": {"sort": "dateAdded", "direction": "desc"},
+            "selection_rule": "provider_order",
+            "require_abstract": False,
+            "item_count": 1,
+            "selected_item_title": "Provider article",
+            "items": [
+                {
+                    "key": "PARENT1",
+                    "data": {"title": "Provider article", "itemType": "journalArticle"},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "zotero_read_item_children",
+        lambda **_kwargs: json.dumps(
+            {
+                "status": "success",
+                "provider_read": True,
+                "parent_item_key": "PARENT1",
+                "note_count": 1,
+                "attachment_count": 1,
+                "children": [
+                    {
+                        "item_key": "NOTE1",
+                        "item_type": "note",
+                        "parent_item_key": "PARENT1",
+                        "note": "<p>Stored note evidence.</p>",
+                    },
+                    {
+                        "item_key": "PDF1",
+                        "item_type": "attachment",
+                        "parent_item_key": "PARENT1",
+                        "filename": "article.pdf",
+                        "content_type": "application/pdf",
+                    },
+                ],
+            }
+        ),
+    )
+
+    context, receipts, blocker = cli._direct_zotero_provider_preflight(
+        "zotero_context_agent",
+        "Use Zotero to select the most recently added article and list its notes "
+        "and available attachments.",
+    )
+
+    assert blocker == ""
+    assert "Stored note evidence" in context
+    assert "PDF1" in context
+    assert receipts[1] == {
+        "status": "success",
+        "provider_read": True,
+        "operation": "read_item_children",
+        "note_count": 1,
+        "attachment_count": 1,
+    }
+
+
+def test_zotero_latest_article_preflight_reads_exact_pdf_only_on_demand(
+    monkeypatch,
+) -> None:
+    pdf_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        cli,
+        "read_latest_zotero_journal_metadata",
+        lambda **_kwargs: {
+            "status": "success",
+            "provider_read": True,
+            "provider_order": {"sort": "dateAdded", "direction": "desc"},
+            "selection_rule": "provider_order",
+            "require_abstract": False,
+            "item_count": 1,
+            "selected_item_title": "Provider article",
+            "items": [
+                {
+                    "key": "PARENT1",
+                    "data": {"title": "Provider article", "itemType": "journalArticle"},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "zotero_read_item_children",
+        lambda **_kwargs: json.dumps(
+            {
+                "status": "success",
+                "provider_read": True,
+                "note_count": 0,
+                "attachment_count": 1,
+                "children": [
+                    {
+                        "item_key": "PDF1",
+                        "item_type": "attachment",
+                        "parent_item_key": "PARENT1",
+                        "filename": "article.pdf",
+                        "content_type": "application/pdf",
+                    }
+                ],
+            }
+        ),
+    )
+
+    def fake_pdf_read(**kwargs: object) -> str:
+        pdf_calls.append(kwargs)
+        return json.dumps(
+            {
+                "status": "success",
+                "provider_read": True,
+                "parent_item_key": "PARENT1",
+                "attachment_item_key": "PDF1",
+                "page_count": 2,
+                "pages_read": 2,
+                "char_count": 27,
+                "text": "Exact attached PDF evidence.",
+                "truncated": False,
+                "file_persisted": False,
+            }
+        )
+
+    monkeypatch.setattr(cli, "zotero_read_pdf_attachment_text", fake_pdf_read)
+
+    context, receipts, blocker = cli._direct_zotero_provider_preflight(
+        "zotero_context_agent",
+        "Use Zotero to select the most recently added article, read its attached PDF, "
+        "and summarize the paper.",
+    )
+
+    assert blocker == ""
+    assert "Exact attached PDF evidence" in context
+    assert pdf_calls == [
+        {
+            "parent_item_key": "PARENT1",
+            "attachment_item_key": "PDF1",
+            "max_pages": 25,
+            "max_chars": 50000,
+            "live": True,
+        }
+    ]
+    assert receipts[-1]["operation"] == "read_pdf_attachment_text"
+
+
+def test_zotero_write_preflight_blocks_rejected_key_before_specialist(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "read_zotero_api_key_capabilities",
+        lambda: (_ for _ in ()).throw(PermissionError("provider rejected key")),
+    )
+
+    context, receipts, blocker = cli._direct_zotero_provider_preflight(
+        "zotero_context_agent",
+        "Make a temporary Zotero note and then remove it.",
+    )
+
+    assert context == ""
+    assert receipts == [
+        {
+            "status": "error",
+            "provider_read": False,
+            "operation": "verify_api_key_capabilities",
+            "error_type": "PermissionError",
+        }
+    ]
+    assert "/keys/current" in blocker
+    assert "no Zotero data was modified" in blocker
+
+
+def test_zotero_write_preflight_requires_user_library_write_access(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "read_zotero_api_key_capabilities",
+        lambda: {
+            "status": "success",
+            "provider_read": True,
+            "operation": "verify_api_key_capabilities",
+            "user_id_present": True,
+            "user_library": True,
+            "user_files": True,
+            "user_notes": True,
+            "user_write": False,
+            "send_enabled": False,
+        },
+    )
+
+    context, receipts, blocker = cli._direct_zotero_provider_preflight(
+        "zotero_context_agent",
+        "Revise this Zotero item note.",
+    )
+
+    assert context == ""
+    assert receipts[0]["user_write"] is False
+    assert "does not grant user-library write access" in blocker
+
+
+def test_zotero_latest_article_preflight_respects_no_full_text_constraint(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "read_latest_zotero_journal_metadata",
+        lambda **_kwargs: {
+            "status": "success",
+            "provider_read": True,
+            "provider_order": {"sort": "dateAdded", "direction": "desc"},
+            "selection_rule": "provider_order",
+            "require_abstract": False,
+            "item_count": 1,
+            "selected_item_title": "Provider article",
+            "items": [
+                {
+                    "key": "PARENT1",
+                    "data": {"title": "Provider article", "itemType": "journalArticle"},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "zotero_read_item_children",
+        lambda **_kwargs: json.dumps(
+            {
+                "status": "success",
+                "provider_read": True,
+                "note_count": 0,
+                "attachment_count": 1,
+                "children": [
+                    {
+                        "item_key": "PDF1",
+                        "item_type": "attachment",
+                        "filename": "article.pdf",
+                        "content_type": "application/pdf",
+                    }
+                ],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "zotero_read_pdf_attachment_text",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("PDF text must not be read when expressly forbidden")
+        ),
+    )
+
+    context, receipts, blocker = cli._direct_zotero_provider_preflight(
+        "zotero_context_agent",
+        "Use Zotero to select the most recently added article and list its PDF "
+        "attachment, but do not use full text or read the PDF.",
+    )
+
+    assert blocker == ""
+    assert "article.pdf" in context
+    assert all(receipt.get("operation") != "read_pdf_attachment_text" for receipt in receipts)
+
+
+def test_zotero_latest_article_preflight_does_not_guess_between_multiple_pdfs(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "read_latest_zotero_journal_metadata",
+        lambda **_kwargs: {
+            "status": "success",
+            "provider_read": True,
+            "provider_order": {"sort": "dateAdded", "direction": "desc"},
+            "selection_rule": "provider_order",
+            "require_abstract": False,
+            "item_count": 1,
+            "selected_item_title": "Provider article",
+            "items": [
+                {
+                    "key": "PARENT1",
+                    "data": {"title": "Provider article", "itemType": "journalArticle"},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "zotero_read_item_children",
+        lambda **_kwargs: json.dumps(
+            {
+                "status": "success",
+                "provider_read": True,
+                "note_count": 0,
+                "attachment_count": 2,
+                "children": [
+                    {
+                        "item_key": key,
+                        "item_type": "attachment",
+                        "filename": filename,
+                        "content_type": "application/pdf",
+                    }
+                    for key, filename in (("PDF1", "main.pdf"), ("PDF2", "supplement.pdf"))
+                ],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "zotero_read_pdf_attachment_text",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an ambiguous PDF attachment must not be selected")
+        ),
+    )
+
+    context, receipts, blocker = cli._direct_zotero_provider_preflight(
+        "zotero_context_agent",
+        "Use Zotero to select the most recently added article, read its attached PDF, "
+        "and summarize the paper.",
+    )
+
+    assert blocker == ""
+    assert '"status": "ambiguous"' in context
+    assert "name one attachment" in context
+    assert all(receipt.get("operation") != "read_pdf_attachment_text" for receipt in receipts)
+
+
+def test_context_agent_public_blockers_deduplicate_mapping_messages() -> None:
+    blockers = cli._context_agent_public_blockers(
+        {
+            "blockers": [
+                "Provider field is unavailable.",
+                "Provider field is unavailable.",
+            ]
+        },
+        execution_blocker="Output validation needs clarification.",
+    )
+
+    assert blockers == [
+        {"message": "Provider field is unavailable."},
+        {"message": "Output validation needs clarification."},
+    ]
+
+
+def test_zotero_thread_followup_keeps_read_tools_for_new_metadata(
+    monkeypatch,
+    capsys,
+) -> None:
+    request = (
+        "For the same Zotero article, who are the authors, where was it published, "
+        "and summarize the stored abstract in no more than 100 words."
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_typed_sdk_sync(agent, prompt, _output_type, **kwargs):
+        captured["tool_names"] = {
+            str(getattr(tool, "name", "") or getattr(tool, "__name__", ""))
+            for tool in agent.tools or []
+        }
+        captured["prompt"] = prompt
+        captured["session"] = kwargs.get("session")
+        return (
+            SimpleNamespace(final_output=None, usage=None, new_items=[]),
+            ZoteroContextResult(
+                summary="The stored abstract reports a bounded follow-up synthesis.",
+                article_titles=["Provider article"],
+            ),
+        )
+
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
+
+    exit_code = cli._run_ask_context_agent_live(
+        "zotero_context_agent",
+        request,
+        json_output=True,
+        execution_context={
+            "schema": "keystone.direct_specialist_context.v1",
+            "prior_agent_runs": [
+                {
+                    "route": "zotero_context_agent",
+                    "title": "Provider article",
+                    "summary": "Prior abstract summary.",
+                }
+            ],
+        },
+    )
+
+    assert exit_code == 0
+    json.loads(capsys.readouterr().out)
+    assert "zotero_read_api_metadata" in captured["tool_names"]
+    assert "Provider article" in str(captured["prompt"])
+
+
+def test_direct_context_agent_tool_tier_separates_reads_from_writes() -> None:
+    read_plan = ManualRequestPlan(
+        target_agent="airtable_context_agent",
+        objective="Read the Airtable schema.",
+        intent="context_lookup",
+    )
+    write_plan = ManualRequestPlan(
+        target_agent="airtable_context_agent",
+        objective="Update one exact Airtable record.",
+        intent="business_system_write",
+    )
+
+    assert cli._direct_context_agent_tool_tier(read_plan) == "core_read"
+    assert cli._direct_context_agent_tool_tier(write_plan) == "internal_write"
+    assert cli._direct_context_agent_tool_tier(None) == "core_read"
+    assert (
+        cli._direct_context_agent_tool_tier(
+                None,
+                input_text=(
+                    "Using Airtable context, create one marked KBA test expense in the "
+                    "Business Expenses table, verify it, update the same record "
+                    "description, verify it again, and remove only that test record."
+                ),
+        )
+        == "internal_write"
+    )
+
+    read_agent = cli.AGENT_REGISTRY["airtable_context_agent"].build_agent(
+        request_text=read_plan.objective,
+        tool_tier=cli._direct_context_agent_tool_tier(read_plan),
+    )
+    write_agent = cli.AGENT_REGISTRY["airtable_context_agent"].build_agent(
+        request_text=write_plan.objective,
+        tool_tier=cli._direct_context_agent_tool_tier(write_plan),
+    )
+    read_names = {
+        str(getattr(tool, "name", "") or getattr(tool, "__name__", ""))
+        for tool in read_agent.tools or []
+    }
+    write_names = {
+        str(getattr(tool, "name", "") or getattr(tool, "__name__", ""))
+        for tool in write_agent.tools or []
+    }
+
+    assert read_names == {"airtable_get_base_schema", "airtable_read_records"}
+    assert "airtable_write_record" in write_names
+    assert read_names < write_names
+
+
+def test_zotero_strict_abstract_answer_promotes_substantive_model_evidence(
+    monkeypatch,
+    capsys,
+) -> None:
+    request = (
+        "Use Zotero to select the most recently added journal article with a stored "
+        "abstract. Provide its exact title and summarize the abstract in no more than "
+        "50 words."
+    )
+    monkeypatch.setattr(
+        cli,
+        "read_latest_zotero_journal_abstract_metadata",
+        lambda: {
+            "status": "success",
+            "provider_read": True,
+            "provider_order": {
+                "sort": "dateAdded",
+                "direction": "desc",
+                "top_level_only": True,
+                "item_type": "journalArticle",
+            },
+            "selection_rule": "first_nonempty_abstract_in_provider_order",
+            "require_abstract": True,
+            "item_count": 1,
+            "selected_item_title": "Provider article",
+            "selected_item_has_abstract": True,
+            "selected_item_date_added": "2026-07-12T12:00:00Z",
+            "items": [
+                {
+                    "key": "ITEM123",
+                    "data": {
+                        "title": "Provider article",
+                        "abstractNote": "A scoping review evaluated relapse detection.",
+                    },
+                }
+            ],
+        },
+    )
+
+    def fake_run_typed_sdk_sync(_agent, _prompt, _output_type, **_kwargs):
+        return (
+            SimpleNamespace(final_output=None, usage=None, new_items=[]),
+            ZoteroContextResult(
+                summary=(
+                    "Selected the most recently added journal article and summarized "
+                    "its abstract in 50 words or fewer."
+                ),
+                article_titles=["Provider article"],
+                relevant_evidence=[
+                    "Provider metadata confirms the ordered item.",
+                    (
+                        "The stored abstract reports a scoping review of AI relapse "
+                        "detection using smartphones and wearables, with heterogeneous "
+                        "performance and limited replication."
+                    ),
+                ],
+            ),
+        )
+
+    monkeypatch.setattr(cli, "run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_args, **_kwargs: 1)
+    plan = ManualRequestPlan(
+        requested_agent="business_research_analyst",
+        target_agent="zotero_context_agent",
+        objective=request,
+        intent="context_lookup",
+        expected_artifact_type="context_summary",
+        ask_shape={
+            "output_form": "brief",
+            "strict_filter_mode": "exact",
+            "stop_condition": "stop_after_50_word_summary",
+        },
+    )
+
+    exit_code = cli._run_ask_context_agent_live(
+        "zotero_context_agent",
+        request,
+        json_output=True,
+        manual_plan=plan,
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["output"]["summary"].startswith("The stored abstract reports")
+    assert payload["human_summary"].startswith("Title: Provider article\nSummary: The stored")
+    assert "Selected the most recently" not in payload["human_summary"]
 
 
 def test_context_agent_tool_receipts_are_bounded_and_report_verified_writes() -> None:
@@ -2938,6 +5534,441 @@ def test_context_agent_tool_receipts_are_bounded_and_report_verified_writes() ->
             },
         }
     ]
+
+
+def test_context_agent_tool_receipts_report_verified_receipt_create_and_attachment() -> None:
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(
+                type="tool_call_output_item",
+                output=json.dumps(
+                    {
+                        "status": "success",
+                        "operation": "create_expense_from_receipt",
+                        "table": "Personal Expenses",
+                        "record_id": "recSyntheticReceipt",
+                        "approval_reference": "airtable-direct:test",
+                        "write_result": {"record": {"private": "omitted"}},
+                        "attachment_result": {"attachment": {"private": "omitted"}},
+                        "verification": {
+                            "status": "verified",
+                            "passed": True,
+                            "record_id_match": True,
+                            "create_read_back": True,
+                            "attachment_read_back": True,
+                            "attachment_count_before": 0,
+                            "attachment_count_after": 1,
+                        },
+                        "send_enabled": False,
+                    }
+                ),
+            )
+        ]
+    )
+
+    receipts = cli._context_agent_tool_receipts(raw_result)
+
+    assert receipts == [
+        {
+            "status": "success",
+            "operation": "create_expense_from_receipt",
+            "table": "Personal Expenses",
+            "record_id": "recSyntheticReceipt",
+            "approval_reference": "airtable-direct:test",
+            "send_enabled": False,
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "record_id_match": True,
+                "create_read_back": True,
+                "attachment_read_back": True,
+                "attachment_count_before": 0,
+                "attachment_count_after": 1,
+            },
+        }
+    ]
+    assert cli._context_agent_external_write_performed(receipts) is True
+
+
+def test_context_agent_tool_receipts_preserve_duplicate_cleanup_evidence() -> None:
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(
+                type="tool_call_output_item",
+                output=json.dumps(
+                    {
+                        "status": "success",
+                        "operation": "reconcile_duplicate_expense",
+                        "table": "Personal Expenses",
+                        "record_id": "recKeep123",
+                        "duplicate_record_id": "recDuplicate456",
+                        "target_estimated_tax_period": "3",
+                        "verification": {
+                            "status": "verified",
+                            "passed": True,
+                            "record_id_match": True,
+                            "updated_period": True,
+                            "attachment_read_back": True,
+                            "attachment_filenames": ["receipt.pdf"],
+                            "duplicate_provider_deleted": True,
+                            "duplicate_record_absent_after": True,
+                        },
+                        "send_enabled": False,
+                    }
+                ),
+            )
+        ]
+    )
+
+    assert cli._context_agent_tool_receipts(raw_result) == [
+        {
+            "status": "success",
+            "operation": "reconcile_duplicate_expense",
+            "table": "Personal Expenses",
+            "record_id": "recKeep123",
+            "duplicate_record_id": "recDuplicate456",
+            "target_estimated_tax_period": "3",
+            "send_enabled": False,
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "record_id_match": True,
+                "attachment_read_back": True,
+                "updated_period": True,
+                "attachment_filenames": ["receipt.pdf"],
+                "duplicate_provider_deleted": True,
+                "duplicate_record_absent_after": True,
+            },
+        }
+    ]
+
+
+def test_airtable_receipt_execution_blocker_requires_both_provider_read_backs() -> None:
+    request = (
+        "Add this attached receipt as exactly one personal expense in Airtable, "
+        "attach the PDF, and verify the created record and attachment."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="airtable_context_agent")
+    successful_receipt = {
+        "status": "success",
+        "operation": "create_expense_from_receipt",
+        "record_id": "recSyntheticReceipt",
+        "verification": {
+            "passed": True,
+            "create_read_back": True,
+            "attachment_read_back": True,
+        },
+    }
+    partial_receipt = {
+        **successful_receipt,
+        "status": "partial",
+        "verification": {
+            "passed": False,
+            "create_read_back": True,
+            "attachment_read_back": False,
+        },
+    }
+
+    assert (
+        cli._airtable_receipt_execution_blocker(
+            "airtable_context_agent",
+            request,
+            manual_plan=plan,
+            tool_receipts=[successful_receipt],
+        )
+        == ""
+    )
+    blocker = cli._airtable_receipt_execution_blocker(
+        "airtable_context_agent",
+        request,
+        manual_plan=plan,
+        tool_receipts=[partial_receipt],
+    )
+    assert "partially completed" in blocker
+    assert "avoid a duplicate expense" in blocker
+    assert cli._context_agent_external_write_performed([partial_receipt]) is True
+
+
+def test_airtable_receipt_reconciliation_accepts_complete_provider_verification() -> None:
+    request = (
+        "Reconcile these duplicate Airtable receipt records. Keep recKeep123, change "
+        "Estimated Tax Periods to 3, preserve receipt.pdf, and remove recDuplicate456."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="airtable_context_agent")
+    receipt = {
+        "status": "success",
+        "operation": "reconcile_duplicate_expense",
+        "record_id": "recKeep123",
+        "duplicate_record_id": "recDuplicate456",
+        "target_estimated_tax_period": "3",
+        "verification": {
+            "passed": True,
+            "record_id_match": True,
+            "updated_period": True,
+            "attachment_read_back": True,
+            "duplicate_provider_deleted": True,
+            "duplicate_record_absent_after": True,
+        },
+    }
+
+    assert (
+        cli._airtable_receipt_execution_blocker(
+            "airtable_context_agent",
+            request,
+            manual_plan=plan,
+            tool_receipts=[receipt],
+        )
+        == ""
+    )
+    assert cli._context_agent_external_write_performed([receipt]) is True
+
+
+def test_airtable_receipt_update_accepts_verified_same_record_mutation() -> None:
+    request = (
+        "Update Airtable Personal Expenses record recKeep123 in place. Set Item to "
+        "Linear Basic, preserve receipt.pdf, and forbid record creation."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="airtable_context_agent")
+    receipt = {
+        "status": "success",
+        "operation": "update",
+        "record_id": "recKeep123",
+        "verification": {
+            "passed": True,
+            "record_id_match": True,
+            "matched_fields": ["Item"],
+            "mismatched_fields": [],
+        },
+    }
+
+    assert (
+        cli._airtable_receipt_execution_blocker(
+            "airtable_context_agent",
+            request,
+            manual_plan=plan,
+            tool_receipts=[receipt],
+        )
+        == ""
+    )
+
+
+def test_airtable_generic_write_scope_binds_update_and_reconcile_without_create() -> None:
+    update_request = (
+        "In Airtable update record recKeep123 in place and verify it; do not create "
+        "another record."
+    )
+    update_plan = ManualRequestPlan(
+        requested_agent="airtable_context_agent",
+        target_agent="airtable_context_agent",
+        intent="business_system_write",
+        target_type="business_system_context",
+        objective="Update one exact Airtable record in place.",
+    )
+    reconcile_request = (
+        "Reconcile the two exact duplicate Airtable records and keep recKeep123; "
+        "do not create anything new."
+    )
+
+    assert (
+        cli._direct_airtable_allowed_operation(
+            update_plan,
+            input_text=update_request,
+        )
+        == "update"
+    )
+    assert (
+        cli._direct_airtable_allowed_operation(
+            update_plan,
+            input_text=reconcile_request,
+        )
+        == "update"
+    )
+
+
+def test_airtable_receipt_read_only_verification_does_not_require_write_receipt() -> None:
+    request = (
+        "Verify the Airtable Personal Expenses receipt cleanup only; do not modify "
+        "anything. Confirm recKeep123 retains receipt.pdf and recDuplicate456 is absent."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="airtable_context_agent")
+
+    assert (
+        cli._airtable_receipt_execution_blocker(
+            "airtable_context_agent",
+            request,
+            manual_plan=plan,
+            tool_receipts=[],
+        )
+        == ""
+    )
+
+
+def test_airtable_write_execution_blocker_requires_typed_verified_mutation() -> None:
+    request = (
+        "In Airtable, update the Description field on this personal expense to "
+        "'Linear Basic - direct-call verification 2026-07-13', and verify the same record."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="airtable_context_agent")
+    verified_receipt = {
+        "status": "success",
+        "operation": "update",
+        "record_id": "recSyntheticReceipt",
+        "verification": {
+            "passed": True,
+            "record_id_match": True,
+            "matched_fields": ["Description"],
+            "mismatched_fields": [],
+        },
+    }
+
+    assert (
+        cli._airtable_write_execution_blocker(
+            "airtable_context_agent",
+            request,
+            manual_plan=plan,
+            tool_receipts=[verified_receipt],
+        )
+        == ""
+    )
+    missing_receipt_blocker = cli._airtable_write_execution_blocker(
+        "airtable_context_agent",
+        request,
+        manual_plan=plan,
+        tool_receipts=[],
+    )
+    assert "was not executed" in missing_receipt_blocker
+
+    unverified_receipt = {
+        **verified_receipt,
+        "verification": {
+            "passed": False,
+            "record_id_match": True,
+            "matched_fields": [],
+            "mismatched_fields": ["Description"],
+        },
+    }
+    unverified_blocker = cli._airtable_write_execution_blocker(
+        "airtable_context_agent",
+        request,
+        manual_plan=plan,
+        tool_receipts=[unverified_receipt],
+    )
+    assert "read-after-write verification did not pass" in unverified_blocker
+    assert "Do not retry blindly" in unverified_blocker
+
+
+def test_airtable_write_execution_blocker_accepts_verified_test_lifecycle() -> None:
+    request = (
+        "In Airtable Business Expenses, add KBA_TEST_RECORD_ANU120_R7, change the "
+        "same record, then remove it and confirm absence."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="airtable_context_agent")
+    lifecycle_receipt = {
+        "status": "success",
+        "operation": "test_record_lifecycle",
+        "record_id": "recSyntheticLifecycle",
+        "verification": {
+            "passed": True,
+            "create_read_back": True,
+            "same_record_update_read_back": True,
+            "record_absent_after_cleanup": True,
+        },
+    }
+
+    assert (
+        cli._airtable_write_execution_blocker(
+            "airtable_context_agent",
+            request,
+            manual_plan=plan,
+            tool_receipts=[lifecycle_receipt],
+        )
+        == ""
+    )
+
+
+def test_context_agent_public_blockers_deduplicates_nested_blocker_objects() -> None:
+    blockers = cli._context_agent_public_blockers(
+        {
+            "blockers": [
+                "Provider evidence is incomplete.",
+                {"message": "Provider evidence is incomplete."},
+                {"message": "Exact record identity is required."},
+            ]
+        },
+        execution_blocker="Exact record identity is required.",
+    )
+
+    assert blockers == [
+        {"message": "Provider evidence is incomplete."},
+        {"message": "Exact record identity is required."},
+    ]
+
+
+def test_zotero_ordered_abstract_receipt_proves_live_provider_selection() -> None:
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(
+                type="tool_call_output_item",
+                output=json.dumps(
+                    {
+                        "status": "success",
+                        "provider_read": True,
+                        "provider_order": {
+                            "sort": "dateAdded",
+                            "direction": "desc",
+                            "top_level_only": True,
+                            "item_type": "journalArticle",
+                        },
+                        "selection_rule": "first_nonempty_abstract_in_provider_order",
+                        "require_abstract": True,
+                        "selected_item_title": "Synthetic article",
+                        "selected_item_has_abstract": True,
+                        "selected_item_date_added": "2026-07-12T12:00:00Z",
+                        "items": [{"private_abstract": "must not enter receipt"}],
+                        "send_enabled": False,
+                    }
+                ),
+            )
+        ]
+    )
+
+    receipts = cli._context_agent_tool_receipts(raw_result)
+
+    assert receipts == [
+        {
+            "status": "success",
+            "provider_read": True,
+            "provider_order": {
+                "sort": "dateAdded",
+                "direction": "desc",
+                "top_level_only": True,
+                "item_type": "journalArticle",
+            },
+            "selection_rule": "first_nonempty_abstract_in_provider_order",
+            "require_abstract": True,
+            "selected_item_title": "Synthetic article",
+            "selected_item_has_abstract": True,
+            "selected_item_date_added": "2026-07-12T12:00:00Z",
+            "send_enabled": False,
+        }
+    ]
+    assert (
+        cli._zotero_ordered_abstract_receipt_blocker(
+            "zotero_context_agent",
+            "Use Zotero to select the most recently added journal article with a "
+            "stored abstract.",
+            receipts,
+        )
+        == ""
+    )
+    assert "live, ordered provider metadata read" in (
+        cli._zotero_ordered_abstract_receipt_blocker(
+            "zotero_context_agent",
+            "Use Zotero to select the most recently added journal article with a "
+            "stored abstract.",
+            [{"status": "success", "source": "local_zotero_cache"}],
+        )
+    )
 
 
 def test_context_agent_blocked_read_is_not_reported_as_blocked_write() -> None:
@@ -3228,6 +6259,9 @@ def test_context_agent_tool_receipts_classify_workspace_sheet_lifecycle() -> Non
 
 def test_context_agent_verified_write_reconciles_direct_write_plan() -> None:
     output_payload: dict[str, object] = {
+        "summary": "The update was not executed.",
+        "blockers": ["The write was not executed because approval is still required."],
+        "approval_needs": ["Live write approval is still required."],
         "write_plan": {
             "approval_required": True,
             "approval_reference_needed": True,
@@ -3249,6 +6283,33 @@ def test_context_agent_verified_write_reconciles_direct_write_plan() -> None:
     assert write_plan["approval_required"] is True
     assert write_plan["approval_reference_needed"] is False
     assert write_plan["live_write_allowed_for_specialist"] is True
+    assert output_payload["blockers"] == []
+    assert output_payload["approval_needs"] == []
+    assert cli._verified_context_agent_write_summary(receipts) == (
+        "Created and provider-verified the exact requested item."
+    )
+
+
+def test_verified_airtable_reconciliation_summary_uses_provider_receipt() -> None:
+    receipts = [
+        {
+            "status": "success",
+            "operation": "reconcile_duplicate_expense",
+            "table": "Personal Expenses",
+            "record_id": "recKeep123",
+            "duplicate_record_id": "recDuplicate456",
+            "verification": {
+                "passed": True,
+                "duplicate_record_absent_after": True,
+            },
+        }
+    ]
+
+    assert cli._verified_context_agent_write_summary(receipts) == (
+        "Reconciled and provider-verified the exact Airtable expense record "
+        "recKeep123 in place; duplicate recDuplicate456 was removed and verified "
+        "absent."
+    )
 
 
 def test_context_agent_slide_copy_receipts_preserve_provenance_and_classify_write() -> None:
@@ -3638,6 +6699,297 @@ def test_context_agent_human_summary_separates_answer_from_details() -> None:
     )
 
 
+def test_work_item_result_shape_honors_exact_two_sentence_summary() -> None:
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.COMPANY_RESEARCH,
+            title="Research: Example Health",
+            request_text=(
+                "Summarize Example Health in exactly 2 sentences using fixture context only."
+            ),
+            sources=[
+                WorkItemSourceRef(
+                    source_id="fixture:example-health",
+                    title="Fixture record for Example Health",
+                    provider="fixture",
+                    supported_claim="Fixture input identifies the company as Example Health.",
+                )
+            ],
+        ),
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        human_summary="Verbose synthesized workflow review.",
+        manual_request_plan={
+            "ask_shape": {
+                "output_form": "brief",
+                "strict_filter_mode": "exact",
+                "stop_condition": "stop_after_exact_requested_sentence_count",
+            }
+        },
+    )
+
+    shaped = cli._shape_work_item_result_for_requested_output(result)
+
+    assert shaped.human_summary == (
+        "Fixture input identifies the company as Example Health. "
+        "No additional company details are supported by the bounded evidence supplied "
+        "for this run."
+    )
+    assert shaped.next_action is None
+
+
+def test_context_agent_human_summary_renders_workspace_artifact_preview_lines() -> None:
+    summary = cli._context_agent_human_summary(
+        {
+            "summary": "Prepared a read-only two-line outline preview.",
+            "recommended_target": "Future Google Doc outline",
+            "artifact_preview_lines": [
+                "Review behavioral-health AI evidence.",
+                "Prepare source-bounded client recommendations.",
+            ],
+        }
+    )
+
+    assert "*Answer:*\nPrepared a read-only two-line outline preview." in summary
+    assert "- Draft artifact preview:" in summary
+    assert "  - Review behavioral-health AI evidence." in summary
+    assert "  - Prepare source-bounded client recommendations." in summary
+
+
+def test_context_agent_human_summary_honors_exact_bullet_output_shape() -> None:
+    summary = cli._context_agent_human_summary(
+        {
+            "summary": "Prepared a two-bullet outline.",
+            "recommended_target": "Future Google Doc outline",
+            "artifact_preview_lines": [
+                "- Review behavioral-health AI evidence",
+                "- Prepare client recommendations",
+            ],
+            "recommended_actions": ["Paste the bullets into a document."],
+        },
+        {
+            "ask_shape": {
+                "output_form": "bullets",
+                "strict_filter_mode": "exact",
+                "stop_condition": "Produce exactly two bullet points and stop.",
+            }
+        },
+    )
+
+    assert summary == (
+        "- Review behavioral-health AI evidence\n"
+        "- Prepare client recommendations"
+    )
+    assert "Detailed Summary" not in summary
+    assert "Candidate target" not in summary
+    assert "Paste the bullets" not in summary
+
+
+def test_context_agent_human_summary_honors_exact_zotero_item_shape() -> None:
+    summary = cli._context_agent_human_summary(
+        {
+            "summary": "Read-only cached Zotero item listed successfully.",
+            "article_titles": ["Signal in Noise"],
+            "zotero_item_keys": ["KICWQFH4"],
+            "sources": [{"title": "Local Zotero Cache"}],
+        },
+        {
+            "ask_shape": {
+                "output_form": "unspecified",
+                "strict_filter_mode": "exact",
+                "stop_condition": (
+                    "Stop after returning one available cached Zotero item with title "
+                    "and item key."
+                ),
+            }
+        },
+    )
+
+    assert summary == "Title: Signal in Noise\nItem key: KICWQFH4"
+    assert "Useful references" not in summary
+
+
+def test_context_agent_human_summary_does_not_deterministically_rewrite_word_cap() -> None:
+    long_summary = " ".join(f"word{index}" for index in range(1, 61))
+    summary = cli._context_agent_human_summary(
+        {
+            "summary": long_summary,
+            "article_titles": ["Provider-backed article"],
+            "zotero_item_keys": ["INTERNAL-KEY"],
+            "recommended_actions": ["Review another article."],
+        },
+        {
+            "objective": (
+                "Provide its exact title and summarize the abstract in no more than "
+                "50 words."
+            ),
+            "ask_shape": {
+                "output_form": "brief",
+                "strict_filter_mode": "exact",
+                "stop_condition": "stop_after_50_word_summary",
+            },
+        },
+    )
+
+    assert summary == f"Title: Provider-backed article\nSummary: {long_summary}"
+    assert long_summary in summary
+    assert len(long_summary.split()) == 60
+    assert "INTERNAL-KEY" not in summary
+    assert "Title: Provider-backed article" in summary
+    assert "Review another article" not in summary
+
+
+def test_strict_requested_display_text_honors_brief_reply_assessment() -> None:
+    summary = cli._strict_requested_display_text(
+        {
+            "summary": "The sender asks to meet Tuesday at 2 PM.",
+            "needs_reply": True,
+            "reasoning": "A response should confirm availability.",
+            "recommended_action": "Draft a reply for review.",
+        },
+        {
+            "ask_shape": {
+                "output_form": "brief",
+                "strict_filter_mode": "unspecified",
+                "stop_condition": (
+                    "Stop after producing a one-sentence summary and reply-needed assessment."
+                ),
+            }
+        },
+    )
+
+    assert summary == "The sender asks to meet Tuesday at 2 PM.\nReply needed: Yes."
+    assert "Draft a reply" not in summary
+
+
+def test_strict_requested_display_text_includes_requested_copyable_draft() -> None:
+    summary = cli._strict_requested_display_text(
+        {
+            "summary": "The sender shared a certification application.",
+            "reasoning": (
+                "A response is optional but useful to clarify the most important "
+                "readiness criterion before applying."
+            ),
+            "needs_reply": True,
+            "draft_reply": (
+                "Thanks for sending this. What readiness criterion would you "
+                "recommend confirming before we apply?"
+            ),
+        },
+        {
+            "objective": (
+                "Tell me briefly what warrants a response, then draft a concise "
+                "response here in Slack so I can copy it."
+            ),
+            "ask_shape": {
+                "output_form": "brief",
+                "strict_filter_mode": "exact",
+                "stop_condition": "Stop after preparing one concise copyable reply.",
+            },
+        },
+    )
+
+    assert summary == (
+        "A response is optional but useful to clarify the most important readiness "
+        "criterion before applying.\n\n"
+        "*Draft response:*\n"
+        "Thanks for sending this. What readiness criterion would you recommend "
+        "confirming before we apply?"
+    )
+
+
+def test_strict_draft_output_preserves_optional_assessment_and_copyable_reply() -> None:
+    summary = cli._strict_requested_display_text(
+        {
+            "summary": "The sender shared certification information.",
+            "reasoning": "A response is optional because no direct question was asked.",
+            "needs_reply": False,
+            "draft_reply": (
+                "Thanks for sharing this. Is there a recommended starting point "
+                "for assessing eligibility?"
+            ),
+        },
+        {
+            "objective": (
+                "Tell me whether it merits a response, then return a short reply "
+                "suggestion here so I can paste it."
+            ),
+            "ask_shape": {
+                "output_form": "draft",
+                "strict_filter_mode": "unspecified",
+                "stop_condition": "",
+            },
+        },
+    )
+
+    assert summary == (
+        "A response is optional because no direct question was asked.\n\n"
+        "*Draft response:*\n"
+        "Thanks for sharing this. Is there a recommended starting point for "
+        "assessing eligibility?"
+    )
+
+
+def test_strict_requested_display_text_honors_company_word_limit() -> None:
+    summary = cli._strict_requested_display_text(
+        {
+            "company_name": "Abridge",
+            "answer": (
+                "Abridge provides ambient clinical documentation AI that converts "
+                "clinician-patient conversations into structured notes integrated "
+                "directly with health-system electronic record workflows."
+            ),
+            "facts": [
+                {
+                    "text": (
+                        "Abridge is a generative AI company for clinical documentation "
+                        "and ambient listening in healthcare systems worldwide today."
+                    ),
+                    "source_ids": ["source:1"],
+                }
+            ],
+            "why_it_matters": "This longer generic section must not replace the answer.",
+        },
+        {
+            "objective": "Identify Abridge and summarize the company in 20 words.",
+            "constraints": ["brief answer", "20 words maximum"],
+            "ask_shape": {
+                "output_form": "brief",
+                "strict_filter_mode": "flexible",
+                "stop_condition": (
+                    "Return a 20-word company summary after identifying Abridge."
+                ),
+            },
+        },
+    )
+
+    assert summary.startswith("Abridge provides ambient clinical documentation AI")
+    assert len(summary.split()) == 20
+    assert "worldwide today" not in summary
+    assert "generic section" not in summary
+
+
+def test_strict_requested_display_text_preserves_safety_details() -> None:
+    output = {
+        "summary": "Prepared a two-bullet outline.",
+        "artifact_preview_lines": ["First", "Second"],
+        "blockers": ["The selected source could not be verified"],
+    }
+    plan = {
+        "ask_shape": {
+            "output_form": "bullets",
+            "strict_filter_mode": "exact",
+            "stop_condition": "Produce exactly two bullet points and stop.",
+        }
+    }
+
+    assert cli._strict_requested_display_text(output, plan) == ""
+    rendered = cli._context_agent_human_summary(output, plan)
+    assert "Needs attention" in rendered
+    assert "could not be verified" in rendered
+
+
 def test_google_workspace_context_dry_run_tracks_onboarding_topic_without_eval_boilerplate() -> None:
     output = cli._context_agent_dry_run_output(
         "google_workspace_context_agent",
@@ -3854,6 +7206,38 @@ def test_zotero_context_dry_run_tracks_requested_topic_without_generic_boilerpla
     assert "Useful references require local item reads" in summary
 
 
+@pytest.mark.parametrize(
+    "request_text, expected_blocker",
+    [
+        (
+            "Attach this PDF to the article.",
+            "Ordinary Zotero PDF attachment is not supported",
+        ),
+        (
+            "Add this link to the notes for the article.",
+            "Ordinary Zotero child-note creation or modification is not supported",
+        ),
+    ],
+)
+def test_zotero_context_dry_run_reports_specific_missing_mutation_tool(
+    request_text: str,
+    expected_blocker: str,
+) -> None:
+    plan = infer_manual_request_plan(request_text, requested_agent="zotero_context_agent")
+
+    output = cli._context_agent_dry_run_output(
+        "zotero_context_agent",
+        request_text,
+        plan,
+    )
+
+    assert output is not None
+    payload = output.model_dump(mode="json")
+    assert expected_blocker in payload["blockers"][0]
+    assert "blocked at the tool boundary" in payload["summary"]
+    assert payload["zotero_write_supported"] is False
+
+
 def test_context_agent_human_summary_includes_feed_item_summaries() -> None:
     summary = cli._context_agent_human_summary(
         {
@@ -3986,6 +7370,7 @@ def test_cli_ask_gmail_triage_long_prompt_is_not_treated_as_fixture_path(
     assert "--no-allow-inbox" in calls[0]
     assert "--request" in calls[0]
     assert calls[0][calls[0].index("--request") + 1] == long_prompt
+    assert "--compact-instructions" in calls[0]
     records = SQLiteStore(database_url).fetch_all("agent_runs")
     assert len(records) == 1
     assert records[0]["agent_name"] == "gmail_triage"
@@ -4071,8 +7456,8 @@ def test_cli_ask_live_explicit_mention_honors_manual_plan_reroute(
     assert "--topic" in command
     topic = command[command.index("--topic") + 1]
     assert topic == (
-        "software-first companies with measurement-based care or digital psychiatry tools "
-        "for behavioral health clinics"
+        "Compare three software-first companies with measurement-based care or digital "
+        "psychiatry tools for behavioral health clinics."
     )
     assert command[command.index("--max-results") + 1] == "3"
 
@@ -4193,7 +7578,7 @@ def test_cli_ask_kni_explicit_agent_auto_live_sdk_in_live_mode(
         **kwargs,
     ):
         assert requested_agent == "opportunity_scout"
-        assert live_manual_plan is True
+        assert live_manual_plan is False
         return _fake_orchestrator_preflight(
             request_text,
             requested_agent=requested_agent,
@@ -4232,7 +7617,81 @@ def test_cli_ask_kni_explicit_agent_auto_live_sdk_in_live_mode(
     assert calls
     assert "scripts/run_opportunity_scout.py" in calls[0]
     assert "--live-search" in calls[0]
+    assert "--live-search-plan" not in calls[0]
     assert "--live-sdk" in calls[0]
+    assert "--compact-instructions" in calls[0]
+    assert calls[0][calls[0].index("--topic") + 1] == "find AI partners"
+
+
+def test_cli_explicit_scout_company_summary_runs_business_research_owner(
+    monkeypatch,
+    capsys,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "agent_name": "business_research_analyst",
+                    "output_type": "CompanyResearchFocusedBrief",
+                    "send_enabled": False,
+                    "output": {
+                        "company_name": "Abridge",
+                        "product": "Abridge provides ambient clinical documentation software.",
+                        "sources": [{"url": "https://www.abridge.com"}],
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+
+    exit_code = main(
+        [
+            "ask",
+            "--json",
+            "@KNI",
+            "opportunity",
+            "scout",
+            "who",
+            "is",
+            "Abridge",
+            "and",
+            "summarize",
+            "the",
+            "company",
+            "in",
+            "20",
+            "words.",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_agent"] == "business_research_analyst"
+    assert payload["manual_request_plan"]["requested_agent"] == "opportunity_scout"
+    assert payload["manual_request_plan"]["target_agent"] == "business_research_analyst"
+    assert payload["manual_request_plan"]["primary_target"] == "Abridge"
+    assert payload["manual_request_plan"]["required_entities"] == ["Abridge"]
+    assert payload["manual_request_plan"]["ask_shape"]["stop_condition"] == (
+        "stop_after_20_word_summary"
+    )
+    assert calls
+    assert "scripts/run_company_research.py" in calls[0]
+    assert calls[0][calls[0].index("--company") + 1] == "Abridge"
+    assert calls[0][calls[0].index("--max-results") + 1] == "2"
+    assert "--quick-retrieval" in calls[0]
+    assert "--live-search-plan" not in calls[0]
+    assert "--compact-instructions" in calls[0]
+    assert "scripts/run_opportunity_scout.py" not in calls[0]
 
 
 def test_cli_ask_explicit_chief_of_staff_runs_orchestrator_preflight_advise_only(
@@ -4579,20 +8038,23 @@ def test_cli_explicit_orchestrator_source_bundle_uses_work_item_graph(
     assert call["max_manager_steps"] == 3
 
 
-def test_cli_source_bundle_request_budget_blocks_before_preflight_model_call(
+def test_cli_source_bundle_request_budget_allows_planner_then_blocks_resolved_route(
     monkeypatch,
     capsys,
 ) -> None:
     fixture_path = Path(__file__).parent / "fixtures/graph_research_to_draft_source_bundle.json"
     preflight_calls: list[str] = []
 
-    def unexpected_preflight(request_text, **_kwargs):
+    def bounded_preflight(request_text, **kwargs):
         preflight_calls.append(request_text)
-        pytest.fail("request budget must block before preflight")
+        result = _fake_orchestrator_preflight(request_text, **kwargs)
+        return result.model_copy(
+            update={"sdk_usage_events": [{"usage": {"requests": 1}}]}
+        )
 
     monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
     monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
-    monkeypatch.setattr(cli, "run_orchestrator_preflight", unexpected_preflight)
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", bounded_preflight)
 
     exit_code = main(
         [
@@ -4611,14 +8073,16 @@ def test_cli_source_bundle_request_budget_blocks_before_preflight_model_call(
 
     payload = json.loads(capsys.readouterr().out)
     assert exit_code == 2
-    assert preflight_calls == []
+    assert preflight_calls == [
+        "Research the supplied packet and prepare a draft-only reply."
+    ]
     assert payload["block_kind"] == "openai_request_budget_exceeded"
+    assert payload["openai_requests_made"] == 1
     assert payload["estimated_requests"]["max"] == 2
     assert payload["estimated_requests"]["stages"] == [
         "manual_request_planner",
         "outreach_composer_synthesis",
     ]
-    assert payload["openai_requests_made"] == 0
 
 
 def test_cli_source_bundle_no_live_manual_plan_fits_one_request_ceiling(
@@ -4747,6 +8211,1611 @@ def test_bounded_connector_graph_fits_eight_request_ceiling_and_disables_web_sea
     ]
 
 
+def test_direct_opportunity_scout_skips_redundant_live_manual_plan() -> None:
+    request = (
+        "Find current remote-accessible opportunities relevant to Keystone across "
+        "conferences, workshops, certifications, grants, collaborations, consulting, "
+        "and professional networking."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent="opportunity_scout",
+        max_manager_steps=3,
+        live_search=True,
+    )
+
+    assert cli._skip_live_manual_plan_for_request(
+        request,
+        requested_route="opportunity_scout",
+    ) is True
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=False,
+    )
+
+    assert estimate["max"] == 2
+    assert estimate["stages"] == ["opportunity_scout_direct_sdk"]
+
+
+@pytest.mark.parametrize(
+    ("route", "request_text"),
+    [
+        (
+            "business_research_analyst",
+            "Summarize one supplied local source in 50 words without web search.",
+        ),
+        (
+            "opportunity_scout",
+            "Assess one supplied opportunity and return one recommendation.",
+        ),
+        (
+            "outreach_composer",
+            "Draft one short reply from approved context and do not send it.",
+        ),
+        (
+            "gmail_triage",
+            "Summarize one selected email and do not modify Gmail.",
+        ),
+        (
+            "airtable_context_agent",
+            "Read one exact Airtable record and do not modify it.",
+        ),
+        (
+            "google_workspace_context_agent",
+            "Read one exact Google Doc and summarize it.",
+        ),
+        (
+            "zotero_context_agent",
+            "Read one Zotero abstract and summarize it in 50 words.",
+        ),
+        (
+            "rss_context_agent",
+            "Read one RSS announcement and summarize it.",
+        ),
+        (
+            "preprints_context_agent",
+            "Read one preprint abstract and summarize it.",
+        ),
+    ],
+)
+def test_bounded_direct_specialists_use_compact_request_estimate(
+    route: str,
+    request_text: str,
+) -> None:
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=False,
+    )
+
+    skips_live_planner = cli._skip_live_manual_plan_for_request(
+        request_text,
+        requested_route=route,
+    )
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request_text,
+        live_sdk=True,
+        live_manual_plan=not skips_live_planner,
+        requested_route=route,
+    )
+
+    assert skips_live_planner is (route == "opportunity_scout")
+    conditional_repair = "words" in request_text
+    assert estimate["max"] == (2 if skips_live_planner else 3) + int(conditional_repair)
+    assert estimate["min"] == (1 if skips_live_planner else 2)
+    assert estimate["stages"] == [
+        *([] if skips_live_planner else ["manual_request_planner"]),
+        f"{route}_direct_sdk",
+        *(["conditional_instruction_following_repair"] if conditional_repair else []),
+    ]
+
+
+def test_preacquired_zotero_direct_read_estimates_one_specialist_request() -> None:
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=False,
+    )
+    request = (
+        "BA use Zotero to select the most recently added journal article with a "
+        "stored abstract and summarize it in 50 words."
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="business_research_analyst",
+    )
+
+    assert estimate["max"] == 3
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "zotero_context_agent_direct_sdk",
+        "conditional_instruction_following_repair",
+    ]
+    assert "counts model turns only" in estimate["note"]
+    assert "provider tool calls are not OpenAI requests" in estimate["note"]
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_class", "expected_compact"),
+    [
+        (
+            "Summarize one selected email and do not modify Gmail.",
+            "bounded_read",
+            True,
+        ),
+        (
+            "Update one exact Airtable record and verify the same record.",
+            "bounded_write",
+            True,
+        ),
+        (
+            "For the same Zotero article, list the authors and publication venue.",
+            "thread_followup",
+            True,
+        ),
+        (
+            "Run a comprehensive multi-stage landscape across all available sources.",
+            "deep_or_multistage",
+            False,
+        ),
+    ],
+)
+def test_direct_runtime_profile_follows_request_shape_after_route_selection(
+    request_text: str,
+    expected_class: str,
+    expected_compact: bool,
+) -> None:
+    profile = cli._direct_specialist_runtime_profile(
+        "business_research_analyst",
+        input_text=request_text,
+    )
+
+    assert profile["request_class"] == expected_class
+    assert profile["compact_instructions"] is expected_compact
+
+
+@pytest.mark.parametrize(
+    ("route", "request_text"),
+    [
+        (
+            "airtable_context_agent",
+            "In Airtable, create KBA_TEST_RECORD_VALIDATION, change it, then delete it.",
+        ),
+        (
+            "zotero_context_agent",
+            "In Zotero, create a KBA_TEST_NOTE_VALIDATION note, revise it, then remove it.",
+        ),
+        (
+            "google_workspace_context_agent",
+            "Create a Google Doc titled KBA_TEST_DOC_VALIDATION, verify it, then "
+            "move the document to trash.",
+        ),
+        (
+            "google_workspace_context_agent",
+            "Make a Google Doc named KBA_TEST_DOC_VARIATION, confirm it, then place "
+            "that document in Drive trash.",
+        ),
+    ],
+)
+def test_marked_composite_lifecycle_keeps_compact_direct_profile(
+    route: str,
+    request_text: str,
+) -> None:
+    profile = cli._direct_specialist_runtime_profile(route, input_text=request_text)
+
+    assert profile["request_class"] == "bounded_write"
+    assert profile["bounded_composite_lifecycle"] is True
+    assert profile["compact_instructions"] is True
+    assert cli._direct_specialist_request_estimate(
+        route,
+        input_text=request_text,
+        live_search=False,
+    ) == 2
+
+
+def test_marked_doc_body_copy_does_not_change_lifecycle_operations() -> None:
+    request = (
+        "Create a Google Doc titled KBA_TEST_DOC_BODY_COPY in KNIOps with the body "
+        "“Set the update policy after review.” Verify it, then move that same document "
+        "to Drive trash."
+    )
+
+    assert cli._is_bounded_composite_lifecycle_request(
+        "google_workspace_context_agent",
+        input_text=request,
+    )
+
+
+def test_google_doc_lifecycle_scope_recovers_same_body_from_slack_history() -> None:
+    latest = (
+        "google workspace context agent rerun that exact approved "
+        "KBA_TEST_DOC_COS_0718 lifecycle now with the same body, verify it, then "
+        "move only that same Google Doc to Drive trash."
+    )
+    envelope = (
+        "google workspace context agent continue this prior Slack thread. "
+        "Previous request: CoS create one Google Doc titled KBA_TEST_DOC_COS_0718 "
+        "in KNIOps with the body “Created through a natural CoS lifecycle ask.” "
+        "User follow-up: "
+        f"{latest} Continue the same agent task."
+    )
+
+    assert cli._google_doc_lifecycle_scope(latest, context_text=envelope) == (
+        "KBA_TEST_DOC_COS_0718",
+        "Created through a natural CoS lifecycle ask.",
+        "KNIOps",
+    )
+
+
+def test_google_doc_lifecycle_scope_accepts_human_sentence_wording() -> None:
+    request = (
+        "Leave one Google document in KNIOps called KBA_TEST_DOC_SENTENCE_SCOPE "
+        "with the sentence ‘This checks a natural CoS document task.’ Check that "
+        "it opens, then file only that test document in Drive trash."
+    )
+
+    assert cli._google_doc_lifecycle_scope(request, context_text=request) == (
+        "KBA_TEST_DOC_SENTENCE_SCOPE",
+        "This checks a natural CoS document task.",
+        "KNIOps",
+    )
+
+
+def test_provider_lifecycle_public_receipt_redacts_provider_identity() -> None:
+    result = cli._public_lifecycle_receipt(
+        {
+            "status": "success",
+            "record_id": "rec-private",
+            "provider_link": "https://provider.example/rec-private",
+            "verification": {"passed": True, "draft_id": "draft-private"},
+        }
+    )
+
+    assert result == {
+        "status": "success",
+        "verification": {"passed": True},
+    }
+
+
+def test_bounded_provider_lifecycle_dispatches_to_interpreted_owner(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_doc_runner(input_text: str, **kwargs: object) -> int:
+        captured["input_text"] = input_text
+        captured.update(kwargs)
+        return 17
+
+    monkeypatch.setattr(cli, "_run_direct_google_doc_test_lifecycle", fake_doc_runner)
+    request = (
+        "Create Google Doc KBA_TEST_DOC_DISPATCH in KNIOps, verify it, and trash "
+        "that same document."
+    )
+
+    result = cli._run_bounded_provider_lifecycle_after_preflight(
+        "google_workspace_context_agent",
+        request,
+        context_text=request,
+        json_output=True,
+        manual_plan=None,
+        orchestrator_preflight=None,
+        database_url="sqlite:///:memory:",
+    )
+
+    assert result == 17
+    assert captured["input_text"] == request
+    assert captured["context_text"] == request
+
+
+def test_llm_objective_can_bind_equivalent_lifecycle_phrasing(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_doc_runner(input_text: str, **kwargs: object) -> int:
+        captured["input_text"] = input_text
+        return 23
+
+    monkeypatch.setattr(cli, "_run_direct_google_doc_test_lifecycle", fake_doc_runner)
+    request = (
+        "Take the marked Google Doc KBA_TEST_DOC_EQUIVALENT in KNIOps through "
+        "the full approved lifecycle and clean it up."
+    )
+    plan = ManualRequestPlan(
+        source="live_sdk",
+        requested_agent="chief_of_staff",
+        target_agent="google_workspace_context_agent",
+        intent="business_system_write",
+        objective=(
+            "Create KBA_TEST_DOC_EQUIVALENT, verify it, then move that same "
+            "Google Doc to trash."
+        ),
+    )
+    interpreted_scope = cli._interpreted_lifecycle_scope_text(request, plan)
+
+    assert not cli._is_bounded_composite_lifecycle_request(
+        "google_workspace_context_agent",
+        input_text=request,
+    )
+    assert cli._is_bounded_composite_lifecycle_request(
+        "google_workspace_context_agent",
+        input_text=interpreted_scope,
+    )
+    assert (
+        cli._run_bounded_provider_lifecycle_after_preflight(
+            "google_workspace_context_agent",
+            request,
+            lifecycle_scope_text=interpreted_scope,
+            context_text=request,
+            json_output=True,
+            manual_plan=plan,
+            orchestrator_preflight=None,
+            database_url="sqlite:///:memory:",
+        )
+        == 23
+    )
+    assert captured["input_text"] == request
+
+
+@pytest.mark.parametrize(
+    ("operator_text", "target_route", "objective", "runner_name"),
+    [
+        (
+            "Please take marked Airtable record KBA_TEST_RECORD_SEMANTIC through "
+            "its full approved lifecycle and leave no test residue.",
+            "airtable_context_agent",
+            "Create KBA_TEST_RECORD_SEMANTIC, verify it, update that same Airtable "
+            "record, verify it again, then delete it and confirm absence.",
+            "_run_direct_airtable_test_record_lifecycle",
+        ),
+        (
+            "Please take Google Doc KBA_TEST_DOC_SEMANTIC in KNIOps through its "
+            "full approved lifecycle using the approved body and leave no test residue.",
+            "google_workspace_context_agent",
+            "Create Google Doc KBA_TEST_DOC_SEMANTIC in KNIOps, verify it, then move "
+            "that same document to Drive trash and confirm it is trashed.",
+            "_run_direct_google_doc_test_lifecycle",
+        ),
+        (
+            "Please take Gmail draft KBA_TEST_DRAFT_SEMANTIC through its full "
+            "approved lifecycle without sending it and leave no test residue.",
+            "gmail_triage",
+            "Create Gmail draft KBA_TEST_DRAFT_SEMANTIC, verify it, update that same "
+            "draft, verify it again, then delete it and confirm absence without sending.",
+            "_run_direct_gmail_test_draft_lifecycle",
+        ),
+    ],
+)
+def test_kni_cos_semantic_lifecycle_runs_typed_helper_after_one_request_preflight(
+    operator_text: str,
+    target_route: str,
+    objective: str,
+    runner_name: str,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_preflight(
+        request_text,
+        *,
+        requested_agent=None,
+        live_manual_plan=False,
+        **_kwargs,
+    ):
+        captured["preflight_request"] = request_text
+        captured["requested_agent"] = requested_agent
+        captured["live_manual_plan"] = live_manual_plan
+        plan = ManualRequestPlan(
+            source="live_sdk",
+            requested_agent=requested_agent,
+            target_agent=target_route,
+            intent="business_system_write",
+            objective=objective,
+        )
+        route_result = cli.route_request(request_text, manual_plan=plan)
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent=requested_agent,
+            advisory_only=True,
+            selected_agent=target_route,
+            manual_request_plan=plan,
+            route_result=route_result,
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    def fake_lifecycle_runner(input_text: str, **kwargs: object) -> int:
+        captured["lifecycle_input"] = input_text
+        captured["lifecycle_kwargs"] = kwargs
+        return 0
+
+    def unexpected_fallback(*_args, **_kwargs):
+        pytest.fail("semantic marked lifecycle must not fall through to agent or WorkItem")
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, runner_name, fake_lifecycle_runner)
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", unexpected_fallback)
+    monkeypatch.setattr(cli, "_run_ask_work_item", unexpected_fallback)
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--max-openai-requests",
+            "1",
+            "--json",
+            f"@KNI CoS {operator_text}",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["preflight_request"] == operator_text
+    assert captured["requested_agent"] == "chief_of_staff"
+    assert captured["live_manual_plan"] is True
+    assert captured["lifecycle_input"] == operator_text
+    lifecycle_kwargs = captured["lifecycle_kwargs"]
+    assert isinstance(lifecycle_kwargs, dict)
+    assert lifecycle_kwargs["manual_plan"].target_agent == target_route
+
+
+def test_ordinary_chief_budget_allows_planner_then_blocks_resolved_route(
+    monkeypatch,
+    capsys,
+) -> None:
+    calls: list[str] = []
+
+    def bounded_preflight(request_text, **kwargs):
+        calls.append(request_text)
+        result = _fake_orchestrator_preflight(request_text, **kwargs)
+        return result.model_copy(
+            update={"sdk_usage_events": [{"usage": {"requests": 1}}]}
+        )
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", bounded_preflight)
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--max-openai-requests",
+            "1",
+            "--json",
+            "@KNI CoS review current operations and recommend my top three actions",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert calls == ["review current operations and recommend my top three actions"]
+    assert payload["block_kind"] == "openai_request_budget_exceeded"
+    assert payload["openai_requests_made"] == 1
+
+
+def test_postposed_only_note_uses_compact_chief_request_estimate() -> None:
+    request = (
+        "CoS: From this note only, Northstar Care sells referral-navigation software "
+        "and has no audited outcomes. Give me one supported fact and the first "
+        "validation question. No search or writes."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    args = SimpleNamespace(
+        context_file="",
+        agent="chief_of_staff",
+        max_manager_steps=3,
+        live_search=True,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="chief_of_staff",
+        manual_plan=plan,
+        effective_live_search=False,
+    )
+
+    assert estimate["min"] == 2
+    assert estimate["max"] == 2
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "chief_of_staff_response_only_sdk",
+    ]
+
+
+def test_kni_cos_doc_lifecycle_continuation_recovers_same_body_before_direct_helper(
+    monkeypatch,
+) -> None:
+    raw_slack_envelope = (
+        "business agents continue this prior Slack thread. "
+        "Previous request: @KNI CoS create one Google Doc titled "
+        "KBA_TEST_DOC_COS_THREAD in KNIOps with the body "
+        "“Created through a natural CoS lifecycle ask.” Verify it, then move only "
+        "that same Google Doc to Drive trash. "
+        "Previous result title: Business Agents Google Workspace Blocked "
+        "User follow-up: @KNI CoS rerun that exact approved KBA_TEST_DOC_COS_THREAD "
+        "lifecycle now with the same body, verify it, then move only that same Google "
+        "Doc to Drive trash. Continue the same agent task."
+    )
+    expected_followup = (
+        "rerun that exact approved KBA_TEST_DOC_COS_THREAD lifecycle now with the "
+        "same body, verify it, then move only that same Google Doc to Drive trash."
+    )
+    captured: dict[str, object] = {}
+
+    def fake_preflight(
+        request_text,
+        *,
+        requested_agent=None,
+        **_kwargs,
+    ):
+        plan = ManualRequestPlan(
+            source="live_sdk",
+            requested_agent=requested_agent,
+            target_agent="google_workspace_context_agent",
+            intent="business_system_write",
+            objective=(
+                "Create Google Doc KBA_TEST_DOC_COS_THREAD in KNIOps, verify it, "
+                "then move that same document to Drive trash and confirm it is trashed."
+            ),
+        )
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent=requested_agent,
+            advisory_only=True,
+            selected_agent="google_workspace_context_agent",
+            manual_request_plan=plan,
+            route_result=cli.route_request(request_text, manual_plan=plan),
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    def fake_doc_runner(input_text: str, **kwargs: object) -> int:
+        captured["input_text"] = input_text
+        captured["context_text"] = kwargs["context_text"]
+        captured["scope"] = cli._google_doc_lifecycle_scope(
+            input_text,
+            context_text=str(kwargs["context_text"]),
+        )
+        return 0
+
+    def unexpected_fallback(*_args, **_kwargs):
+        pytest.fail("same-object lifecycle continuation must stay on the direct helper")
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "_run_direct_google_doc_test_lifecycle", fake_doc_runner)
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", unexpected_fallback)
+    monkeypatch.setattr(cli, "_run_ask_work_item", unexpected_fallback)
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--max-openai-requests",
+            "1",
+            "--json",
+            raw_slack_envelope,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["input_text"] == expected_followup
+    assert captured["context_text"] == raw_slack_envelope
+    assert captured["scope"] == (
+        "KBA_TEST_DOC_COS_THREAD",
+        "Created through a natural CoS lifecycle ask.",
+        "KNIOps",
+    )
+
+
+def test_kni_cos_semantic_doc_lifecycle_uses_verified_wrapper_and_public_redaction(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    operator_text = (
+        "Please take Google Doc KBA_TEST_DOC_WRAPPER in KNIOps through its full "
+        "approved lifecycle using the body “Natural CoS wrapper validation.” and "
+        "leave no test residue."
+    )
+    database_url = f"sqlite:///{tmp_path / 'doc-wrapper.sqlite'}"
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text, *, requested_agent=None, **_kwargs):
+        plan = ManualRequestPlan(
+            source="live_sdk",
+            requested_agent=requested_agent,
+            target_agent="google_workspace_context_agent",
+            intent="business_system_write",
+            objective=(
+                "Create Google Doc KBA_TEST_DOC_WRAPPER in KNIOps, verify it, then "
+                "move that same document to Drive trash and confirm it is trashed."
+            ),
+        )
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent=requested_agent,
+            advisory_only=True,
+            selected_agent="google_workspace_context_agent",
+            manual_request_plan=plan,
+            route_result=cli.route_request(request_text, manual_plan=plan),
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    def fake_doc_lifecycle(title: str, body_text: str, **kwargs: object):
+        captured["title"] = title
+        captured["body_text"] = body_text
+        captured.update(kwargs)
+        return {
+            "status": "success",
+            "operation": "test_doc_lifecycle",
+            "document_id": "doc-private-123",
+            "provider_link": "https://docs.google.com/document/d/doc-private-123/edit",
+            "approval_reference": str(kwargs["approval_reference"]),
+            "create": {
+                "status": "success",
+                "document_id": "doc-private-123",
+                "verification": {"passed": True},
+            },
+            "trash": {
+                "status": "success",
+                "document_id": "doc-private-123",
+                "verification": {"passed": True},
+            },
+            "verification": {
+                "passed": True,
+                "create_read_back": True,
+                "document_trashed_after_cleanup": True,
+            },
+            "send_enabled": False,
+        }
+
+    def unexpected_fallback(*_args, **_kwargs):
+        pytest.fail("verified Doc lifecycle must not fall through to an agent or WorkItem")
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "google_doc_test_lifecycle_impl", fake_doc_lifecycle)
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", unexpected_fallback)
+    monkeypatch.setattr(cli, "_run_ask_work_item", unexpected_fallback)
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--max-openai-requests",
+            "1",
+            "--database-url",
+            database_url,
+            "--json",
+            f"@KNI CoS {operator_text}",
+        ]
+    )
+
+    payload_text = capsys.readouterr().out
+    payload = json.loads(payload_text)
+    assert exit_code == 0
+    assert captured["title"] == "KBA_TEST_DOC_WRAPPER"
+    assert captured["body_text"] == "Natural CoS wrapper validation."
+    assert captured["folder_path"] == "KNIOps"
+    assert captured["live"] is True
+    assert str(captured["approval_reference"]).startswith(
+        "operator-command:google-workspace-test-lifecycle:"
+    )
+    assert payload["status"] == "done"
+    assert payload["route"] == "google_workspace_context_agent"
+    assert payload["output_type"] == "GoogleWorkspaceContextResult"
+    assert payload["output"]["summary"] == payload["human_summary"]
+    assert payload["slack_display_text"] == payload["human_summary"]
+    assert payload["slack_display_title"].endswith("Lifecycle Complete")
+    assert payload["openai_requests"] == 1
+    assert payload["provider_identity_redacted"] is True
+    assert payload["tool_receipt"]["verification"]["passed"] is True
+    assert payload["side_effects"] == {
+        "google_doc_created_and_verified": True,
+        "google_doc_trashed_after_cleanup": True,
+        "slack_message_posted": False,
+    }
+    assert "doc-private-123" not in payload_text
+    assert "docs.google.com" not in payload_text
+    assert "WorkItem command completed" not in payload_text
+    assert "approval_reference" not in payload["tool_receipt"]
+
+    stored_rows = SQLiteStore(database_url).fetch_all("agent_runs")
+    assert len(stored_rows) == 1
+    assert stored_rows[0]["agent_name"] == "google_workspace_context_agent"
+    assert stored_rows[0]["status"] == "success"
+    assert stored_rows[0]["dry_run"] == 0
+    assert "doc-private-123" in stored_rows[0]["output_json"]
+
+
+def test_kni_cos_semantic_gmail_lifecycle_uses_verified_wrapper_without_send(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    operator_text = (
+        "Please take Gmail draft KBA_TEST_DRAFT_WRAPPER through its full approved "
+        "lifecycle without sending it and leave no test residue."
+    )
+    database_url = f"sqlite:///{tmp_path / 'gmail-wrapper.sqlite'}"
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text, *, requested_agent=None, **_kwargs):
+        plan = ManualRequestPlan(
+            source="live_sdk",
+            requested_agent=requested_agent,
+            target_agent="gmail_triage",
+            intent="business_system_write",
+            objective=(
+                "Create Gmail draft KBA_TEST_DRAFT_WRAPPER, verify it, update that "
+                "same draft, verify it again, then delete it and confirm absence "
+                "without sending."
+            ),
+        )
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent=requested_agent,
+            advisory_only=True,
+            selected_agent="gmail_triage",
+            manual_request_plan=plan,
+            route_result=cli.route_request(request_text, manual_plan=plan),
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    class FakeGmailTool:
+        def __init__(self, *, live: bool) -> None:
+            captured["gmail_live"] = live
+            self.live = live
+
+    def fake_gmail_lifecycle(_gmail, **kwargs: object):
+        captured.update(kwargs)
+        return {
+            "status": "success",
+            "operation": "test_draft_lifecycle",
+            "draft_id": "draft-private-123",
+            "approval_reference": str(kwargs["approval_reference"]),
+            "create": {
+                "status": "ok",
+                "draft_id": "draft-private-123",
+                "verification": {"passed": True},
+            },
+            "update": {
+                "status": "ok",
+                "draft_id": "draft-private-123",
+                "verification": {"passed": True},
+            },
+            "delete": {
+                "status": "ok",
+                "draft_id": "draft-private-123",
+                "verification": {"passed": True},
+            },
+            "verification": {
+                "passed": True,
+                "create_read_back": True,
+                "same_draft_update_read_back": True,
+                "draft_absent_after_cleanup": True,
+            },
+            "sent": False,
+            "send_enabled": False,
+        }
+
+    def unexpected_fallback(*_args, **_kwargs):
+        pytest.fail("verified Gmail lifecycle must not fall through to an agent or WorkItem")
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "_configured_gmail_draft_account", lambda: "operator@example.test")
+    monkeypatch.setattr(cli, "GmailTool", FakeGmailTool)
+    monkeypatch.setattr(cli, "execute_gmail_test_draft_lifecycle", fake_gmail_lifecycle)
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", unexpected_fallback)
+    monkeypatch.setattr(cli, "_run_ask_work_item", unexpected_fallback)
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--max-openai-requests",
+            "1",
+            "--database-url",
+            database_url,
+            "--json",
+            f"@KNI CoS {operator_text}",
+        ]
+    )
+
+    payload_text = capsys.readouterr().out
+    payload = json.loads(payload_text)
+    assert exit_code == 0
+    assert captured["gmail_live"] is True
+    assert captured["marker"] == "KBA_TEST_DRAFT_WRAPPER"
+    assert captured["expected_account"] == "operator@example.test"
+    assert captured["recipient"] == "operator@example.test"
+    assert str(captured["approval_reference"]).startswith("operator-command:")
+    assert payload["status"] == "done"
+    assert payload["route"] == "gmail_triage"
+    assert payload["output_type"] == "EmailTriageResult"
+    assert payload["output"]["summary"] == payload["human_summary"]
+    assert payload["slack_display_text"] == payload["human_summary"]
+    assert payload["slack_display_title"].endswith("Lifecycle Complete")
+    assert payload["openai_requests"] == 1
+    assert payload["provider_identity_redacted"] is True
+    assert payload["send_enabled"] is False
+    assert payload["tool_receipt"]["verification"]["passed"] is True
+    assert payload["side_effects"] == {
+        "gmail_draft_created": True,
+        "gmail_draft_absent_after_cleanup": True,
+        "email_sent": False,
+        "slack_message_posted": False,
+    }
+    assert "draft-private-123" not in payload_text
+    assert "WorkItem command completed" not in payload_text
+    assert "approval_reference" not in payload["tool_receipt"]
+
+    stored_rows = SQLiteStore(database_url).fetch_all("agent_runs")
+    assert len(stored_rows) == 1
+    assert stored_rows[0]["agent_name"] == "gmail_triage"
+    assert stored_rows[0]["status"] == "success"
+    assert stored_rows[0]["dry_run"] == 0
+    assert "draft-private-123" in stored_rows[0]["output_json"]
+
+
+def test_named_ba_zotero_read_uses_compact_source_owner_estimate() -> None:
+    request = (
+        "Use Zotero to select the most recently added journal article with a stored "
+        "abstract. Provide its exact title and summarize the abstract in no more than "
+        "50 words. Do not use web search, full text, or modify Zotero."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=False,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="business_research_analyst",
+    )
+
+    assert estimate["max"] == 3
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "zotero_context_agent_direct_sdk",
+        "conditional_instruction_following_repair",
+    ]
+    assert "counts model turns only" in estimate["note"]
+
+
+def test_named_ba_zotero_read_runs_preflight_then_source_owner(
+    monkeypatch,
+) -> None:
+    request = (
+        "Use Zotero to select the most recently added journal article with a stored "
+        "abstract. Provide its exact title and summarize the abstract in no more than "
+        "50 words. Do not use web search, full text, or modify Zotero."
+    )
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text, *, requested_agent=None, live_manual_plan=False, **kwargs):
+        captured["preflight_request"] = request_text
+        captured["requested_agent"] = requested_agent
+        captured["live_manual_plan"] = live_manual_plan
+        return _fake_orchestrator_preflight(
+            request_text,
+            requested_agent=requested_agent,
+            live_manual_plan=live_manual_plan,
+            **kwargs,
+        )
+
+    def fake_specialist(route, input_text, **kwargs):
+        captured["specialist_route"] = route
+        captured["specialist_input"] = input_text
+        captured["manual_plan"] = kwargs["manual_plan"]
+        return 0
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", fake_specialist)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "business_research_analyst",
+            "--live-sdk",
+            "--max-openai-requests",
+            "8",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["preflight_request"] == request
+    assert captured["requested_agent"] == "business_research_analyst"
+    assert captured["live_manual_plan"] is True
+    assert captured["specialist_route"] == "zotero_context_agent"
+    assert captured["specialist_input"] == request
+    plan = captured["manual_plan"]
+    assert isinstance(plan, ManualRequestPlan)
+    assert plan.ask_shape.stop_condition == "stop_after_50_word_summary"
+
+
+def test_slack_continuation_recovers_latest_named_agent_followup() -> None:
+    request = (
+        "business agents continue this prior Slack thread. "
+        "Linked WorkItem: wi_example Previous request: workitem business agents "
+        "continue this prior Slack thread. Previous request: &gt; BA old request. "
+        "Previous result title: Business Agents WorkItem Failed "
+        "User follow-up: BA use Zotero to select the most recently added journal "
+        "article with a stored abstract. Provide its exact title and summarize the "
+        "abstract in no more than 50 words. Do not use web search, full text, or "
+        "modify Zotero. Continue the same agent task."
+    )
+
+    operator_request = cli._latest_slack_operator_request(request)
+    mention = cli.parse_agent_mention(
+        operator_request,
+        allow_bare_agent_aliases=True,
+    )
+
+    assert operator_request.startswith("BA use Zotero")
+    assert "Previous result" not in operator_request
+    assert mention.route == "business_research_analyst"
+    assert mention.input_text.startswith("use Zotero")
+
+
+def test_slack_continuation_without_history_file_keeps_latest_ask_and_prior_object() -> None:
+    request = (
+        "ba continue this prior Slack thread. "
+        "Previous request: BA use Zotero to select the most recently added journal "
+        "article with a stored abstract. "
+        "Previous result title: Business Agents Zotero Context Ready "
+        "Previous result: Title: Using AI to Detect Psychosis Relapse: Scoping Review. "
+        "Summary: The stored abstract was summarized. "
+        "User follow-up: Who are the authors, where was the article published, and "
+        "summarize its abstract in no more than 100 words. Use the same Zotero article "
+        "from this thread. Do not use web search, full text, or modify Zotero. "
+        "Continue the same agent task."
+    )
+
+    assert cli._latest_slack_operator_request(request) == (
+        "business research analyst Who are the authors, where was the article published, "
+        "and summarize its abstract in no more than 100 words. Use the same Zotero "
+        "article from this thread. Do not use web search, full text, or modify Zotero."
+    )
+    state = cli._slack_continuation_workflow_state(request)
+    assert state["prior_agent_runs"] == [
+        {
+            "id": "slack-envelope-1",
+            "route": "zotero_context_agent",
+            "status": "completed",
+            "title": "Using AI to Detect Psychosis Relapse: Scoping Review.",
+            "summary": (
+                "Title: Using AI to Detect Psychosis Relapse: Scoping Review. Summary: "
+                "The stored abstract was summarized."
+            ),
+        }
+    ]
+
+
+def test_slack_continuation_state_merge_deduplicates_prior_results() -> None:
+    prior = {
+        "route": "zotero_context_agent",
+        "title": "Provider article",
+        "summary": "Stored abstract summary.",
+    }
+
+    merged = cli._merge_direct_workflow_state(
+        {"slack_context": {"thread_ts": "123.456"}, "prior_agent_runs": [prior]},
+        {"prior_agent_runs": [dict(prior)]},
+    )
+
+    assert merged["slack_context"] == {"thread_ts": "123.456"}
+    assert merged["prior_agent_runs"] == [prior]
+
+
+def test_slack_operator_request_strips_rendered_quote_and_lone_mention_marker() -> None:
+    assert cli._latest_slack_operator_request(
+        "&gt; @ BA summarize one stored abstract"
+    ) == "BA summarize one stored abstract"
+
+
+def test_slack_continuation_preserves_named_chief_route_for_path_followup() -> None:
+    request = (
+        "chief of staff continue this prior Slack thread. "
+        "Previous request: add this personal expense in Airtable. "
+        "User follow-up: The path to the receipt is /private/tmp/receipt.pdf. "
+        "Continue the same agent task."
+    )
+
+    operator_request = cli._latest_slack_operator_request(request)
+    mention = cli.parse_agent_mention(
+        operator_request,
+        allow_bare_agent_aliases=True,
+    )
+
+    assert operator_request.startswith("chief of staff The path")
+    assert mention.route == "chief_of_staff"
+    assert mention.input_text.startswith("The path")
+
+
+@pytest.mark.parametrize(
+    ("outer_agent", "newest_ask", "expected_route"),
+    [
+        (
+            "BA",
+            "CoS audit the current request and identify the right internal owner.",
+            "chief_of_staff",
+        ),
+        (
+            "CoS",
+            "Gmail triage review the unread messages from today.",
+            "gmail_triage",
+        ),
+        (
+            "OS",
+            "BA research the company named in the selected message.",
+            "business_research_analyst",
+        ),
+        (
+            "BA",
+            "OS find current behavioral-health partnership opportunities.",
+            "opportunity_scout",
+        ),
+        (
+            "BA",
+            "GWC read the selected Google Doc and summarize it.",
+            "google_workspace_context_agent",
+        ),
+    ],
+)
+def test_slack_continuation_newest_explicit_agent_supersedes_outer_route(
+    outer_agent: str,
+    newest_ask: str,
+    expected_route: str,
+) -> None:
+    request = (
+        f"{outer_agent} continue this prior Slack thread. "
+        "Previous request: research the earlier object. "
+        "Previous result title: Business Agents Company Research Ready "
+        "Previous result: Title: Earlier object. Summary: Prior result. "
+        f"User follow-up: {newest_ask} Continue the same agent task."
+    )
+
+    operator_request = cli._latest_slack_operator_request(request)
+    mention = cli._parse_ask_agent_mention(
+        operator_request,
+        slack_context_input=False,
+        slack_continuation=True,
+    )
+
+    assert operator_request == newest_ask
+    assert mention.explicit is True
+    assert mention.route == expected_route
+    assert "Previous result" not in mention.input_text
+
+
+def test_slack_continuation_newest_bare_cos_runs_current_route_not_stale_graph(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    request = (
+        "BA continue this prior Slack thread. "
+        "Previous request: research the earlier object. "
+        "Previous result title: Business Agents Company Research Ready "
+        "Previous result: Title: Earlier object. Summary: Prior result. "
+        "User follow-up: CoS audit the current request and identify the right "
+        "internal owner. Continue the same agent task."
+    )
+
+    exit_code = main(
+        [
+                "ask",
+                "--database-url",
+                f"sqlite:///{tmp_path / 'continuation-route.db'}",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
+    assert payload["manual_request_plan"]["requested_agent"] == "chief_of_staff"
+    assert payload["manual_request_plan"]["target_agent"] == "chief_of_staff"
+    assert payload["route"] == "chief_of_staff"
+    assert payload["status"] == "done"
+    assert payload["work_item"]["request_text"] == (
+        "research the earlier object.\n"
+        "Prior result for context: Title: Earlier object. Summary: Prior result.\n"
+        "Authoritative follow-up: audit the current request and identify the right "
+        "internal owner."
+    )
+    assert payload["_execution"]["openai_requests"] == 0
+    assert "Previous result" not in payload["work_item"]["request_text"]
+
+
+def test_chief_format_only_followup_preserves_prior_facts_without_outreach_reroute(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    request = (
+        "chief of staff continue this prior Slack thread. "
+        "Previous request: I need a quick prep note. Using only these facts, give me "
+        "exactly three concise bullets: all entry surfaces should create the same "
+        "request envelope; direct and stateful multi-agent execution may remain "
+        "separate backends; a provider write is complete only after its receipt passes "
+        "verification. Do not search, call providers, or change anything. "
+        "Previous result title: Business Agents Result Ready "
+        "Previous result: A longer note. "
+        "User follow-up: Make that just the three bullets with no note after them. "
+        "Continue the same agent task."
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'format-followup.db'}",
+            "--no-live-sdk",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["manual_request_plan"]["target_agent"] == "chief_of_staff"
+    assert payload["manual_request_plan"]["intent"] == "route_request"
+    assert payload["human_summary"] == (
+        "- All entry surfaces should create the same request envelope.\n"
+        "- Direct and stateful multi-agent execution may remain separate backends.\n"
+        "- A provider write is complete only after its receipt passes verification."
+    )
+    assert payload["public_result"]["status"] == "completed"
+    assert payload["public_result"]["completion_confirmed"] is True
+    assert "clarification" not in payload["human_summary"].lower()
+    assert "slack.com" not in payload["human_summary"].lower()
+
+
+@pytest.mark.parametrize("route", ["orchestrator", "chief_of_staff"])
+def test_coordinating_agents_keep_broader_request_estimates(route: str) -> None:
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=False,
+    )
+
+    assert cli._skip_live_manual_plan_for_request(
+        "Coordinate a multi-stage operational review.",
+        requested_route=route,
+    ) is False
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text="Coordinate a multi-stage operational review.",
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route=route,
+    )
+
+    assert estimate["max"] > 3
+    assert estimate["stages"][0] == "manual_request_planner"
+
+
+def test_prior_context_chief_response_only_request_fits_five_request_ceiling() -> None:
+    request = (
+        "CoS, one more correction: reply with only the exact three bullets "
+        "supported by my original request. No heading or closing note. Do not "
+        "search, call tools or providers, draft anything, or change anything."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=False,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="chief_of_staff",
+    )
+
+    assert estimate["max"] == 3
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "chief_of_staff_response_only_sdk",
+        "conditional_instruction_following_repair",
+    ]
+
+
+def test_natural_cos_supplied_note_graph_counts_only_model_backed_stages() -> None:
+    request = (
+        "CoS, I have five minutes before a partnership discussion. Here is all I know: "
+        "Harbor Bridge Health sells behavioral-health care-navigation software to "
+        "health plans and says it tracks referral completion and care engagement, but "
+        "it has not shared audited outcomes, customer references, implementation data, "
+        "or an evaluation design. Give me one decision brief: what is actually "
+        "supported, the strongest potential KNI advisory or research fit, the single "
+        "validation question that should come first, and a short internal Slack note I "
+        "can paste to the team. Use only this note; do not search, create or modify "
+        "anything, draft or send email, or post anywhere else."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent="chief_of_staff",
+        max_manager_steps=4,
+        live_search=False,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="chief_of_staff",
+    )
+
+    assert estimate["min"] == 3
+    assert estimate["max"] == 4
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "business_research_analyst_source_provided_deterministic",
+        "opportunity_scout_source_provided_deterministic",
+        "outreach_composer_sdk",
+        "final_response_synthesis",
+        "conditional_instruction_following_repair",
+    ]
+
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    plan.ask_shape.output_constraints = (
+        plan.ask_shape.output_constraints.model_copy(
+            update={
+                "interpretation": (
+                    "Return a decision brief and a separate paste-ready Slack note."
+                ),
+                "required_sections": [
+                    "Decision brief",
+                    "Paste-ready Slack note",
+                ],
+            }
+        )
+    )
+    resolved = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="chief_of_staff",
+        manual_plan=plan,
+        effective_live_search=False,
+    )
+
+    assert resolved["min"] == 3
+    assert resolved["max"] == 4
+    assert resolved["stages"][-1] == "conditional_instruction_following_repair"
+
+
+def test_short_human_cos_stateful_review_fits_shared_five_request_ceiling() -> None:
+    request = (
+        "CoS: Track this review. Northstar Care sells referral-navigation software "
+        "but has no audited outcomes. Assess what is supported, choose the first "
+        "validation gap, and give me a paste-ready internal Slack recommendation. "
+        "No search or external actions."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent="chief_of_staff",
+        max_manager_steps=4,
+        live_search=False,
+    )
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="chief_of_staff",
+        manual_plan=plan,
+        effective_live_search=False,
+    )
+
+    assert estimate["min"] == 3
+    assert estimate["max"] == 4
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "business_research_analyst_source_provided_deterministic",
+        "opportunity_scout_source_provided_deterministic",
+        "outreach_composer_sdk",
+        "final_response_synthesis",
+        "conditional_instruction_following_repair",
+    ]
+
+
+def test_natural_cos_supplied_note_without_planner_workflow_stays_bounded() -> None:
+    request = (
+        "CoS, I have a partner check-in shortly. Here is the only information I "
+        "have: Riverbend Behavioral is considering a clinician-facing documentation "
+        "assistant for outpatient psychiatry practices and says it may reduce "
+        "after-hours charting, but it has not provided time-motion data, a safety "
+        "evaluation, pilot retention, or customer references. Give me two clearly "
+        "separated things. First, a concise decision brief covering what this "
+        "establishes and does not establish, the strongest potential KNI fit, and the "
+        "first validation question. Second, a paste-ready internal Slack update for "
+        "my team in two or three sentences. Use only this note. Do not search, use "
+        "provider tools, create or modify anything, draft or send email, or post "
+        "anywhere else."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent="chief_of_staff",
+        max_manager_steps=4,
+        live_search=False,
+    )
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    assert plan.workflow == []
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="chief_of_staff",
+        manual_plan=plan,
+        effective_live_search=False,
+    )
+
+    assert estimate["min"] == 2
+    assert estimate["max"] == 3
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "chief_of_staff_response_only_sdk",
+        "conditional_instruction_following_repair",
+    ]
+
+
+def test_cos_exact_gmail_read_to_slack_reply_fits_shared_five_request_ceiling() -> None:
+    request = (
+        'CoS, find the Gmail email with subject "Why Healthtech Needs a New Kind '
+        'of Product Leader". Read its complete thread, tell me briefly what warrants '
+        "a response, then draft a concise response here in this Slack thread so I "
+        "can copy it. Use your judgment: either ask one thoughtful question or make "
+        "one useful point. Do not create a Gmail draft, send anything, change labels, "
+        "archive, or otherwise modify the mailbox."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent="chief_of_staff",
+        max_manager_steps=3,
+        live_search=False,
+    )
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="chief_of_staff",
+    )
+
+    assert cli._route_with_manual_plan_advice("chief_of_staff", plan) == "gmail_triage"
+    assert estimate["max"] == 3
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "gmail_triage_direct_sdk",
+    ]
+    assert not any(
+        "chief_of_staff_sdk" in stage
+        or "outreach_composer" in stage
+        or "manager_specialist" in stage
+        for stage in estimate["stages"]
+    )
+
+
+def test_cos_email_title_and_paste_copy_rephrase_fits_shared_five_request_ceiling() -> None:
+    request = (
+        'CoS, I need a quick reply I can paste. Find the email titled "RUAIH '
+        'Certification", read the whole conversation, and tell me briefly whether it '
+        "merits a response. Then write a short reply here—choose either one sensible "
+        "question or one useful observation. Leave Gmail exactly as it is: no draft, "
+        "send, label changes, or archive."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent="chief_of_staff",
+        max_manager_steps=3,
+        live_search=False,
+    )
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="chief_of_staff",
+    )
+
+    assert cli._route_with_manual_plan_advice("chief_of_staff", plan) == "gmail_triage"
+    assert estimate["max"] == 3
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "gmail_triage_direct_sdk",
+    ]
+
+
+def test_live_cos_exact_gmail_read_executes_gmail_specialist_not_manager_graph(
+    monkeypatch,
+) -> None:
+    request = (
+        'CoS, find the Gmail email with subject "Why Healthtech Needs a New Kind '
+        'of Product Leader". Read its complete thread, tell me briefly what warrants '
+        "a response, then draft a concise response here in this Slack thread so I "
+        "can copy it. Do not create a Gmail draft, send anything, change labels, "
+        "archive, or otherwise modify the mailbox."
+    )
+    calls: list[tuple[str, str]] = []
+
+    def fake_gmail_live(input_text: str, **_kwargs: object) -> int:
+        calls.append(("gmail_triage", input_text))
+        return 0
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _fake_orchestrator_preflight)
+    monkeypatch.setattr(cli, "_run_ask_gmail_triage_live", fake_gmail_live)
+    monkeypatch.setattr(
+        cli,
+        "_run_ask_chief_of_staff_live",
+        lambda *_args, **_kwargs: pytest.fail("Chief must delegate this bounded Gmail ask"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_run_ask_work_item",
+        lambda *_args, **_kwargs: pytest.fail("single-owner Gmail ask must not use a graph"),
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--live-sdk",
+            "--max-openai-requests",
+            "5",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [("gmail_triage", request)]
+
+
+def test_live_gmail_child_promotes_assessment_and_copyable_draft(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    request = (
+        'CoS, find the Gmail email with subject "RUAIH Certification". Read that '
+        "email in the context of its complete thread. Tell me briefly what warrants "
+        "a response, then draft a concise response here in this Slack thread so I "
+        "can copy it. Use your judgment: either ask one thoughtful question or make "
+        "one useful point, whichever fits the email better. Do not create a Gmail "
+        "draft, send anything, change labels, archive, or otherwise modify the mailbox."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    plan.source = "llm"
+    plan.objective = (
+        'Find the Gmail email with subject "RUAIH Certification", read its complete '
+        "thread, identify briefly what warrants a response, and draft a concise "
+        "Slack-ready reply the operator can copy."
+    )
+    plan.ask_shape.output_constraints = InterpretedOutputConstraints(
+        interpretation=(
+            "Brief Slack-ready response with a short note on what warrants a reply "
+            "and one concise draft reply."
+        ),
+        scope="entire_response",
+        style_requirements=["keep it concise", "draft only", "Slack readable"],
+    )
+    assessment = (
+        "A response is optional but useful to clarify the most important readiness "
+        "criterion before applying."
+    )
+    draft = (
+        "Thanks for sending this. What readiness criterion would you recommend "
+        "confirming before we apply?"
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "output_type": "EmailTriageResult",
+                    "send_enabled": False,
+                    "output": {
+                        "summary": "The sender shared a certification application.",
+                        "reasoning": assessment,
+                        "needs_reply": True,
+                        "draft_reply": draft,
+                    },
+                    "model": {
+                        "provider": "openai",
+                        "name": "gpt-5.4-mini",
+                        "run_mode": "live_sdk",
+                    },
+                }
+            ),
+            stderr="",
+        ),
+    )
+
+    exit_code = cli._run_ask_script_live(
+        "gmail_triage",
+        request,
+        ["unused-child-command"],
+        json_output=True,
+        manual_plan=plan,
+        database_url=f"sqlite:///{tmp_path / 'gmail-slack-render.db'}",
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.get("status") != "blocked"
+    assert payload["human_summary"] == f"{assessment}\n\n*Draft response:*\n{draft}"
+    assert payload["slack_display_text"] == payload["human_summary"]
+    assert payload["instruction_following"]["validation"]["applicable"] is False
+    assert payload["instruction_following"]["repair_attempted"] is False
+
+
+def test_unnamed_supplied_facts_request_resolves_to_bounded_chief_budget() -> None:
+    request = (
+        "I’m short on time. Without searching or using provider tools, use only "
+        "these two facts: negative constraints now narrow execution instead of "
+        "blocking it, and the full offline suite passes. Give me exactly two short "
+        "bullets: what changed and what we still need to validate. Do not draft "
+        "outreach, create or modify records, or include routing metadata."
+    )
+    plan = infer_manual_request_plan(request)
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=False,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route=plan.target_agent,
+    )
+
+    assert plan.target_agent == "chief_of_staff"
+    assert estimate["max"] == 3
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "chief_of_staff_response_only_sdk",
+        "conditional_instruction_following_repair",
+    ]
+
+
 def test_bounded_connector_graph_accepts_state_and_collaboration_wording() -> None:
     request = (
         "Review the latest Gmail thread from the configured exact test sender, including "
@@ -4788,7 +9857,7 @@ def test_controlled_gmail_recommendation_fits_two_request_ceiling() -> None:
     assert estimate["stages"] == ["manual_request_planner", "outreach_composer_sdk"]
 
 
-def test_bounded_gmail_research_summary_fits_eight_request_ceiling() -> None:
+def test_bounded_gmail_research_summary_includes_conditional_repair_ceiling() -> None:
     request = (
         "Read the latest Gmail thread from the configured exact sender, including all "
         "messages. Identify the organization and product, then research them using "
@@ -4812,12 +9881,13 @@ def test_bounded_gmail_research_summary_fits_eight_request_ceiling() -> None:
     )
 
     assert cli._is_bounded_gmail_research_summary_graph(request, manager_steps=3) is True
-    assert estimate["max"] == 8
+    assert estimate["max"] == 9
     assert estimate["stages"] == [
         "manual_request_planner",
         "gmail_provider_read",
         "business_research_sdk",
         "final_response_synthesis",
+        "conditional_instruction_following_repair",
     ]
 
 
@@ -4882,6 +9952,76 @@ def test_cli_explicit_chief_budget_uses_delegated_context_owner_turn_limit(
     assert payload["estimated_requests"]["max"] == 6
     assert payload["estimated_requests"]["stages"] == ["airtable_context_agent_sdk"]
     assert payload["openai_requests_made"] == 0
+
+
+def test_simple_chief_airtable_receipt_uses_direct_context_agent_budget() -> None:
+    request = (
+        "Add this attached receipt as exactly one personal expense in Airtable. "
+        "Read the PDF, map only receipt-backed fields to the live schema, attach "
+        "the PDF, and verify the created record and attachment."
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=False,
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=False,
+        requested_route="chief_of_staff",
+    )
+
+    assert plan.target_agent == "airtable_context_agent"
+    assert plan.intent == "business_system_write"
+    assert estimate["max"] == 2
+    assert estimate["stages"] == ["airtable_context_agent_direct_sdk"]
+    assert cli._skip_live_manual_plan_for_request(
+        request,
+        requested_route="airtable_context_agent",
+    ) is True
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_max"),
+    [
+        (
+            "Read one Personal Expenses record with order KBA_TEST_ORDER_001 and "
+            "report its receipt-backed fields.",
+            2,
+        ),
+        (
+            "Update one Personal Expenses record with order KBA_TEST_ORDER_001 to set "
+            "Description to Software subscription and verify it.",
+            3,
+        ),
+    ],
+)
+def test_direct_airtable_single_action_budget_is_bounded(
+    prompt: str,
+    expected_max: int,
+) -> None:
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=False,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=prompt,
+        live_sdk=True,
+        live_manual_plan=False,
+        requested_route="airtable_context_agent",
+    )
+
+    assert estimate["max"] == expected_max
+    assert estimate["stages"] == ["airtable_context_agent_direct_sdk"]
 
 
 def test_cli_ask_gmail_triage_live_accepts_simple_inline_sanitized_email_fixture(
@@ -4967,6 +10107,24 @@ def test_cli_ask_live_child_timeout_returns_structured_payload(
     assert payload["output"]["failure"]["kind"] == "provider_timeout"
 
 
+def test_opportunity_scout_child_timeout_reserves_synthesis_headroom(monkeypatch) -> None:
+    monkeypatch.delenv("KEYSTONE_CHILD_AGENT_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setenv("KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("KEYSTONE_OPPORTUNITY_RETRIEVAL_DEADLINE_SECONDS", "90")
+
+    assert cli._child_agent_timeout_seconds(route="opportunity_scout") == 150.0
+    assert cli._child_agent_timeout_seconds(route="business_research_analyst") == 120.0
+
+
+def test_explicit_child_timeout_remains_authoritative_for_opportunity_scout(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_CHILD_AGENT_TIMEOUT_SECONDS", "75")
+    monkeypatch.setenv("KEYSTONE_OPPORTUNITY_RETRIEVAL_DEADLINE_SECONDS", "90")
+
+    assert cli._child_agent_timeout_seconds(route="opportunity_scout") == 75.0
+
+
 def test_cli_ask_live_child_failure_returns_redacted_structured_payload(
     monkeypatch,
     capsys,
@@ -5017,6 +10175,54 @@ def test_cli_ask_live_child_failure_returns_redacted_structured_payload(
     assert "ValueError: final diagnostic line from SDK provider" in payload["output"]["stderr_excerpt"]
     assert "ValueError: final diagnostic line from SDK provider" in payload["output"]["error_tail"]
     assert "sk-" + ("x" * 24) not in payload["output"]["error_tail"]
+
+
+def test_live_child_failure_persists_redacted_local_diagnostics(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'child-failure.db'}"
+    fake_token = "sk-" + ("z" * 24)
+    monkeypatch.setattr(
+        cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr=(
+                f"Traceback token={fake_token}\n"
+                "ModelBehaviorError: structured output did not match the schema"
+            ),
+        ),
+    )
+
+    exit_code = cli._run_ask_script_live(
+        "gmail_triage",
+        "Find one selected email and draft a Slack-only response.",
+        ["unused-child-command"],
+        json_output=True,
+        manual_plan=infer_manual_request_plan(
+            "Find one selected email and draft a Slack-only response.",
+            requested_agent="gmail_triage",
+        ),
+        database_url=database_url,
+    )
+
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["agent_run_id"] > 0
+    rows = SQLiteStore(database_url).fetch_all("agent_runs")
+    assert len(rows) == 1
+    assert rows[0]["status"] == "error"
+    assert rows[0]["error"] == "schema_or_parse_error"
+    stored = json.loads(rows[0]["output_json"])
+    assert (
+        "ModelBehaviorError: structured output did not match the schema"
+        in stored["output"]["error_tail"]
+    )
+    assert fake_token not in rows[0]["output_json"]
+    assert "[REDACTED]" in rows[0]["output_json"]
 
 
 def test_cli_ask_live_child_failure_prefers_operator_failure_payload(

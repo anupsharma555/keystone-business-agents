@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -116,14 +117,32 @@ def infer_finance_expense_receipt_target(text: object) -> FinanceExpenseReceiptT
         table = "Personal Expenses"
     if not table:
         return None
-    if not re.search(r"\b(?:add|create|insert|record|update|change|set|fill)\b", lowered):
+    if not re.search(
+        r"\b(?:add|create|insert|record|update|change|correct|move|set|fill|remove|"
+        r"verify|confirm|check|read)\b",
+        lowered,
+    ):
         return None
+    operation = "create"
+    if re.search(
+        r"^(?:verify|confirm|check|read)\b|"
+        r"\b(?:verify|confirm|check|read)\s+only\b|"
+        r"\b(?:do\s+not|don't)\s+(?:modify|change|update)\b|"
+        r"\bread[- ]only\b",
+        lowered,
+    ):
+        operation = "read"
+    elif re.search(r"\brec[a-zA-Z0-9]{10,}\b", raw_text) or re.search(
+        r"\b(?:update|change|correct|move|set|relabel|replace|remove)\b",
+        lowered,
+    ):
+        operation = "update"
     paths = _local_receipt_paths(raw_text)
     return FinanceExpenseReceiptTarget(
         base_alias=FINANCE_TAX_TRACKER_BASE_ALIAS,
         base_name=FINANCE_TAX_TRACKER_BASE_NAME,
         table=table,
-        operation="create",
+        operation=operation,
         receipt_local_path=paths[0] if paths else "",
     )
 
@@ -388,7 +407,14 @@ def _local_receipt_paths(text: str) -> list[str]:
 def _extract_local_artifact_text(path: Path) -> tuple[str, str, str]:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        pdftotext = shutil.which("pdftotext")
+        pdftotext = _resolve_local_executable(
+            os.getenv("KEYSTONE_PDFTOTEXT_COMMAND", "pdftotext"),
+            fallback_paths=(
+                "/opt/homebrew/bin/pdftotext",
+                "/usr/local/bin/pdftotext",
+                "/usr/bin/pdftotext",
+            ),
+        )
         if pdftotext:
             try:
                 completed = subprocess.run(
@@ -426,6 +452,30 @@ def _extract_local_artifact_text(path: Path) -> tuple[str, str, str]:
             return "", "tesseract", f"{type(exc).__name__}: {exc}"
         return completed.stdout, "tesseract", ""
     return "", "", f"unsupported artifact extension {suffix}"
+
+
+def _resolve_local_executable(
+    command: str,
+    *,
+    fallback_paths: tuple[str, ...] = (),
+) -> str:
+    """Resolve a local helper even when a launch daemon has a minimal PATH."""
+
+    candidate = str(command or "").strip()
+    if candidate:
+        if Path(candidate).is_absolute():
+            path = Path(candidate).expanduser()
+            if path.is_file() and os.access(path, os.X_OK):
+                return str(path)
+        else:
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+    for raw_path in fallback_paths:
+        path = Path(raw_path).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return ""
 
 
 def _vendor_from_text(text: str) -> str:
@@ -466,12 +516,12 @@ def _estimated_tax_period_for_date(date_value: str) -> str:
     if parsed.year != 2026:
         return ""
     if parsed.month <= 3:
-        return "Q1"
+        return "1"
     if parsed.month <= 5:
-        return "Q2"
+        return "2"
     if parsed.month <= 8:
-        return "Q3"
-    return "Q4"
+        return "3"
+    return "4"
 
 
 def _line_item_from_text(text: str) -> tuple[str, str]:

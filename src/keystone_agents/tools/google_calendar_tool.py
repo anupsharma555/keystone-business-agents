@@ -207,6 +207,7 @@ def _google_api_error_detail(response: Any) -> str:
 def resolve_google_calendar_event_impl(
     event_reference: str,
     *,
+    start_date: str = "",
     calendar_id: str = "",
     live: bool = False,
     tool: GoogleCalendarTool | None = None,
@@ -214,6 +215,7 @@ def resolve_google_calendar_event_impl(
     """Resolve one active Calendar event from a natural title reference."""
 
     reference = _required(event_reference, "Calendar event name")
+    requested_date = _iso_date(start_date) if start_date.strip() else ""
     clean_calendar = _calendar_id(calendar_id)
     if not live:
         return {
@@ -221,6 +223,7 @@ def resolve_google_calendar_event_impl(
             "operation": "resolve_calendar_event",
             "calendar_id": clean_calendar,
             "event_reference": reference,
+            "start_date": requested_date,
             "match_count": 0,
             "send_enabled": False,
         }
@@ -245,12 +248,19 @@ def resolve_google_calendar_event_impl(
             or _normalize_event_title(item.get("summary")) in normalized_reference
         )
     ]
+    if requested_date:
+        matches = [
+            item
+            for item in matches
+            if _provider_event_start_date(item) == requested_date
+        ]
     if len(matches) != 1:
         return {
             "status": "not_found" if not matches else "ambiguous",
             "operation": "resolve_calendar_event",
             "calendar_id": clean_calendar,
             "event_reference": reference,
+            "start_date": requested_date,
             "match_count": len(matches),
             "send_enabled": False,
         }
@@ -262,10 +272,16 @@ def resolve_google_calendar_event_impl(
         "event_reference": reference,
         "match_count": 1,
         "event_id": str(event.get("id") or ""),
+        "provider_link": str(event.get("htmlLink") or ""),
         "title": str(event.get("summary") or ""),
-        "start_date": str((event.get("start") or {}).get("date") or ""),
+        "start_date": _provider_event_start_date(event),
         "send_enabled": False,
     }
+
+
+def _provider_event_start_date(event: dict[str, Any]) -> str:
+    start = event.get("start") if isinstance(event.get("start"), dict) else {}
+    return str(start.get("date") or start.get("dateTime") or "")[:10]
 
 
 def read_google_calendar_window_impl(
@@ -330,6 +346,8 @@ def create_google_calendar_event_impl(
     start_date: str,
     *,
     description: str = "",
+    end_date: str = "",
+    repeat_each_day: bool = False,
     calendar_id: str = "",
     timezone: str = "",
     start_time: str = "",
@@ -360,7 +378,14 @@ def create_google_calendar_event_impl(
     )
     expected_start = str(dates["start"].get("dateTime") or dates["start"].get("date") or "")
     event_id = _deterministic_event_id(clean_calendar, clean_title, expected_start, approval)
-    payload = _event_payload(clean_title, dates, description, clean_timezone)
+    recurrence = _daily_recurrence(clean_date, end_date) if repeat_each_day else []
+    payload = _event_payload(
+        clean_title,
+        dates,
+        description,
+        clean_timezone,
+        recurrence=recurrence,
+    )
     calendar = tool or GoogleCalendarTool(live=live)
     if not live:
         return _preview("create", clean_calendar, event_id, payload, approval)
@@ -374,18 +399,23 @@ def create_google_calendar_event_impl(
         expected_start=expected_start,
         all_day=not timed,
         description=description,
+        recurrence=recurrence,
     )
+    html_link = str(created.get("htmlLink") or verified.get("htmlLink") or "")
     return {
         "status": "success" if verification["passed"] else "verification_failed",
         "operation": "create_calendar_event",
         "calendar_id": clean_calendar,
         "event_id": event_id,
-        "html_link": str(created.get("htmlLink") or verified.get("htmlLink") or ""),
+        "html_link": html_link,
+        "provider_link": html_link,
         "title": clean_title,
         "start_date": clean_date,
+        "end_date": _iso_date(end_date) if end_date.strip() else "",
         "start_time": start_time.strip(),
         "end_time": end_time.strip(),
         "all_day": not timed,
+        "repeat_each_day": bool(recurrence),
         "timezone": clean_timezone,
         "description_present": bool(description.strip()),
         "approval_reference": approval,
@@ -405,6 +435,7 @@ def update_google_calendar_event_impl(
     start_time: str = "",
     end_time: str = "",
     duration_minutes: int = 60,
+    append_description: bool = False,
     approval_reference: str = "",
     live: bool = False,
     tool: GoogleCalendarTool | None = None,
@@ -423,15 +454,13 @@ def update_google_calendar_event_impl(
     if start_date.strip():
         clean_date = _iso_date(start_date)
         changes.update(
-            _timed_dates(
+            _calendar_update_dates(
                 clean_date,
-                start_time,
+                start_time=start_time,
                 end_time=end_time,
                 duration_minutes=duration_minutes,
                 timezone=clean_timezone,
             )
-            if start_time.strip()
-            else _all_day_dates(clean_date)
         )
     if description:
         changes["description"] = description.strip()
@@ -439,11 +468,18 @@ def update_google_calendar_event_impl(
         raise ValueError("Calendar event update requires title, start_date, or description.")
     calendar = tool or GoogleCalendarTool(live=live)
     if not live:
-        return _preview("update", clean_calendar, clean_event_id, changes, approval)
+        preview = _preview("update", clean_calendar, clean_event_id, changes, approval)
+        preview["description_mode"] = "append" if append_description else "replace"
+        return preview
     _require_live_write_gate()
     before = calendar.get_event(clean_calendar, clean_event_id)
     if before.get("_not_found"):
         raise GoogleCalendarError("Exact Calendar event was not found for update.")
+    if append_description and description.strip():
+        changes["description"] = _append_calendar_description(
+            str(before.get("description") or ""),
+            description.strip(),
+        )
     calendar.update_event(clean_calendar, clean_event_id, changes)
     verified = calendar.get_event(clean_calendar, clean_event_id)
     expected_title = str(changes.get("summary") or before.get("summary") or "")
@@ -463,18 +499,21 @@ def update_google_calendar_event_impl(
         all_day=expected_all_day,
         description=expected_description,
     )
+    html_link = str(verified.get("htmlLink") or "")
     return {
         "status": "success" if verification["passed"] else "verification_failed",
         "operation": "update_calendar_event",
         "calendar_id": clean_calendar,
         "event_id": clean_event_id,
-        "html_link": str(verified.get("htmlLink") or ""),
+        "html_link": html_link,
+        "provider_link": html_link,
         "title": expected_title,
         "start_date": expected_start[:10],
         "start_time": "" if expected_all_day else expected_start[11:16],
         "all_day": expected_all_day,
         "timezone": clean_timezone,
         "description_present": bool(expected_description),
+        "description_mode": "append" if append_description else "replace",
         "approval_reference": approval,
         "verification": verification,
         "send_enabled": False,
@@ -510,6 +549,7 @@ def delete_google_calendar_event_impl(
         "operation": "delete_calendar_event",
         "calendar_id": clean_calendar,
         "event_id": clean_event_id,
+        "provider_link": str(before.get("htmlLink") or ""),
         "title": str(before.get("summary") or ""),
         "start_date": str((before.get("start") or {}).get("date") or ""),
         "approval_reference": approval,
@@ -550,6 +590,8 @@ def create_google_calendar_event(
     title: str,
     start_date: str,
     description: str = "",
+    end_date: str = "",
+    repeat_each_day: bool = False,
     calendar_id: str = "",
     timezone: str = "",
     start_time: str = "",
@@ -565,6 +607,8 @@ def create_google_calendar_event(
             title,
             start_date,
             description=description,
+            end_date=end_date,
+            repeat_each_day=repeat_each_day,
             calendar_id=calendar_id,
             timezone=timezone,
             start_time=start_time,
@@ -588,6 +632,7 @@ def update_google_calendar_event(
     start_time: str = "",
     end_time: str = "",
     duration_minutes: int = 60,
+    append_description: bool = False,
     approval_reference: str = "",
     live: bool = False,
 ) -> str:
@@ -604,6 +649,7 @@ def update_google_calendar_event(
             start_time=start_time,
             end_time=end_time,
             duration_minutes=duration_minutes,
+            append_description=append_description,
             approval_reference=approval_reference,
             live=live,
         ),
@@ -764,13 +810,55 @@ def _timed_dates(
     }
 
 
+def _calendar_update_dates(
+    start_date: str,
+    *,
+    start_time: str,
+    end_time: str,
+    duration_minutes: int,
+    timezone: str,
+) -> dict[str, dict[str, Any]]:
+    """Build mutually exclusive PATCH fields for all-day/timed conversions."""
+
+    if start_time.strip():
+        dates: dict[str, dict[str, Any]] = _timed_dates(
+            start_date,
+            start_time,
+            end_time=end_time,
+            duration_minutes=duration_minutes,
+            timezone=timezone,
+        )
+        for boundary in ("start", "end"):
+            dates[boundary]["date"] = None
+        return dates
+    dates = _all_day_dates(start_date)
+    for boundary in ("start", "end"):
+        dates[boundary]["dateTime"] = None
+        dates[boundary]["timeZone"] = None
+    return dates
+
+
+def _append_calendar_description(existing: str, addition: str) -> str:
+    """Append one note without duplicating content already present."""
+
+    clean_existing = existing.strip()
+    clean_addition = addition.strip()
+    if not clean_existing:
+        return clean_addition
+    if clean_addition in clean_existing:
+        return clean_existing
+    return f"{clean_existing}\n{clean_addition}"
+
+
 def _event_payload(
     title: str,
     dates: dict[str, dict[str, str]],
     description: str,
     timezone: str,
+    *,
+    recurrence: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "summary": title,
         "description": description.strip(),
         **dates,
@@ -781,6 +869,20 @@ def _event_payload(
             }
         },
     }
+    if recurrence:
+        payload["recurrence"] = recurrence
+    return payload
+
+
+def _daily_recurrence(start_date: str, end_date: str) -> list[str]:
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(_iso_date(end_date))
+    if end < start:
+        raise ValueError("Calendar recurrence end_date must not precede start_date.")
+    count = (end - start).days + 1
+    if count > 366:
+        raise ValueError("Calendar daily recurrence is limited to 366 instances.")
+    return [f"RRULE:FREQ=DAILY;COUNT={count}"]
 
 
 def _event_verification(
@@ -791,6 +893,7 @@ def _event_verification(
     expected_start: str,
     all_day: bool,
     description: str,
+    recurrence: list[str] | None = None,
 ) -> dict[str, Any]:
     checks = {
         "event_id_match": str(event.get("id") or "") == event_id,
@@ -800,6 +903,7 @@ def _event_verification(
         )
         == expected_start,
         "description_match": str(event.get("description") or "") == description.strip(),
+        "recurrence_match": list(event.get("recurrence") or []) == list(recurrence or []),
     }
     return {
         "status": "verified" if all(checks.values()) else "verification_failed",

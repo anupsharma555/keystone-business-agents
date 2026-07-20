@@ -21,7 +21,7 @@ from keystone_agents.models import (
 )
 from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
 from keystone_agents.schemas.email_triage import EmailTriageResult, GmailPriorityGroupingResult
-from keystone_agents.schemas.opportunity import OpportunityScoutResult
+from keystone_agents.schemas.opportunity import OpportunityScoutResult, OpportunityScoutSynthesis
 from keystone_agents.schemas.orchestrator import OrchestratorOutputReview
 from keystone_agents.schemas.outreach import OutreachDraft
 from keystone_agents.sdk import ToolGuardrailViolation
@@ -450,7 +450,22 @@ def _sdk_cli_cases() -> list[dict[str, Any]]:
                 "--json",
             ],
             "typed_input": OpportunityScoutSDKInput,
-            "output": lambda: OpportunityScoutResult.model_validate(_opportunity_scout_payload()),
+            "output": lambda: OpportunityScoutSynthesis.model_validate(
+                {
+                    "decisions": [
+                        {
+                            "record_key": "company:curebase",
+                            "include": True,
+                            "why_now_signal": "Current fixture evidence supports review.",
+                            "keystone_fit_reason": "Clinical AI and research operations fit.",
+                            "recommended_next_step": "Review the verified source packet.",
+                            "missing_evidence": [],
+                        }
+                    ],
+                    "audit_summary": "Selected one verified fixture opportunity.",
+                    "outreach_generated": False,
+                }
+            ),
             "missing_live_key_message": "KEYSTONE_OPENAI_API_KEY is required",
         },
         {
@@ -1452,8 +1467,6 @@ def test_opportunity_scout_os1_improvement_case_uses_llm_synthesis_context(
             "os-1",
             "--fixture",
             str(FIXTURES / "opportunity_scout_os1_role_sources.json"),
-            "--founder-fit-profile",
-            str(FIXTURES / "founder_fit_profile_approved.json"),
             "--run-sdk",
             "--json",
         ],
@@ -1480,7 +1493,10 @@ def test_opportunity_scout_os1_improvement_case_uses_llm_synthesis_context(
     assert "candidate_role_sources" in prompt
     assert "Exclude AI tutor roles" in prompt
     assert "neuro-measure-medical-director" in prompt
-    assert "founder_fit_test" in prompt
+    assert "founder_fit_2026" in prompt
+    assert "opportunity_lanes" in prompt
+    assert "Remote, virtual, or online opportunities are preferred for now." in prompt
+    assert payload["founder_fit_profile"]["search_context_complete"] is True
 
 
 def test_opportunity_scout_os1_live_search_queries_pass_search_guardrails() -> None:
@@ -1493,6 +1509,64 @@ def test_opportunity_scout_os1_live_search_queries_pass_search_guardrails() -> N
         )
 
         assert assessment.allowed, query
+
+
+def test_opportunity_scout_skips_sdk_when_live_retrieval_has_zero_raw_results(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.run_opportunity_scout as cli
+
+    _disable_dotenv(monkeypatch)
+    _patch_no_side_effects(cli, monkeypatch)
+    monkeypatch.setattr(cli, "SDK_RUN_CONFIG_FACTORY", lambda: LOCAL_RUN_CONFIG)
+    monkeypatch.setattr(
+        cli,
+        "run_opportunity_scout_live",
+        lambda **_kwargs: (
+            OpportunityScoutResult(
+                topic="remote clinical AI workshops",
+                dry_run=False,
+                search_provider="searxng",
+                raw_search_result_count=0,
+                records=[],
+                review_candidates=[],
+                audit_notes=["Provider returned zero raw results."],
+            ),
+            {
+                "primary_search_provider": "searxng",
+                "retrieval_diagnostics": {"errors": ["all engines unavailable"]},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_retrieved_sdk_synthesis",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("empty retrieval must not invoke SDK synthesis")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_opportunity_scout.py",
+            "--topic",
+            "remote clinical AI workshops",
+            "--live-search",
+            "--no-dry-run",
+            "--run-sdk",
+            "--json",
+        ],
+    )
+
+    assert cli.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["sdk_run_invoked"] is False
+    assert payload["synthesis_skipped_reason"] == ("live_retrieval_returned_zero_raw_results")
+    assert payload["usage"]["requests"] == 0
+    assert payload["cost"]["estimated_usd"] == 0.0
+    assert payload["output"]["records"] == []
 
 
 def test_opportunity_scout_os1_live_search_falls_back_to_searxng(

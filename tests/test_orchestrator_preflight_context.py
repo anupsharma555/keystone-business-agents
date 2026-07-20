@@ -7,6 +7,9 @@ from keystone_agents.orchestrator.preflight_context import (
     MANUAL_REQUEST_PLAN_ENV,
     ORCHESTRATOR_PREFLIGHT_ENV,
     ORCHESTRATOR_ROUTE_RESULT_ENV,
+    SPECIALIST_EXECUTION_CONTEXT_ENV,
+    load_specialist_execution_context_from_env,
+    orchestrator_preflight_context_text,
     orchestrator_preflight_env,
 )
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
@@ -409,6 +412,29 @@ def test_orchestrator_preflight_env_omits_raw_workflow_state() -> None:
     assert "private Slack thread text" not in serialized
     assert "operator feedback" not in serialized
     assert preflight["preflight_memo"]["orchestrator_route"] == "chief_of_staff"
+
+
+def test_preflight_env_carries_only_explicit_bounded_specialist_context(monkeypatch) -> None:
+    execution_context = {
+        "schema": "keystone.direct_specialist_context.v1",
+        "prior_agent_runs": [
+            {
+                "route": "zotero_context_agent",
+                "object_id": "ITEM123",
+                "title": "Example article",
+            }
+        ],
+    }
+    env = orchestrator_preflight_env(None, execution_context=execution_context)
+
+    assert json.loads(env[SPECIALIST_EXECUTION_CONTEXT_ENV]) == execution_context
+    assert ORCHESTRATOR_PREFLIGHT_ENV not in env
+
+    monkeypatch.setenv(SPECIALIST_EXECUTION_CONTEXT_ENV, env[SPECIALIST_EXECUTION_CONTEXT_ENV])
+    assert load_specialist_execution_context_from_env() == execution_context
+    text = orchestrator_preflight_context_text(type("Args", (), {})())
+    assert "ITEM123" in text
+    assert "current operator request is authoritative" in text
 
 
 def test_preflight_memo_includes_temporal_depth_policy() -> None:

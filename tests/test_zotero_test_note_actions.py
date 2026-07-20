@@ -7,16 +7,57 @@ import pytest
 
 from keystone_agents.tools import zotero_context_tools
 from keystone_agents.tools.zotero_context_tools import (
+    read_zotero_api_key_capabilities,
     zotero_delete_test_note_impl,
     zotero_test_note_lifecycle_impl,
     zotero_write_test_note_impl,
 )
 
 
+def test_read_zotero_api_key_capabilities_returns_secret_free_receipt(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ZOTERO_API_KEY", "secret-key")
+    monkeypatch.setattr(
+        "keystone_agents.tools.zotero_context_tools._read_zotero_api_json",
+        lambda *_args, **_kwargs: {
+            "userID": 123,
+            "username": "Private User",
+            "access": {
+                "user": {
+                    "library": True,
+                    "files": True,
+                    "notes": True,
+                    "write": True,
+                }
+            },
+        },
+    )
+
+    result = read_zotero_api_key_capabilities()
+
+    assert result == {
+        "status": "success",
+        "provider_read": True,
+        "operation": "verify_api_key_capabilities",
+        "user_id_present": True,
+        "user_library": True,
+        "user_files": True,
+        "user_notes": True,
+        "user_write": True,
+        "send_enabled": False,
+    }
+    assert "secret-key" not in str(result)
+    assert "Private User" not in str(result)
+
+
 def _item(key: str, version: int, note: str) -> dict[str, Any]:
     return {
         "key": key,
         "version": version,
+        "links": {
+            "alternate": {"href": f"https://www.zotero.org/users/12345/items/{key}"}
+        },
         "data": {
             "key": key,
             "version": version,
@@ -69,6 +110,7 @@ def test_zotero_test_note_create_reads_back_without_returning_content(
     assert result["status"] == "success"
     assert result["verification"]["passed"] is True
     assert result["item_key"] == "NOTE1234"
+    assert result["provider_link"].endswith("/items/NOTE1234")
     assert "note" not in result["after"]
     assert result["after"]["note_sha256"]
     assert [method for method, _path in calls] == ["POST", "GET"]

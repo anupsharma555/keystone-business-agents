@@ -22,6 +22,7 @@ class FakeCalendarTool:
     def __init__(self) -> None:
         self.events: dict[str, dict[str, Any]] = {}
         self.calls: list[tuple[str, str]] = []
+        self.last_update_payload: dict[str, Any] = {}
 
     def create_event(
         self, calendar_id: str, event_id: str, payload: dict[str, Any]
@@ -60,6 +61,7 @@ class FakeCalendarTool:
         self, calendar_id: str, event_id: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
         self.calls.append(("update", event_id))
+        self.last_update_payload = payload
         self.events[event_id].update(payload)
         return dict(self.events[event_id])
 
@@ -133,6 +135,101 @@ def test_calendar_plan_extracts_timed_meeting_without_defaulting_all_day() -> No
     assert plan.start_time == "14:00"
     assert plan.end_time == "15:30"
     assert plan.all_day is False
+    assert plan.complete is True
+
+
+def test_calendar_plan_extracts_labeled_daily_date_range() -> None:
+    plan = infer_calendar_action_plan(
+        "add this to the calendar. Event: Condo Walkthrough "
+        "Dates: Monday, August 3 through Friday, August 7 "
+        "Time: 11:00 AM to 4:00 PM each day Note: Inspect balconies",
+        today=date(2026, 7, 16),
+    )
+
+    assert plan is not None
+    assert plan.title == "Condo Walkthrough"
+    assert plan.start_date == "2026-08-03"
+    assert plan.end_date == "2026-08-07"
+    assert plan.start_time == "11:00"
+    assert plan.end_time == "16:00"
+    assert plan.repeat_each_day is True
+    assert plan.complete is True
+
+
+def test_calendar_plan_ignores_update_words_inside_markdown_note() -> None:
+    request = (
+        "can u add this to the calendar for the dates and times specified here: "
+        "Event: Condo Walkthrough "
+        "**Dates: Monday, August 3 through Friday, August 7** "
+        "*Time: 11:00 AM to 4:00 PM each day* "
+        "Note: Please move balcony items prior to arrival and identify areas "
+        "requiring attention."
+    )
+
+    plan = infer_calendar_action_plan(request, today=date(2026, 7, 16))
+
+    assert plan is not None
+    assert plan.operation == "create"
+    assert plan.title == "Condo Walkthrough"
+    assert plan.start_date == "2026-08-03"
+    assert plan.end_date == "2026-08-07"
+    assert plan.start_time == "11:00"
+    assert plan.end_time == "16:00"
+    assert plan.repeat_each_day is True
+    assert plan.complete is True
+
+
+def test_calendar_create_verifies_daily_recurrence(monkeypatch) -> None:
+    monkeypatch.setenv(GOOGLE_CALENDAR_WRITE_ENV, "true")
+    tool = FakeCalendarTool()
+
+    result = create_google_calendar_event_impl(
+        "Condo Walkthrough",
+        "2026-08-03",
+        end_date="2026-08-07",
+        repeat_each_day=True,
+        start_time="11:00",
+        end_time="16:00",
+        approval_reference="approved-calendar-range",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+
+    assert result["status"] == "success"
+    assert result["repeat_each_day"] is True
+    assert result["end_date"] == "2026-08-07"
+    assert result["verification"]["recurrence_match"] is True
+    created = next(iter(tool.events.values()))
+    assert created["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=5"]
+
+
+def test_calendar_plan_bounds_title_before_schedule_and_plural_notes() -> None:
+    plan = infer_calendar_action_plan(
+        "create a calendar event titled KBA_TEST_CAL_ANU120_R4 on July 15, 2026 "
+        "from 4:10pm to 4:25pm ET with notes ANU-120 agent-specific write validation",
+        today=date(2026, 7, 13),
+    )
+
+    assert plan is not None
+    assert plan.title == "KBA_TEST_CAL_ANU120_R4"
+    assert plan.start_date == "2026-07-15"
+    assert plan.start_time == "16:10"
+    assert plan.end_time == "16:25"
+    assert plan.description == "ANU-120 agent-specific write validation"
+    assert plan.complete is True
+
+
+def test_calendar_plan_keeps_quoted_note_separate_from_followup_instruction() -> None:
+    plan = infer_calendar_action_plan(
+        'create a calendar event titled "KBA_TEST_CAL_ANU120_R4" on July 15, 2026 '
+        'from 4:10pm to 4:25pm ET with notes "ANU-120 agent-specific write validation". '
+        "Verify the provider event.",
+        today=date(2026, 7, 13),
+    )
+
+    assert plan is not None
+    assert plan.title == "KBA_TEST_CAL_ANU120_R4"
+    assert plan.description == "ANU-120 agent-specific write validation"
     assert plan.complete is True
 
 
@@ -223,6 +320,35 @@ def test_calendar_event_reference_blocks_ambiguous_matches() -> None:
     assert "event_id" not in result
 
 
+def test_calendar_event_reference_uses_operator_date_to_disambiguate() -> None:
+    tool = FakeCalendarTool()
+    tool.events = {
+        "event-1": {
+            "id": "event-1",
+            "status": "confirmed",
+            "summary": "Livestream",
+            "start": {"dateTime": "2026-07-14T14:00:00-04:00"},
+        },
+        "event-2": {
+            "id": "event-2",
+            "status": "confirmed",
+            "summary": "Livestream",
+            "start": {"dateTime": "2026-07-21T14:00:00-04:00"},
+        },
+    }
+
+    result = resolve_google_calendar_event_impl(
+        "Livestream",
+        start_date="2026-07-14",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+
+    assert result["status"] == "success"
+    assert result["event_id"] == "event-1"
+    assert result["start_date"] == "2026-07-14"
+
+
 def test_calendar_window_read_splits_one_time_and_recurring_without_private_bodies() -> None:
     tool = FakeCalendarTool()
     tool.events = {
@@ -306,6 +432,7 @@ def test_calendar_create_update_delete_lifecycle_verifies_provider(
     assert created["status"] == "success"
     assert created["verification"]["passed"] is True
     assert created["description_present"] is True
+    assert created["provider_link"] == "https://calendar.test/event"
 
     updated = update_google_calendar_event_impl(
         event_id,
@@ -319,6 +446,7 @@ def test_calendar_create_update_delete_lifecycle_verifies_provider(
     assert updated["status"] == "success"
     assert updated["start_date"] == "2026-11-05"
     assert updated["verification"]["passed"] is True
+    assert updated["provider_link"] == "https://calendar.test/event"
 
     deleted = delete_google_calendar_event_impl(
         event_id,
@@ -327,6 +455,7 @@ def test_calendar_create_update_delete_lifecycle_verifies_provider(
         tool=tool,  # type: ignore[arg-type]
     )
     assert deleted["status"] == "success"
+    assert deleted["provider_link"] == "https://calendar.test/event"
     assert deleted["verification"]["event_absent_after"] is True
 
 
@@ -382,6 +511,75 @@ def test_calendar_timed_create_update_delete_preserves_timezone(
         tool=tool,  # type: ignore[arg-type]
     )
     assert deleted["verification"]["event_absent_after"] is True
+
+
+def test_calendar_all_day_to_timed_update_clears_date_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(GOOGLE_CALENDAR_WRITE_ENV, "true")
+    tool = FakeCalendarTool()
+    created = create_google_calendar_event_impl(
+        "Partner livestream",
+        "2026-07-14",
+        approval_reference="calendar-conversion:create",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+
+    updated = update_google_calendar_event_impl(
+        created["event_id"],
+        start_date="2026-07-14",
+        start_time="14:00",
+        end_time="15:00",
+        timezone="America/New_York",
+        approval_reference="calendar-conversion:update",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+
+    assert updated["status"] == "success"
+    assert updated["all_day"] is False
+    assert tool.last_update_payload["start"] == {
+        "dateTime": "2026-07-14T14:00:00-04:00",
+        "timeZone": "America/New_York",
+        "date": None,
+    }
+    assert tool.last_update_payload["end"] == {
+        "dateTime": "2026-07-14T15:00:00-04:00",
+        "timeZone": "America/New_York",
+        "date": None,
+    }
+
+
+def test_calendar_note_append_preserves_existing_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(GOOGLE_CALENDAR_WRITE_ENV, "true")
+    tool = FakeCalendarTool()
+    created = create_google_calendar_event_impl(
+        "Partner livestream",
+        "2026-07-14",
+        description="Existing event context.",
+        approval_reference="calendar-note:create",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+    url = "https://example.test/thread/123"
+
+    updated = update_google_calendar_event_impl(
+        created["event_id"],
+        description=url,
+        append_description=True,
+        approval_reference="calendar-note:append",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+
+    assert updated["status"] == "success"
+    assert updated["description_mode"] == "append"
+    assert tool.events[created["event_id"]]["description"] == (
+        f"Existing event context.\n{url}"
+    )
 
 
 def test_calendar_timed_event_requires_normalized_start_time() -> None:

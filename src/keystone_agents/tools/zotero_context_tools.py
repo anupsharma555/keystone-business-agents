@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import html
+import io
 import json
 import os
+import re
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -18,16 +22,21 @@ from keystone_agents.config import parse_bool
 from keystone_agents.context_env import context_env_value
 from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
 from keystone_agents.sdk import function_tool
+from keystone_agents.source_specific_enrichment import enrich_source_reference
 from keystone_agents.zotero_research import (
     build_zotero_article_research_brief,
     build_zotero_collection_research_brief,
+    list_zotero_cached_item_metadata,
 )
 
 ZOTERO_API_BASE_URL = "https://api.zotero.org"
 ZOTERO_READ_CONTEXT_TOOL_NAMES: tuple[str, ...] = (
+    "zotero_list_cached_items",
     "zotero_resolve_collection_context",
     "zotero_resolve_article_context",
     "zotero_read_api_metadata",
+    "zotero_read_item_children",
+    "zotero_read_pdf_attachment_text",
 )
 ZOTERO_IMPORT_TOOL_NAMES: tuple[str, ...] = (
     "zotero_import_article_with_backend",
@@ -134,6 +143,38 @@ def zotero_resolve_article_context(
     return _json_payload(_brief_payload(brief, paragraphs))
 
 
+@function_tool(**keystone_tool_guardrail_kwargs())
+def zotero_list_cached_items(
+    limit: int = 10,
+    item_type: str = "",
+) -> str:
+    """List a bounded set of readable local Zotero cache items without mutation."""
+
+    try:
+        items = list_zotero_cached_item_metadata(limit=limit, item_type=item_type)
+    except Exception as exc:
+        return _json_payload(
+            {
+                "status": "blocked",
+                "reason": str(exc),
+                "items": [],
+                "send_enabled": False,
+                "zotero_write_supported": False,
+            }
+        )
+    return _json_payload(
+        {
+            "status": "success" if items else "not_found",
+            "items": items,
+            "item_count": len(items),
+            "item_type_filter": item_type.strip(),
+            "source": "local_zotero_cache",
+            "send_enabled": False,
+            "zotero_write_supported": False,
+        }
+    )
+
+
 def _zotero_api_path(
     *,
     library_type: str,
@@ -154,6 +195,77 @@ def _zotero_api_path(
     return f"{base}/items/top" if top_level_only else f"{base}/items"
 
 
+def _read_zotero_api_json(path: str, *, api_key: str, params: dict[str, Any]) -> Any:
+    query = f"?{urlencode(params)}" if params else ""
+    request = Request(
+        f"{ZOTERO_API_BASE_URL}{path}{query}",
+        headers={
+            "Zotero-API-Key": api_key,
+            "Zotero-API-Version": "3",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _read_zotero_api_bytes(path: str, *, api_key: str) -> tuple[bytes, str]:
+    request = Request(
+        f"{ZOTERO_API_BASE_URL}{path}",
+        headers={
+            "Zotero-API-Key": api_key,
+            "Zotero-API-Version": "3",
+            "Accept": "application/pdf",
+        },
+    )
+    with urlopen(request, timeout=45) as response:
+        content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0]
+        payload = response.read(25 * 1024 * 1024 + 1)
+    if len(payload) > 25 * 1024 * 1024:
+        raise RuntimeError("Zotero PDF attachment exceeds the 25 MB read limit.")
+    return payload, content_type
+
+
+def _current_zotero_user_library_id(api_key: str) -> str:
+    key_info = _read_zotero_api_json("/keys/current", api_key=api_key, params={})
+    if not isinstance(key_info, dict):
+        raise RuntimeError("Zotero key verification returned an invalid response.")
+    access = key_info.get("access")
+    user_access = access.get("user") if isinstance(access, dict) else None
+    if not isinstance(user_access, dict) or user_access.get("library") is not True:
+        raise RuntimeError("The configured Zotero API key cannot read its user library.")
+    user_id = str(key_info.get("userID") or "").strip()
+    if not user_id:
+        raise RuntimeError("Zotero key verification did not return a user library ID.")
+    return user_id
+
+
+def read_zotero_api_key_capabilities() -> dict[str, Any]:
+    """Return a secret-free capability receipt for the configured Zotero key."""
+
+    api_key = context_env_value("ZOTERO_API_KEY").strip()
+    if not api_key:
+        raise RuntimeError("Live Zotero API access requires ZOTERO_API_KEY.")
+    key_info = _read_zotero_api_json("/keys/current", api_key=api_key, params={})
+    if not isinstance(key_info, dict):
+        raise RuntimeError("Zotero key verification returned an invalid response.")
+    access = key_info.get("access")
+    user_access = access.get("user") if isinstance(access, dict) else None
+    if not isinstance(user_access, dict):
+        user_access = {}
+    return {
+        "status": "success",
+        "provider_read": True,
+        "operation": "verify_api_key_capabilities",
+        "user_id_present": bool(str(key_info.get("userID") or "").strip()),
+        "user_library": user_access.get("library") is True,
+        "user_files": user_access.get("files") is True,
+        "user_notes": user_access.get("notes") is True,
+        "user_write": user_access.get("write") is True,
+        "send_enabled": False,
+    }
+
+
 @function_tool(**keystone_tool_guardrail_kwargs())
 def zotero_read_api_metadata(
     library_id: str = "",
@@ -166,6 +278,7 @@ def zotero_read_api_metadata(
     direction: str = "",
     top_level_only: bool = False,
     item_type: str = "",
+    require_abstract: bool = False,
     live: bool = False,
 ) -> str:
     """Read Zotero API metadata for libraries, collections, or items without mutation."""
@@ -230,6 +343,18 @@ def zotero_read_api_metadata(
                 "api_base_url": ZOTERO_API_BASE_URL,
                 "planned_path": planned_path,
                 "params": params,
+                "selection_rule": (
+                    "first_nonempty_abstract_in_provider_order"
+                    if require_abstract
+                    else "provider_order"
+                ),
+                "provider_order": {
+                    "sort": clean_sort,
+                    "direction": clean_direction,
+                    "top_level_only": bool(top_level_only),
+                    "item_type": clean_item_type,
+                },
+                "require_abstract": bool(require_abstract),
                 "send_enabled": False,
                 "zotero_write_supported": False,
                 "required_live_env": ["ZOTERO_API_KEY", "ZOTERO_LIBRARY_ID"],
@@ -242,7 +367,8 @@ def zotero_read_api_metadata(
             }
         )
     api_key = context_env_value("ZOTERO_API_KEY").strip()
-    resolved_library_id = library_id.strip() or context_env_value("ZOTERO_LIBRARY_ID").strip()
+    explicit_library_id = library_id.strip()
+    resolved_library_id = explicit_library_id or context_env_value("ZOTERO_LIBRARY_ID").strip()
     if not api_key:
         raise RuntimeError("Live Zotero API reads require ZOTERO_API_KEY.")
     path = _zotero_api_path(
@@ -252,21 +378,513 @@ def zotero_read_api_metadata(
         item_key=item_key,
         top_level_only=top_level_only,
     )
-    url = f"{ZOTERO_API_BASE_URL}{path}?{urlencode(params)}"
-    request = Request(url, headers={"Zotero-API-Key": api_key, "Accept": "application/json"})
-    with urlopen(request, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    library_id_resolution = "explicit" if explicit_library_id else "configured"
+    try:
+        payload = _read_zotero_api_json(path, api_key=api_key, params=params)
+    except HTTPError as exc:
+        clean_library_type = str(library_type or "").strip().lower()
+        may_resolve_current_user = (
+            exc.code == 403 and not explicit_library_id and clean_library_type != "group"
+        )
+        if not may_resolve_current_user:
+            raise
+        resolved_library_id = _current_zotero_user_library_id(api_key)
+        path = _zotero_api_path(
+            library_type="user",
+            library_id=resolved_library_id,
+            collection_key=collection_key,
+            item_key=item_key,
+            top_level_only=top_level_only,
+        )
+        payload = _read_zotero_api_json(path, api_key=api_key, params=params)
+        library_id_resolution = "api_key_current_user_after_configured_403"
+    items = payload if isinstance(payload, list) else [payload]
+    if require_abstract:
+        items = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and isinstance(item.get("data"), dict)
+            and str(item["data"].get("abstractNote") or "").strip()
+        ][:1]
+    selected_data = (
+        items[0].get("data")
+        if items and isinstance(items[0], dict) and isinstance(items[0].get("data"), dict)
+        else {}
+    )
     return _json_payload(
         {
-            "status": "success",
+            "status": "success" if items else "not_found",
             "api_base_url": ZOTERO_API_BASE_URL,
             "path": path,
             "params": params,
-            "items": payload if isinstance(payload, list) else [payload],
+            "provider_read": True,
+            "library_id_resolution": library_id_resolution,
+            "selection_rule": (
+                "first_nonempty_abstract_in_provider_order"
+                if require_abstract
+                else "provider_order"
+            ),
+            "provider_order": {
+                "sort": clean_sort,
+                "direction": clean_direction,
+                "top_level_only": bool(top_level_only),
+                "item_type": clean_item_type,
+            },
+            "require_abstract": bool(require_abstract),
+            "items": items,
+            "item_count": len(items),
+            "selected_item_title": str(selected_data.get("title") or ""),
+            "selected_item_key": str(
+                items[0].get("key") if items and isinstance(items[0], dict) else ""
+            ),
+            "selected_item_has_abstract": bool(
+                str(selected_data.get("abstractNote") or "").strip()
+            ),
+            "selected_item_date_added": str(selected_data.get("dateAdded") or ""),
             "send_enabled": False,
             "zotero_write_supported": False,
         }
     )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def zotero_read_item_children(
+    parent_item_key: str,
+    library_id: str = "",
+    library_type: str = "user",
+    limit: int = 50,
+    live: bool = False,
+) -> str:
+    """Read bounded notes and attachment metadata for one exact Zotero parent item."""
+
+    clean_parent = str(parent_item_key or "").strip()
+    if not clean_parent:
+        raise ValueError("parent_item_key is required for Zotero child reads.")
+    bounded_limit = min(max(int(limit or 50), 1), 100)
+    explicit_library_id = str(library_id or "").strip()
+    planned_path = _zotero_api_path(
+        library_type=library_type,
+        library_id=explicit_library_id or "configured_library_id",
+        collection_key="",
+        item_key=clean_parent,
+    ) + "/children"
+    if not live:
+        return _json_payload(
+            {
+                "status": "dry-run",
+                "planned_path": planned_path,
+                "parent_item_key": clean_parent,
+                "limit": bounded_limit,
+                "supported_child_types": ["note", "attachment"],
+                "send_enabled": False,
+                "zotero_write_supported": False,
+            }
+        )
+    api_key = context_env_value("ZOTERO_API_KEY").strip()
+    resolved_library_id = explicit_library_id or context_env_value("ZOTERO_LIBRARY_ID").strip()
+    if not api_key:
+        raise RuntimeError("Live Zotero API reads require ZOTERO_API_KEY.")
+
+    def child_path(current_library_id: str, current_library_type: str) -> str:
+        return _zotero_api_path(
+            library_type=current_library_type,
+            library_id=current_library_id,
+            collection_key="",
+            item_key=clean_parent,
+        ) + "/children"
+
+    path = child_path(resolved_library_id, library_type)
+    library_id_resolution = "explicit" if explicit_library_id else "configured"
+    try:
+        payload = _read_zotero_api_json(path, api_key=api_key, params={"limit": bounded_limit})
+    except HTTPError as exc:
+        may_resolve_current_user = (
+            exc.code == 403
+            and not explicit_library_id
+            and str(library_type or "").strip().lower() != "group"
+        )
+        if not may_resolve_current_user:
+            raise
+        resolved_library_id = _current_zotero_user_library_id(api_key)
+        path = child_path(resolved_library_id, "user")
+        payload = _read_zotero_api_json(path, api_key=api_key, params={"limit": bounded_limit})
+        library_id_resolution = "api_key_current_user_after_configured_403"
+    children = payload if isinstance(payload, list) else []
+    projected_children: list[dict[str, Any]] = []
+    for child in children[:bounded_limit]:
+        if not isinstance(child, dict):
+            continue
+        data = child.get("data") if isinstance(child.get("data"), dict) else {}
+        item_type = str(data.get("itemType") or "").strip()
+        if item_type not in {"note", "attachment"}:
+            continue
+        raw_note = str(data.get("note") or "")[:12000]
+        note_text = html.unescape(re.sub(r"<[^>]+>", " ", raw_note))
+        note_text = " ".join(note_text.split())
+        projected_children.append(
+            {
+                "item_key": str(child.get("key") or data.get("key") or "").strip(),
+                "version": child.get("version"),
+                "item_type": item_type,
+                "parent_item_key": str(data.get("parentItem") or "").strip(),
+                "title": str(data.get("title") or "").strip(),
+                "filename": str(data.get("filename") or "").strip(),
+                "content_type": str(data.get("contentType") or "").strip(),
+                "link_mode": str(data.get("linkMode") or "").strip(),
+                "url": str(data.get("url") or "").strip(),
+                "note": raw_note,
+                "note_text": note_text,
+                "tags": data.get("tags") if isinstance(data.get("tags"), list) else [],
+                "date_added": str(data.get("dateAdded") or "").strip(),
+                "date_modified": str(data.get("dateModified") or "").strip(),
+            }
+        )
+    return _json_payload(
+        {
+            "status": "success",
+            "provider_read": True,
+            "path": path,
+            "library_id_resolution": library_id_resolution,
+            "parent_item_key": clean_parent,
+            "children": projected_children,
+            "child_count": len(projected_children),
+            "note_count": sum(item["item_type"] == "note" for item in projected_children),
+            "attachment_count": sum(
+                item["item_type"] == "attachment" for item in projected_children
+            ),
+            "send_enabled": False,
+            "zotero_write_supported": False,
+        }
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def zotero_read_pdf_attachment_text(
+    parent_item_key: str,
+    attachment_item_key: str,
+    library_id: str = "",
+    library_type: str = "user",
+    max_pages: int = 25,
+    max_chars: int = 50000,
+    live: bool = False,
+) -> str:
+    """Read bounded text from one exact PDF attachment without persisting the file."""
+
+    clean_parent = str(parent_item_key or "").strip()
+    clean_attachment = str(attachment_item_key or "").strip()
+    if not clean_parent or not clean_attachment:
+        raise ValueError("parent_item_key and attachment_item_key are required.")
+    bounded_pages = min(max(int(max_pages or 25), 1), 100)
+    bounded_chars = min(max(int(max_chars or 50000), 1000), 200000)
+    explicit_library_id = str(library_id or "").strip()
+    if not live:
+        return _json_payload(
+            {
+                "status": "dry-run",
+                "parent_item_key": clean_parent,
+                "attachment_item_key": clean_attachment,
+                "max_pages": bounded_pages,
+                "max_chars": bounded_chars,
+                "file_persisted": False,
+                "send_enabled": False,
+                "zotero_write_supported": False,
+            }
+        )
+    api_key = context_env_value("ZOTERO_API_KEY").strip()
+    resolved_library_id = explicit_library_id or context_env_value("ZOTERO_LIBRARY_ID").strip()
+    if not api_key:
+        raise RuntimeError("Live Zotero API reads require ZOTERO_API_KEY.")
+
+    def item_path(current_library_id: str, current_library_type: str) -> str:
+        return _zotero_api_path(
+            library_type=current_library_type,
+            library_id=current_library_id,
+            collection_key="",
+            item_key=clean_attachment,
+        )
+
+    path = item_path(resolved_library_id, library_type)
+    library_id_resolution = "explicit" if explicit_library_id else "configured"
+    try:
+        attachment = _read_zotero_api_json(path, api_key=api_key, params={})
+    except HTTPError as exc:
+        may_resolve_current_user = (
+            exc.code == 403
+            and not explicit_library_id
+            and str(library_type or "").strip().lower() != "group"
+        )
+        if not may_resolve_current_user:
+            raise
+        resolved_library_id = _current_zotero_user_library_id(api_key)
+        path = item_path(resolved_library_id, "user")
+        attachment = _read_zotero_api_json(path, api_key=api_key, params={})
+        library_id_resolution = "api_key_current_user_after_configured_403"
+    data = attachment.get("data") if isinstance(attachment, dict) else {}
+    if not isinstance(data, dict):
+        raise RuntimeError("Zotero attachment metadata returned an invalid object.")
+    if str(data.get("itemType") or "") != "attachment":
+        raise RuntimeError("The selected Zotero child is not an attachment.")
+    if str(data.get("parentItem") or "").strip() != clean_parent:
+        raise RuntimeError("The selected Zotero attachment does not belong to the parent item.")
+    content_type = str(data.get("contentType") or "").lower().strip()
+    filename = str(data.get("filename") or data.get("title") or "").strip()
+    if content_type != "application/pdf" and not filename.lower().endswith(".pdf"):
+        raise RuntimeError("The selected Zotero attachment is not a PDF.")
+    file_payload, response_content_type = _read_zotero_api_bytes(
+        path + "/file",
+        api_key=api_key,
+    )
+    if not file_payload.startswith(b"%PDF-"):
+        raise RuntimeError("Zotero attachment bytes did not have a valid PDF signature.")
+    try:
+        from pypdf import PdfReader  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - dependency boundary
+        raise RuntimeError("PDF text extraction requires optional pypdf.") from exc
+    reader = PdfReader(io.BytesIO(file_payload))
+    page_count = len(reader.pages)
+    text_parts = [
+        str(reader.pages[index].extract_text() or "")
+        for index in range(min(page_count, bounded_pages))
+    ]
+    extracted = "\n\n".join(text_parts).strip()
+    truncated = len(extracted) > bounded_chars or page_count > bounded_pages
+    return _json_payload(
+        {
+            "status": "success",
+            "provider_read": True,
+            "library_id_resolution": library_id_resolution,
+            "parent_item_key": clean_parent,
+            "attachment_item_key": clean_attachment,
+            "filename": filename,
+            "content_type": content_type or response_content_type,
+            "page_count": page_count,
+            "pages_read": min(page_count, bounded_pages),
+            "text": extracted[:bounded_chars],
+            "char_count": min(len(extracted), bounded_chars),
+            "truncated": truncated,
+            "sha256": hashlib.sha256(file_payload).hexdigest(),
+            "file_persisted": False,
+            "send_enabled": False,
+            "zotero_write_supported": False,
+        }
+    )
+
+
+def read_latest_zotero_journal_metadata(
+    *,
+    require_abstract: bool = False,
+) -> dict[str, Any]:
+    """Read the provider-selected latest journal article metadata."""
+
+    payload = json.loads(
+        zotero_read_api_metadata(
+            limit=100 if require_abstract else 1,
+            sort="dateAdded",
+            direction="desc",
+            top_level_only=True,
+            item_type="journalArticle",
+            require_abstract=require_abstract,
+            live=True,
+        )
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("Zotero metadata read returned a non-object payload.")
+    return payload
+
+
+def read_latest_zotero_journal_abstract_metadata() -> dict[str, Any]:
+    """Read the provider-selected latest journal article with a stored abstract."""
+
+    return read_latest_zotero_journal_metadata(require_abstract=True)
+
+
+_ZOTERO_METADATA_FIELDS: tuple[tuple[str, str], ...] = (
+    ("item_type", "itemType"),
+    ("title", "title"),
+    ("abstract", "abstractNote"),
+    ("publication_title", "publicationTitle"),
+    ("journal_abbreviation", "journalAbbreviation"),
+    ("volume", "volume"),
+    ("issue", "issue"),
+    ("pages", "pages"),
+    ("publication_date", "date"),
+    ("series", "series"),
+    ("series_title", "seriesTitle"),
+    ("language", "language"),
+    ("doi", "DOI"),
+    ("issn", "ISSN"),
+    ("isbn", "ISBN"),
+    ("pmid", "PMID"),
+    ("short_title", "shortTitle"),
+    ("url", "url"),
+    ("access_date", "accessDate"),
+    ("publisher", "publisher"),
+    ("place", "place"),
+    ("rights", "rights"),
+    ("archive", "archive"),
+    ("archive_location", "archiveLocation"),
+    ("library_catalog", "libraryCatalog"),
+    ("call_number", "callNumber"),
+    ("extra", "extra"),
+    ("date_added", "dateAdded"),
+    ("date_modified", "dateModified"),
+    ("tags", "tags"),
+    ("collections", "collections"),
+    ("relations", "relations"),
+)
+
+_ZOTERO_FIELD_ALIASES: tuple[tuple[str, str], ...] = (
+    ("title", r"\btitles?\b"),
+    ("authors", r"\bauthors?|creators?\b"),
+    ("abstract", r"\babstract\b"),
+    ("publication_title", r"\bpublication\s+title\b|\bjournal(?:\s+name)?\b|\bpublished\s+in\b"),
+    ("publication_date", r"\bpublication\s+date\b|\bpublished\s+(?:on|when)\b"),
+    ("doi", r"\bdoi\b"),
+    ("issn", r"\bissn\b"),
+    ("isbn", r"\bisbn\b"),
+    ("pmid", r"\bpmid\b|\bpubmed\s+id\b"),
+    ("url", r"\burls?|links?\b"),
+    ("volume", r"\bvolume\b"),
+    ("issue", r"\bissue\b"),
+    ("pages", r"\bpages?\b"),
+    ("publisher", r"\bpublisher\b"),
+    ("language", r"\blanguage\b"),
+    ("tags", r"\btags?\b"),
+    ("collections", r"\bcollections?\b"),
+    ("rights", r"\brights?|license\b"),
+    ("extra", r"\bextra\s+(?:field|metadata)\b"),
+    ("date_added", r"\bdate\s+added\b|\badded\s+(?:on|when)\b"),
+    ("date_modified", r"\bdate\s+modified\b|\bmodified\s+(?:on|when)\b"),
+)
+
+
+def _bounded_zotero_provider_value(value: Any, *, depth: int = 0) -> Any:
+    """Keep provider metadata inspectable without admitting unbounded nested payloads."""
+
+    if depth >= 4:
+        return "[nested value omitted]"
+    if isinstance(value, str):
+        return value[:12000]
+    if isinstance(value, list):
+        return [
+            _bounded_zotero_provider_value(item, depth=depth + 1)
+            for item in value[:100]
+        ]
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_zotero_provider_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:100]
+        }
+    return value
+
+
+def project_zotero_item_metadata(
+    item: dict[str, Any],
+    *,
+    request_text: str,
+) -> dict[str, Any]:
+    """Project requested Zotero fields without losing provider field identity."""
+
+    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    available: dict[str, Any] = {}
+    for canonical_name, provider_name in _ZOTERO_METADATA_FIELDS:
+        value = data.get(provider_name)
+        if value not in (None, "", [], {}):
+            available[canonical_name] = value
+    creators = data.get("creators")
+    creator_names = zotero_creator_names(creators)
+    if creator_names:
+        available["authors"] = creator_names
+    if isinstance(creators, list) and creators:
+        available["creators"] = creators
+
+    normalized_request = " ".join(str(request_text or "").lower().split())
+    requested_fields = [
+        field
+        for field, pattern in _ZOTERO_FIELD_ALIASES
+        if re.search(pattern, normalized_request)
+    ]
+    broad_metadata_request = bool(
+        re.search(
+            r"\b(?:all|available|complete|full)\s+(?:item\s+)?(?:metadata|details|fields|information)\b",
+            normalized_request,
+        )
+    )
+    if broad_metadata_request:
+        requested_fields = list(available)
+    if not requested_fields:
+        requested_fields = ["title"]
+    requested_fields = list(dict.fromkeys(requested_fields))
+    projected = {field: available.get(field, "") for field in requested_fields}
+    provider_field_map = dict(_ZOTERO_METADATA_FIELDS)
+    provider_field_map.update({"authors": "creators", "creators": "creators"})
+    return {
+        "schema": "keystone.zotero_item_metadata_projection.v1",
+        "item_key": str(item.get("key") or data.get("key") or "").strip(),
+        "version": item.get("version"),
+        "requested_fields": requested_fields,
+        "fields": projected,
+        "missing_requested_fields": [
+            field for field, value in projected.items() if value in (None, "", [], {})
+        ],
+        "available_field_names": sorted(available),
+        "available_provider_field_names": sorted(str(key) for key in data),
+        "provider_field_map": {
+            canonical_name: provider_field_map[canonical_name]
+            for canonical_name in requested_fields
+            if canonical_name in provider_field_map
+        },
+        "provider_fields": (
+            _bounded_zotero_provider_value(data) if broad_metadata_request else {}
+        ),
+        "source": "zotero_api_metadata",
+    }
+
+
+def enrich_zotero_bibliographic_metadata(
+    *,
+    doi: str,
+    title: str,
+    item_key: str,
+) -> dict[str, Any]:
+    """Resolve missing citation fields from DOI metadata without page/full-text search."""
+
+    clean_doi = str(doi or "").strip()
+    if not clean_doi:
+        return {"status": "missing_identifier", "authors": [], "publication_title": ""}
+    result = enrich_source_reference(
+        url=f"https://doi.org/{clean_doi}",
+        title=title,
+        source_id=f"zotero:item:{item_key}",
+        live=True,
+    )
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return {
+        "status": result.status,
+        "authors": list(metadata.get("authors") or []),
+        "publication_title": str(metadata.get("publication_title") or "").strip(),
+        "doi": str(metadata.get("doi") or clean_doi).strip(),
+        "source": "crossref_doi_metadata",
+    }
+
+
+def zotero_creator_names(creators: Any) -> list[str]:
+    """Normalize Zotero person and organization creators into display names."""
+
+    if not isinstance(creators, list):
+        return []
+    names: list[str] = []
+    for creator in creators:
+        if not isinstance(creator, dict):
+            continue
+        literal = str(creator.get("name") or "").strip()
+        first_name = str(creator.get("firstName") or "").strip()
+        last_name = str(creator.get("lastName") or "").strip()
+        name = literal or " ".join(part for part in (first_name, last_name) if part)
+        if name:
+            names.append(name)
+    return list(dict.fromkeys(names))
 
 
 def zotero_write_test_note_impl(
@@ -390,6 +1008,7 @@ def zotero_write_test_note_impl(
         "status": "success" if verification["passed"] else "verification_failed",
         "operation": clean_operation,
         "item_key": resolved_item_key,
+        "provider_link": _zotero_provider_link(after),
         "parent_item_key": str(after_data.get("parentItem") or ""),
         "required_marker": ZOTERO_TEST_NOTE_MARKER,
         "approval_reference": clean_approval,
@@ -497,6 +1116,7 @@ def zotero_delete_test_note_impl(
         "status": "success" if passed else "verification_failed",
         "operation": "delete_test_note",
         "item_key": clean_item_key,
+        "provider_link": _zotero_provider_link(before),
         "required_marker": ZOTERO_TEST_NOTE_MARKER,
         "approval_reference": clean_approval,
         "before": _zotero_note_receipt(before),
@@ -616,6 +1236,7 @@ def zotero_test_note_lifecycle_impl(
         "status": "success" if passed else "failed",
         "operation": "test_note_lifecycle",
         "item_key": item_key,
+        "provider_link": str(create_result.get("provider_link") or ""),
         "required_marker": ZOTERO_TEST_NOTE_MARKER,
         "approval_reference": clean_approval,
         "create": _zotero_lifecycle_step_receipt(create_result),
@@ -644,6 +1265,7 @@ def _zotero_lifecycle_step_receipt(result: dict[str, Any]) -> dict[str, Any]:
             "status",
             "operation",
             "item_key",
+            "provider_link",
             "required_marker",
             "approval_reference",
             "verification",
@@ -1496,12 +2118,28 @@ def _zotero_note_receipt(item: dict[str, Any]) -> dict[str, Any]:
     normalized_note = _normalized_note(data.get("note"))
     return {
         "item_key": str(data.get("key") or ""),
+        "provider_link": _zotero_provider_link(item),
         "version": int(data.get("version") or item.get("version") or 0),
         "item_type": str(data.get("itemType") or ""),
         "parent_item_key": str(data.get("parentItem") or ""),
         "marker_present": _contains_zotero_test_note_marker(data),
         "note_sha256": hashlib.sha256(normalized_note.encode("utf-8")).hexdigest(),
     }
+
+
+def _zotero_provider_link(item: Mapping[str, Any]) -> str:
+    """Prefer Zotero's returned web link, then its exact API self link."""
+
+    links = item.get("links")
+    if not isinstance(links, Mapping):
+        return ""
+    for name in ("alternate", "self"):
+        candidate = links.get(name)
+        if isinstance(candidate, Mapping):
+            href = str(candidate.get("href") or "").strip()
+            if href:
+                return href
+    return ""
 
 
 @function_tool(**keystone_tool_guardrail_kwargs())

@@ -17,7 +17,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -46,6 +46,7 @@ from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_
 from keystone_agents.tools.website_extraction_tool import (
     WebsiteExtractionError,
     extract_website_content,
+    extract_website_content_with_fallbacks,
 )
 
 GOOGLE_WORKSPACE_SCOPES = [
@@ -66,6 +67,7 @@ AIRTABLE_BASE_ALIAS_PREFIXES = {
 }
 AIRTABLE_LIVE_READS_ENV = "KEYSTONE_AIRTABLE_LIVE_READS"
 AIRTABLE_OPERATOR_APPROVAL_ENV = "KEYSTONE_AIRTABLE_OPERATOR_APPROVAL_REFERENCE"
+AIRTABLE_ALLOWED_OPERATION_ENV = "KEYSTONE_AIRTABLE_ALLOWED_OPERATION"
 AIRTABLE_TEST_RECORD_MARKER = "KBA_TEST_RECORD"
 GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
@@ -263,11 +265,13 @@ def read_linked_article_impl(
         }
     provider = os.getenv("KEYSTONE_WEBSITE_EXTRACTOR") or "trafilatura"
     try:
-        result = extract_website_content(
+        result = extract_website_content_with_fallbacks(
             normalized_url,
             company_name="article",
-            provider=provider,
+            primary_provider=provider,
+            guardrail_context="public_web_source",
             live=True,
+            extractor=extract_website_content,
         )
     except WebsiteExtractionError as exc:
         return {
@@ -588,6 +592,19 @@ def airtable_write_record_impl(
     provider_fields = fields
     if clean_operation not in {"create", "update"}:
         raise ValueError("operation must be 'create' or 'update'.")
+    allowed_operation = os.getenv(AIRTABLE_ALLOWED_OPERATION_ENV, "").strip().lower()
+    if allowed_operation and clean_operation != allowed_operation:
+        return {
+            "status": "blocked",
+            "reason": (
+                "Airtable write operation did not match the operator-approved "
+                f"{allowed_operation!r} scope."
+            ),
+            "operation": clean_operation,
+            "allowed_operation": allowed_operation,
+            "table": table_name,
+            "send_enabled": False,
+        }
     schema_validation: dict[str, Any] = {}
     if validate_schema:
         schema = airtable_get_base_schema_impl(
@@ -757,6 +774,11 @@ def airtable_write_record_impl(
         "operation": "update" if clean_record_id else "create",
         "table": table_name,
         "record_id": written_record_id,
+        "provider_link": (
+            _airtable_record_provider_link(config["base_id"], written_record_id)
+            if verification["passed"]
+            else ""
+        ),
         "record": payload,
         "verified_record": verified_record,
         "verification": verification,
@@ -800,6 +822,244 @@ def airtable_write_record(
             operation=operation,
             match_filter_formula=match_filter_formula,
             validate_schema=validate_schema,
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def airtable_reconcile_duplicate_expense_impl(
+    keep_record_id: str,
+    duplicate_record_id: str,
+    *,
+    target_estimated_tax_period: str,
+    table: str = "Personal Expenses",
+    base_alias: str = "finance_tax_tracker",
+    base_id: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Correct one expense in place and remove one provider-verified duplicate."""
+
+    keep_id = keep_record_id.strip()
+    duplicate_id = duplicate_record_id.strip()
+    period = target_estimated_tax_period.strip()
+    if not keep_id or not duplicate_id or keep_id == duplicate_id:
+        raise ValueError("Duplicate cleanup requires two distinct exact Airtable record IDs.")
+    if period not in {"1", "2", "3", "4"}:
+        raise ValueError("target_estimated_tax_period must be one of 1, 2, 3, or 4.")
+    config = _airtable_base_config(
+        base_alias=_infer_airtable_base_alias(
+            base_alias=base_alias,
+            base_id=base_id,
+            table=table,
+        ),
+        base_id=base_id,
+    )
+    table_name = _airtable_table(table, config=config)
+    dry_run = not live or parse_bool(os.getenv("AIRTABLE_WRITE_DRY_RUN", "true"))
+    if dry_run:
+        return {
+            "status": "dry-run",
+            "operation": "reconcile_duplicate_expense",
+            "table": table_name,
+            "record_id": keep_id,
+            "duplicate_record_id": duplicate_id,
+            "target_estimated_tax_period": period,
+            "approval_reference": approval_reference.strip(),
+            "verification": {"status": "preview", "passed": False},
+            "send_enabled": False,
+            "audit_notes": [
+                "No Airtable record was changed or deleted.",
+                "Live execution requires exact duplicate proof before correction and cleanup.",
+            ],
+        }
+    if not approval_reference.strip():
+        raise RuntimeError("Airtable duplicate cleanup requires a non-empty approval_reference.")
+    if not parse_bool(os.getenv("AIRTABLE_ALLOW_WRITES")):
+        raise RuntimeError("Airtable live writes are disabled. Set AIRTABLE_ALLOW_WRITES=true.")
+    if not parse_bool(os.getenv("AIRTABLE_ALLOW_DUPLICATE_CLEANUP")):
+        raise RuntimeError(
+            "Airtable duplicate cleanup is disabled. "
+            "Set AIRTABLE_ALLOW_DUPLICATE_CLEANUP=true for the approved cleanup window."
+        )
+    _require_airtable_credentials(base_id=config["base_id"], access_token=config["access_token"])
+
+    def read_exact(record_id: str) -> list[dict[str, Any]]:
+        result = airtable_read_records_impl(
+            table_name,
+            base_alias=base_alias,
+            base_id=config["base_id"],
+            filter_formula=f"RECORD_ID()='{record_id}'",
+            max_records=2,
+            live=True,
+        )
+        records = result.get("records", [])
+        return [record for record in records if isinstance(record, dict)] if isinstance(records, list) else []
+
+    keep_records = read_exact(keep_id)
+    duplicate_records = read_exact(duplicate_id)
+    if len(keep_records) != 1 or len(duplicate_records) != 1:
+        return {
+            "status": "blocked",
+            "operation": "reconcile_duplicate_expense",
+            "record_id": keep_id,
+            "duplicate_record_id": duplicate_id,
+            "reason": "Both exact Airtable records must exist uniquely before cleanup.",
+            "keep_records_found": len(keep_records),
+            "duplicate_records_found": len(duplicate_records),
+            "send_enabled": False,
+        }
+    keep_fields = keep_records[0].get("fields", {})
+    duplicate_fields = duplicate_records[0].get("fields", {})
+    if not isinstance(keep_fields, dict) or not isinstance(duplicate_fields, dict):
+        return {
+            "status": "blocked",
+            "operation": "reconcile_duplicate_expense",
+            "reason": "Airtable duplicate fields were unavailable.",
+            "record_id": keep_id,
+            "duplicate_record_id": duplicate_id,
+            "send_enabled": False,
+        }
+    identity_fields = (
+        "Date of Expense",
+        "Expense Client/Vendor",
+        "Description",
+        "Amount",
+        "Total Expenses",
+        "Receipt Available",
+    )
+    mismatched_identity_fields = [
+        name for name in identity_fields if keep_fields.get(name) != duplicate_fields.get(name)
+    ]
+    keep_attachments = _airtable_attachment_filenames(keep_fields.get("Attachments"))
+    duplicate_attachments = _airtable_attachment_filenames(duplicate_fields.get("Attachments"))
+    if keep_attachments != duplicate_attachments or not keep_attachments:
+        mismatched_identity_fields.append("Attachments")
+    if mismatched_identity_fields:
+        return {
+            "status": "blocked",
+            "operation": "reconcile_duplicate_expense",
+            "record_id": keep_id,
+            "duplicate_record_id": duplicate_id,
+            "reason": "The two records were not verified as exact expense duplicates.",
+            "mismatched_identity_fields": sorted(set(mismatched_identity_fields)),
+            "send_enabled": False,
+        }
+
+    update_result = airtable_write_record_impl(
+        json.dumps({"Estimated Tax Periods": period}),
+        table=table_name,
+        base_alias=base_alias,
+        base_id=config["base_id"],
+        record_id=keep_id,
+        approval_reference=approval_reference,
+        operation="update",
+        validate_schema=True,
+        live=True,
+    )
+    update_verification = update_result.get("verification", {})
+    if update_result.get("status") != "success" or not (
+        isinstance(update_verification, dict) and update_verification.get("passed") is True
+    ):
+        return {
+            "status": "verification_failed",
+            "operation": "reconcile_duplicate_expense",
+            "record_id": keep_id,
+            "duplicate_record_id": duplicate_id,
+            "reason": "The original expense could not be verified after correction.",
+            "update_result": update_result,
+            "send_enabled": False,
+        }
+    corrected_records = read_exact(keep_id)
+    corrected_fields = corrected_records[0].get("fields", {}) if corrected_records else {}
+    corrected_attachments = _airtable_attachment_filenames(
+        corrected_fields.get("Attachments") if isinstance(corrected_fields, dict) else None
+    )
+    if corrected_attachments != keep_attachments:
+        return {
+            "status": "verification_failed",
+            "operation": "reconcile_duplicate_expense",
+            "record_id": keep_id,
+            "duplicate_record_id": duplicate_id,
+            "reason": "The original receipt attachment was not preserved after correction.",
+            "send_enabled": False,
+        }
+
+    delete_request = {
+        "method": "DELETE",
+        "url": (
+            f"{_airtable_table_url(table_name, base_id=config['base_id'])}/"
+            f"{quote(duplicate_id, safe='')}"
+        ),
+        "table": table_name,
+        "params": {},
+    }
+    delete_payload = _airtable_send(delete_request, access_token=config["access_token"])
+    duplicate_absent = not read_exact(duplicate_id)
+    provider_deleted = bool(delete_payload.get("deleted")) if isinstance(delete_payload, dict) else False
+    passed = provider_deleted and duplicate_absent
+    return {
+        "status": "success" if passed else "verification_failed",
+        "operation": "reconcile_duplicate_expense",
+        "table": table_name,
+        "record_id": keep_id,
+        "duplicate_record_id": duplicate_id,
+        "target_estimated_tax_period": period,
+        "approval_reference": approval_reference.strip(),
+        "verification": {
+            "status": "verified" if passed else "verification_failed",
+            "passed": passed,
+            "record_id_match": True,
+            "updated_period": corrected_fields.get("Estimated Tax Periods") == period,
+            "attachment_read_back": corrected_attachments == keep_attachments,
+            "attachment_filenames": keep_attachments,
+            "duplicate_provider_deleted": provider_deleted,
+            "duplicate_record_absent_after": duplicate_absent,
+        },
+        "send_enabled": False,
+        "audit_notes": [
+            "Provider reads proved the two exact records represented the same expense.",
+            "The original record was corrected and its attachment verified before duplicate deletion.",
+            "Provider read-back checked duplicate absence after deletion.",
+        ],
+    }
+
+
+def _airtable_attachment_filenames(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return sorted(
+        str(item.get("filename") or "").strip()
+        for item in value
+        if isinstance(item, dict) and str(item.get("filename") or "").strip()
+    )
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def airtable_reconcile_duplicate_expense(
+    keep_record_id: str,
+    duplicate_record_id: str,
+    target_estimated_tax_period: str,
+    table: str = "Personal Expenses",
+    base_alias: str = "finance_tax_tracker",
+    base_id: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Correct one exact expense and remove one exact provider-verified duplicate."""
+
+    return json.dumps(
+        airtable_reconcile_duplicate_expense_impl(
+            keep_record_id,
+            duplicate_record_id,
+            target_estimated_tax_period=target_estimated_tax_period,
+            table=table,
+            base_alias=base_alias,
+            base_id=base_id,
+            approval_reference=approval_reference,
             live=live,
         ),
         ensure_ascii=True,
@@ -983,6 +1243,11 @@ def airtable_test_record_lifecycle_impl(
         raise RuntimeError(
             "The Airtable test lifecycle requires a non-empty approval_reference."
         )
+    if live and not parse_bool(os.getenv("AIRTABLE_ALLOW_TEST_DELETES")):
+        raise RuntimeError(
+            "The Airtable test lifecycle requires its cleanup gate before create. "
+            "Set AIRTABLE_ALLOW_TEST_DELETES=true for the approved lifecycle window."
+        )
 
     marker = f"{AIRTABLE_TEST_RECORD_MARKER} {uuid4().hex[:10]}"
     create_fields = {
@@ -1064,6 +1329,11 @@ def airtable_test_record_lifecycle_impl(
         "operation": "test_record_lifecycle",
         "table": clean_table,
         "record_id": record_id,
+        "provider_link": (
+            f"https://airtable.com/{quote(_airtable_base_config(base_alias=base_alias)['base_id'], safe='')}"
+            if passed
+            else ""
+        ),
         "required_marker": AIRTABLE_TEST_RECORD_MARKER,
         "approval_reference": clean_approval,
         "create": _airtable_lifecycle_step_receipt(create_result),
@@ -1093,6 +1363,7 @@ def _airtable_lifecycle_step_receipt(result: Mapping[str, Any]) -> dict[str, Any
             "operation",
             "table",
             "record_id",
+            "provider_link",
             "required_marker",
             "verification",
             "send_enabled",
@@ -1562,6 +1833,11 @@ def airtable_create_expense_from_receipt_impl(
 ) -> dict[str, Any]:
     """Create one finance tracker expense record from a receipt, then attach it."""
 
+    approval_reference = (
+        approval_reference.strip()
+        or os.getenv(AIRTABLE_OPERATOR_APPROVAL_ENV, "").strip()
+    )
+
     config = _airtable_base_config(
         base_alias=_infer_airtable_base_alias(
             base_alias=base_alias,
@@ -1658,6 +1934,25 @@ def airtable_create_expense_from_receipt_impl(
             "send_enabled": False,
         }
     attachment_field = mapping.get("attachment_field") if isinstance(mapping, Mapping) else {}
+    if not isinstance(attachment_field, Mapping) or not attachment_field:
+        return {
+            "status": "blocked",
+            "operation": "create_expense_from_receipt",
+            "reason": (
+                "The target expense table does not expose a multipleAttachments field; "
+                "no Airtable record was created."
+            ),
+            "table": table_name,
+            "mapping": mapping,
+            "approval_reference": approval_reference.strip(),
+            "verification": {
+                "status": "blocked_before_write",
+                "passed": False,
+                "create_read_back": False,
+                "attachment_read_back": False,
+            },
+            "send_enabled": False,
+        }
     live_write_requested = live and not parse_bool(os.getenv("AIRTABLE_WRITE_DRY_RUN", "true"))
     if live_write_requested:
         if not approval_reference.strip():
@@ -1679,12 +1974,22 @@ def airtable_create_expense_from_receipt_impl(
         base_id=config["base_id"],
         approval_reference=approval_reference,
         operation="create",
+        validate_schema=True,
         live=live,
     )
     record_id = str(write_result.get("record_id") or "").strip()
     dry_run = write_result.get("status") == "dry-run"
+    write_verification = (
+        write_result.get("verification")
+        if isinstance(write_result.get("verification"), Mapping)
+        else {}
+    )
+    record_verified = bool(
+        write_result.get("status") == "success"
+        and write_verification.get("passed") is True
+    )
     attachment_result: dict[str, Any] = {}
-    if isinstance(attachment_field, Mapping) and attachment_field:
+    if dry_run or record_verified:
         attachment_record_id = record_id
         if dry_run and not attachment_record_id:
             attachment_record_id = "rec_dry_run_after_create"
@@ -1700,17 +2005,30 @@ def airtable_create_expense_from_receipt_impl(
                 approval_reference=approval_reference,
                 live=live and bool(record_id),
             )
+    attachment_verification = (
+        attachment_result.get("verification")
+        if isinstance(attachment_result.get("verification"), Mapping)
+        else {}
+    )
+    attachment_verified = bool(
+        attachment_result.get("status") == "success"
+        and attachment_verification.get("passed") is True
+    )
     status = (
         "success"
-        if write_result.get("status") == "success"
-        and attachment_result.get("status") in {"success", ""}
+        if record_verified and attachment_verified
         else "dry-run"
         if dry_run
         else "partial"
     )
     return {
         "status": status,
+        "operation": "create_expense_from_receipt",
         "table": table_name,
+        "record_id": record_id,
+        "provider_link": (
+            str(write_result.get("provider_link") or "") if status == "success" else ""
+        ),
         "receipt_evidence": {
             "vendor": evidence.vendor,
             "receipt_date": evidence.receipt_date,
@@ -1727,6 +2045,21 @@ def airtable_create_expense_from_receipt_impl(
         "write_result": write_result,
         "attachment_result": attachment_result,
         "approval_reference": approval_reference.strip(),
+        "verification": {
+            "status": "verified" if status == "success" else "preview" if dry_run else "partial",
+            "passed": status == "success",
+            "record_id_match": bool(
+                record_id and write_verification.get("record_id_match") is True
+            ),
+            "create_read_back": record_verified,
+            "attachment_read_back": attachment_verified,
+            "attachment_count_before": attachment_verification.get(
+                "attachment_count_before"
+            ),
+            "attachment_count_after": attachment_verification.get(
+                "attachment_count_after"
+            ),
+        },
         "send_enabled": False,
     }
 
@@ -1797,6 +2130,7 @@ def google_doc_read_impl(
         "status": "success",
         "operation": "read_doc",
         "document_id": document_id,
+        "provider_link": f"https://docs.google.com/document/d/{document_id}/edit",
         "title": title,
         "text": text,
         "char_count": len(text),
@@ -2470,15 +2804,19 @@ def google_doc_write_impl(
     body_text: str,
     *,
     document_id: str = "",
+    content_mode: Literal["replace", "append"] = "replace",
     folder_path: str = "",
     approval_reference: str = "",
     live: bool = False,
 ) -> dict[str, Any]:
-    """Create or replace a Google Doc body behind explicit approval and env gates."""
+    """Create, replace, or append a Google Doc behind approval and env gates."""
 
     cleaned_title = " ".join(str(title or "Keystone Chief of Staff Artifact").split())
     body = str(body_text or "").strip()
     target_folder_path = _google_docs_folder_path(folder_path)
+    normalized_mode = str(content_mode or "replace").strip().lower()
+    if normalized_mode not in {"replace", "append"}:
+        raise ValueError("content_mode must be replace or append.")
     if not body:
         raise ValueError("body_text is required for Google Doc writes.")
     if not live:
@@ -2487,6 +2825,7 @@ def google_doc_write_impl(
             "operation": "write_doc",
             "title": cleaned_title,
             "document_id": document_id.strip(),
+            "content_mode": normalized_mode,
             "folder_path": target_folder_path,
             "body_preview": body[:1200],
             "approval_reference": approval_reference.strip(),
@@ -2499,9 +2838,14 @@ def google_doc_write_impl(
     target_id = document_id.strip()
     if target_id:
         _assert_drive_file_in_folder(services["drive"], target_id, target_folder_path)
+        requests = (
+            _append_doc_requests(docs_service, target_id, body)
+            if normalized_mode == "append"
+            else _replace_doc_requests(docs_service, target_id, body)
+        )
         docs_service.documents().batchUpdate(
             documentId=target_id,
-            body={"requests": _replace_doc_requests(docs_service, target_id, body)},
+            body={"requests": requests},
         ).execute()
     else:
         created = docs_service.documents().create(body={"title": cleaned_title}).execute()
@@ -2513,11 +2857,25 @@ def google_doc_write_impl(
             documentId=target_id,
             body={"requests": [{"insertText": {"location": {"index": 1}, "text": body}}]},
         ).execute()
+    verified_document = docs_service.documents().get(documentId=target_id).execute()
+    verified_text = _google_doc_text(verified_document)
+    content_verified = (
+        verified_text.rstrip().endswith(body)
+        if normalized_mode == "append"
+        else verified_text.strip() == body
+    )
+    if not content_verified:
+        raise RuntimeError("Google Doc provider read-back did not verify the requested content.")
     return {
         "status": "success",
+        "operation": "write_doc",
         "document_id": target_id,
         "title": cleaned_title,
+        "content_mode": normalized_mode,
+        "provider_verification": "passed",
+        "content_verified": True,
         "url": f"https://docs.google.com/document/d/{target_id}/edit",
+        "provider_link": f"https://docs.google.com/document/d/{target_id}/edit",
         "folder_path": target_folder_path,
         "approval_reference": approval_reference.strip(),
         "send_enabled": False,
@@ -2529,6 +2887,7 @@ def google_doc_write(
     title: str,
     body_text: str,
     document_id: str = "",
+    content_mode: Literal["replace", "append"] = "replace",
     folder_path: str = "",
     approval_reference: str = "",
     live: bool = False,
@@ -2540,6 +2899,7 @@ def google_doc_write(
             title,
             body_text,
             document_id=document_id,
+            content_mode=content_mode,
             folder_path=folder_path,
             approval_reference=approval_reference,
             live=live,
@@ -2624,6 +2984,9 @@ def google_doc_trash_impl(
         "trashed": bool(metadata.get("trashed")) if isinstance(metadata, dict) else True,
         "verification": verification,
         "url": metadata.get("webViewLink", "") if isinstance(metadata, dict) else "",
+        "provider_link": (
+            metadata.get("webViewLink", "") if isinstance(metadata, dict) else ""
+        ),
         "folder_path": target_folder_path,
         "approval_reference": approval_reference.strip(),
         "send_enabled": False,
@@ -2642,6 +3005,158 @@ def google_doc_trash(
     return json.dumps(
         google_doc_trash_impl(
             document_id_or_url,
+            folder_path=folder_path,
+            approval_reference=approval_reference,
+            live=live,
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def google_doc_test_lifecycle_impl(
+    title: str,
+    body_text: str,
+    *,
+    folder_path: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Create, verify, trash, and reverify one explicitly marked test Doc."""
+
+    cleaned_title = " ".join(str(title or "").split())
+    body = str(body_text or "").strip()
+    clean_approval = str(approval_reference or "").strip()
+    if "KBA_TEST_DOC" not in cleaned_title.upper():
+        raise ValueError("The Google Doc test lifecycle requires KBA_TEST_DOC in the title.")
+    if not body:
+        raise ValueError("body_text is required for the Google Doc test lifecycle.")
+    if live and not clean_approval:
+        raise RuntimeError(
+            "The Google Doc test lifecycle requires a non-empty approval_reference."
+        )
+    if live and not parse_bool(
+        os.getenv("KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE")
+    ):
+        raise RuntimeError(
+            "Google Workspace test lifecycle is disabled. Set "
+            "KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE=true for the approved window."
+        )
+
+    create_result: dict[str, Any] = {}
+    trash_result: dict[str, Any] = {}
+    document_id = ""
+    failure = ""
+    try:
+        create_result = google_doc_write_impl(
+            cleaned_title,
+            body,
+            folder_path=folder_path,
+            approval_reference=f"{clean_approval}:create" if clean_approval else "",
+            live=live,
+        )
+        document_id = str(create_result.get("document_id") or "").strip()
+        if not live:
+            return {
+                "status": "dry-run",
+                "operation": "test_doc_lifecycle",
+                "title": cleaned_title,
+                "required_marker": "KBA_TEST_DOC",
+                "approval_reference": clean_approval,
+                "create": _google_doc_lifecycle_step_receipt(create_result),
+                "send_enabled": False,
+            }
+        if not document_id or create_result.get("content_verified") is not True:
+            failure = "Google Doc create did not pass provider read-back verification."
+    except Exception as exc:  # preserve a bounded receipt and still attempt cleanup
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        if live and document_id:
+            try:
+                trash_result = google_doc_trash_impl(
+                    document_id,
+                    folder_path=folder_path,
+                    approval_reference=f"{clean_approval}:trash",
+                    live=True,
+                )
+            except Exception as exc:
+                trash_result = {
+                    "status": "failed",
+                    "operation": "trash_doc",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "verification": {"passed": False},
+                    "send_enabled": False,
+                }
+
+    create_passed = bool(
+        create_result.get("status") == "success"
+        and create_result.get("content_verified") is True
+        and document_id
+    )
+    trash_verification = trash_result.get("verification")
+    cleanup_passed = bool(
+        isinstance(trash_verification, Mapping)
+        and trash_verification.get("passed")
+        and trash_result.get("trashed") is True
+    )
+    passed = create_passed and cleanup_passed and not failure
+    return {
+        "status": "success" if passed else "failed",
+        "operation": "test_doc_lifecycle",
+        "document_id": document_id,
+        "provider_link": str(
+            create_result.get("provider_link") or create_result.get("url") or ""
+        ),
+        "title": cleaned_title,
+        "required_marker": "KBA_TEST_DOC",
+        "approval_reference": clean_approval,
+        "create": _google_doc_lifecycle_step_receipt(create_result),
+        "trash": _google_doc_lifecycle_step_receipt(trash_result),
+        "verification": {
+            "passed": passed,
+            "create_read_back": create_passed,
+            "document_trashed_after_cleanup": cleanup_passed,
+        },
+        "failure": failure,
+        "send_enabled": False,
+    }
+
+
+def _google_doc_lifecycle_step_receipt(result: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: result.get(key)
+        for key in (
+            "status",
+            "operation",
+            "document_id",
+            "title",
+            "folder_path",
+            "trashed",
+            "verification",
+            "send_enabled",
+            "reason",
+            "url",
+            "provider_link",
+        )
+        if key in result
+    }
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def google_doc_test_lifecycle(
+    title: str,
+    body_text: str,
+    folder_path: str = "",
+    approval_reference: str = "",
+    live: bool = False,
+) -> str:
+    """Run one approved KBA_TEST_DOC create/verify/trash lifecycle."""
+
+    return json.dumps(
+        google_doc_test_lifecycle_impl(
+            title,
+            body_text,
             folder_path=folder_path,
             approval_reference=approval_reference,
             live=live,
@@ -4458,6 +4973,19 @@ def _airtable_table_url(table_name: str, *, base_id: str = "") -> str:
     return f"https://api.airtable.com/v0/{base_id}/{quote(table_name, safe='')}"
 
 
+def _airtable_record_provider_link(base_id: str, record_id: str) -> str:
+    """Return Airtable's documented base/record URL for one exact record."""
+
+    clean_base_id = str(base_id or "").strip()
+    clean_record_id = str(record_id or "").strip()
+    if not clean_base_id or not clean_record_id:
+        return ""
+    return (
+        f"https://airtable.com/{quote(clean_base_id, safe='')}/"
+        f"{quote(clean_record_id, safe='')}"
+    )
+
+
 def _require_airtable_credentials(*, base_id: str = "", access_token: str = "") -> None:
     if not (base_id or context_env_value("AIRTABLE_BASE_ID").strip()):
         raise RuntimeError("Missing Airtable configuration: AIRTABLE_BASE_ID.")
@@ -5455,3 +5983,21 @@ def _replace_doc_requests(docs_service: Any, document_id: str, body: str) -> lis
         )
     requests.append({"insertText": {"location": {"index": 1}, "text": body}})
     return requests
+
+
+def _append_doc_requests(docs_service: Any, document_id: str, body: str) -> list[dict[str, Any]]:
+    document = docs_service.documents().get(documentId=document_id).execute()
+    content = document.get("body", {}).get("content", []) if isinstance(document, dict) else []
+    end_index = 1
+    if content and isinstance(content[-1], dict):
+        end_index = int(content[-1].get("endIndex", 1))
+    existing_text = _google_doc_text(document)
+    appended_text = ("\n" if existing_text else "") + body
+    return [
+        {
+            "insertText": {
+                "location": {"index": max(1, end_index - 1)},
+                "text": appended_text,
+            }
+        }
+    ]

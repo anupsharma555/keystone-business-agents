@@ -19,7 +19,10 @@ from keystone_agents.guardrails import (
     keystone_guardrails,
     keystone_tool_guardrail_kwargs,
 )
-from keystone_agents.manual_request import infer_manual_request_plan
+from keystone_agents.manual_request import (
+    infer_manual_request_plan,
+    positive_capability_text,
+)
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.orchestrator.routing import (
     OPPORTUNITY_RE as _OPPORTUNITY_RE,
@@ -416,6 +419,7 @@ def run_orchestrator_preflight(
         run_config=run_config,
         model=model,
         session=session,
+        workflow_state=workflow_state,
         cost_callback=record_planner_cost,
     )
     route_result = route_request(
@@ -789,7 +793,8 @@ def _request_has_inline_approved_outreach_context(text: str) -> bool:
         return False
     approved_context_label = re.search(
         r"\b(?:"
-        r"approved(?:\s+(?:inline|source|source-backed|source backed))?\s+"
+        r"(?:these\s+|the\s+following\s+)?approved"
+        r"(?:\s+(?:inline|source|source-backed|source backed))?\s+"
         r"(?:context|facts|evidence|background|grounding|rationale)"
         r"|source[-\s]+backed\s+(?:context|facts|evidence|background|grounding)"
         r"|context\s+approved\s+for\s+(?:drafting|draft-only\s+use|draft\s+only\s+use)"
@@ -799,7 +804,15 @@ def _request_has_inline_approved_outreach_context(text: str) -> bool:
     )
     if not approved_context_label:
         return False
-    return bool(re.search(r"\b(?:do not send|no send|draft-only|draft only)\b", cleaned, flags=re.I))
+    return bool(
+        re.search(r"\b(?:no send|draft-only|draft only)\b", cleaned, flags=re.I)
+        or re.search(
+            r"\b(?:do\s+not|don't|dont|never|without)\b"
+            r"[^.;\n]{0,200}\b(?:send|post|publish|share)\b",
+            cleaned,
+            flags=re.I,
+        )
+    )
 
 
 def _to_mapping(value: Any) -> Mapping[str, Any] | None:
@@ -938,12 +951,11 @@ def _looks_like_crm_write_request(text: str) -> bool:
 
 
 def _without_negated_outreach_draft_clauses(text: str) -> str:
-    return _without_negated_route_action_clauses(text)
+    return positive_capability_text(text)
 
 
 def _without_negated_route_action_clauses(text: str) -> str:
-    cleaned = _NEGATED_OUTREACH_DRAFT_CLAUSE_RE.sub(" ", str(text or ""))
-    return _NEGATED_OPPORTUNITY_DISCOVERY_CLAUSE_RE.sub(" ", cleaned)
+    return positive_capability_text(text)
 
 
 def _without_negated_context_send_clauses(text: str) -> str:
@@ -1144,7 +1156,7 @@ def _looks_like_discovery_outreach_workflow(text: str) -> bool:
 
 
 def _gmail_cross_agent_workflow(text: str) -> list[str]:
-    lower = str(text or "").lower()
+    lower = positive_capability_text(text).lower()
     if not re.search(r"\b(?:gmail|email|inquiry|thread|reply|response)\b", lower):
         return []
     workflow = ["gmail_triage"]
@@ -1191,6 +1203,10 @@ def _requested_cross_agent_workflow(text: str, *, start_route: str) -> list[str]
         r"\b(?:company\s+research|research\s+(?:it|the\s+company|company)|"
         r"research\s+summary|research\s+brief|source[- ]backed|profile\s+company)\b",
         lower,
+    ) or re.search(
+        r"\bbusiness\s+research(?:\s+analyst|\s+agent)?\b"
+        r"[^.;\n]{0,120}\b(?:summari[sz]e|review|analy[sz]e|assess|brief)\b",
+        lower,
     ):
         workflow.append("business_research_analyst")
     if re.search(
@@ -1203,6 +1219,10 @@ def _requested_cross_agent_workflow(text: str, *, start_route: str) -> list[str]
         r"\b(?:draft|write|compose|prepare)\b[\s\S]{0,160}\b"
         r"(?:outreach|email|reply|response|follow-up|followup)\b"
         r"|\boutreach\s+(?:recommendation|draft)\b",
+        lower,
+    ) or re.search(
+        r"\boutreach\s+composer\b[^.;\n]{0,120}"
+        r"\b(?:draft|write|compose|prepare)\b",
         lower,
     ):
         workflow.append("outreach_composer")
@@ -2900,6 +2920,67 @@ def _route_from_manual_plan(
         result.audit_notes = [*result.audit_notes, *audit_notes]
         return result
     route = plan.target_agent
+    planned_workflow = list(
+        dict.fromkeys(
+            str(step)
+            for step in plan.workflow
+            if str(step)
+            in {
+                "gmail_triage",
+                "business_research_analyst",
+                "opportunity_scout",
+                "outreach_composer",
+                *_CONTEXT_AGENT_ROUTES,
+            }
+        )
+    )
+    if len(planned_workflow) > 1:
+        if "outreach_composer" in planned_workflow and not approved_context_present:
+            outreach_index = planned_workflow.index("outreach_composer")
+            has_context_building_step = any(
+                step
+                in {
+                    "gmail_triage",
+                    "business_research_analyst",
+                    "opportunity_scout",
+                }
+                for step in planned_workflow[:outreach_index]
+            )
+            if not has_context_building_step:
+                result = _missing_outreach_context_refusal(workflow_state=workflow_state)
+                result.audit_notes = [*result.audit_notes, *audit_notes]
+                return result
+        first_route = planned_workflow[0]
+        result = _result(
+            route=first_route,
+            rationale=plan.objective
+            or "The manual request plan selected an ordered multi-owner workflow.",
+            approved_context_present=approved_context_present,
+            approval_scope=(
+                ApprovalScope.EXTERNAL_USE
+                if "outreach_composer" in planned_workflow
+                else ApprovalScope.DRAFTING
+            ),
+            approval_rationale=(
+                "The final copy remains internal and draft-only unless a separate "
+                "scoped external-use approval permits publication."
+            ),
+            artifact=("input_type", plan.target_type),
+            routing_mode=plan.source
+            if plan.source in {"llm", "llm_unavailable"}
+            else "deterministic",
+            workflow_state=workflow_state,
+            audit_notes=[
+                *audit_notes,
+                "Python validated the planner's ordered workflow before execution.",
+            ],
+            retrieval_hint=_route_retrieval_hint(
+                first_route,
+                request_text=request_text,
+            ),
+            workflow=planned_workflow,
+        )
+        return _with_crm_write_boundary(result, request_text=request_text)
     if (
         not approved_context_present
         and route == "outreach_composer"
@@ -2947,6 +3028,29 @@ def _route_from_manual_plan(
     if route == "orchestrator":
         return None
     if route == "outreach_composer":
+        if not plan.requires_approved_context:
+            return _result(
+                route="outreach_composer",
+                rationale=plan.objective
+                or (
+                    "The manual request plan selected Outreach Composer for a "
+                    "provider-free response task."
+                ),
+                approved_context_present=approved_context_present,
+                approval_scope=ApprovalScope.DRAFTING,
+                approval_rationale=(
+                    "No outreach artifact or external-use action was requested; "
+                    "ordinary send and publish gates remain unchanged."
+                ),
+                routing_mode=plan.source
+                if plan.source in {"llm", "llm_unavailable"}
+                else "deterministic",
+                workflow_state=workflow_state,
+                audit_notes=[
+                    *audit_notes,
+                    "Outreach approval context was not required by the semantic plan.",
+                ],
+            )
         thread_local_draft = _looks_like_thread_local_draft_request(request_text)
         if not approved_context_present and not thread_local_draft:
             result = _missing_outreach_context_refusal(workflow_state=workflow_state)
@@ -3042,6 +3146,36 @@ def _manual_plan_is_read_only_context_lookup(
     return not _looks_like_send_side_effect(cleaned)
 
 
+def _manual_plan_is_internal_provider_write(
+    plan: ManualRequestPlan | None,
+    *,
+    request_text: str,
+) -> bool:
+    """Keep an interpreted internal write out of the generic outbound-send gate."""
+
+    if plan is None or not (
+        plan.intent == "business_system_write"
+        and plan.side_effect_policy == "internal_write_approval_required"
+        and plan.target_agent
+        in {
+            "chief_of_staff",
+            "airtable_context_agent",
+            "google_workspace_context_agent",
+            "gmail_triage",
+            "zotero_context_agent",
+        }
+    ):
+        return False
+    actionable = _without_negated_route_action_clauses(request_text)
+    return not bool(
+        re.search(
+            r"\b(?:send|post|publish|share|deliver)\b",
+            actionable,
+            re.IGNORECASE,
+        )
+    )
+
+
 def route_request(
     request: str | Mapping[str, Any] | None,
     *,
@@ -3104,6 +3238,10 @@ def route_request(
         resolved_manual_plan,
         request_text=text,
     )
+    internal_provider_write = _manual_plan_is_internal_provider_write(
+        resolved_manual_plan,
+        request_text=text,
+    )
 
     def finish(result: OrchestratorResult) -> OrchestratorResult:
         return _with_operator_feedback_request(
@@ -3114,6 +3252,7 @@ def route_request(
     if (
         send_side_effect
         and not read_only_context_lookup
+        and not internal_provider_write
         and _looks_like_discovery_outreach_workflow(text)
     ):
         return finish(
@@ -3124,7 +3263,7 @@ def route_request(
             )
         )
 
-    if send_side_effect and not read_only_context_lookup:
+    if send_side_effect and not read_only_context_lookup and not internal_provider_write:
         return finish(
             _send_refusal(
                 approved_context_present=approved_context_present,

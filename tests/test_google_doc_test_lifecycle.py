@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import keystone_agents.tools.internal_data_tools as data_tools
 import scripts.run_google_doc_test_lifecycle as lifecycle
 
 
@@ -140,3 +141,61 @@ def test_google_doc_lifecycle_trashes_after_update_failure(monkeypatch) -> None:
     assert "update failed" in result["failure"]
     assert trash_calls == ["doc-123"]
     assert result["receipts"]["trash_readback"]["passed"] is True
+
+
+def test_google_doc_agent_tool_lifecycle_uses_one_composite_call(monkeypatch) -> None:
+    monkeypatch.setenv("KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE", "true")
+    write_calls: list[dict[str, object]] = []
+    trash_calls: list[dict[str, object]] = []
+
+    def fake_write(title, body_text, **kwargs):
+        write_calls.append({"title": title, "body_text": body_text, **kwargs})
+        return {
+            "status": "success",
+            "operation": "write_doc",
+            "document_id": "doc-123",
+            "title": title,
+            "content_verified": True,
+            "provider_link": "https://docs.google.com/document/d/doc-123/edit",
+            "send_enabled": False,
+        }
+
+    def fake_trash(document_id, **kwargs):
+        trash_calls.append({"document_id": document_id, **kwargs})
+        return {
+            "status": "success",
+            "operation": "trash_doc",
+            "document_id": document_id,
+            "trashed": True,
+            "verification": {"passed": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(data_tools, "google_doc_write_impl", fake_write)
+    monkeypatch.setattr(data_tools, "google_doc_trash_impl", fake_trash)
+
+    result = data_tools.google_doc_test_lifecycle_impl(
+        "KBA_TEST_DOC_VALIDATION",
+        "Provider lifecycle validation.",
+        folder_path="KNIOps",
+        approval_reference="ANU-120",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["provider_link"] == "https://docs.google.com/document/d/doc-123/edit"
+    assert result["verification"] == {
+        "passed": True,
+        "create_read_back": True,
+        "document_trashed_after_cleanup": True,
+    }
+    assert len(write_calls) == 1
+    assert write_calls[0]["approval_reference"] == "ANU-120:create"
+    assert trash_calls == [
+        {
+            "document_id": "doc-123",
+            "folder_path": "KNIOps",
+            "approval_reference": "ANU-120:trash",
+            "live": True,
+        }
+    ]
