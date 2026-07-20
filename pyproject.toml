@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=83", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -38,6 +38,7 @@ dev = [
   "PyYAML>=6.0.3,<7",
   "pytest>=8.0",
   "ruff",
+  "setuptools>=83",
 ]
 orchestration = [
   "langgraph>=1.0,<2",
