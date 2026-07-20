@@ -980,7 +980,13 @@ def _run_single_sdk_synthesis(
             build_outreach_composer_compact_synthesis_agent()
             if compact_gemini
             else build_outreach_composer_agent(
-                include_tools=_include_outreach_tools_for_sdk_run(live=live),
+                include_tools=(
+                    False
+                    if args.compact_instructions
+                    else _include_outreach_tools_for_sdk_run(live=live)
+                ),
+                request_text=objective,
+                compact_instructions=args.compact_instructions,
             )
         ),
         output_type=OutreachLLMDraftPayload if compact_gemini else OutreachDraft,

@@ -6,6 +6,7 @@ import argparse
 import json
 
 from keystone_agents.agents.chief_of_staff import (
+    chief_slack_command_resolution_is_applicable,
     resolve_high_confidence_chief_slack_command,
     run_chief_slack_command_resolver,
     validate_chief_slack_command_resolution,
@@ -27,6 +28,29 @@ def main() -> int:
         list_slack_slash_commands(repo_path=args.slack_repo_path)
     )
     command_catalog = list(catalog_payload.get("command_details") or [])
+    if not chief_slack_command_resolution_is_applicable(args.input):
+        print(
+            json.dumps(
+                {
+                    "output": {
+                        "status": "no_match",
+                        "command_text": "",
+                        "rationale": (
+                            "Provider-owned action continues through Chief of Staff "
+                            "interpretation and typed tools."
+                        ),
+                        "confidence": "high",
+                    },
+                    "usage": {"available": True, "requests": 0, "total_tokens": 0},
+                    "cost": {"available": True, "estimated_cost_usd": 0.0},
+                    "model": "provider-action-admission-gate",
+                    "provider": "local",
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+        )
+        return 0
     deterministic_output = resolve_high_confidence_chief_slack_command(
         args.input,
         command_catalog,

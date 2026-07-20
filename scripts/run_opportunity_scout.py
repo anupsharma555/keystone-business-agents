@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from keystone_agents.agents.opportunity_scout import (
+    apply_opportunity_scout_synthesis,
     build_opportunity_scout_agent,
+    build_opportunity_scout_synthesis_agent,
     scout_opportunities_fixture,
 )
 from keystone_agents.agents.opportunity_search_planner import resolve_opportunity_search_plan
@@ -60,7 +62,10 @@ from keystone_agents.retrieval_policy import (
     derive_request_autonomy_hint,
 )
 from keystone_agents.run import run_retrieved_sdk_synthesis
-from keystone_agents.schemas.opportunity import OpportunityScoutResult
+from keystone_agents.schemas.opportunity import (
+    OpportunityScoutResult,
+    OpportunityScoutSynthesis,
+)
 from keystone_agents.schemas.retrieval import RetrievalHint
 from keystone_agents.tools.serper_tool import (
     SearchProviderConfigurationError,
@@ -131,10 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--founder-fit-profile",
-        default=None,
+        default="documents/founder_fit_profile.json",
         help=(
-            "Optional approved founder-fit JSON profile for search query planning "
-            "and opportunity-fit assessment."
+            "Approved founder-fit JSON profile for search query planning and "
+            "opportunity-fit assessment (defaults to the repo's reviewed profile)."
         ),
     )
     parser.add_argument(
@@ -670,11 +675,37 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     storage = StorageTool(args.database_url) if args.save else None
+    prefetched_live_result = retrieve() if args.live_search and not args.improvement_case else None
+    if _skip_synthesis_for_empty_live_retrieval(prefetched_live_result):
+        assert isinstance(prefetched_live_result, OpportunityScoutResult)
+        payload = _empty_live_retrieval_payload(
+            result=prefetched_live_result,
+            retrieval_metadata=retrieval_metadata,
+            founder_profile=founder_profile,
+            founder_profile_path=args.founder_fit_profile,
+        )
+        attach_orchestrator_preflight_payload(payload, args)
+        return payload
+
+    def retrieve_for_synthesis() -> Any:
+        if prefetched_live_result is not None:
+            return prefetched_live_result
+        return retrieve()
+
+    legacy_os1_mode = args.improvement_case == OS1_IMPROVEMENT_CASE_ID
     outcome = run_retrieved_sdk_synthesis(
-        agent=build_opportunity_scout_agent(),
-        output_type=OpportunityScoutResult,
-        retrieve=retrieve,
+        agent=(
+            build_opportunity_scout_agent(
+                attach_tools=False,
+                compact_instructions=args.compact_instructions,
+            )
+            if legacy_os1_mode
+            else build_opportunity_scout_synthesis_agent(max_results=args.max_results)
+        ),
+        output_type=OpportunityScoutResult if legacy_os1_mode else OpportunityScoutSynthesis,
+        retrieve=retrieve_for_synthesis,
         normalize=normalize,
+        finalize_output=None if legacy_os1_mode else apply_opportunity_scout_synthesis,
         input_summary=args.topic or "opportunity scout SDK synthesis",
         input_audit_payload={
             "fixture": args.fixture,
@@ -708,6 +739,10 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         provider_cost_window_seconds=args.provider_cost_window_seconds,
         openai_cost_project_id=args.openai_cost_project_id,
     )
+    payload["founder_fit_profile"] = founder_profile_audit_payload(
+        args.founder_fit_profile,
+        founder_profile,
+    )
     if retrieval_metadata:
         payload["live_search_metadata"] = retrieval_metadata
         payload["retrieval_diagnostics"] = retrieval_metadata.get(
@@ -728,6 +763,72 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             run_type="live SDK" if live else "local SDK",
         )
     return payload
+
+
+def _skip_synthesis_for_empty_live_retrieval(result: Any) -> bool:
+    return bool(
+        isinstance(result, OpportunityScoutResult)
+        and result.raw_search_result_count == 0
+        and not result.records
+        and not result.review_candidates
+    )
+
+
+def _empty_live_retrieval_payload(
+    *,
+    result: OpportunityScoutResult,
+    retrieval_metadata: dict[str, Any],
+    founder_profile: Any,
+    founder_profile_path: str,
+) -> dict[str, Any]:
+    return {
+        "mode": "sdk-synthesis",
+        "agent_name": "opportunity_scout",
+        "dry_run": False,
+        "live_sdk": False,
+        "live_sdk_requested": True,
+        "sdk_run_invoked": False,
+        "synthesis_skipped_reason": "live_retrieval_returned_zero_raw_results",
+        "model": {"provider": "", "name": "", "run_mode": "not_invoked"},
+        "usage": {
+            "available": True,
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+        },
+        "cost": {
+            "source": "not_incurred",
+            "estimated_usd": 0.0,
+            "actual_usd": 0.0,
+            "currency": "USD",
+            "note": "Synthesis was skipped because live retrieval returned no raw evidence.",
+        },
+        "request_cache": {},
+        "budget_guard": {
+            "status": "not_needed",
+            "estimated_usd": 0.0,
+            "exceeded": False,
+        },
+        "output_type": "OpportunityScoutResult",
+        "output": jsonable(result),
+        "storage": {},
+        "audit_notes": [
+            "Live retrieval completed with zero raw results.",
+            "SDK synthesis was skipped to avoid spending on an empty evidence packet.",
+            "No outbound side effects were invoked.",
+        ],
+        "founder_fit_profile": founder_profile_audit_payload(
+            founder_profile_path,
+            founder_profile,
+        ),
+        "live_search_metadata": retrieval_metadata,
+        "retrieval_diagnostics": retrieval_metadata.get(
+            "retrieval_diagnostics",
+            retrieval_diagnostics_from_metadata(retrieval_metadata),
+        ),
+    }
 
 
 def _write_result_output_atomic(path: Path, payload: dict[str, Any]) -> None:

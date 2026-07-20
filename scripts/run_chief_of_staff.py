@@ -19,9 +19,12 @@ from keystone_agents.agents.chief_of_staff import (
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
 from keystone_agents.agents.orchestrator import review_specialist_output, run_orchestrator_preflight
 from keystone_agents.agents.web_query_planner import resolve_web_query_plan
+from keystone_agents.calendar_actions import infer_calendar_action_plan
+from keystone_agents.cli import execute_direct_calendar_action
 from keystone_agents.cli_sdk import add_sdk_session_arguments, sdk_session_from_args
 from keystone_agents.config import load_settings
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
+from keystone_agents.execution_request import attach_execution_public_result
 from keystone_agents.finance_expense_receipts import infer_finance_expense_receipt_target
 from keystone_agents.local_kni_evidence import (
     build_local_kni_evidence_packet,
@@ -30,6 +33,12 @@ from keystone_agents.local_kni_evidence import (
     local_kni_live_instruction,
     looks_like_local_kni_evidence_lookup,
 )
+from keystone_agents.manual_request import (
+    looks_like_supplied_context_synthesis_request,
+    positive_capability_text,
+    provider_tool_action_bound,
+    request_forbids_live_research,
+)
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
 from keystone_agents.operator_failures import known_exception_to_operator_failure
@@ -37,6 +46,7 @@ from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
     load_manual_request_plan_from_env,
     load_orchestrator_preflight_from_env,
+    load_specialist_execution_context_from_env,
 )
 from keystone_agents.quality_budget import AgentQualityBudget, chief_of_staff_quality_budget
 from keystone_agents.schemas.chief_of_staff import (
@@ -45,6 +55,7 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffSourceRef,
 )
 from keystone_agents.source_layer_context import runtime_source_layer_policy_context
+from keystone_agents.storage.sqlite_store import redact_secrets
 from keystone_agents.visible_sources import append_visible_source_urls_to_output
 
 
@@ -126,7 +137,42 @@ def _requests_finance_tracker_airtable_write(input_text: str) -> bool:
     return has_airtable_tracker and has_write_intent
 
 
-def _live_side_effect_policy(input_text: str) -> str:
+def _requests_calendar_write(
+    input_text: str,
+    manual_request_plan: object | None = None,
+) -> bool:
+    """Bind a semantically interpreted Calendar request to Calendar tools only."""
+
+    local_plan = infer_calendar_action_plan(input_text)
+    if local_plan is not None and local_plan.operation in {"create", "update", "delete"}:
+        return True
+    if str(getattr(manual_request_plan, "intent", "") or "") != "business_system_write":
+        return False
+    semantic_context = " ".join(
+        [
+            str(getattr(manual_request_plan, "objective", "") or ""),
+            str(getattr(manual_request_plan, "primary_target", "") or ""),
+            str(getattr(manual_request_plan, "rationale", "") or ""),
+            " ".join(getattr(manual_request_plan, "constraints", []) or []),
+        ]
+    )
+    return bool(re.search(r"\b(?:google\s+calendar|calendar\s+event)\b", semantic_context, re.I))
+
+
+def _live_side_effect_policy(
+    input_text: str,
+    manual_request_plan: object | None = None,
+) -> str:
+    if _requests_calendar_write(input_text, manual_request_plan):
+        return (
+            "The authenticated operator requested one exact Google Calendar action. "
+            "Use only the dedicated Calendar create/update/delete tool needed for that "
+            "action, with the supplied approval_reference and configured primary "
+            "calendar/timezone. Infer the next-occurrence year and all-day status when "
+            "the request supports one conventional interpretation. Verify provider "
+            "state before reporting completion. Do not mutate Slack, Gmail, Airtable, "
+            "Google Drive/Docs/Sheets, the repo, or any other system."
+        )
     if _requests_google_workspace_artifact(input_text):
         return (
             "Live internal Airtable reads are allowed for this command. Live Google "
@@ -152,18 +198,171 @@ def _live_side_effect_policy(input_text: str) -> str:
     return "read-only; no Slack post, Gmail send, calendar write, repo write, or external action"
 
 
-def _request_forbids_live_web_research(input_text: str) -> bool:
-    normalized = " ".join(str(input_text or "").lower().split())
-    if not normalized:
-        return False
-    return bool(
-        re.search(
-            r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\b"
-            r"[^.;\n]{0,180}\b"
-            r"(?:web\s+search|live\s+web|external\s+(?:search|research|tools?)|"
-            r"browser\s+automation|research\s+externally)\b",
-            normalized,
+def _run_interpreted_calendar_action(
+    *,
+    input_text: str,
+    plan: object,
+    json_output: bool,
+    openai_requests: int,
+) -> int:
+    """Execute a bounded Calendar action and keep the Chief Slack wire contract."""
+
+    direct = execute_direct_calendar_action(
+        input_text,
+        plan,
+        live=True,
+        openai_requests=openai_requests,
+    )
+    receipt = direct.get("tool_receipt")
+    if not isinstance(receipt, dict):
+        if json_output:
+            print(json.dumps(direct, ensure_ascii=True, indent=2, sort_keys=True))
+        else:
+            print(str(direct.get("message") or "Calendar action could not be completed."))
+        return 1
+
+    operation = str(getattr(plan, "operation", "") or receipt.get("operation") or "action")
+    title = str(
+        receipt.get("title")
+        or (direct.get("calendar_lookup") or {}).get("title")
+        or getattr(plan, "event_reference", "")
+        or getattr(plan, "title", "")
+    ).strip()
+    passed = bool((receipt.get("verification") or {}).get("passed"))
+    verb = {"create": "Created", "update": "Updated", "delete": "Deleted"}.get(
+        operation,
+        operation.capitalize(),
+    )
+    start_date = str(receipt.get("start_date") or getattr(plan, "start_date", "")).strip()
+    start_time = str(receipt.get("start_time") or getattr(plan, "start_time", "")).strip()
+    end_time = str(receipt.get("end_time") or getattr(plan, "end_time", "")).strip()
+    timing = " ".join(
+        part
+        for part in (
+            f"on {start_date}" if start_date else "",
+            f"at {start_time}-{end_time}" if start_time and end_time else "",
         )
+        if part
+    )
+    if operation == "delete":
+        summary = (
+            f"{verb} {title}; Google Calendar read-back confirmed the exact event "
+            "is no longer active."
+        )
+    else:
+        summary = (
+            f"{verb} {title}{(' ' + timing) if timing else ''}; "
+            "Google Calendar provider read-back passed."
+        )
+    actions: list[str] = []
+    description = str(getattr(plan, "description", "") or "").strip()
+    if description:
+        actions.append(f'Calendar note verified from the requested update: "{description}".')
+    if operation == "update":
+        actions.append("The existing event was modified; no duplicate event was created.")
+
+    payload = {
+        "status": "done" if passed else str(direct.get("status") or "failed"),
+        "mode": "live_calendar",
+        "live_sdk": True,
+        "model": "orchestrator-preflight-plus-typed-calendar-tools",
+        "output": {
+            "summary": summary,
+            "synthesis": "",
+            "recommended_actions": actions,
+            "recommended_route": {
+                "workflow_type": "calendar-action-complete",
+                "command_text": "",
+                "target_channel": "",
+                "rationale": "Chief of Staff executed the exact provider-owned Calendar action.",
+            },
+            "approval_required": True,
+            "slack_post_allowed": False,
+            "send_enabled": False,
+            "audit_notes": [
+                "Provider receipt, not model speculation, is authoritative for completion."
+            ],
+        },
+        "calendar_action": direct.get("calendar_action"),
+        "calendar_lookup": direct.get("calendar_lookup"),
+        "tool_receipt": receipt,
+        "usage": {
+            "available": True,
+            "requests": openai_requests,
+        },
+        "side_effects": direct.get("side_effects"),
+    }
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(summary)
+        for action in actions:
+            print(f"- {action}")
+    return 0 if passed else 1
+
+
+def _request_forbids_live_web_research(input_text: str) -> bool:
+    """Compatibility shim for the shared natural-language research boundary."""
+
+    return request_forbids_live_research(input_text)
+
+
+def _chief_tool_scope_text(input_text: str) -> str:
+    """Exclude Slack continuation boilerplate from provider-tool admission."""
+
+    text = str(input_text or "")
+    previous = re.search(
+        r"\bPrevious request:\s*(.*?)\s+Previous result title:",
+        text,
+        flags=re.I | re.S,
+    )
+    current = re.search(
+        r"\b(?:Current user request \(authoritative\)|User follow-up):\s*(.*?)"
+        r"(?:\s+Previous request:|\s+Continue the same agent task|\Z)",
+        text,
+        flags=re.I | re.S,
+    )
+    scoped = " ".join(
+        part
+        for part in (
+            previous.group(1).strip() if previous else "",
+            current.group(1).strip() if current else "",
+        )
+        if part
+    )
+    return scoped or text
+
+
+def _chief_of_staff_should_attach_tools(
+    input_text: str,
+    manual_plan: object | None = None,
+) -> bool:
+    """Attach tools only for semantically supported research or bound system work."""
+
+    tool_scope_text = _chief_tool_scope_text(input_text)
+    if looks_like_supplied_context_synthesis_request(tool_scope_text):
+        return False
+    if provider_tool_action_bound(tool_scope_text):
+        return True
+    if manual_plan is None:
+        return False
+    tool_backed_intents = {
+        "company_research",
+        "research_brief",
+        "opportunity_search",
+        "opportunity_to_outreach_loop",
+        "gmail_triage",
+        "slack_operations",
+        "browser_diagnostics",
+        "reference_capture",
+        "business_system_write",
+        "context_lookup",
+    }
+    return bool(
+        getattr(manual_plan, "requires_live_search", False)
+        or str(getattr(manual_plan, "intent", "") or "") in tool_backed_intents
+        or str(getattr(manual_plan, "task_objective", "") or "") in tool_backed_intents
+        or list(getattr(manual_plan, "workflow", []) or [])
     )
 
 
@@ -328,6 +527,48 @@ def _with_cost_tracking_note(
     return output.model_copy(update={"summary": summary, "audit_notes": audit_notes})
 
 
+def _chief_of_staff_human_summary(
+    output: object,
+    *,
+    manual_request_plan: object | None = None,
+) -> str:
+    """Return the complete public Chief answer without operational metadata."""
+
+    summary = str(getattr(output, "summary", "") or "").strip()
+    synthesis = str(getattr(output, "synthesis", "") or "").strip()
+    ask_shape = getattr(manual_request_plan, "ask_shape", None)
+    constraints = getattr(ask_shape, "output_constraints", None)
+    requested_item_count = getattr(constraints, "maximum_items", None)
+    exact_item_count = (
+        getattr(constraints, "item_count_mode", "") == "exact"
+        and isinstance(requested_item_count, int)
+        and requested_item_count > 0
+    )
+    summary_bullets = [
+        line
+        for line in summary.splitlines()
+        if re.match(r"^\s*(?:[-*]|\d+[.)])\s+\S", line)
+    ]
+    if (
+        getattr(ask_shape, "output_form", "") == "bullets"
+        and exact_item_count
+        and len(summary_bullets) == requested_item_count
+    ):
+        return summary
+    if not summary:
+        return synthesis
+    if not synthesis:
+        return summary
+
+    normalized_summary = " ".join(summary.lower().split())
+    normalized_synthesis = " ".join(synthesis.lower().split())
+    if normalized_summary in normalized_synthesis:
+        return synthesis
+    if normalized_synthesis in normalized_summary:
+        return summary
+    return f"{summary}\n\n{synthesis}"
+
+
 def _payload(
     *,
     mode: str,
@@ -347,6 +588,10 @@ def _payload(
     delegated_work_item_result: object | None = None,
 ) -> dict[str, object]:
     dumped = output.model_dump(mode="json") if hasattr(output, "model_dump") else output
+    human_summary = _chief_of_staff_human_summary(
+        output,
+        manual_request_plan=manual_request_plan,
+    )
     payload: dict[str, object] = {
         "agent_name": "chief_of_staff",
         "mode": mode,
@@ -357,6 +602,10 @@ def _payload(
         "send_enabled": False,
         "output": dumped,
     }
+    if human_summary:
+        payload["human_summary"] = human_summary
+        payload["slack_display_text"] = human_summary
+        payload["display_text"] = human_summary
     if quality_budget is not None:
         payload["quality_budget"] = quality_budget.model_dump(mode="json")
     if usage is not None:
@@ -397,6 +646,7 @@ def _payload(
             if hasattr(original_orchestrator_review, "model_dump")
             else original_orchestrator_review
         )
+    attach_execution_public_result(payload)
     return payload
 
 
@@ -424,7 +674,11 @@ def _maybe_execute_recommended_work_item_handoff(
         output_payload,
         input_text,
     )
-    if delegated_route is None:
+    if delegated_route is None or not _chief_handoff_execution_authorized(
+        input_text=input_text,
+        manual_request_plan=manual_request_plan,
+        delegated_route=delegated_route,
+    ):
         return output, None
     inline_only = _direct_handoff_should_use_inline_only(input_text)
     delegated = advance_work_item_manager_loop_with_optional_langgraph(
@@ -455,6 +709,43 @@ def _maybe_execute_recommended_work_item_handoff(
         max_steps=2,
     )
     return _chief_result_from_delegated_work_item(output, delegated), delegated
+
+
+def _chief_handoff_execution_authorized(
+    *,
+    input_text: str,
+    manual_request_plan: object | None,
+    delegated_route: object,
+) -> bool:
+    """Require request/plan authority before executing a model-suggested handoff."""
+
+    route_value = str(getattr(delegated_route, "value", delegated_route) or "").strip()
+    planned_target = str(
+        getattr(manual_request_plan, "target_agent", "") or ""
+    ).strip()
+    if route_value and planned_target == route_value:
+        return True
+
+    workflow = {
+        str(getattr(item, "value", item) or "").strip()
+        for item in (getattr(manual_request_plan, "workflow", None) or [])
+    }
+    if route_value and route_value in workflow:
+        return True
+
+    positive_request = positive_capability_text(input_text).lower()
+    return bool(
+        re.search(
+            r"\b(?:coordinate|delegate|execute|hand\s+off|handoff|run)\b",
+            positive_request,
+        )
+        and re.search(
+            r"\b(?:agent|specialist|work\s*item|workflow|next\s+owner|"
+            r"business\s+research|research\s+analyst|opportunity\s+scout|"
+            r"outreach\s+composer|gmail\s+triage)\b",
+            positive_request,
+        )
+    )
 
 
 def _direct_handoff_should_use_inline_only(input_text: str) -> bool:
@@ -711,11 +1002,17 @@ def _fallback_after_live_sdk_exception(
         database_url=database_url,
         manual_request_plan=manual_request_plan,
     )
+    error_detail = " ".join(str(redact_secrets(str(exc or "")) or "").split())[:500]
     audit_notes = [
         *getattr(result, "audit_notes", []),
         (
             "Live SDK structured output could not be parsed or validated; "
             f"deterministic Chief of Staff fallback was rendered instead ({type(exc).__name__})."
+        ),
+        *(
+            [f"Live SDK validation diagnostic: {error_detail}"]
+            if error_detail
+            else []
         ),
     ]
     if hasattr(result, "model_copy"):
@@ -760,6 +1057,7 @@ def main(argv: list[str] | None = None) -> int:
     input_text = (cost_directive.cleaned_text or raw_input_text).strip()
     orchestrator_preflight = load_orchestrator_preflight_from_env()
     parent_manual_plan = load_manual_request_plan_from_env()
+    specialist_execution_context = load_specialist_execution_context_from_env()
     local_kni_lookup = _looks_like_local_kni_evidence_lookup(input_text.lower())
     if args.live_sdk:
         load_settings(force_dotenv=True)
@@ -788,6 +1086,14 @@ def main(argv: list[str] | None = None) -> int:
             )
             manual_plan = preflight.manual_request_plan
             orchestrator_preflight = compact_orchestrator_preflight_payload(preflight)
+        calendar_plan = infer_calendar_action_plan(input_text)
+        if calendar_plan is not None:
+            return _run_interpreted_calendar_action(
+                input_text=input_text,
+                plan=calendar_plan,
+                json_output=args.json,
+                openai_requests=1,
+            )
         budget = chief_of_staff_quality_budget(
             args.quality,
             request_text=input_text,
@@ -830,8 +1136,12 @@ def main(argv: list[str] | None = None) -> int:
                 "request": input_text,
                 "slack_repo_path": args.slack_repo_path,
                 "approval_reference": _approval_reference_for_request(input_text),
-                "side_effect_policy": _live_side_effect_policy(input_text),
+                "side_effect_policy": _live_side_effect_policy(input_text, manual_plan),
                 "live_web_research_enabled": live_web_research_enabled,
+                "attach_tools": _chief_of_staff_should_attach_tools(
+                    input_text,
+                    manual_plan,
+                ),
                 "include_specialist_tools": chief_of_staff_should_use_specialist_tools(
                     input_text,
                     manual_plan,
@@ -842,6 +1152,14 @@ def main(argv: list[str] | None = None) -> int:
                     "chief_of_staff"
                 ),
             }
+            if specialist_execution_context:
+                typed_input["execution_context"] = specialist_execution_context
+                typed_input["execution_context_instruction"] = (
+                    "Use the bounded execution context to resolve references such as "
+                    "'original', 'above', 'same', and 'previous'. The current operator "
+                    "request remains authoritative. Human thread-root facts outrank prior "
+                    "agent replies, route metadata, and stale WorkItem state."
+                )
             if local_kni_evidence is not None:
                 typed_input["local_kni_evidence_packet"] = local_kni_evidence
                 typed_input["local_kni_instruction"] = local_kni_live_instruction()
@@ -862,6 +1180,7 @@ def main(argv: list[str] | None = None) -> int:
                 force_sdk_interpretation=True,
                 manual_request_plan=manual_plan,
                 include_specialist_tools=bool(typed_input["include_specialist_tools"]),
+                attach_tools=bool(typed_input["attach_tools"]),
             )
             result = typed_result.output
             result = append_visible_source_urls_to_output(result)
