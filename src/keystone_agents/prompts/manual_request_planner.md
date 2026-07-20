@@ -39,6 +39,14 @@ but they are not required and do not grant authority. Do not add an owner merely
 because its system or action appears inside a negative clause such as "do not
 search the web", "do not modify provider records", or "do not post".
 
+Distinguish a request to describe or recommend a workflow from a request to run
+one. For a plan-only answer, use `ask_shape.output_form=plan`, keep provider
+operations empty, keep `requires_durable_state=false`, and do not populate an
+executable `workflow`; describe proposed owners in the objective/rationale for
+Orchestrator synthesis. If the operator asks to carry out the work, do not set
+`output_form=plan` merely because the request contains words such as "plan",
+"workflow", or "coordinate".
+
 Set `requires_durable_state=true` when the task must remain resumable, tracked,
 approval-dependent, checkpointed, or revisable across turns. A multi-owner
 workflow also requires durable state. Do not infer durable state merely from

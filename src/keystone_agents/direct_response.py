@@ -11,6 +11,7 @@ from keystone_agents.sdk import build_sdk_agent, load_prompt
 
 _DIRECT_RESPONSE_ROUTES = frozenset(
     {
+        "chief_of_staff",
         "business_research_analyst",
         "opportunity_scout",
         "outreach_composer",
@@ -23,6 +24,7 @@ def build_direct_supplied_response_agent(
     route: str,
     *,
     request_text: str,
+    manual_request_plan: Any | None = None,
 ) -> Any:
     """Adapt the named specialist to a one-turn, zero-tool response contract."""
 
@@ -34,10 +36,14 @@ def build_direct_supplied_response_agent(
     builder_kwargs: dict[str, Any] = {}
     if "request_text" in parameters:
         builder_kwargs["request_text"] = request_text
+    if "manual_request_plan" in parameters:
+        builder_kwargs["manual_request_plan"] = manual_request_plan
     if "attach_tools" in parameters:
         builder_kwargs["attach_tools"] = False
     if "include_tools" in parameters:
         builder_kwargs["include_tools"] = False
+    if "include_specialist_tools" in parameters:
+        builder_kwargs["include_specialist_tools"] = False
     if "compact_instructions" in parameters:
         builder_kwargs["compact_instructions"] = True
     base_agent = builder(**builder_kwargs)

@@ -4325,7 +4325,7 @@ def test_cli_live_finance_receipt_write_uses_shared_live_manual_planner(
     assert plan.target_type == "business_system_context"
 
 
-def test_cli_bounded_smoke_suppresses_live_manual_planner_and_live_search(
+def test_cli_bounded_smoke_wording_keeps_live_manual_planner_and_suppresses_search(
     monkeypatch,
     capsys,
 ) -> None:
@@ -4365,7 +4365,7 @@ def test_cli_bounded_smoke_suppresses_live_manual_planner_and_live_search(
 
     assert exit_code == 0
     assert capsys.readouterr().out == ""
-    assert captured["live_manual_plan"] is False
+    assert captured["live_manual_plan"] is True
     assert cli._request_forbids_live_research(prompt) is True
     direct = captured["direct"]
     assert direct["route"] == "business_research_analyst"
@@ -5818,6 +5818,33 @@ def test_zotero_latest_article_preflight_reads_exact_pdf_only_on_demand(
     assert receipts[-1]["operation"] == "read_pdf_attachment_text"
 
 
+def test_live_semantic_zotero_read_plan_ignores_incidental_write_words(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "read_zotero_api_key_capabilities",
+        lambda: (_ for _ in ()).throw(AssertionError("write preflight must not run")),
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="zotero_context_agent",
+        provider_system="zotero",
+        intent="context_lookup",
+        target_type="zotero_article",
+        provider_operations=["read"],
+        objective="Read the selected Zotero article.",
+    )
+
+    context, receipts, blocker = cli._direct_zotero_provider_preflight(
+        "zotero_context_agent",
+        "The prior note was created and updated; now explain the selected article.",
+        manual_plan=plan,
+    )
+
+    assert (context, receipts, blocker) == ("", [], "")
+
+
 def test_zotero_write_preflight_blocks_rejected_key_before_specialist(
     monkeypatch,
 ) -> None:
@@ -6112,6 +6139,25 @@ def test_direct_context_agent_tool_tier_separates_reads_from_writes() -> None:
     assert read_names == {"airtable_get_base_schema", "airtable_read_records"}
     assert "airtable_write_record" in write_names
     assert read_names < write_names
+
+
+def test_live_semantic_read_plan_cannot_gain_write_tools_from_request_words() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="airtable_context_agent",
+        provider_system="airtable",
+        objective="Read the exact marked Airtable record.",
+        intent="context_lookup",
+        provider_operations=["read", "verify"],
+    )
+    noisy_request = (
+        "The prior test created and updated KBA_TEST_RECORD_001; now read and verify it."
+    )
+
+    assert (
+        cli._direct_context_agent_tool_tier(plan, input_text=noisy_request)
+        == "core_read"
+    )
 
 
 def test_zotero_strict_abstract_answer_promotes_substantive_model_evidence(
@@ -6496,6 +6542,36 @@ def test_airtable_generic_write_scope_binds_update_and_reconcile_without_create(
             input_text=reconcile_request,
         )
         == "update"
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_operations", "noisy_request", "expected"),
+    [
+        (["update", "verify"], "Tighten the saved value; no create wording is required.", "update"),
+        (["create", "verify"], "The note mentions an earlier update, but add one record now.", "create"),
+        (["create", "update", "verify"], "Handle both stages in order.", ""),
+    ],
+)
+def test_live_semantic_airtable_operations_override_raw_verb_noise(
+    provider_operations: list[str],
+    noisy_request: str,
+    expected: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="airtable_context_agent",
+        provider_system="airtable",
+        intent="business_system_write",
+        target_type="business_system_context",
+        provider_operations=provider_operations,
+        objective="Perform the normalized Airtable operation.",
+    )
+
+    assert (
+        cli._direct_airtable_allowed_operation(plan, input_text=noisy_request)
+        == expected
     )
 
 
@@ -8938,10 +9014,6 @@ def test_direct_opportunity_scout_uses_shared_live_manual_plan() -> None:
         live_search=True,
     )
 
-    assert cli._skip_live_manual_plan_for_request(
-        request,
-        requested_route="opportunity_scout",
-    ) is False
     estimate = cli._estimate_ask_openai_requests(
         args,
         input_text=request,
@@ -9008,19 +9080,14 @@ def test_bounded_direct_specialists_use_compact_request_estimate(
         live_search=False,
     )
 
-    skips_live_planner = cli._skip_live_manual_plan_for_request(
-        request_text,
-        requested_route=route,
-    )
     estimate = cli._estimate_ask_openai_requests(
         args,
         input_text=request_text,
         live_sdk=True,
-        live_manual_plan=not skips_live_planner,
+        live_manual_plan=True,
         requested_route=route,
     )
 
-    assert skips_live_planner is False
     conditional_repair = "words" in request_text
     assert estimate["max"] == 3 + int(conditional_repair)
     assert estimate["min"] == 2
@@ -10110,10 +10177,6 @@ def test_coordinating_agents_keep_broader_request_estimates(route: str) -> None:
         live_search=False,
     )
 
-    assert cli._skip_live_manual_plan_for_request(
-        "Coordinate a multi-stage operational review.",
-        requested_route=route,
-    ) is False
     estimate = cli._estimate_ask_openai_requests(
         args,
         input_text="Coordinate a multi-stage operational review.",
@@ -10525,11 +10588,10 @@ def test_unnamed_supplied_facts_request_resolves_to_bounded_chief_budget() -> No
     )
 
     assert plan.target_agent == "chief_of_staff"
-    assert estimate["max"] == 3
+    assert estimate["max"] == 2
     assert estimate["stages"] == [
         "manual_request_planner",
-        "chief_of_staff_response_only_sdk",
-        "conditional_instruction_following_repair",
+        "chief_of_staff_direct_supplied_response_sdk",
     ]
 
 
@@ -10700,10 +10762,6 @@ def test_simple_chief_airtable_receipt_uses_direct_context_agent_budget() -> Non
         "manual_request_planner",
         "airtable_context_agent_direct_sdk",
     ]
-    assert cli._skip_live_manual_plan_for_request(
-        request,
-        requested_route="airtable_context_agent",
-    ) is False
 
 
 @pytest.mark.parametrize(

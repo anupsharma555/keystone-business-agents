@@ -881,6 +881,8 @@ def _chief_request_plan(
         request_text,
         requested_agent="chief_of_staff",
     )
+    if plan.source == "llm":
+        return plan
     if _looks_like_web_search_brief_request(request_text):
         constraints = list(plan.constraints)
         for constraint in (
@@ -4138,6 +4140,11 @@ def _operator_supplied_synthesis_items(text: str, *, desired_count: int) -> list
     """Extract explicit semicolon/newline facts for the deterministic safe fallback."""
 
     raw = str(text or "").strip()
+    raw = re.sub(
+        r"(?im)^\s*Operator-supplied Slack attachment local path:\s*\S+\s*$",
+        "",
+        raw,
+    ).strip()
     if ":" not in raw:
         return []
     material = raw.split(":", 1)[1].strip()
@@ -4176,7 +4183,11 @@ def _plan_operator_supplied_synthesis_request(
 ) -> ChiefOfStaffResult | None:
     """Return a useful read-only fallback instead of an unrelated Slack route."""
 
-    if not _looks_like_operator_supplied_synthesis_request(text):
+    semantic_supplied_context = _chief_direct_supplied_synthesis(
+        text,
+        manual_request_plan,
+    )
+    if not semantic_supplied_context:
         return None
     items = _operator_supplied_synthesis_items(
         text,
@@ -4965,6 +4976,21 @@ def plan_chief_of_staff_request(
     def planned(result: ChiefOfStaffResult, *, action: str) -> ChiefOfStaffResult:
         return _with_manual_plan_audit(result, request_plan, action=action)
 
+    if request_plan.source == "llm":
+        supplied_context_synthesis = _plan_operator_supplied_synthesis_request(
+            active_text,
+            manual_request_plan=request_plan,
+        )
+        if supplied_context_synthesis is not None:
+            return planned(
+                supplied_context_synthesis,
+                action="allowed_semantic_operator_supplied_synthesis",
+            )
+        return planned(
+            _plan_semantic_chief_recovery(request_plan),
+            action="preserved_semantic_plan_during_recovery",
+        )
+
     if _looks_like_slack_history_digest_request(text):
         return planned(
             _plan_slack_history_digest_request(text),
@@ -5193,6 +5219,53 @@ def plan_chief_of_staff_request(
             ],
         ),
         action="allowed_general_route_plan",
+    )
+
+
+def _plan_semantic_chief_recovery(plan: ManualRequestPlan) -> ChiefOfStaffResult:
+    """Preserve one validated semantic plan when live synthesis cannot be used."""
+
+    workflow_type = (
+        "gmail-triage"
+        if plan.target_agent == "gmail_triage"
+        else "research-direction-review"
+        if plan.target_agent in {"business_research_analyst", "opportunity_scout"}
+        else "business-agents-route"
+    )
+    objective = plan.objective or "Complete the interpreted operator request."
+    return ChiefOfStaffResult(
+        mode="llm_unavailable",
+        intent=objective,
+        summary=(
+            "The live Chief response could not be validated. The preserved task is: "
+            f"{objective} No provider action or completion is being claimed."
+        ),
+        operating_capabilities=[],
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type=workflow_type,
+            command_text="",
+            target_channel="current-thread",
+            rationale=(
+                "Recovery preserved the LLM planner's owner and intent instead of "
+                "reclassifying the request from keywords."
+            ),
+            requires_live_connector=False,
+            requires_human_approval_before_post=True,
+        ),
+        recommended_actions=[
+            f"Retry the preserved {plan.target_agent} task without changing its scope."
+        ],
+        blocked_side_effects=BLOCKED_SIDE_EFFECTS,
+        approval_required=True,
+        human_review_required=True,
+        send_enabled=False,
+        slack_post_allowed=False,
+        sources=[],
+        context_sources_considered=[],
+        audit_notes=[
+            "Semantic-plan recovery used; no legacy phrase route was evaluated.",
+            "No Slack, Gmail, Calendar, CRM, or provider write was attempted.",
+        ],
     )
 
 

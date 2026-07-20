@@ -983,13 +983,11 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     live_manual_plan_requested = (
         live_sdk if args.live_manual_plan is None else bool(args.live_manual_plan)
     )
-    live_manual_plan = live_manual_plan_requested and not (
-        live_sdk
-        and _skip_live_manual_plan_for_request(
-            semantic_input_text,
-            requested_route=requested_route,
-        )
-    )
+    # Natural-language wording never bypasses semantic planning. Harnesses that
+    # deliberately omit the planner must use the typed --no-live-manual-plan
+    # control instead of embedding magic phrases such as "bounded smoke" in
+    # the operator request.
+    live_manual_plan = live_manual_plan_requested
     request_estimate = _estimate_ask_openai_requests(
         args,
         input_text=semantic_input_text,
@@ -2637,6 +2635,7 @@ def _print_ask_request_budget_blocked(
 
 _DIRECT_SUPPLIED_RESPONSE_ROUTES = frozenset(
     {
+        "chief_of_staff",
         "business_research_analyst",
         "opportunity_scout",
         "outreach_composer",
@@ -2734,31 +2733,6 @@ def _should_run_direct_supplied_response(
     )
 
 
-def _skip_live_manual_plan_for_request(
-    input_text: str,
-    *,
-    requested_route: str | None,
-) -> bool:
-    """Skip semantic planning only for the explicit bounded SDK smoke harness.
-
-    Ordinary natural-language requests always receive the shared LLM plan,
-    including supplied-context answers, direct specialist asks, and receipt
-    operations. Their wording must not select a deterministic bypass.
-    """
-
-    del requested_route
-    return _ask_request_is_bounded_live_sdk_smoke(input_text)
-
-
-def _ask_request_is_bounded_live_sdk_smoke(input_text: str) -> bool:
-    normalized = " ".join(str(input_text or "").lower().split())
-    if "smoke" not in normalized:
-        return False
-    return bool(
-        re.search(r"\bbounded\b|\bread[- ]only\b|\blive sdk is approved only\b", normalized)
-    )
-
-
 _DIRECT_SPECIALIST_ROUTES = frozenset(
     {
         "business_research_analyst",
@@ -2790,8 +2764,10 @@ def _direct_specialist_request_estimate(
         if route == "opportunity_scout" and _request_forbids_live_research(input_text):
             # The compact supplied-evidence adapter performs one tool-free synthesis.
             return 1
-        if route == "zotero_context_agent" and bool(
-            "abstract" in normalized
+        if (
+            plan.source != "llm"
+            and route == "zotero_context_agent"
+            and "abstract" in normalized
             and re.search(r"\b(?:latest|most\s+recent(?:ly)?\s+added)\b", normalized)
         ):
             # The ordered provider read is acquired before the specialist call.
@@ -6422,7 +6398,11 @@ def _run_direct_supplied_context_response_live(
 ) -> int:
     """Run the explicitly named specialist once without tools or domain blockers."""
 
-    agent = build_direct_supplied_response_agent(route, request_text=input_text)
+    agent = build_direct_supplied_response_agent(
+        route,
+        request_text=input_text,
+        manual_request_plan=manual_plan,
+    )
     typed_input = DirectAgentResponseInput(
         requested_agent=route,
         original_request=input_text,
@@ -6540,7 +6520,11 @@ def _run_ask_context_agent_live(
     database_url: str | None = None,
 ) -> int:
     provider_context, preacquired_receipts, provider_blocker = (
-        _direct_zotero_provider_preflight(route, input_text)
+        _direct_zotero_provider_preflight(
+            route,
+            input_text,
+            manual_plan=manual_plan,
+        )
     )
     airtable_receipt_context = _direct_airtable_receipt_provider_context(
         route,
@@ -6628,9 +6612,9 @@ def _run_ask_context_agent_live(
         if route == "airtable_context_agent"
         else ""
     )
-    if route == "airtable_context_agent" and (
-        (manual_plan is not None and manual_plan.intent == "business_system_write")
-        or _chief_workflow_requests_marked_airtable_test_lifecycle(input_text)
+    if route == "airtable_context_agent" and _direct_context_agent_write_admitted(
+        manual_plan,
+        input_text=input_text,
     ):
         request_hash = hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:16]
         os.environ[operator_approval_env] = f"airtable-direct:{request_hash}"
@@ -6891,11 +6875,27 @@ def _direct_context_agent_tool_tier(
 ) -> str:
     """Attach only the source tools needed by a bounded direct context call."""
 
-    if (
-        manual_plan is not None and manual_plan.intent == "business_system_write"
-    ) or _chief_workflow_requests_marked_airtable_test_lifecycle(input_text):
+    if _direct_context_agent_write_admitted(
+        manual_plan,
+        input_text=input_text,
+    ):
         return "internal_write"
     return "core_read"
+
+
+def _direct_context_agent_write_admitted(
+    manual_plan: ManualRequestPlan | None,
+    *,
+    input_text: str,
+) -> bool:
+    """Use semantic intent for live plans and phrases only as offline fallback."""
+
+    if manual_plan is not None:
+        if manual_plan.source == "llm":
+            return manual_plan.intent == "business_system_write"
+        if manual_plan.intent == "business_system_write":
+            return True
+    return _chief_workflow_requests_marked_airtable_test_lifecycle(input_text)
 
 
 def _direct_airtable_allowed_operation(
@@ -6919,6 +6919,18 @@ def _direct_airtable_allowed_operation(
         if receipt_target.operation == "update":
             return "update"
         return ""
+    if manual_plan.source == "llm":
+        if (
+            manual_plan.target_agent != "airtable_context_agent"
+            or manual_plan.provider_system != "airtable"
+        ):
+            return ""
+        mutations = {
+            operation
+            for operation in manual_plan.provider_operations
+            if operation in {"create", "update"}
+        }
+        return next(iter(mutations)) if len(mutations) == 1 else ""
     actionable = re.sub(
         r"\b(?:do\s+not|don't|dont|never|without)\b[^.;\n]*",
         " ",
@@ -7237,18 +7249,34 @@ def _direct_airtable_receipt_provider_context(
 def _direct_zotero_provider_preflight(
     route: str,
     input_text: str,
+    *,
+    manual_plan: ManualRequestPlan | None = None,
 ) -> tuple[str, list[dict[str, object]], str]:
     """Acquire required ordered Zotero evidence before the synthesis model call."""
 
     normalized = " ".join(str(input_text or "").lower().split())
-    write_requested = bool(
-        route == "zotero_context_agent"
-        and re.search(
-            r"\b(?:create|add|make|write|edit|update|change|revise|delete|remove)\b",
-            normalized,
+    semantic_authority = bool(manual_plan is not None and manual_plan.source == "llm")
+    if semantic_authority:
+        write_requested = bool(
+            route == "zotero_context_agent"
+            and manual_plan is not None
+            and manual_plan.target_agent == "zotero_context_agent"
+            and manual_plan.provider_system == "zotero"
+            and manual_plan.intent == "business_system_write"
+            and any(
+                operation in {"create", "update", "delete", "attach"}
+                for operation in manual_plan.provider_operations
+            )
         )
-        and re.search(r"\b(?:note|item|article|collection)\b", normalized)
-    )
+    else:
+        write_requested = bool(
+            route == "zotero_context_agent"
+            and re.search(
+                r"\b(?:create|add|make|write|edit|update|change|revise|delete|remove)\b",
+                normalized,
+            )
+            and re.search(r"\b(?:note|item|article|collection)\b", normalized)
+        )
     if write_requested:
         try:
             capabilities = read_zotero_api_key_capabilities()
@@ -7306,7 +7334,8 @@ def _direct_zotero_provider_preflight(
         )
 
     latest_journal_requested = bool(
-        route == "zotero_context_agent"
+        not semantic_authority
+        and route == "zotero_context_agent"
         and "zotero" in normalized
         and re.search(r"\b(?:journal\s+article|article)\b", normalized)
         and re.search(r"\b(?:latest|most\s+recent(?:ly)?\s+added)\b", normalized)

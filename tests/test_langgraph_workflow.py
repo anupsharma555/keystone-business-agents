@@ -113,6 +113,73 @@ def test_manager_loop_continue_keeps_cursor_and_original_objective() -> None:
     assert updated["request"]["manual_request_plan"]["objective"] == request.request_text
 
 
+def test_llm_plan_not_context_keywords_owns_graph_context_edge() -> None:
+    request_text = (
+        "Zotero, Google Workspace, RSS, and preprints are incidental notes. "
+        "Use the selected Airtable context before the opportunity review."
+    )
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        manual_request_plan={
+            "source": "llm",
+            "target_agent": "chief_of_staff",
+            "workflow": ["airtable_context_agent", "opportunity_scout"],
+            "intent": "route_request",
+            "requires_durable_state": True,
+        },
+    )
+    prepared = workflow_runner.PreparedWorkItemStep(
+        request=request,
+        work_item=WorkItem(kind=WorkItemKind.OPPORTUNITY, title="Context edge"),
+        route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        input_text=request_text,
+        context_pack={},
+    )
+
+    assert langgraph_workflow._airtable_context_edge_requested(request_text, prepared)
+    assert langgraph_workflow._airtable_context_should_stage_before_specialist(
+        request_text,
+        prepared,
+    )
+    assert not langgraph_workflow._zotero_context_edge_requested(request_text, prepared)
+    assert not langgraph_workflow._google_workspace_context_edge_requested(
+        request_text,
+        prepared,
+    )
+    assert langgraph_workflow._feed_context_edge_kind(request_text, prepared) is None
+
+
+def test_llm_plan_without_context_handoff_ignores_all_context_keywords() -> None:
+    request_text = (
+        "Airtable context, Google Workspace, Zotero, RSS, and preprints all appear "
+        "in the prior thread, but they are not part of this selected opportunity step."
+    )
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        manual_request_plan={
+            "source": "llm",
+            "target_agent": "opportunity_scout",
+            "workflow": [],
+            "intent": "opportunity_search",
+        },
+    )
+    prepared = workflow_runner.PreparedWorkItemStep(
+        request=request,
+        work_item=WorkItem(kind=WorkItemKind.OPPORTUNITY, title="No context edge"),
+        route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        input_text=request_text,
+        context_pack={},
+    )
+
+    assert not langgraph_workflow._airtable_context_edge_requested(request_text, prepared)
+    assert not langgraph_workflow._google_workspace_context_edge_requested(
+        request_text,
+        prepared,
+    )
+    assert not langgraph_workflow._zotero_context_edge_requested(request_text, prepared)
+    assert langgraph_workflow._feed_context_edge_kind(request_text, prepared) is None
+
+
 def test_graph_terminal_summary_integrates_decision_evidence_and_draft() -> None:
     work_item = WorkItem(
         kind=WorkItemKind.OUTREACH,
@@ -5403,6 +5470,17 @@ def test_langgraph_slack_airtable_read_only_smoke_does_not_stage_write_plan(
                     workflow_type="research-direction-review",
                     target_channel="current thread",
                 ),
+                durable_handoff=ChiefDurableHandoff(
+                    agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                    rationale="The typed plan selected Opportunity Scout next.",
+                ),
+                context_handoffs=[
+                    ChiefContextHandoff(
+                        agent="airtable_context_agent",
+                        before_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                        rationale="Stage schema context before opportunity review.",
+                    )
+                ],
                 approval_required=True,
                 audit_notes=[],
             ),
@@ -5452,7 +5530,9 @@ def test_langgraph_slack_airtable_read_only_smoke_does_not_stage_write_plan(
             manual_request_plan={
                 "source": "llm",
                 "target_agent": "chief_of_staff",
+                "workflow": ["airtable_context_agent", "opportunity_scout"],
                 "intent": "slack_operations",
+                "requires_durable_state": True,
                 "primary_target": (
                     "LangGraph smoke 3: Chief of Staff coordinate Airtable Context "
                     "agent schema context before Opportunity Scout assesses Example Health"

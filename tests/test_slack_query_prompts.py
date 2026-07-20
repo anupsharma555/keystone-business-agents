@@ -148,6 +148,96 @@ def test_slack_query_prompt_keeps_deterministic_route_authoritative() -> None:
     assert selection.route_mismatch == {}
 
 
+@pytest.mark.parametrize(
+    ("raw_request", "manual_plan", "expected_kind", "expected_route"),
+    [
+        (
+            (
+                "Continue with this supplied note. It mentions an opportunity and an "
+                "outreach draft, but the requested job is the source-backed company review."
+            ),
+            {
+                "source": "llm",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "task_objective": "entity_research",
+                "requires_approved_context": False,
+            },
+            SlackQueryPromptKind.RESEARCH_SUMMARY,
+            WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        ),
+        (
+            "Research was already discussed; now continue with the selected opportunity.",
+            {
+                "source": "llm",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "task_objective": "opportunity_discovery",
+                "requires_approved_context": False,
+            },
+            SlackQueryPromptKind.OPPORTUNITY_SEARCH,
+            WorkItemRoute.OPPORTUNITY_SCOUT,
+        ),
+    ],
+)
+def test_live_semantic_plan_owns_reusable_slack_prompt_kind(
+    raw_request: str,
+    manual_plan: dict[str, object],
+    expected_kind: SlackQueryPromptKind,
+    expected_route: WorkItemRoute,
+) -> None:
+    selection = resolve_slack_query_prompt(
+        build_slack_query_prompt_input(
+            raw_request=raw_request,
+            manual_plan=manual_plan,
+        )
+    )
+
+    assert selection is not None
+    assert selection.kind == expected_kind
+    assert selection.target_route == expected_route
+    assert selection.requires_approved_context is False
+
+
+def test_live_semantic_plan_does_not_fall_back_to_raw_phrase_authority() -> None:
+    selection = resolve_slack_query_prompt(
+        build_slack_query_prompt_input(
+            raw_request=(
+                "Continue the research and draft discussion, but create the approved "
+                "Airtable record described by the structured plan."
+            ),
+            manual_plan={
+                "source": "llm",
+                "target_agent": "airtable_context_agent",
+                "intent": "business_system_write",
+                "task_objective": "business_system_write",
+                "expected_artifact_type": "business_system_write_plan",
+                "requires_approved_context": False,
+            },
+        )
+    )
+
+    assert selection is None
+
+
+def test_live_semantic_plan_owns_approval_context_hint() -> None:
+    selection = resolve_slack_query_prompt(
+        build_slack_query_prompt_input(
+            raw_request="Draft a review-only note from the supplied facts.",
+            manual_plan={
+                "source": "llm",
+                "target_agent": "outreach_composer",
+                "intent": "outreach_draft",
+                "requires_approved_context": False,
+            },
+        )
+    )
+
+    assert selection is not None
+    assert selection.kind == SlackQueryPromptKind.OUTREACH_DRAFT
+    assert selection.requires_approved_context is False
+
+
 def test_slack_query_prompt_context_flags_select_reusable_agent_skill_contracts() -> None:
     selection = resolve_slack_query_prompt(
         build_slack_query_prompt_input(
