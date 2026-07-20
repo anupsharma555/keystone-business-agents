@@ -1467,6 +1467,8 @@ def test_opportunity_scout_os1_improvement_case_uses_llm_synthesis_context(
             "os-1",
             "--fixture",
             str(FIXTURES / "opportunity_scout_os1_role_sources.json"),
+            "--founder-fit-profile",
+            str(FIXTURES / "founder_fit_profile_approved.json"),
             "--run-sdk",
             "--json",
         ],
@@ -1493,7 +1495,7 @@ def test_opportunity_scout_os1_improvement_case_uses_llm_synthesis_context(
     assert "candidate_role_sources" in prompt
     assert "Exclude AI tutor roles" in prompt
     assert "neuro-measure-medical-director" in prompt
-    assert "founder_fit_2026" in prompt
+    assert "founder_fit_test" in prompt
     assert "opportunity_lanes" in prompt
     assert "Remote, virtual, or online opportunities are preferred for now." in prompt
     assert payload["founder_fit_profile"]["search_context_complete"] is True
