@@ -24,6 +24,7 @@ from keystone_agents.models import AgentRunRequest, RunMode, TypedAgentRunResult
 from keystone_agents.run import run_agent_dry
 from keystone_agents.schemas.approval import ApprovalQueueItem
 from keystone_agents.schemas.company_profile import CompanyProfile
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.orchestrator import (
     OrchestratorDecision,
     OrchestratorOutputReview,
@@ -1542,3 +1543,116 @@ def test_no_route_can_send_email() -> None:
 
     assert all(result.send_enabled is False for result in results)
     assert all(result.can_send_email is False for result in results)
+
+
+@pytest.mark.parametrize(
+    ("target_agent", "intent", "provider_system", "provider_operations", "request_text"),
+    [
+        (
+            "business_research_analyst",
+            "company_research",
+            "unspecified",
+            [],
+            "The note mentions an opportunity, Gmail, and a draft; assess the company.",
+        ),
+        (
+            "opportunity_scout",
+            "opportunity_search",
+            "unspecified",
+            [],
+            "Research and email are background; identify the selected opportunity.",
+        ),
+        (
+            "gmail_triage",
+            "gmail_triage",
+            "gmail",
+            ["read"],
+            "Calendar and research came up earlier; check the selected conversation.",
+        ),
+        (
+            "outreach_composer",
+            "outreach_draft",
+            "unspecified",
+            [],
+            "The opportunity and research are approved; prepare copy for review only.",
+        ),
+        (
+            "chief_of_staff",
+            "route_request",
+            "unspecified",
+            [],
+            "Gmail, Calendar, research, and outreach are all context; handle the ask.",
+        ),
+        (
+            "airtable_context_agent",
+            "context_lookup",
+            "airtable",
+            ["read"],
+            "A draft and opportunity are mentioned in the record; inspect it read-only.",
+        ),
+        (
+            "google_workspace_context_agent",
+            "context_lookup",
+            "google_workspace",
+            ["read", "search"],
+            "Email and research appear in the file; find the selected document.",
+        ),
+        (
+            "zotero_context_agent",
+            "context_lookup",
+            "zotero",
+            ["read", "search"],
+            "The note says draft and opportunity; retrieve the selected library item.",
+        ),
+    ],
+)
+def test_llm_plan_owns_route_across_agents_despite_incidental_words(
+    target_agent: str,
+    intent: str,
+    provider_system: str,
+    provider_operations: list[str],
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="orchestrator",
+        target_agent=target_agent,
+        intent=intent,
+        provider_system=provider_system,
+        provider_operations=provider_operations,
+        objective="Complete the typed task without changing owners from incidental words.",
+        requires_approved_context=False,
+    )
+
+    result = route_request(request_text, manual_plan=plan)
+
+    assert result.route == target_agent
+    assert result.stop_reason != "uncertain_input"
+    assert result.routing_mode == "llm"
+
+
+def test_llm_plan_owns_ordered_graph_despite_different_request_vocabulary() -> None:
+    workflow = [
+        "business_research_analyst",
+        "opportunity_scout",
+        "outreach_composer",
+    ]
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        workflow=workflow,
+        intent="route_request",
+        objective="Run the ordered internal review.",
+        requires_durable_state=True,
+        requires_approved_context=False,
+    )
+
+    result = route_request(
+        "Email and Calendar are background; coordinate the selected review now.",
+        manual_plan=plan,
+    )
+
+    assert result.route == "business_research_analyst"
+    assert result.workflow == workflow
+    assert result.routing_mode == "llm"

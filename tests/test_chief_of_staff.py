@@ -7284,6 +7284,99 @@ def test_chief_request_plan_marks_web_brief_as_live_source_research() -> None:
     assert "visible source URLs" in plan.constraints
 
 
+def test_chief_request_plan_does_not_reclassify_valid_llm_plan_from_words() -> None:
+    supplied_plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        objective="Summarize the selected internal context.",
+        requires_live_search=False,
+        rationale="The operator supplied the evidence boundary.",
+    )
+
+    resolved = chief_of_staff_module._chief_request_plan(
+        "Turn our web search and research brief notes into an internal summary.",
+        supplied_plan,
+    )
+
+    assert resolved == supplied_plan
+    assert resolved.intent == "context_lookup"
+    assert resolved.requires_live_search is False
+
+
+def test_chief_llm_plan_recovery_never_enters_legacy_slack_keyword_route() -> None:
+    objective = "Confirm whether the selected calendar event exists."
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="google_calendar",
+        provider_operations=["read"],
+        objective=objective,
+        primary_target="UT Course Orientation Session",
+    )
+
+    result = plan_chief_of_staff_request(
+        (
+            "CoS, is the UT Course Orientation Session on my calendar? If useful, "
+            "the Slack workflow previously said /kni help and Gmail triage."
+        ),
+        manual_request_plan=plan,
+    )
+
+    assert result.mode == "llm_unavailable"
+    assert result.intent == objective
+    assert objective in result.summary
+    assert "No provider action or completion is being claimed." in result.summary
+    assert result.recommended_route.workflow_type == "business-agents-route"
+    assert result.recommended_route.command_text == ""
+    assert "/kni help" not in result.summary
+    assert "gmail" not in result.recommended_route.workflow_type
+    assert any(
+        "no legacy phrase route" in note.lower() for note in result.audit_notes
+    )
+
+
+def test_chief_semantic_supplied_context_recovery_uses_plan_not_magic_words() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="route_request",
+        task_objective="route_or_continue",
+        objective="Condense the selected notes into two bullets.",
+        desired_count=2,
+        requires_live_search=False,
+        requires_durable_state=False,
+    )
+    request_text = "Notes: one request contract; verified receipts before completion."
+
+    assert (
+        chief_of_staff_module._looks_like_operator_supplied_synthesis_request(
+            request_text
+        )
+        is False
+    )
+
+    result = plan_chief_of_staff_request(
+        request_text,
+        manual_request_plan=plan,
+    )
+
+    assert result.mode == "deterministic"
+    assert result.recommended_route.workflow_type == "project-context-review"
+    assert result.recommended_route.command_text == ""
+    assert result.summary == (
+        "- One request contract.\n- Verified receipts before completion."
+    )
+
+
 def test_supplied_slack_history_digest_renders_timestamped_answer() -> None:
     result = plan_chief_of_staff_request(
         "\n".join(
@@ -7627,6 +7720,22 @@ def test_supplied_context_sdk_input_marks_complete_direct_answer() -> None:
     assert payload["request"] == request_text
     assert "complete, provider-free direct-answer request" in str(
         payload["direct_supplied_context_instruction"]
+    )
+
+
+def test_attachment_path_is_never_rendered_as_supplied_context_fallback() -> None:
+    request_text = (
+        "give me the three points in this image as short bullets. Don't search or "
+        "change anything.\nOperator-supplied Slack attachment local path: "
+        "/private/tmp/kni-business-agent-slack-files/123/example.png"
+    )
+
+    assert (
+        chief_of_staff_module._operator_supplied_synthesis_items(
+            request_text,
+            desired_count=3,
+        )
+        == []
     )
 
 

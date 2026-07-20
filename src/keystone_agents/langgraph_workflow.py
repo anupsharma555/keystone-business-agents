@@ -2670,6 +2670,73 @@ def _chief_context_handoff_text(handoff: dict[str, Any]) -> str:
     return f"{agent_text} {before_text} as read-only context."
 
 
+def _semantic_manual_plan_for_context_edges(
+    prepared: PreparedWorkItemStep,
+) -> dict[str, Any] | None:
+    """Return the typed LLM plan that owns graph context-edge selection."""
+
+    value = prepared.request.manual_request_plan
+    if not isinstance(value, dict):
+        value = prepared.work_item.target.metadata.get("manual_request_plan")
+    if not isinstance(value, dict) or str(value.get("source") or "") != "llm":
+        return None
+    return value
+
+
+def _semantic_context_handoff(
+    prepared: PreparedWorkItemStep,
+    *,
+    agent: str,
+) -> dict[str, Any] | None:
+    """Resolve a context edge from typed plan or typed Chief output, never prose."""
+
+    plan = _semantic_manual_plan_for_context_edges(prepared)
+    if plan is None:
+        return None
+    workflow = plan.get("workflow")
+    if isinstance(workflow, list):
+        normalized = [str(item or "").strip() for item in workflow]
+        if agent in normalized:
+            index = normalized.index(agent)
+            executable = {
+                WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                WorkItemRoute.GMAIL_TRIAGE.value,
+                WorkItemRoute.OUTREACH_COMPOSER.value,
+            }
+            before_agent = next(
+                (item for item in normalized[index + 1 :] if item in executable),
+                "",
+            )
+            return {
+                "agent": agent,
+                "before_agent": before_agent,
+                "source": "manual_request_plan.workflow",
+            }
+    for artifact in prepared.work_item.artifact_refs:
+        if artifact.artifact_type != "chief_of_staff_plan":
+            continue
+        handoffs = artifact.metadata.get("context_handoffs")
+        if not isinstance(handoffs, list):
+            continue
+        for item in handoffs:
+            if isinstance(item, dict) and str(item.get("agent") or "") == agent:
+                return {**item, "source": "chief_of_staff.context_handoffs"}
+    return None
+
+
+def _semantic_context_stages_before_route(
+    prepared: PreparedWorkItemStep,
+    *,
+    agent: str,
+) -> bool:
+    handoff = _semantic_context_handoff(prepared, agent=agent)
+    if handoff is None:
+        return False
+    before_agent = str(handoff.get("before_agent") or "").strip()
+    return not before_agent or before_agent == prepared.route.value
+
+
 def _zotero_context_edge_requested(
     request_text: str,
     prepared: PreparedWorkItemStep,
@@ -2679,6 +2746,20 @@ def _zotero_context_edge_requested(
         for ref in prepared.work_item.artifact_refs
     ):
         return False
+    semantic_plan = _semantic_manual_plan_for_context_edges(prepared)
+    if semantic_plan is not None:
+        return bool(
+            _semantic_context_handoff(prepared, agent="zotero_context_agent")
+            and prepared.route
+            in {
+                WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+                WorkItemRoute.OPPORTUNITY_SCOUT,
+                WorkItemRoute.GMAIL_TRIAGE,
+                WorkItemRoute.CHIEF_OF_STAFF,
+                WorkItemRoute.ORCHESTRATOR,
+                WorkItemRoute.CLARIFICATION,
+            }
+        )
     normalized = " ".join(str(request_text or "").lower().split())
     if not _normalized_mentions_zotero_context_source(normalized):
         return False
@@ -2713,6 +2794,20 @@ def _airtable_context_edge_requested(
         and _airtable_context_summary_artifact_exists(prepared)
     ):
         return False
+    semantic_plan = _semantic_manual_plan_for_context_edges(prepared)
+    if semantic_plan is not None:
+        return bool(
+            _semantic_context_handoff(prepared, agent="airtable_context_agent")
+            and prepared.route
+            in {
+                WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+                WorkItemRoute.OPPORTUNITY_SCOUT,
+                WorkItemRoute.GMAIL_TRIAGE,
+                WorkItemRoute.CHIEF_OF_STAFF,
+                WorkItemRoute.ORCHESTRATOR,
+                WorkItemRoute.CLARIFICATION,
+            }
+        )
     normalized = " ".join(str(request_text or "").lower().split())
     if "airtable" not in normalized:
         return False
@@ -2765,6 +2860,11 @@ def _airtable_context_should_stage_before_specialist(
         WorkItemRoute.GMAIL_TRIAGE,
     }:
         return False
+    if _semantic_manual_plan_for_context_edges(prepared) is not None:
+        return _semantic_context_stages_before_route(
+            prepared,
+            agent="airtable_context_agent",
+        )
     normalized = " ".join(str(request_text or "").lower().split())
     if "airtable" not in normalized or "context" not in normalized:
         return False
@@ -2878,6 +2978,23 @@ def _google_workspace_context_edge_requested(
         and _google_workspace_context_summary_artifact_exists(prepared)
     ):
         return False
+    semantic_plan = _semantic_manual_plan_for_context_edges(prepared)
+    if semantic_plan is not None:
+        return bool(
+            _semantic_context_handoff(
+                prepared,
+                agent="google_workspace_context_agent",
+            )
+            and prepared.route
+            in {
+                WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+                WorkItemRoute.OPPORTUNITY_SCOUT,
+                WorkItemRoute.GMAIL_TRIAGE,
+                WorkItemRoute.CHIEF_OF_STAFF,
+                WorkItemRoute.ORCHESTRATOR,
+                WorkItemRoute.CLARIFICATION,
+            }
+        )
     normalized = " ".join(str(request_text or "").lower().split())
     if not re.search(
         r"\b(?:google workspace|google drive|google docs|google sheets)\b",
@@ -2933,6 +3050,11 @@ def _google_workspace_context_should_stage_before_specialist(
         WorkItemRoute.GMAIL_TRIAGE,
     }:
         return False
+    if _semantic_manual_plan_for_context_edges(prepared) is not None:
+        return _semantic_context_stages_before_route(
+            prepared,
+            agent="google_workspace_context_agent",
+        )
     normalized = " ".join(str(request_text or "").lower().split())
     if not re.search(
         r"\b(?:google workspace|google drive|google docs|google sheets)\b",
@@ -3051,6 +3173,13 @@ def _feed_context_edge_kind(
         ref.artifact_type in {"rss_context_summary", "preprints_context_summary"}
         for ref in prepared.work_item.artifact_refs
     ):
+        return None
+    semantic_plan = _semantic_manual_plan_for_context_edges(prepared)
+    if semantic_plan is not None:
+        if _semantic_context_handoff(prepared, agent="preprints_context_agent"):
+            return "preprints"
+        if _semantic_context_handoff(prepared, agent="rss_context_agent"):
+            return "rss"
         return None
     normalized = " ".join(str(request_text or "").lower().split())
     kind = _normalized_feed_context_kind(normalized)

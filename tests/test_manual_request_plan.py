@@ -332,7 +332,7 @@ def test_llm_workflow_survives_merge_for_chief_of_staff_front_door() -> None:
     ]
 
 
-def test_llm_workflow_cannot_drop_explicit_goal_deliverables_or_execute_cos() -> None:
+def test_invalid_llm_clarification_does_not_restore_heuristic_graph() -> None:
     request = (
         "CoS, NeuroFlow is a behavioral health company I want to evaluate. Research "
         "it using current public sources, identify the strongest plausible KNI "
@@ -355,11 +355,10 @@ def test_llm_workflow_cannot_drop_explicit_goal_deliverables_or_execute_cos() ->
 
     assert fallback.primary_target == "NeuroFlow"
     assert merged.target_agent == "chief_of_staff"
-    assert merged.workflow == [
-        "business_research_analyst",
-        "opportunity_scout",
-        "outreach_composer",
-    ]
+    assert merged.workflow == []
+    assert merged.intent == "route_request"
+    assert merged.requires_durable_state is False
+    assert any("No keyword route was restored" in item for item in merged.planner_warnings)
 
 
 def test_negated_provider_record_actions_do_not_select_write_intent() -> None:
@@ -2069,35 +2068,31 @@ def test_negative_constraints_cannot_become_blockers_or_prerequisites(
 
 
 @pytest.mark.parametrize(
-    ("request_text", "requested_agent", "expected_owner", "expected_workflow"),
+    ("request_text", "requested_agent", "expected_recovery_owner"),
     [
         (
             "Without provider tools, use only these facts and return two bullets. "
             "Do not draft outreach or modify records.",
             None,
             "chief_of_staff",
-            [],
         ),
         (
             "Research NeuroFlow from the attached approved notes only. Do not search "
             "the web, draft outreach, or modify provider records.",
             None,
-            "business_research_analyst",
-            [],
+            "chief_of_staff",
         ),
         (
             "Identify the strongest collaboration opportunity in these supplied notes. "
             "Do not search the web, draft outreach, or create CRM records.",
             None,
-            "opportunity_scout",
-            [],
+            "chief_of_staff",
         ),
         (
             "Read the latest Gmail thread from the configured sender and summarize it. "
             "Do not draft a reply, change labels, or send anything.",
             None,
             "gmail_triage",
-            [],
         ),
         (
             "CoS, using the supplied company packet, review what is known and unknown, "
@@ -2106,19 +2101,13 @@ def test_negative_constraints_cannot_become_blockers_or_prerequisites(
             "provider records, send email, or post.",
             "chief_of_staff",
             "chief_of_staff",
-            [
-                "business_research_analyst",
-                "opportunity_scout",
-                "outreach_composer",
-            ],
         ),
     ],
 )
-def test_constraint_pruning_never_blocks_direct_specialist_or_graph_routes(
+def test_unexplained_clarification_recovers_without_phrase_restored_route(
     request_text: str,
     requested_agent: str | None,
-    expected_owner: str,
-    expected_workflow: list[str],
+    expected_recovery_owner: str,
 ) -> None:
     fallback = infer_manual_request_plan(
         request_text,
@@ -2140,12 +2129,11 @@ def test_constraint_pruning_never_blocks_direct_specialist_or_graph_routes(
         allow_contextual_delegation=True,
     )
 
-    assert fallback.target_agent == expected_owner
-    assert fallback.workflow == expected_workflow
-    assert merged.target_agent == expected_owner
-    assert merged.workflow == expected_workflow
+    assert merged.target_agent == expected_recovery_owner
+    assert merged.workflow == []
     assert merged.intent != "clarification"
     assert merged.requires_live_search is False
+    assert any("No keyword route was restored" in item for item in merged.planner_warnings)
 
 
 def test_conditional_agent_notation_is_not_execution_evidence() -> None:
@@ -2955,6 +2943,90 @@ def test_llm_owner_can_refine_all_explicit_named_agent_mentions(
     assert merged.requested_agent == fallback.requested_agent
     assert merged.target_agent == bad_target
     assert merged.intent == bad_candidate.intent
+
+
+def test_unexplained_llm_clarification_does_not_restore_keyword_owner() -> None:
+    request = (
+        "Research is mentioned in this note, but decide the right next step now; "
+        "the prior Slack reply also mentioned Gmail and Calendar."
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="orchestrator")
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="orchestrator",
+        target_agent="clarification",
+        intent="clarification",
+        objective="Interpret and complete the operator's supplied task.",
+        missing_required_information=[],
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.target_agent == "chief_of_staff"
+    assert merged.intent == "route_request"
+    assert merged.task_objective == "route_or_continue"
+    assert merged.workflow == []
+    assert any("No keyword route was restored" in item for item in merged.planner_warnings)
+
+
+@pytest.mark.parametrize(
+    "requested_agent",
+    [
+        "business_research_analyst",
+        "opportunity_scout",
+        "gmail_triage",
+        "outreach_composer",
+        "chief_of_staff",
+    ],
+)
+def test_unexplained_llm_clarification_preserves_explicit_owner_contract(
+    requested_agent: str,
+) -> None:
+    fallback = ManualRequestPlan(
+        requested_agent=requested_agent,
+        target_agent="clarification",
+        objective="Handle the request through the named entry surface.",
+    )
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent=requested_agent,
+        target_agent="clarification",
+        intent="clarification",
+        objective=fallback.objective,
+        missing_required_information=[],
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.target_agent == requested_agent
+    assert merged.intent == "route_request"
+    assert merged.missing_required_information == []
+
+
+def test_unexplained_llm_clarification_recovers_typed_calendar_read() -> None:
+    fallback = infer_manual_request_plan(
+        "Is the referenced session on my schedule?",
+        requested_agent="chief_of_staff",
+    )
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="clarification",
+        intent="clarification",
+        provider_system="google_calendar",
+        provider_operations=["read", "verify"],
+        primary_target="referenced session",
+        objective="Verify whether the referenced session exists on the calendar.",
+        missing_required_information=[],
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.target_agent == "chief_of_staff"
+    assert merged.intent == "context_lookup"
+    assert merged.task_objective == "context_lookup"
+    assert merged.expected_artifact_type == "context_summary"
+    assert merged.provider_operations == ["read", "verify"]
 
 
 def test_manual_plan_maps_business_research_summary_to_source_summary() -> None:

@@ -750,6 +750,26 @@ def test_manual_plan_route_keeps_real_slack_operation_handoff() -> None:
     assert route == WorkItemRoute.CHIEF_OF_STAFF
 
 
+def test_live_semantic_chief_route_is_not_reclassified_from_raw_plan_words() -> None:
+    route = workflow_runner._route_from_manual_plan(
+        {
+            "source": "llm",
+            "requested_agent": "chief_of_staff",
+            "target_agent": "chief_of_staff",
+            "intent": "route_request",
+            "task_objective": "route_or_continue",
+            "ask_shape": {"output_form": "brief"},
+            "requires_durable_state": False,
+        },
+        request_text=(
+            "Plan and research are background words; give the bounded Chief answer."
+        ),
+        live_sdk=False,
+    )
+
+    assert route == WorkItemRoute.CHIEF_OF_STAFF
+
+
 def test_configured_test_recipient_alias_resolves_to_internal_exact_recipient(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -906,6 +926,81 @@ def test_explicit_safest_workflow_plan_remains_planning_only() -> None:
         request,
         manual_request_plan={"requested_agent": "orchestrator"},
     ) is True
+
+
+def test_live_semantic_plan_not_raw_words_decides_planning_only() -> None:
+    plan_only = {
+        "source": "llm",
+        "requested_agent": "chief_of_staff",
+        "target_agent": "chief_of_staff",
+        "intent": "route_request",
+        "task_objective": "route_or_continue",
+        "ask_shape": {"output_form": "plan"},
+        "requires_durable_state": False,
+        "provider_operations": [],
+    }
+    execute = {
+        **plan_only,
+        "workflow": ["business_research_analyst", "opportunity_scout"],
+        "ask_shape": {"output_form": "brief"},
+        "requires_durable_state": True,
+    }
+
+    assert workflow_runner._manager_loop_request_is_planning_only(
+        "Please execute this now; the semantic plan says return a plan only.",
+        manual_request_plan=plan_only,
+    )
+    assert not workflow_runner._manager_loop_request_is_planning_only(
+        "Plan the safest workflow; the semantic plan says execute the tracked review.",
+        manual_request_plan=execute,
+    )
+
+
+def test_live_chief_handoff_uses_semantic_workflow_not_request_keywords() -> None:
+    output = {"summary": "Research and draft terms appear only as background."}
+    plan = {
+        "source": "llm",
+        "workflow": ["opportunity_scout", "outreach_composer"],
+    }
+
+    assert workflow_runner._chief_of_staff_delegated_next_agent(
+        output,
+        "Do not let the words business research or Gmail change the selected owner.",
+        manual_request_plan=plan,
+    ) == workflow_runner.WorkItemRoute.OPPORTUNITY_SCOUT
+    assert workflow_runner._chief_of_staff_delegated_next_agent(
+        output,
+        "Delegate to business research according to these incidental notes.",
+        manual_request_plan={"source": "llm", "workflow": []},
+    ) is None
+
+
+def test_recovered_llm_plan_accepts_only_typed_chief_handoff() -> None:
+    recovered_plan = {
+        "source": "llm",
+        "workflow": [],
+        "planner_warnings": [
+            "Recovered an executable owner from the typed contract. "
+            "No keyword route was restored."
+        ],
+    }
+    structured_output = {
+        "durable_handoff": {"agent": "opportunity_scout"},
+        "summary": "Chief selected the next owner.",
+    }
+
+    assert workflow_runner._chief_of_staff_delegated_next_agent(
+        structured_output,
+        "Research, Gmail, and outreach are all mentioned as background.",
+        manual_request_plan=recovered_plan,
+    ) == workflow_runner.WorkItemRoute.OPPORTUNITY_SCOUT
+    assert workflow_runner._chief_of_staff_delegated_next_agent(
+        {"summary": "Delegate to Business Research Agent."},
+        "Delegate to business research according to these incidental notes.",
+        manual_request_plan=recovered_plan,
+    ) is None
+
+
 def test_gmail_public_summary_hides_query_participants_and_provider_identity() -> None:
     summary = workflow_runner.GmailThreadSummaryResult(
         thread_id="thread-private-1",

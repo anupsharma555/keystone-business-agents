@@ -1476,7 +1476,7 @@ def _repair_structurally_invalid_llm_plan(
     base: ManualRequestPlan,
     candidate: ManualRequestPlan,
 ) -> ManualRequestPlan:
-    """Repair schema contradictions without reclassifying valid LLM meaning."""
+    """Repair schema contradictions without restoring keyword route authority."""
 
     updates: dict[str, Any] = {}
     warnings = list(candidate.planner_warnings)
@@ -1486,39 +1486,67 @@ def _repair_structurally_invalid_llm_plan(
             or candidate.intent == "clarification"
         )
         and not candidate.missing_required_information
-        and base.target_agent != "clarification"
-        and base.intent != "clarification"
     )
     unowned_route_only = bool(
         candidate.target_agent == "orchestrator"
         and candidate.intent == "route_request"
         and not candidate.workflow
         and not candidate.requires_durable_state
-        and base.target_agent not in {"orchestrator", "clarification"}
     )
     if ungrounded_clarification or unowned_route_only:
+        owner_by_provider: dict[str, ManualTargetAgent] = {
+            "google_calendar": "chief_of_staff",
+            "gmail": "gmail_triage",
+            "airtable": "airtable_context_agent",
+            "google_workspace": "google_workspace_context_agent",
+            "zotero": "zotero_context_agent",
+            "slack": "chief_of_staff",
+        }
+        explicit_owner = candidate.requested_agent or base.requested_agent
+        recovery_owner = owner_by_provider.get(candidate.provider_system)
+        if recovery_owner is None and explicit_owner not in {
+            None,
+            "orchestrator",
+            "clarification",
+        }:
+            recovery_owner = explicit_owner
+        if recovery_owner is None:
+            recovery_owner = "chief_of_staff"
+        operations = set(candidate.provider_operations)
+        if operations & {"create", "update", "delete", "attach"}:
+            recovered_intent: ManualRequestIntent = "business_system_write"
+            recovered_task: ManualTaskObjective = "business_system_write"
+            recovered_artifact: ManualExpectedArtifactType = (
+                "business_system_write_plan"
+            )
+        elif candidate.provider_system != "unspecified" and operations <= {
+            "read",
+            "search",
+            "verify",
+        }:
+            recovered_intent = "context_lookup"
+            recovered_task = "context_lookup"
+            recovered_artifact = "context_summary"
+        else:
+            recovered_intent = "route_request"
+            recovered_task = "route_or_continue"
+            recovered_artifact = "none"
         updates.update(
             {
-                "target_agent": base.target_agent,
-                "workflow": base.workflow,
-                "intent": base.intent,
-                "primary_target": base.primary_target,
-                "target_type": base.target_type,
-                "provider_system": base.provider_system,
-                "provider_operations": base.provider_operations,
-                "objective": base.objective,
-                "task_objective": base.task_objective,
-                "expected_artifact_type": base.expected_artifact_type,
-                "requires_live_search": base.requires_live_search,
-                "requires_approved_context": base.requires_approved_context,
-                "requires_durable_state": base.requires_durable_state,
+                "target_agent": recovery_owner,
+                "workflow": [],
+                "intent": recovered_intent,
+                "objective": candidate.objective or base.objective,
+                "task_objective": recovered_task,
+                "expected_artifact_type": recovered_artifact,
+                "requires_durable_state": False,
                 "missing_required_information": [],
             }
         )
         warnings.append(
-            "Recovered an executable fallback because the LLM returned a "
-            "clarification or route-only plan without naming material missing "
-            "information."
+            "Recovered an executable owner from the typed requested-agent/provider "
+            "contract because the LLM returned an unexplained clarification or "
+            "ownerless route. No keyword route was restored."
         )
 
     outreach_context_needed = bool(

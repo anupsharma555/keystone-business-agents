@@ -11,6 +11,7 @@ from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.schemas.execution_request import DirectAgentResponse
 
 DIRECT_ROUTES = (
+    "chief_of_staff",
     "business_research_analyst",
     "opportunity_scout",
     "outreach_composer",
@@ -30,12 +31,43 @@ PROMPT = (
 
 @pytest.mark.parametrize("route", DIRECT_ROUTES)
 def test_direct_supplied_response_agents_admit_zero_tools(route: str) -> None:
-    agent = build_direct_supplied_response_agent(route, request_text=PROMPT)
+    plan = infer_manual_request_plan(PROMPT, requested_agent=route)
+    agent = build_direct_supplied_response_agent(
+        route,
+        request_text=PROMPT,
+        manual_request_plan=plan,
+    )
 
     assert agent.tools == []
     assert agent.output_type is DirectAgentResponse
     assert "direct_supplied_response.md" in str(agent.instructions)
     assert "do not reinterpret" in str(agent.instructions).lower()
+
+
+def test_chief_attachment_response_uses_minimal_zero_tool_contract() -> None:
+    request = (
+        "give me the three points in this image as short bullets. Don't search or "
+        "change anything.\nOperator-supplied Slack attachment local path: "
+        "/private/tmp/kni-business-agent-slack-files/123/example.png"
+    )
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff").model_copy(
+        update={"source": "llm"}
+    )
+
+    agent = build_direct_supplied_response_agent(
+        "chief_of_staff",
+        request_text=request,
+        manual_request_plan=plan,
+    )
+
+    assert agent.tools == []
+    assert agent.output_type is DirectAgentResponse
+    assert "chief_of_staff_supplied_synthesis_compact" in str(agent.instructions)
+    assert cli._should_run_direct_supplied_response(
+        request,
+        requested_route="chief_of_staff",
+        manual_plan=plan,
+    )
 
 
 @pytest.mark.parametrize("route", DIRECT_ROUTES)
@@ -80,10 +112,6 @@ def test_direct_supplied_response_uses_planner_then_one_specialist_request(
         max_manager_steps=3,
     )
 
-    assert not cli._skip_live_manual_plan_for_request(
-        PROMPT,
-        requested_route=route,
-    )
     estimate = cli._estimate_ask_openai_requests(
         args,
         input_text=PROMPT,

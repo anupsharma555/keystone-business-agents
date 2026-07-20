@@ -4084,6 +4084,11 @@ def _manager_loop_needs_orchestrator_plan_summary(
     loop_steps: list[dict[str, Any]],
 ) -> bool:
     manual = _manual_plan_event_payload(original_request.manual_request_plan)
+    if str(manual.get("source") or "") == "llm":
+        return _manager_loop_request_is_planning_only(
+            original_request.request_text,
+            manual_request_plan=manual,
+        )
     if manual.get("requested_agent") not in {None, "", WorkItemRoute.ORCHESTRATOR.value}:
         return False
     text = str(original_request.request_text or "").lower()
@@ -4113,6 +4118,21 @@ def _manager_loop_request_is_planning_only(
     manual_request_plan: dict[str, Any] | None,
 ) -> bool:
     manual = _manual_plan_event_payload(manual_request_plan)
+    if str(manual.get("source") or "") == "llm":
+        ask_shape = manual.get("ask_shape")
+        ask_shape = ask_shape if isinstance(ask_shape, dict) else {}
+        return bool(
+            str(manual.get("target_agent") or "")
+            in {
+                WorkItemRoute.ORCHESTRATOR.value,
+                WorkItemRoute.CHIEF_OF_STAFF.value,
+            }
+            and str(manual.get("intent") or "") == "route_request"
+            and str(manual.get("task_objective") or "") == "route_or_continue"
+            and str(ask_shape.get("output_form") or "") == "plan"
+            and not bool(manual.get("requires_durable_state"))
+            and not list(manual.get("provider_operations") or [])
+        )
     requested_agent = str(manual.get("requested_agent") or "").strip()
     text = str(request_text or "").lower()
     planning_pattern = (
@@ -4955,6 +4975,7 @@ def _route_from_manual_plan(
         return None
     if (
         target_agent == WorkItemRoute.CHIEF_OF_STAFF.value
+        and not bool(typed_plan is not None and typed_plan.source == "llm")
         and not live_sdk
         and _chief_request_needs_manager_loop(request_text)
         and not _chief_request_should_start_with_chief(request_text)
@@ -12726,6 +12747,26 @@ def _chief_of_staff_delegated_next_agent(
     *,
     manual_request_plan: dict[str, Any] | None = None,
 ) -> WorkItemRoute | None:
+    manual = _manual_plan_event_payload(manual_request_plan)
+    if str(manual.get("source") or "") == "llm":
+        planned_route = _chief_semantic_plan_handoff_route(output_payload, manual)
+        if planned_route is not None:
+            return planned_route
+        warnings = manual.get("planner_warnings")
+        recovered_ownerless_plan = bool(
+            isinstance(warnings, list)
+            and any(
+                "No keyword route was restored" in str(item or "")
+                for item in warnings
+            )
+        )
+        if recovered_ownerless_plan:
+            return _chief_structured_durable_handoff_route(
+                output_payload,
+                request_text,
+            )
+        return None
+
     output_text = _chief_output_payload_text(output_payload)
     if _chief_advisory_only_handoff_blocked(output_text, request_text):
         return None
@@ -12761,6 +12802,38 @@ def _chief_of_staff_delegated_next_agent(
     if _chief_positive_business_research_intent(lower, request_text=request_text):
         return WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     return None
+
+
+def _chief_semantic_plan_handoff_route(
+    output_payload: dict[str, Any],
+    manual_plan: dict[str, Any],
+) -> WorkItemRoute | None:
+    """Advance the typed LLM workflow without a second phrase classifier."""
+
+    raw_workflow = manual_plan.get("workflow")
+    if not isinstance(raw_workflow, list):
+        return None
+    route_by_name = {
+        WorkItemRoute.GMAIL_TRIAGE.value: WorkItemRoute.GMAIL_TRIAGE,
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value: WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        WorkItemRoute.OPPORTUNITY_SCOUT.value: WorkItemRoute.OPPORTUNITY_SCOUT,
+        WorkItemRoute.OUTREACH_COMPOSER.value: WorkItemRoute.OUTREACH_COMPOSER,
+    }
+    workflow = [
+        route_by_name[name]
+        for item in raw_workflow
+        if (name := str(item or "").strip()) in route_by_name
+    ]
+    if not workflow:
+        return None
+    durable_handoff = output_payload.get("durable_handoff")
+    if isinstance(durable_handoff, dict):
+        structured = route_by_name.get(
+            str(durable_handoff.get("agent") or "").strip()
+        )
+        if structured in workflow:
+            return structured
+    return workflow[0]
 
 
 def _chief_manual_plan_handoff_route(
@@ -13505,6 +13578,8 @@ def _is_source_provided_business_research_request(work_item: WorkItem, request_t
         ask_shape.get("prior_context_dependency") == "selected_context"
         and manual_plan.get("requires_live_search") is False
     )
+    if str(manual_plan.get("source") or "") == "llm" and selected_context_only:
+        return True
     if selected_context_only and looks_like_supplied_context_synthesis_request(text):
         return True
     if selected_context_only and re.search(

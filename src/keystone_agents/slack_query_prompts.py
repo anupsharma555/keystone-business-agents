@@ -33,7 +33,6 @@ _NEGATED_SIDE_EFFECT_WINDOW_RE = re.compile(
 )
 _DRAFT_SAFE_RE = re.compile(r"\b(draft|compose|write|revise|rewrite|suggest)\b", flags=re.I)
 
-
 class SlackQueryPromptKind(StrEnum):
     """Reusable Slack query prompt families."""
 
@@ -43,6 +42,32 @@ class SlackQueryPromptKind(StrEnum):
     THREAD_SUMMARY_NEXT_ACTION = "thread_summary_next_action"
     OUTREACH_DRAFT = "outreach_draft"
     CONTINUE_OR_REVISE = "continue_or_revise"
+
+
+_SEMANTIC_KIND_BY_INTENT: dict[str, SlackQueryPromptKind] = {
+    "company_research": SlackQueryPromptKind.RESEARCH_SUMMARY,
+    "research_brief": SlackQueryPromptKind.RESEARCH_SUMMARY,
+    "opportunity_search": SlackQueryPromptKind.OPPORTUNITY_SEARCH,
+    "opportunity_to_outreach_loop": SlackQueryPromptKind.OPPORTUNITY_SEARCH,
+    "outreach_draft": SlackQueryPromptKind.OUTREACH_DRAFT,
+    "slack_operations": SlackQueryPromptKind.THREAD_SUMMARY_NEXT_ACTION,
+    "continue_work_item": SlackQueryPromptKind.CONTINUE_OR_REVISE,
+}
+
+_SEMANTIC_KIND_BY_TASK_OBJECTIVE = {
+    "entity_research": SlackQueryPromptKind.RESEARCH_SUMMARY,
+    "source_research": SlackQueryPromptKind.RESEARCH_SUMMARY,
+    "opportunity_discovery": SlackQueryPromptKind.OPPORTUNITY_SEARCH,
+    "outreach_draft": SlackQueryPromptKind.OUTREACH_DRAFT,
+}
+
+_SEMANTIC_KIND_BY_ARTIFACT = {
+    "company_profile": SlackQueryPromptKind.RESEARCH_SUMMARY,
+    "research_brief": SlackQueryPromptKind.RESEARCH_SUMMARY,
+    "source_summary": SlackQueryPromptKind.RESEARCH_SUMMARY,
+    "opportunity_record": SlackQueryPromptKind.OPPORTUNITY_SEARCH,
+    "outreach_draft": SlackQueryPromptKind.OUTREACH_DRAFT,
+}
 
 
 class SlackQueryPromptInput(BaseModel):
@@ -175,10 +200,16 @@ def resolve_slack_query_prompt(
         }
 
     context_flags = _context_flags_for_kind(detected)
-    requires_approved_context = detected in {
-        SlackQueryPromptKind.OUTREACH_DRAFT,
-        SlackQueryPromptKind.CONTINUE_OR_REVISE,
-    }
+    semantic_plan = _semantic_manual_plan(prompt_input)
+    requires_approved_context = (
+        bool(semantic_plan.get("requires_approved_context"))
+        if semantic_plan is not None
+        else detected
+        in {
+            SlackQueryPromptKind.OUTREACH_DRAFT,
+            SlackQueryPromptKind.CONTINUE_OR_REVISE,
+        }
+    )
     safety_notes = _safety_notes_for_kind(detected)
     cost_profile = _cost_profile_for_kind(detected)
     task_brief = _render_task_brief(prompt_input, kind=detected, target_route=target_route)
@@ -221,6 +252,10 @@ def slack_query_prompt_external_context(
 
 
 def _detect_prompt_kind(prompt_input: SlackQueryPromptInput) -> SlackQueryPromptKind | None:
+    semantic_plan = _semantic_manual_plan(prompt_input)
+    if semantic_plan is not None:
+        return _semantic_prompt_kind(semantic_plan)
+
     text = " ".join(
         item
         for item in (
@@ -293,6 +328,34 @@ def _detect_prompt_kind(prompt_input: SlackQueryPromptInput) -> SlackQueryPrompt
     if prompt_input.target_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
         return SlackQueryPromptKind.RESEARCH_SUMMARY
     return None
+
+
+def _semantic_manual_plan(prompt_input: SlackQueryPromptInput) -> dict[str, Any] | None:
+    """Return a live semantic plan, excluding fallback phrase classifications."""
+
+    plan = prompt_input.manual_plan
+    if not isinstance(plan, dict) or str(plan.get("source") or "") != "llm":
+        return None
+    return plan
+
+
+def _semantic_prompt_kind(plan: dict[str, Any]) -> SlackQueryPromptKind | None:
+    """Select reusable prompt guidance only from the structured semantic plan.
+
+    This metadata may influence specialist skill/context selection, so request
+    phrases cannot reinterpret it after the LLM planner has already established
+    the task meaning. Unknown semantic shapes simply receive no reusable prompt
+    rather than falling back to keyword authority.
+    """
+
+    intent = str(plan.get("intent") or "").strip()
+    if kind := _SEMANTIC_KIND_BY_INTENT.get(intent):
+        return kind
+    task_objective = str(plan.get("task_objective") or "").strip()
+    if kind := _SEMANTIC_KIND_BY_TASK_OBJECTIVE.get(task_objective):
+        return kind
+    artifact = str(plan.get("expected_artifact_type") or "").strip()
+    return _SEMANTIC_KIND_BY_ARTIFACT.get(artifact)
 
 
 def _explicit_business_research_requested(text: str) -> bool:
