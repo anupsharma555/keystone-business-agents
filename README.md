@@ -63,10 +63,14 @@ The runtime has four main layers:
 Generated architecture visual:
 `docs/assets/kba-current-agent-architecture.svg`
 
+Integrated architecture and ordered execution visual:
+`docs/assets/kba-integrated-agent-architecture.svg`
+
 Regenerate it after agent, workflow, trace, or eval-structure changes:
 
 ```bash
 .venv/bin/python scripts/render_agent_architecture_diagram.py
+.venv/bin/python scripts/render_agent_execution_diagrams.py
 ```
 
 ## Agent Set

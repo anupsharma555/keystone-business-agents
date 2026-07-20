@@ -46,8 +46,14 @@ Start here when changing or operating the repository.
   defining how KBA should differ from ChatGPT and Codex.
 - `docs/VISUAL_CONTEXT.md`: repo-local architecture visuals for operator and agent context.
 - `docs/assets/kba-current-agent-architecture.svg`: generated current architecture visual.
+- `docs/assets/kba-integrated-agent-architecture.svg`: one numbered overall system map with
+  read/context specialists and a source-derived graph loop.
+- `docs/assets/kba-request-execution-sequence.svg`: numbered direct-versus-stateful request flow.
+- `docs/assets/kba-workitem-langgraph-topology.svg`: every compiled WorkItem/LangGraph node and edge.
 - `scripts/render_agent_architecture_diagram.py`: regenerate the current architecture visual from
   the agent registry, workflow, trace, and eval structure.
+- `scripts/render_agent_execution_diagrams.py`: regenerate the numbered request sequence and
+  compiled runtime topology using Graphviz.
 
 ## Natural-Language Workflows
 
