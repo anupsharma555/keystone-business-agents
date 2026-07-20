@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
@@ -61,6 +61,22 @@ class WebsiteExtractionTool:
         )
 
 
+@dataclass
+class WebsiteExtractionBudget:
+    """Per-workflow cap for managed extraction calls."""
+
+    firecrawl_max_calls: int = 0
+    firecrawl_calls_attempted: int = 0
+
+    def reserve(self, provider: WebsiteExtractorProvider) -> bool:
+        if provider != "firecrawl":
+            return True
+        if self.firecrawl_calls_attempted >= self.firecrawl_max_calls:
+            return False
+        self.firecrawl_calls_attempted += 1
+        return True
+
+
 def extract_website_content(
     url: str,
     *,
@@ -113,6 +129,194 @@ def extract_website_content(
         company_name=company_name,
         guardrail_context=guardrail_context,
         http_get=http_get,
+    )
+
+
+def extract_website_content_with_fallbacks(
+    url: str,
+    *,
+    company_name: str,
+    primary_provider: str | None = None,
+    fallback_providers: Sequence[str] | None = None,
+    live: bool = False,
+    guardrail_context: WebsiteExtractionGuardrailContext = "default",
+    minimum_useful_chars: int = 3000,
+    budget: WebsiteExtractionBudget | None = None,
+    extractor: Callable[..., WebsiteExtractionResult] | None = None,
+) -> WebsiteExtractionResult:
+    """Extract one page through the shared static, local-rendered, and paid ladder.
+
+    Crawl4AI is the default local fallback after a failed, empty, or shallow
+    Trafilatura result. Firecrawl is attempted only when it is explicitly named
+    in ``KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK`` or supplied by the caller.
+    """
+
+    page_profile = website_extraction_page_profile(url)
+    if page_profile == "structured_api_preferred":
+        raise WebsiteExtractionError(
+            f"Structured source API is preferred over rendered page extraction for {url}."
+        )
+    extract = extractor or extract_website_content
+    providers = website_extraction_provider_sequence(
+        primary_provider=primary_provider,
+        fallback_providers=fallback_providers,
+        url=url,
+    )
+    active_budget = budget or website_extraction_budget()
+    attempts: list[dict[str, Any]] = []
+    candidates: list[WebsiteExtractionResult] = []
+    errors: list[tuple[str, str]] = []
+    for provider in providers:
+        if not active_budget.reserve(provider):
+            message = "managed extraction budget exhausted"
+            attempts.append({"provider": provider, "status": "budget_blocked", "error": message})
+            errors.append((provider, message))
+            continue
+        try:
+            result = extract(
+                url,
+                company_name=company_name,
+                provider=provider,
+                live=live,
+                guardrail_context=guardrail_context,
+            )
+        except Exception as exc:
+            if type(exc).__name__ == "ToolGuardrailViolation":
+                message = f"guardrail blocked extraction: {exc}"[:500]
+            else:
+                message = f"{type(exc).__name__}: {exc}"[:500]
+            attempts.append({"provider": provider, "status": "error", "error": message})
+            errors.append((provider, message))
+            continue
+        text_length = len(result.text_or_markdown.strip())
+        attempts.append(
+            {
+                "provider": result.provider,
+                "status": result.status,
+                "text_length": text_length,
+                "claim_count": len(result.claims),
+            }
+        )
+        candidates.append(result)
+        if _website_extraction_is_useful(result, minimum_useful_chars=minimum_useful_chars):
+            return result.model_copy(
+                update={
+                    "metadata": {
+                        **result.metadata,
+                        "extraction_attempts": attempts,
+                        "fallback_used": len(attempts) > 1,
+                        "extraction_strategy": page_profile,
+                    }
+                }
+            )
+
+    if candidates:
+        best = max(candidates, key=_website_extraction_candidate_score)
+        return best.model_copy(
+            update={
+                "metadata": {
+                    **best.metadata,
+                    "extraction_attempts": attempts,
+                    "fallback_used": len(attempts) > 1,
+                    "quality_gate": "no provider met the useful-content threshold",
+                    "extraction_strategy": page_profile,
+                }
+            }
+        )
+    if errors:
+        primary_error = f"{errors[0][0]}: {errors[0][1]}"
+        fallback_errors = [
+            f"fallback {provider}: {_compact_fallback_error(message)}"
+            for provider, message in errors[1:]
+        ]
+        raise WebsiteExtractionError("; ".join([primary_error, *fallback_errors]))
+    raise WebsiteExtractionError(f"No website extraction provider returned content for {url}.")
+
+
+def website_extraction_provider_sequence(
+    *,
+    primary_provider: str | None = None,
+    fallback_providers: Sequence[str] | None = None,
+    url: str = "",
+) -> tuple[WebsiteExtractorProvider, ...]:
+    """Resolve a deduplicated provider ladder without silently enabling paid calls."""
+
+    primary = _normalize_provider(primary_provider or load_settings().website_extractor)
+    if fallback_providers is None:
+        configured = os.getenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", "").strip()
+        raw_fallbacks = [item for item in configured.split(",") if item.strip()]
+        if not raw_fallbacks and primary == "trafilatura":
+            raw_fallbacks = ["crawl4ai"]
+    else:
+        raw_fallbacks = list(fallback_providers)
+    normalized = [primary, *(_normalize_provider(item) for item in raw_fallbacks)]
+    if website_extraction_page_profile(url) == "rendered_first" and "crawl4ai" in normalized:
+        normalized = ["crawl4ai", *(item for item in normalized if item != "crawl4ai")]
+    return tuple(dict.fromkeys(normalized))
+
+
+def website_extraction_page_profile(url: str) -> str:
+    """Classify selected URLs for deterministic extraction routing."""
+
+    parsed = urlparse(str(url or ""))
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if host == "clinicaltrials.gov" and path.startswith("/search"):
+        return "structured_api_preferred"
+    rendered_hosts = {
+        "sam.gov",
+        "reporter.nih.gov",
+        "boards.greenhouse.io",
+        "jobs.lever.co",
+        "jobs.ashbyhq.com",
+    }
+    rendered_path_markers = (
+        "/search",
+        "/careers",
+        "/jobs",
+        "/job/",
+        "/funding/searchguide",
+    )
+    if host in rendered_hosts or any(marker in path for marker in rendered_path_markers):
+        return "rendered_first"
+    return "static_first"
+
+
+def website_extraction_budget() -> WebsiteExtractionBudget:
+    """Build the explicit per-workflow managed extraction budget."""
+
+    raw = os.getenv("KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN", "0").strip()
+    try:
+        maximum = int(raw)
+    except ValueError:
+        maximum = 0
+    return WebsiteExtractionBudget(firecrawl_max_calls=max(0, min(8, maximum)))
+
+
+def _compact_fallback_error(message: str) -> str:
+    if message.startswith("guardrail blocked extraction:"):
+        return message
+    return message.split(": ", 1)[-1]
+
+
+def _website_extraction_is_useful(
+    result: WebsiteExtractionResult,
+    *,
+    minimum_useful_chars: int,
+) -> bool:
+    text = result.text_or_markdown.strip()
+    return (
+        result.status == "success"
+        and bool(result.claims)
+        and len(text) >= max(200, int(minimum_useful_chars))
+    )
+
+
+def _website_extraction_candidate_score(result: WebsiteExtractionResult) -> tuple[int, int, int]:
+    return (
+        int(result.status == "success"),
+        len(result.claims),
+        len(result.text_or_markdown.strip()),
     )
 
 

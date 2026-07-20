@@ -18,6 +18,7 @@ from keystone_agents.schemas.approval import (
 from keystone_agents.schemas.company_profile import ClaimEvidenceRecord, CompanyProfile
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
 from keystone_agents.schemas.email_style import EmailStyleProfile
+from keystone_agents.schemas.request_coverage import RequestCoverage
 
 EM_DASH = "\u2014"
 PROFESSIONAL_ADVICE_TERMS = (
@@ -276,6 +277,38 @@ class OutreachContext(BaseModel):
         return [_validate_internal_copy(value.strip()) for value in values if value.strip()]
 
 
+class SelectedOutreachDraft(BaseModel):
+    """Exact approved draft identity and copy supplied for a bounded revision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    draft_id: str = Field(min_length=1, max_length=160)
+    recipient: str = Field(default="", max_length=240)
+    email_subject: str = Field(min_length=1, max_length=240)
+    email_body: str = Field(min_length=1)
+    linkedin_note: str = Field(default="", max_length=300)
+    cta_text: str = Field(default="", max_length=300)
+    approved_for_revision: bool = True
+
+    @field_validator(
+        "draft_id",
+        "recipient",
+        "email_subject",
+        "email_body",
+        "linkedin_note",
+        "cta_text",
+    )
+    @classmethod
+    def _safe_selected_copy(cls, value: str) -> str:
+        return _validate_internal_copy(value.strip())
+
+    @model_validator(mode="after")
+    def _selected_draft_is_approved(self) -> SelectedOutreachDraft:
+        if not self.approved_for_revision:
+            raise ValueError("selected draft must be approved for revision")
+        return self
+
+
 class ApprovedOutreachDraftingContext(BaseModel):
     """Typed context envelope for constrained LLM outreach drafting."""
 
@@ -288,6 +321,10 @@ class ApprovedOutreachDraftingContext(BaseModel):
     blocked_facts: list[str] = Field(default_factory=list)
     objective: str
     revision_request: str = ""
+    selected_draft: SelectedOutreachDraft | None = None
+    revision_max_words: int | None = Field(default=None, ge=1, le=179)
+    preserve_selected_cta: bool = False
+    preserve_selected_recipient: bool = True
     max_variants: int = Field(default=1, ge=1, le=3)
     outreach_template: OutreachTemplateContext | None = None
     example_guidance: list[OutreachExampleGuidance] = Field(default_factory=list)
@@ -340,6 +377,17 @@ class ApprovedOutreachDraftingContext(BaseModel):
             self.allowed_source_ids = list(
                 dict.fromkeys(fact.source_id for fact in self.allowed_facts if fact.source_id)
             )
+        return self
+
+    @model_validator(mode="after")
+    def _revision_constraints_require_selected_draft(self) -> ApprovedOutreachDraftingContext:
+        if self.revision_max_words is not None and self.selected_draft is None:
+            raise ValueError("revision word limit requires a selected draft")
+        if self.preserve_selected_cta:
+            if self.selected_draft is None:
+                raise ValueError("CTA preservation requires a selected draft")
+            if not self.selected_draft.cta_text:
+                raise ValueError("CTA preservation requires selected draft CTA text")
         return self
 
 
@@ -562,6 +610,7 @@ class OutreachDraft(BaseModel):
     follow_up_schedules: list[FollowUpScheduleRecord] = Field(default_factory=list)
     drafting_mode: Literal["deterministic_fixture", "llm_constrained"] = "deterministic_fixture"
     revision_request: str = ""
+    revised_from_draft_id: str = ""
     draft_policy: Literal["normal", "acknowledgement_only", "refused"] = "normal"
     approved_context_used: bool = False
     unsupported_claims_flagged: list[str] = Field(default_factory=list)
@@ -580,6 +629,7 @@ class OutreachDraft(BaseModel):
     subject: str | None = None
     body: str | None = None
     retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
+    request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
 
     @model_validator(mode="before")
     @classmethod
@@ -645,7 +695,7 @@ class OutreachDraft(BaseModel):
     def _safe_internal_lists(cls, values: list[str]) -> list[str]:
         return [_validate_internal_copy(value.strip()) for value in values if value.strip()]
 
-    @field_validator("revision_request")
+    @field_validator("revision_request", "revised_from_draft_id")
     @classmethod
     def _safe_revision_request(cls, value: str) -> str:
         return _validate_internal_copy(value.strip())
@@ -903,6 +953,7 @@ class OutreachLLMDraftPayload(BaseModel):
     additional_information_needed: list[str] = Field(default_factory=list, max_length=6)
     collaboration_ideas: list[str] = Field(default_factory=list, max_length=4)
     deferral_reason: str = ""
+    request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
 
 
 class OutreachLLMDraftVariantPayload(BaseModel):

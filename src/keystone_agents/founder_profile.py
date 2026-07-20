@@ -28,6 +28,9 @@ class FounderFitProfile(BaseModel):
     role_targets: list[str] = Field(default_factory=list)
     role_exclusions: list[str] = Field(default_factory=list)
     fit_dimensions: list[str] = Field(default_factory=list)
+    strategic_priorities: list[str] = Field(default_factory=list)
+    opportunity_lanes: list[str] = Field(default_factory=list)
+    access_preferences: list[str] = Field(default_factory=list)
     allowed_outreach_claims: list[str] = Field(default_factory=list)
     reply_context: list[str] = Field(default_factory=list)
     public_links: list[str] = Field(default_factory=list)
@@ -40,6 +43,9 @@ class FounderFitProfile(BaseModel):
         "role_targets",
         "role_exclusions",
         "fit_dimensions",
+        "strategic_priorities",
+        "opportunity_lanes",
+        "access_preferences",
         "allowed_outreach_claims",
         "reply_context",
         "public_links",
@@ -99,6 +105,9 @@ def founder_search_context(profile: FounderFitProfile | None) -> str:
         "role_targets": profile.role_targets,
         "role_exclusions": profile.role_exclusions,
         "fit_dimensions": profile.fit_dimensions,
+        "strategic_priorities": profile.strategic_priorities,
+        "opportunity_lanes": profile.opportunity_lanes,
+        "access_preferences": profile.access_preferences,
         "public_links": profile.public_links,
         "policy": (
             "Use for search query planning, role-fit assessment, and Keystone-fit "
@@ -157,11 +166,41 @@ def founder_profile_audit_payload(
 ) -> dict[str, Any]:
     """Return non-sensitive metadata for agent-run audit payloads."""
 
+    search_context_fields = []
+    if profile:
+        search_context_fields = [
+            field_name
+            for field_name in (
+                "summary",
+                "search_fit_keywords",
+                "fit_dimensions",
+                "strategic_priorities",
+                "opportunity_lanes",
+                "access_preferences",
+                "public_links",
+            )
+            if getattr(profile, field_name)
+        ]
+    required_search_fields = {
+        "summary",
+        "search_fit_keywords",
+        "fit_dimensions",
+        "strategic_priorities",
+        "opportunity_lanes",
+        "access_preferences",
+        "public_links",
+    }
     return {
         "path": str(path_value or ""),
         "profile_id": profile.profile_id if profile else "",
         "approved_for_search": bool(profile and profile.approved_for_search),
         "approved_for_drafting": bool(profile and profile.approved_for_drafting),
+        "search_context_fields": search_context_fields,
+        "search_context_complete": bool(
+            profile
+            and profile.approved_for_search
+            and required_search_fields <= set(search_context_fields)
+        ),
     }
 
 

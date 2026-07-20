@@ -203,6 +203,93 @@ def test_company_research_focused_brief_payload_exposes_clean_slack_summary() ->
     assert business_agent_result_display_text(payload) == summary
 
 
+def test_company_research_focused_brief_honors_requested_summary_word_limit() -> None:
+    import scripts.run_company_research as run_company_research
+
+    payload = {
+        "output_type": "CompanyResearchFocusedBrief",
+        "manual_request_plan": {
+            "ask_shape": {
+                "stop_condition": "stop_after_20_word_summary",
+                "output_constraints": {
+                    "interpretation": "exact 20-word answer",
+                    "scope": "answer",
+                    "word_count_mode": "exact",
+                    "word_count": 20,
+                },
+            }
+        },
+        "output": {
+            "company_name": "Abridge",
+            "answer": (
+                "Abridge provides ambient clinical documentation AI that converts "
+                "clinician-patient conversations into structured notes integrated "
+                "directly with health-system electronic record workflows."
+            ),
+            "product": (
+                "Abridge provides ambient clinical documentation software that converts "
+                "patient-clinician conversations into structured notes integrated with "
+                "health-system workflows and electronic health records."
+            ),
+            "why_it_matters": "The workflow is relevant to clinical AI evaluation.",
+            "sources": [
+                {
+                    "title": "Abridge",
+                    "url": "https://www.abridge.com",
+                    "source_type": "company_site",
+                }
+            ],
+        },
+    }
+
+    summary = run_company_research._company_research_sdk_human_summary(payload)
+    run_company_research._attach_company_research_display_text(payload, summary)
+    run_company_research._attach_company_research_output_constraint_validation(payload)
+
+    answer = summary.split("\n\n", 1)[0].removeprefix("*Answer:*\n")
+    assert len(answer.split()) == 20
+    assert "https://www.abridge.com" in summary
+    assert "*Detailed Summary:*" not in summary
+    assert payload["output_constraint_validation"] == {
+        "applicable": True,
+        "passed": True,
+        "scope": "answer",
+        "word_count": 20,
+        "sentence_count": None,
+        "item_count": None,
+        "satisfied_constraints": ["word count exact 20"],
+        "violations": [],
+    }
+
+
+def test_company_research_style_constraint_keeps_full_research_layout() -> None:
+    import scripts.run_company_research as run_company_research
+
+    payload = {
+        "output_type": "CompanyResearchFocusedBrief",
+        "manual_request_plan": {
+            "ask_shape": {
+                "output_constraints": {
+                    "interpretation": "avoid em dashes",
+                    "scope": "entire_response",
+                    "forbid_em_dash": True,
+                }
+            }
+        },
+        "output": {
+            "company_name": "Abridge",
+            "product": "Ambient clinical documentation software.",
+            "why_it_matters": "Relevant to clinical AI evaluation.",
+            "sources": [{"title": "Abridge", "url": "https://www.abridge.com"}],
+        },
+    }
+
+    summary = run_company_research._company_research_sdk_human_summary(payload)
+
+    assert "*Detailed Summary:*" in summary
+    assert "*Useful references:*" in summary
+
+
 def test_company_research_focused_brief_summary_avoids_internal_jargon_and_fragments() -> None:
     import scripts.run_company_research as run_company_research
 

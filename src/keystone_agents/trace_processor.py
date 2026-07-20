@@ -301,16 +301,17 @@ def _sdk_run_summary_metadata(
         "tool_call_count": observed["tool_call_count"],
         "tool_call_counts": observed["tool_call_counts"],
         "tool_call_summary": observed["tool_call_summary"],
+        "child_step_summary": observed["child_step_summary"],
         "handoff_count": observed["handoff_count"],
         "retry_count": retry_total,
         "repair_loop_count": repair_total,
-            "retrieval_provider_summary": {
-                "provider_summary": _clean_scalar(search_diagnostics.get("provider_summary")),
-                "providers_used": _clean_string_list(search_diagnostics.get("providers_used")),
-                "attempted": _clean_string_list(search_diagnostics.get("search_providers_attempted")),
-                "error_count": retrieval_errors,
-                "error_types": retrieval_error_types,
-            },
+        "retrieval_provider_summary": {
+            "provider_summary": _clean_scalar(search_diagnostics.get("provider_summary")),
+            "providers_used": _clean_string_list(search_diagnostics.get("providers_used")),
+            "attempted": _clean_string_list(search_diagnostics.get("search_providers_attempted")),
+            "error_count": retrieval_errors,
+            "error_types": retrieval_error_types,
+        },
         "prompt_cache": {
             "static_prefix_sha256": _clean_hash(request_cache.get("static_prefix_sha256")),
             "dynamic_prompt_sha256": _clean_hash(request_cache.get("dynamic_prompt_sha256")),
@@ -348,6 +349,7 @@ def _sdk_run_summary_metadata(
                     "timing",
                     "model",
                     "tooling",
+                    "child_steps",
                     "retrieval",
                     "orchestrator",
                     "approval",
@@ -378,6 +380,7 @@ def _sdk_run_summary_metadata(
                 "failed_tool_call_count": failed_tool_count,
                 "tool_names": tool_names,
                 "tool_call_summary": observed["tool_call_summary"],
+                "child_step_summary": observed["child_step_summary"],
                 "handoff_count": observed["handoff_count"],
                 "has_tool_metadata": bool(observed["tool_call_count"] or failed_tool_count or tool_names),
             },
@@ -449,6 +452,7 @@ def _sdk_run_summary_metadata(
                     or orchestrator_feedback_count > 0
                     or orchestrator_blocker_count > 0
                 ),
+                "has_child_step_metadata": bool(observed["child_step_summary"]),
                 "has_web_extraction_issues": web_extraction_issue_count > 0,
                 "has_error_or_retry": (
                     status_text not in {"", "ok", "done", "success"}
@@ -516,13 +520,22 @@ def _observed_sdk_activity(raw_result: Any) -> dict[str, Any]:
     tool_failed_counts: dict[str, int] = {}
     tool_statuses: dict[str, set[str]] = {}
     handoff_count = 0
-    for item in _result_items(raw_result):
-        kind = _clean_scalar(
-            getattr(item, "type", "")
-            or getattr(item, "item_type", "")
-            or item.__class__.__name__
-        ).lower()
+    child_step_summary: list[dict[str, Any]] = []
+    for step_index, item in enumerate(_result_items(raw_result), start=1):
+        kind = _activity_kind(item)
         name = _activity_name(item)
+        category = _activity_category(kind, name)
+        if category:
+            child_step_summary.append(
+                {
+                    "step_index": step_index,
+                    "category": category,
+                    "name": _clean_scalar(name or category),
+                    "status": _activity_status(item) or "observed",
+                    "duration_ms": _activity_duration_ms(item),
+                    "error_kind": _activity_error_kind(item),
+                }
+            )
         if "handoff" in kind or "handoff" in name.lower():
             handoff_count += 1
             continue
@@ -558,8 +571,46 @@ def _observed_sdk_activity(raw_result: Any) -> dict[str, Any]:
         "tool_call_counts": dict(sorted(tool_counts.items())),
         "failed_tool_call_count": sum(tool_failed_counts.values()),
         "tool_call_summary": tool_call_summary[:20],
+        "child_step_summary": child_step_summary[:40],
         "handoff_count": handoff_count,
     }
+
+
+def _activity_category(kind: str, name: str) -> str:
+    normalized_name = name.lower()
+    if "handoff" in kind or "handoff" in normalized_name:
+        return "handoff"
+    if "tool" in kind or "function" in kind or name:
+        return "tool"
+    if "message" in kind or "model" in kind or "reasoning" in kind:
+        return "model"
+    return ""
+
+
+def _activity_kind(item: Any) -> str:
+    raw_kind = getattr(item, "type", "") or getattr(item, "item_type", "")
+    if isinstance(item, dict):
+        raw_kind = item.get("type") or item.get("item_type") or raw_kind
+    return _clean_scalar(raw_kind or item.__class__.__name__).lower()
+
+
+def _activity_duration_ms(item: Any) -> float | None:
+    candidates = (
+        getattr(item, "duration_ms", None),
+        getattr(getattr(item, "raw_item", None), "duration_ms", None),
+        getattr(getattr(item, "item", None), "duration_ms", None),
+    )
+    if isinstance(item, dict):
+        raw = item.get("raw_item")
+        candidates += (
+            item.get("duration_ms"),
+            raw.get("duration_ms") if isinstance(raw, dict) else None,
+        )
+    for candidate in candidates:
+        duration = _safe_float(candidate)
+        if duration is not None:
+            return max(0.0, duration)
+    return None
 
 
 def _result_items(raw_result: Any) -> list[Any]:

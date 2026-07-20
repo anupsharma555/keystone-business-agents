@@ -28,6 +28,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
         (
             "orchestrator agent",
             "orchestrator",
+            "orch",
             "router",
             "routing agent",
         ),
@@ -43,6 +44,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "analyst",
             "research agent",
             "business research",
+            "ba",
         ),
     ),
     (
@@ -53,6 +55,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "opportunity scout",
             "scout agent",
             "scout",
+            "os",
         ),
     ),
     (
@@ -63,6 +66,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "outreach composer",
             "outreach agent",
             "composer",
+            "oc",
         ),
     ),
     (
@@ -74,6 +78,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "email triage",
             "triage agent",
             "triage",
+            "gt",
         ),
     ),
     (
@@ -86,6 +91,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "chief of staff",
             "slack operations",
             "slack ops",
+            "cos",
         ),
     ),
     (
@@ -95,6 +101,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "airtable context agent",
             "airtable context",
             "airtable agent",
+            "atc",
         ),
     ),
     (
@@ -108,6 +115,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "google drive context",
             "google docs context",
             "google sheets context",
+            "gwc",
         ),
     ),
     (
@@ -117,6 +125,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "zotero context agent",
             "zotero context",
             "zotero agent",
+            "zc",
         ),
     ),
     (
@@ -127,6 +136,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "rss context",
             "announcements context agent",
             "announcements context",
+            "rc",
         ),
     ),
     (
@@ -137,6 +147,7 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
             "preprints context",
             "preprint context agent",
             "preprint context",
+            "pc",
         ),
     ),
 )
@@ -186,15 +197,19 @@ def parse_agent_mention(
     text: str,
     *,
     allow_bare_context_agents: bool = False,
+    allow_bare_agent_aliases: bool = False,
 ) -> AgentMention:
     """Parse an optional `@KNI <agent alias>` mention from user text."""
 
     raw = text.strip()
     match = KNI_MENTION_RE.match(raw)
     if match is None:
-        if allow_bare_context_agents:
+        if allow_bare_context_agents or allow_bare_agent_aliases:
             raw = _strip_bare_business_agent_prefix(raw)
-            best = _best_alias_match(raw, context_agents_only=True)
+            best = _best_alias_match(
+                raw,
+                context_agents_only=not allow_bare_agent_aliases,
+            )
             if best is not None:
                 route, agent_name, normalized_alias = best
                 words_to_drop = len(normalized_alias.split())

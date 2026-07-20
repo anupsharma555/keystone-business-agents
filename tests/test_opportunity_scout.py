@@ -4,13 +4,16 @@ import json
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 from keystone_agents.agents import opportunity_scout as scout_module
 from keystone_agents.agents.opportunity_scout import (
+    apply_opportunity_scout_synthesis,
     build_opportunity_scout_agent,
+    build_opportunity_scout_synthesis_agent,
     handoff_to_business_research_analyst_placeholder_impl,
     load_existing_opportunity_state_impl,
     save_opportunity_placeholder_impl,
@@ -31,6 +34,8 @@ from keystone_agents.schemas.opportunity import (
     Opportunity,
     OpportunityRecord,
     OpportunityScoutResult,
+    OpportunityScoutSynthesis,
+    OpportunityScoutSynthesisDecision,
     OpportunitySource,
     OpportunitySourceBundle,
 )
@@ -219,6 +224,641 @@ def test_formal_opportunity_plan_expands_short_request_across_actionable_lanes()
     assert any(
         "call for proposals" in spec.query.lower() or "cfp" in spec.query.lower() for spec in specs
     )
+
+
+@pytest.mark.parametrize("identifier", ["PAR-25-310", "RFA-MH-27-180"])
+def test_formal_identifier_request_searches_exact_identifier_first(identifier: str) -> None:
+    topic = (
+        f"Assess NIH grant {identifier} for Keystone and verify deadline, eligibility, "
+        "application path, and official source."
+    )
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=1)
+
+    specs = scout_module._build_live_query_specs(topic, search_plan=plan)  # noqa: SLF001
+
+    assert specs[0].query == identifier
+    assert specs[0].lane == "grant"
+    assert specs[0].entity_hint == "grant_program"
+    assert sum(spec.query == identifier for spec in specs) == 1
+    assert len(specs) == 1
+
+
+def test_formal_opportunity_search_does_not_apply_publication_date_filter() -> None:
+    grant_spec = scout_module._OpportunityQuerySpec(  # noqa: SLF001
+        lane="grant",
+        time_window="current",
+        query="PAR-25-310",
+        entity_hint="grant_program",
+    )
+    role_spec = scout_module._OpportunityQuerySpec(  # noqa: SLF001
+        lane="role",
+        time_window="recent",
+        query="current remote psychiatry role",
+    )
+
+    grant_request = scout_module._search_request_from_query(  # noqa: SLF001
+        grant_spec,
+        max_results=1,
+    )
+    role_request = scout_module._search_request_from_query(  # noqa: SLF001
+        role_spec,
+        max_results=1,
+    )
+
+    assert grant_request.time_range is None
+    assert grant_request.language is None
+    assert grant_request.safe_search is None
+    assert role_request.time_range == "recent"
+
+
+def test_broad_personalized_plan_covers_full_keystone_opportunity_portfolio() -> None:
+    topic = (
+        "Find a broad range of current remote-accessible opportunities relevant to "
+        "Keystone and its physician-scientist founder across conferences, workshops, "
+        "certifications, grants, industry collaborations, consulting, and networking."
+    )
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=8)
+    specs = scout_module._build_live_query_specs(topic, search_plan=plan)  # noqa: SLF001
+
+    lane_types = {lane.lane_type for lane in plan.lanes}
+    assert {
+        "conference_speaking",
+        "workshop_training",
+        "certification_professional_development",
+        "grant_fellowship",
+        "industry_collaboration",
+        "consulting_advisory",
+        "networking_community",
+        "contract_procurement",
+    } <= lane_types
+    query_lanes = {spec.lane for spec in specs}
+    assert {
+        "workshop_training",
+        "certification_professional_development",
+        "networking_community",
+        "consulting_advisory",
+    } <= query_lanes
+    new_portfolio_specs = [
+        spec
+        for spec in specs
+        if spec.lane
+        in {
+            "workshop_training",
+            "certification_professional_development",
+            "networking_community",
+            "consulting_advisory",
+        }
+    ]
+    assert all("2026" in spec.query for spec in new_portfolio_specs)
+
+
+def test_short_broad_portfolio_request_does_not_collapse_to_remote_roles() -> None:
+    topic = (
+        "Find a broad range of current remote-accessible opportunities relevant to "
+        "Keystone and its physician-scientist founder."
+    )
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=5)
+    specs = scout_module._build_live_query_specs(topic, search_plan=plan)  # noqa: SLF001
+
+    assert len(plan.lanes) == 8
+    assert {"workshop_training", "networking_community", "grant"} <= {spec.lane for spec in specs}
+    assert plan.strict_targeting is False
+
+
+def test_precise_grant_request_stays_in_grant_lane_when_search_broadens() -> None:
+    topic = (
+        "Find up to 2 active U.S. grants for behavioral-health AI evaluation that a "
+        "small consulting company could pursue. Require verified eligibility and a deadline."
+    )
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=2)
+    specs = scout_module._build_live_query_specs(topic, search_plan=plan)  # noqa: SLF001
+    followups = scout_module._build_adaptive_followup_query_specs(  # noqa: SLF001
+        topic,
+        existing_specs=specs,
+        search_plan=plan,
+    )
+
+    assert plan.target_entity_types == ["grant_program"]
+    assert [lane.lane_type for lane in plan.lanes] == ["grant_funding"]
+    assert {spec.lane for spec in specs} == {"grant"}
+    assert {spec.lane for spec in followups} == {"grant"}
+
+
+def test_precise_advisory_request_stays_in_role_lane_when_search_broadens() -> None:
+    topic = (
+        "Find current remote U.S. paid consulting, fractional, or advisory opportunities "
+        "for a physician-scientist psychiatrist."
+    )
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=3)
+    specs = scout_module._build_live_query_specs(topic, search_plan=plan)  # noqa: SLF001
+    followups = scout_module._build_adaptive_followup_query_specs(  # noqa: SLF001
+        topic,
+        existing_specs=specs,
+        search_plan=plan,
+    )
+
+    assert plan.target_entity_types == ["role"]
+    assert {spec.lane for spec in specs} == {"role"}
+    assert {spec.lane for spec in followups} == {"role"}
+
+
+def test_professional_development_fallback_does_not_add_company_lanes() -> None:
+    topic = (
+        "Find current remote workshops, certifications, professional-development programs, "
+        "and networking communities in clinical AI or psychiatry."
+    )
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=3)
+    specs = scout_module._build_live_query_specs(topic, search_plan=plan)  # noqa: SLF001
+    followups = scout_module._build_adaptive_followup_query_specs(  # noqa: SLF001
+        topic,
+        existing_specs=specs,
+        search_plan=plan,
+    )
+
+    expected = {
+        "workshop_training",
+        "certification_professional_development",
+        "networking_community",
+    }
+    assert {spec.lane for spec in specs} == expected
+    assert {spec.lane for spec in followups} == expected
+
+
+def test_professional_development_coverage_followup_does_not_add_company_news() -> None:
+    topic = (
+        "Find current remote workshops, certifications, professional-development programs, "
+        "and networking communities in clinical AI or psychiatry."
+    )
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=3)
+    specs = scout_module._build_live_query_specs(topic, search_plan=plan)  # noqa: SLF001
+
+    followups, coverage = scout_module._build_coverage_followup_query_specs(  # noqa: SLF001
+        topic,
+        existing_specs=specs,
+        hits=[],
+        search_plan=plan,
+    )
+
+    assert set(coverage["expected_lanes"]) == {
+        "conference_events",
+        "people_institutions",
+    }
+    assert {spec.lane for spec in followups} == {"conference", "researcher"}
+    assert "company_growth" not in {spec.lane for spec in followups}
+
+
+def test_professional_development_request_uses_dedicated_non_role_lanes() -> None:
+    topic = (
+        "Find current remote workshops, certifications, professional-development "
+        "programs, and networking communities in clinical AI or psychiatry."
+    )
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=5)
+    specs = scout_module._build_live_query_specs(topic, search_plan=plan)  # noqa: SLF001
+
+    assert {lane.lane_type for lane in plan.lanes} == {
+        "workshop_training",
+        "certification_professional_development",
+        "networking_community",
+    }
+    assert {spec.lane for spec in specs} == {
+        "workshop_training",
+        "certification_professional_development",
+        "networking_community",
+    }
+    assert "role" not in {spec.lane for spec in specs}
+    assert scout_module._is_role_search(topic) is False  # noqa: SLF001
+    assert all("clinical research operations" not in spec.query for spec in specs)
+    followups = scout_module._build_adaptive_followup_query_specs(  # noqa: SLF001
+        topic,
+        existing_specs=specs,
+        search_plan=plan,
+    )
+    assert any("site:ecornell.cornell.edu" in spec.query for spec in followups)
+
+
+def test_professional_development_live_search_enables_page_verification_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topic = (
+        "Find current remote workshops, certifications, and networking communities "
+        "in clinical AI or psychiatry."
+    )
+    observed: dict[str, object] = {}
+
+    class Provider:
+        provider_name = "searxng"
+        dry_run = False
+
+        def validate_configuration(self) -> None:
+            return None
+
+        def search(self, query: str, *, max_results: int = 3) -> list[dict[str, str]]:
+            return []
+
+    original = scout_module._process_candidate_hits  # noqa: SLF001
+
+    def capture(*args: object, **kwargs: object) -> object:
+        observed["verify_source_pages"] = kwargs.get("verify_source_pages")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(scout_module, "_process_candidate_hits", capture)
+
+    scout_opportunities_live_search(
+        topic=topic,
+        max_results=3,
+        search_provider=Provider(),
+    )
+
+    assert observed["verify_source_pages"] is True
+
+
+def test_verified_non_company_program_reaches_ranked_results_with_action_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "4")
+    monkeypatch.setenv("KEYSTONE_ENABLE_SEARCH_COVERAGE_FOLLOWUP", "false")
+
+    class Provider:
+        provider_name = "searxng"
+        dry_run = False
+
+        def validate_configuration(self) -> None:
+            return None
+
+        def search_structured(self, request) -> list[SearchResult]:
+            if "certification" not in request.query.lower():
+                return []
+            return [
+                SearchResult(
+                    title="Certificate in Applied AI for Health Systems | Example University",
+                    link="https://example.edu/applied-ai-certificate",
+                    snippet="Online certificate program for healthcare professionals.",
+                    source="searxng",
+                )
+            ]
+
+    monkeypatch.setattr(
+        scout_module,
+        "extract_website_content",
+        lambda *_args, **_kwargs: WebsiteExtractionResult(
+            url="https://example.edu/applied-ai-certificate",
+            title="Certificate in Applied AI for Health Systems",
+            provider="trafilatura",
+            status="success",
+            text_or_markdown=(
+                "Enrollment is open for this online applied clinical AI certificate. "
+                "Eligible applicants include physicians, clinical researchers, and health "
+                "system professionals. Apply by December 15, 2026. The program is virtual."
+            ),
+            claims=["Enrollment is open through December 15, 2026."],
+        ),
+    )
+
+    result = scout_opportunities_live_search(
+        topic=(
+            "Find current remote workshops, certifications, and networking communities "
+            "in clinical AI or psychiatry."
+        ),
+        max_results=3,
+        search_provider=Provider(),
+    )
+
+    assert len(result.records) == 1, {
+        "audit_notes": result.audit_notes,
+        "filtered": [item.model_dump(mode="json") for item in result.filtered_candidates],
+        "review": [item.model_dump(mode="json") for item in result.review_candidates],
+    }
+    record = result.records[0]
+    assert record.entity_name == "Certificate in Applied AI for Health Systems"
+    assert record.entity_kind == "institute"
+    assert record.opportunity_kind == "certification_or_professional_development"
+    assert record.opportunity_status == "open"
+    assert record.deadline == "2026-12-15"
+    assert "physicians" in record.eligibility_summary
+    assert record.access_mode == "remote_or_virtual"
+    assert record.detail_verification_status == "page_verified"
+    assert record.application_or_contact_path == "https://example.edu/applied-ai-certificate"
+
+
+def test_verified_open_wording_does_not_override_a_past_deadline() -> None:
+    hit = {
+        "company_name": "Expired Clinical AI Workshop",
+        "entity_kind": "conference",
+        "source_title": "Expired Clinical AI Workshop",
+        "source_url": "https://example.test/expired-workshop",
+        "signal": (
+            "Registration open for a virtual psychiatry AI workshop. Register by June 30, 2026."
+        ),
+        "verified_excerpt": "Registration open. Register by June 30, 2026.",
+        "source_category": "conference",
+    }
+
+    reasons = scout_module._candidate_acceptance_rejection_reasons(  # noqa: SLF001
+        hit,
+        topic="Find current remote psychiatry AI workshops.",
+    )
+
+    assert any("deadline 2026-06-30 has passed" in reason for reason in reasons)
+
+
+def test_active_grant_without_requested_eligibility_is_withheld_from_final_ranking() -> None:
+    topic = (
+        "Find active behavioral-health AI grants that a small consulting company "
+        "is eligible to pursue."
+    )
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=3)
+    hit = {
+        "company_name": "Behavioral Health AI Grant",
+        "entity_kind": "grant_program",
+        "source_title": "Behavioral Health AI Grant",
+        "source_url": "https://example.test/grant",
+        "signal": "Applications open. Apply by December 20, 2026.",
+        "verified_excerpt": "Applications open. Apply by December 20, 2026.",
+        "source_category": "grant",
+    }
+
+    reasons = scout_module._detail_completeness_rejection_reasons(  # noqa: SLF001
+        hit,
+        topic=topic,
+        search_plan=plan,
+    )
+
+    assert reasons == ["applicant eligibility was not verified"]
+
+
+def test_remote_professional_program_without_access_details_is_withheld() -> None:
+    topic = "Find current remote clinical AI workshops and certification programs."
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=3)
+    hit = {
+        "company_name": "Clinical AI Workshop",
+        "entity_kind": "conference",
+        "source_title": "Clinical AI Workshop",
+        "source_url": "https://example.test/workshop",
+        "signal": "Registration open. Register by December 20, 2026.",
+        "verified_excerpt": "Registration open. Register by December 20, 2026.",
+        "source_category": "conference",
+    }
+
+    reasons = scout_module._detail_completeness_rejection_reasons(  # noqa: SLF001
+        hit,
+        topic=topic,
+        search_plan=plan,
+    )
+
+    assert reasons == ["remote or virtual access was not verified"]
+
+
+def test_non_company_opportunity_preserves_first_class_entity_name() -> None:
+    record = OpportunityRecord(
+        company_name="Clinical AI Workshop 2026",
+        entity_kind="conference",
+        opportunity_kind="workshop_or_training",
+        opportunity_type="grant or collaboration opportunity",
+        priority_score=80,
+        why_now_signal="Registration is open for a virtual workshop.",
+        recommended_next_step="Review registration details.",
+        sources=[
+            OpportunitySource(
+                title="Workshop page",
+                url="https://example.test/workshop",
+                source_type="conference",
+                supported_signal="Virtual registration is open.",
+            )
+        ],
+        keystone_fit_reason="Relevant to clinical AI professional development.",
+        outside_consulting_likelihood=50,
+        handoff_to_business_research_analyst=False,
+    )
+
+    assert record.entity_name == "Clinical AI Workshop 2026"
+    assert record.entity_kind == "conference"
+    assert record.opportunity_kind == "workshop_or_training"
+
+
+def test_portfolio_eval_dataset_covers_broad_and_precise_current_opportunities() -> None:
+    path = Path("evals/static/opportunity_scout_portfolio_cases.json")
+    cases = json.loads(path.read_text(encoding="utf-8"))
+
+    assert [case["id"] for case in cases] == [
+        "broad_remote_accessible_keystone_portfolio",
+        "precise_current_grant_no_padding",
+        "precise_remote_advisory_roles",
+        "current_workshops_certifications_networking",
+        "industry_collaboration_and_consulting",
+    ]
+    assert all(case["required_lanes"] for case in cases)
+    assert all(isinstance(case["minimum_verified_results"], int) for case in cases)
+    assert sum(case["minimum_verified_results"] for case in cases) >= 3
+    assert all(len(case["requirements"]) >= 4 for case in cases)
+    assert any("Reject expired" in item for case in cases for item in case["requirements"])
+    assert any("Allow zero results" in item for case in cases for item in case["requirements"])
+
+
+def test_portfolio_eval_prompts_route_to_every_required_opportunity_lane() -> None:
+    cases = json.loads(
+        Path("evals/static/opportunity_scout_portfolio_cases.json").read_text(encoding="utf-8")
+    )
+
+    for case in cases:
+        plan = scout_module.infer_opportunity_search_plan(case["prompt"], desired_count=8)
+        specs = scout_module._build_live_query_specs(  # noqa: SLF001
+            case["prompt"], search_plan=plan
+        )
+        lane_aliases = {
+            "conference_speaking": "conference",
+            "grant_fellowship": "grant",
+            "grant_funding": "grant",
+            "industry_collaboration": "collaboration",
+            "contract_procurement": "contract_rfp",
+            "role": "consulting_advisory",
+        }
+        routed_lanes = {lane_aliases.get(spec.lane, spec.lane) for spec in specs}
+        required_lanes = {lane_aliases.get(lane, lane) for lane in case["required_lanes"]}
+        assert required_lanes <= routed_lanes, case["id"]
+
+
+@pytest.mark.parametrize(
+    ("text", "lane", "entity_kind", "expected"),
+    [
+        (
+            "Online clinical AI certificate program",
+            "certification_professional_development",
+            "institute",
+            "certification_or_professional_development",
+        ),
+        (
+            "Virtual workshop seeking physician-scientist facilitators",
+            "workshop_training",
+            "conference",
+            "workshop_or_training",
+        ),
+        (
+            "Behavioral health professional society networking community",
+            "networking_community",
+            "conference",
+            "networking_or_professional_community",
+        ),
+        (
+            "Remote fractional clinical AI advisor",
+            "consulting_advisory",
+            "company",
+            "consulting_or_advisory",
+        ),
+        (
+            "Open NIH fellowship for clinical AI",
+            "grant_fellowship",
+            "grant_program",
+            "grant_or_fellowship",
+        ),
+    ],
+)
+def test_actionable_opportunity_kind_is_separate_from_clinical_domain(
+    text: str,
+    lane: str,
+    entity_kind: str,
+    expected: str,
+) -> None:
+    assert (
+        scout_module._opportunity_kind_from_text(  # noqa: SLF001
+            text,
+            lane=lane,
+            entity_kind=entity_kind,
+        )
+        == expected
+    )
+
+
+def test_job_posting_from_researcher_lane_is_classified_as_role() -> None:
+    assert (
+        scout_module._entity_kind_from_lane(  # noqa: SLF001
+            lane="researcher",
+            title="Researcher Position - Adult Division",
+            url="https://recruit.example.edu/JPF10980",
+            snippet="Apply now for this open role in a university psychiatry department.",
+            entity_hint="researcher",
+        )
+        == "role"
+    )
+
+
+def test_long_role_title_is_not_rejected_as_article_headline() -> None:
+    hit = {
+        "company_name": "Psychiatry Operations Associate at Two Chairs - Remote",
+        "entity_kind": "role",
+        "source_title": "Psychiatry Operations Associate at Two Chairs - Remote",
+        "source_url": "https://jobs.example.test/two-chairs-operations",
+        "signal": "Apply now for this paid remote U.S. role in behavioral health operations.",
+        "source_category": "job_posting",
+    }
+
+    reasons = scout_module._candidate_acceptance_rejection_reasons(  # noqa: SLF001
+        hit,
+        topic="Find current remote U.S. advisory roles in behavioral health.",
+    )
+
+    assert not any("article headline" in reason for reason in reasons)
+    assert not any("not a real organization" in reason for reason in reasons)
+
+
+def test_closed_and_stale_formal_opportunities_are_rejected_before_scoring() -> None:
+    closed = {
+        "company_name": "Example Workshop 2026",
+        "entity_kind": "conference",
+        "source_title": "Clinical AI Workshop",
+        "source_url": "https://example.test/workshop",
+        "signal": "Registration closed; this workshop is no longer accepting applications.",
+        "source_category": "conference",
+        "published_at": "2026-02-01",
+    }
+    stale = {
+        "company_name": "Example Grant 2023",
+        "entity_kind": "grant_program",
+        "source_title": "Behavioral Health AI Grant",
+        "source_url": "https://example.test/grant-2023",
+        "signal": "Funding opportunity for behavioral health AI research.",
+        "source_category": "grant",
+        "published_at": "2023-03-01",
+    }
+
+    closed_reasons = scout_module._candidate_acceptance_rejection_reasons(  # noqa: SLF001
+        closed,
+        topic="find current workshops",
+    )
+    stale_reasons = scout_module._candidate_acceptance_rejection_reasons(  # noqa: SLF001
+        stale,
+        topic="find current grants",
+    )
+
+    assert any("closed, expired, or canceled" in reason for reason in closed_reasons)
+    assert any("older than 18 months" in reason for reason in stale_reasons)
+
+
+def test_specific_formal_candidate_without_status_is_retained_for_detail_verification() -> None:
+    hit = {
+        "company_name": "PAR-26-123",
+        "entity_kind": "grant_program",
+        "source_title": "Behavioral Health AI Research Opportunity PAR-26-123",
+        "source_url": "https://grants.nih.gov/grants/guide/pa-files/PAR-26-123.html",
+        "signal": "Research opportunity supporting behavioral health AI evaluation.",
+        "source_category": "grant",
+    }
+    rejection_reasons = scout_module._candidate_acceptance_rejection_reasons(  # noqa: SLF001
+        hit,
+        topic="Find active behavioral-health AI grants.",
+    )
+    review_reasons = scout_module._candidate_acceptance_review_reasons(  # noqa: SLF001
+        hit,
+        rejection_reasons=rejection_reasons,
+    )
+
+    assert any("lacks active opportunity evidence" in reason for reason in rejection_reasons)
+    assert any("page-level status" in reason for reason in review_reasons)
+
+
+def test_formal_grant_identifier_is_not_rejected_as_article_or_company_name() -> None:
+    hit = {
+        "company_name": "PAR-25-310",
+        "entity_kind": "grant_program",
+        "source_title": (
+            "PAR-25-310: Accelerating Solutions to Improve Access and Quality of "
+            "Empirically-Supported Practices for Youth Mental Health"
+        ),
+        "source_url": "https://grants.nih.gov/grants/guide/pa-files/PAR-25-310.html",
+        "signal": "Official NIH notice of funding opportunity; applications are open.",
+        "source_category": "grant",
+    }
+
+    reasons = scout_module._candidate_acceptance_rejection_reasons(
+        hit,
+        topic="Find one current U.S. mental-health grant.",
+    )
+
+    assert not any("article headline" in reason for reason in reasons)
+    assert not any("real organization" in reason for reason in reasons)
+
+
+def test_behavioral_health_grant_does_not_require_company_level_ai_keywords() -> None:
+    hit = {
+        "company_name": "RFA-MH-27-180",
+        "entity_kind": "grant_program",
+        "source_title": "RFA-MH-27-180: Behavioral Health Implementation Research",
+        "source_url": "https://grants.nih.gov/example",
+        "signal": (
+            "Official NIMH notice of funding opportunity for behavioral-health "
+            "implementation and evidence generation; applications are open."
+        ),
+        "source_category": "grant",
+    }
+
+    reasons = scout_module._topic_relevance_rejection_reasons(
+        hit,
+        topic=(
+            "Find a behavioral-health AI, clinical AI, neuroinformatics, or evidence "
+            "generation grant relevant to KNI."
+        ),
+    )
+
+    assert not any("AI company topic" in reason for reason in reasons)
 
 
 def test_strict_role_live_search_does_not_pad_with_weak_adjacent_result() -> None:
@@ -714,6 +1354,79 @@ def test_build_opportunity_scout_agent_can_detach_tools() -> None:
     assert agent.tools == []
 
 
+def test_retrieved_synthesis_agent_is_compact_tool_free_and_output_capped() -> None:
+    agent = build_opportunity_scout_synthesis_agent(max_results=1)
+
+    assert agent.tools == []
+    assert len(agent.instructions) < 35_000
+    assert "Use only the supplied retrieved evidence" in agent.instructions
+    assert "## Opportunity Scout Tools" not in agent.instructions
+    assert getattr(agent.model_settings, "max_tokens", None) == 1800
+    assert getattr(agent.model_settings, "verbosity", None) == "low"
+    reasoning = getattr(agent.model_settings, "reasoning", None)
+    assert getattr(reasoning, "effort", None) == "low"
+
+
+def test_compact_synthesis_merges_judgment_onto_verified_record() -> None:
+    retrieved = scout_opportunities_fixture(
+        fixture=FIXTURES / "opportunity_scout_high_confidence_sources.json",
+        max_results=1,
+    )
+    record = retrieved.records[0]
+    decision = OpportunityScoutSynthesisDecision(
+        record_key=record.canonical_entity_key or record.company_name,
+        include=True,
+        why_now_signal="The supplied evidence confirms a current decision window.",
+        keystone_fit_reason="The verified opportunity matches KNI's evaluation capabilities.",
+        recommended_next_step=(
+            "Review the official requirements and prepare an internal go/no-go note."
+        ),
+    )
+    synthesis = OpportunityScoutSynthesis(
+        decisions=[decision],
+        audit_summary="One verified opportunity is decision-ready.",
+    )
+
+    merged = apply_opportunity_scout_synthesis(retrieved, synthesis)
+
+    assert len(merged.records) == 1
+    assert merged.records[0].company_name == record.company_name
+    assert merged.records[0].sources == record.sources
+    assert merged.records[0].keystone_fit_reason == decision.keystone_fit_reason
+    assert "One verified opportunity is decision-ready." in merged.audit_notes
+    assert merged.outreach_generated is False
+
+
+def test_compact_synthesis_cannot_select_unknown_or_generate_outreach() -> None:
+    retrieved = scout_opportunities_fixture(
+        fixture=FIXTURES / "opportunity_scout_high_confidence_sources.json",
+        max_results=1,
+    )
+    synthesis = OpportunityScoutSynthesis(
+        decisions=[
+            OpportunityScoutSynthesisDecision(
+                record_key="unknown-record",
+                include=True,
+                why_now_signal="Current.",
+                keystone_fit_reason="Potential fit.",
+                recommended_next_step="Review.",
+            )
+        ],
+        audit_summary="Unknown selection.",
+    )
+
+    merged = apply_opportunity_scout_synthesis(retrieved, synthesis)
+
+    assert merged.records == []
+    assert any("unknown-record" in note for note in merged.audit_notes)
+    with pytest.raises(ValueError, match="must not generate outreach"):
+        OpportunityScoutSynthesis(
+            decisions=[],
+            audit_summary="Unsafe.",
+            outreach_generated=True,
+        )
+
+
 def test_opportunity_prompt_keeps_event_type_and_geography_source_bound() -> None:
     instructions = build_opportunity_scout_agent(attach_tools=False).instructions
     normalized = " ".join(str(instructions).split())
@@ -971,7 +1684,7 @@ def test_source_verification_uses_public_opportunity_guardrail_context(
             status="success",
             text_or_markdown=(
                 "Behavioral health AI solicitation with proposal deadline June 30, 2026. "
-                "For-profit vendors may respond."
+                "For-profit vendors may respond. " * 40
             ),
             claims=["Behavioral health AI solicitation with proposal deadline June 30, 2026."],
         )
@@ -1023,6 +1736,98 @@ def test_source_verification_guardrail_failure_is_nonfatal(
     assert any("guardrail blocked extraction" in note for note in notes)
 
 
+def test_source_verification_cache_reuses_unique_page_across_search_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "1")
+    calls: list[str] = []
+
+    def fake_extract(url: str, **_kwargs) -> WebsiteExtractionResult:
+        calls.append(url)
+        return WebsiteExtractionResult(
+            url=url,
+            title="Active grant",
+            provider="trafilatura",
+            status="success",
+            text_or_markdown=(
+                "Active behavioral health AI grant. Small businesses are eligible. "
+                "Applications are due December 15, 2026."
+            ),
+            claims=[],
+        )
+
+    monkeypatch.setattr(scout_module, "_extract_opportunity_verification_page", fake_extract)
+    hit = {
+        "company_name": "Example Grant",
+        "source_title": "Active grant",
+        "source_url": "https://example.test/grant",
+        "signal": "Official grant notice.",
+    }
+    cache: dict[str, dict[str, object]] = {}
+
+    first, _first_notes = scout_module._verify_source_hits(
+        [hit],
+        verify_source_pages=True,
+        verification_cache=cache,
+    )
+    second, second_notes = scout_module._verify_source_hits(
+        [hit],
+        verify_source_pages=True,
+        verification_cache=cache,
+    )
+
+    assert calls == ["https://example.test/grant"]
+    assert first[0]["verified_excerpt"] == second[0]["verified_excerpt"]
+    assert any("Reused verified source page" in note for note in second_notes)
+
+
+def test_verification_excerpt_retains_late_formal_opportunity_details() -> None:
+    text = (
+        "Official NIH funding opportunity overview. "
+        + ("General program description. " * 120)
+        + "Application Due Dates\nJune 15, 2026\nOctober 15, 2026\n"
+        + ("Additional requirements. " * 120)
+        + "For-Profit Organizations\nSmall Businesses\n"
+        + "Applications must be submitted electronically through the How to Apply guide."
+    )
+
+    excerpt = scout_module._opportunity_verification_excerpt(text)
+
+    assert len(excerpt) <= 5000
+    assert "October 15, 2026" in excerpt
+    assert "For-Profit Organizations" in excerpt
+    assert "Applications must be submitted electronically" in excerpt
+
+
+def test_opportunity_deadline_uses_next_upcoming_date_from_due_date_table() -> None:
+    text = (
+        "Application Due Dates\nFebruary 18, 2025\nJune 15, 2026\n"
+        "October 15, 2026\nFebruary 17, 2027"
+    )
+
+    assert scout_module._opportunity_deadline_from_text(text) == date(2026, 10, 15)
+
+
+def test_opportunity_details_prioritize_explicit_for_profit_eligibility_block() -> None:
+    details = scout_module._opportunity_detail_fields(
+        {
+            "source_title": "Official NIH funding opportunity",
+            "source_url": "https://grants.nih.gov/example",
+            "signal": "Applications are open.",
+            "verified_excerpt": (
+                "Application Due Dates October 15, 2026. "
+                "For-Profit Organizations - Small Businesses - For-Profit Organizations "
+                "(Other than Small Businesses). Applications must be submitted electronically."
+            ),
+        }
+    )
+
+    assert details["deadline"] == "2026-10-15"
+    assert "For-Profit Organizations" in details["eligibility_summary"]
+    assert "Small Businesses" in details["eligibility_summary"]
+    assert details["access_mode"] == "remote_or_virtual"
+
+
 def test_opportunity_fixture_can_validate() -> None:
     data = json.loads((FIXTURES / "sample_lead_curebase.json").read_text(encoding="utf-8"))
     opportunity = Opportunity(
@@ -1040,6 +1845,27 @@ def test_scout_fixture_returns_top_5_or_fewer() -> None:
     result = scout_opportunities_fixture(max_results=5)
 
     assert len(result.records) <= 5
+    assert result.outreach_generated is False
+
+
+def test_diverse_behavioral_health_ai_fixture_returns_ranked_sources_without_padding() -> None:
+    result = scout_opportunities_fixture(
+        topic="Find behavioral-health AI opportunities relevant to KNI.",
+        max_results=5,
+    )
+
+    assert 0 < len(result.records) <= 5
+    assert [record.priority_score for record in result.records] == sorted(
+        (record.priority_score for record in result.records),
+        reverse=True,
+    )
+    assert all(record.sources for record in result.records)
+    assert all(not record.weak_evidence_reasons for record in result.records)
+    assert all(record.recommended_next_step for record in result.records)
+    assert result.deduped_candidate_count == len(result.records)
+    assert result.decision_trace is not None
+    assert "no_outreach_generation" in result.decision_trace.safety_gates_applied
+    assert result.dry_run is True
     assert result.outreach_generated is False
 
 
@@ -2616,7 +3442,7 @@ def test_live_search_passes_provider_specific_query_hints() -> None:
 
     assert requests
     assert {request.country for request in requests} == {"US"}
-    assert {request.language for request in requests} == {"en"}
+    assert {request.language for request in requests} == {None}
     assert any(request.source == "news" for request in requests)
     assert any(request.time_range == "recent" for request in requests)
 
@@ -2720,6 +3546,59 @@ def test_live_search_runs_coverage_followup_for_missing_source_lanes() -> None:
 
     assert any("site:reporter.nih.gov" in query for query in provider.queries)
     assert any("Coverage-aware search ran" in note for note in result.audit_notes)
+
+
+def test_remote_compatible_grant_request_does_not_activate_role_filters() -> None:
+    topic = "Find one current remote-compatible grant or fellowship opportunity."
+
+    assert scout_module._is_role_search(topic) is False
+    assert scout_module._parse_hard_filters(topic).strict_verification is False
+
+
+def test_explicitly_negated_role_wording_keeps_grant_request_out_of_role_lane() -> None:
+    topic = (
+        "Find one current grant or fellowship opportunity. Remote-compatible "
+        "administration is preferred, but this is not a job or role search."
+    )
+
+    assert scout_module._is_role_search(topic) is False
+    assert scout_module._parse_hard_filters(topic).strict_verification is False
+
+
+def test_grant_lane_precedes_incidental_conference_or_trial_markers() -> None:
+    assert (
+        scout_module._entity_kind_from_lane(
+            lane="grant",
+            title="PAR-25-182: Mental Disorders R61/R33 Clinical Trial Required",
+            url="https://grants.nih.gov/grants/guide/pa-files/PAR-25-182.html",
+            snippet="NIH notice of funding opportunity.",
+            entity_hint="grant_program",
+        )
+        == "grant_program"
+    )
+
+
+def test_live_search_deadline_returns_initial_partial_evidence_without_followups() -> None:
+    provider = FakeCoverageFollowupProvider()
+
+    result = scout_opportunities_live_search(
+        topic="find behavioral health AI grant opportunities",
+        max_results=2,
+        search_provider=provider,
+        retrieval_deadline_seconds=0,
+        clock=lambda: 0.0,
+    )
+
+    assert result.retrieval_diagnostics == {
+        "status": "partial",
+        "deadline_seconds": 0.0,
+        "elapsed_seconds": 0.0,
+        "stopped_before_stage": "coverage_followup",
+        "query_count": len(result.search_queries),
+        "unique_pages_cached": 1,
+    }
+    assert not any("site:reporter.nih.gov" in query for query in provider.queries)
+    assert any("returning bounded partial evidence" in note for note in result.audit_notes)
 
 
 def test_live_search_rejects_publication_and_generic_program_noise() -> None:

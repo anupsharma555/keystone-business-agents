@@ -92,6 +92,41 @@ def test_chief_of_staff_automation_audit_plans_internal_writes(tmp_path: Path) -
     assert "airtable" in destinations
 
 
+def test_diverse_current_operations_audit_ranks_failures_and_stays_read_only(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+    ensure_default_automation_inventory(store)
+    store.save_automation_run(
+        AutomationRun(
+            automation_id="auto_gmail_triage",
+            automation_name="Gmail Triage",
+            stage="read-only-triage",
+            status=AutomationRunStatus.FAILED,
+            failure_summary="Synthetic credential readiness check failed.",
+            next_safe_action="Repair the local credential boundary and rerun dry-run checks.",
+        )
+    )
+
+    result = plan_chief_of_staff_request(
+        "Audit current operations and tell me what matters next.",
+        database_url=_database_url(tmp_path),
+    )
+
+    assert result.automation_report is not None
+    assert result.automation_report.recent_runs[0].status == AutomationRunStatus.FAILED
+    assert result.automation_report.findings[0].severity.value == "error"
+    assert result.recommended_actions[0] == (
+        "Resolve failing automation runs before enabling live writes."
+    )
+    assert "1 recent run" in result.summary
+    assert result.approval_required is True
+    assert result.human_review_required is True
+    assert result.send_enabled is False
+    assert result.slack_post_allowed is False
+    assert result.write_requests == []
+
+
 def test_publishers_are_dry_run_and_keep_sqlite_canonical(tmp_path: Path) -> None:
     report = build_automation_inventory_report(database_url=_database_url(tmp_path))
 

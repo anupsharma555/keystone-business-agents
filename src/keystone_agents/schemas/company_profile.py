@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
+from keystone_agents.schemas.request_coverage import RequestCoverage
 from keystone_agents.source_quality import (
     ResearchCompletenessScore,
     SourceQualityScore,
@@ -280,6 +281,7 @@ class CompanyResearchFocusedBrief(BaseModel):
     brief_purpose: Literal["partnership_or_advisory_relevance"] = (
         "partnership_or_advisory_relevance"
     )
+    answer: str = ""
     product: str = ""
     customers: str = ""
     traction_signals: str = ""
@@ -297,6 +299,7 @@ class CompanyResearchFocusedBrief(BaseModel):
 
     @field_validator(
         "company_name",
+        "answer",
         "product",
         "customers",
         "traction_signals",
@@ -455,6 +458,7 @@ class CompanyProfile(BaseModel):
     missing_evidence: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     missing_information: list[str] = Field(default_factory=list)
+    request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
 
     @property
     def company_name(self) -> str:

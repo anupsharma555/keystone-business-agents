@@ -15,6 +15,7 @@ GMAIL_TEST_SEND_RECIPIENT_ENV = "KEYSTONE_GMAIL_TEST_SEND_RECIPIENT"
 GMAIL_TEST_SEND_MAX_ENV = "KEYSTONE_GMAIL_TEST_SEND_MAX"
 GMAIL_DRAFT_ATTACHMENT_ENV = "KEYSTONE_GMAIL_ALLOW_DRAFT_ATTACHMENTS"
 GMAIL_DRAFT_ATTACHMENT_RECIPIENT_ENV = "KEYSTONE_GMAIL_DRAFT_ATTACHMENT_RECIPIENT"
+GMAIL_OPERATOR_APPROVAL_ENV = "KEYSTONE_GMAIL_OPERATOR_APPROVAL_REFERENCE"
 
 
 class GmailDraftProvider(Protocol):
@@ -87,6 +88,154 @@ class GmailDraftProvider(Protocol):
     ) -> dict[str, Any]: ...
 
     def get_message(self, message_id: str) -> dict[str, Any]: ...
+
+
+def execute_gmail_test_draft_lifecycle(
+    gmail: GmailDraftProvider,
+    *,
+    marker: str,
+    expected_account: str,
+    recipient: str,
+    approval_reference: str,
+) -> dict[str, Any]:
+    """Create, verify, update, verify, and remove one exact marked test draft."""
+
+    clean_marker = " ".join(str(marker or "").split()).strip()
+    account = expected_account.strip()
+    to = recipient.strip()
+    approval = str(
+        approval_reference or os.getenv(GMAIL_OPERATOR_APPROVAL_ENV, "")
+    ).strip()
+    if GMAIL_TEST_DRAFT_MARKER not in clean_marker:
+        raise ValueError(
+            f"Gmail test-draft lifecycle marker must contain {GMAIL_TEST_DRAFT_MARKER}."
+        )
+    if not account or not to:
+        raise ValueError(
+            "Gmail test-draft lifecycle requires an exact account and draft recipient."
+        )
+    if not approval:
+        raise RuntimeError(
+            "Gmail test-draft lifecycle requires a non-empty approval_reference."
+        )
+    if gmail.live and not _truthy(os.getenv(GMAIL_TEST_DRAFT_DELETE_ENV)):
+        raise RuntimeError(
+            "Gmail test-draft lifecycle requires its cleanup gate before create. "
+            f"Set {GMAIL_TEST_DRAFT_DELETE_ENV}=true for the approved lifecycle window."
+        )
+
+    draft_id = ""
+    create_result: dict[str, Any] = {}
+    update_result: dict[str, Any] = {}
+    delete_result: dict[str, Any] = {}
+    failure = ""
+    try:
+        create_result = execute_approved_gmail_draft_action(
+            gmail,
+            to=to,
+            subject=f"{clean_marker} operational validation",
+            body=(
+                f"{clean_marker}\n"
+                "Created for bounded Gmail draft lifecycle validation."
+            ),
+            expected_account=account,
+            approval_reference=f"{approval}:create",
+        )
+        draft_id = str(create_result.get("draft_id") or "").strip()
+        if not gmail.live:
+            return {
+                "status": "dry-run",
+                "operation": "test_draft_lifecycle",
+                "required_marker": GMAIL_TEST_DRAFT_MARKER,
+                "approval_reference": approval,
+                "openai_requests": 0,
+                "sent": False,
+                "send_enabled": False,
+                "create": _gmail_lifecycle_step_receipt(create_result),
+            }
+        if not draft_id or not _gmail_verification_passed(create_result):
+            failure = "Gmail test-draft create did not pass read-back verification."
+        else:
+            update_result = execute_approved_gmail_draft_action(
+                gmail,
+                to=to,
+                subject=f"{clean_marker} operational validation updated",
+                body=f"{clean_marker}\nModified in place and ready for verified cleanup.",
+                expected_account=account,
+                approval_reference=f"{approval}:update",
+                draft_id=draft_id,
+            )
+            if not _gmail_verification_passed(update_result):
+                failure = "Gmail test-draft update did not pass read-back verification."
+    except Exception as exc:  # cleanup must still run after a partial lifecycle
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        if gmail.live and draft_id:
+            try:
+                delete_result = delete_approved_gmail_test_draft(
+                    gmail,
+                    draft_id=draft_id,
+                    expected_account=account,
+                    approval_reference=f"{approval}:delete",
+                )
+            except Exception as exc:
+                delete_result = {
+                    "status": "failed",
+                    "operation": "delete_test_draft",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "verification": {"passed": False},
+                    "sent": False,
+                    "send_enabled": False,
+                }
+
+    create_passed = _gmail_verification_passed(create_result)
+    update_passed = _gmail_verification_passed(update_result)
+    cleanup_passed = _gmail_verification_passed(delete_result)
+    passed = create_passed and update_passed and cleanup_passed and not failure
+    return {
+        "status": "success" if passed else "failed",
+        "operation": "test_draft_lifecycle",
+        "draft_id": draft_id,
+        "required_marker": GMAIL_TEST_DRAFT_MARKER,
+        "approval_reference": approval,
+        "failure": failure,
+        "openai_requests": 0,
+        "sent": False,
+        "send_enabled": False,
+        "create": _gmail_lifecycle_step_receipt(create_result),
+        "update": _gmail_lifecycle_step_receipt(update_result),
+        "delete": _gmail_lifecycle_step_receipt(delete_result),
+        "verification": {
+            "passed": passed,
+            "create_read_back": create_passed,
+            "same_draft_update_read_back": update_passed,
+            "draft_absent_after_cleanup": cleanup_passed,
+        },
+    }
+
+
+def _gmail_verification_passed(result: dict[str, Any]) -> bool:
+    verification = result.get("verification")
+    return bool(isinstance(verification, dict) and verification.get("passed"))
+
+
+def _gmail_lifecycle_step_receipt(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: result.get(key)
+        for key in (
+            "status",
+            "operation",
+            "draft_id",
+            "approval_reference",
+            "before",
+            "after",
+            "verification",
+            "reason",
+            "sent",
+            "send_enabled",
+        )
+        if key in result
+    }
 
 
 def execute_approved_gmail_draft_action(

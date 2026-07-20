@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import pytest
 
+from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.target_action_matrix import (
+    ContextualTargetActionCase,
     TargetActionCase,
+    contextual_target_action_scorecard,
     target_action_scorecard,
 )
 
@@ -88,3 +91,39 @@ def test_approval_required_scorecard_cases_do_not_enable_external_side_effects()
         if case.expected_intent == "blocked_send":
             assert plan.task_objective == "blocked_side_effect"
             assert plan.planner_warnings
+
+
+def test_contextual_scorecard_covers_supported_and_missing_tool_contracts() -> None:
+    cases = contextual_target_action_scorecard()
+
+    assert 5 <= len(cases) <= 11
+    assert len({case.case_id for case in cases}) == len(cases)
+    assert any(case.tool_contract_status.startswith("unsupported") for case in cases)
+    assert any("supported" in case.tool_contract_status for case in cases)
+    for case in cases:
+        assert case.prior_context
+        assert case.follow_up
+        assert case.target_action
+        assert case.required_tool_change
+        assert case.expected_safety_boundary
+
+
+@pytest.mark.parametrize(
+    "case",
+    contextual_target_action_scorecard(),
+    ids=[case.case_id for case in contextual_target_action_scorecard()],
+)
+def test_contextual_scorecard_routes_follow_up_to_source_owner(
+    case: ContextualTargetActionCase,
+) -> None:
+    plan = resolve_manual_request_plan(
+        case.follow_up,
+        requested_agent="chief_of_staff",
+        workflow_state={
+            "recent_slack_thread": [{"summary": case.prior_context}],
+            "slack_context": {"thread_ts": "1715366400.000100"},
+        },
+    )
+
+    assert plan.target_agent == case.owner_agent
+    assert plan.intent == case.expected_intent

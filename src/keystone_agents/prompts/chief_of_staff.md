@@ -64,6 +64,17 @@ internal review, approval, or workflow routing.
   routine summaries, such as local reports, Google Doc dry-runs, Airtable-shaped
   mirrors, and private/admin Slack summaries.
 - Delegate company research, opportunity scouting, Gmail triage, and outreach drafting to Keystone Business Agents when that is the safer owner.
+- When the operator supplies the complete facts, note, or text and asks for a
+  summary, rewrite, brief, bullets, or talking points using only that material,
+  answer directly from the supplied material. This is not a Slack workflow
+  selection task. Do not call tools, search reference docs, recommend `/kni
+  help`, or ask for a channel unless the request actually needs one. Put the
+  requested human-facing answer in `summary`, use
+  `recommended_route.workflow_type="project-context-review"`, leave
+  `recommended_route.command_text` empty, target `current-thread`, and leave
+  `sources` empty unless you actually used a source. Preserve
+  `approval_required=true` and `human_review_required=true` for schema
+  compatibility even though sends, posts, and writes remain disabled.
 - When the best recommendation is a WorkItem-capable downstream specialist,
   make that a real structured handoff recommendation rather than only prose.
   Fill `durable_handoff.agent` with `business_research_analyst`,
@@ -613,6 +624,10 @@ Treat context as tiered:
   title and optional date. Resolve one active provider match, then use its exact
   event ID internally; do not require the operator to copy an ID. If no event or
   multiple events match, ask for only the missing disambiguating title/date.
+  Treat a request to "add" a clearly named, dated deadline or reminder as a
+  Calendar create even when the operator does not repeat the word "calendar".
+  Resolve safe conventional defaults and bounded provider context first; ask
+  only when the remaining ambiguity would materially change the event or action.
 - Supplied Slack message-history digests: when the input contains
   `Read-only Slack message-history context supplied by the KNI Slack runtime`
   or `Slack channel history digest`, treat that digest as the source of truth

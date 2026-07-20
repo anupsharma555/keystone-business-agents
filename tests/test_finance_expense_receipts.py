@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from keystone_agents.finance_expense_receipts import (
+    _resolve_local_executable,
     extract_finance_receipt_evidence,
     finance_expense_receipt_field_hints,
     finance_expense_receipt_provider_context,
@@ -13,6 +14,21 @@ from keystone_agents.finance_expense_receipts import (
     match_receipt_evidence_to_airtable_fields,
     parse_finance_receipt_text,
 )
+
+
+def test_resolve_local_executable_uses_absolute_fallback_when_path_is_minimal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    helper = tmp_path / "pdftotext"
+    helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    helper.chmod(0o700)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    assert _resolve_local_executable(
+        "pdftotext",
+        fallback_paths=(str(helper),),
+    ) == str(helper)
 
 
 def test_infer_business_expense_receipt_target_from_airtable_ask() -> None:
@@ -91,7 +107,7 @@ def test_parse_finance_receipt_text_extracts_example_print_fields() -> None:
 
     assert parsed["vendor"] == "Example Print Inc."
     assert parsed["receipt_date"] == "2026-06-28"
-    assert parsed["estimated_tax_periods"] == "Q3"
+    assert parsed["estimated_tax_periods"] == "3"
     assert parsed["order_number"] == "1002003"
     assert parsed["description"] == "Business Cards"
     assert parsed["quantity"] == "50"
@@ -113,7 +129,7 @@ def test_extract_finance_receipt_evidence_reads_supplied_example_print_pdf() -> 
     assert evidence.extraction_method == "pdftotext"
     assert evidence.vendor == "Example Print Inc."
     assert evidence.receipt_date == "2026-06-28"
-    assert evidence.estimated_tax_periods == "Q3"
+    assert evidence.estimated_tax_periods == "3"
     assert evidence.order_number == "1002003"
     assert evidence.total == "76.80"
     assert evidence.currency == "USD"
@@ -215,7 +231,7 @@ def test_match_receipt_evidence_to_airtable_fields_uses_exact_schema() -> None:
     assert mapping["fields"]["Expense Client/Vendor"] == "Example Print Inc."
     assert mapping["fields"]["Item"] == "Business Cards"
     assert mapping["fields"]["Date of Expense"] == "2026-06-28"
-    assert mapping["fields"]["Estimated Tax Periods"] == "Q3"
+    assert mapping["fields"]["Estimated Tax Periods"] == "3"
     assert mapping["fields"]["Amount"] == 31.0
     assert mapping["fields"]["Total Expenses"] == 76.8
     assert mapping["fields"]["Receipt Available"] is True
@@ -229,3 +245,36 @@ def test_match_receipt_evidence_to_airtable_fields_uses_exact_schema() -> None:
     assert "Payment Method" not in mapping["fields"]
     assert mapping["unmapped_receipt_fields"]["Shipping or Fees"] == "45.80"
     assert any("Payment Method" in note for note in mapping["review_notes"])
+
+
+def test_receipt_correction_is_an_update_not_a_create() -> None:
+    target = infer_finance_expense_receipt_target(
+        "Correct the Airtable Personal Expenses receipt record "
+        "recReceiptKeep123 and move Estimated Tax Periods from Q3 to 3."
+    )
+
+    assert target is not None
+    assert target.table == "Personal Expenses"
+    assert target.operation == "update"
+
+
+def test_receipt_cleanup_verification_is_read_only_despite_record_ids() -> None:
+    target = infer_finance_expense_receipt_target(
+        "Verify the Airtable Personal Expenses receipt cleanup only; do not modify "
+        "anything. Confirm recReceiptKeep123 retains receipt.pdf and that "
+        "recReceiptDuplicate456 is absent."
+    )
+
+    assert target is not None
+    assert target.operation == "read"
+
+
+def test_receipt_update_with_no_create_constraint_remains_an_update() -> None:
+    target = infer_finance_expense_receipt_target(
+        "Update Airtable Personal Expenses record recReceiptKeep123. Set Item to "
+        "Linear Basic and preserve receipt.pdf. Do not create any record or field "
+        "value. Verify the same ID."
+    )
+
+    assert target is not None
+    assert target.operation == "update"

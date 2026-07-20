@@ -181,8 +181,15 @@ def classify_source_lanes(
             "professor",
             "researcher",
             "institute",
+            "university",
             "medical school",
             "department of",
+            "training",
+            "certification",
+            "certificate",
+            "professional development",
+            "professional society",
+            "consortium",
         )
     ):
         lanes.append("people_institutions")
@@ -320,9 +327,10 @@ def required_source_lanes_for_opportunity(
 
     text = " ".join([request_text, " ".join(target_entity_types), " ".join(objectives)]).lower()
     lanes: list[str] = []
-    if any(
+    company_targeted = "company" in {str(item).lower() for item in target_entity_types}
+    if company_targeted or any(
         term in text
-        for term in ("broad company", "company discovery", "growth", "advisory", "partnership")
+        for term in ("broad company", "company discovery", "company growth", "partnership")
     ):
         lanes.extend(["company_site", "press_news"])
     if any(term in text for term in ("role", "job", "hiring", "career")):
@@ -348,7 +356,23 @@ def required_source_lanes_for_opportunity(
         )
     ):
         lanes.append("conference_events")
-    if any(term in text for term in ("researcher", "institute", "university", "faculty")):
+    if any(
+        term in text
+        for term in (
+            "researcher",
+            "institute",
+            "university",
+            "faculty",
+            "training",
+            "certification",
+            "certificate",
+            "professional development",
+            "networking",
+            "professional society",
+            "consortium",
+            "community",
+        )
+    ):
         lanes.append("people_institutions")
     if any(term in text for term in ("fda", "cms", "hhs", "regulatory")):
         lanes.append("regulatory")

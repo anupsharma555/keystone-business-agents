@@ -108,6 +108,10 @@ route or perform only scoped internal artifact operations inside `KNIOps`.
   no downstream handoff, or source-backed evidence, make those constraints
   visible in the specialist brief. Do not soften exact-match requirements into
   broad discovery.
+- Treat negative capability clauses as execution pruning, never as standalone
+  blockers. Remove the forbidden tool, owner, or stage; do not turn that removal
+  into clarification, approval, unsupported-route, or WorkItem requirements
+  when the remaining positive task is feasible.
 - For broad or deep web-search requests, preserve the full search intent in the
   specialist brief: the topic/query, requested search depth, selected-output
   shape, source URL visibility, provider-diagnostics or metadata requirements,

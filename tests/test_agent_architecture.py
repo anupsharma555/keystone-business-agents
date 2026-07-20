@@ -279,6 +279,130 @@ def test_airtable_attachment_tools_distinguish_https_urls_from_local_paths() -> 
     assert "never use this tool for a URL" in upload_description
 
 
+def test_airtable_receipt_create_exposes_only_composite_lifecycle_tool() -> None:
+    from keystone_agents.agents.airtable_context import build_airtable_context_agent
+
+    agent = build_airtable_context_agent(
+        request_text=(
+            "Add this attached receipt as exactly one personal expense in Airtable. "
+            "Read the PDF, map receipt-backed fields to Personal Expenses, attach the "
+            "PDF, and verify the created record and attachment. /tmp/receipt.pdf"
+        ),
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {"airtable_create_expense_from_receipt"}
+
+
+def test_airtable_receipt_update_cannot_expose_create_tools() -> None:
+    from keystone_agents.agents.airtable_context import build_airtable_context_agent
+
+    agent = build_airtable_context_agent(
+        request_text=(
+            "Correct the Airtable Personal Expenses receipt record "
+            "recReceiptKeep123. Remove Q3 and use existing period 3."
+        ),
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {
+        "airtable_get_base_schema",
+        "airtable_read_records",
+        "airtable_reconcile_duplicate_expense",
+        "airtable_write_record",
+    }
+
+
+def test_airtable_receipt_verification_exposes_only_read_tools() -> None:
+    from keystone_agents.agents.airtable_context import build_airtable_context_agent
+
+    agent = build_airtable_context_agent(
+        request_text=(
+            "Verify the Airtable Personal Expenses receipt cleanup only; do not "
+            "modify anything. Confirm recReceiptKeep123 retains receipt.pdf and "
+            "recReceiptDuplicate456 is absent."
+        ),
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {
+        "airtable_get_base_schema",
+        "airtable_read_records",
+    }
+
+
+def test_zotero_natural_note_sequence_exposes_composite_write_tool() -> None:
+    from keystone_agents.agents.zotero_context import build_zotero_context_agent
+
+    agent = build_zotero_context_agent(
+        request_text=(
+            "Create one temporary standalone Zotero note containing KBA_TEST_NOTE, "
+            "confirm that it exists, change that same note, confirm the change, then "
+            "delete only that temporary note and confirm it is gone."
+        ),
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert "zotero_test_note_lifecycle" in _tool_names(agent)
+
+
+def test_google_doc_natural_test_sequence_exposes_only_composite_write_tool() -> None:
+    from keystone_agents.agents.google_workspace_context import (
+        build_google_workspace_context_agent,
+    )
+
+    agent = build_google_workspace_context_agent(
+        request_text=(
+            "Create a Google Doc titled KBA_TEST_DOC_VALIDATION in KNIOps, put one "
+            "validation sentence in it, confirm it, then move that same document to "
+            "trash and confirm it is trashed."
+        ),
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {"google_doc_test_lifecycle"}
+
+
+def test_google_doc_make_and_drive_trash_sequence_uses_composite_tool() -> None:
+    from keystone_agents.agents.google_workspace_context import (
+        build_google_workspace_context_agent,
+    )
+
+    agent = build_google_workspace_context_agent(
+        request_text=(
+            "In KNIOps, make a temporary Google Doc named KBA_TEST_DOC_ANU120_R6 "
+            "whose entire body is Workspace lifecycle R6. Check the saved title and "
+            "body, then place that same document in Drive trash and verify it is trashed."
+        ),
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {"google_doc_test_lifecycle"}
+
+
+def test_airtable_marked_lifecycle_exposes_only_composite_tool() -> None:
+    from keystone_agents.agents.airtable_context import build_airtable_context_agent
+
+    agent = build_airtable_context_agent(
+        request_text=(
+            "In Airtable Business Expenses, add one disposable record identified by "
+            "KBA_TEST_RECORD_ANU120_R7. Confirm it, change that same record description "
+            "to KBA_TEST_RECORD_ANU120_R7 revised, verify the same record, then remove "
+            "only it and confirm absence."
+        ),
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {"airtable_test_record_lifecycle"}
+
+
 def test_every_write_capable_agent_receives_shared_direct_execution_contract() -> None:
     checked: set[str] = set()
     for route, spec in AGENT_REGISTRY.items():

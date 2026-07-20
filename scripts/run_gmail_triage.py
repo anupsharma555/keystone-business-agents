@@ -52,6 +52,7 @@ from keystone_agents.gmail_triage.draft_actions import (
     execute_approved_gmail_draft_reply_action,
     resolve_unique_gmail_draft,
 )
+from keystone_agents.gmail_triage.execution_plan import extract_gmail_subject_hint
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import (
     DEFAULT_GMAIL_PRIORITY_GROUPING_REQUEST,
@@ -96,6 +97,14 @@ TERMINAL_APPROVAL_DECISIONS = {ApprovalState.REJECTED.value, ApprovalState.EXPIR
 SDK_RUN_CONFIG_FACTORY: SDKRunConfigFactory | None = None
 ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY: SDKRunConfigFactory | None = None
 GT1_PRIORITY_GROUPING_PROMPT = DEFAULT_GMAIL_PRIORITY_GROUPING_REQUEST
+
+
+class GmailTargetResolutionError(RuntimeError):
+    """Carry a safe structured no-match result out of the SDK retrieval callback."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(str(payload.get("human_summary") or payload.get("message") or ""))
+        self.payload = payload
 
 
 def _approval_context(
@@ -224,6 +233,170 @@ def _structured_gmail_clarification(
         draft_created=False,
         labels_modified=False,
     ).model_dump(mode="json")
+
+
+def _gmail_target_block_payload(
+    *,
+    reason_code: str,
+    human_summary: str,
+    clarification_request: str,
+    query: str,
+    attempts: list[dict[str, object]],
+    candidate_count: int = 0,
+) -> dict[str, Any]:
+    output = {
+        "status": "blocked",
+        "block_kind": reason_code,
+        "summary": human_summary,
+        "clarification_request": clarification_request,
+        "candidate_count": candidate_count,
+        "send_enabled": False,
+        "draft_created": False,
+        "labels_modified": False,
+    }
+    return {
+        "status": "blocked",
+        "block_kind": reason_code,
+        "send_enabled": False,
+        "human_summary": human_summary,
+        "output_type": "GmailClarificationResult",
+        "output": output,
+        "retrieval_diagnostics": {
+            "provider": "gmail",
+            "operation": "resolve_message_for_draft_reply",
+            "query": query,
+            "attempts": attempts,
+            "candidate_count": candidate_count,
+            "provider_read": True,
+            "provider_write": False,
+        },
+        "side_effects": {
+            "gmail_draft_created": False,
+            "gmail_draft_updated": False,
+            "labels_modified": False,
+            "email_sent": False,
+            "send_enabled": False,
+        },
+    }
+
+
+_GMAIL_RELAXED_SUBJECT_STOPWORDS = frozenset(
+    {
+        "about",
+        "and",
+        "for",
+        "from",
+        "kind",
+        "new",
+        "needs",
+        "of",
+        "the",
+        "this",
+        "why",
+        "with",
+    }
+)
+
+
+def _relaxed_gmail_subject_query(subject: str) -> str:
+    tokens = [
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9-]{2,}", subject)
+        if token.lower() not in _GMAIL_RELAXED_SUBJECT_STOPWORDS
+    ]
+    distinctive = list(dict.fromkeys(tokens))[:6]
+    if len(distinctive) < 2:
+        return ""
+    return " ".join(f"subject:{token}" for token in distinctive)
+
+
+def _resolve_live_sdk_message_refs(
+    gmail: Any,
+    *,
+    request_text: str,
+    label: str,
+    query: str,
+    max_results: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Resolve one message with bounded read-only fallbacks and safe diagnostics."""
+
+    bounded_max = max(5, min(10, int(max_results)))
+    attempts: list[dict[str, object]] = []
+
+    def search(search_label: str | None, search_query: str, scope: str) -> list[dict[str, Any]]:
+        raw_refs = list(
+            gmail.list_recent_messages(
+                label=search_label,
+                max_results=bounded_max,
+                query=search_query,
+            )
+        )
+        refs: list[dict[str, Any]] = []
+        seen_threads: set[str] = set()
+        for ref in raw_refs:
+            thread_id = str(ref.get("threadId") or ref.get("id") or "").strip()
+            if not thread_id or thread_id in seen_threads:
+                continue
+            seen_threads.add(thread_id)
+            refs.append(ref)
+        attempts.append(
+            {
+                "scope": scope,
+                "query": search_query,
+                "candidate_count": len(refs),
+            }
+        )
+        return refs
+
+    refs = search(label, query, "requested_label")
+    subject = extract_gmail_subject_hint(request_text)
+    if not refs and subject and label:
+        refs = search(None, query, "all_mail_exact_subject")
+    relaxed_query = _relaxed_gmail_subject_query(subject)
+    if not refs and relaxed_query and relaxed_query != query:
+        refs = search(None, relaxed_query, "all_mail_relaxed_subject")
+    if len(refs) > 1:
+        raise GmailTargetResolutionError(
+            _gmail_target_block_payload(
+                reason_code="gmail_target_ambiguous",
+                human_summary=(
+                    "I found more than one plausible Gmail message after bounded "
+                    "read-only subject matching, so I did not guess which thread to use."
+                ),
+                clarification_request=(
+                    "Add the sender or approximate date, or choose a different exact subject."
+                ),
+                query=query,
+                attempts=attempts,
+                candidate_count=len(refs),
+            )
+        )
+    if not refs:
+        raise GmailTargetResolutionError(
+            _gmail_target_block_payload(
+                reason_code="gmail_target_not_found",
+                human_summary=(
+                    "I checked the connected Gmail mailbox using the requested scope, "
+                    "All Mail with the exact subject, and a bounded relaxed-subject search, "
+                    "but found no matching message. No mailbox data was changed."
+                ),
+                clarification_request=(
+                    "Confirm the connected Gmail account, or provide another subject, "
+                    "sender, or approximate date."
+                ),
+                query=query,
+                attempts=attempts,
+            )
+        )
+    return refs, {
+        "provider": "gmail",
+        "operation": "resolve_message_for_draft_reply",
+        "query": query,
+        "attempts": attempts,
+        "candidate_count": 1,
+        "provider_read": True,
+        "provider_write": False,
+    }
 
 
 def _dedupe_thread_ids(refs: list[dict[str, Any]]) -> list[str]:
@@ -636,6 +809,7 @@ def _run_sdk_synthesis(
     style_context = _style_profile_context(email_style_profile)
     founder_context = founder_drafting_context(founder_fit_profile)
     preflight_context = orchestrator_preflight_context_text(args)
+    retrieval_diagnostics: dict[str, Any] = {}
 
     resolved_draft: dict[str, Any] = {}
 
@@ -671,13 +845,14 @@ def _run_sdk_synthesis(
                 )
             label = _priority_grouping_source_label(args)
             gmail = GmailTool(live=True)
-            message_refs = gmail.list_recent_messages(
+            message_refs, resolution_diagnostics = _resolve_live_sdk_message_refs(
+                gmail,
+                request_text=str(args.request or ""),
                 label=label,
-                max_results=args.max_messages,
                 query=args.gmail_query,
+                max_results=args.max_messages,
             )
-            if not message_refs:
-                raise RuntimeError("No Gmail message matched the live SDK request.")
+            retrieval_diagnostics.update(resolution_diagnostics)
             if len(message_refs) != 1:
                 raise RuntimeError(
                     "Live Gmail SDK synthesis requires exactly one selected message. "
@@ -710,7 +885,11 @@ def _run_sdk_synthesis(
 
     storage = StorageTool(args.database_url) if args.save else None
     outcome = run_retrieved_sdk_synthesis(
-        agent=build_gmail_triage_agent(include_tools=False),
+        agent=build_gmail_triage_agent(
+            include_tools=False,
+            request_text=args.request,
+            compact_instructions=args.compact_instructions,
+        ),
         output_type=EmailTriageResult,
         retrieve=retrieve,
         normalize=normalize,
@@ -745,6 +924,8 @@ def _run_sdk_synthesis(
         provider_cost_window_seconds=args.provider_cost_window_seconds,
         openai_cost_project_id=args.openai_cost_project_id,
     )
+    if retrieval_diagnostics:
+        payload["retrieval_diagnostics"] = retrieval_diagnostics
     _repair_gmail_triage_output_hygiene(payload)
     if args.create_draft:
         draft_result = _create_verified_sdk_reply_draft(args, outcome)
@@ -1142,7 +1323,14 @@ def _search_live_message_summaries(
 ) -> list[dict[str, Any]]:
     search_summaries = getattr(gmail, "search_message_summaries", None)
     if callable(search_summaries):
-        return list(search_summaries(label=label, max_results=max_results, query=query))
+        try:
+            return list(search_summaries(label=label, max_results=max_results, query=query))
+        except ToolGuardrailViolation:
+            # A credential/reset message in one search page must not discard the
+            # other safe candidates. Fall back to ID-only search; the staged
+            # batch read below enforces guardrails per message and skips only
+            # rejected items.
+            pass
     return list(gmail.list_recent_messages(label=label, max_results=max_results, query=query))
 
 
@@ -1526,6 +1714,9 @@ def main() -> int:
                     email_style_profile=email_style_profile,
                     founder_fit_profile=founder_fit_profile,
                 )
+        except GmailTargetResolutionError as exc:
+            payload = exc.payload
+            attach_orchestrator_preflight_payload(payload, args)
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
         if args.markdown and not args.json:

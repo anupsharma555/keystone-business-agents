@@ -167,6 +167,124 @@ class SourceTriageResult(BaseModel):
     recommended_action: str = ""
 
 
+class SourceTriageSummaryItem(BaseModel):
+    """Bounded source decision promoted into specialist and synthesis context."""
+
+    source_id: str = ""
+    title: str = ""
+    url: str = ""
+    decision: SourceTriageDecision
+    relevance_score: int = Field(default=0, ge=0, le=100)
+    directness_score: int = Field(default=0, ge=0, le=100)
+    rationale: str = ""
+
+
+class SourceTriageSummary(BaseModel):
+    """Compact validated source-selection contract for downstream reasoning."""
+
+    mode: str = ""
+    recommended_action: str = ""
+    needs_broaden_or_deepen: bool = False
+    decision_counts: dict[SourceTriageDecision, int] = Field(default_factory=dict)
+    retained_source_ids: list[str] = Field(default_factory=list)
+    retained_urls: list[str] = Field(default_factory=list)
+    review_source_ids: list[str] = Field(default_factory=list)
+    review_urls: list[str] = Field(default_factory=list)
+    rejected_source_ids: list[str] = Field(default_factory=list)
+    rejected_urls: list[str] = Field(default_factory=list)
+    deepen_source_ids: list[str] = Field(default_factory=list)
+    deepen_urls: list[str] = Field(default_factory=list)
+    recall_gaps: list[str] = Field(default_factory=list)
+    decisions: list[SourceTriageSummaryItem] = Field(default_factory=list)
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> SourceTriageSummary:
+        """Normalize a full or compact legacy triage payload."""
+
+        if isinstance(payload, cls):
+            return payload
+        if isinstance(payload, BaseModel):
+            payload = payload.model_dump(mode="json")
+        if not isinstance(payload, dict) or not payload:
+            return cls()
+        raw_decisions = payload.get("decisions")
+        decisions: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        if isinstance(raw_decisions, list):
+            for item in raw_decisions[:8]:
+                if not isinstance(item, dict):
+                    continue
+                decision = str(item.get("decision") or "").strip()
+                if decision not in {"retain", "review", "reject", "deepen"}:
+                    continue
+                counts[decision] = counts.get(decision, 0) + 1
+                decisions.append(
+                    {
+                        "source_id": str(item.get("source_id") or "")[:120],
+                        "title": str(item.get("title") or "")[:160],
+                        "url": str(item.get("url") or "")[:500],
+                        "decision": decision,
+                        "relevance_score": _bounded_score(item.get("relevance_score")),
+                        "directness_score": _bounded_score(item.get("directness_score")),
+                        "rationale": str(item.get("rationale") or "")[:260],
+                    }
+                )
+        raw_counts = payload.get("decision_counts")
+        if isinstance(raw_counts, dict):
+            counts = {
+                str(key): max(0, int(value))
+                for key, value in raw_counts.items()
+                if str(key) in {"retain", "review", "reject", "deepen"}
+                and isinstance(value, int | float)
+            }
+        return cls.model_validate(
+            {
+                "mode": str(payload.get("mode") or ""),
+                "recommended_action": str(payload.get("recommended_action") or ""),
+                "needs_broaden_or_deepen": bool(payload.get("needs_broaden_or_deepen")),
+                "decision_counts": counts,
+                "retained_source_ids": _bounded_strings(payload.get("retained_source_ids"), 8),
+                "retained_urls": _bounded_strings(payload.get("retained_urls"), 8),
+                "review_source_ids": _bounded_strings(payload.get("review_source_ids"), 8),
+                "review_urls": _bounded_strings(payload.get("review_urls"), 8),
+                "rejected_source_ids": _bounded_strings(payload.get("rejected_source_ids"), 8),
+                "rejected_urls": _bounded_strings(payload.get("rejected_urls"), 8),
+                "deepen_source_ids": _bounded_strings(payload.get("deepen_source_ids"), 8),
+                "deepen_urls": _bounded_strings(payload.get("deepen_urls"), 8),
+                "recall_gaps": _bounded_strings(payload.get("recall_gaps"), 6),
+                "decisions": decisions,
+            }
+        )
+
+    def has_evidence(self) -> bool:
+        """Return whether this summary carries any triage decision or boundary."""
+
+        return bool(
+            self.mode
+            or self.recommended_action
+            or self.needs_broaden_or_deepen
+            or self.decisions
+            or self.retained_source_ids
+            or self.review_source_ids
+            or self.rejected_source_ids
+            or self.deepen_source_ids
+            or self.recall_gaps
+        )
+
+
+def _bounded_score(value: Any) -> int:
+    try:
+        return max(0, min(100, int(float(value or 0))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bounded_strings(value: Any, limit: int) -> list[str]:
+    if not isinstance(value, list | tuple):
+        return []
+    return [str(item).strip() for item in value if str(item or "").strip()][:limit]
+
+
 def triage_source_candidates(
     *,
     request_text: str,
@@ -445,5 +563,7 @@ __all__ = [
     "SourceTriageDecision",
     "SourceTriageItem",
     "SourceTriageResult",
+    "SourceTriageSummary",
+    "SourceTriageSummaryItem",
     "triage_source_candidates",
 ]

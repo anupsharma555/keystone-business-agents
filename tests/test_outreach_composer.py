@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sys
 
+import pytest
+
 from keystone_agents.agents.outreach_composer import (
     build_approved_outreach_drafting_context,
     build_follow_up_schedule_record,
@@ -71,6 +73,14 @@ def test_compact_llm_draft_payload_ignores_harmless_extra_fields() -> None:
             "additional_information_needed": ["Licensing terms"],
             "collaboration_ideas": ["Dataset-fit assessment"],
             "deferral_reason": "The thread is closed and the idea needs more evidence.",
+            "request_coverage": {
+                "interpreted_request": "Return an internal decision and paste-ready note.",
+                "status": "complete",
+                "satisfied_dimensions": ["decision", "paste-ready note"],
+                "unmet_dimensions": ["None"],
+                "output_form_status": "satisfied",
+                "stop_condition_status": "satisfied",
+            },
             "recipient": "Review thread",
         }
     )
@@ -78,6 +88,8 @@ def test_compact_llm_draft_payload_ignores_harmless_extra_fields() -> None:
     assert payload.company_name == "NeuroFlow"
     assert payload.reply_recommended is False
     assert payload.collaboration_ideas == ["Dataset-fit assessment"]
+    assert payload.request_coverage.status == "complete"
+    assert payload.request_coverage.unmet_dimensions == []
     assert not hasattr(payload, "recipient")
 
 
@@ -141,6 +153,23 @@ def test_compact_synthesis_agent_omits_unused_tool_contract_prompt() -> None:
     assert "<!-- action_boundary_enforcement/SKILL.md -->" in str(agent.instructions)
     assert "<!-- tool_result_resilience/SKILL.md -->" not in str(agent.instructions)
     assert "<!-- workflow_lifecycle_tracking/SKILL.md -->" not in str(agent.instructions)
+
+
+def test_internal_slack_compact_agent_uses_internal_artifact_guardrail() -> None:
+    internal_agent = build_outreach_composer_compact_synthesis_agent(
+        request_text="Give me an internal Slack recommendation.",
+        internal_slack_copy=True,
+    )
+    external_agent = build_outreach_composer_compact_synthesis_agent(
+        request_text="Draft an external outreach reply.",
+    )
+
+    assert [guardrail.name for guardrail in internal_agent.output_guardrails] == [
+        "keystone_internal_artifact_output_safety"
+    ]
+    assert [guardrail.name for guardrail in external_agent.output_guardrails] == [
+        "keystone_output_safety"
+    ]
 
 
 def test_build_outreach_composer_agent_supports_synthesis_only_mode() -> None:
@@ -591,6 +620,133 @@ def test_llm_constrained_draft_records_revision_request() -> None:
     assert draft.revision_request == "Make the note shorter and direct."
     assert len(draft.email_body.split()) < 60
     assert draft.source_ids_used
+
+
+def test_selected_draft_revision_preserves_identity_cta_recipient_and_word_limit() -> None:
+    cta = "Would a brief conversation be useful?"
+    context = build_approved_outreach_drafting_context(
+        company_profile=load_company_profile("sample_company_curebase"),
+        opportunity_record=load_opportunity_record("sample_lead_curebase"),
+        contact_context=load_contact_context("sample_contact_curebase_approved"),
+        objective="Revise the selected approved draft to 80 words and keep the CTA.",
+        revision_request="Use at most 80 words and preserve the same CTA.",
+        selected_draft={
+            "draft_id": "draft-approved-1",
+            "recipient": "Dr. Priya Shah",
+            "email_subject": "Curebase research workflow discussion",
+            "email_body": f"Hello Dr. Priya Shah,\n\nPrior copy. {cta}",
+            "cta_text": cta,
+        },
+        revision_max_words=80,
+        preserve_selected_cta=True,
+    )
+    payload = {
+        "email_subject": "Curebase research workflow discussion",
+        "email_body": (
+            "Hello Dr. Priya Shah,\n\n"
+            "I saw Curebase's decentralized clinical trial operations. "
+            f"{cta}"
+        ),
+        "linkedin_note": "",
+        "personalization_rationale": "Kept the approved source-backed context.",
+        "source_ids_used": context.allowed_source_ids,
+    }
+
+    draft = compose_outreach_draft_llm_constrained(
+        approved_context=context,
+        llm_draft_payload=payload,
+    )
+
+    assert draft.revised_from_draft_id == "draft-approved-1"
+    assert draft.recipient == "Dr. Priya Shah"
+    assert cta in draft.email_body
+    assert len(draft.email_body.split()) <= 80
+    assert draft.send_enabled is False
+
+
+def test_selected_draft_revision_rejects_constraint_drift() -> None:
+    cta = "Would a brief conversation be useful?"
+    context = build_approved_outreach_drafting_context(
+        company_profile=load_company_profile("sample_company_curebase"),
+        opportunity_record=load_opportunity_record("sample_lead_curebase"),
+        contact_context=load_contact_context("sample_contact_curebase_approved"),
+        objective="Revise the selected approved draft.",
+        selected_draft={
+            "draft_id": "draft-approved-1",
+            "recipient": "Dr. Priya Shah",
+            "email_subject": "Curebase research workflow discussion",
+            "email_body": f"Hello Dr. Priya Shah,\n\nPrior copy. {cta}",
+            "cta_text": cta,
+        },
+        revision_max_words=12,
+        preserve_selected_cta=True,
+    )
+    base_payload = {
+        "email_subject": "Curebase research workflow discussion",
+        "email_body": "Hello Dr. Priya Shah, this revision changes the call to action.",
+        "linkedin_note": "",
+        "personalization_rationale": "Uses approved context.",
+        "source_ids_used": context.allowed_source_ids,
+    }
+
+    with pytest.raises(ValueError, match="preserve the selected CTA"):
+        compose_outreach_draft_llm_constrained(
+            approved_context=context,
+            llm_draft_payload=base_payload,
+        )
+
+    recipient_drift = dict(base_payload)
+    recipient_drift["recipient"] = "Different Recipient"
+    recipient_drift["email_body"] = f"Hello. {cta}"
+    with pytest.raises(ValueError, match="preserve the selected recipient"):
+        compose_outreach_draft_llm_constrained(
+            approved_context=context,
+            llm_draft_payload=recipient_drift,
+        )
+
+    over_limit = dict(base_payload)
+    over_limit["email_body"] = " ".join(["approved"] * 13) + f" {cta}"
+    with pytest.raises(ValueError, match="exceeds the selected revision word limit"):
+        compose_outreach_draft_llm_constrained(
+            approved_context=context,
+            llm_draft_payload=over_limit,
+        )
+
+
+def test_diverse_approved_founder_note_is_source_backed_reviewable_and_never_sendable() -> None:
+    context = _approved_llm_context(style=True)
+    payload = {
+        "email_subject": "Curebase research workflow discussion",
+        "email_body": (
+            "Hello Dr. Priya Shah,\n\n"
+            "I saw Curebase's decentralized clinical trial operations. Happy to compare "
+            "notes on clinical AI evaluation support if useful.\n\n"
+            "Warmly,\nKeystone"
+        ),
+        "linkedin_note": (
+            "Hello Dr. Priya Shah, happy to compare notes on clinical AI evaluation "
+            "support if useful."
+        ),
+        "personalization_rationale": (
+            "Used the approved company evidence, recipient persona, and warm style profile."
+        ),
+        "source_ids_used": context.allowed_source_ids,
+    }
+
+    draft = compose_outreach_draft_llm_constrained(
+        approved_context=context,
+        llm_draft_payload=OutreachLLMDraftPayload.model_validate(payload),
+    )
+
+    assert draft.recipient == "Dr. Priya Shah"
+    assert draft.source_ids_used
+    assert draft.facts_used
+    assert draft.style_profile_used is True
+    assert draft.approved_context_used is True
+    assert draft.approval_required is True
+    assert draft.send_enabled is False
+    assert draft.sent is False
+    assert draft.can_send_email is False
 
 
 def test_outreach_variant_labels_parse_from_goal() -> None:

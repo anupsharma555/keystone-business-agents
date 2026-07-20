@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
+import keystone_agents.cli as cli_module
+import keystone_agents.slack_actions as slack_actions_module
 import scripts.handle_slack_agent_action as slack_agent_action_cli
 from keystone_agents.cli import main
 from keystone_agents.models import TypedAgentRunResult
@@ -110,6 +113,200 @@ def test_selected_message_payload_parses_bounded_thread_context() -> None:
     ]
 
 
+def test_selected_message_payload_manifest_reports_text_truncation_and_attachments() -> None:
+    payload = _message_action_payload()
+    payload["message"]["text"] = "x" * 4500
+    payload["message"]["files"] = [
+        {
+            "id": "F123",
+            "name": "brief.pdf",
+            "mimetype": "application/pdf",
+            "size": 2048,
+            "url_private": "https://files.slack.example/private-secret-url",
+        }
+    ]
+
+    context = build_selected_message_context(payload)
+
+    manifest = context.payload_manifest
+    selected_entry = next(
+        entry for entry in manifest.entries if entry.kind == "selected_message"
+    )
+    attachment_entry = next(
+        entry for entry in manifest.entries if entry.kind == "attachment"
+    )
+    assert manifest.truncation_detected is True
+    assert manifest.attachments_present is True
+    assert manifest.attachments_materialized is False
+    assert selected_entry.original_chars == 4500
+    assert selected_entry.captured_chars == 4000
+    assert selected_entry.truncated is True
+    assert len(selected_entry.original_sha256) == 64
+    assert attachment_entry.file_id == "F123"
+    assert attachment_entry.name == "brief.pdf"
+    assert attachment_entry.byte_size == 2048
+    assert attachment_entry.remote_url_present is True
+    assert attachment_entry.materialization_status == "metadata_only"
+    serialized = context.model_dump_json(by_alias=True)
+    assert "private-secret-url" not in serialized
+    assert any("truncated message text" in warning for warning in context.warnings)
+    assert any("not checksum-verified" in warning for warning in context.warnings)
+
+
+def test_selected_message_payload_manifest_accepts_checksum_verified_local_attachment(
+    tmp_path: Path,
+) -> None:
+    attachment_path = tmp_path / "diagram.png"
+    attachment_bytes = b"verified slack attachment bytes"
+    attachment_path.write_bytes(attachment_bytes)
+    payload = _message_action_payload()
+    payload["message"]["files"] = [
+        {
+            "id": "F456",
+            "name": "diagram.png",
+            "mimetype": "image/png",
+            "size": len(attachment_bytes),
+            "local_path": str(attachment_path),
+            "sha256": hashlib.sha256(attachment_bytes).hexdigest(),
+        }
+    ]
+
+    context = build_selected_message_context(payload)
+
+    manifest = context.payload_manifest
+    attachment_entry = next(
+        entry for entry in manifest.entries if entry.kind == "attachment"
+    )
+    assert manifest.attachments_present is True
+    assert manifest.attachments_materialized is True
+    assert attachment_entry.materialized_path == str(attachment_path)
+    assert attachment_entry.checksum_sha256 == hashlib.sha256(attachment_bytes).hexdigest()
+    assert attachment_entry.materialization_status == "materialized"
+
+
+def test_selected_message_payload_manifest_rejects_attachment_checksum_mismatch(
+    tmp_path: Path,
+) -> None:
+    attachment_path = tmp_path / "receipt.pdf"
+    attachment_path.write_bytes(b"actual receipt bytes")
+    payload = _message_action_payload()
+    payload["message"]["files"] = [
+        {
+            "id": "F457",
+            "name": "receipt.pdf",
+            "mimetype": "application/pdf",
+            "size": len(b"actual receipt bytes"),
+            "local_path": str(attachment_path),
+            "sha256": hashlib.sha256(b"different bytes").hexdigest(),
+        }
+    ]
+
+    context = build_selected_message_context(payload)
+
+    manifest = context.payload_manifest
+    attachment_entry = next(
+        entry for entry in manifest.entries if entry.kind == "attachment"
+    )
+    assert manifest.attachments_present is True
+    assert manifest.attachments_materialized is False
+    assert attachment_entry.materialization_status == "invalid"
+    assert any("do not match" in warning for warning in attachment_entry.warnings)
+
+
+def test_thread_payload_manifest_preserves_original_length_before_bounding() -> None:
+    context = build_selected_message_context(
+        _message_action_payload(),
+        thread_messages=[
+            {
+                "ts": "1715366460.000200",
+                "user": "U789",
+                "text": "thread-" + ("y" * 4300),
+            }
+        ],
+    )
+
+    thread_entry = next(
+        entry for entry in context.payload_manifest.entries
+        if entry.kind == "thread_message"
+    )
+    assert thread_entry.original_chars == 4307
+    assert thread_entry.captured_chars == 4000
+    assert thread_entry.truncated is True
+    assert context.thread_messages[0].metadata["text_truncated"] is True
+
+
+def test_cli_and_selected_message_eval_evidence_use_execution_provenance() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Research Acme Health",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+    )
+    result = WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.IN_PROGRESS,
+        advanced=True,
+        execution_provenance={
+            "run_mode": "live_sdk_search",
+            "live_sdk": True,
+            "live_search": True,
+            "model_provider": "openai",
+            "model_name": "gpt-5.4-mini",
+            "model_source": "workflow_sdk_usage",
+            "search_provider": "searxng+agents-web-search",
+            "search_provider_sequence": ["searxng", "agents-web-search"],
+            "search_source": "workflow_retrieval_usage",
+        },
+        execution_steps=[
+            {
+                "step_index": 1,
+                "category": "orchestration",
+                "name": "advance_started",
+                "status": "started",
+            },
+            {
+                "step_index": 2,
+                "category": "retrieval",
+                "name": "workflow_retrieval_usage",
+                "status": "completed",
+                "provider": "searxng+agents-web-search",
+                "source_count": 4,
+            },
+        ],
+    )
+    context = build_selected_message_context(_message_action_payload())
+
+    cli_evidence = cli_module._cli_slack_eval_evidence(
+        slack_context_payload={},
+        result=result,
+        run_id=work_item.id,
+        summary="Source-backed result.",
+    )
+    selected_evidence = slack_actions_module._slack_eval_evidence(
+        context=context,
+        result=result,
+        run_provenance={
+            "work_item_id": work_item.id,
+            "route": WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+            "status": WorkItemStatus.IN_PROGRESS.value,
+        },
+    )
+
+    for evidence in (cli_evidence, selected_evidence):
+        assert evidence["run_mode"] == "live_sdk_search"
+        assert evidence["model_provider"] == "openai"
+        assert evidence["model_name"] == "gpt-5.4-mini"
+        assert evidence["search_provider"] == "searxng+agents-web-search"
+        assert evidence["search_provider_sequence"] == [
+            "searxng",
+            "agents-web-search",
+        ]
+        assert [step["name"] for step in evidence["child_step_summary"]] == [
+            "advance_started",
+            "workflow_retrieval_usage",
+        ]
+
+
 def test_selected_message_context_sorts_and_dedupes_thread_messages() -> None:
     context = build_selected_message_context(
         _message_action_payload(),
@@ -156,6 +353,31 @@ def test_selected_message_context_limits_thread_messages_to_recent_week() -> Non
     assert any("most recent 7 days" in warning for warning in context.warnings)
 
 
+def test_orchestrator_workflow_state_keeps_newest_eight_thread_messages() -> None:
+    context = build_selected_message_context(
+        _message_action_payload(),
+        thread_messages=[
+            {
+                "ts": f"17153664{index:02d}.000100",
+                "user": f"U{index:03d}",
+                "text": f"thread message {index}",
+            }
+            for index in range(10)
+        ],
+    )
+
+    state = slack_actions_module.orchestrator_workflow_state_from_slack_context(
+        context,
+        request_text="Use the latest correction.",
+    )
+
+    assert [item["summary"] for item in state["recent_slack_thread"]] == [
+        f"thread message {index}" for index in range(2, 10)
+    ]
+    assert state["recent_slack_thread"][-1]["summary"] == "thread message 9"
+    assert state["slack_thread_transcript"].endswith("Use the latest correction.")
+
+
 def test_message_action_creates_context_file_and_modal(tmp_path: Path) -> None:
     result = handle_run_agent_interaction(
         _message_action_payload(),
@@ -174,6 +396,7 @@ def test_message_action_creates_context_file_and_modal(tmp_path: Path) -> None:
     assert context_path.is_absolute()
     metadata = json.loads(result.modal_view["private_metadata"])
     assert metadata["selected_context"]["selected_message"]["text"].startswith("Can someone")
+    assert len(metadata["context_file_sha256"]) == 64
 
 
 def test_modal_submission_can_create_context_file_from_private_metadata(tmp_path: Path) -> None:
@@ -226,6 +449,42 @@ def test_modal_submission_uses_embedded_context_when_context_file_is_missing(
     assert any("embedded modal context fallback" in warning for warning in run_result.warnings)
     work_item = run_result.work_item or {}
     assert work_item["target"]["metadata"]["slack_context"]["channel_id"] == "C123"
+
+
+def test_modal_submission_recovers_from_context_checksum_mismatch(
+    tmp_path: Path,
+) -> None:
+    modal_result = handle_run_agent_interaction(
+        _message_action_payload(),
+        context_dir=tmp_path / "contexts",
+    )
+    original_context_path = Path(modal_result.context_file_path)
+    original_context_path.write_text('{"tampered": true}\n', encoding="utf-8")
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task="CoS summarize this selected Slack context",
+        ),
+        database_url=_database_url(tmp_path),
+        context_dir=tmp_path / "contexts",
+    )
+
+    assert run_result.stage == "work_item"
+    assert any("checksum mismatch" in warning for warning in run_result.warnings)
+    recovered_path = Path(run_result.context_file_path)
+    assert recovered_path.is_file()
+    assert recovered_path != original_context_path
+    recovered_payload = json.loads(recovered_path.read_text(encoding="utf-8"))
+    manifest = recovered_payload["payload_manifest"]
+    assert manifest["raw_request_ref"] == "slack:modal:raw-request"
+    raw_request_entry = next(
+        entry for entry in manifest["entries"] if entry["kind"] == "raw_request"
+    )
+    assert raw_request_entry["original_chars"] == len(
+        "CoS summarize this selected Slack context"
+    )
+    assert raw_request_entry["original_sha256"] == raw_request_entry["captured_sha256"]
 
 
 def test_run_agent_modal_private_metadata_uses_small_embedded_fallback(
@@ -334,6 +593,152 @@ def test_modal_submission_orchestrator_block_stops_before_work_item(
     assert run_result.feedback_events[0]["payload"]["execution_allowed"] is False
 
 
+def test_attachment_dependent_modal_blocks_before_planner_or_model_when_bytes_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _message_action_payload()
+    payload["message"]["files"] = [
+        {
+            "id": "F123",
+            "name": "brief.pdf",
+            "mimetype": "application/pdf",
+            "size": 2048,
+            "url_private": "https://files.slack.example/private-secret-url",
+        }
+    ]
+    modal_result = handle_run_agent_interaction(
+        payload,
+        context_dir=tmp_path / "contexts",
+    )
+
+    def fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Attachment admission must block before planner, model, or WorkItem")
+
+    monkeypatch.setattr(slack_actions_module, "infer_manual_request_plan", fail_if_called)
+    monkeypatch.setattr(slack_actions_module, "run_orchestrator_preflight", fail_if_called)
+    monkeypatch.setattr(
+        slack_actions_module,
+        "advance_work_item_manager_loop_with_optional_langgraph",
+        fail_if_called,
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task="@KNI CoS summarize the attached PDF",
+        ),
+        database_url=_database_url(tmp_path),
+        context_dir=tmp_path / "contexts",
+        live_sdk=True,
+    )
+
+    assert run_result.stage == "work_item"
+    assert run_result.work_item is None
+    assert run_result.status == "blocked"
+    assert run_result.route == "orchestrator"
+    assert Path(run_result.context_file_path).is_file()
+    result_payload = run_result.result or {}
+    assert result_payload["blockers"][0]["code"] == (
+        "slack_attachment_bytes_unavailable"
+    )
+    assert result_payload["operator_status"] == "needs_input"
+    assert result_payload["retry"]["same_request_supported"] is True
+    assert result_payload["retry"]["context_file_path"] == run_result.context_file_path
+    assert result_payload["attachment_manifest"]["attachments_present"] is True
+    assert result_payload["attachment_manifest"]["attachments_materialized"] is False
+    assert result_payload["attachment_manifest"]["entries"][0][
+        "materialization_status"
+    ] == "metadata_only"
+    assert "without rephrasing" in result_payload["human_summary"]
+    assert run_result.run_provenance["context_validated"] is False
+    assert run_result.run_provenance["validation_errors"] == [
+        "slack_attachment_bytes_unavailable"
+    ]
+    assert [event["event_type"] for event in run_result.feedback_events] == [
+        "slack_attachment_admission_blocked"
+    ]
+    serialized = json.dumps(result_payload)
+    assert "private-secret-url" not in serialized
+
+
+def test_metadata_only_attachment_does_not_block_text_only_request(
+    tmp_path: Path,
+) -> None:
+    payload = _message_action_payload()
+    payload["message"]["files"] = [
+        {
+            "id": "F123",
+            "name": "brief.pdf",
+            "mimetype": "application/pdf",
+            "size": 2048,
+            "url_private": "https://files.slack.example/private-secret-url",
+        }
+    ]
+    modal_result = handle_run_agent_interaction(
+        payload,
+        context_dir=tmp_path / "contexts",
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task=(
+                "research Acme Health using the selected Slack text only; "
+                "ignore attachments"
+            ),
+        ),
+        database_url=_database_url(tmp_path),
+        context_dir=tmp_path / "contexts",
+    )
+
+    assert run_result.work_item is not None
+    assert "slack_attachment_admission_blocked" not in {
+        event["event_type"] for event in run_result.feedback_events
+    }
+
+
+def test_checksum_verified_attachment_passes_attachment_admission(
+    tmp_path: Path,
+) -> None:
+    attachment_path = tmp_path / "brief.pdf"
+    attachment_bytes = b"verified PDF-like bytes for the selected Slack context"
+    attachment_path.write_bytes(attachment_bytes)
+    payload = _message_action_payload()
+    payload["message"]["files"] = [
+        {
+            "id": "F456",
+            "name": "brief.pdf",
+            "mimetype": "application/pdf",
+            "size": len(attachment_bytes),
+            "local_path": str(attachment_path),
+            "sha256": hashlib.sha256(attachment_bytes).hexdigest(),
+        }
+    ]
+    modal_result = handle_run_agent_interaction(
+        payload,
+        context_dir=tmp_path / "contexts",
+    )
+
+    run_result = handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task="@KNI CoS summarize the attached PDF",
+        ),
+        database_url=_database_url(tmp_path),
+        context_dir=tmp_path / "contexts",
+    )
+
+    assert "slack_attachment_admission_blocked" not in {
+        event["event_type"] for event in run_result.feedback_events
+    }
+    assert "slack_attachment_bytes_unavailable" not in {
+        blocker.get("code")
+        for blocker in (run_result.result or {}).get("blockers", [])
+        if isinstance(blocker, dict)
+    }
+
+
 def test_modal_submission_starts_work_item_with_slack_metadata(tmp_path: Path) -> None:
     modal_result = handle_run_agent_interaction(
         _message_action_payload(),
@@ -354,6 +759,16 @@ def test_modal_submission_starts_work_item_with_slack_metadata(tmp_path: Path) -
     result_payload = run_result.result or {}
     assert slack_context["permalink"] == "https://kni.slack.com/archives/C123/p1715366400000100"
     assert slack_context["selected_message"]["text"].startswith("Can someone research")
+    assert slack_context["payload_manifest"]["schema"] == (
+        "keystone.slack.payload_manifest.v1"
+    )
+    assert slack_context["payload_manifest"]["raw_request_ref"] == (
+        "slack:modal:raw-request"
+    )
+    assert any(
+        entry["kind"] == "raw_request"
+        for entry in slack_context["payload_manifest"]["entries"]
+    )
     assert manual_plan["target_agent"] == "business_research_analyst"
     assert manual_plan["intent"] == "company_research"
     preflight_payload = result_payload["orchestrator_preflight"]

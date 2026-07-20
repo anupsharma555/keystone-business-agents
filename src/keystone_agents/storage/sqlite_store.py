@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -916,6 +918,29 @@ def sqlite_path_from_url(database_url: str | Path | None = None) -> str:
     return path.lstrip("/")
 
 
+def _assert_test_database_is_isolated(path: str) -> None:
+    """Fail before pytest can initialize or mutate the operator database."""
+
+    if str(os.getenv("KEYSTONE_TEST_MODE") or "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    if path == ":memory:":
+        return
+    resolved_path = Path(path).expanduser().resolve()
+    operator_path = Path(__file__).resolve().parents[3] / DEFAULT_DATABASE_URL.removeprefix(
+        "sqlite:///"
+    )
+    if resolved_path == operator_path.resolve():
+        raise RuntimeError(
+            "KEYSTONE_TEST_MODE cannot use the operator keystone_agents.db; "
+            "set DATABASE_URL to an isolated temporary SQLite database."
+        )
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
@@ -1336,6 +1361,7 @@ class SQLiteStore:
     def __init__(self, database_url: str | Path | None = None) -> None:
         self.database_url = str(database_url or database_url_from_env())
         self.path = sqlite_path_from_url(database_url)
+        _assert_test_database_is_isolated(self.path)
         self._memory_connection: sqlite3.Connection | None = None
         if self.path != ":memory:":
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
@@ -1355,8 +1381,39 @@ class SQLiteStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def managed_connection(self) -> Iterator[sqlite3.Connection]:
+        """Provide a transaction and close transient file-backed connections."""
+
+        connection = self.connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            if connection is not self._memory_connection:
+                connection.close()
+
+    def close(self) -> None:
+        """Close the persistent in-memory connection, when present."""
+
+        if self._memory_connection is not None:
+            self._memory_connection.close()
+            self._memory_connection = None
+
+    def __enter__(self) -> SQLiteStore:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def initialize(self) -> None:
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             connection.execute(SCHEMA_MIGRATIONS_TABLE_SQL)
             applied_versions = {
                 int(row["version"])
@@ -1473,14 +1530,14 @@ class SQLiteStore:
         self.initialize()
 
     def table_names(self) -> set[str]:
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall()
         return {str(row["name"]) for row in rows}
 
     def migration_versions(self) -> list[int]:
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
@@ -1492,7 +1549,7 @@ class SQLiteStore:
     def fetch_all(self, table: str) -> list[dict[str, Any]]:
         if table not in self.table_names():
             raise ValueError(f"Unknown table: {table}")
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             columns = self._column_names(connection, table)
             if "id" in columns:
                 order_column = "id"
@@ -1510,7 +1567,7 @@ class SQLiteStore:
             raise ValueError(f"Unknown table: {table}")
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_et):
             raise ValueError("date_et must use YYYY-MM-DD format.")
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             columns = self._column_names(connection, table)
             if "created_date_et" not in columns:
                 raise ValueError(f"Table does not support ET date filtering: {table}")
@@ -1529,7 +1586,7 @@ class SQLiteStore:
     def count(self, table: str) -> int:
         if table not in self.table_names():
             raise ValueError(f"Unknown table: {table}")
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
         return int(row["count"])
 
@@ -1541,7 +1598,7 @@ class SQLiteStore:
         existing = self.get_work_item(item.id)
         target_json = stable_json(item.target.model_dump(mode="json"))
         payload_json = stable_json(item.model_dump(mode="json"))
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             connection.execute(
                 """
                 INSERT INTO work_items
@@ -1588,7 +1645,7 @@ class SQLiteStore:
     def get_work_item(self, work_item_id: str) -> WorkItem | None:
         """Load one WorkItem by id."""
 
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             row = connection.execute(
                 "SELECT work_item_json FROM work_items WHERE id = ?",
                 (work_item_id,),
@@ -1615,7 +1672,7 @@ class SQLiteStore:
             clauses.append("kind = ?")
             params.append(kind)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT work_item_json FROM work_items {where} "
                 "ORDER BY updated_at_utc DESC, id DESC LIMIT ?",
@@ -1628,7 +1685,7 @@ class SQLiteStore:
 
         event = WorkItemEvent.model_validate(_as_dict(event))
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             if self._work_item_missing(connection, work_item_id):
                 raise ValueError(f"Cannot save WorkItem event for missing WorkItem: {work_item_id}")
             cursor = connection.execute(
@@ -1656,7 +1713,7 @@ class SQLiteStore:
     def list_work_item_events(self, work_item_id: str) -> list[WorkItemEvent]:
         """Return WorkItem events in insertion order."""
 
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM work_item_events WHERE work_item_id = ? ORDER BY id",
                 (work_item_id,),
@@ -1682,7 +1739,7 @@ class SQLiteStore:
         artifact = WorkItemArtifactRef.model_validate(_as_dict(artifact))
         metadata = {**artifact.metadata, "selected": artifact.selected}
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             if self._work_item_missing(connection, work_item_id):
                 raise ValueError(
                     f"Cannot save WorkItem artifact for missing WorkItem: {work_item_id}"
@@ -1723,7 +1780,7 @@ class SQLiteStore:
     def list_work_item_artifacts(self, work_item_id: str) -> list[WorkItemArtifactRef]:
         """Return artifact refs attached to a WorkItem."""
 
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM work_item_artifacts WHERE work_item_id = ? ORDER BY id",
                 (work_item_id,),
@@ -1743,12 +1800,74 @@ class SQLiteStore:
             for row in rows
         ]
 
+    def audit_work_item_integrity(self, *, id_limit: int = 100) -> dict[str, Any]:
+        """Report legacy WorkItem child rows whose parent is missing, without mutation."""
+
+        bounded_limit = max(1, min(500, int(id_limit)))
+        with self.managed_connection() as connection:
+            event_rows = connection.execute(
+                """
+                SELECT e.work_item_id, e.event_type, COUNT(*) AS row_count
+                FROM work_item_events AS e
+                LEFT JOIN work_items AS w ON w.id = e.work_item_id
+                WHERE w.id IS NULL
+                GROUP BY e.work_item_id, e.event_type
+                ORDER BY e.work_item_id, e.event_type
+                """
+            ).fetchall()
+            artifact_rows = connection.execute(
+                """
+                SELECT a.work_item_id, a.artifact_type, COUNT(*) AS row_count
+                FROM work_item_artifacts AS a
+                LEFT JOIN work_items AS w ON w.id = a.work_item_id
+                WHERE w.id IS NULL
+                GROUP BY a.work_item_id, a.artifact_type
+                ORDER BY a.work_item_id, a.artifact_type
+                """
+            ).fetchall()
+        missing_ids = sorted(
+            {
+                str(row["work_item_id"])
+                for row in [*event_rows, *artifact_rows]
+                if row["work_item_id"]
+            }
+        )
+        orphan_event_count = sum(int(row["row_count"]) for row in event_rows)
+        orphan_artifact_count = sum(int(row["row_count"]) for row in artifact_rows)
+        return {
+            "schema": "keystone.work_item_integrity_audit.v1",
+            "status": "fail" if missing_ids else "pass",
+            "orphan_event_count": orphan_event_count,
+            "orphan_artifact_count": orphan_artifact_count,
+            "orphan_child_count": orphan_event_count + orphan_artifact_count,
+            "missing_parent_count": len(missing_ids),
+            "missing_work_item_ids": missing_ids[:bounded_limit],
+            "missing_work_item_ids_truncated": len(missing_ids) > bounded_limit,
+            "event_groups": [
+                {
+                    "work_item_id": str(row["work_item_id"]),
+                    "event_type": str(row["event_type"]),
+                    "row_count": int(row["row_count"]),
+                }
+                for row in event_rows[:bounded_limit]
+            ],
+            "artifact_groups": [
+                {
+                    "work_item_id": str(row["work_item_id"]),
+                    "artifact_type": str(row["artifact_type"]),
+                    "row_count": int(row["row_count"]),
+                }
+                for row in artifact_rows[:bounded_limit]
+            ],
+            "repair_performed": False,
+        }
+
     def save_automation_spec(self, spec: AutomationSpec) -> str:
         """Upsert an automation spec."""
 
         item = AutomationSpec.model_validate(_as_dict(spec))
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             existing = connection.execute(
                 "SELECT id FROM automation_specs WHERE id = ?",
                 (item.id,),
@@ -1792,7 +1911,7 @@ class SQLiteStore:
     def get_automation_spec(self, automation_id: str) -> AutomationSpec | None:
         """Load one automation spec by id."""
 
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             row = connection.execute(
                 "SELECT spec_json FROM automation_specs WHERE id = ?",
                 (automation_id,),
@@ -1815,7 +1934,7 @@ class SQLiteStore:
             clauses.append("status = ?")
             params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT spec_json FROM automation_specs {where} ORDER BY name LIMIT ?",
                 (*params, max(1, min(500, int(limit)))),
@@ -1827,7 +1946,7 @@ class SQLiteStore:
 
         item = AutomationChannelBinding.model_validate(_as_dict(binding))
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             existing = connection.execute(
                 "SELECT id FROM automation_channel_bindings WHERE id = ?",
                 (item.id,),
@@ -1881,7 +2000,7 @@ class SQLiteStore:
             clauses.append("(channel_name = ? OR channel_id = ?)")
             params.extend([channel.lstrip("#"), channel])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT binding_json FROM automation_channel_bindings {where} "
                 "ORDER BY channel_name, id LIMIT ?",
@@ -1896,7 +2015,7 @@ class SQLiteStore:
 
         item = AutomationRun.model_validate(_as_dict(run))
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             connection.execute(
                 """
                 INSERT INTO automation_runs
@@ -1958,7 +2077,7 @@ class SQLiteStore:
             clauses.append("status = ?")
             params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT run_json FROM automation_runs {where} "
                 "ORDER BY created_at_utc DESC, id DESC LIMIT ?",
@@ -1971,7 +2090,7 @@ class SQLiteStore:
 
         item = AutomationFinding.model_validate(_as_dict(finding))
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             connection.execute(
                 """
                 INSERT INTO automation_findings
@@ -2032,7 +2151,7 @@ class SQLiteStore:
             clauses.append("severity = ?")
             params.append(severity)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT finding_json FROM automation_findings {where} "
                 "ORDER BY created_at_utc DESC, id DESC LIMIT ?",
@@ -2051,7 +2170,7 @@ class SQLiteStore:
         extraction_status = _announcement_extraction_status(record.evidence)
         content_hash = record.content_hash or _announcement_content_hash(record)
         now = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             existing = connection.execute(
                 "SELECT first_seen_at_utc, seen_count, selected, selection_reason, summary "
                 "FROM announcement_feed_items WHERE canonical_key = ?",
@@ -2256,7 +2375,7 @@ class SQLiteStore:
             params.append(1 if selected_only else 0)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         bounded_limit = max(1, min(500, int(limit or 50)))
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT * FROM announcement_feed_items {where} "
                 "ORDER BY selected DESC, published_at DESC, last_seen_at_utc DESC, title "
@@ -2267,7 +2386,7 @@ class SQLiteStore:
         return items
 
     def get_announcement_feed_item(self, canonical_key: str) -> AnnouncementFeedItem | None:
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             row = connection.execute(
                 "SELECT * FROM announcement_feed_items WHERE canonical_key = ?",
                 (canonical_key,),
@@ -2305,7 +2424,7 @@ class SQLiteStore:
             params.append(1 if selected_only else 0)
         where = f" AND {' AND '.join(clauses)}" if clauses else ""
         bounded_limit = max(1, min(100, int(limit or 10)))
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             try:
                 rows = connection.execute(
                     """
@@ -2408,7 +2527,7 @@ class SQLiteStore:
             stable_hash(safe_output) if output is not None or output_summary else ""
         )
         created = _time_metadata(timestamp)
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO tool_events
@@ -2464,7 +2583,7 @@ class SQLiteStore:
             params.append(int(bool(dry_run)))
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT * FROM tool_events {where} ORDER BY id",
                 params,
@@ -2501,7 +2620,7 @@ class SQLiteStore:
             stable_hash(safe_output) if output is not None or output_summary else ""
         )
         created = _time_metadata(timestamp)
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO agent_run_logs
@@ -2557,7 +2676,7 @@ class SQLiteStore:
             params.append(int(bool(dry_run)))
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT * FROM agent_run_logs {where} ORDER BY id",
                 params,
@@ -2597,7 +2716,7 @@ class SQLiteStore:
         payload.update({key: value for key, value in updates.items() if value is not None})
         record = FeedbackRecord.model_validate(payload)
         created = _time_metadata(record.created_at)
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO feedback
@@ -2648,7 +2767,7 @@ class SQLiteStore:
             params.append(approval_id)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT * FROM feedback {where} ORDER BY id",
                 params,
@@ -2722,7 +2841,7 @@ class SQLiteStore:
             else stable_json(output or {}, summarize_email_content=True)
         )
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO agent_runs
@@ -2760,7 +2879,7 @@ class SQLiteStore:
         """Attach operator-provided actual platform cost to a saved SDK run."""
 
         row_id = int(run_id)
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             row = connection.execute(
                 "SELECT output_json FROM agent_runs WHERE id = ?",
                 (row_id,),
@@ -2813,7 +2932,7 @@ class SQLiteStore:
                 " ".join(draft_reply.split())[:EMAIL_BODY_SUMMARY_CHARS]
             )
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO emails
@@ -2847,7 +2966,7 @@ class SQLiteStore:
         safe_notes = _redact_sensitive_personal_note(record.notes)
         payload["notes"] = safe_notes
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO contacts
@@ -2897,7 +3016,7 @@ class SQLiteStore:
             conditions.append("approval_state = ?")
             params.append(ApprovalState.APPROVED_FOR_DRAFTING.value)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT contact_json FROM contacts {where} ORDER BY id",
                 params,
@@ -2910,7 +3029,7 @@ class SQLiteStore:
         record = CRMAccountContext.model_validate(_as_dict(context))
         payload = record.model_dump(mode="json")
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO crm_contexts
@@ -2957,7 +3076,7 @@ class SQLiteStore:
             conditions.append("approval_state = ?")
             params.append(ApprovalState.APPROVED_FOR_DRAFTING.value)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT context_json FROM crm_contexts {where} ORDER BY id",
                 params,
@@ -2970,7 +3089,7 @@ class SQLiteStore:
         record = EmailStyleProfile.model_validate(_as_dict(profile))
         payload = record.model_dump(mode="json")
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO email_style_profiles
@@ -3014,7 +3133,7 @@ class SQLiteStore:
             conditions.append("approval_state = ?")
             params.append(ApprovalState.APPROVED_FOR_DRAFTING.value)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT profile_json FROM email_style_profiles {where} ORDER BY id",
                 params,
@@ -3026,7 +3145,7 @@ class SQLiteStore:
 
         record = MemoryItem.model_validate(_as_dict(item))
         created = _time_metadata(record.created_at)
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO memory_items
@@ -3141,7 +3260,7 @@ class SQLiteStore:
             conditions.append("safe_for_prompt = ?")
             params.append(1 if safe_for_prompt else 0)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT * FROM memory_items {where} ORDER BY id",
                 params,
@@ -3181,7 +3300,7 @@ class SQLiteStore:
         if safe_for_prompt:
             conditions.append("m.safe_for_prompt = 1")
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 """
                 SELECT m.*, i.title AS index_title, i.summary AS index_summary,
@@ -3221,7 +3340,7 @@ class SQLiteStore:
         payload = record.model_dump(mode="json")
         created = _time_metadata(record.created_at)
         retrieval_text = _redact_sensitive_personal_note(record.safe_retrieval_text())
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             connection.execute(
                 """
                 INSERT INTO outreach_examples
@@ -3306,7 +3425,7 @@ class SQLiteStore:
             limit_clause = " LIMIT ?"
             params.append(max(int(limit), 0))
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT document_json FROM outreach_examples {where} ORDER BY id{limit_clause}",
                 params,
@@ -3344,7 +3463,7 @@ class SQLiteStore:
         rows: list[dict[str, Any]] = []
         if match_query and bounded_limit:
             try:
-                with self.connect() as connection:
+                with self.managed_connection() as connection:
                     fetched = connection.execute(
                         """
                         SELECT e.*, bm25(outreach_example_fts) AS fts_rank
@@ -3363,7 +3482,7 @@ class SQLiteStore:
 
         if not rows and bounded_limit:
             where = f"WHERE {' AND '.join(conditions)}"
-            with self.connect() as connection:
+            with self.managed_connection() as connection:
                 fetched = connection.execute(
                     f"SELECT * FROM outreach_examples {where} ORDER BY id DESC",
                     params,
@@ -3449,7 +3568,7 @@ class SQLiteStore:
         record = FollowUpScheduleRecord.model_validate(_as_dict(schedule))
         payload = record.model_dump(mode="json")
         created = _time_metadata(record.created_at)
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO follow_up_schedules
@@ -3498,7 +3617,7 @@ class SQLiteStore:
             conditions.append("status = ?")
             params.append(_redact_string(status))
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT schedule_json FROM follow_up_schedules {where} ORDER BY id",
                 params,
@@ -3513,7 +3632,7 @@ class SQLiteStore:
         record = OutreachTrackingRecord.model_validate(_as_dict(tracking))
         payload = record.model_dump(mode="json")
         created = _time_metadata(record.created_at)
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO outreach_tracking
@@ -3581,7 +3700,7 @@ class SQLiteStore:
         if limit is not None:
             limit_clause = " LIMIT ?"
             params.append(max(int(limit), 0))
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT tracking_json FROM outreach_tracking {where} ORDER BY id{limit_clause}",
                 params,
@@ -3593,7 +3712,7 @@ class SQLiteStore:
     def save_company(self, profile: Any) -> int:
         payload = _as_dict(profile)
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO companies
@@ -3632,7 +3751,7 @@ class SQLiteStore:
     def load_company_profile(self, company_id: int) -> CompanyProfile:
         """Load one saved company profile payload from SQLite."""
 
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             row = connection.execute(
                 "SELECT profile_json FROM companies WHERE id = ?",
                 (int(company_id),),
@@ -3649,7 +3768,7 @@ class SQLiteStore:
     def load_opportunity_record(self, opportunity_id: int) -> OpportunityRecord:
         """Load one saved opportunity payload from SQLite."""
 
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             row = connection.execute(
                 "SELECT opportunity_json FROM opportunities WHERE id = ?",
                 (int(opportunity_id),),
@@ -3661,7 +3780,7 @@ class SQLiteStore:
     def save_opportunity(self, opportunity: Any, *, status: str = "candidate") -> int:
         payload = _as_dict(opportunity)
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO opportunities
@@ -3735,7 +3854,7 @@ class SQLiteStore:
         email_body = _redact_string(str(payload.get("email_body") or payload.get("body") or ""))
         safe_payload = redact_secrets(payload, summarize_email_content=True)
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO outreach_drafts
@@ -3802,7 +3921,7 @@ class SQLiteStore:
             validate_approval_transition(previous_state, record.decision)
         created = _time_metadata()
         decision_time = _time_metadata(record.timestamp)
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO approvals
@@ -3848,7 +3967,7 @@ class SQLiteStore:
             conditions.append("scope = ?")
             params.append(_redact_string(resolved_scope.value))
         where = " AND ".join(conditions)
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             row = connection.execute(
                 f"SELECT * FROM approvals WHERE {where} ORDER BY id DESC LIMIT 1",
                 params,
@@ -3866,7 +3985,7 @@ class SQLiteStore:
                 record.approval_status,
             )
         created = _time_metadata(record.created_at)
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             connection.execute(
                 """
                 INSERT INTO approval_queue
@@ -3939,7 +4058,7 @@ class SQLiteStore:
             conditions.append("source_agent = ?")
             params.append(_redact_string(source_agent))
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             rows = connection.execute(
                 f"SELECT * FROM approval_queue {where} ORDER BY created_at_utc, id",
                 params,
@@ -3957,7 +4076,7 @@ class SQLiteStore:
     def get_approval_item(self, approval_id: str) -> ApprovalQueueItem | None:
         """Fetch one approval queue item by id."""
 
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             row = connection.execute(
                 "SELECT * FROM approval_queue WHERE id = ?",
                 (_redact_string(approval_id),),
@@ -3982,7 +4101,7 @@ class SQLiteStore:
         resolved_status = normalize_approval_queue_status(status)
         validate_approval_queue_transition(existing.approval_status, resolved_status)
         updated_at = _iso_z(datetime.now(UTC).replace(microsecond=0))
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE approval_queue
@@ -4035,7 +4154,7 @@ class SQLiteStore:
         snippet: str = "",
     ) -> int:
         created = _time_metadata()
-        with self.connect() as connection:
+        with self.managed_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO sources

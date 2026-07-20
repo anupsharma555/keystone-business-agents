@@ -38,8 +38,11 @@ from keystone_agents.tools.search_provider import (
     build_search_provider,
 )
 from keystone_agents.tools.website_extraction_tool import (
+    WebsiteExtractionBudget,
     WebsiteExtractionError,
     extract_website_content,
+    extract_website_content_with_fallbacks,
+    website_extraction_budget,
 )
 
 MAX_MEETING_PREP_ITEMS = 3
@@ -1619,7 +1622,9 @@ def _run_opportunity_scout_github_repo_synthesis(
                 ),
             ),
             live=True,
-            tool_tier="deep_retrieval",
+            tool_tier="core_read",
+            attach_tools=False,
+            compact_instructions=True,
         )
     except Exception as exc:
         return None, diagnostics + [
@@ -1687,7 +1692,9 @@ def _run_business_research_analyst_github_repo_synthesis(
                 source_context=source_context,
             ),
             live=True,
-            tool_tier="deep_retrieval",
+            tool_tier="core_read",
+            attach_tools=False,
+            compact_instructions=True,
         )
     except Exception as exc:
         return None, diagnostics + [
@@ -1934,7 +1941,9 @@ def _run_business_research_analyst_announcement_synthesis(
                 source_context=source_context,
             ),
             live=True,
-            tool_tier="deep_retrieval",
+            tool_tier="core_read",
+            attach_tools=False,
+            compact_instructions=True,
         )
     except Exception as exc:
         return None, diagnostics + [
@@ -2166,24 +2175,34 @@ def _attach_announcement_search_evidence(items: list[AnnouncementLinkInput]) -> 
     provider, error = _live_search_provider()
     if provider is None:
         return diagnostics + [error]
+    extraction_budget = website_extraction_budget()
     for item in items:
         try:
             query = f"{item.title} {item.source}".strip()
             item.evidence.extend(_search_evidence(provider.search_web(query, num_results=2)))
         except (SearchProviderConfigurationError, SearchProviderError, OSError) as exc:
             diagnostics.append(f"Search failed for `{item.title}`: {type(exc).__name__}: {exc}")
-        diagnostics.extend(_attach_announcement_article_evidence(item))
+        diagnostics.extend(
+            _attach_announcement_article_evidence(item, extraction_budget=extraction_budget)
+        )
     return diagnostics
 
 
-def _attach_announcement_article_evidence(item: AnnouncementLinkInput) -> list[str]:
+def _attach_announcement_article_evidence(
+    item: AnnouncementLinkInput,
+    *,
+    extraction_budget: WebsiteExtractionBudget | None = None,
+) -> list[str]:
     diagnostics: list[str] = []
     for url in _announcement_article_urls(item):
         try:
-            extraction = extract_website_content(
+            extraction = extract_website_content_with_fallbacks(
                 url,
                 company_name=item.title,
+                guardrail_context="public_web_source",
                 live=True,
+                budget=extraction_budget,
+                extractor=extract_website_content,
             )
         except (WebsiteExtractionError, OSError) as exc:
             diagnostics.append(

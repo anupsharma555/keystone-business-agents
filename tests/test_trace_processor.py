@@ -140,8 +140,15 @@ def test_sdk_run_summary_trace_event_is_joinable_and_redacted(tmp_path) -> None:
         },
         raw_result={
             "new_items": [
-                {"type": "function_call", "name": "search_web"},
+                {
+                    "type": "function_call",
+                    "name": "search_web",
+                    "status": "completed",
+                    "duration_ms": 8.25,
+                    "arguments": {"query": "private query must not persist"},
+                },
                 {"type": "handoff_call", "name": "handoff_to_business_research_analyst"},
+                {"type": "message_output_item", "output": "private answer must not persist"},
             ]
         },
         trace_metadata={
@@ -170,6 +177,32 @@ def test_sdk_run_summary_trace_event_is_joinable_and_redacted(tmp_path) -> None:
     assert metadata["turns_used_source"] == "usage_requests"
     assert metadata["tool_call_counts"] == {"search_web": 1}
     assert metadata["handoff_count"] == 1
+    assert metadata["child_step_summary"] == [
+        {
+            "step_index": 1,
+            "category": "tool",
+            "name": "search_web",
+            "status": "completed",
+            "duration_ms": 8.25,
+            "error_kind": "",
+        },
+        {
+            "step_index": 2,
+            "category": "handoff",
+            "name": "handoff_to_business_research_analyst",
+            "status": "observed",
+            "duration_ms": None,
+            "error_kind": "",
+        },
+        {
+            "step_index": 3,
+            "category": "model",
+            "name": "model",
+            "status": "observed",
+            "duration_ms": None,
+            "error_kind": "",
+        },
+    ]
     assert metadata["retrieval_provider_summary"]["providers_used"] == [
         "searxng",
         "agents-web-search",
@@ -179,6 +212,7 @@ def test_sdk_run_summary_trace_event_is_joinable_and_redacted(tmp_path) -> None:
     assert metadata["model"]["provider"] == "openai"
     assert metadata["tooling"]["tool_call_count"] == 1
     assert metadata["tooling"]["tool_names"] == ["search_web"]
+    assert metadata["tooling"]["child_step_summary"] == metadata["child_step_summary"]
     assert metadata["retrieval"]["search_provider"] == "searxng+agents-web-search"
     assert metadata["retrieval"]["search_provider_sequence"] == ["searxng", "agents-web-search"]
     assert metadata["cost"]["sdk_estimated_cost_usd"] == 0.0042
@@ -194,6 +228,8 @@ def test_sdk_run_summary_trace_event_is_joinable_and_redacted(tmp_path) -> None:
     assert metadata["redaction"]["raw_prompt_included"] is False
     assert metadata["redaction"]["raw_response_included"] is False
     assert "raw model prompt" not in serialized
+    assert "private query" not in serialized
+    assert "private answer" not in serialized
     assert "sk-" not in serialized
     summary = summarize_eval_trace_events(database_path=database_path)
     assert summary["diagnostic_category_counts"] == []

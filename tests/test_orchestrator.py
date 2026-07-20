@@ -111,6 +111,22 @@ def test_resume_gate_does_not_block_source_link_followup_without_marker() -> Non
     assert result is None
 
 
+def test_negated_capabilities_do_not_create_orchestrator_workflow_or_blocker() -> None:
+    prompt = (
+        "CoS, give me exactly three bullets from these supplied facts. "
+        "Do not search, call tools or providers, draft anything, or change anything."
+    )
+    plan = infer_manual_request_plan(prompt, requested_agent="chief_of_staff")
+
+    result = route_request(prompt, manual_plan=plan)
+
+    assert result.route == "chief_of_staff"
+    assert result.workflow == ["chief_of_staff"]
+    assert result.refused is False
+    assert result.clarification_request is None
+    assert result.decision_trace.missing_information_blockers == []
+
+
 def test_route_request_source_link_followup_bypasses_pending_approval_gate() -> None:
     result = route_request(
         "can u summarize link 1",

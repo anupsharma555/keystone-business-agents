@@ -26,6 +26,10 @@ from keystone_agents.schemas.context_pack import (
     ProjectContextPack,
     ResearchContextPack,
 )
+from keystone_agents.schemas.handoff_types import (
+    HandoffAdaptationAssessment,
+    assess_handoff_adaptation,
+)
 from keystone_agents.schemas.manual_request_plan import AskShapePolicy
 from keystone_agents.schemas.memory import normalize_memory_key
 from keystone_agents.schemas.work_item import (
@@ -43,6 +47,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemTarget,
     utc_now_iso,
 )
+from keystone_agents.source_triage import SourceTriageSummary
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.zotero_research import (
     extract_zotero_article_query,
@@ -695,6 +700,23 @@ def _work_item_ask_shape(work_item: WorkItem) -> AskShapePolicy:
     return AskShapePolicy.model_validate(payload) if isinstance(payload, dict) else AskShapePolicy()
 
 
+def _work_item_adaptation_assessment(
+    work_item: WorkItem,
+    *,
+    target_agent: str,
+) -> HandoffAdaptationAssessment | None:
+    plan = work_item.target.metadata.get("manual_request_plan")
+    if not isinstance(plan, dict) or not isinstance(plan.get("ask_shape"), dict):
+        return None
+    source_agent = str(plan.get("requested_agent") or "orchestrator")
+    return assess_handoff_adaptation(
+        source_agent=source_agent,
+        target_agent=target_agent,
+        source_plan=plan,
+        target_payload={"ask_shape": _work_item_ask_shape(work_item).model_dump(mode="json")},
+    )
+
+
 def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
     ready = research_ready(work_item)
     project_context = build_project_context_pack(work_item)
@@ -708,7 +730,11 @@ def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
         current_status=work_item.status,
         target=work_item.target,
         request_text=work_item.request_text,
+        constraints=_metadata_text_list(work_item.target.metadata, "manual_constraints"),
         ask_shape=_work_item_ask_shape(work_item),
+        adaptation_assessment=_work_item_adaptation_assessment(
+            work_item, target_agent="business_research_analyst"
+        ),
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
@@ -751,7 +777,11 @@ def build_opportunity_context_pack(work_item: WorkItem) -> OpportunityContextPac
         current_status=work_item.status,
         target=work_item.target,
         request_text=work_item.request_text,
+        constraints=_metadata_text_list(work_item.target.metadata, "manual_constraints"),
         ask_shape=_work_item_ask_shape(work_item),
+        adaptation_assessment=_work_item_adaptation_assessment(
+            work_item, target_agent="opportunity_scout"
+        ),
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
@@ -772,7 +802,6 @@ def build_opportunity_context_pack(work_item: WorkItem) -> OpportunityContextPac
         project_context=project_context,
         summary=_specialist_context_summary(work_item),
         objective=work_item.request_text or work_item.target.name,
-        constraints=_metadata_text_list(work_item.target.metadata, "constraints"),
         entity_types=_metadata_text_list(work_item.target.metadata, "entity_types"),
         retrieved_candidates=[
             ref for ref in work_item.artifact_refs if ref.artifact_type == "opportunity"
@@ -816,7 +845,11 @@ def build_outreach_context_pack(work_item: WorkItem) -> OutreachContextPack:
         current_status=work_item.status,
         target=work_item.target,
         request_text=work_item.request_text,
+        constraints=_metadata_text_list(work_item.target.metadata, "manual_constraints"),
         ask_shape=_work_item_ask_shape(work_item),
+        adaptation_assessment=_work_item_adaptation_assessment(
+            work_item, target_agent="outreach_composer"
+        ),
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
@@ -867,7 +900,11 @@ def build_gmail_context_pack(work_item: WorkItem) -> GmailContextPack:
         current_status=work_item.status,
         target=work_item.target,
         request_text=work_item.request_text,
+        constraints=_metadata_text_list(work_item.target.metadata, "manual_constraints"),
         ask_shape=_work_item_ask_shape(work_item),
+        adaptation_assessment=_work_item_adaptation_assessment(
+            work_item, target_agent="gmail_triage"
+        ),
         approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
@@ -1959,50 +1996,11 @@ def _source_context_focus_terms(work_item: WorkItem, *, max_terms: int = 6) -> l
     return list(dict.fromkeys(terms))[:max_terms]
 
 
-def _source_triage_summary(work_item: WorkItem) -> dict[str, Any]:
+def _source_triage_summary(work_item: WorkItem) -> SourceTriageSummary:
     """Return compact source-triage state from retrieval diagnostics."""
 
     triage = _latest_source_triage_payload(work_item)
-    if not isinstance(triage, dict):
-        return {}
-    decisions = triage.get("decisions")
-    decision_counts: dict[str, int] = {}
-    compact_decisions: list[dict[str, Any]] = []
-    if isinstance(decisions, list):
-        for item in decisions:
-            if not isinstance(item, dict):
-                continue
-            decision = str(item.get("decision") or "").strip()
-            if decision:
-                decision_counts[decision] = decision_counts.get(decision, 0) + 1
-            if len(compact_decisions) < 8:
-                compact_decisions.append(
-                    {
-                        "source_id": str(item.get("source_id") or "")[:120],
-                        "title": _compact_source_context_value(item.get("title"), 160),
-                        "url": _compact_source_context_value(item.get("url"), 500),
-                        "decision": decision,
-                        "relevance_score": int(_safe_context_int(item.get("relevance_score"))),
-                        "directness_score": int(_safe_context_int(item.get("directness_score"))),
-                        "rationale": _compact_source_context_value(item.get("rationale"), 260),
-                    }
-                )
-    return {
-        "mode": str(triage.get("mode") or ""),
-        "recommended_action": str(triage.get("recommended_action") or ""),
-        "needs_broaden_or_deepen": bool(triage.get("needs_broaden_or_deepen")),
-        "decision_counts": decision_counts,
-        "retained_source_ids": [
-            str(item) for item in (triage.get("retained_source_ids") or [])[:8]
-        ],
-        "review_source_ids": [str(item) for item in (triage.get("review_source_ids") or [])[:8]],
-        "rejected_source_ids": [
-            str(item) for item in (triage.get("rejected_source_ids") or [])[:8]
-        ],
-        "deepen_source_ids": [str(item) for item in (triage.get("deepen_source_ids") or [])[:8]],
-        "recall_gaps": [str(item) for item in (triage.get("recall_gaps") or [])[:6]],
-        "decisions": compact_decisions,
-    }
+    return SourceTriageSummary.from_payload(triage)
 
 
 def _latest_source_triage_payload(work_item: WorkItem) -> dict[str, Any]:

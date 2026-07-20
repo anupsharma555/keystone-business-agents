@@ -208,6 +208,39 @@ class WorkflowRunRequest(BaseModel):
     cost_tracking_requested: bool = False
 
 
+class WorkflowExecutionProvenance(BaseModel):
+    """Resolved model and retrieval mode for one WorkItem advancement."""
+
+    run_mode: str = "fixture"
+    live_sdk: bool = False
+    live_search: bool = False
+    model_provider: str = ""
+    model_name: str = ""
+    model_source: str = "none"
+    search_provider: str = ""
+    search_provider_sequence: list[str] = Field(default_factory=list)
+    search_source: str = "none"
+
+
+class WorkflowExecutionStep(BaseModel):
+    """One bounded, privacy-safe WorkItem execution event for eval tracing."""
+
+    step_index: int = Field(ge=1)
+    category: str
+    name: str
+    status: str = "observed"
+    duration_ms: float | None = Field(default=None, ge=0)
+    error_kind: str = ""
+    provider: str = ""
+    request_count: int = Field(default=0, ge=0)
+    source_count: int = Field(default=0, ge=0)
+    visible_source_count: int = Field(default=0, ge=0)
+    estimated_cost_usd: float | None = Field(default=None, ge=0)
+    cache_hit_rate: float | None = Field(default=None, ge=0, le=1)
+    approval_required: bool = False
+    blocker_count: int = Field(default=0, ge=0)
+
+
 class WorkflowRunResult(BaseModel):
     """Result of one WorkItem advancement."""
 
@@ -224,3 +257,7 @@ class WorkflowRunResult(BaseModel):
     orchestrator_preflight: dict[str, Any] | None = None
     context_pack: dict[str, Any] | None = None
     nested_specialist_results: list[dict[str, Any]] = Field(default_factory=list)
+    execution_provenance: WorkflowExecutionProvenance = Field(
+        default_factory=WorkflowExecutionProvenance
+    )
+    execution_steps: list[WorkflowExecutionStep] = Field(default_factory=list)

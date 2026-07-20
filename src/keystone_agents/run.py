@@ -195,8 +195,14 @@ def run_typed_sdk_agent(
         session=resolved_session,
         max_turns=max_turns,
     )
-    retry_count = 0
+    rate_limit_retry_count = 0
+    structured_output_retry_count = 0
     max_rate_limit_retries = _sdk_rate_limit_max_retries(live=live, run_config=run_config)
+    max_structured_output_retries = _sdk_structured_output_max_retries(
+        live=live,
+        run_config=run_config,
+    )
+    active_session = resolved_session
     started_at = time.time()
     model_run_mode = "local_sdk" if run_config is not None else ("live_sdk" if live else "sdk")
     while True:
@@ -210,7 +216,7 @@ def run_typed_sdk_agent(
                 run_config=run_config,
                 live=live,
                 config=config,
-                session=resolved_session,
+                session=active_session,
                 workflow_name=workflow_name,
                 group_id=group_id,
                 trace_metadata=trace_metadata,
@@ -223,7 +229,29 @@ def run_typed_sdk_agent(
             break
         except Exception as exc:
             search_telemetry = consume_sdk_search_telemetry()
-            if retry_count >= max_rate_limit_retries or not _is_sdk_rate_limit_error(exc):
+            if (
+                structured_output_retry_count < max_structured_output_retries
+                and _is_sdk_structured_output_error(exc)
+            ):
+                structured_output_retry_count += 1
+                # A failed structured turn may already have persisted its user
+                # input without a valid assistant response. Retry from the same
+                # bounded prompt without carrying that partial session forward.
+                active_session = None
+                continue
+            if (
+                rate_limit_retry_count < max_rate_limit_retries
+                and _is_sdk_rate_limit_error(exc)
+            ):
+                rate_limit_retry_count += 1
+                time.sleep(
+                    _sdk_rate_limit_retry_delay_seconds(
+                        exc,
+                        rate_limit_retry_count,
+                    )
+                )
+                continue
+            else:
                 _record_sdk_run_summary_safely(
                     agent_name=agent.name,
                     model_provider=model_provider,
@@ -239,12 +267,12 @@ def run_typed_sdk_agent(
                     trace_metadata=trace_metadata,
                     status="error",
                     failure_kind=_failure_kind(exc),
-                    retry_count=retry_count,
+                    retry_count=(
+                        rate_limit_retry_count + structured_output_retry_count
+                    ),
                     duration_ms=round((time.time() - started_at) * 1000, 3),
                 )
                 raise
-            retry_count += 1
-            time.sleep(_sdk_rate_limit_retry_delay_seconds(exc, retry_count))
     output = _attach_retrieval_diagnostics(output, search_telemetry)
     search_diagnostics = sdk_search_diagnostics_from_telemetry(search_telemetry)
     usage = _extract_sdk_usage(raw_result)
@@ -273,7 +301,7 @@ def run_typed_sdk_agent(
             trace_metadata=trace_metadata,
             status="error",
             failure_kind=_failure_kind(exc),
-            retry_count=retry_count,
+            retry_count=rate_limit_retry_count + structured_output_retry_count,
             duration_ms=round((time.time() - started_at) * 1000, 3),
         )
         raise
@@ -292,7 +320,7 @@ def run_typed_sdk_agent(
         raw_result=raw_result,
         trace_metadata=trace_metadata,
         status="ok",
-        retry_count=retry_count,
+        retry_count=rate_limit_retry_count + structured_output_retry_count,
         duration_ms=round((time.time() - started_at) * 1000, 3),
     )
     return TypedAgentRunResult(
@@ -305,7 +333,19 @@ def run_typed_sdk_agent(
         budget_guard=budget_guard,
         request_cache={
             **request_cache,
-            **({"rate_limit_retries": retry_count} if retry_count else {}),
+            **(
+                {"rate_limit_retries": rate_limit_retry_count}
+                if rate_limit_retry_count
+                else {}
+            ),
+            **(
+                {
+                    "structured_output_retries": structured_output_retry_count,
+                    "structured_output_retry_session_reset": True,
+                }
+                if structured_output_retry_count
+                else {}
+            ),
         },
     )
 
@@ -318,6 +358,32 @@ def _sdk_rate_limit_max_retries(*, live: bool, run_config: Any | None) -> int:
         return max(0, min(3, int(raw) if raw else 1))
     except ValueError:
         return 1
+
+
+def _sdk_structured_output_max_retries(
+    *,
+    live: bool,
+    run_config: Any | None,
+) -> int:
+    if not live or run_config is not None:
+        return 0
+    raw = os.getenv("KEYSTONE_SDK_STRUCTURED_OUTPUT_MAX_RETRIES", "").strip()
+    try:
+        return max(0, min(1, int(raw) if raw else 1))
+    except ValueError:
+        return 1
+
+
+def _is_sdk_structured_output_error(exc: BaseException) -> bool:
+    error_type = type(exc).__name__.lower()
+    text = f"{error_type} {exc}".lower()
+    return bool(
+        error_type in {"modelbehaviorerror", "validationerror"}
+        or (
+            "structured" in text
+            and any(marker in text for marker in ("json", "output", "schema", "valid"))
+        )
+    )
 
 
 def _is_sdk_rate_limit_error(exc: BaseException) -> bool:
@@ -800,6 +866,7 @@ def run_retrieved_sdk_synthesis(
     output_type: type[TOutput],
     retrieve: Callable[[], TRaw],
     normalize: Callable[[TRaw], Any],
+    finalize_output: Callable[[TRaw, TOutput], Any] | None = None,
     input_summary: str,
     input_audit_payload: Mapping[str, Any] | None = None,
     run_config: Any | None = None,
@@ -944,9 +1011,14 @@ def run_retrieved_sdk_synthesis(
             raise RuntimeError("SDK synthesis did not execute a model attempt.") from last_exc
 
         validated_output = _validate_synthesis_output(typed_result.output, output_type)
+        finalized_output = (
+            finalize_output(raw_context, validated_output)
+            if finalize_output is not None
+            else validated_output
+        )
         typed_result = TypedAgentRunResult(
             agent_name=typed_result.agent_name,
-            output=validated_output,
+            output=finalized_output,
             raw_result=typed_result.raw_result,
             live=typed_result.live,
             usage=typed_result.usage,
@@ -968,11 +1040,11 @@ def run_retrieved_sdk_synthesis(
 
         if save:
             if persist_output is not None:
-                persisted = persist_output(validated_output)
+                persisted = persist_output(finalized_output)
                 if persisted:
                     storage_results["artifact"] = dict(persisted)
             audit_output = _sdk_audit_output(
-                output=validated_output,
+                output=finalized_output,
                 model_provider=resolved_model_provider,
                 model_name=resolved_model_name,
                 model_run_mode=resolved_model_run_mode,

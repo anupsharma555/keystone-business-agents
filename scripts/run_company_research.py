@@ -53,6 +53,10 @@ from keystone_agents.founder_profile import (
     founder_search_context,
     load_founder_fit_profile,
 )
+from keystone_agents.instruction_following import (
+    output_constraints_from_plan,
+    validate_output_constraints,
+)
 from keystone_agents.live_retrieval import (
     company_research_request_text as _live_company_research_request_text,
 )
@@ -85,6 +89,7 @@ from keystone_agents.schemas.company_profile import (
     CompanyProfile,
     CompanyResearchComparison,
     CompanyResearchFocusedBrief,
+    SourceRecord,
 )
 from keystone_agents.schemas.retrieval import RetrievalHint
 from keystone_agents.tools.serper_tool import (
@@ -120,6 +125,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--request-text",
         default=None,
         help="Original manual operator request. Used for structured pre-execution planning.",
+    )
+    parser.add_argument(
+        "--inline-source-context",
+        default=None,
+        help=(
+            "Bounded operator-provided evidence for direct, no-search SDK synthesis. "
+            "The text is treated as one user-provided source and is never searched."
+        ),
     )
     parser.add_argument(
         "--live-manual-plan",
@@ -182,7 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--live-search",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=live_search_default,
         help=(
             "Use live search through the configured provider. Supported in both "
@@ -217,6 +230,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Maximum live search results per query.",
+    )
+    parser.add_argument(
+        "--quick-retrieval",
+        action="store_true",
+        help=(
+            "Use a narrow source-visible discovery profile for explicitly brief, "
+            "low-latency company identification asks."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -471,6 +492,34 @@ def _retrieve_company_profile(
     resolved_linkedin_url = linkedin_url or args.linkedin_url
     resolved_fixture = fixture if fixture is not None else args.fixture
 
+    inline_source_context = str(
+        getattr(args, "inline_source_context", "") or ""
+    ).strip()
+    if inline_source_context:
+        if args.live_search:
+            raise SystemExit("--inline-source-context cannot be combined with --live-search.")
+        profile = CompanyProfile(
+            name=str(resolved_company or "Operator-provided company context").strip(),
+            website=resolved_company_url,
+            description=inline_source_context,
+            sources=[
+                SourceRecord(
+                    source_id="operator:inline_company_context",
+                    title="Operator-provided company context",
+                    url="operator://inline-company-context",
+                    source_type="user_provided",
+                    supported_claims=[inline_source_context],
+                    evidence_excerpt=inline_source_context[:1000],
+                    confidence=0.7,
+                )
+            ],
+            missing_information=[
+                "No external verification was requested; claims are limited to "
+                "operator-provided context."
+            ],
+        )
+        return profile, _retrieval_metadata(args, retrieval_mode="inline_context")
+
     if args.live_search:
         require_cli_live_confirmation(
             dry_run=args.dry_run,
@@ -484,6 +533,7 @@ def _retrieve_company_profile(
             request_text=" ".join(
                 part
                 for part in (
+                    getattr(args, "request_text", ""),
                     getattr(args, "research_goal", ""),
                     getattr(args, "notes", ""),
                 )
@@ -492,6 +542,11 @@ def _retrieve_company_profile(
             or None,
             requested_provider=args.search_provider,
             max_results=args.max_results,
+            agents_web_search_max_calls=1 if args.quick_retrieval else None,
+            tavily_search_fallback=False if args.quick_retrieval else None,
+            exa_search_fallback=False if args.quick_retrieval else None,
+            extract_selected_pages=not args.quick_retrieval,
+            max_queries=2 if args.quick_retrieval else None,
             retrieval_hint=_explicit_retrieval_hint(args),
             settings_loader=load_settings,
             query_builder=_company_query_builder_for_args(args),
@@ -679,15 +734,26 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     )
     if comparison_requested:
         output_type = CompanyResearchComparison
-        agent = build_business_research_analyst_comparison_agent()
+        agent = build_business_research_analyst_comparison_agent(
+            attach_tools=not args.compact_instructions,
+            compact_instructions=args.compact_instructions,
+        )
         normalize = normalize_comparison
     elif focused_brief_requested:
         output_type = CompanyResearchFocusedBrief
-        agent = build_business_research_analyst_focused_brief_agent()
+        # Retrieval is completed and normalized before this synthesis call. Keep the
+        # focused brief tool-free so a bounded Slack research ask uses one model turn.
+        agent = build_business_research_analyst_focused_brief_agent(
+            attach_tools=False,
+            compact_instructions=args.compact_instructions,
+        )
         normalize = normalize_brief
     else:
         output_type = CompanyProfile
-        agent = build_business_research_analyst_agent()
+        agent = build_business_research_analyst_agent(
+            attach_tools=not args.compact_instructions,
+            compact_instructions=args.compact_instructions,
+        )
         normalize = normalize_profile
     storage = StorageTool(args.database_url) if args.save else None
     outcome = run_retrieved_sdk_synthesis(
@@ -753,10 +819,11 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         retrieval_mode="live_search" if args.live_search else "fixture",
     )
     payload["retrieval_diagnostics"] = payload["retrieval"].get("retrieval_diagnostics")
-    human_summary = _company_research_sdk_human_summary(payload)
-    _attach_company_research_display_text(payload, human_summary)
     if getattr(args, "manual_request_plan", None):
         payload["manual_request_plan"] = args.manual_request_plan
+    human_summary = _company_research_sdk_human_summary(payload)
+    _attach_company_research_display_text(payload, human_summary)
+    _attach_company_research_output_constraint_validation(payload)
     attach_orchestrator_preflight_payload(payload, args)
     _save_retrieval_tool_performance_memory(args, payload)
     if args.orchestrator_review:
@@ -806,6 +873,22 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
     unknowns = _summary_list(output.get("unknowns"), limit=4)
     facts = _summary_facts(output.get("facts"), limit=4)
     sources = _summary_sources(output.get("sources"), limit=5)
+    output_constraints = output_constraints_from_plan(payload.get("manual_request_plan"))
+
+    narrow_answer_requested = output_constraints.scope == "answer" and (
+        output_constraints.word_count_mode != "unspecified"
+        or output_constraints.sentence_count_mode != "unspecified"
+    )
+    if narrow_answer_requested:
+        answer = _summary_text(output.get("answer"))
+        if not answer:
+            answer = product or why_it_matters or traction
+        if not answer:
+            answer = f"{company} has source-backed company information available for review."
+        sections = ["*Answer:*\n" + answer]
+        if sources:
+            sections.append("*Useful reference:*\n" + sources[0])
+        return "\n\n".join(sections)
 
     answer_parts = []
     if why_it_matters:
@@ -854,6 +937,19 @@ def _attach_company_research_display_text(payload: dict[str, Any], human_summary
     payload["slack_display_text"] = display_text
     payload["display_text"] = display_text
     payload["summary"] = display_text
+
+
+def _attach_company_research_output_constraint_validation(payload: dict[str, Any]) -> None:
+    """Measure the LLM answer without rewriting it."""
+
+    constraints = output_constraints_from_plan(payload.get("manual_request_plan"))
+    if not constraints.is_explicit():
+        return
+    display_text = str(payload.get("human_summary") or "")
+    validation = validate_output_constraints(display_text, constraints)
+    payload["output_constraint_validation"] = validation.model_dump(
+        mode="json", exclude={"checked_text"}
+    )
 
 
 def _summary_text(value: Any) -> str:

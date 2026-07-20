@@ -25,13 +25,18 @@ from keystone_agents.agents.chief_of_staff import (
     plan_chief_of_staff_request,
     run_chief_of_staff_sdk,
 )
+from keystone_agents.manual_request import provider_tool_action_bound
 from keystone_agents.memory import chief_of_staff_memory_item
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.orchestrator.preflight_context import (
     MANUAL_REQUEST_PLAN_ENV,
     ORCHESTRATOR_PREFLIGHT_ENV,
 )
-from keystone_agents.quality_budget import QualityMode, chief_of_staff_quality_budget
+from keystone_agents.quality_budget import (
+    QualityMode,
+    chief_of_staff_quality_budget,
+    is_bounded_chief_response_only_request,
+)
 from keystone_agents.schemas.airtable import airtable_base_schema_summary_from_metadata
 from keystone_agents.schemas.automation import AutomationWriteDestination
 from keystone_agents.schemas.chief_of_staff import (
@@ -74,6 +79,7 @@ from keystone_agents.tools.internal_data_tools import (
     airtable_delete_test_record_impl,
     airtable_get_base_schema_impl,
     airtable_read_records_impl,
+    airtable_reconcile_duplicate_expense_impl,
     airtable_test_record_lifecycle_impl,
     airtable_upload_attachment_impl,
     airtable_write_record_impl,
@@ -99,7 +105,10 @@ from keystone_agents.tools.internal_data_tools import (
     google_sheet_update_tab_impl,
     read_linked_article_impl,
 )
-from keystone_agents.tools.website_extraction_tool import WebsiteExtractionError
+from keystone_agents.tools.website_extraction_tool import (
+    WebsiteExtractionError,
+    WebsiteExtractionResult,
+)
 from keystone_agents.visible_sources import append_visible_source_urls_to_output
 
 
@@ -165,6 +174,54 @@ def test_chief_of_staff_builder_can_structurally_disable_all_tools() -> None:
     )
 
     assert list(agent.tools or []) == []
+
+
+def test_chief_calendar_plan_exposes_only_calendar_writes() -> None:
+    request = "CoS add “UT AI Agents application due on July 23rd”"
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="route_request",
+        target_type="unknown",
+        objective=request,
+        primary_target="UT AI Agents application due on July 23rd",
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text=request,
+        manual_request_plan=plan,
+    )
+    tool_names = {getattr(tool, "name", "") for tool in agent.tools}
+
+    assert {
+        "create_google_calendar_event",
+        "update_google_calendar_event",
+        "delete_google_calendar_event",
+    } <= tool_names
+    assert "read_google_calendar_window" in tool_names
+    assert "airtable_write_record" not in tool_names
+    assert "google_doc_write" not in tool_names
+    assert "publish_slack_summary" not in tool_names
+
+
+def test_chief_read_only_plan_exposes_no_internal_write_tools() -> None:
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="route_request",
+        objective="Summarize the selected operating context.",
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text=plan.objective,
+        manual_request_plan=plan,
+    )
+    tool_names = {getattr(tool, "name", "") for tool in agent.tools}
+
+    assert "airtable_write_record" not in tool_names
+    assert "create_google_calendar_event" not in tool_names
+    assert "google_doc_write" not in tool_names
+    assert "publish_slack_summary" not in tool_names
 
 
 def test_chief_of_staff_result_can_carry_structured_durable_handoff() -> None:
@@ -1624,6 +1681,114 @@ def test_run_script_live_sdk_executes_recommended_work_item_handoff(
     assert "Suggested route" not in output["summary"]
 
 
+def test_run_script_live_sdk_uses_thread_root_and_does_not_execute_incidental_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import keystone_agents.langgraph_workflow as langgraph_workflow
+
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="test",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="route_request",
+        primary_target="the original three bullets",
+        target_type="operator_reference",
+        objective="Return only the original three supplied bullets.",
+        task_objective="route_or_continue",
+        expected_artifact_type="none",
+        workflow=[],
+    )
+    execution_context = {
+        "schema": "keystone.direct_specialist_context.v1",
+        "thread_root_request": (
+            "Using only these facts, give me exactly three concise bullets: "
+            "one shared request envelope; separate direct and stateful backends; "
+            "provider writes complete only after receipt verification."
+        ),
+    }
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_run_chief_of_staff_sdk(
+        typed_input: object,
+        **_kwargs: object,
+    ) -> TypedAgentRunResult:
+        captured["typed_input"] = typed_input
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary=(
+                    "- Use one shared request envelope.\n"
+                    "- Keep direct and stateful execution as separate backends.\n"
+                    "- Complete provider writes only after receipt verification."
+                ),
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="slack-follow-up-review",
+                ),
+                approval_required=True,
+                audit_notes=[
+                    "Business Research Agent was not needed for this supplied-context answer."
+                ],
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    def fail_if_handoff_runs(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("Incidental agent wording must not authorize a WorkItem handoff.")
+
+    monkeypatch.setenv(
+        "KEYSTONE_SPECIALIST_EXECUTION_CONTEXT_JSON",
+        json.dumps(execution_context),
+    )
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "load_manual_request_plan_from_env", lambda: plan)
+    monkeypatch.setattr(script, "load_orchestrator_preflight_from_env", lambda: None)
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(script, "_chief_of_staff_output_review", lambda **_: {"status": "pass"})
+    monkeypatch.setattr(
+        langgraph_workflow,
+        "advance_work_item_manager_loop_with_optional_langgraph",
+        fail_if_handoff_runs,
+    )
+
+    assert (
+        script.main(
+            [
+                "--live-sdk",
+                "--json",
+                "--input",
+                (
+                    "Return only the same three bullets. Do not search, call tools or "
+                    "providers, draft anything, or change anything."
+                ),
+            ]
+        )
+        == 0
+    )
+
+    typed_input = captured["typed_input"]
+    assert isinstance(typed_input, dict)
+    assert typed_input["execution_context"] == execution_context
+    assert "Human thread-root facts outrank prior agent replies" in str(
+        typed_input["execution_context_instruction"]
+    )
+    payload = _payload(capsys.readouterr().out)
+    assert "delegated_work_item_result" not in payload
+    assert payload["human_summary"].count("\n") == 2
+
+
 def test_chief_deterministic_handoff_accepts_workitem_capable_specialist_wording() -> None:
     result = plan_chief_of_staff_request(
         "chief of staff agent: Use only sanitized inline context. Delta Harbor "
@@ -2276,6 +2441,11 @@ def test_run_script_falls_back_when_live_sdk_output_is_malformed(
         "Live SDK structured output could not be parsed or validated" in note
         for note in output["audit_notes"]
     )
+    assert any(
+        'Live SDK validation diagnostic: Invalid JSON when parsing {"agent_name"'
+        in note
+        for note in output["audit_notes"]
+    )
     assert payload["orchestrator_review"] == {"status": "ok"}
 
 
@@ -2299,6 +2469,191 @@ def test_run_script_payload_includes_sdk_usage_cost_and_request_cache() -> None:
     assert payload["request_cache"]["request_layout"] == (
         "static_agent_prefix_then_dynamic_typed_input"
     )
+
+
+def test_run_script_payload_combines_public_summary_and_synthesis_without_metadata() -> None:
+    script = _load_run_chief_of_staff_script()
+    output = ChiefOfStaffResult(
+        mode="llm",
+        summary=(
+            "The supplied note establishes the product positioning but not its "
+            "performance or customer validation."
+        ),
+        synthesis=(
+            "The most credible KNI opportunity is evidence-design advisory. "
+            "The single most important validation gap is the missing evaluation design."
+        ),
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="research-direction-review",
+            rationale="Internal routing rationale must not appear in public text.",
+        ),
+        audit_notes=["provider_status=ok route=chief_of_staff run_id=private"],
+    )
+
+    payload = script._payload(
+        mode="live_sdk",
+        live_sdk=True,
+        model={"provider": "openai", "name": "gpt-5.4-mini"},
+        output=output,
+        input_text="Give me one concise combined brief.",
+    )
+
+    public_text = payload["human_summary"]
+    assert output.summary in public_text
+    assert output.synthesis in public_text
+    assert payload["slack_display_text"] == public_text
+    assert payload["display_text"] == public_text
+    assert "provider_status" not in public_text
+    assert "run_id" not in public_text
+    assert "routing rationale" not in public_text.lower()
+
+
+def test_run_script_exact_bullets_do_not_append_explanatory_synthesis() -> None:
+    script = _load_run_chief_of_staff_script()
+    summary = "- First fact.\n- Second fact.\n- Third fact."
+    output = ChiefOfStaffResult(
+        mode="llm",
+        summary=summary,
+        synthesis="Read-only prep note built only from the supplied facts.",
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="project-context-review",
+            target_channel="current-thread",
+        ),
+    )
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        ask_shape={
+            "output_form": "bullets",
+            "output_constraints": {
+                "item_count_mode": "exact",
+                "minimum_items": 3,
+                "maximum_items": 3,
+            },
+        },
+    )
+
+    payload = script._payload(
+        mode="live_sdk",
+        live_sdk=True,
+        model={"provider": "openai", "name": "gpt-5.4-mini"},
+        output=output,
+        input_text="Using only these facts, return exactly three bullets.",
+        manual_request_plan=plan,
+    )
+
+    assert payload["human_summary"] == summary
+    assert payload["slack_display_text"] == summary
+    assert payload["public_result"]["text"] == summary
+
+
+@pytest.mark.parametrize(
+    "operator_text",
+    [
+        "Don't browse the internet; use only this supplied note.",
+        "Do not search the web. Give me a brief from these facts.",
+        "Use only the provided context for this assessment.",
+    ],
+)
+def test_run_script_uses_shared_no_live_research_semantics(operator_text: str) -> None:
+    script = _load_run_chief_of_staff_script()
+
+    assert script._request_forbids_live_web_research(operator_text) is True
+
+
+def test_run_script_omits_provider_tools_for_supplied_note_only_judgment() -> None:
+    script = _load_run_chief_of_staff_script()
+
+    assert (
+        script._chief_of_staff_should_attach_tools(
+            "Use only this supplied note. Don't look anything up online."
+        )
+        is False
+    )
+    assert (
+        script._chief_of_staff_should_attach_tools(
+            "Use only these approved facts. Assess what is supported, decide the "
+            "highest-value gap, and prepare an internal recommendation. Do not use "
+            "provider tools."
+        )
+        is False
+    )
+    assert (
+        script._chief_of_staff_should_attach_tools(
+            "Use only this supplied note and create a Google Doc for my review."
+        )
+        is True
+    )
+    assert (
+        script._chief_of_staff_should_attach_tools(
+            "Do a current source-backed web search for this company."
+        )
+        is True
+    )
+    continuation = (
+        "chief of staff continue this prior Slack thread. "
+        "Current user request (authoritative): Make that three bullets. "
+        "Previous request: Use only this supplied note. Don't look anything up online. "
+        "Previous result title: Business Agents Chief of Staff Plan Ready "
+        "Previous result: A bounded answer. "
+        "User follow-up: Make that three bullets. "
+        "Continue the same agent task. Any approval change remains subject to tool gates."
+    )
+    assert script._chief_tool_scope_text(continuation).startswith(
+        "Use only this supplied note."
+    )
+    assert script._chief_of_staff_should_attach_tools(continuation) is False
+
+
+def test_supplied_facts_may_name_slack_without_admitting_provider_tools() -> None:
+    script = _load_run_chief_of_staff_script()
+    request = (
+        "Using only these two facts, give me exactly two short bullets: the shared "
+        "admission layer requires semantic intent plus a provider-bound action before "
+        "any provider handler runs; exact response-count constraints should suppress "
+        "decorative Slack titles. Do not search, use tools or providers, create or "
+        "modify anything, or include routing metadata."
+    )
+    plan = chief_of_staff_module.infer_manual_request_plan(
+        request,
+        requested_agent="chief_of_staff",
+    )
+
+    assert chief_of_staff_module.looks_like_supplied_context_synthesis_request(request)
+    assert script._chief_of_staff_should_attach_tools(request, plan) is False
+    assert provider_tool_action_bound(request) is False
+
+
+@pytest.mark.parametrize(
+    "operator_text",
+    [
+        "Check my Google Calendar for tomorrow's meetings.",
+        "Read the latest Gmail thread from the grant team.",
+        "Create a Google Doc from this approved summary.",
+        "Post this approved update to Slack.",
+        "Search the KNI repository for the routing contract.",
+    ],
+)
+def test_bound_provider_actions_still_admit_chief_tools(operator_text: str) -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = chief_of_staff_module.infer_manual_request_plan(
+        operator_text,
+        requested_agent="chief_of_staff",
+    )
+
+    assert provider_tool_action_bound(operator_text) is True
+    assert script._chief_of_staff_should_attach_tools(operator_text, plan) is True
+
+
+def test_chief_specialist_tool_routing_ignores_approval_boilerplate() -> None:
+    request = (
+        "chief of staff continue this prior Slack thread. "
+        "Previous request: Use only this supplied note. "
+        "User follow-up: Make that three bullets. "
+        "If the follow-up grants approval, still obey the agent and tool approval gates."
+    )
+
+    assert chief_of_staff_module.chief_of_staff_should_use_specialist_tools(request) is False
 
 
 def test_run_script_json_exception_emits_operator_failure_payload(
@@ -2374,6 +2729,18 @@ def test_run_script_allows_explicit_finance_tracker_airtable_receipt_write() -> 
     assert "one receipt attachment upload is allowed through typed Airtable tools" in policy
     assert "delete records" in policy
     assert script._requests_finance_tracker_airtable_write(request) is True
+
+
+def test_run_script_treats_dated_deadline_as_scoped_calendar_write() -> None:
+    script = _load_run_chief_of_staff_script()
+    request = "CoS add “UT AI Agents application due on July 23rd”"
+
+    policy = script._live_side_effect_policy(request)
+
+    assert script._requests_calendar_write(request) is True
+    assert "one exact Google Calendar action" in policy
+    assert "Verify provider state" in policy
+    assert "Do not mutate Slack, Gmail, Airtable" in policy
 
 
 def test_chief_of_staff_article_reader_is_default_off_until_explicit() -> None:
@@ -3471,18 +3838,17 @@ def test_internal_data_tools_dry_run_are_gated(monkeypatch: pytest.MonkeyPatch) 
     )
     assert explicit_url_extract["status"] == "dry-run"
 
-    class FakeExtractionResult:
-        status = "success"
-        url = "https://example.com/article"
-        title = "Example Article"
-        provider = "trafilatura"
-        text_or_markdown = "Extracted page text for source-aware synthesis."
-        claims = ["Source-backed claim"]
-        metadata = {"duration_ms": 12, "secret": "redacted_by_safe_metadata"}
-
-    def fake_extract_website_content(*_args: object, **kwargs: object) -> FakeExtractionResult:
+    def fake_extract_website_content(*_args: object, **kwargs: object) -> WebsiteExtractionResult:
         assert kwargs["live"] is True
-        return FakeExtractionResult()
+        return WebsiteExtractionResult(
+            status="success",
+            url="https://example.com/article",
+            title="Example Article",
+            provider="trafilatura",
+            text_or_markdown="Extracted page text for source-aware synthesis.",
+            claims=["Source-backed claim"],
+            metadata={"duration_ms": 12, "secret": "redacted_by_safe_metadata"},
+        )
 
     monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
     monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
@@ -3564,9 +3930,14 @@ def test_internal_data_tools_dry_run_are_gated(monkeypatch: pytest.MonkeyPatch) 
     assert "imageMediaMetadata" in drive_file_metadata["metadata_fields"]
     assert "does not download file bytes" in " ".join(drive_file_metadata["notes"])
 
-    doc_write = google_doc_write_impl("Company Note", "Source-backed note.")
+    doc_write = google_doc_write_impl(
+        "Company Note",
+        "Source-backed note.",
+        content_mode="append",
+    )
     assert doc_write["status"] == "dry-run"
     assert doc_write["operation"] == "write_doc"
+    assert doc_write["content_mode"] == "append"
     assert doc_write["title"] == "Company Note"
     assert doc_write["folder_path"] == "KNIOps"
 
@@ -3816,6 +4187,23 @@ def test_airtable_allowed_tables_and_update_matching_are_guarded(
     assert sheet_trash["spreadsheet_id"] == "sheet123"
 
 
+def test_airtable_tool_blocks_create_when_operator_scope_is_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_AIRTABLE_ALLOWED_OPERATION", "update")
+
+    result = airtable_write_record_impl(
+        '{"Item": "Linear Basic"}',
+        table="Personal Expenses",
+        operation="create",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["operation"] == "create"
+    assert result["allowed_operation"] == "update"
+    assert "operator-approved" in result["reason"]
+
+
 def test_google_workspace_token_path_prefers_new_key_then_legacy_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3872,6 +4260,7 @@ def test_airtable_live_write_returns_read_after_write_verification(
     assert result["status"] == "success"
     assert result["operation"] == "update"
     assert result["record_id"] == "rec_verified"
+    assert result["provider_link"] == "https://airtable.com/app_finance/rec_verified"
     assert result["verified_record"]["fields"]["Total Expenses"] == 1304.88
     assert result["verification"] == {
         "status": "verified",
@@ -3925,6 +4314,7 @@ def test_airtable_live_write_reports_field_verification_failure(
         "matched_fields": [],
         "mismatched_fields": ["Review Status"],
     }
+    assert result["provider_link"] == ""
 
 
 def test_airtable_verification_treats_omitted_unchecked_checkbox_as_false(
@@ -4304,6 +4694,7 @@ def test_airtable_delete_test_record_reads_deletes_and_verifies_absence(
 def test_airtable_test_record_lifecycle_uses_minimal_schema_safe_fields_and_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("AIRTABLE_ALLOW_TEST_DELETES", "true")
     writes: list[dict[str, object]] = []
     deletes: list[dict[str, object]] = []
 
@@ -4366,9 +4757,30 @@ def test_airtable_test_record_lifecycle_uses_minimal_schema_safe_fields_and_clea
     ]
 
 
+def test_airtable_test_record_lifecycle_checks_cleanup_gate_before_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[object] = []
+    monkeypatch.delenv("AIRTABLE_ALLOW_TEST_DELETES", raising=False)
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_write_record_impl",
+        lambda *args, **kwargs: writes.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="cleanup gate before create"):
+        airtable_test_record_lifecycle_impl(
+            approval_reference="authenticated-operator",
+            live=True,
+        )
+
+    assert writes == []
+
+
 def test_airtable_test_record_lifecycle_cleans_created_record_after_update_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("AIRTABLE_ALLOW_TEST_DELETES", "true")
     write_count = 0
     deleted: list[str] = []
 
@@ -4444,7 +4856,6 @@ def test_airtable_upload_attachment_dry_run_redacts_local_file(
         table="Business Expenses",
         record_id="rec_verified",
         field_id="fld_receipt",
-        approval_reference="slack-test-approved",
         live=False,
     )
 
@@ -4466,6 +4877,10 @@ def test_airtable_create_expense_from_receipt_dry_run_maps_and_attaches(
     monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
     monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
     monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setenv(
+        "KEYSTONE_AIRTABLE_OPERATOR_APPROVAL_REFERENCE",
+        "airtable-direct:receipt-test",
+    )
     monkeypatch.setattr(
         "keystone_agents.tools.internal_data_tools.extract_finance_receipt_evidence",
         lambda path: FinanceReceiptEvidence(
@@ -4532,7 +4947,6 @@ def test_airtable_create_expense_from_receipt_dry_run_maps_and_attaches(
         table="Business Expenses",
         category="Professional",
         payment_method="Credit card (personal)",
-        approval_reference="slack-test-approved",
         live=False,
     )
 
@@ -4546,6 +4960,7 @@ def test_airtable_create_expense_from_receipt_dry_run_maps_and_attaches(
     assert result["attachment_result"]["status"] == "dry-run"
     assert result["attachment_result"]["request"]["payload"]["file"].startswith("<base64 ")
     assert result["mapping"]["attachment_field"]["field_id"] == "fldAttachment"
+    assert result["approval_reference"] == "airtable-direct:receipt-test"
 
 
 def test_airtable_create_expense_from_receipt_accepts_model_receipt_facts_and_schema_fields(
@@ -4824,11 +5239,25 @@ def test_airtable_create_expense_from_receipt_live_success_writes_then_attaches(
 
     def fake_write(fields_json: str, **kwargs: object) -> dict[str, object]:
         calls.append(("write", {"fields_json": fields_json, **kwargs}))
-        return {"status": "success", "record_id": "rec_created", "verified_record": {}}
+        return {
+            "status": "success",
+            "record_id": "rec_created",
+            "verified_record": {},
+            "verification": {"passed": True, "record_id_match": True},
+        }
 
     def fake_upload(local_file_path: str, **kwargs: object) -> dict[str, object]:
         calls.append(("upload", {"local_file_path": local_file_path, **kwargs}))
-        return {"status": "success", "record_id": kwargs["record_id"], "field_id": "fldAttachment"}
+        return {
+            "status": "success",
+            "record_id": kwargs["record_id"],
+            "field_id": "fldAttachment",
+            "verification": {
+                "passed": True,
+                "attachment_count_before": 0,
+                "attachment_count_after": 1,
+            },
+        }
 
     monkeypatch.setattr(
         "keystone_agents.tools.internal_data_tools.airtable_write_record_impl",
@@ -4853,11 +5282,210 @@ def test_airtable_create_expense_from_receipt_live_success_writes_then_attaches(
     write_call = calls[0][1]
     upload_call = calls[1][1]
     assert write_call["live"] is True
+    assert write_call["validate_schema"] is True
     assert upload_call["live"] is True
     assert upload_call["record_id"] == "rec_created"
     assert upload_call["field_id"] == "fldAttachment"
     assert result["write_result"]["record_id"] == "rec_created"
     assert result["attachment_result"]["status"] == "success"
+    assert result["operation"] == "create_expense_from_receipt"
+    assert result["record_id"] == "rec_created"
+    assert result["verification"] == {
+        "status": "verified",
+        "passed": True,
+        "record_id_match": True,
+        "create_read_back": True,
+        "attachment_read_back": True,
+        "attachment_count_before": 0,
+        "attachment_count_after": 1,
+    }
+
+
+def test_airtable_duplicate_expense_reconciliation_is_dry_run_safe() -> None:
+    result = airtable_reconcile_duplicate_expense_impl(
+        "recKeep123456789",
+        "recDuplicate12345",
+        target_estimated_tax_period="3",
+        table="Personal Expenses",
+        base_alias="finance_tax_tracker",
+        approval_reference="thread:test duplicate cleanup",
+        live=False,
+    )
+
+    assert result["status"] == "dry-run"
+    assert result["operation"] == "reconcile_duplicate_expense"
+    assert result["record_id"] == "recKeep123456789"
+    assert result["duplicate_record_id"] == "recDuplicate12345"
+    assert result["verification"]["passed"] is False
+
+
+def test_airtable_create_expense_from_receipt_uses_live_schema_field_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Personal Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+    monkeypatch.setenv("AIRTABLE_ALLOW_ATTACHMENT_UPLOADS", "true")
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="receipt.pdf",
+            content_read=True,
+            extraction_method="fixture",
+            vendor="Example Vendor",
+            receipt_date="2026-07-13",
+            description="Software subscription",
+            total="127.20",
+            estimated_tax_periods="Q3",
+        ),
+    )
+    schema_fields = [
+        {"name": "Item", "field_type": "multilineText", "field_id": "fldItem"},
+        {
+            "name": "Estimated Tax Periods",
+            "field_type": "multilineText",
+            "field_id": "fldTaxPeriod",
+        },
+        {"name": "Date of Expense", "field_type": "date", "field_id": "fldDate"},
+        {
+            "name": "Expense Client/Vendor",
+            "field_type": "multilineText",
+            "field_id": "fldVendor",
+        },
+        {"name": "Description", "field_type": "multilineText", "field_id": "fldDescription"},
+        {"name": "Amount", "field_type": "currency", "field_id": "fldAmount"},
+        {
+            "name": "Receipt Available",
+            "field_type": "checkbox",
+            "field_id": "fldReceiptAvailable",
+        },
+        {
+            "name": "Attachments",
+            "field_type": "multipleAttachments",
+            "field_id": "fldAttachments",
+        },
+    ]
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {"tables": [{"name": "Personal Expenses", "fields": schema_fields}]},
+        },
+    )
+    names_by_id = {field["field_id"]: field["name"] for field in schema_fields}
+    requests: list[dict[str, object]] = []
+    written_fields: dict[str, object] = {}
+
+    def fake_send(request: dict[str, object], **_: object) -> dict[str, object]:
+        requests.append(request)
+        if request["method"] == "POST":
+            provider_fields = dict(request["payload"]["fields"])
+            written_fields.update(
+                {names_by_id[field_id]: value for field_id, value in provider_fields.items()}
+            )
+            return {"id": "rec_created", "fields": provider_fields}
+        return {"records": [{"id": "rec_created", "fields": written_fields}]}
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", fake_send)
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_upload_attachment_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "record_id": "rec_created",
+            "verification": {
+                "passed": True,
+                "attachment_count_before": 0,
+                "attachment_count_after": 1,
+            },
+        },
+    )
+    receipt = tmp_path / "receipt.pdf"
+    receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
+
+    result = airtable_create_expense_from_receipt_impl(
+        str(receipt),
+        table="Personal Expenses",
+        approval_reference="slack-test-approved",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    post_request = requests[0]
+    assert post_request["params"] == {"returnFieldsByFieldId": "true"}
+    assert "fldReceiptAvailable" in post_request["payload"]["fields"]
+    assert "Receipt Available" not in post_request["payload"]["fields"]
+    assert result["write_result"]["schema_validation"]["provider_field_ids_used"] is True
+    assert result["verification"]["create_read_back"] is True
+    assert result["verification"]["attachment_read_back"] is True
+
+
+def test_airtable_create_expense_from_receipt_blocks_without_attachment_field_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.finance_expense_receipts import FinanceReceiptEvidence
+
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Personal Expenses")
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.extract_finance_receipt_evidence",
+        lambda path: FinanceReceiptEvidence(
+            source_path=str(path),
+            filename="receipt.pdf",
+            content_read=True,
+            extraction_method="fixture",
+            vendor="Example Vendor",
+            receipt_date="2026-07-13",
+            description="Software subscription",
+            total="127.20",
+            estimated_tax_periods="Q3",
+        ),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Personal Expenses",
+                        "fields": [
+                            {"name": "Item", "field_type": "multilineText"},
+                            {"name": "Date of Expense", "field_type": "date"},
+                            {"name": "Amount", "field_type": "currency"},
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools.airtable_write_record_impl",
+        lambda *_args, **_kwargs: pytest.fail(
+            "missing attachment schema must block before record creation"
+        ),
+    )
+    receipt = tmp_path / "receipt.pdf"
+    receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
+
+    result = airtable_create_expense_from_receipt_impl(
+        str(receipt),
+        table="Personal Expenses",
+        approval_reference="slack-test-approved",
+        live=True,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["operation"] == "create_expense_from_receipt"
+    assert result["verification"]["status"] == "blocked_before_write"
+    assert result["verification"]["passed"] is False
 
 
 def test_chief_of_staff_live_business_expense_receipt_uses_llm_tool_path(
@@ -5302,6 +5930,49 @@ def test_chief_of_staff_quality_budget_caps_bounded_live_smoke() -> None:
     assert budget.max_tool_calls == 3
     assert budget.hosted_web_search_max_calls == 0
     assert budget.enable_context_deepening is False
+
+
+def test_chief_of_staff_quality_budget_caps_prior_context_response_only_turn() -> None:
+    request = (
+        "CoS, reply with only the exact three bullets supported by my original "
+        "request. No heading or closing note. Do not search, call tools or "
+        "providers, draft anything, or change anything."
+    )
+
+    budget = chief_of_staff_quality_budget(request_text=request, live_sdk=True)
+
+    assert is_bounded_chief_response_only_request(request) is True
+    assert budget.mode == QualityMode.FAST
+    assert budget.max_turns == 1
+    assert budget.max_tokens == 1200
+    assert budget.max_tool_calls == 0
+    assert budget.hosted_web_search_max_calls == 0
+    assert budget.enable_context_deepening is False
+    assert build_chief_of_staff_agent(
+        quality_budget=budget,
+        request_text=request,
+    ).tools == []
+
+
+def test_chief_of_staff_quality_budget_caps_postposed_only_note_response() -> None:
+    request = (
+        "CoS: From this note only, Northstar Care sells referral-navigation software "
+        "and has no audited outcomes. Give me one supported fact and the first "
+        "validation question. No search or writes."
+    )
+
+    budget = chief_of_staff_quality_budget(request_text=request, live_sdk=True)
+
+    assert is_bounded_chief_response_only_request(request) is True
+    assert budget.mode == QualityMode.FAST
+    assert budget.max_turns == 1
+    assert budget.max_tool_calls == 0
+    assert budget.hosted_web_search_max_calls == 0
+    assert budget.enable_context_deepening is False
+    assert build_chief_of_staff_agent(
+        quality_budget=budget,
+        request_text=request,
+    ).tools == []
 
 
 def test_chief_of_staff_quality_budget_deep_for_cross_channel_audit() -> None:
@@ -5947,6 +6618,147 @@ def test_budget_request_with_no_memory_uses_validation_plan(tmp_path: Path) -> N
     assert result.memory_context.records == []
     assert "No approved prompt-safe" in result.memory_context.missing_reason
     assert any("validation plan" in action.lower() for action in result.recommended_actions)
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        (
+            "I have five minutes before a team check-in. Using only this note, give me "
+            "three short bullets: we need one shared request contract; direct and "
+            "multi-step execution can remain different; provider receipts must be "
+            "verified before saying work is done. Do not search the web or change anything."
+        ),
+        (
+            "Using only these facts, summarize the plan in 3 concise bullets: one request "
+            "contract; separate direct and graph executors; verify receipts before completion."
+        ),
+        (
+            "Turn the following supplied text into three brief talking points: one request "
+            "contract; separate execution paths; verified receipts before completion."
+        ),
+    ],
+)
+def test_supplied_context_synthesis_returns_direct_answer_without_slack_route(
+    request_text: str,
+) -> None:
+    result = plan_chief_of_staff_request(request_text)
+
+    assert result.recommended_route.workflow_type == "project-context-review"
+    assert result.recommended_route.command_text == ""
+    assert result.recommended_route.target_channel == "current-thread"
+    assert result.summary.count("\n- ") == 2
+    assert "Need clarification" not in result.summary
+    assert "/kni help" not in result.summary
+    assert result.sources == []
+    assert result.context_sources_considered == ["operator_supplied_context"]
+
+
+def test_supplied_context_sdk_input_marks_complete_direct_answer() -> None:
+    request_text = (
+        "Using only this note, give me three bullets: one request contract; separate "
+        "execution paths; verified receipts."
+    )
+
+    payload = chief_of_staff_module._chief_of_staff_sdk_input_for_request(
+        request_text,
+        raw_request_text=request_text,
+    )
+
+    assert isinstance(payload, dict)
+    assert payload["request"] == request_text
+    assert "complete, provider-free direct-answer request" in str(
+        payload["direct_supplied_context_instruction"]
+    )
+
+
+def test_supplied_context_sdk_output_cannot_reintroduce_clarification_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_text = (
+        "Without searching or using provider tools, use only these two facts: "
+        "constraint pruning works, and the offline suite passes. Give me two bullets."
+    )
+
+    def fake_run_typed_sdk_agent(**_kwargs: object) -> TypedAgentRunResult[ChiefOfStaffResult]:
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(
+                mode="llm",
+                summary="- Constraint pruning works.\n- The offline suite passes.",
+                recommended_route=ChiefOfStaffRouteRecommendation(
+                    workflow_type="clarification",
+                ),
+            ),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.agents.chief_of_staff.run_typed_sdk_agent",
+        fake_run_typed_sdk_agent,
+    )
+
+    result = run_chief_of_staff_sdk(request_text, live=True)
+
+    assert result.output.recommended_route.workflow_type == "project-context-review"
+    assert result.output.recommended_route.command_text == ""
+    assert result.output.recommended_route.target_channel == "current-thread"
+    assert result.output.durable_handoff is None
+    assert result.output.context_handoffs == []
+
+
+def test_supplied_context_agent_uses_compact_zero_tool_profile() -> None:
+    request_text = (
+        "Using only these facts, give me exactly three concise bullets: one request "
+        "contract; separate direct and graph executors; verify receipts before "
+        "completion. Do not search or change anything."
+    )
+    plan = ManualRequestPlan.model_validate(
+        chief_of_staff_module.infer_manual_request_plan(
+            request_text,
+            requested_agent="chief_of_staff",
+        )
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text=request_text,
+        manual_request_plan=plan,
+        attach_tools=False,
+    )
+
+    assert agent.tools == []
+    assert isinstance(agent.instructions, str)
+    assert "chief_of_staff_supplied_synthesis_compact" in agent.instructions
+    assert len(agent.instructions) < 25_000
+
+
+def test_supplied_context_advisory_verbs_still_use_zero_tool_profile() -> None:
+    request_text = (
+        "Use only these approved facts: Northstar Care sells referral-navigation "
+        "software and has not supplied audited outcomes. Assess what is supported, "
+        "decide the highest-value validation gap, and prepare a paste-ready internal "
+        "Slack recommendation. Do not search or use provider tools."
+    )
+    plan = chief_of_staff_module.infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+
+    assert (
+        chief_of_staff_module._looks_like_operator_supplied_synthesis_request(
+            request_text
+        )
+        is True
+    )
+    agent = build_chief_of_staff_agent(
+        request_text=request_text,
+        manual_request_plan=plan,
+        attach_tools=False,
+    )
+
+    assert agent.tools == []
+    assert "chief_of_staff_supplied_synthesis_compact" in str(agent.instructions)
 
 
 def test_slack_repo_context_tools_are_read_only_and_secret_filtered(tmp_path: Path) -> None:

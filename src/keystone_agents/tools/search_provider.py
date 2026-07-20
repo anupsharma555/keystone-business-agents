@@ -1062,7 +1062,32 @@ def _search_searxng_live(
             results.append(result)
         if len(results) >= request.num_results:
             break
+    if not results:
+        unresponsive_summary = _searxng_unresponsive_engine_summary(
+            data.get("unresponsive_engines")
+        )
+        if unresponsive_summary:
+            raise SearxngSearchError(
+                "SearXNG returned no results while search engines were unavailable: "
+                f"{unresponsive_summary}."
+            )
     return results
+
+
+def _searxng_unresponsive_engine_summary(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    summaries: list[str] = []
+    for item in value[:8]:
+        if isinstance(item, list | tuple) and item:
+            engine = str(item[0] or "unknown").strip()
+            reason = str(item[1] if len(item) > 1 else "unavailable").strip()
+            summaries.append(f"{engine} ({reason})")
+        elif isinstance(item, dict):
+            engine = str(item.get("engine") or item.get("name") or "unknown").strip()
+            reason = str(item.get("error") or item.get("reason") or "unavailable").strip()
+            summaries.append(f"{engine} ({reason})")
+    return ", ".join(item for item in summaries if item)
 
 
 def _search_firecrawl_live(

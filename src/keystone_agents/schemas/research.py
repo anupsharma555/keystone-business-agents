@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from keystone_agents.schemas.request_coverage import RequestCoverage
+
 ResearchTargetType = Literal[
     "company",
     "institute",
@@ -103,6 +105,7 @@ class ResearchBrief(BaseModel):
     sources: list[ResearchSourceCitation] = Field(default_factory=list)
     raw_source_content_included: bool = False
     send_enabled: bool = False
+    request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
 
     @field_validator("target_name", "research_goal", "summary", mode="before")
     @classmethod

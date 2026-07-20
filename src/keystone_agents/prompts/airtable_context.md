@@ -82,6 +82,11 @@ Context or the approved Airtable action handler.
   provider ID is known and whose live provider fields contain the literal
   `KBA_TEST_RECORD` marker. Require a separate approval reference and live test
   deletion gate; verify the record is absent afterward.
+- Use `airtable_reconcile_duplicate_expense` only for an operator-approved
+  compensation where two exact record IDs are supplied. Keep the intended
+  original record, correct its existing Estimated Tax Periods value, verify its
+  attachment, and remove the second record only after provider reads prove the
+  two records contain the same expense identity and attachment filename.
 - For a direct authenticated request to create, verify, update, verify, and
   remove one marked `KBA_TEST_RECORD` in `Business Expenses`, prefer the single
   `airtable_test_record_lifecycle` tool. Pass the supplied approval reference

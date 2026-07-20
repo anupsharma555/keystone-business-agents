@@ -24,6 +24,7 @@ from keystone_agents.langgraph_workflow import (
     work_item_graph_thread_id,
     work_item_langgraph_enabled,
 )
+from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.reporting import render_work_item_graph_report
 from keystone_agents.schemas.announcement_feed import AnnouncementFeedEvidence, AnnouncementFeedItem
@@ -456,6 +457,489 @@ def test_langgraph_manager_loop_runs_distinct_next_specialist_edge(tmp_path: Pat
         WorkItemRoute.OPPORTUNITY_SCOUT.value,
     ]
     assert "max_steps=2" in graph_completion.metadata["stop_reason"]
+
+
+def test_langgraph_honors_goal_based_cos_workflow_and_keeps_target(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "CoS, using the approved Northstar Behavioral Analytics packet, review what "
+        "is known and unknown, identify the highest-value advisory opportunity and "
+        "validation gap, then draft a concise internal Slack recommendation for my "
+        "review. Use supplied materials only. Do not search the web, create provider "
+        "records, send email, or post."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+
+    result = advance_work_item_manager_loop_with_optional_langgraph(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            context_file_path=str(
+                Path(__file__).parent
+                / "fixtures"
+                / "graph_research_to_draft_source_bundle.json"
+            ),
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            manual_request_plan=plan.model_dump(mode="json"),
+            live_sdk=False,
+            live_search=False,
+            save=True,
+        ),
+        max_steps=3,
+        use_langgraph=True,
+    )
+
+    events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(
+        result.work_item.id
+    )
+    handoffs = [
+        event for event in events if event.event_type == "planned_workflow_handoff"
+    ]
+
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.work_item.target.name == "Northstar Behavioral Analytics"
+    assert "*Recommendation:*" in result.human_summary
+    assert "*Most important validation gap:*" in result.human_summary
+    assert "*Sources:*" in result.human_summary
+    assert "fixture://graph-source/company-brief" in result.human_summary
+    assert "Hi," not in result.human_summary
+    assert "exploratory reply" not in result.human_summary
+    assert {
+        artifact.title
+        for artifact in result.work_item.artifact_refs
+        if artifact.artifact_type == "opportunity"
+    } == {"Northstar Behavioral Analytics"}
+    assert [
+        (event.metadata["from_route"], event.metadata["to_route"])
+        for event in handoffs
+    ] == [
+        ("business_research_analyst", "opportunity_scout"),
+        ("opportunity_scout", "outreach_composer"),
+    ]
+
+
+def test_langgraph_preserves_supplied_note_across_automatic_research_opportunity_handoff(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "CoS, I only have a minute. Here is a supplied read-only note—Harbor Bridge "
+        "Health provides behavioral-health care-navigation software, works with health "
+        "plans, and reports an outcomes measurement program. First assess what the note "
+        "establishes, then decide the most credible advisory or research opportunity and "
+        "the single validation gap. Use whoever is needed. Do not search the web, write "
+        "provider records, send email, or post anywhere. Return one combined brief."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+
+    result = advance_work_item_manager_loop_with_optional_langgraph(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            manual_request_plan=plan.model_dump(mode="json"),
+            live_sdk=False,
+            live_search=False,
+            save=True,
+        ),
+        max_steps=2,
+        use_langgraph=True,
+    )
+
+    events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(
+        result.work_item.id
+    )
+    source_provided_research = next(
+        artifact
+        for artifact in result.work_item.artifact_refs
+        if artifact.artifact_type == "company_profile"
+        and artifact.metadata.get("source_provided") is True
+    )
+    retained_facts = source_provided_research.metadata["source_refs"][0]["key_facts"]
+
+    assert plan.workflow == [
+        "business_research_analyst",
+        "opportunity_scout",
+    ]
+    assert result.route == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert any("care-navigation software" in fact for fact in retained_facts)
+    assert any("health plans" in fact for fact in retained_facts)
+    assert all("First assess" not in fact for fact in retained_facts)
+    assert [
+        (event.metadata["from_route"], event.metadata["to_route"])
+        for event in events
+        if event.event_type == "planned_workflow_handoff"
+    ] == [("business_research_analyst", "opportunity_scout")]
+
+
+def test_natural_cos_decision_brief_completes_planned_graph_without_post_checkpoint(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "CoS, I have five minutes before a partnership discussion. Here is all I know: "
+        "Harbor Bridge Health sells behavioral-health care-navigation software to "
+        "health plans and says it tracks referral completion and care engagement, but "
+        "it has not shared audited outcomes, customer references, implementation data, "
+        "or an evaluation design. Give me one decision brief: what is actually "
+        "supported, the strongest potential KNI advisory or research fit, the single "
+        "validation question that should come first, and a short internal Slack note I "
+        "can paste to the team. Use only this note; do not search, create or modify "
+        "anything, draft or send email, or post anywhere else."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+    database_url = _database_url(tmp_path)
+    workflow_request = WorkflowRunRequest(
+        request_text=request_text,
+        database_url=database_url,
+        requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+        manual_request_plan=plan.model_dump(mode="json"),
+        live_sdk=False,
+        live_search=False,
+        save=True,
+    )
+
+    assert should_use_langgraph_for_work_item(workflow_request, manager_loop=True) is True
+
+    result = advance_work_item_manager_loop_with_optional_langgraph(
+        workflow_request,
+        max_steps=4,
+    )
+    events = SQLiteStore(database_url).list_work_item_events(result.work_item.id)
+    graph_event = next(
+        event for event in events if event.event_type == "langgraph_orchestration"
+    )
+
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.DONE
+    outreach = result.work_item.artifact_refs[-1]
+    research = next(
+        artifact
+        for artifact in result.work_item.artifact_refs
+        if artifact.artifact_type == "company_profile"
+    )
+    opportunity = next(
+        artifact
+        for artifact in result.work_item.artifact_refs
+        if artifact.artifact_type == "opportunity"
+    )
+    assert research.metadata["source_provided"] is True
+    assert "care-navigation software" in research.summary
+    assert opportunity.metadata["source_provided"] is True
+    assert outreach.artifact_type == "outreach_draft"
+    assert outreach.metadata["internal_slack_copy"] is True
+    assert result.human_summary.startswith("*Decision brief:*")
+    assert "*What the supplied note supports:*" in result.human_summary
+    assert "*Internal Slack note:*" in result.human_summary
+    assert "care-navigation software" in result.human_summary
+    assert result.human_summary.count("*Next safe action:*") == 1
+    assert "Email draft" not in result.human_summary
+    assert "Hi," not in result.human_summary
+    assert "fixture://" not in result.human_summary
+    assert graph_event.metadata["checkpoint_required"] is False
+    assert "approval_checkpoint" not in graph_event.metadata["node_path"]
+    assert [
+        (event.metadata["from_route"], event.metadata["to_route"])
+        for event in events
+        if event.event_type == "planned_workflow_handoff"
+    ] == [
+        ("business_research_analyst", "opportunity_scout"),
+        ("opportunity_scout", "outreach_composer"),
+    ]
+    assert all(
+        artifact.metadata.get("external_write_performed") is not True
+        and artifact.metadata.get("send_enabled") is not True
+        for artifact in result.work_item.artifact_refs
+    )
+
+
+def test_resumable_approved_facts_internal_slack_recommendation_is_not_external_outreach(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "CoS, track this as a resumable internal review. Use only these approved "
+        "facts: Northstar Care sells behavioral-health referral-navigation software "
+        "to health plans; it says it tracks closed-loop referrals and member "
+        "engagement; it has not supplied audited outcomes, customer references, "
+        "implementation data, or an evaluation design. Assess what is supported, "
+        "decide the highest-value validation gap, and prepare a paste-ready internal "
+        "Slack recommendation. Preserve the assessment and recommendation together "
+        "so I can ask you to revise the recommendation in this thread later. Do not "
+        "search, use provider tools, create or modify records, send email, or post "
+        "anywhere else."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+    database_url = _database_url(tmp_path)
+
+    result = advance_work_item_manager_loop_with_optional_langgraph(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=database_url,
+            requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+            manual_request_plan=plan.model_dump(mode="json"),
+            live_sdk=False,
+            live_search=False,
+            save=True,
+        ),
+        max_steps=4,
+    )
+
+    internal_artifact = result.work_item.artifact_refs[-1]
+    blocker_codes = {blocker.code for blocker in result.work_item.blockers}
+
+    assert result.status == WorkItemStatus.DONE
+    assert result.work_item.id.startswith("wi_")
+    assert internal_artifact.metadata["internal_slack_copy"] is True
+    assert "outreach_requires_approved_context" not in blocker_codes
+    assert result.human_summary.startswith("*Assessment:*")
+    assert "*Paste-ready internal Slack recommendation:*" in result.human_summary
+    assert "Northstar Care" in result.human_summary
+    assert "referral-navigation software" in result.human_summary
+    assert "track this as a resumable" not in result.human_summary.lower()
+    assert "assess what is supported" not in result.human_summary.lower()
+    assert "Gmail draft" not in result.human_summary
+    assert "Email draft" not in result.human_summary
+
+
+def test_short_human_cos_stateful_review_completes_same_graph_contract(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "CoS: Track this review. Northstar Care sells referral-navigation software "
+        "but has no audited outcomes. Assess what is supported, choose the first "
+        "validation gap, and give me a paste-ready internal Slack recommendation. "
+        "No search or external actions."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+    database_url = _database_url(tmp_path)
+
+    result = advance_work_item_manager_loop_with_optional_langgraph(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=database_url,
+            requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+            manual_request_plan=plan.model_dump(mode="json"),
+            live_sdk=False,
+            live_search=False,
+            save=True,
+        ),
+        max_steps=4,
+    )
+
+    assert plan.workflow == [
+        "business_research_analyst",
+        "opportunity_scout",
+        "outreach_composer",
+    ]
+    assert result.status == WorkItemStatus.DONE
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    research = next(
+        artifact
+        for artifact in result.work_item.artifact_refs
+        if artifact.artifact_type == "company_profile"
+    )
+    opportunity = next(
+        artifact
+        for artifact in result.work_item.artifact_refs
+        if artifact.artifact_type == "opportunity"
+    )
+    assert research.metadata["source_provided"] is True
+    assert opportunity.metadata["source_provided"] is True
+    assert research.metadata["source_refs"][0]["key_facts"] == [
+        "Northstar Care sells referral-navigation software but has no audited outcomes."
+    ]
+    assert result.work_item.artifact_refs[-1].metadata["internal_slack_copy"] is True
+    assert result.human_summary.startswith("*Assessment:*")
+    assert "*Paste-ready internal Slack recommendation:*" in result.human_summary
+    assert "Track this review" not in result.human_summary
+    assert "*Answer:*" not in result.human_summary
+    assert "*Detailed Summary:*" not in result.human_summary
+    assert "Email draft" not in result.human_summary
+    assert all(
+        artifact.metadata.get("external_write_performed") is not True
+        and artifact.metadata.get("send_enabled") is not True
+        for artifact in result.work_item.artifact_refs
+    )
+
+
+def test_langgraph_goal_based_cos_internal_slack_uses_live_synthesis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_text = (
+        "CoS, using the approved Northstar Behavioral Analytics packet, review what "
+        "is known and unknown, identify the highest-value advisory opportunity and "
+        "validation gap, then draft a concise internal Slack recommendation for my "
+        "review. Use supplied materials only. Do not search the web, create provider "
+        "records, send email, or post."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+    captured: dict[str, object] = {"sdk_calls": 0, "final_review_calls": 0}
+
+    def fake_run_retrieved_sdk_synthesis(**kwargs):
+        captured["sdk_calls"] = int(captured["sdk_calls"]) + 1
+        captured["agent_instructions"] = str(kwargs["agent"].instructions)
+        context = kwargs["retrieve"]()
+        typed_input = kwargs["normalize"](context)
+        captured["approved_context"] = typed_input.approved_context
+
+        class Outcome:
+            usage = {"requests": 1, "input_tokens": 120, "output_tokens": 90}
+            cost = {"estimated_usd": 0.001}
+            request_cache = {"dynamic_prompt_chars": 420}
+            final_output = {
+                "company_name": "Northstar Behavioral Analytics",
+                "email_subject": "Internal recommendation: Northstar Behavioral Analytics",
+                "email_body": (
+                    "*Recommendation:*\nPrioritize a bounded evaluation-design review.\n\n"
+                    "*Most important validation gap:*\nVerify measured outcomes and the "
+                    "decision owner.\n\n*Sources:*\n"
+                    "fixture://graph-source/company-brief"
+                ),
+                "linkedin_note": "",
+                "personalization_rationale": (
+                    "Used only the supplied company packet and retained source."
+                ),
+                "source_ids_used": ["fixture:graph-source:company-brief"],
+                "reply_recommended": True,
+                "recommended_next_step": "Confirm the evaluation decision and owner.",
+                "additional_information_needed": [
+                    "Measured outcomes and decision owner."
+                ],
+                "request_coverage": {
+                    "interpreted_request": (
+                        "Return an internal recommendation and next safe action."
+                    ),
+                    "status": "complete",
+                    "satisfied_dimensions": [
+                        "internal recommendation",
+                        "next safe action",
+                    ],
+                    "unmet_dimensions": [],
+                    "output_form_status": "satisfied",
+                    "stop_condition_status": "satisfied",
+                },
+            }
+
+        return Outcome()
+
+    def fake_compose_outreach_draft_llm_constrained(
+        *,
+        approved_context,
+        llm_draft_payload,
+        **_kwargs,
+    ):
+        return workflow_runner.OutreachDraft(
+            company_name=approved_context.company_profile.name,
+            email_subject=llm_draft_payload["email_subject"],
+            email_body=llm_draft_payload["email_body"],
+            personalization_rationale=llm_draft_payload[
+                "personalization_rationale"
+            ],
+            source_ids_used=llm_draft_payload["source_ids_used"],
+            drafting_mode="llm_constrained",
+            approved_context_used=True,
+            request_coverage=llm_draft_payload["request_coverage"],
+        )
+
+    def fake_terminal_review(result, *, request):
+        captured["final_review_calls"] = int(captured["final_review_calls"]) + 1
+        assert request.live_sdk is True
+        return result.model_copy(
+            update={
+                "human_summary": (
+                    "*Recommendation:*\n"
+                    "Prioritize a bounded evaluation-design review.\n\n"
+                    "*Most important validation gap:*\n"
+                    "Verify measured outcomes and the decision owner.\n\n"
+                    "*Next safe action:*\n"
+                    "Confirm the evaluation decision and owner.\n\n"
+                    "*Sources:*\nfixture://graph-source/company-brief"
+                ),
+                "audit_notes": [
+                    *result.audit_notes,
+                    "Live user-facing response synthesis executed.",
+                ],
+            }
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_retrieved_sdk_synthesis",
+        fake_run_retrieved_sdk_synthesis,
+    )
+    monkeypatch.setattr(
+        workflow_runner,
+        "compose_outreach_draft_llm_constrained",
+        fake_compose_outreach_draft_llm_constrained,
+    )
+    monkeypatch.setattr(
+        langgraph_workflow,
+        "synthesize_terminal_work_item_response",
+        fake_terminal_review,
+    )
+
+    database_url = _database_url(tmp_path)
+    result = advance_work_item_manager_loop_with_optional_langgraph(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=database_url,
+            context_file_path=str(
+                Path(__file__).parent
+                / "fixtures"
+                / "graph_research_to_draft_source_bundle.json"
+            ),
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            manual_request_plan=plan.model_dump(mode="json"),
+            live_sdk=True,
+            live_search=False,
+            save=True,
+        ),
+        max_steps=3,
+        use_langgraph=True,
+    )
+
+    outreach = result.work_item.artifact_refs[-1]
+    assert captured["sdk_calls"] == 1
+    assert captured["final_review_calls"] == 1
+    assert "Internal Slack recommendation mode" in str(
+        captured["agent_instructions"]
+    )
+    assert "Internal Slack recommendation mode" in str(captured["approved_context"])
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert "Prioritize a bounded evaluation-design review." in result.human_summary
+    assert "fixture://graph-source/company-brief" in result.human_summary
+    assert "Confirm the evaluation decision and owner." in result.human_summary
+    assert "exploratory reply" not in result.human_summary
+    assert outreach.metadata["internal_slack_copy"] is True
+    assert outreach.metadata["sdk_synthesis_used"] is True
+    assert outreach.metadata["model_recommendation"]["reply_recommended"] is True
+    assert outreach.metadata["request_coverage"]["status"] == "complete"
+    graph_event = next(
+        event
+        for event in SQLiteStore(database_url).list_work_item_events(
+            result.work_item.id
+        )
+        if event.event_type == "langgraph_orchestration"
+    )
+    assert graph_event.metadata["graph_completion_review"]["llm_review_used"] is True
 
 
 def test_langgraph_manager_loop_emits_graph_feedback_events(tmp_path: Path) -> None:
@@ -5597,6 +6081,63 @@ def test_langgraph_preserves_concrete_zotero_item_before_business_research(
     assert not zotero_artifact.metadata["external_writes_enabled"]
 
 
+def test_langgraph_zotero_acquisition_uses_direct_provider_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, bool] = {}
+
+    def fake_latest_zotero_metadata() -> dict[str, object]:
+        captured["called"] = True
+        return {
+            "status": "success",
+            "provider_read": True,
+            "selection_rule": "first_nonempty_abstract_in_provider_order",
+            "provider_order": {
+                "sort": "dateAdded",
+                "direction": "desc",
+                "top_level_only": True,
+                "item_type": "journalArticle",
+            },
+            "require_abstract": True,
+            "item_count": 1,
+            "selected_item_title": "Provider-backed article",
+            "selected_item_has_abstract": True,
+            "selected_item_date_added": "2026-07-12T12:00:00Z",
+            "items": [
+                {
+                    "key": "ITEM-LIVE-1",
+                    "data": {
+                        "title": "Provider-backed article",
+                        "itemType": "journalArticle",
+                        "dateAdded": "2026-07-12T12:00:00Z",
+                        "abstractNote": "Provider-backed stored abstract.",
+                        "DOI": "10.1000/synthetic",
+                        "url": "https://example.test/article",
+                    }
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        langgraph_workflow,
+        "read_latest_zotero_journal_abstract_metadata",
+        fake_latest_zotero_metadata,
+    )
+
+    source, receipt = langgraph_workflow._read_zotero_ordered_abstract_source(
+        "Use Zotero to select the most recently added journal article with a stored "
+        "abstract."
+    )
+
+    assert captured == {"called": True}
+    assert source is not None
+    assert source.source_id == "zotero:item:ITEM-LIVE-1"
+    assert source.evidence_excerpt == "Provider-backed stored abstract."
+    assert receipt["provider_read"] is True
+    assert receipt["selection_rule"] == "first_nonempty_abstract_in_provider_order"
+    assert "items" not in receipt
+
+
 def test_langgraph_stripped_chief_advisory_context_stays_chief_owned(
     tmp_path: Path,
 ) -> None:
@@ -6980,6 +7521,17 @@ def test_backend_selects_langgraph_only_for_graph_worthy_work_item_flows(
         should_use_langgraph_for_work_item(workflow_request, manager_loop=manager_loop)
         is expected
     ), case_name
+
+
+def test_negated_capabilities_do_not_make_request_graph_worthy() -> None:
+    request = WorkflowRunRequest(
+        request_text=(
+            "CoS, return three bullets from supplied facts. Do not run a workflow, "
+            "research, assess opportunities, draft outreach, or write provider records."
+        )
+    )
+
+    assert should_use_langgraph_for_work_item(request, manager_loop=True) is False
 
 
 def test_langgraph_work_item_thread_id_is_stable() -> None:

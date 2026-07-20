@@ -2,6 +2,13 @@
   "env_vars": [
     {
       "category": "safety",
+      "default_notes": "Defaults to false; enables cleanup only for one exact provider record containing KBA_TEST_RECORD during an approved validation window.",
+      "display_safety": "safe",
+      "name": "AIRTABLE_ALLOW_TEST_DELETES",
+      "secret": false
+    },
+    {
+      "category": "safety",
       "default_notes": "Must remain false/disabled for Slack-owned child runs.",
       "display_safety": "safe",
       "name": "AUTO_SEND_EMAIL",
@@ -274,6 +281,13 @@
       "secret": false
     },
     {
+      "category": "website_extraction",
+      "default_notes": "Defaults to 0; set an explicit 1-8 call cap for managed fallback.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN",
+      "secret": false
+    },
+    {
       "category": "model",
       "default_notes": "Base URL override for gmail_triage.",
       "display_safety": "url",
@@ -292,6 +306,13 @@
       "default_notes": "Provider override for gmail_triage.",
       "display_safety": "safe",
       "name": "KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER",
+      "secret": false
+    },
+    {
+      "category": "safety",
+      "default_notes": "Defaults to false; enables one approved KBA_TEST_DOC lifecycle with provider-verified cleanup.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE",
       "secret": false
     },
     {
@@ -358,6 +379,13 @@
       "secret": false
     },
     {
+      "category": "search",
+      "default_notes": "Defaults to 90 seconds; bounds Opportunity Scout retrieval phases before SDK synthesis.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_OPPORTUNITY_RETRIEVAL_DEADLINE_SECONDS",
+      "secret": false
+    },
+    {
       "category": "model",
       "default_notes": "Base URL override for opportunity_scout.",
       "display_safety": "url",
@@ -376,6 +404,13 @@
       "default_notes": "Provider override for opportunity_scout.",
       "display_safety": "safe",
       "name": "KEYSTONE_OPPORTUNITY_SCOUT_MODEL_PROVIDER",
+      "secret": false
+    },
+    {
+      "category": "search",
+      "default_notes": "Defaults to 4 and is capped between 1 and 8.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_OPPORTUNITY_SEARCH_CONCURRENCY",
       "secret": false
     },
     {
@@ -646,6 +681,7 @@
       "Bridge-supplied per-command env overrides are applied last by Keystone Slack."
     ],
     "scrub_parent_env_vars": [
+      "AIRTABLE_ALLOW_TEST_DELETES",
       "AUTO_SEND_EMAIL",
       "DATABASE_URL",
       "EXA_API_KEY",
@@ -685,9 +721,11 @@
       "KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT",
       "KEYSTONE_EXA_SEARCH_FALLBACK",
       "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN",
+      "KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN",
       "KEYSTONE_GMAIL_TRIAGE_BASE_URL",
       "KEYSTONE_GMAIL_TRIAGE_MODEL",
       "KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER",
+      "KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE",
       "KEYSTONE_HOME",
       "KEYSTONE_LIVE_MODE",
       "KEYSTONE_LIVE_MODEL_MAX_RETRIES",
@@ -697,9 +735,11 @@
       "KEYSTONE_OPENAI_FALLBACK_BASE_URL",
       "KEYSTONE_OPENAI_FALLBACK_MODEL",
       "KEYSTONE_OPENAI_MODEL",
+      "KEYSTONE_OPPORTUNITY_RETRIEVAL_DEADLINE_SECONDS",
       "KEYSTONE_OPPORTUNITY_SCOUT_BASE_URL",
       "KEYSTONE_OPPORTUNITY_SCOUT_MODEL",
       "KEYSTONE_OPPORTUNITY_SCOUT_MODEL_PROVIDER",
+      "KEYSTONE_OPPORTUNITY_SEARCH_CONCURRENCY",
       "KEYSTONE_ORCHESTRATOR_BASE_URL",
       "KEYSTONE_ORCHESTRATOR_MODEL",
       "KEYSTONE_ORCHESTRATOR_MODEL_PROVIDER",

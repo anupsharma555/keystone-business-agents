@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from argparse import Namespace
@@ -282,7 +283,7 @@ def test_build_sdk_session_applies_sdk_session_settings() -> None:
     assert session.session_settings.limit == 3
 
 
-def test_ask_default_sessions_are_limited_to_chief_of_staff(monkeypatch) -> None:
+def test_chief_of_staff_requires_scoped_context_for_default_session(monkeypatch) -> None:
     monkeypatch.delenv(SDK_SESSIONS_ENABLED_ENV, raising=False)
     monkeypatch.delenv(SDK_SESSION_ID_ENV, raising=False)
     monkeypatch.delenv(SDK_SESSION_DB_ENV, raising=False)
@@ -305,8 +306,46 @@ def test_ask_default_sessions_are_limited_to_chief_of_staff(monkeypatch) -> None
         default_enabled=_ask_route_session_default("business_research_analyst"),
     )
 
-    assert chief_spec.enabled is True
+    assert chief_spec.enabled is False
     assert research_spec.enabled is False
+
+
+def test_bounded_sdk_session_keeps_function_call_with_output(tmp_path: Path) -> None:
+    spec = resolve_sdk_session_spec(
+        scope="slack",
+        components=("T123", "C456", "thread-1"),
+        enabled=True,
+        database_path=str(tmp_path / "sessions.sqlite3"),
+        history_limit=3,
+    )
+    session = build_sdk_session(spec)
+    assert session is not None
+    asyncio.run(
+        session.add_items(
+            [
+                {
+                    "type": "function_call",
+                    "name": "calendar_lookup",
+                    "call_id": "call_calendar_1",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_calendar_1",
+                    "output": "{}",
+                },
+                {"role": "user", "content": "follow up one"},
+                {"role": "user", "content": "follow up two"},
+            ]
+        )
+    )
+
+    items = asyncio.run(session.get_items())
+
+    assert len(items) == 4
+    assert items[0]["type"] == "function_call"
+    assert items[1]["type"] == "function_call_output"
+    assert items[0]["call_id"] == items[1]["call_id"]
 
 
 def test_non_chief_ask_can_still_opt_into_session() -> None:

@@ -241,16 +241,19 @@ def _enrich_crossref(
         )
     message = _mapping(payload.get("message") if isinstance(payload, dict) else {})
     resolved_title = _first(message.get("title")) or title
+    authors = _crossref_authors(message.get("author"))
+    publication_title = _first(message.get("container-title"))
     facts = [
         _fact("DOI", doi),
         _fact("Title", resolved_title),
+        _fact("Authors", "; ".join(authors)),
         _fact("Publisher", message.get("publisher")),
         _fact("Type", message.get("type")),
         _fact(
             "Published",
             _date_parts(message.get("published-print") or message.get("published-online")),
         ),
-        _fact("Container", _first(message.get("container-title"))),
+        _fact("Container", publication_title),
         _fact("Abstract", message.get("abstract")),
     ]
     facts = [fact for fact in facts if fact]
@@ -262,7 +265,12 @@ def _enrich_crossref(
         status="success",
         structured_facts=facts,
         text="\n".join(facts),
-        metadata={"doi": doi, "api_url": endpoint},
+        metadata={
+            "doi": doi,
+            "api_url": endpoint,
+            "authors": authors,
+            "publication_title": publication_title,
+        },
     )
 
 
@@ -279,6 +287,22 @@ def _first(value: Any) -> str:
     if isinstance(value, list | tuple) and value:
         return str(value[0] or "").strip()
     return str(value or "").strip()
+
+
+def _crossref_authors(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        literal = str(item.get("name") or "").strip()
+        given = str(item.get("given") or "").strip()
+        family = str(item.get("family") or "").strip()
+        name = literal or " ".join(part for part in (given, family) if part)
+        if name:
+            names.append(name)
+    return list(dict.fromkeys(names))
 
 
 def _nct_id(text: str) -> str:

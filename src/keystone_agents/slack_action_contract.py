@@ -13,6 +13,7 @@ BUSINESS_AGENT_SLACK_CONTRACT_VERSION = "1"
 BUSINESS_AGENT_SLACK_CONTRACT_CAPABILITIES = (
     "feedback_jsonl",
     "operator_failure_payload",
+    "payload_manifest_checksums",
     "selected_context_prior_agent_runs",
     "selected_context_embedded_fallback",
     "write_gate_no_send",
@@ -21,6 +22,7 @@ BUSINESS_AGENT_SLACK_CONTRACT_CAPABILITIES = (
     "source_channel_response_routing",
 )
 SLACK_SELECTED_CONTEXT_SCHEMA = "keystone.slack.selected_message_context.v1"
+SLACK_PAYLOAD_MANIFEST_SCHEMA = "keystone.slack.payload_manifest.v1"
 SLACK_AGENT_FEEDBACK_EVENT_SCHEMA = "keystone.slack.agent_feedback_event.v1"
 OPERATOR_FAILURE_SCHEMA = "keystone.operator_failure.v1"
 
@@ -446,6 +448,14 @@ def selected_message_context_json_schema() -> dict[str, Any]:
     return SlackSelectedMessageContext.model_json_schema()
 
 
+def slack_payload_manifest_json_schema() -> dict[str, Any]:
+    """Return the canonical Slack payload manifest JSON schema."""
+
+    from keystone_agents.slack_actions import SlackPayloadManifest
+
+    return SlackPayloadManifest.model_json_schema()
+
+
 def business_agent_slack_contract() -> dict[str, Any]:
     """Return the side-effect-free Slack action/context contract metadata."""
 
@@ -457,6 +467,7 @@ def business_agent_slack_contract() -> dict[str, Any]:
             "business_agent_action": BUSINESS_AGENT_ACTION_SCHEMA,
             "agent_feedback_event": SLACK_AGENT_FEEDBACK_EVENT_SCHEMA,
             "operator_failure": OPERATOR_FAILURE_SCHEMA,
+            "payload_manifest": SLACK_PAYLOAD_MANIFEST_SCHEMA,
             "selected_message_context": SLACK_SELECTED_CONTEXT_SCHEMA,
             "write_gate": BUSINESS_AGENT_WRITE_GATE_SCHEMA,
         },
@@ -486,6 +497,7 @@ def business_agent_slack_contract() -> dict[str, Any]:
             "business_agent_action": BusinessAgentActionPayload.model_json_schema(),
             "agent_feedback_event": SlackAgentFeedbackEvent.model_json_schema(),
             "operator_failure": OperatorFailurePayload.model_json_schema(),
+            "payload_manifest": slack_payload_manifest_json_schema(),
             "selected_message_context": selected_message_context_json_schema(),
             "write_gate": BusinessAgentWriteGatePayload.model_json_schema(),
         },

@@ -38,6 +38,21 @@ class TargetActionCase:
     expected_warning_substrings: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ContextualTargetActionCase:
+    """Thread-local ask whose source identity comes from prior bounded context."""
+
+    case_id: str
+    prior_context: str
+    follow_up: str
+    owner_agent: ManualTargetAgent
+    expected_intent: ManualRequestIntent
+    target_action: str
+    tool_contract_status: str
+    required_tool_change: str
+    expected_safety_boundary: str
+
+
 TARGET_ACTION_SCORECARD: tuple[TargetActionCase, ...] = (
     TargetActionCase(
         case_id="research_company",
@@ -398,21 +413,21 @@ TARGET_ACTION_SCORECARD: tuple[TargetActionCase, ...] = (
         case_id="schedule_blocked",
         request="Schedule a follow-up meeting with Lindus Health.",
         category="schedule",
-        owner_agent="clarification",
+        owner_agent="chief_of_staff",
         source_system="operator request",
         target_system="Calendar",
         target_action="schedule event",
-        required_context="calendar, attendees, time window, and approval",
-        allowed_tool_tier="blocked side-effect plan",
-        approval_gate="scoped calendar event approval required",
-        expected_proof="schedule request blocks with clarification warning",
-        fallback_blocker="missing event details or approval",
+        required_context="event identity, date/time, attendees when needed, and approval",
+        allowed_tool_tier="Orchestrator preflight then typed Calendar action gates",
+        approval_gate="scoped Calendar event approval required",
+        expected_proof="Calendar intent is established before missing fields can block",
+        fallback_blocker="missing event date/time or ambiguous write scope",
         artifact_backed=False,
-        expected_intent="blocked_send",
-        expected_target_type="unknown",
-        expected_task_objective="blocked_side_effect",
-        expected_artifact_type="none",
-        expected_warning_substrings=("not contain enough information", "external send/write"),
+        expected_intent="business_system_write",
+        expected_target_type="business_system_context",
+        expected_task_objective="business_system_write",
+        expected_artifact_type="business_system_write_plan",
+        expected_side_effect_policy="internal_write_approval_required",
     ),
     TargetActionCase(
         case_id="browser_diagnostics",
@@ -477,7 +492,116 @@ TARGET_ACTION_SCORECARD: tuple[TargetActionCase, ...] = (
 )
 
 
+CONTEXTUAL_TARGET_ACTION_SCORECARD: tuple[ContextualTargetActionCase, ...] = (
+    ContextualTargetActionCase(
+        case_id="gmail_draft_revision",
+        prior_context="Gmail draft created and provider verified for the selected thread.",
+        follow_up="Make this shorter and add the link.",
+        owner_agent="gmail_triage",
+        expected_intent="gmail_triage",
+        target_action="update the same provider draft",
+        tool_contract_status="supported_with_exact_draft_identity",
+        required_tool_change="none after contextual admission reaches Gmail draft execution",
+        expected_safety_boundary="draft-only, exact draft, approval, and provider read-back",
+    ),
+    ContextualTargetActionCase(
+        case_id="airtable_record_update",
+        prior_context="Airtable record created and provider verified in the Projects table.",
+        follow_up="Update this record with status Reviewed.",
+        owner_agent="airtable_context_agent",
+        expected_intent="business_system_write",
+        target_action="update exact record fields",
+        tool_contract_status="supported_with_unique_record_identity",
+        required_tool_change="none after contextual admission reaches the typed record writer",
+        expected_safety_boundary="schema validation, exact record, approval, and read-back",
+    ),
+    ContextualTargetActionCase(
+        case_id="google_doc_append",
+        prior_context="Google Doc created and provider verified in the scoped KNIOps folder.",
+        follow_up="Add this paragraph to the document notes.",
+        owner_agent="google_workspace_context_agent",
+        expected_intent="business_system_write",
+        target_action="append content without replacing the body",
+        tool_contract_status="supported_with_content_mode_append",
+        required_tool_change="implemented explicit append mode and provider content read-back",
+        expected_safety_boundary="exact Doc, scoped folder, approval, and read-back",
+    ),
+    ContextualTargetActionCase(
+        case_id="google_sheet_row_update",
+        prior_context="Google Sheet row appended and verified with stable key KBA_TEST_ROW.",
+        follow_up="Change this row status to Reviewed.",
+        owner_agent="google_workspace_context_agent",
+        expected_intent="business_system_write",
+        target_action="update one stable-key row",
+        tool_contract_status="supported_with_stable_row_key",
+        required_tool_change="none after contextual admission reaches the typed row updater",
+        expected_safety_boundary="exact Sheet/tab/key, approval, and read-back",
+    ),
+    ContextualTargetActionCase(
+        case_id="zotero_article_note",
+        prior_context="Zotero article resolved to one exact library item.",
+        follow_up="Add this note to the paper.",
+        owner_agent="zotero_context_agent",
+        expected_intent="business_system_write",
+        target_action="create or append a child note on an article",
+        tool_contract_status="unsupported_for_ordinary_items",
+        required_tool_change=(
+            "reviewed ordinary-note tool with parent item identity, append/replace mode, "
+            "version precondition, approval, and read-back"
+        ),
+        expected_safety_boundary=(
+            "ordinary Zotero mutation remains blocked until that contract exists"
+        ),
+    ),
+    ContextualTargetActionCase(
+        case_id="zotero_pdf_attachment",
+        prior_context="Zotero article resolved to one exact library item.",
+        follow_up="Attach this PDF to the article.",
+        owner_agent="zotero_context_agent",
+        expected_intent="business_system_write",
+        target_action="attach a PDF child item to an article",
+        tool_contract_status="unsupported",
+        required_tool_change=(
+            "reviewed attachment tool with local-file validation, MIME/size/checksum, "
+            "parent item identity, upload protocol, approval, and read-back"
+        ),
+        expected_safety_boundary="no ordinary attachment upload through current test-only tools",
+    ),
+    ContextualTargetActionCase(
+        case_id="slack_message_edit",
+        prior_context="The selected Slack message is one exact marked test post.",
+        follow_up="Edit that message to include the link.",
+        owner_agent="chief_of_staff",
+        expected_intent="slack_operations",
+        target_action="update one exact bot-authored message",
+        tool_contract_status="supported_for_marked_test_messages_only",
+        required_tool_change=(
+            "ordinary bot-authored edit contract if production edits are desired; "
+            "keep human posts excluded"
+        ),
+        expected_safety_boundary="exact channel/timestamp/author marker and provider verification",
+    ),
+    ContextualTargetActionCase(
+        case_id="prior_result_link_summary",
+        prior_context="Research result 2 is a source-backed article with a retained URL.",
+        follow_up="Summarize link 2 from the prior results.",
+        owner_agent="business_research_analyst",
+        expected_intent="research_brief",
+        target_action="read and summarize the referenced source",
+        tool_contract_status="supported_read_only",
+        required_tool_change="none after contextual admission preserves the source reference",
+        expected_safety_boundary="read-only source extraction with visible attribution",
+    ),
+)
+
+
 def target_action_scorecard() -> tuple[TargetActionCase, ...]:
     """Return the immutable ANU-120 representative target-action scorecard."""
 
     return TARGET_ACTION_SCORECARD
+
+
+def contextual_target_action_scorecard() -> tuple[ContextualTargetActionCase, ...]:
+    """Return ANU-120 thread-local target-action and tool-gap cases."""
+
+    return CONTEXTUAL_TARGET_ACTION_SCORECARD

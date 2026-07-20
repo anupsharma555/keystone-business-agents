@@ -12,14 +12,27 @@ def _has_approved_inline_context(text: str) -> bool:
         return False
     if not re.search(r"\b(?:draft|write|compose|prepare)\b", text, flags=re.I):
         return False
-    if not re.search(r"\b(?:outreach|email|linkedin|message|note)\b", text, flags=re.I):
+    if not re.search(
+        r"\b(?:outreach|email|linkedin|message|note|update|brief)\b",
+        text,
+        flags=re.I,
+    ):
         return False
-    if not re.search(r"\b(?:do not send|no send|draft-only|draft only)\b", text, flags=re.I):
+    if not (
+        re.search(r"\b(?:no send|draft-only|draft only)\b", text, flags=re.I)
+        or re.search(
+            r"\b(?:do\s+not|don't|dont|never|without)\b"
+            r"[^.;\n]{0,200}\b(?:send|post|publish|share)\b",
+            text,
+            flags=re.I,
+        )
+    ):
         return False
     return bool(
         re.search(
             r"\b(?:"
-            r"approved(?:\s+(?:inline|source|source-backed|source backed))?\s+"
+            r"(?:these\s+|the\s+following\s+)?approved"
+            r"(?:\s+(?:inline|source|source-backed|source backed))?\s+"
             r"(?:context|facts|evidence|background|grounding|rationale)"
             r"|source[-\s]+backed\s+(?:context|facts|evidence|background|grounding)"
             r"|context\s+approved\s+for\s+(?:drafting|draft-only\s+use|draft\s+only\s+use)"

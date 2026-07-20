@@ -13,6 +13,7 @@ from keystone_agents.temporal_policy import temporal_depth_policy
 ORCHESTRATOR_PREFLIGHT_ENV = "KEYSTONE_ORCHESTRATOR_PREFLIGHT_JSON"
 MANUAL_REQUEST_PLAN_ENV = "KEYSTONE_MANUAL_REQUEST_PLAN_JSON"
 ORCHESTRATOR_ROUTE_RESULT_ENV = "KEYSTONE_ORCHESTRATOR_ROUTE_RESULT_JSON"
+SPECIALIST_EXECUTION_CONTEXT_ENV = "KEYSTONE_SPECIALIST_EXECUTION_CONTEXT_JSON"
 
 _PREFLIGHT_HANDOFF_KEYS = (
     "request_text",
@@ -55,19 +56,27 @@ def _json_payload(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True)
 
 
-def orchestrator_preflight_env(preflight: Any | None) -> dict[str, str]:
+def orchestrator_preflight_env(
+    preflight: Any | None,
+    *,
+    execution_context: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
     """Return environment values for a child specialist process."""
 
     payload = compact_orchestrator_preflight_payload(preflight)
-    if not payload:
+    if not payload and not execution_context:
         return {}
-    env = {ORCHESTRATOR_PREFLIGHT_ENV: _json_payload(payload)}
+    env: dict[str, str] = {}
+    if payload:
+        env[ORCHESTRATOR_PREFLIGHT_ENV] = _json_payload(payload)
     manual_plan = payload.get("manual_request_plan")
     if manual_plan:
         env[MANUAL_REQUEST_PLAN_ENV] = _json_payload(manual_plan)
     route_result = payload.get("route_result")
     if route_result:
         env[ORCHESTRATOR_ROUTE_RESULT_ENV] = _json_payload(route_result)
+    if execution_context:
+        env[SPECIALIST_EXECUTION_CONTEXT_ENV] = _json_payload(dict(execution_context))
     return env
 
 
@@ -208,6 +217,36 @@ def load_manual_request_plan_from_env(
         return None
 
 
+def load_specialist_execution_context_from_env(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Load bounded thread/source context prepared by the direct-call front door."""
+
+    raw = (environ or os.environ).get(SPECIALIST_EXECUTION_CONTEXT_ENV)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def specialist_execution_context_text(
+    execution_context: Mapping[str, Any] | None,
+) -> str:
+    """Render the shared bounded-context contract for a direct specialist."""
+
+    if not execution_context:
+        return ""
+    return (
+        "Bounded direct-call execution context. The current operator request is "
+        "authoritative; use prior context only to resolve references such as this, "
+        "that, it, same, or previous. Keep provider IDs internal unless requested:\n"
+        + json.dumps(dict(execution_context), ensure_ascii=True, sort_keys=True)
+    )
+
+
 def apply_orchestrator_preflight_to_args(args: Any) -> Any:
     """Attach parent Orchestrator preflight context to an argparse namespace."""
 
@@ -236,25 +275,37 @@ def orchestrator_preflight_context_text(args: Any) -> str:
 
     preflight = getattr(args, "orchestrator_preflight", None)
     manual_plan = getattr(args, "manual_request_plan", None)
-    if not isinstance(preflight, dict) and not manual_plan:
+    execution_context = load_specialist_execution_context_from_env()
+    if not isinstance(preflight, dict) and not manual_plan and not execution_context:
         return ""
+    sections: list[str] = []
     if isinstance(preflight, dict) and isinstance(preflight.get("preflight_memo"), dict):
         memo = preflight["preflight_memo"]
-        return "Orchestrator preflight memo for this specialist run:\n" + json.dumps(
-            memo, ensure_ascii=True, sort_keys=True
+        sections.append(
+            "Orchestrator preflight memo for this specialist run:\n"
+            + json.dumps(memo, ensure_ascii=True, sort_keys=True)
         )
-    route_result = preflight.get("route_result") if isinstance(preflight, dict) else {}
-    if not isinstance(route_result, dict):
-        route_result = {}
-    memo = {
-        "raw_request": preflight.get("request_text") if isinstance(preflight, dict) else None,
-        "manual_request_plan": manual_plan,
-        "advisory_only": preflight.get("advisory_only") if isinstance(preflight, dict) else None,
-        "selected_agent": preflight.get("selected_agent") if isinstance(preflight, dict) else None,
-        "orchestrator_route": route_result.get("route"),
-        "orchestrator_rationale": route_result.get("rationale"),
-        "orchestrator_refused": route_result.get("refused"),
-    }
-    return "Orchestrator preflight memo for this specialist run:\n" + json.dumps(
-        memo, ensure_ascii=True, sort_keys=True
-    )
+    elif isinstance(preflight, dict) or manual_plan:
+        route_result = preflight.get("route_result") if isinstance(preflight, dict) else {}
+        if not isinstance(route_result, dict):
+            route_result = {}
+        memo = {
+            "raw_request": preflight.get("request_text") if isinstance(preflight, dict) else None,
+            "manual_request_plan": manual_plan,
+            "advisory_only": (
+                preflight.get("advisory_only") if isinstance(preflight, dict) else None
+            ),
+            "selected_agent": (
+                preflight.get("selected_agent") if isinstance(preflight, dict) else None
+            ),
+            "orchestrator_route": route_result.get("route"),
+            "orchestrator_rationale": route_result.get("rationale"),
+            "orchestrator_refused": route_result.get("refused"),
+        }
+        sections.append(
+            "Orchestrator preflight memo for this specialist run:\n"
+            + json.dumps(memo, ensure_ascii=True, sort_keys=True)
+        )
+    if execution_context:
+        sections.append(specialist_execution_context_text(execution_context))
+    return "\n\n".join(sections)

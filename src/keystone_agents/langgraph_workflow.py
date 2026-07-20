@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from keystone_agents.manual_request import positive_capability_text
 from keystone_agents.schemas.approval import ApprovalState
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
@@ -32,12 +33,17 @@ from keystone_agents.tools.announcement_context_tools import (
     retrieve_preprint_announcement_history_impl,
     retrieve_rss_announcement_history_impl,
 )
+from keystone_agents.tools.zotero_context_tools import (
+    read_latest_zotero_journal_abstract_metadata,
+)
 from keystone_agents.work_items import attach_artifact, build_context_pack_for_route, record_event
 from keystone_agents.workflow_runner import (
     _MANAGER_LOOP_STOP_STATUSES,
     PreparedWorkItemStep,
+    _apply_planned_workflow_continuation,
     _finalize_manager_loop_result,
     _manager_loop_request_is_planning_only,
+    _manual_plan_requests_manager_continuation,
     _operator_requested_manager_continuation,
     advance_work_item,
     advance_work_item_manager_loop,
@@ -46,6 +52,7 @@ from keystone_agents.workflow_runner import (
     normalize_workflow_request_for_graph,
     prepare_work_item_step,
     run_prepared_work_item_specialist,
+    synthesize_terminal_work_item_response,
 )
 
 LANGGRAPH_WORKITEM_ENV_KEYS = (
@@ -135,7 +142,9 @@ def should_use_langgraph_for_work_item(
 
     if request.work_item_id:
         return True
-    normalized = " ".join(str(request.request_text or "").lower().split())
+    normalized = " ".join(
+        positive_capability_text(request.request_text or "").lower().split()
+    )
     if not normalized or normalized in {"continue", "resume"}:
         return False
     if not manager_loop:
@@ -549,6 +558,31 @@ def run_work_item_langgraph(
             result=result,
             graph_completion_review=graph_completion_review,
         )
+        result = synthesize_terminal_work_item_response(
+            result,
+            request=request,
+        )
+        audit_note_set = set(result.audit_notes)
+        llm_review_used = bool(
+            "Live user-facing response synthesis executed." in audit_note_set
+            or "Canonical internal Slack artifact instruction repair executed."
+            in audit_note_set
+        )
+        canonical_artifact_review_used = (
+            "Canonical internal Slack artifact returned without generic "
+            "research-response recasting."
+        ) in audit_note_set
+        graph_completion_review = {
+            **graph_completion_review,
+            "llm_review_used": llm_review_used,
+            "review_mode": (
+                "llm_synthesis_plus_deterministic_gates"
+                if llm_review_used
+                else "canonical_artifact_plus_deterministic_gates"
+                if canonical_artifact_review_used
+                else graph_completion_review.get("review_mode", "deterministic")
+            ),
+        }
     _record_langgraph_checkpoint_event(
         request=request,
         result=result,
@@ -859,6 +893,28 @@ def _enhance_graph_terminal_summary(
     """Compose a compact graph-aware operator brief without another model call."""
 
     request_text = " ".join(str(original_request.request_text or "").lower().split())
+    outreach = next(
+        (
+            artifact
+            for artifact in reversed(result.work_item.artifact_refs)
+            if artifact.artifact_type == "outreach_draft"
+        ),
+        None,
+    )
+    if outreach is not None and outreach.metadata.get("internal_slack_copy") is True:
+        internal_copy = _internal_slack_terminal_copy(result)
+        return result.model_copy(
+            update={
+                "human_summary": internal_copy,
+                "audit_notes": [
+                    *result.audit_notes,
+                    (
+                        "LangGraph returned the reviewed internal Slack artifact directly "
+                        "without recasting it as external outreach."
+                    ),
+                ],
+            }
+        )
     if not re.search(
         r"\b(?:visible result|recommendation|strongest evidence|main uncertainty|"
         r"next step|decision|data\s*source|facts?|inference|limitations?|unknowns?|"
@@ -889,14 +945,6 @@ def _enhance_graph_terminal_summary(
                 ],
             }
         )
-    outreach = next(
-        (
-            artifact
-            for artifact in reversed(result.work_item.artifact_refs)
-            if artifact.artifact_type == "outreach_draft"
-        ),
-        None,
-    )
     if outreach is None:
         return result
     model_recommendation = outreach.metadata.get("model_recommendation")
@@ -967,6 +1015,112 @@ def _enhance_graph_terminal_summary(
             ],
         }
     )
+
+
+def _internal_slack_terminal_copy(result: WorkflowRunResult) -> str:
+    """Return the requested internal decision artifact without workflow metadata."""
+
+    outreach = next(
+        (
+            artifact
+            for artifact in reversed(result.work_item.artifact_refs)
+            if artifact.artifact_type == "outreach_draft"
+            and artifact.metadata.get("internal_slack_copy") is True
+        ),
+        None,
+    )
+    summary = str(
+        outreach.summary if outreach is not None else result.human_summary or ""
+    ).strip()
+    summary = re.sub(
+        r"^Internal Slack draft for [^\n]+\n+",
+        "",
+        summary,
+        count=1,
+        flags=re.I,
+    ).strip()
+    summary = re.split(
+        r"\n+\*(?:Review notes|Supporting evidence and approval status):\*",
+        summary,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip()
+    summary = re.sub(
+        r"(?im)^\s*(?:[-*]\s*)?fixture://\S+\s*$",
+        "",
+        summary,
+    )
+    summary = re.sub(
+        r"(?im)^\s*\*{0,2}sources?\s*:?\*{0,2}\s*(?:\n\s*)?\Z",
+        "",
+        summary,
+    )
+    summary = re.sub(r"\n{3,}", "\n\n", summary).strip()
+    model_recommendation = (
+        outreach.metadata.get("model_recommendation")
+        if outreach is not None
+        else None
+    )
+    next_step = (
+        str(model_recommendation.get("recommended_next_step") or "").strip()
+        if isinstance(model_recommendation, dict)
+        else ""
+    )
+    if next_step and not re.search(
+        r"\*{0,2}next safe action:\*{0,2}",
+        summary,
+        flags=re.I,
+    ):
+        summary = re.sub(
+            r"(?is)\n+(?:\*{0,2}recommended actions?\*{0,2}|"
+            r"\*{0,2}next safe action\*{0,2})\s*:?\s*\n+.*?"
+            r"(?=\n+\*{0,2}sources?\*{0,2}\s*:|\Z)",
+            "",
+            summary,
+        ).strip()
+        summary = "\n\n".join(
+            [
+                summary,
+                f"*Next safe action:*\n- {next_step}",
+            ]
+        ).strip()
+    source_urls: list[str] = []
+    include_fixture_sources = bool(
+        re.search(
+            r"\b(?:source|sources|citation|citations|urls?|packet|materials)\b",
+            result.work_item.request_text,
+            flags=re.I,
+        )
+    )
+    opportunity = next(
+        (
+            artifact
+            for artifact in reversed(result.work_item.artifact_refs)
+            if artifact.artifact_type == "opportunity"
+        ),
+        None,
+    )
+    if opportunity is not None:
+        raw_sources = opportunity.metadata.get("source_refs")
+        if isinstance(raw_sources, list):
+            for raw_source in raw_sources:
+                if not isinstance(raw_source, dict):
+                    continue
+                url = str(raw_source.get("url") or "").strip()
+                if url.startswith("fixture://") and not include_fixture_sources:
+                    continue
+                if url and url not in source_urls:
+                    source_urls.append(url)
+                if len(source_urls) >= 3:
+                    break
+    if source_urls and not re.search(r"https?://|fixture://", summary):
+        summary = "\n\n".join(
+            [
+                summary,
+                "*Sources:*\n" + "\n".join(f"- {url}" for url in source_urls),
+            ]
+        ).strip()
+    return summary
 
 
 def _graph_research_terminal_summary(
@@ -1360,9 +1514,12 @@ def _manager_loop_stop_reason(state: WorkItemGraphState) -> str:
         original_request = WorkflowRunRequest.model_validate(
             state.get("original_request") or state.get("request") or {}
         )
-        if not _operator_requested_manager_continuation(
-            original_request.request_text,
-            next_action_agent=result.next_action.agent,
+        if not (
+            _manual_plan_requests_manager_continuation(original_request, result)
+            or _operator_requested_manager_continuation(
+                original_request.request_text,
+                next_action_agent=result.next_action.agent,
+            )
         ):
             return "stopped after one specialist step; no multi-step workflow was requested"
     return ""
@@ -1626,6 +1783,17 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         if source.source_id.startswith("zotero:item:")
         or source.provider in {"zotero", "zotero_context_agent"}
     ]
+    provider_receipt: dict[str, Any] = {}
+    if (
+        not existing_zotero_sources
+        and prepared.request.live_sdk
+        and _zotero_ordered_abstract_read_requested(request_text)
+    ):
+        provider_source, provider_receipt = _read_zotero_ordered_abstract_source(
+            request_text
+        )
+        if provider_source is not None:
+            existing_zotero_sources.append(provider_source)
     provider_evidence = bool(existing_zotero_sources)
     source_ref = (
         existing_zotero_sources[0]
@@ -1637,6 +1805,7 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         request_text,
         source_ref,
         provider_evidence=provider_evidence,
+        provider_receipt=provider_receipt,
     )
     existing_source_ids = {source.source_id for source in work_item.sources}
     sources = list(work_item.sources)
@@ -1653,6 +1822,7 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
             "artifact_id": artifact.artifact_id,
             "source_id": source_ref.source_id,
             "provider_evidence": provider_evidence,
+            "provider_receipt": provider_receipt,
             "external_writes_enabled": False,
         },
     }
@@ -1690,6 +1860,7 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
                 "artifact_id": artifact.artifact_id,
                 "source_id": source_ref.source_id,
                 "downstream_route": route.value,
+                "provider_receipt": provider_receipt,
                 "external_writes_enabled": False,
                 "schema_policy": "WorkItem artifact/source handoff; no WorkItemRoute expansion",
             },
@@ -2198,6 +2369,21 @@ def _finalize_step_node(state: WorkItemGraphState) -> WorkItemGraphState:
     loop_steps = list(state.get("loop_steps") or [])
     if manager_loop:
         loop_steps.append(_graph_step_summary(result, len(loop_steps) + 1))
+        original_request = WorkflowRunRequest.model_validate(
+            state.get("original_request") or state.get("request") or {}
+        )
+        store = (
+            SQLiteStore(original_request.database_url or database_url_from_env())
+            if original_request.save
+            else None
+        )
+        result = _apply_planned_workflow_continuation(
+            result,
+            original_request=original_request,
+            completed_steps=loop_steps,
+            store=store,
+        )
+        loop_steps[-1] = _graph_step_summary(result, len(loop_steps))
     updated = _state_with_result(
         {
             **state,
@@ -3122,12 +3308,99 @@ def _zotero_context_source_ref(work_item_id: str, request_text: str) -> WorkItem
     )
 
 
+def _zotero_ordered_abstract_read_requested(request_text: str) -> bool:
+    normalized = " ".join(str(request_text or "").lower().split())
+    return bool(
+        "zotero" in normalized
+        and "abstract" in normalized
+        and re.search(r"\b(?:latest|most\s+recent(?:ly)?\s+added)\b", normalized)
+    )
+
+
+def _read_zotero_ordered_abstract_source(
+    request_text: str,
+) -> tuple[WorkItemSourceRef | None, dict[str, Any]]:
+    """Acquire one provider-backed Zotero source using the direct-path tool contract."""
+
+    if not _zotero_ordered_abstract_read_requested(request_text):
+        return None, {}
+    try:
+        payload = read_latest_zotero_journal_abstract_metadata()
+    except Exception as exc:
+        return None, {
+            "status": "error",
+            "provider_read": False,
+            "error_type": type(exc).__name__,
+        }
+    safe_receipt = {
+        key: payload.get(key)
+        for key in (
+            "status",
+            "provider_read",
+            "selection_rule",
+            "provider_order",
+            "require_abstract",
+            "item_count",
+            "selected_item_title",
+            "selected_item_has_abstract",
+            "selected_item_date_added",
+        )
+        if key in payload
+    }
+    items = payload.get("items")
+    item = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
+    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    item_key = str(item.get("key") or data.get("key") or "").strip()
+    abstract = str(data.get("abstractNote") or "").strip()
+    if (
+        payload.get("status") != "success"
+        or payload.get("provider_read") is not True
+        or not item_key
+        or not abstract
+    ):
+        return None, safe_receipt
+    title = str(data.get("title") or payload.get("selected_item_title") or "").strip()
+    date_added = str(data.get("dateAdded") or "").strip()
+    doi = str(data.get("DOI") or "").strip()
+    url = str(data.get("url") or "").strip()
+    key_facts = [
+        value
+        for value in (
+            f"Title: {title}" if title else "",
+            f"Date added: {date_added}" if date_added else "",
+            f"DOI: {doi}" if doi else "",
+            f"Stored abstract: {abstract}",
+        )
+        if value
+    ]
+    return (
+        WorkItemSourceRef(
+            title=title,
+            url=url,
+            source_type="zotero:journalArticle",
+            source_id=f"zotero:item:{item_key}",
+            provider="zotero",
+            supported_claim=(
+                "This was the first top-level journal article with a non-empty stored "
+                "abstract in Zotero dateAdded-descending provider order."
+            ),
+            extraction_status="provider_metadata",
+            source_quality="provider_metadata",
+            key_facts=key_facts,
+            evidence_excerpt=abstract,
+            zotero_key=item_key,
+        ),
+        safe_receipt,
+    )
+
+
 def _zotero_context_artifact(
     work_item_id: str,
     request_text: str,
     source_ref: WorkItemSourceRef,
     *,
     provider_evidence: bool = False,
+    provider_receipt: dict[str, Any] | None = None,
 ) -> WorkItemArtifactRef:
     return WorkItemArtifactRef(
         artifact_type="zotero_context_summary",
@@ -3158,6 +3431,7 @@ def _zotero_context_artifact(
             "send_enabled": False,
             "live_reads_enabled": provider_evidence,
             "provider_evidence": provider_evidence,
+            "provider_receipt": dict(provider_receipt or {}),
         },
     )
 

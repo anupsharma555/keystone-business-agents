@@ -1,0 +1,180 @@
+"""Canonical request envelope shared by human-facing agent entrypoints."""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+ExecutionEntrypoint = Literal[
+    "cli",
+    "slack_root",
+    "slack_followup",
+    "scheduled",
+    "work_item",
+    "direct_sdk",
+]
+ExecutionResultStatus = Literal[
+    "completed",
+    "recovered",
+    "needs_input",
+    "blocked",
+    "failed",
+]
+
+
+class DirectAgentResponseInput(BaseModel):
+    """Complete operator request plus its interpreted response constraints."""
+
+    requested_agent: str
+    original_request: str
+    output_constraints: dict[str, Any] = Field(default_factory=dict)
+
+    def to_prompt(self) -> str:
+        return "\n\n".join(
+            [
+                f"Selected agent: {self.requested_agent}",
+                "Original operator request:\n" + self.original_request,
+                (
+                    "Interpreted response constraints:\n"
+                    + str(self.output_constraints)
+                    if self.output_constraints
+                    else "Interpreted response constraints: none beyond the raw request."
+                ),
+                "Return only a valid DirectAgentResponse.",
+            ]
+        )
+
+
+class DirectAgentResponse(BaseModel):
+    """Minimal structured result for one provider-free direct response."""
+
+    answer: str
+
+    @field_validator("answer", mode="before")
+    @classmethod
+    def _clean_answer(cls, value: object) -> str:
+        return str(value or "").replace("\u2014", "-").strip()
+
+
+class ExecutionContinuation(BaseModel):
+    """Bounded prior-turn identity for one continuation request."""
+
+    work_item_id: str = ""
+    prior_request: str = ""
+    prior_result_title: str = ""
+    prior_result_summary: str = ""
+
+    @field_validator(
+        "work_item_id",
+        "prior_request",
+        "prior_result_title",
+        "prior_result_summary",
+        mode="before",
+    )
+    @classmethod
+    def _clean_text(cls, value: object) -> str:
+        return str(value or "").replace("\u2014", "-").strip()
+
+
+class ExecutionRequest(BaseModel):
+    """Entrypoint-neutral input to semantic planning and capability selection.
+
+    The current operator request is authoritative. Entrypoint and continuation
+    fields provide bounded context and telemetry; they do not select tools,
+    grant approval, or force direct versus WorkItem/LangGraph execution.
+    """
+
+    schema_name: str = "keystone.execution_request.v1"
+    entrypoint: ExecutionEntrypoint = "cli"
+    raw_request: str = ""
+    current_request: str = ""
+    requested_agent: str = ""
+    requested_agent_explicit: bool = False
+    continuation: ExecutionContinuation = Field(default_factory=ExecutionContinuation)
+    source_context: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator(
+        "schema_name",
+        "raw_request",
+        "current_request",
+        "requested_agent",
+        mode="before",
+    )
+    @classmethod
+    def _clean_text(cls, value: object) -> str:
+        return str(value or "").replace("\u2014", "-").strip()
+
+    @field_validator("source_context", mode="before")
+    @classmethod
+    def _clean_source_context(cls, value: object) -> dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(key).strip(): str(item or "").strip()
+            for key, item in value.items()
+            if str(key or "").strip() and str(item or "").strip()
+        }
+
+
+class ExecutionPublicResult(BaseModel):
+    """Entrypoint-neutral reader-facing result and completion contract."""
+
+    schema_name: str = "keystone.execution_public_result.v1"
+    status: ExecutionResultStatus = "completed"
+    title: str = "Business Agents Result Ready"
+    omit_title: bool = False
+    text: str = ""
+    completion_confirmed: bool = False
+    provider_write_attempted: bool = False
+    provider_receipt_verified: bool | None = None
+    recovery_used: bool = False
+    recovery_notice: str = ""
+    failure_code: str = ""
+    failure_summary: str = ""
+    run_id: str = ""
+
+    @field_validator(
+        "schema_name",
+        "title",
+        "text",
+        "recovery_notice",
+        "failure_code",
+        "failure_summary",
+        "run_id",
+        mode="before",
+    )
+    @classmethod
+    def _clean_result_text(cls, value: object) -> str:
+        return str(value or "").replace("\u2014", "-").strip()
+
+    @model_validator(mode="after")
+    def _validate_completion_claim(self) -> ExecutionPublicResult:
+        if self.completion_confirmed and self.status not in {"completed", "recovered"}:
+            raise ValueError("Only completed or recovered results may confirm completion.")
+        if self.completion_confirmed and not self.text:
+            raise ValueError("Confirmed public results require reader-facing text.")
+        if (
+            self.completion_confirmed
+            and self.provider_write_attempted
+            and self.provider_receipt_verified is not True
+        ):
+            raise ValueError(
+                "Provider-write completion requires a verified provider receipt."
+            )
+        if self.status == "recovered" and not self.recovery_used:
+            raise ValueError("Recovered results must declare recovery_used=true.")
+        if self.recovery_used and not self.recovery_notice:
+            raise ValueError("Recovered results require a concise recovery notice.")
+        return self
+
+
+__all__ = [
+    "DirectAgentResponse",
+    "DirectAgentResponseInput",
+    "ExecutionContinuation",
+    "ExecutionEntrypoint",
+    "ExecutionPublicResult",
+    "ExecutionRequest",
+    "ExecutionResultStatus",
+]

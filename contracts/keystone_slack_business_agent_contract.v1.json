@@ -27,6 +27,7 @@
   "capabilities": [
     "feedback_jsonl",
     "operator_failure_payload",
+    "payload_manifest_checksums",
     "selected_context_prior_agent_runs",
     "selected_context_embedded_fallback",
     "write_gate_no_send",
@@ -196,6 +197,179 @@
       "title": "OperatorFailurePayload",
       "type": "object"
     },
+    "payload_manifest": {
+      "$defs": {
+        "SlackPayloadEntry": {
+          "description": "One source text or attachment represented in a Slack context payload.",
+          "properties": {
+            "byte_size": {
+              "default": 0,
+              "title": "Byte Size",
+              "type": "integer"
+            },
+            "captured_chars": {
+              "default": 0,
+              "title": "Captured Chars",
+              "type": "integer"
+            },
+            "captured_sha256": {
+              "default": "",
+              "title": "Captured Sha256",
+              "type": "string"
+            },
+            "checksum_sha256": {
+              "default": "",
+              "title": "Checksum Sha256",
+              "type": "string"
+            },
+            "file_id": {
+              "default": "",
+              "title": "File Id",
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "raw_request",
+                "selected_message",
+                "thread_message",
+                "attachment"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "materialization_status": {
+              "default": "not_applicable",
+              "enum": [
+                "not_applicable",
+                "metadata_only",
+                "materialized",
+                "missing",
+                "invalid"
+              ],
+              "title": "Materialization Status",
+              "type": "string"
+            },
+            "materialized_path": {
+              "default": "",
+              "title": "Materialized Path",
+              "type": "string"
+            },
+            "media_type": {
+              "default": "",
+              "title": "Media Type",
+              "type": "string"
+            },
+            "name": {
+              "default": "",
+              "title": "Name",
+              "type": "string"
+            },
+            "original_chars": {
+              "default": 0,
+              "title": "Original Chars",
+              "type": "integer"
+            },
+            "original_sha256": {
+              "default": "",
+              "title": "Original Sha256",
+              "type": "string"
+            },
+            "provenance": {
+              "default": "",
+              "title": "Provenance",
+              "type": "string"
+            },
+            "ref": {
+              "title": "Ref",
+              "type": "string"
+            },
+            "remote_url_present": {
+              "default": false,
+              "title": "Remote Url Present",
+              "type": "boolean"
+            },
+            "source_message_ts": {
+              "default": "",
+              "title": "Source Message Ts",
+              "type": "string"
+            },
+            "truncated": {
+              "default": false,
+              "title": "Truncated",
+              "type": "boolean"
+            },
+            "warnings": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Warnings",
+              "type": "array"
+            }
+          },
+          "required": [
+            "ref",
+            "kind"
+          ],
+          "title": "SlackPayloadEntry",
+          "type": "object"
+        }
+      },
+      "description": "Typed provenance and truncation evidence for selected Slack context.",
+      "properties": {
+        "attachments_materialized": {
+          "default": false,
+          "title": "Attachments Materialized",
+          "type": "boolean"
+        },
+        "attachments_present": {
+          "default": false,
+          "title": "Attachments Present",
+          "type": "boolean"
+        },
+        "current_turn_ref": {
+          "default": "",
+          "title": "Current Turn Ref",
+          "type": "string"
+        },
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/SlackPayloadEntry"
+          },
+          "title": "Entries",
+          "type": "array"
+        },
+        "raw_request_ref": {
+          "default": "",
+          "title": "Raw Request Ref",
+          "type": "string"
+        },
+        "schema": {
+          "const": "keystone.slack.payload_manifest.v1",
+          "default": "keystone.slack.payload_manifest.v1",
+          "title": "Schema",
+          "type": "string"
+        },
+        "thread_root_ref": {
+          "default": "",
+          "title": "Thread Root Ref",
+          "type": "string"
+        },
+        "truncation_detected": {
+          "default": false,
+          "title": "Truncation Detected",
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "title": "SlackPayloadManifest",
+      "type": "object"
+    },
     "selected_message_context": {
       "$defs": {
         "SlackContextMessage": {
@@ -234,6 +408,177 @@
           },
           "title": "SlackContextMessage",
           "type": "object"
+        },
+        "SlackPayloadEntry": {
+          "description": "One source text or attachment represented in a Slack context payload.",
+          "properties": {
+            "byte_size": {
+              "default": 0,
+              "title": "Byte Size",
+              "type": "integer"
+            },
+            "captured_chars": {
+              "default": 0,
+              "title": "Captured Chars",
+              "type": "integer"
+            },
+            "captured_sha256": {
+              "default": "",
+              "title": "Captured Sha256",
+              "type": "string"
+            },
+            "checksum_sha256": {
+              "default": "",
+              "title": "Checksum Sha256",
+              "type": "string"
+            },
+            "file_id": {
+              "default": "",
+              "title": "File Id",
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "raw_request",
+                "selected_message",
+                "thread_message",
+                "attachment"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "materialization_status": {
+              "default": "not_applicable",
+              "enum": [
+                "not_applicable",
+                "metadata_only",
+                "materialized",
+                "missing",
+                "invalid"
+              ],
+              "title": "Materialization Status",
+              "type": "string"
+            },
+            "materialized_path": {
+              "default": "",
+              "title": "Materialized Path",
+              "type": "string"
+            },
+            "media_type": {
+              "default": "",
+              "title": "Media Type",
+              "type": "string"
+            },
+            "name": {
+              "default": "",
+              "title": "Name",
+              "type": "string"
+            },
+            "original_chars": {
+              "default": 0,
+              "title": "Original Chars",
+              "type": "integer"
+            },
+            "original_sha256": {
+              "default": "",
+              "title": "Original Sha256",
+              "type": "string"
+            },
+            "provenance": {
+              "default": "",
+              "title": "Provenance",
+              "type": "string"
+            },
+            "ref": {
+              "title": "Ref",
+              "type": "string"
+            },
+            "remote_url_present": {
+              "default": false,
+              "title": "Remote Url Present",
+              "type": "boolean"
+            },
+            "source_message_ts": {
+              "default": "",
+              "title": "Source Message Ts",
+              "type": "string"
+            },
+            "truncated": {
+              "default": false,
+              "title": "Truncated",
+              "type": "boolean"
+            },
+            "warnings": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Warnings",
+              "type": "array"
+            }
+          },
+          "required": [
+            "ref",
+            "kind"
+          ],
+          "title": "SlackPayloadEntry",
+          "type": "object"
+        },
+        "SlackPayloadManifest": {
+          "description": "Typed provenance and truncation evidence for selected Slack context.",
+          "properties": {
+            "attachments_materialized": {
+              "default": false,
+              "title": "Attachments Materialized",
+              "type": "boolean"
+            },
+            "attachments_present": {
+              "default": false,
+              "title": "Attachments Present",
+              "type": "boolean"
+            },
+            "current_turn_ref": {
+              "default": "",
+              "title": "Current Turn Ref",
+              "type": "string"
+            },
+            "entries": {
+              "items": {
+                "$ref": "#/$defs/SlackPayloadEntry"
+              },
+              "title": "Entries",
+              "type": "array"
+            },
+            "raw_request_ref": {
+              "default": "",
+              "title": "Raw Request Ref",
+              "type": "string"
+            },
+            "schema": {
+              "const": "keystone.slack.payload_manifest.v1",
+              "default": "keystone.slack.payload_manifest.v1",
+              "title": "Schema",
+              "type": "string"
+            },
+            "thread_root_ref": {
+              "default": "",
+              "title": "Thread Root Ref",
+              "type": "string"
+            },
+            "truncation_detected": {
+              "default": false,
+              "title": "Truncation Detected",
+              "type": "boolean"
+            },
+            "warnings": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Warnings",
+              "type": "array"
+            }
+          },
+          "title": "SlackPayloadManifest",
+          "type": "object"
         }
       },
       "description": "Local-only context captured from a selected Slack message or thread.",
@@ -257,6 +602,9 @@
           "additionalProperties": true,
           "title": "Metadata",
           "type": "object"
+        },
+        "payload_manifest": {
+          "$ref": "#/$defs/SlackPayloadManifest"
         },
         "permalink": {
           "default": "",
@@ -464,6 +812,7 @@
     "agent_feedback_event": "keystone.slack.agent_feedback_event.v1",
     "business_agent_action": "keystone.business_agent_action.v1",
     "operator_failure": "keystone.operator_failure.v1",
+    "payload_manifest": "keystone.slack.payload_manifest.v1",
     "selected_message_context": "keystone.slack.selected_message_context.v1",
     "write_gate": "keystone.business_agent_write_request.v1"
   },

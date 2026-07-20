@@ -41,6 +41,13 @@ def test_response_synthesis_receives_manual_plan_ask_shape() -> None:
                 "output_form": "table",
                 "permission_state": "read_only",
                 "stop_condition": "return_zero_without_broadening_if_no_exact_match",
+                "output_constraints": {
+                    "interpretation": "exact two-row table",
+                    "scope": "entire_response",
+                    "item_count_mode": "exact",
+                    "minimum_items": 2,
+                    "maximum_items": 2,
+                },
             }
         },
     )
@@ -56,6 +63,64 @@ def test_response_synthesis_receives_manual_plan_ask_shape() -> None:
         synthesis_input.manual_plan["ask_shape"]["stop_condition"]
         == "return_zero_without_broadening_if_no_exact_match"
     )
+    assert (
+        synthesis_input.manual_plan["ask_shape"]["output_constraints"]["maximum_items"]
+        == 2
+    )
+    prompt = synthesis_input.to_prompt()
+    assert "manual_plan.ask_shape.output_constraints" in prompt
+    assert '"maximum_items": 2' in prompt
+    assert synthesis_input.request_coverage_required is True
+
+
+def test_response_synthesis_receives_validated_partial_request_coverage() -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="company_profile",
+        artifact_id="coverage-1",
+        metadata={
+            "request_coverage": {
+                "interpreted_request": "Return exact official-source matches in a table.",
+                "status": "partial",
+                "satisfied_dimensions": ["table"],
+                "unmet_dimensions": ["official-source coverage"],
+                "output_form_status": "satisfied",
+                "stop_condition_status": "blocked",
+                "next_safe_action": "Read the official source before finalizing.",
+            }
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.COMPANY_RESEARCH,
+            title="Coverage review",
+            artifact_refs=[artifact],
+        ),
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="A partial table is available.",
+        manual_request_plan={
+            "ask_shape": {
+                "strict_filter_mode": "exact",
+                "output_form": "table",
+                "stop_condition": "stop_before_unverified_claims",
+            }
+        },
+    )
+
+    synthesis_input = _user_response_synthesis_input(
+        result, user_request="Return exact official-source matches in a table."
+    )
+
+    assert synthesis_input.request_coverage_required is True
+    assert len(synthesis_input.request_coverage) == 1
+    assert synthesis_input.request_coverage[0].status == "partial"
+    assert synthesis_input.request_coverage[0].unmet_dimensions == [
+        "official-source coverage"
+    ]
+    prompt = synthesis_input.to_prompt()
+    assert "present a precise partial answer or blocker" in prompt
 
 
 def test_visible_sources_appends_structured_urls_to_plain_text() -> None:
@@ -84,6 +149,40 @@ def test_visible_sources_does_not_duplicate_when_text_already_has_url() -> None:
     )
 
     assert text.count("https://www.irs.gov/publications/p505") == 1
+
+
+def test_response_synthesis_excludes_internal_fixture_urls() -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="company_profile",
+        artifact_id="fixture-source",
+        source_agent="business_research_analyst",
+        title="Supplied Slack facts",
+        summary="Operator-supplied context.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Source-provided Slack facts",
+                    "url": "fixture://source-provided/slack-context",
+                    "supported_claim": "Facts came from the operator's Slack note.",
+                }
+            ]
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="Supplied context",
+            artifact_refs=[artifact],
+        ),
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="Supplied context reviewed.",
+    )
+
+    assert response_synthesis_sources(result) == []
+    assert response_synthesis_ordered_sources(result) == []
 
 
 def test_visible_sources_updates_mapping_summary_from_structured_sources() -> None:
@@ -623,6 +722,9 @@ def test_response_synthesis_includes_provider_lane_results_in_prompt() -> None:
                     "retained_count": 1,
                     "deepen_count": 1,
                     "rejected_count": 1,
+                    "retained_source_ids": ["selected:1"],
+                    "deepen_source_ids": ["selected:2"],
+                    "rejected_source_ids": ["selected:3"],
                     "needs_broaden_or_deepen": True,
                     "recommended_action": "broaden_or_deepen_before_final_synthesis",
                     "recall_gaps": ["missing expected source lane: press_news"],
@@ -704,6 +806,13 @@ def test_response_synthesis_includes_provider_lane_results_in_prompt() -> None:
     assert synthesis_input.provider_results == provider_results
     assert synthesis_input.source_data_summaries == source_data_summaries
     assert synthesis_input.source_triage_notes == source_triage_notes
+    assert len(synthesis_input.source_triage) == 1
+    assert synthesis_input.source_triage[0].decision_counts == {
+        "retain": 1,
+        "deepen": 1,
+        "reject": 1,
+    }
+    assert synthesis_input.source_triage[0].deepen_source_ids == ["selected:2"]
     assert synthesis_input.source_triage_notes == [
         (
             "Source triage: broaden_or_deepen_before_final_synthesis; "

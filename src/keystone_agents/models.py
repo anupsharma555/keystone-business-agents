@@ -419,6 +419,10 @@ class BusinessResearchFocusedBriefSDKInput:
             "If leadership is not source-backed, set leadership to unknown and list it in "
             "unknowns.",
             "Keep the brief concise and decision-oriented.",
+            "Read the original operator request and interpreted output constraints in "
+            "the Orchestrator preflight context. Put the direct, constraint-compliant "
+            "user-facing answer in answer. Do not rely on a later formatter to shorten, "
+            "reshape, or reinterpret it.",
             "Write user-facing fields in direct operator language. Do not refer to "
             "approved context, supplied context, source bundles, or internal evidence "
             "handling; state the supported facts directly and let citations carry provenance.",

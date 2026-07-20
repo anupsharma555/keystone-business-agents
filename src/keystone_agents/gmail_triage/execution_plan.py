@@ -19,11 +19,17 @@ def infer_gmail_execution_plan(
     text = " ".join(str(request_text or "").split()).strip()
     lowered = text.lower()
     read_scope = "message" if _single_message_request(lowered) else "thread"
-    lookback_days = _lookback_days(lowered) or 3
-    query_terms = _query_terms(lowered)
-    query = _date_scope_query(lowered, lookback_days)
+    explicit_lookback_days = _lookback_days(lowered)
+    lookback_days = explicit_lookback_days or 3
+    subject_hint = extract_gmail_subject_hint(text)
+    query_terms = _query_terms(text)
+    query = (
+        _date_scope_query(lowered, lookback_days)
+        if explicit_lookback_days is not None or not subject_hint
+        else ""
+    )
     if query_terms:
-        query = f"{query} {query_terms}"
+        query = " ".join(part for part in (query, query_terms) if part)
 
     if _inline_context_request(lowered):
         return GmailExecutionPlan(
@@ -327,8 +333,47 @@ def _requested_count(lowered: str) -> int | None:
         return None
 
 
-def _query_terms(lowered: str) -> str:
+def extract_gmail_subject_hint(text: str) -> str:
+    """Extract a bounded Gmail subject named by ordinary operator wording."""
+
+    normalized = " ".join(str(text or "").split()).strip()
+    subject_label = (
+        r"(?:email\s+)?(?:with\s+(?:the\s+)?subject(?:\s+line)?|"
+        r"subject(?:\s+line)?|titled|called)"
+    )
+    patterns = (
+        rf"\b{subject_label}\s*:?\s*[\"“‘']"
+        r"(?P<value>[^\"”’']{2,160})[\"”’']",
+        rf"\b{subject_label}\s*:?\s*"
+        r"(?P<value>[A-Za-z0-9][^.!?\n]{1,159}?)"
+        r"(?=(?:[.!?](?:\s|$)|$|\s+(?:and\s+)?"
+        r"(?:read|review|summari[sz]e|tell|then|draft|reply|respond|"
+        r"do\s+not|don't|dont|without)\b))",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = " ".join(match.group("value").split()).strip(" \t,:;\"'“”‘’")
+        if 2 <= len(value) <= 160:
+            return value
+    return ""
+
+
+def _gmail_subject_query_term(text: str) -> str:
+    subject = extract_gmail_subject_hint(text)
+    if not subject:
+        return ""
+    safe_subject = subject.replace("\\", " ").replace('"', "'")
+    return f'subject:"{safe_subject}"'
+
+
+def _query_terms(text: str) -> str:
+    lowered = text.lower()
     terms: list[str] = []
+    subject_query = _gmail_subject_query_term(text)
+    if subject_query:
+        terms.append(subject_query)
     if "keystone" in lowered:
         terms.append("Keystone")
     if "opportunit" in lowered:

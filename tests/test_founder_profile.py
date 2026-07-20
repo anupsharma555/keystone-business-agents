@@ -5,6 +5,7 @@ import zipfile
 from keystone_agents.founder_profile import (
     build_founder_cv_review_packet,
     founder_drafting_context,
+    founder_profile_audit_payload,
     founder_profile_claims,
     founder_search_context,
     load_founder_fit_profile,
@@ -23,6 +24,31 @@ def test_founder_fit_profile_contexts_use_approval_flags() -> None:
     assert "allowed_outreach_claims" in drafting_context
     assert claims
     assert claims[0].source_id == "founder_fit_profile:founder_fit_test"
+
+
+def test_sanitized_founder_profile_covers_expanded_opportunity_identity_context() -> None:
+    profile_path = "tests/fixtures/founder_fit_profile_approved.json"
+    profile = load_founder_fit_profile(profile_path)
+    assert profile is not None
+
+    context = founder_search_context(profile)
+
+    assert "strategic_priorities" in context
+    assert "opportunity_lanes" in context
+    assert "access_preferences" in context
+    assert "conferences and speaking calls" in context
+    assert "industry-sponsored collaborations and pilots" in context
+    assert "Remote, virtual, or online opportunities are preferred for now." in context
+
+    audit = founder_profile_audit_payload(profile_path, profile)
+    assert audit["search_context_complete"] is True
+    assert set(audit["search_context_fields"]) >= {
+        "summary",
+        "strategic_priorities",
+        "opportunity_lanes",
+        "access_preferences",
+        "public_links",
+    }
 
 
 def test_founder_cv_review_packet_extracts_docx_metadata(tmp_path) -> None:

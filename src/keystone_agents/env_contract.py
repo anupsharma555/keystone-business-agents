@@ -31,6 +31,14 @@ class EnvVarContract:
 
 _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
     EnvVarContract(
+        "AIRTABLE_ALLOW_TEST_DELETES",
+        "safety",
+        default_notes=(
+            "Defaults to false; enables cleanup only for one exact provider record "
+            "containing KBA_TEST_RECORD during an approved validation window."
+        ),
+    ),
+    EnvVarContract(
         "AUTO_SEND_EMAIL",
         "safety",
         default_notes="Must remain false/disabled for Slack-owned child runs.",
@@ -137,6 +145,14 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         default_notes="Defaults to disabled unless explicitly enabled.",
     ),
     EnvVarContract(
+        "KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE",
+        "safety",
+        default_notes=(
+            "Defaults to false; enables one approved KBA_TEST_DOC lifecycle with "
+            "provider-verified cleanup."
+        ),
+    ),
+    EnvVarContract(
         "KEYSTONE_EXA_SEARCH_FALLBACK",
         "search",
         default_notes=(
@@ -166,6 +182,19 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         "KEYSTONE_OPENAI_MODEL",
         "model",
         default_notes="Defaults to the repo model provider policy.",
+    ),
+    EnvVarContract(
+        "KEYSTONE_OPPORTUNITY_RETRIEVAL_DEADLINE_SECONDS",
+        "search",
+        default_notes=(
+            "Defaults to 90 seconds; bounds Opportunity Scout retrieval phases before "
+            "SDK synthesis."
+        ),
+    ),
+    EnvVarContract(
+        "KEYSTONE_OPPORTUNITY_SEARCH_CONCURRENCY",
+        "search",
+        default_notes="Defaults to 4 and is capped between 1 and 8.",
     ),
     EnvVarContract("KEYSTONE_RUNTIME_STATE_DIR", "storage", display_safety="path"),
     EnvVarContract(
@@ -221,6 +250,11 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         default_notes="Defaults to trafilatura.",
     ),
     EnvVarContract("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", "website_extraction"),
+    EnvVarContract(
+        "KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN",
+        "website_extraction",
+        default_notes="Defaults to 0; set an explicit 1-8 call cap for managed fallback.",
+    ),
     EnvVarContract("LITELLM_BASE_URL", "model", display_safety="url"),
     EnvVarContract("MODEL_PROVIDER", "model", default_notes="Defaults to openai."),
     EnvVarContract(

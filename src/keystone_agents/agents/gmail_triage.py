@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from email.utils import parseaddr
@@ -43,10 +44,16 @@ from keystone_agents.schemas.email_triage import (
     EmailTriageResult,
     GmailMailboxActionPlan,
     GmailMessageEnvelope,
+    GmailPriorityGroupedMessage,
     GmailPriorityGroupingResult,
     managed_gmail_labels,
 )
-from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
+from keystone_agents.sdk import (
+    Agent,
+    build_sdk_agent,
+    compose_direct_instructions,
+    compose_instructions,
+)
 from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.tools.approval_tool import create_approval_queue_item
@@ -57,6 +64,7 @@ from keystone_agents.tools.gmail_tool import (
     create_gmail_draft_with_attachment,
     get_gmail_message,
     gmail_message_envelope_from_dict,
+    gmail_test_draft_lifecycle,
     modify_gmail_message_state,
     send_gmail_test_draft,
 )
@@ -400,6 +408,83 @@ def triage_gmail_message_envelope(
     )
 
 
+def group_gmail_envelopes_fixture(
+    envelopes: list[GmailMessageEnvelope],
+    *,
+    operator_request: str,
+    lookback_days: int,
+    source_label: str = "INBOX",
+) -> GmailPriorityGroupingResult:
+    """Prioritize a bounded sanitized Gmail batch without a model or provider write."""
+
+    buckets: dict[str, list[GmailPriorityGroupedMessage]] = {
+        "urgent": [],
+        "important": [],
+        "can_wait": [],
+        "ignore": [],
+    }
+    for envelope in envelopes:
+        triage = triage_gmail_message_envelope(envelope)
+        if triage.priority == "urgent" or any(
+            flag in {"security", "possible_phi"} for flag in triage.risk_flags
+        ):
+            bucket = "urgent"
+        elif triage.needs_reply or triage.priority == "high":
+            bucket = "important"
+        elif triage.category in {"newsletter", "vendor"}:
+            bucket = "ignore"
+        else:
+            bucket = "can_wait"
+
+        buckets[bucket].append(
+            GmailPriorityGroupedMessage(
+                message_id=triage.message_id,
+                thread_id=triage.thread_id,
+                received_at=triage.received_at,
+                subject=triage.subject,
+                sender_name=triage.sender_name,
+                sender_email=triage.sender_email,
+                bucket=bucket,
+                category=triage.category,
+                confidence=triage.confidence,
+                priority=triage.priority,
+                summary=triage.summary,
+                reasoning=triage.reasoning,
+                needs_reply=triage.needs_reply,
+                recommended_action=triage.recommended_action,
+                recommended_labels=triage.recommended_labels,
+                risk_flags=triage.risk_flags,
+                draft_reply=None,
+                draft_created=False,
+                approval_required=False,
+                requires_human_review=triage.requires_human_review,
+                send_enabled=False,
+                sent=False,
+            )
+        )
+
+    for messages in buckets.values():
+        messages.sort(key=lambda message: message.received_at, reverse=True)
+    return GmailPriorityGroupingResult(
+        request_summary=operator_request,
+        source_label=source_label,
+        lookback_days=lookback_days,
+        source_message_count=len(envelopes),
+        urgent=buckets["urgent"],
+        important=buckets["important"],
+        can_wait=buckets["can_wait"],
+        ignore=buckets["ignore"],
+        draft_count=0,
+        send_enabled=False,
+        sent=False,
+        live_side_effects_enabled=False,
+        audit_notes=[
+            "Deterministic grouping used only the supplied sanitized bounded message set.",
+            "No provider draft, label change, or send action was attempted.",
+        ],
+    )
+
+
 def run_gmail_triage_fixture(
     fixture: str | Path | None = None,
     *,
@@ -431,6 +516,8 @@ def run_gmail_triage_sdk(
     context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    attach_tools: bool = True,
+    compact_instructions: bool = False,
 ) -> TypedAgentRunResult[EmailTriageResult]:
     """Run Gmail triage through the typed SDK harness."""
 
@@ -439,9 +526,11 @@ def run_gmail_triage_sdk(
     resolved_tool_tier = tool_tier or _default_gmail_triage_sdk_tool_tier(typed_input)
     agent = build_gmail_triage_agent(
         model=model,
+        include_tools=attach_tools,
         request_text=skill_request_text(typed_input),
         context_flags=context_flags,
         tool_tier=resolved_tool_tier,
+        compact_instructions=compact_instructions,
     )
     turn_policy = resolve_sdk_turn_policy(
         "gmail_triage",
@@ -512,21 +601,24 @@ def build_gmail_triage_agent(
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
+    compact_instructions: bool = False,
 ) -> Agent:
     """Build the Gmail triage agent."""
 
-    instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "tools.md",
-        "gmail_triage.md",
-        skill_files=select_agent_skill_names(
-            "gmail_triage",
-            request_text=request_text,
-            context_flags=context_flags,
-            include_all=include_all_skills,
-        ),
+    skill_files = select_agent_skill_names(
+        "gmail_triage",
+        request_text=request_text,
+        context_flags=context_flags,
+        include_all=include_all_skills,
+        compact=compact_instructions,
     )
+    composer = compose_direct_instructions if compact_instructions else compose_instructions
+    prompt_files = (
+        ("keystone_profile.md", "safety_policy.md", "gmail_triage.md")
+        if compact_instructions
+        else ("keystone_profile.md", "safety_policy.md", "tools.md", "gmail_triage.md")
+    )
+    instructions = composer(*prompt_files, skill_files=skill_files)
     tools = (
         [
             get_gmail_message,
@@ -534,6 +626,7 @@ def build_gmail_triage_agent(
             modify_gmail_message_state,
             create_gmail_draft_with_attachment,
             create_gmail_draft_reply,
+            gmail_test_draft_lifecycle,
             send_gmail_test_draft,
             load_email_style_profile,
             list_local_context_sources,
@@ -552,6 +645,8 @@ def build_gmail_triage_agent(
         if include_tools
         else []
     )
+    if include_tools and _marked_test_draft_lifecycle_request(request_text):
+        tools = [gmail_test_draft_lifecycle]
     if tool_tier is not None:
         tools = filter_tools_for_tier("gmail_triage", tools, tool_tier)
     return build_sdk_agent(
@@ -566,6 +661,18 @@ def build_gmail_triage_agent(
             "Use for inbound email classification, label planning, suspicious message review, "
             "and draft-only reply preparation."
         ),
+    )
+
+
+def _marked_test_draft_lifecycle_request(request_text: str) -> bool:
+    """Recognize one bounded marker-gated draft lifecycle already owned by one tool."""
+
+    normalized = " ".join(str(request_text or "").lower().split())
+    return bool(
+        re.search(r"\bkba_test_draft(?:_[a-z0-9]+)*\b", normalized)
+        and re.search(r"\b(?:add|create|make|write)\b", normalized)
+        and re.search(r"\b(?:update|change|modify|revise|edit)\b", normalized)
+        and re.search(r"\b(?:delete|remove|clean\s*up)\b", normalized)
     )
 
 

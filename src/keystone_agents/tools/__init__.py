@@ -144,6 +144,8 @@ __all__ = [
     "ZOTERO_READ_CONTEXT_TOOL_NAMES",
     "zotero_import_article_with_backend",
     "zotero_read_api_metadata",
+    "zotero_read_item_children",
+    "zotero_read_pdf_attachment_text",
     "zotero_resolve_article_context",
     "zotero_resolve_collection_context",
 ]
@@ -156,6 +158,8 @@ _ZOTERO_CONTEXT_EXPORTS = {
     "ZOTERO_READ_CONTEXT_TOOL_NAMES",
     "zotero_import_article_with_backend",
     "zotero_read_api_metadata",
+    "zotero_read_item_children",
+    "zotero_read_pdf_attachment_text",
     "zotero_resolve_article_context",
     "zotero_resolve_collection_context",
 }

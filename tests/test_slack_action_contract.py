@@ -28,6 +28,7 @@ from keystone_agents.slack_action_contract import (
     OPERATOR_FAILURE_SCHEMA,
     RUN_AGENT_MESSAGE_CALLBACK_ID,
     SLACK_AGENT_FEEDBACK_EVENT_SCHEMA,
+    SLACK_PAYLOAD_MANIFEST_SCHEMA,
     SLACK_SELECTED_CONTEXT_SCHEMA,
     BusinessAgentWriteGatePayload,
     OperatorFailurePayload,
@@ -40,7 +41,7 @@ from keystone_agents.slack_action_contract import (
     parse_business_agent_write_gate_value,
     slack_agent_feedback_event,
 )
-from keystone_agents.slack_actions import SlackSelectedMessageContext
+from keystone_agents.slack_actions import SlackPayloadManifest, SlackSelectedMessageContext
 
 
 def test_business_agent_action_contract_rejects_unknown_schema_version() -> None:
@@ -92,6 +93,7 @@ def test_business_agent_slack_contract_exports_action_and_context_metadata() -> 
     assert contract["schemas"]["business_agent_action"] == BUSINESS_AGENT_ACTION_SCHEMA
     assert contract["schemas"]["agent_feedback_event"] == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
     assert contract["schemas"]["operator_failure"] == OPERATOR_FAILURE_SCHEMA
+    assert contract["schemas"]["payload_manifest"] == SLACK_PAYLOAD_MANIFEST_SCHEMA
     assert contract["schemas"]["selected_message_context"] == SLACK_SELECTED_CONTEXT_SCHEMA
     assert contract["schemas"]["write_gate"] == BUSINESS_AGENT_WRITE_GATE_SCHEMA
     assert KBA_MORE_RESEARCH in contract["action_ids"]
@@ -106,6 +108,7 @@ def test_business_agent_slack_contract_exports_action_and_context_metadata() -> 
 
     action_schema = contract["payload_json_schemas"]["business_agent_action"]
     feedback_schema = contract["payload_json_schemas"]["agent_feedback_event"]
+    manifest_schema = contract["payload_json_schemas"]["payload_manifest"]
     selected_context_schema = contract["payload_json_schemas"]["selected_message_context"]
     write_gate_schema = contract["payload_json_schemas"]["write_gate"]
     failure_schema = contract["payload_json_schemas"]["operator_failure"]
@@ -113,7 +116,9 @@ def test_business_agent_slack_contract_exports_action_and_context_metadata() -> 
     assert "event_type" in feedback_schema["required"]
     assert "kind" in failure_schema["required"]
     assert failure_schema["properties"]["schema"]["default"] == OPERATOR_FAILURE_SCHEMA
+    assert manifest_schema["properties"]["schema"]["const"] == SLACK_PAYLOAD_MANIFEST_SCHEMA
     assert selected_context_schema["properties"]["schema"]["const"] == SLACK_SELECTED_CONTEXT_SCHEMA
+    assert "payload_manifest" in selected_context_schema["properties"]
     assert "prior_agent_runs" in selected_context_schema["properties"]
     assert "request_text" in write_gate_schema["required"]
     assert contract["result_rendering"]["context_agents"] == [
@@ -168,6 +173,7 @@ def test_generated_slack_contract_artifact_matches_canonical_contract_shape() ->
     assert payload["action_ids"] == sorted(KBA_ACTION_IDS)
     assert payload["schemas"]["agent_feedback_event"] == SLACK_AGENT_FEEDBACK_EVENT_SCHEMA
     assert payload["schemas"]["operator_failure"] == OPERATOR_FAILURE_SCHEMA
+    assert payload["schemas"]["payload_manifest"] == SLACK_PAYLOAD_MANIFEST_SCHEMA
     assert payload["schemas"]["selected_message_context"] == SLACK_SELECTED_CONTEXT_SCHEMA
     assert (
         payload["payload_json_schemas"]["agent_feedback_event"]["properties"]["schema"]["default"]
@@ -427,6 +433,10 @@ def test_action_and_selected_context_models_share_contract_schema_names() -> Non
     assert parsed.source_message_ts == "1782000000.000100"
     assert parsed.source_thread_ts == "1782000000.000100"
     assert context.model_dump(mode="json", by_alias=True)["schema"] == SLACK_SELECTED_CONTEXT_SCHEMA
+    manifest = SlackPayloadManifest()
+    assert manifest.model_dump(mode="json", by_alias=True)["schema"] == (
+        SLACK_PAYLOAD_MANIFEST_SCHEMA
+    )
 
 
 def test_slack_agent_feedback_event_has_contract_schema() -> None:

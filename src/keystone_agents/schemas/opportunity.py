@@ -10,6 +10,7 @@ from pydantic.json_schema import SkipJsonSchema
 
 from keystone_agents.schemas.company_profile import ClaimEvidenceRecord
 from keystone_agents.schemas.decision_trace import DecisionTrace
+from keystone_agents.schemas.request_coverage import RequestCoverage
 from keystone_agents.source_quality import (
     SourceQualityScore,
     SourceQualitySummary,
@@ -65,6 +66,23 @@ OpportunityType = Literal[
     "contract or RFP opportunity",
     "open-source repository opportunity",
     "hackathon or challenge opportunity",
+]
+
+OpportunityKind = Literal[
+    "company_or_partner",
+    "consulting_or_advisory",
+    "role",
+    "conference",
+    "workshop_or_training",
+    "certification_or_professional_development",
+    "grant_or_fellowship",
+    "contract_or_rfp",
+    "industry_collaboration_or_pilot",
+    "networking_or_professional_community",
+    "publication_call",
+    "clinical_trial_or_research",
+    "accelerator_or_challenge",
+    "other",
 ]
 
 OpportunitySourceType = Literal[
@@ -232,6 +250,16 @@ class OpportunityScoreBreakdown(BaseModel):
 
 class OpportunityRecord(BaseModel):
     company_name: str
+    entity_name: str = ""
+    opportunity_kind: OpportunityKind = "other"
+    opportunity_status: Literal["open", "closed_or_expired", "unknown"] = "unknown"
+    deadline: str = ""
+    eligibility_summary: str = ""
+    access_mode: Literal["remote_or_virtual", "in_person", "hybrid", "unknown"] = "unknown"
+    application_or_contact_path: str = ""
+    detail_verification_status: Literal["page_verified", "snippet_only", "unverified"] = (
+        "unverified"
+    )
     entity_kind: str | None = None
     canonical_entity_key: str | None = None
     opportunity_type: OpportunityType
@@ -278,6 +306,8 @@ class OpportunityRecord(BaseModel):
 
     @model_validator(mode="after")
     def populate_scoring_and_validate_claims(self) -> OpportunityRecord:
+        if not self.entity_name:
+            self.entity_name = self.company_name
         unique_bundles: list[OpportunitySourceBundle] = []
         seen_bundle_keys: set[tuple[str, str, str]] = set()
         for bundle in self.source_bundles:
@@ -433,6 +463,35 @@ class OpportunityAssessmentBrief(BaseModel):
         return self
 
 
+class OpportunityScoutSynthesisDecision(BaseModel):
+    """One compact model judgment over an already verified opportunity record."""
+
+    record_key: str = Field(min_length=1, max_length=240)
+    include: bool
+    why_now_signal: str = Field(min_length=1, max_length=500)
+    keystone_fit_reason: str = Field(min_length=1, max_length=700)
+    recommended_next_step: str = Field(min_length=1, max_length=500)
+    missing_evidence: list[str] = Field(default_factory=list, max_length=6)
+
+
+class OpportunityScoutSynthesis(BaseModel):
+    """Compact judgments merged onto deterministic Opportunity Scout evidence."""
+
+    decisions: list[OpportunityScoutSynthesisDecision] = Field(default_factory=list, max_length=5)
+    audit_summary: str = Field(min_length=1, max_length=700)
+    constraint_relaxation_suggestion: str = Field(default="", max_length=500)
+    outreach_generated: bool = False
+
+    @model_validator(mode="after")
+    def preserve_synthesis_safety(self) -> OpportunityScoutSynthesis:
+        if self.outreach_generated:
+            raise ValueError("Opportunity Scout synthesis must not generate outreach.")
+        keys = [decision.record_key.strip().casefold() for decision in self.decisions]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Opportunity Scout synthesis decisions must use unique record keys.")
+        return self
+
+
 class OpportunityScoutResult(BaseModel):
     topic: str | None = None
     dry_run: bool = True
@@ -455,6 +514,7 @@ class OpportunityScoutResult(BaseModel):
     audit_notes: list[str] = Field(default_factory=list)
     constraint_relaxation_suggestion: str = ""
     outreach_generated: bool = False
+    request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
 
     @model_validator(mode="after")
     def normalize_result_evidence(self) -> OpportunityScoutResult:

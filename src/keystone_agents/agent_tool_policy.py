@@ -39,6 +39,7 @@ AIRTABLE_WRITE_ALLOWED_TOOLS = frozenset(
         "airtable_upload_attachment",
         "airtable_link_attachment",
         "airtable_create_expense_from_receipt",
+        "airtable_reconcile_duplicate_expense",
     }
 )
 AIRTABLE_TEST_CLEANUP_TOOLS = frozenset({"airtable_delete_test_record"})
@@ -256,6 +257,7 @@ INTERNAL_WRITE_TOOL_NAMES = (
     | AIRTABLE_TEST_CLEANUP_TOOLS
     | AIRTABLE_TEST_LIFECYCLE_TOOLS
     | GOOGLE_WORKSPACE_WRITE_TOOLS
+    | frozenset({"google_doc_test_lifecycle"})
     | CONTACT_CONTEXT_TOOL_NAMES
     | CALENDAR_WRITE_TOOL_NAMES
     | frozenset(
@@ -264,6 +266,7 @@ INTERNAL_WRITE_TOOL_NAMES = (
             "modify_gmail_message_state",
             "create_gmail_draft_with_attachment",
             "create_gmail_draft_reply",
+            "gmail_test_draft_lifecycle",
             "send_gmail_test_draft",
             "create_approval_queue_item",
             "create_approval_request_placeholder",
@@ -437,6 +440,7 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "modify_gmail_message_state",
                 "create_gmail_draft_with_attachment",
                 "create_gmail_draft_reply",
+                "gmail_test_draft_lifecycle",
                 "send_gmail_test_draft",
                 "load_email_style_profile",
                 "list_local_context_sources",
@@ -473,7 +477,9 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
     ),
     "google_workspace_context_agent": AgentToolPolicy(
         agent_name="google_workspace_context_agent",
-        allowed_tool_names=GOOGLE_WORKSPACE_ALLOWED_TOOLS,
+        allowed_tool_names=(
+            GOOGLE_WORKSPACE_ALLOWED_TOOLS | frozenset({"google_doc_test_lifecycle"})
+        ),
         rationale=(
             "The Google Workspace context agent lists, searches, reads, and may "
             "perform direct approved Drive/Docs/Sheets writes; nested Chief calls "

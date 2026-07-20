@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.json_schema import SkipJsonSchema
 
 from keystone_agents.schemas.operational_context import HumanWorkContext
+from keystone_agents.schemas.request_coverage import RequestCoverage
 
 EmailCategory = Literal[
     "consulting_opportunity",
@@ -284,6 +285,7 @@ class EmailTriageResult(BaseModel):
     approval_required: bool = False
     requires_human_review: bool = True
     human_work_context: HumanWorkContext = Field(default_factory=HumanWorkContext)
+    request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
 
     @field_validator(
         "subject",
@@ -312,8 +314,6 @@ class EmailTriageResult(BaseModel):
     @model_validator(mode="after")
     def require_approval_for_drafts(self) -> EmailTriageResult:
         if self.draft_reply:
-            if not self.needs_reply:
-                raise ValueError("Draft replies require needs_reply=true.")
             if not self.approval_required:
                 raise ValueError("Draft replies require approval_required=true.")
         self.recommended_labels = normalize_managed_gmail_labels(self.recommended_labels)

@@ -113,6 +113,26 @@ def chief_of_staff_quality_budget(
                 ],
             }
         )
+    if not explicit and is_bounded_chief_response_only_request(request_text):
+        return budget.model_copy(
+            update={
+                "mode": QualityMode.FAST,
+                "max_turns": 1,
+                "max_tokens": min(budget.max_tokens or 1200, 1200),
+                "max_tool_calls": 0,
+                "enable_context_deepening": False,
+                "hosted_web_search_max_calls": 0,
+                "tool_tier": "core_read",
+                "notes": [
+                    *budget.notes,
+                    (
+                        "Bounded response-only Chief synthesis uses one tool-free SDK "
+                        "turn; an independent output-constraint repair is budgeted by "
+                        "the caller only if validation fails."
+                    ),
+                ],
+            }
+        )
     return budget
 
 
@@ -443,6 +463,54 @@ def _looks_like_chief_of_staff_fast_request(text: str) -> bool:
         "bookmark this",
     )
     return any(marker in normalized for marker in fast_markers)
+
+
+def is_bounded_chief_response_only_request(text: str) -> bool:
+    """Recognize a prior-context answer transformation without selecting a route.
+
+    This is a cost/tool-profile hint only. The planner and Orchestrator still
+    own intent and route selection, while Python keeps the explicit no-action
+    boundary authoritative.
+    """
+
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized:
+        return False
+    response_shape = bool(
+        re.search(
+            r"\b(?:reply|answer|give|return|rewrite|reformat|shorten|condense)\b"
+            r".{0,180}\b(?:bullets?|points?|answer|response|nothing else|"
+            r"facts?|questions?|no heading|no (?:closing|introductory) note)\b",
+            normalized,
+        )
+    )
+    bounded_context = bool(
+        re.search(
+            r"\b(?:same|original|prior|previous|last|above)\b.{0,100}"
+            r"\b(?:request|answer|response|reply|bullets?|facts?|context)\b"
+            r"|\b(?:these|those|supplied|provided|operator[- ]supplied)\s+"
+            r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?"
+            r"facts?\b",
+            normalized,
+        )
+    )
+    if not bounded_context:
+        # Reuse the planner's shared supplied-context grammar so preposed and
+        # postposed "only" forms receive the same compact cost/tool profile.
+        from keystone_agents.manual_request import (
+            looks_like_supplied_context_synthesis_request,
+        )
+
+        bounded_context = looks_like_supplied_context_synthesis_request(text)
+    explicit_no_action = bool(
+        re.search(
+            r"\b(?:do not|don't|dont|without|no)\b.{0,120}"
+            r"\b(?:search|tools?|providers?|draft|send|post|write|change|modify|"
+            r"create|delete|schedule)\b",
+            normalized,
+        )
+    )
+    return response_shape and bounded_context and explicit_no_action
 
 
 def _looks_like_bounded_live_sdk_smoke_request(text: str) -> bool:

@@ -60,7 +60,10 @@ from keystone_agents.tools.website_extraction_tool import (
     default_company_page_urls,
     discover_company_page_urls,
     extract_website_content,
+    extract_website_content_with_fallbacks,
+    website_extraction_budget,
     website_extraction_enabled,
+    website_extraction_provider_sequence,
 )
 
 DEFAULT_SANDBOX_SEARCH_REVIEW_CONTEXT_SIZE = "low"
@@ -956,6 +959,10 @@ def retrieve_company_profile_live(
     max_results: int = 5,
     agents_web_search_max_calls: int | None = None,
     agents_web_search_parallel: bool | None = None,
+    tavily_search_fallback: bool | None = None,
+    exa_search_fallback: bool | None = None,
+    extract_selected_pages: bool = True,
+    max_queries: int | None = None,
     retrieval_hint: RetrievalHint | None = None,
     settings_loader: Callable[[], Any] | None = None,
     query_builder: Callable[[str, str | None], list[str]] | None = None,
@@ -984,6 +991,8 @@ def retrieve_company_profile_live(
         serper_enabled=bool(getattr(settings, "serper_enabled", False)),
         agents_web_search_max_calls=agents_web_search_max_calls,
         agents_web_search_parallel=agents_web_search_parallel,
+        tavily_search_fallback=tavily_search_fallback,
+        exa_search_fallback=exa_search_fallback,
     )
 
     def build_client() -> HybridSearchProvider:
@@ -1019,6 +1028,8 @@ def retrieve_company_profile_live(
         if default_query_builder and _query_builder_accepts_request_text(query_builder)
         else query_builder(company, company_url)
     )
+    if max_queries is not None:
+        queries = queries[: max(1, max_queries)]
     request_focus_terms = _company_extraction_query_terms(company=company, queries=queries)
     search_results: list[Any] = []
     query_timings: list[dict[str, Any]] = []
@@ -1118,13 +1129,24 @@ def retrieve_company_profile_live(
         telemetry_packets=telemetry_packets or [client.telemetry()],
     )
     website_started_at = perf_counter()
-    website_inputs, website_errors, website_stats = _extract_company_website_inputs(
-        company=company,
-        company_url=company_url,
-        search_results=search_results,
-        queries=queries,
-        provider=str(getattr(settings, "website_extractor", "trafilatura") or "trafilatura"),
-    )
+    if extract_selected_pages:
+        website_inputs, website_errors, website_stats = _extract_company_website_inputs(
+            company=company,
+            company_url=company_url,
+            search_results=search_results,
+            queries=queries,
+            provider=str(
+                getattr(settings, "website_extractor", "trafilatura") or "trafilatura"
+            ),
+        )
+    else:
+        website_inputs, website_errors, website_stats = [], [], {
+            "mode": "skipped_quick_retrieval",
+            "providers_used": [],
+            "pages_considered": 0,
+            "page_count": 0,
+            "claim_count": 0,
+        }
     website_seconds = perf_counter() - website_started_at
     profile_started_at = perf_counter()
     profile_kwargs: dict[str, Any] = {
@@ -1228,7 +1250,8 @@ def _extract_company_website_inputs(
     queries: list[str] | None = None,
     provider: str,
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
-    fallback_provider = _website_extraction_fallback_provider(primary_provider=provider)
+    provider_sequence = website_extraction_provider_sequence(primary_provider=provider)
+    fallback_provider = ",".join(provider_sequence[1:])
     base_stats = {
         "enabled": website_extraction_enabled(),
         "provider": provider,
@@ -1267,6 +1290,7 @@ def _extract_company_website_inputs(
     html_review_claim_count = 0
     extraction_started_at = perf_counter()
     extraction_timed_out = False
+    extraction_budget = website_extraction_budget()
     for index, url in enumerate(urls, start=1):
         if perf_counter() - extraction_started_at >= _website_extraction_total_timeout_seconds():
             extraction_timed_out = True
@@ -1277,41 +1301,18 @@ def _extract_company_website_inputs(
             )
             break
         try:
-            result = extract_website_content(
+            result = extract_website_content_with_fallbacks(
                 url,
                 company_name=company,
-                provider=provider,
+                primary_provider=provider,
+                guardrail_context="public_web_source",
                 live=True,
+                budget=extraction_budget,
+                extractor=extract_website_content,
             )
         except Exception as exc:
-            if not fallback_provider:
-                errors.append(f"{url}: {exc}")
-                continue
-            try:
-                result = extract_website_content(
-                    url,
-                    company_name=company,
-                    provider=fallback_provider,
-                    live=True,
-                )
-            except Exception as fallback_exc:
-                errors.append(f"{url}: {exc}; fallback {fallback_provider}: {fallback_exc}")
-                continue
-        if not result.claims and result.provider != "firecrawl":
-            if fallback_provider:
-                try:
-                    fallback_result = extract_website_content(
-                        url,
-                        company_name=company,
-                        provider=fallback_provider,
-                        live=True,
-                    )
-                except Exception as exc:
-                    errors.append(
-                        f"{url}: empty {result.provider}; fallback {fallback_provider}: {exc}"
-                    )
-                else:
-                    result = fallback_result
+            errors.append(f"{url}: {exc}")
+            continue
         if (
             agent_html_review_enabled()
             and html_review_attempts < agent_html_review_max_pages()
@@ -1375,19 +1376,10 @@ def _extract_company_website_inputs(
         "agent_html_review_claim_count": html_review_claim_count,
         "timed_out": extraction_timed_out,
         "total_timeout_seconds": _website_extraction_total_timeout_seconds(),
+        "firecrawl_call_cap": extraction_budget.firecrawl_max_calls,
+        "firecrawl_calls_attempted": extraction_budget.firecrawl_calls_attempted,
     }
     return website_inputs, errors, stats
-
-
-def _website_extraction_fallback_provider(*, primary_provider: str) -> str:
-    fallback = os.getenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", "").strip().lower()
-    if not fallback or fallback == primary_provider.strip().lower():
-        return ""
-    if fallback in {"crawl-4-ai", "crawl_4_ai"}:
-        fallback = "crawl4ai"
-    if fallback not in {"crawl4ai", "firecrawl", "trafilatura"}:
-        return ""
-    return fallback
 
 
 def _company_website_extraction_urls(

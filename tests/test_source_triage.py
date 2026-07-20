@@ -57,6 +57,32 @@ def test_source_triage_retains_specific_primary_opportunity_source() -> None:
     assert result.decisions[0].decision == "retain"
 
 
+def test_source_triage_preserves_professional_development_program_for_review() -> None:
+    result = triage_source_candidates(
+        agent_name="opportunity_scout",
+        request_text=(
+            "Find current remote workshops, certifications, or networking communities "
+            "in clinical AI, psychiatry, or neuroinformatics."
+        ),
+        candidates=[
+            SearchResult(
+                title="Online AI in Healthcare Certificate - eCornell - Cornell University",
+                link="https://ecornell.cornell.edu/certificates/ai-in-healthcare/",
+                snippet=(
+                    "Enroll now in a remote online AI in healthcare certificate program "
+                    "for clinical professionals."
+                ),
+                source="searxng",
+            )
+        ],
+    )
+
+    assert result.expected_lanes == ["conference_events", "people_institutions"]
+    assert result.rejected_source_ids == []
+    assert result.review_source_ids == ["source:1"]
+    assert "does not match expected source lanes" not in result.decisions[0].rationale
+
+
 def test_source_triage_rejects_award_recognition_for_formal_opportunity_request() -> None:
     result = triage_source_candidates(
         agent_name="opportunity_scout",

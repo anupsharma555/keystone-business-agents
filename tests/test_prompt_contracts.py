@@ -216,6 +216,33 @@ def test_dynamic_skill_selector_includes_core_and_specialist_contracts() -> None
             assert len(selected) < len(AGENT_SKILL_NAMES[agent_name])
 
 
+def test_compact_read_only_context_skills_omit_generic_duplicate_contracts() -> None:
+    selected = select_agent_skill_names(
+        "zotero_context_agent",
+        request_text="Read one exact Zotero article and summarize its abstract.",
+        compact=True,
+    )
+
+    assert "zotero_context_specialist_contracts" in selected
+    assert "evidence_attribution_and_claim_mapping" in selected
+    assert "context_permission_gating" not in selected
+    assert "action_boundary_enforcement" not in selected
+    assert "tool_result_resilience" not in selected
+    assert "structured_output_quality_review" not in selected
+
+
+def test_compact_mutation_skills_keep_permission_and_action_contracts() -> None:
+    selected = select_agent_skill_names(
+        "google_workspace_context_agent",
+        request_text="Update one exact Google Doc and verify it.",
+        compact=True,
+    )
+
+    assert "google_workspace_context_specialist_contracts" in selected
+    assert "context_permission_gating" in selected
+    assert "action_boundary_enforcement" in selected
+
+
 def test_ask_to_target_resolution_skill_selected_for_chief_and_airtable() -> None:
     request = (
         "Add a business expense to Airtable business expenses based on receipt details "
@@ -356,6 +383,16 @@ def test_operating_architecture_requires_reranked_links_to_be_extracted_before_s
     assert "separate search planning, retrieval, source ranking, claim extraction" in text
     assert "broadens, deepens, reranks, or promotes additional links" in normalized
     assert "read/extracted or explicitly marked snippet-only before final synthesis" in normalized
+
+
+def test_operating_architecture_resolves_noncritical_uncertainty_before_blocking() -> None:
+    text = _read_prompt("agent-operating-architecture.md")
+    normalized = " ".join(text.split())
+
+    assert "use an uncertainty-resolution ladder before blocking" in normalized
+    assert "apply configured account, calendar, timezone" in normalized
+    assert "ask one targeted question only if the remaining alternatives would materially change" in normalized
+    assert "Do not turn every omitted optional field into a blocker" in normalized
 
 
 def test_agent_builders_include_selected_skills_and_tools_prompts() -> None:

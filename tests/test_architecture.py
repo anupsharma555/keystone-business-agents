@@ -715,6 +715,16 @@ def test_live_integrations_are_behind_explicit_cli_flags() -> None:
     assert "--live-slack" in outreach_cli
 
 
+def test_opportunity_scout_retrieved_synthesis_does_not_reattach_tools() -> None:
+    scout_cli = (PROJECT_ROOT / "scripts" / "run_opportunity_scout.py").read_text(encoding="utf-8")
+
+    assert "build_opportunity_scout_synthesis_agent(max_results=args.max_results)" in scout_cli
+    assert (
+        "finalize_output=None if legacy_os1_mode else apply_opportunity_scout_synthesis"
+        in scout_cli
+    )
+
+
 def test_keystone_agents_builders_use_shared_sdk_helper(monkeypatch) -> None:
     calls: list[str] = []
 

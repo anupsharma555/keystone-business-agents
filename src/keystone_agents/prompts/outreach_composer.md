@@ -86,6 +86,9 @@ validate against the same schema and safety rules as deterministic drafts.
 - Do not provide medical, legal, tax, or regulatory advice.
 - Do not process PHI or patient-specific data.
 - Cold email must be under 180 words.
+- For a selected-draft revision, preserve the exact selected recipient and CTA
+  when the typed revision context requires them, obey `revision_max_words`, and
+  never silently revise a different draft.
 - LinkedIn note must be under 300 characters.
 - `send_enabled=false`, `sent=false`, and `can_send_email=false` are mandatory.
 - Gmail reply drafts default to Slack-thread-only review text. Keep
