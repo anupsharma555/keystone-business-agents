@@ -756,14 +756,19 @@ only when needed:
 ```bash
 export KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true
 export KEYSTONE_WEBSITE_EXTRACTOR=trafilatura
-export KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=crawl4ai
+export KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK=crawl4ai,firecrawl
+export KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN=2
 export FIRECRAWL_API_KEY="..."
 ```
 
-Trafilatura is the default extractor. Crawl4AI can be selected with
-`KEYSTONE_WEBSITE_EXTRACTOR=crawl4ai` or used as the preferred fallback for
-local/heavier extraction before spending Firecrawl credits. Firecrawl can be
-selected with `KEYSTONE_WEBSITE_EXTRACTOR=firecrawl` or used as a later fallback.
+Trafilatura is the default extractor for ordinary pages. Known JS-heavy search,
+career, job-board, and directory URLs route to Crawl4AI first; other failed,
+empty, or shallow selected-page reads try it as the local/heavier fallback.
+Extractors do not fan out in parallel. Firecrawl is attempted later only when
+it is explicitly included in the comma-separated
+`KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK` sequence and its API key is configured;
+the per-run cap must also be greater than zero. Omit Firecrawl or leave the cap
+at `0` to guarantee that adaptive extraction cannot consume Firecrawl credits.
 Extracted page text is converted into source-backed claim candidates; it is not
 a generic crawl or outbound action.
 

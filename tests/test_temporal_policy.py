@@ -26,3 +26,15 @@ def test_temporal_depth_policy_keeps_non_temporal_requests_on_standard_sufficien
     assert policy["trigger_terms"] == []
     assert policy["source_recency_requirement"] == "as_requested"
     assert policy["completion_rule"] == "Use normal source sufficiency and blocker rules."
+
+
+def test_provider_state_now_does_not_activate_external_research_policy() -> None:
+    policy = temporal_depth_policy(
+        "Is it on the calendar now?",
+        provider_system="google_calendar",
+        requires_live_search=False,
+    )
+
+    assert policy["temporal_intent"] is False
+    assert policy["trigger_terms"] == []
+    assert policy["source_recency_requirement"] == "as_requested"

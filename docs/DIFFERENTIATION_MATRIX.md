@@ -100,3 +100,26 @@ reframed as a win.
 The comparison also repaired the measurement contract: cost and latency fields
 now participate in improvement/regression decisions instead of being recorded
 but ignored.
+
+## Broader Weekly-Operations Comparison Readiness
+
+The next ANU-175 comparison now has a dedicated matched harness for the saved
+weekly operations packet. It reuses the exact KBA operator request and the same
+32 privacy-minimized assertions, fixes the model to `gpt-5.4-mini`, attaches no
+tools, permits one request, and caps the maintained estimate at `$0.05`.
+
+Its zero-request preflight validates the saved KBA receipt, all required packet
+sections and assertion markers, the common request hash, review-only behavior,
+and the no-send/no-post/no-write boundary. The preflight is green. The external
+baseline itself is not evidence yet: the execution environment blocked export
+because the minimized assertions are derived from internal Slack and Gmail
+operations. The process did not start and no API request was consumed. Keep
+ANU-175 open until this same comparison runs inside an explicitly trusted data
+boundary or an equally broad fully synthetic matched packet proves the claimed
+operator advantage.
+
+Run only the offline readiness check with:
+
+```bash
+npm run compare:weekly-ops:baseline -- --preflight-only
+```

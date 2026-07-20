@@ -16,6 +16,7 @@ from keystone_agents.differentiation_matrix import (
     DifferentiationObservation,
     compare_differentiation_observations,
 )
+from keystone_agents.pilot_receipt_replay import PilotReceiptReplay
 
 
 def build_controlled_pilot_scorecard(
@@ -23,11 +24,19 @@ def build_controlled_pilot_scorecard(
     trusted_runtime_rows: dict[str, str],
     observations: Iterable[ControlledPilotObservation],
     baseline_observations: Iterable[DifferentiationObservation] = (),
+    replay_readiness: Iterable[PilotReceiptReplay] = (),
 ) -> dict[str, Any]:
     """Build one complete scorecard without inferring missing evidence."""
 
     observation_by_case = _unique_by_case(observations, label="KBA pilot")
     baseline_by_case = _unique_baselines(baseline_observations)
+    replay_by_case = _unique_replays(replay_readiness)
+    overlapping_cases = sorted(set(observation_by_case) & set(replay_by_case))
+    if overlapping_cases:
+        raise ValueError(
+            "Replay readiness cannot accompany a pilot observation for: "
+            + ", ".join(overlapping_cases)
+        )
     case_rows: list[dict[str, Any]] = []
     observed_requests = 0
     observed_cost = 0.0
@@ -36,12 +45,19 @@ def build_controlled_pilot_scorecard(
     for case in controlled_pilot_cases():
         observation = observation_by_case.get(case.case_id)
         if observation is None:
+            replay = replay_by_case.get(case.case_id)
+            status = "pending_slack_transport" if replay else "missing"
+            failed_checks = (
+                ["slack_permalink_missing", "pilot_observation_missing"]
+                if replay
+                else ["observation_missing"]
+            )
             case_rows.append(
                 {
                     "case_id": case.case_id,
                     "title": case.title,
-                    "status": "missing",
-                    "failed_checks": ["observation_missing"],
+                    "status": status,
+                    "failed_checks": failed_checks,
                     "backend": case.backend,
                     "entry_owner": case.expected_entry_owner,
                     "context_sources": list(case.context_sources),
@@ -50,6 +66,28 @@ def build_controlled_pilot_scorecard(
                     "max_openai_requests": case.max_openai_requests,
                     "max_cost_usd": case.max_cost_usd,
                     "comparison_status": "pending_kba_observation",
+                    "replay_ready": replay is not None,
+                    "replay_openai_requests": (
+                        replay.replay_openai_requests if replay is not None else None
+                    ),
+                    "repeated_model_synthesis": (
+                        replay.repeated_model_synthesis if replay is not None else None
+                    ),
+                    "replay_provider_writes": (
+                        replay.provider_writes if replay is not None else None
+                    ),
+                    "replay_visible_source_count": (
+                        len(replay.visible_sources) if replay is not None else 0
+                    ),
+                    "replay_evidence_refs": (
+                        list(replay.evidence_refs) if replay is not None else []
+                    ),
+                    **_case_guidance(
+                        status=status,
+                        failed_checks=failed_checks,
+                        max_openai_requests=case.max_openai_requests,
+                        comparison_status="pending_kba_observation",
+                    ),
                 }
             )
             continue
@@ -70,33 +108,38 @@ def build_controlled_pilot_scorecard(
             comparison_status = comparison.status
             improvements = list(comparison.improvements)
             regressions = list(comparison.regressions)
-        case_rows.append(
-            {
-                "case_id": case.case_id,
-                "title": case.title,
-                "status": assessment.status,
-                "failed_checks": list(assessment.failed_checks),
-                "backend": case.backend,
-                "entry_owner": case.expected_entry_owner,
-                "context_sources": list(case.context_sources),
-                "expected_artifact": case.expected_artifact,
-                "allowed_provider_writes": case.allowed_provider_writes,
-                "max_openai_requests": case.max_openai_requests,
-                "max_cost_usd": case.max_cost_usd,
-                "openai_requests": observation.openai_requests,
-                "estimated_cost_usd": observation.estimated_cost_usd,
-                "latency_ms": observation.latency_ms,
-                "visible_source_count": observation.visible_source_count,
-                "context_reentry_fields": observation.context_reentry_fields,
-                "manual_provider_ids": observation.manual_provider_ids,
-                "approval_round_trips": observation.approval_round_trips,
-                "provider_writes": observation.provider_writes,
-                "evidence_refs": list(observation.evidence_refs),
-                "comparison_status": comparison_status,
-                "improvements": improvements,
-                "regressions": regressions,
-            }
-        )
+        row = {
+            "case_id": case.case_id,
+            "title": case.title,
+            "status": assessment.status,
+            "failed_checks": list(assessment.failed_checks),
+            "backend": case.backend,
+            "entry_owner": case.expected_entry_owner,
+            "context_sources": list(case.context_sources),
+            "expected_artifact": case.expected_artifact,
+            "allowed_provider_writes": case.allowed_provider_writes,
+            "max_openai_requests": case.max_openai_requests,
+            "max_cost_usd": case.max_cost_usd,
+            "openai_requests": observation.openai_requests,
+            "estimated_cost_usd": observation.estimated_cost_usd,
+            "latency_ms": observation.latency_ms,
+            "visible_source_count": observation.visible_source_count,
+            "context_reentry_fields": observation.context_reentry_fields,
+            "manual_provider_ids": observation.manual_provider_ids,
+            "approval_round_trips": observation.approval_round_trips,
+            "provider_writes": observation.provider_writes,
+            "evidence_refs": list(observation.evidence_refs),
+            "comparison_status": comparison_status,
+            "improvements": improvements,
+            "regressions": regressions,
+            **_case_guidance(
+                status=assessment.status,
+                failed_checks=list(assessment.failed_checks),
+                max_openai_requests=case.max_openai_requests,
+                comparison_status=comparison_status,
+            ),
+        }
+        case_rows.append(row)
 
     trusted_ready = controlled_pilot_ready(trusted_runtime_rows)
     all_observed = len(observation_by_case) == len(controlled_pilot_cases())
@@ -118,6 +161,7 @@ def build_controlled_pilot_scorecard(
         },
         "case_count": len(case_rows),
         "observed_case_count": len(observation_by_case),
+        "replay_ready_case_count": len(replay_by_case),
         "passing_case_count": sum(row["status"] == "pass" for row in case_rows),
         "totals": {
             "openai_requests": observed_requests,
@@ -144,6 +188,8 @@ def build_controlled_pilot_scorecard(
 
 
 def controlled_pilot_observation_from_dict(payload: dict[str, Any]) -> ControlledPilotObservation:
+    if payload.get("pilot_observation_claimed") is False or payload.get("transport_status"):
+        raise ValueError("Replay readiness cannot be ingested as a pilot observation.")
     values = dict(payload)
     values["evidence_refs"] = tuple(values.get("evidence_refs") or ())
     return ControlledPilotObservation(**values)
@@ -153,6 +199,62 @@ def differentiation_observation_from_dict(payload: dict[str, Any]) -> Differenti
     values = dict(payload)
     values["evidence_refs"] = tuple(values.get("evidence_refs") or ())
     return DifferentiationObservation(**values)
+
+
+def _case_guidance(
+    *,
+    status: str,
+    failed_checks: list[str],
+    max_openai_requests: int,
+    comparison_status: str,
+) -> dict[str, Any]:
+    if status == "pending_slack_transport":
+        return {
+            "reuse_policy": "reuse_saved_specialist_output_no_model_rerun",
+            "model_rerun_required": False,
+            "transport_only": True,
+            "next_required_evidence": [
+                "Authorized Slack transport of the prepared replay packet.",
+                "Slack permalink plus local run or WorkItem identity.",
+                "Human review pass and one final answer-first response.",
+            ],
+        }
+    if status == "missing":
+        return {
+            "reuse_policy": "no_reusable_case_receipt",
+            "model_rerun_required": True,
+            "transport_only": False,
+            "next_required_evidence": [
+                "One exact catalog-ask pilot observation with route, backend, sources, "
+                "usage, cost, Slack permalink, and no-side-effect review."
+            ],
+        }
+    if status == "fail":
+        evidence: list[str] = []
+        mapping = {
+            "human_review_passed": "Fresh human copy/usefulness review marked pass.",
+            "no_developer_intervention": "Fresh execution requiring no developer repair.",
+            "request_ceiling": (
+                f"Fresh exact-ask receipt using at most {max_openai_requests} OpenAI requests."
+            ),
+        }
+        for check in failed_checks:
+            evidence.append(mapping.get(check, f"Fresh evidence passing check: {check}."))
+        return {
+            "reuse_policy": "do_not_promote_failed_observation",
+            "model_rerun_required": True,
+            "transport_only": False,
+            "next_required_evidence": evidence,
+        }
+    next_evidence = []
+    if comparison_status == "pending_baseline":
+        next_evidence.append("One matched baseline observation for comparative assessment.")
+    return {
+        "reuse_policy": "reuse_passing_observation",
+        "model_rerun_required": False,
+        "transport_only": False,
+        "next_required_evidence": next_evidence,
+    }
 
 
 def _unique_by_case(
@@ -186,6 +288,20 @@ def _unique_baselines(
                 f"Duplicate baseline observation for {observation.workflow_id}."
             )
         indexed[observation.workflow_id] = observation
+    return indexed
+
+
+def _unique_replays(
+    replays: Iterable[PilotReceiptReplay],
+) -> dict[str, PilotReceiptReplay]:
+    indexed: dict[str, PilotReceiptReplay] = {}
+    known_cases = {case.case_id for case in controlled_pilot_cases()}
+    for replay in replays:
+        if replay.case_id not in known_cases:
+            raise ValueError(f"Unknown replay-readiness case: {replay.case_id}.")
+        if replay.case_id in indexed:
+            raise ValueError(f"Duplicate replay readiness for {replay.case_id}.")
+        indexed[replay.case_id] = replay
     return indexed
 
 

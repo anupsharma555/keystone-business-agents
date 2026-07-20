@@ -240,6 +240,82 @@ def test_direct_specialist_provider_blocker_skips_llm_constraint_repair(
     assert "instruction_following" not in payload
 
 
+def test_parent_renderer_prefers_verified_child_provider_summary(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    correct_summary = (
+        'Yes - "UT Course Orientation Session" is on your Google Calendar '
+        "on 2026-08-22."
+    )
+    stale_summary = "Aug 15, 2026."
+    monkeypatch.setattr(
+        cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "status": "done",
+                    "send_enabled": False,
+                    "completion_confirmed": True,
+                    "user_facing_result_verified": True,
+                    "human_summary": correct_summary,
+                    "slack_display_text": correct_summary,
+                    "public_result": {
+                        "status": "completed",
+                        "completion_confirmed": True,
+                        "provider_write_attempted": False,
+                        "provider_receipt_verified": None,
+                    },
+                    "tool_receipts": [
+                        {
+                            "status": "success",
+                            "operation": "resolve_calendar_event",
+                            "event_reference": "UT Course Orientation Session",
+                            "title": "UT Course Orientation Session",
+                            "start_date": "2026-08-22",
+                        }
+                    ],
+                    "output_type": "ChiefOfStaffResult",
+                    "output": {
+                        "summary": stale_summary,
+                        "sources": [
+                            {
+                                "title": "Stale prior Calendar result",
+                                "url": "https://example.invalid/prior-event",
+                            }
+                        ],
+                    },
+                }
+            ),
+            stderr="",
+        ),
+    )
+
+    exit_code = cli._run_ask_script_live(
+        "chief_of_staff",
+        "What date is the UT Course Orientation Session?",
+        ["unused-child-command"],
+        json_output=True,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            provider_system="google_calendar",
+            primary_target="UT Course Orientation Session",
+        ),
+        database_url=f"sqlite:///{tmp_path / 'provider-render.db'}",
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["human_summary"] == correct_summary
+    assert payload["slack_display_text"] == correct_summary
+    assert stale_summary not in payload["human_summary"]
+
+
 @pytest.mark.parametrize(
     ("route", "output_type"),
     [
@@ -2771,8 +2847,7 @@ def test_provider_action_detector_cannot_veto_semantic_plan(
     assert "calendar_action" not in payload
 
 
-def test_chief_calendar_fast_path_executes_complete_live_write_immediately(
-    capsys,
+def test_typed_calendar_executor_executes_complete_live_write_immediately(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -2791,38 +2866,28 @@ def test_chief_calendar_fast_path_executes_complete_live_write_immediately(
         }
 
     monkeypatch.setattr(cli, "create_google_calendar_event_impl", fake_create)
-    monkeypatch.setattr(
-        cli,
-        "resolve_calendar_action_plan",
-        lambda input_text, plan, **kwargs: SimpleNamespace(
-            plan=plan,
-            openai_requests=1,
-            warnings=(),
-        ),
+    request = (
+        "on November 4th add an all day calendar event that Frontiers in Human "
+        "Dynamics paper Due Date"
     )
-    exit_code = main(
-        [
-            "ask",
-            "--agent",
-            "chief_of_staff",
-            "--live-sdk",
-            "--json",
-            "on November 4th add an all day calendar event that Frontiers in Human "
-            "Dynamics paper Due Date",
-        ]
+    plan = cli.infer_calendar_action_plan(request)
+    assert plan is not None
+
+    payload = cli.execute_direct_calendar_action(
+        request,
+        plan,
+        live=True,
+        openai_requests=0,
     )
 
-    assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "done"
-    assert payload["openai_requests"] == 1
+    assert payload["openai_requests"] == 0
     assert payload["side_effects"]["calendar_write_performed"] is True
     assert captured["live"] is True
     assert str(captured["approval_reference"]).startswith("calendar-direct:")
 
 
-def test_chief_calendar_fast_path_forwards_timed_event_fields_to_writer(
-    capsys,
+def test_typed_calendar_executor_forwards_timed_event_fields_to_writer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -2842,39 +2907,25 @@ def test_chief_calendar_fast_path_forwards_timed_event_fields_to_writer(
         }
 
     monkeypatch.setattr(cli, "create_google_calendar_event_impl", fake_create)
-    monkeypatch.setattr(
-        cli,
-        "resolve_calendar_action_plan",
-        lambda input_text, plan, **kwargs: SimpleNamespace(
-            plan=plan,
-            openai_requests=1,
-            warnings=(),
-        ),
+    request = (
+        "schedule a calendar meeting on July 14th, 2026 at 2pm titled "
+        "Livestream with Corey Ching and Peter Steinberger"
+    )
+    plan = cli.infer_calendar_action_plan(request)
+    assert plan is not None
+    payload = cli.execute_direct_calendar_action(
+        request,
+        plan,
+        live=True,
     )
 
-    exit_code = main(
-        [
-            "ask",
-            "--agent",
-            "chief_of_staff",
-            "--live-sdk",
-            "--json",
-            "schedule a calendar meeting on July 14th, 2026 at 2pm titled "
-            "Livestream with Corey Ching and Peter Steinberger",
-        ]
-    )
-
-    payload = json.loads(capsys.readouterr().out)
-    assert exit_code == 0
     assert payload["status"] == "done"
-    assert payload["openai_requests"] == 1
     assert captured["start_time"] == "14:00"
     assert captured["end_time"] == "15:00"
     assert captured["timezone"] == "America/New_York"
 
 
-def test_chief_calendar_fast_path_resolves_natural_update_reference(
-    capsys,
+def test_typed_calendar_executor_resolves_natural_update_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -2906,32 +2957,19 @@ def test_chief_calendar_fast_path_resolves_natural_update_reference(
 
     monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
     monkeypatch.setattr(cli, "update_google_calendar_event_impl", fake_update)
-    monkeypatch.setattr(
-        cli,
-        "resolve_calendar_action_plan",
-        lambda input_text, plan, **kwargs: SimpleNamespace(
-            plan=plan,
-            openai_requests=1,
-            warnings=(),
-        ),
+    request = (
+        "change the note on the Frontiers in Human Dynamics paper Due Date event "
+        "to submit the final paper"
+    )
+    plan = cli.infer_calendar_action_plan(request)
+    assert plan is not None
+    payload = cli.execute_direct_calendar_action(
+        request,
+        plan,
+        live=True,
     )
 
-    exit_code = main(
-        [
-            "ask",
-            "--agent",
-            "chief_of_staff",
-            "--live-sdk",
-            "--json",
-            "change the note on the Frontiers in Human Dynamics paper Due Date event ",
-            "to submit the final paper",
-        ]
-    )
-
-    assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "done"
-    assert payload["openai_requests"] == 1
     assert payload["calendar_action"]["event_id"] == ""
     assert payload["calendar_action"]["event_reference"] == (
         "Frontiers in Human Dynamics paper Due Date"
@@ -2942,8 +2980,7 @@ def test_chief_calendar_fast_path_resolves_natural_update_reference(
     assert captured["update"]["live"] is True
 
 
-def test_named_cos_calendar_delete_resolves_exact_event_and_verifies_absence(
-    capsys,
+def test_typed_calendar_executor_delete_resolves_exact_event_and_verifies_absence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -2977,33 +3014,21 @@ def test_named_cos_calendar_delete_resolves_exact_event_and_verifies_absence(
 
     monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
     monkeypatch.setattr(cli, "delete_google_calendar_event_impl", fake_delete)
-    monkeypatch.setattr(
-        cli,
-        "resolve_calendar_action_plan",
-        lambda input_text, plan, **kwargs: SimpleNamespace(
-            plan=plan,
-            openai_requests=1,
-            warnings=(),
-        ),
+    request = (
+        "@KNI CoS remove the KBA_TEST_CALENDAR_DIRECT calendar event on July 21, 2026"
+    )
+    plan = cli.infer_calendar_action_plan(request)
+    assert plan is not None
+    payload = cli.execute_direct_calendar_action(
+        request,
+        plan,
+        live=True,
     )
 
-    exit_code = main(
-        [
-            "ask",
-            "--live-sdk",
-            "--json",
-            "@KNI",
-            "CoS",
-            "remove the KBA_TEST_CALENDAR_DIRECT calendar event on July 21, 2026",
-        ]
-    )
-
-    assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "done"
     assert payload["selected_agent"] == "chief_of_staff"
     assert payload["route"] == "chief_of_staff"
-    assert payload["openai_requests"] == 1
+    assert payload["openai_requests"] == 0
     assert payload["calendar_action"]["operation"] == "delete"
     assert payload["calendar_lookup"]["match_count"] == 1
     assert payload["tool_receipt"]["verification"]["passed"] is True
@@ -3011,8 +3036,7 @@ def test_named_cos_calendar_delete_resolves_exact_event_and_verifies_absence(
     assert captured["delete"]["live"] is True
 
 
-def test_chief_calendar_thread_time_update_uses_prior_event_date(
-    capsys,
+def test_typed_calendar_executor_thread_time_update_uses_prior_event_date(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -3045,15 +3069,6 @@ def test_chief_calendar_thread_time_update_uses_prior_event_date(
 
     monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
     monkeypatch.setattr(cli, "update_google_calendar_event_impl", fake_update)
-    monkeypatch.setattr(
-        cli,
-        "resolve_calendar_action_plan",
-        lambda input_text, plan, **kwargs: SimpleNamespace(
-            plan=plan,
-            openai_requests=1,
-            warnings=(),
-        ),
-    )
     request = (
         "chief of staff continue this prior Slack thread. "
         "Previous request: CoS schedule a calendar meeting on July 14th at 2pm titled "
@@ -3063,12 +3078,16 @@ def test_chief_calendar_thread_time_update_uses_prior_event_date(
         "Continue the same agent task."
     )
 
-    exit_code = main(
-        ["ask", "--agent", "chief_of_staff", "--live-sdk", "--json", request]
+    plan = CalendarActionPlan(
+        operation="update",
+        event_reference="Livestream with Corey Ching and Peter Steinberger",
+        event_reference_date="2026-07-14",
+        start_time="14:00",
+        end_time="15:00",
+        all_day=False,
+        complete=True,
     )
-
-    assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
+    payload = cli.execute_direct_calendar_action(request, plan, live=True)
     assert payload["status"] == "done"
     assert captured["event_reference"] == (
         "Livestream with Corey Ching and Peter Steinberger"
@@ -3079,8 +3098,7 @@ def test_chief_calendar_thread_time_update_uses_prior_event_date(
     assert captured["update"]["end_time"] == "15:00"
 
 
-def test_chief_calendar_thread_note_uses_llm_first_candidate_and_append(
-    capsys,
+def test_typed_calendar_executor_thread_note_appends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -3094,10 +3112,6 @@ def test_chief_calendar_thread_note_uses_llm_first_candidate_and_append(
         all_day=False,
         complete=True,
     )
-
-    def fake_interpret(input_text: str, fallback, **kwargs: object) -> SimpleNamespace:
-        captured["fallback"] = fallback
-        return SimpleNamespace(plan=plan, openai_requests=1, warnings=())
 
     def fake_resolve(event_reference: str, **kwargs: object) -> dict[str, object]:
         return {
@@ -3123,7 +3137,6 @@ def test_chief_calendar_thread_note_uses_llm_first_candidate_and_append(
             "send_enabled": False,
         }
 
-    monkeypatch.setattr(cli, "resolve_calendar_action_plan", fake_interpret)
     monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
     monkeypatch.setattr(cli, "update_google_calendar_event_impl", fake_update)
     request = (
@@ -3135,16 +3148,705 @@ def test_chief_calendar_thread_note_uses_llm_first_candidate_and_append(
         "Continue the same agent task."
     )
 
+    payload = cli.execute_direct_calendar_action(request, plan, live=True)
+    assert payload["status"] == "done"
+    assert captured["update"]["description"] == url
+    assert captured["update"]["append_description"] is True
+
+
+def test_typed_calendar_executor_verifies_event_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = (
+        "chief of staff continue this prior Slack thread. "
+        "Current user request (authoritative): Is it on the calendar now? "
+        "Provider affinity: calendar "
+        "Previous request: CoS add UT Austin Course Starts on August 15, 2026 "
+        "to my Google Calendar. Can add it at 8am-9am. "
+        "Previous result title: Business Agents WorkItem Failed "
+        "Previous result: No specialist or provider action ran. "
+        "User follow-up: Is it on the calendar now? "
+        "Continue the same agent task."
+    )
+    captured: dict[str, object] = {}
+
+    def fake_resolve(event_reference: str, **kwargs: object) -> dict[str, object]:
+        captured["event_reference"] = event_reference
+        captured["lookup"] = kwargs
+        return {
+            "status": "success",
+            "operation": "resolve_calendar_event",
+            "event_reference": event_reference,
+            "event_id": "calendar-event-1",
+            "title": "UT Austin Course Starts",
+            "start_date": "2026-08-15",
+            "match_count": 1,
+            "provider_link": "https://calendar.test/event",
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
+    plan = CalendarActionPlan(
+        operation="read",
+        event_reference="UT Austin Course Starts",
+        start_date="2026-08-15",
+        complete=True,
+    )
+    payload = cli.execute_direct_calendar_action(request, plan, live=True)
+    assert captured["event_reference"] == "UT Austin Course Starts"
+    assert captured["lookup"]["start_date"] == "2026-08-15"
+    assert payload["status"] == "done"
+    assert payload["side_effects"]["calendar_write_performed"] is False
+    assert payload["tool_receipt"]["found"] is True
+    assert payload["public_result"]["status"] == "completed"
+    assert payload["public_result"]["text"] == (
+        'Yes - "UT Austin Course Starts" is on your Google Calendar on 2026-08-15.'
+    )
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        (
+            "@KNI CoS add UT Austin Course Starts on August 15, 2026 to google "
+            "calendar. Can add it at 8am-9am."
+        ),
+        (
+            "@KNI CoS add UT Austin Course Starts on August 15, 2026 to my Google "
+            "Calendar from 8am to 9am."
+        ),
+        (
+            "@KNI Chief of Staff, please put UT Austin Course Starts on my Google "
+            "Calendar for August 15, 2026, 8:00-9:00 AM."
+        ),
+    ],
+)
+def test_live_calendar_variants_use_shared_chief_provider_path_with_five_call_ceiling(
+    request_text: str,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    child_envs: list[dict[str, str]] = []
+
+    def fail_direct_calendar_path(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("Live natural-language Calendar asks must use the shared Chief path.")
+
+    def fake_semantic_preflight(
+        preflight_request: str,
+        *,
+        requested_agent: str | None = None,
+        **_kwargs: object,
+    ) -> object:
+        plan = infer_manual_request_plan(
+            preflight_request,
+            requested_agent=requested_agent,
+        ).model_copy(
+            update={
+                "source": "llm",
+                "target_agent": "chief_of_staff",
+                "intent": "business_system_write",
+                "target_type": "business_system_context",
+                "provider_system": "google_calendar",
+                "primary_target": "UT Austin Course Starts",
+                "requires_live_search": False,
+            }
+        )
+        result = cli.route_request(preflight_request, manual_plan=plan)
+        return cli.OrchestratorPreflight(
+            request_text=preflight_request,
+            requested_agent=requested_agent or "chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            execution_allowed=True,
+            manual_request_plan=plan,
+            route_result=result,
+        )
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        child_envs.append(dict(kwargs.get("env") or {}))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "status": "done",
+                    "output_type": "ChiefOfStaffResult",
+                    "send_enabled": False,
+                    "human_summary": (
+                        'Google Calendar event created and verified: '
+                        '"UT Austin Course Starts" on 2026-08-15.'
+                    ),
+                    "output": {
+                        "summary": (
+                            'Google Calendar event created and verified: '
+                            '"UT Austin Course Starts" on 2026-08-15.'
+                        )
+                    },
+                    "tool_receipts": [
+                        {
+                            "status": "success",
+                            "operation": "create_calendar_event",
+                            "title": "UT Austin Course Starts",
+                            "start_date": "2026-08-15",
+                            "verification": {"passed": True},
+                        }
+                    ],
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_semantic_preflight)
+    monkeypatch.setattr(cli, "resolve_calendar_action_plan", fail_direct_calendar_path)
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+
     exit_code = main(
-        ["ask", "--agent", "chief_of_staff", "--live-sdk", "--json", request]
+        [
+            "ask",
+            "--live-sdk",
+            "--max-openai-requests",
+            "5",
+            "--json",
+            request_text,
+        ]
     )
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["status"] == "done"
-    assert captured["fallback"] is None
-    assert captured["update"]["description"] == url
-    assert captured["update"]["append_description"] is True
+    assert payload["selected_agent"] == "chief_of_staff"
+    assert payload.get("status") != "blocked"
+    assert payload["script_payload"]["status"] == "done"
+    assert payload["manual_request_plan"]["provider_system"] == "google_calendar"
+    assert calls and "scripts/run_chief_of_staff.py" in calls[0]
+    assert "--live-search" not in calls[0]
+    assert "--live-search-plan" not in calls[0]
+    assert calls[0][calls[0].index("--quality") + 1] == "fast"
+    child_plan = json.loads(child_envs[0][MANUAL_REQUEST_PLAN_ENV])
+    assert child_plan["provider_system"] == "google_calendar"
+    assert child_plan["intent"] == "business_system_write"
+
+
+def test_live_calendar_followup_reuses_human_root_without_failed_bot_output_or_search(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope = "\n".join(
+        [
+            "chief of staff continue this prior Slack thread.",
+            "Current user request (authoritative): Is it on the calendar now?",
+            "Provider affinity: calendar",
+            (
+                "Previous request: CoS add UT Austin Course Starts on August 15, 2026 "
+                "to my Google Calendar. Can add it at 8am-9am."
+            ),
+            "Previous result title: Business Agents WorkItem Failed",
+            "Previous result: No specialist or provider action ran.",
+            "User follow-up: Is it on the calendar now?",
+            "Continue the same agent task.",
+        ]
+    )
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text: str, **kwargs: object) -> object:
+        captured["preflight_request"] = request_text
+        captured["workflow_state"] = kwargs.get("workflow_state")
+        plan = infer_manual_request_plan(
+            request_text,
+            requested_agent="chief_of_staff",
+        ).model_copy(
+            update={
+                "source": "llm",
+                "target_agent": "chief_of_staff",
+                "intent": "context_lookup",
+                "target_type": "business_system_context",
+                "provider_system": "google_calendar",
+                "primary_target": "UT Austin Course Starts",
+                "requires_live_search": False,
+            }
+        )
+        result = cli.route_request(request_text, manual_plan=plan)
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            execution_allowed=True,
+            manual_request_plan=plan,
+            route_result=result,
+        )
+
+    def fail_direct_calendar_path(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("Live provider follow-ups must use the shared Chief path.")
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["command"] = command
+        captured["child_input"] = command[command.index("--input") + 1]
+        captured["child_env"] = dict(kwargs.get("env") or {})
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "status": "done",
+                    "output_type": "ChiefOfStaffResult",
+                    "send_enabled": False,
+                    "human_summary": (
+                        'Yes - "UT Austin Course Starts" is on your Google Calendar '
+                        "on 2026-08-15."
+                    ),
+                    "output": {
+                        "summary": (
+                            'Yes - "UT Austin Course Starts" is on your Google Calendar '
+                            "on 2026-08-15."
+                        )
+                    },
+                    "tool_receipts": [
+                        {
+                            "status": "success",
+                            "operation": "read_calendar_window",
+                            "events": [
+                                {
+                                    "event_id": "event-1",
+                                    "title": "UT Austin Course Starts",
+                                    "start": "2026-08-15T08:00:00-04:00",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "resolve_calendar_action_plan", fail_direct_calendar_path)
+    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--live-sdk",
+            "--max-openai-requests",
+            "5",
+            "--json",
+            envelope,
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.get("status") != "blocked"
+    assert payload["script_payload"]["status"] == "done"
+    assert captured["preflight_request"] == "Is it on the calendar now?"
+    workflow_state = captured["workflow_state"]
+    assert isinstance(workflow_state, dict)
+    assert workflow_state["execution_continuation"]["provider_affinity"] == "calendar"
+    child_input = str(captured["child_input"])
+    assert "UT Austin Course Starts" in child_input
+    assert "Authoritative follow-up: Is it on the calendar now?" in child_input
+    assert "No specialist or provider action ran" not in child_input
+    assert "Business Agents WorkItem Failed" not in child_input
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--live-search" not in command
+    assert "--live-search-plan" not in command
+    assert command[command.index("--quality") + 1] == "fast"
+
+
+def test_live_unowned_calendar_followup_executes_typed_action_before_work_item(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    envelope = "\n".join(
+        [
+            "business agents continue this prior Slack thread.",
+            (
+                "Current user request (authoritative): "
+                "Move this event to 4:10 PM and make it 15 minutes."
+            ),
+            "Linked WorkItem: wi_stale_calendar_plan",
+            "Provider affinity: calendar",
+            "Previous request: Move this event to 4:20 PM and make it 25 minutes.",
+            "Previous result title: Calendar update plan",
+            "Previous result: This response reflects the plan, not a live mutation.",
+            "User follow-up: Move this event to 4:10 PM and make it 15 minutes.",
+            "Continue the same agent task.",
+        ]
+    )
+    context_file = tmp_path / "slack-calendar-followup.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.message_context.v1",
+                "thread_ts": "1784574080.467439",
+                "thread_root_request": (
+                    "CoS: Put a 15-minute event called "
+                    '"KBA_TEST_CALENDAR natural language canary" on my calendar '
+                    "for July 22, 2026 at 4:10 PM Eastern."
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan = CalendarActionPlan(
+        operation="update",
+        event_reference="KBA_TEST_CALENDAR natural language canary",
+        event_reference_date="2026-07-22",
+        start_date="2026-07-22",
+        start_time="16:10",
+        end_time="16:25",
+        all_day=False,
+        complete=True,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text: str, **_kwargs: object) -> object:
+        semantic_plan = ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="business_system_write",
+            task_objective="business_system_write",
+            provider_system="google_calendar",
+            provider_operations=["update"],
+            primary_target="KBA_TEST_CALENDAR natural language canary",
+            required_entities=["KBA_TEST_CALENDAR natural language canary"],
+            requires_live_search=False,
+            requires_durable_state=False,
+            objective=request_text,
+        )
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            execution_allowed=True,
+            manual_request_plan=semantic_plan,
+            route_result=cli.route_request(request_text, manual_plan=semantic_plan),
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    def fake_resolve(
+        request_text: str,
+        fallback: object,
+        **kwargs: object,
+    ) -> object:
+        captured["resolve_request"] = request_text
+        captured["fallback"] = fallback
+        captured["resolve_kwargs"] = kwargs
+        return SimpleNamespace(
+            plan=plan,
+            interpreter_used=True,
+            openai_requests=1,
+            warnings=(),
+        )
+
+    def fake_direct(
+        input_text: str,
+        resolved_plan: CalendarActionPlan,
+        **kwargs: object,
+    ) -> int:
+        captured["direct_input"] = input_text
+        captured["resolved_plan"] = resolved_plan
+        captured["direct_kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "resolve_calendar_action_plan", fake_resolve)
+    monkeypatch.setattr(cli, "run_direct_calendar_action", fake_direct)
+    monkeypatch.setattr(
+        cli,
+        "_run_ask_work_item",
+        lambda *_args, **_kwargs: pytest.fail(
+            "A one-owner live Calendar follow-up must not become a WorkItem."
+        ),
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--context-file",
+            str(context_file),
+            "--max-openai-requests",
+            "5",
+            "--json",
+            envelope,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["resolved_plan"] == plan
+    assert captured["resolve_kwargs"]["live"] is True
+    assert captured["resolve_kwargs"]["semantic_candidate"] is True
+    fallback = captured["fallback"]
+    assert isinstance(fallback, CalendarActionPlan)
+    assert fallback.event_reference == "KBA_TEST_CALENDAR natural language canary"
+    assert fallback.event_reference_date == "2026-07-22"
+    direct_input = str(captured["direct_input"])
+    assert "KBA_TEST_CALENDAR natural language canary" in direct_input
+    assert "Move this event to 4:10 PM" in direct_input
+    assert "Linked WorkItem: wi_stale_calendar_plan" not in direct_input
+    assert captured["direct_kwargs"]["live"] is True
+    assert captured["direct_kwargs"]["openai_requests"] == 2
+
+
+def test_continuation_provider_affinity_fills_only_unspecified_provider() -> None:
+    plan = infer_manual_request_plan(
+        "What date is the UT Course Orientation Session?",
+        requested_agent="chief_of_staff",
+    ).model_copy(
+        update={
+            "source": "llm",
+            "target_agent": "chief_of_staff",
+            "intent": "context_lookup",
+            "provider_system": "unspecified",
+        }
+    )
+    preflight = cli.OrchestratorPreflight(
+        request_text="What date is the UT Course Orientation Session?",
+        requested_agent="chief_of_staff",
+        advisory_only=True,
+        selected_agent="chief_of_staff",
+        execution_allowed=True,
+        manual_request_plan=plan,
+        route_result=cli.route_request(
+            "What date is the UT Course Orientation Session?",
+            manual_plan=plan,
+        ),
+    )
+
+    resolved = cli._apply_continuation_provider_affinity(preflight, "calendar")
+
+    assert resolved.manual_request_plan.provider_system == "google_calendar"
+    assert resolved.manual_request_plan.target_agent == "chief_of_staff"
+    assert resolved.manual_request_plan.intent == "context_lookup"
+
+    explicit_gmail = preflight.model_copy(
+        update={
+            "manual_request_plan": plan.model_copy(
+                update={"provider_system": "gmail"}
+            )
+        }
+    )
+    unchanged = cli._apply_continuation_provider_affinity(
+        explicit_gmail,
+        "calendar",
+    )
+    assert unchanged.manual_request_plan.provider_system == "gmail"
+
+
+def test_bounded_provider_plan_uses_provider_budget_not_manager_graph_budget() -> None:
+    request = "What date is the UT Course Orientation Session?"
+    plan = infer_manual_request_plan(
+        request,
+        requested_agent="chief_of_staff",
+    ).model_copy(
+        update={
+            "source": "llm",
+            "target_agent": "chief_of_staff",
+            "intent": "context_lookup",
+            "provider_system": "google_calendar",
+            "requires_live_search": False,
+            "workflow": [],
+        }
+    )
+    args = SimpleNamespace(
+        context_file="",
+        agent=None,
+        max_manager_steps=3,
+        live_search=False,
+    )
+
+    estimate = cli._estimate_ask_openai_requests(
+        args,
+        input_text=request,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="chief_of_staff",
+        manual_plan=plan,
+        effective_live_search=False,
+    )
+
+    assert estimate["max"] == 3
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "google_calendar_bounded_provider_sdk",
+    ]
+
+
+def test_live_provider_plan_cannot_be_downgraded_to_tool_free_response() -> None:
+    request = (
+        'Using only the relevant message, find the Gmail email titled "Example" '
+        "and tell me what it says."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="gmail_triage",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        provider_system="gmail",
+        provider_operations=["read"],
+        primary_target="Example",
+        target_type="gmail_thread",
+    )
+
+    assert (
+        cli._should_run_direct_supplied_response(
+            request,
+            requested_route="gmail_triage",
+            manual_plan=plan,
+        )
+        is False
+    )
+
+
+def test_live_local_attachment_plan_does_not_admit_unneeded_provider_tools() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="airtable",
+        provider_operations=["read"],
+        primary_target="receipt details from attached image",
+        target_type="local_document_collection",
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            source_type_preference=["attached local file image"],
+            permission_state="read_only",
+        ),
+    )
+
+    assert (
+        cli._should_run_direct_supplied_response(
+            "Read the attached receipt and report four fields.",
+            requested_route="chief_of_staff",
+            manual_plan=plan,
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Turn these supplied facts into a concise answer.",
+        "Please synthesize the material I pasted into a short note.",
+        "What is the clearest takeaway from the information above?",
+    ],
+)
+def test_live_provider_free_plan_uses_same_tool_free_path_across_phrasings(
+    request_text: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="business_research_analyst",
+        target_agent="business_research_analyst",
+        intent="route_request",
+        task_objective="route_or_continue",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_live_search=False,
+        requires_durable_state=False,
+        requires_approved_context=False,
+    )
+
+    assert (
+        cli._should_run_direct_supplied_response(
+            request_text,
+            requested_route="business_research_analyst",
+            manual_plan=plan,
+        )
+        is True
+    )
+
+
+def test_calendar_followup_planner_fallback_dispatches_chief_within_budget(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context_file = tmp_path / "slack-calendar-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.message_context.v1",
+                "team_id": "T123",
+                "channel_id": "C123",
+                "thread_ts": "1784563046.670369",
+                "request_ts": "1784567539.798959",
+                "read_context": "Calendar thread context.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    request = "\n".join(
+        [
+            "business agents continue this prior Slack thread.",
+            (
+                "Current user request (authoritative): "
+                "What date is the UT Course Orientation Session?"
+            ),
+            "Provider affinity: calendar",
+            "Previous request: Add the UT Course Orientation Session to my calendar.",
+            "Previous result title: Business Agents WorkItem Failed",
+            "Previous result: The prior run failed before provider execution.",
+            "User follow-up: What date is the UT Course Orientation Session?",
+            "Continue the same agent task.",
+        ]
+    )
+    original_preflight = cli.run_orchestrator_preflight
+    dispatched: dict[str, object] = {}
+
+    def fallback_preflight(request_text, **kwargs):
+        kwargs["live_manual_plan"] = False
+        return original_preflight(request_text, **kwargs)
+
+    def capture_specialist(route, input_text, **kwargs):
+        dispatched.update(
+            {
+                "route": route,
+                "input_text": input_text,
+                "manual_plan": kwargs["manual_plan"],
+            }
+        )
+        return 0
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fallback_preflight)
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", capture_specialist)
+
+    exit_code = main(
+        [
+            "ask",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'fallback.db'}",
+            "--context-file",
+            str(context_file),
+            "--live-sdk",
+            "--max-openai-requests",
+            "8",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    assert dispatched["route"] == "chief_of_staff"
+    plan = dispatched["manual_plan"]
+    assert isinstance(plan, ManualRequestPlan)
+    assert plan.intent == "context_lookup"
+    assert plan.provider_system == "google_calendar"
+    assert plan.workflow == []
 
 
 def test_chief_calendar_natural_update_dry_run_previews_lookup_without_write(
@@ -3555,7 +4257,7 @@ def test_cli_ask_agent_override_auto_live_sdk_in_live_mode(
     assert "--compact-instructions" in calls[0]
 
 
-def test_cli_live_finance_receipt_write_skips_live_manual_planner(
+def test_cli_live_finance_receipt_write_uses_shared_live_manual_planner(
     monkeypatch,
     capsys,
 ) -> None:
@@ -3615,7 +4317,7 @@ def test_cli_live_finance_receipt_write_skips_live_manual_planner(
     )
 
     assert exit_code == 0
-    assert captured["live_manual_plan"] is False
+    assert captured["live_manual_plan"] is True
     assert captured["route"] == "airtable_context_agent"
     assert "example-business-cards-receipt.pdf" in str(captured["input_text"])
     plan = captured["manual_plan"]
@@ -4247,8 +4949,8 @@ def test_direct_airtable_receipt_live_prompt_includes_selected_attachment(
     tmp_path,
 ) -> None:
     captured: dict[str, object] = {}
-    receipt = tmp_path / "Receipt-example.pdf"
-    receipt.write_bytes(b"%PDF-1.4\n% bounded test receipt\n")
+    receipt = tmp_path / "Receipt-example.png"
+    receipt.write_bytes(b"\x89PNG\r\n\x1a\nbounded test receipt")
     request = "add this attached receipt as exactly one personal expense in Airtable"
     plan = infer_manual_request_plan(request, requested_agent="airtable_context_agent")
 
@@ -4284,8 +4986,20 @@ def test_direct_airtable_receipt_live_prompt_includes_selected_attachment(
 
     assert exit_code == 0
     json.loads(capsys.readouterr().out)
-    assert str(receipt) in str(captured["prompt"])
-    assert "airtable_target_table" in str(captured["prompt"])
+    prompt = captured["prompt"]
+    assert isinstance(prompt, list)
+    content = prompt[0]["content"]
+    assert any(
+        part.get("type") == "input_text"
+        and str(receipt) in str(part.get("text") or "")
+        for part in content
+    )
+    assert any(
+        part.get("type") == "input_image"
+        and str(part.get("image_url") or "").startswith("data:image/png;base64,")
+        for part in content
+    )
+    assert "airtable_target_table" in str(prompt)
     assert captured["tool_names"] == {"airtable_create_expense_from_receipt"}
 
 
@@ -7578,7 +8292,7 @@ def test_cli_ask_kni_explicit_agent_auto_live_sdk_in_live_mode(
         **kwargs,
     ):
         assert requested_agent == "opportunity_scout"
-        assert live_manual_plan is False
+        assert live_manual_plan is True
         return _fake_orchestrator_preflight(
             request_text,
             requested_agent=requested_agent,
@@ -7750,8 +8464,8 @@ def test_cli_ask_explicit_chief_of_staff_runs_orchestrator_preflight_advise_only
     assert payload["orchestrator_preflight"]["route_result"]["route"] == "chief_of_staff"
     assert calls
     assert "scripts/run_chief_of_staff.py" in calls[0]
-    assert "--live-search" in calls[0]
-    assert "--live-search-plan" in calls[0]
+    assert "--live-search" not in calls[0]
+    assert "--live-search-plan" not in calls[0]
     assert child_envs
     assert ORCHESTRATOR_PREFLIGHT_ENV in child_envs[0]
     assert MANUAL_REQUEST_PLAN_ENV in child_envs[0]
@@ -8211,7 +8925,7 @@ def test_bounded_connector_graph_fits_eight_request_ceiling_and_disables_web_sea
     ]
 
 
-def test_direct_opportunity_scout_skips_redundant_live_manual_plan() -> None:
+def test_direct_opportunity_scout_uses_shared_live_manual_plan() -> None:
     request = (
         "Find current remote-accessible opportunities relevant to Keystone across "
         "conferences, workshops, certifications, grants, collaborations, consulting, "
@@ -8227,16 +8941,19 @@ def test_direct_opportunity_scout_skips_redundant_live_manual_plan() -> None:
     assert cli._skip_live_manual_plan_for_request(
         request,
         requested_route="opportunity_scout",
-    ) is True
+    ) is False
     estimate = cli._estimate_ask_openai_requests(
         args,
         input_text=request,
         live_sdk=True,
-        live_manual_plan=False,
+        live_manual_plan=True,
     )
 
-    assert estimate["max"] == 2
-    assert estimate["stages"] == ["opportunity_scout_direct_sdk"]
+    assert estimate["max"] == 3
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "opportunity_scout_direct_sdk",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -8303,12 +9020,12 @@ def test_bounded_direct_specialists_use_compact_request_estimate(
         requested_route=route,
     )
 
-    assert skips_live_planner is (route == "opportunity_scout")
+    assert skips_live_planner is False
     conditional_repair = "words" in request_text
-    assert estimate["max"] == (2 if skips_live_planner else 3) + int(conditional_repair)
-    assert estimate["min"] == (1 if skips_live_planner else 2)
+    assert estimate["max"] == 3 + int(conditional_repair)
+    assert estimate["min"] == 2
     assert estimate["stages"] == [
-        *([] if skips_live_planner else ["manual_request_planner"]),
+        "manual_request_planner",
         f"{route}_direct_sdk",
         *(["conditional_instruction_following_repair"] if conditional_repair else []),
     ]
@@ -9972,18 +10689,21 @@ def test_simple_chief_airtable_receipt_uses_direct_context_agent_budget() -> Non
         args,
         input_text=request,
         live_sdk=True,
-        live_manual_plan=False,
+        live_manual_plan=True,
         requested_route="chief_of_staff",
     )
 
     assert plan.target_agent == "airtable_context_agent"
     assert plan.intent == "business_system_write"
-    assert estimate["max"] == 2
-    assert estimate["stages"] == ["airtable_context_agent_direct_sdk"]
+    assert estimate["max"] == 3
+    assert estimate["stages"] == [
+        "manual_request_planner",
+        "airtable_context_agent_direct_sdk",
+    ]
     assert cli._skip_live_manual_plan_for_request(
         request,
         requested_route="airtable_context_agent",
-    ) is True
+    ) is False
 
 
 @pytest.mark.parametrize(

@@ -96,7 +96,7 @@ STATIC_PREFIX_FINGERPRINTS = {
         "output_schema_sha256": "98f0e154658a465df86c498fbf9b1a6c84028fbd02eedef97d1549ef5b5887e7",
     },
     "chief_of_staff": {
-        "instructions_sha256": "77945a69bc9131be7f61c5a2a30e041c963c3a318c9afd4066fe1407e6113b30",
+        "instructions_sha256": "19355cfb1099a324d5449824886488c9c2e231cd7ac960fe4425e7fd2556954b",
         "tool_names_sha256": "5d10d910810cfa07005226805bbaf378f7420af4d3133d8d88d9db8667f804ff",
         "output_schema_sha256": "c172f11e63550cf751d67a22c72020c661cf35d7a9f6b118274dd7ffdea1e5b9",
     },

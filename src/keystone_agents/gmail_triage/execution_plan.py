@@ -3,10 +3,173 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from keystone_agents.schemas.gmail_execution_plan import GmailExecutionPlan
+
+
+def resolve_gmail_execution_plan(
+    request_text: str | None,
+    *,
+    manual_plan: object | None = None,
+    source: str = "heuristic",
+) -> GmailExecutionPlan:
+    """Use the LLM semantic plan when available, otherwise use local fallback."""
+
+    plan = _manual_plan_mapping(manual_plan)
+    if str(plan.get("source") or "") != "llm":
+        return infer_gmail_execution_plan(request_text, source=source)
+    if (
+        str(plan.get("provider_system") or "") != "gmail"
+        and str(plan.get("target_agent") or "") != "gmail_triage"
+        and "gmail_triage" not in (plan.get("workflow") or [])
+    ):
+        return infer_gmail_execution_plan(request_text, source=source)
+    return _gmail_execution_plan_from_semantic_plan(plan)
+
+
+def _gmail_execution_plan_from_semantic_plan(
+    plan: Mapping[str, object],
+) -> GmailExecutionPlan:
+    operations = [
+        str(item or "").strip().lower()
+        for item in (plan.get("provider_operations") or [])
+        if str(item or "").strip()
+    ]
+    workflow = [
+        str(item or "").strip()
+        for item in (plan.get("workflow") or [])
+        if str(item or "").strip()
+    ]
+    ask_shape = plan.get("ask_shape")
+    ask_shape_mapping = ask_shape if isinstance(ask_shape, Mapping) else {}
+    selected_context = (
+        str(ask_shape_mapping.get("prior_context_dependency") or "")
+        == "selected_context"
+    )
+    lookback_days = _bounded_int(plan.get("lookback_days"), default=3, lower=1, upper=365)
+    desired_count = _bounded_int(plan.get("desired_count"), default=1, lower=1, upper=50)
+    query = str(plan.get("gmail_query") or "").strip()
+    primary_target = str(plan.get("primary_target") or "").strip()
+    recipient = str(plan.get("recipient") or "").strip()
+    target_type = str(plan.get("target_type") or "")
+    expected_artifact = str(plan.get("expected_artifact_type") or "")
+    draft_policy = str(plan.get("draft_policy") or "")
+    task_objective = str(plan.get("task_objective") or "")
+
+    common = {
+        "source": "llm_manual_plan",
+        "lookback_days": lookback_days,
+        "gmail_query": query,
+        "live_read_required": not selected_context,
+        "rationale": (
+            "Derived from the LLM semantic plan; raw request wording does not "
+            "reclassify the Gmail operation."
+        ),
+    }
+    if "update" in operations:
+        return GmailExecutionPlan(
+            **common,
+            operation="update_draft",
+            max_messages=1,
+            source_label="DRAFT",
+            draft_subject_hint=primary_target,
+            draft_recipient_hint=recipient,
+            create_gmail_drafts=True,
+            draft_replies_in_output=True,
+            candidate_helpers=["gmail_draft_read", "gmail_draft_update"],
+            artifact_policy="update_verified_gmail_draft",
+            side_effect_policy="scoped_gmail_draft_write_no_send",
+        )
+    if "create" in operations:
+        return GmailExecutionPlan(
+            **common,
+            operation="draft_reply",
+            read_scope="thread" if target_type == "gmail_thread" else "message",
+            max_messages=1,
+            source_label="INBOX",
+            create_gmail_drafts=True,
+            draft_replies_in_output=True,
+            candidate_helpers=[
+                "gmail_single_message_read",
+                "gmail_triage_sdk",
+                "gmail_verified_reply_draft_create",
+            ],
+            artifact_policy="create_verified_gmail_draft",
+            side_effect_policy="scoped_gmail_draft_write_no_send",
+        )
+    if (
+        expected_artifact == "outreach_draft"
+        or draft_policy not in {"", "no_drafts_requested"}
+        or "outreach_composer" in workflow
+    ):
+        return GmailExecutionPlan(
+            **common,
+            operation="draft_reply",
+            read_scope="thread" if target_type == "gmail_thread" else "message",
+            max_messages=1,
+            source_label="INBOX",
+            create_gmail_drafts=False,
+            draft_replies_in_output=True,
+            candidate_helpers=["gmail_single_message_read", "gmail_triage_sdk"],
+            artifact_policy="draft_text_in_output",
+            side_effect_policy="read_only_or_draft_only",
+        )
+    if desired_count > 1:
+        return GmailExecutionPlan(
+            **common,
+            operation="priority_grouping",
+            max_messages=desired_count,
+            source_label="INBOX",
+            candidate_helpers=[
+                "gmail_search_summaries",
+                "gmail_batch_message_read",
+                "gmail_thread_expansion_when_needed",
+                "gmail_priority_grouping_sdk",
+            ],
+        )
+    if target_type == "gmail_thread" and task_objective == "gmail_triage":
+        return GmailExecutionPlan(
+            **common,
+            operation="thread_summary",
+            read_scope="thread",
+            max_messages=1,
+            source_label="INBOX",
+            candidate_helpers=["gmail_thread_summary"],
+        )
+    return GmailExecutionPlan(
+        **common,
+        operation="single_message_triage",
+        read_scope="message",
+        max_messages=desired_count,
+        source_label="INBOX" if not selected_context else "inline_context",
+        candidate_helpers=[
+            "gmail_message_triage"
+            if selected_context
+            else "gmail_single_message_read",
+            "gmail_triage_sdk",
+        ],
+    )
+
+
+def _manual_plan_mapping(value: object | None) -> Mapping[str, object]:
+    if isinstance(value, Mapping):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        payload = model_dump(mode="python")
+        if isinstance(payload, Mapping):
+            return payload
+    return {}
+
+
+def _bounded_int(value: object, *, default: int, lower: int, upper: int) -> int:
+    try:
+        return max(lower, min(upper, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 def infer_gmail_execution_plan(

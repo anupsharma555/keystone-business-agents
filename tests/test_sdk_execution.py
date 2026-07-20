@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sys
@@ -1182,6 +1183,93 @@ def test_run_typed_sdk_agent_retries_live_structured_output_once_without_session
     assert result.output.summary == "Recovered with valid structured output."
     assert result.request_cache["structured_output_retries"] == 1
     assert result.request_cache["structured_output_retry_session_reset"] is True
+
+
+def test_run_typed_sdk_agent_preserves_write_receipt_across_structured_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class ModelBehaviorError(Exception):
+        pass
+
+    async def invoke_update(_context: Any, _tool_input: str) -> str:
+        return json.dumps(
+            {
+                "status": "success",
+                "operation": "update_calendar_event",
+                "event_id": "event-1",
+                "title": "KBA_TEST_CALENDAR natural language canary",
+                "verification": {"passed": True},
+            }
+        )
+
+    tool = SimpleNamespace(
+        name="update_google_calendar_event",
+        on_invoke_tool=invoke_update,
+        is_enabled=True,
+    )
+
+    class FakeAgent:
+        name = "chief_of_staff"
+        model = "gpt-test"
+        tools = [tool]
+
+    def fake_run_typed_sdk_sync(
+        agent: Any,
+        prompt: Any,
+        _output_type: Any,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], ChiefOfStaffResult]:
+        calls.append(
+            {
+                "prompt": prompt,
+                "session": kwargs.get("session"),
+                "write_tool_enabled": agent.tools[0].is_enabled,
+            }
+        )
+        if len(calls) == 1:
+            asyncio.run(agent.tools[0].on_invoke_tool(None, "{}"))
+            raise ModelBehaviorError("structured output did not match the schema")
+        return (
+            {"fake": True},
+            ChiefOfStaffResult(
+                mode="llm",
+                summary="The existing event was updated and verified.",
+                audit_notes=[],
+            ),
+        )
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(
+        "keystone_agents.run.enforce_agent_run_budget",
+        lambda **_kwargs: {"enforced": False},
+    )
+
+    result = run_typed_sdk_agent(
+        agent=FakeAgent(),
+        typed_input={"request": "Move the event to 4:20 PM."},
+        output_type=ChiefOfStaffResult,
+        live=True,
+        config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+        session=object(),
+    )
+
+    assert calls[0]["write_tool_enabled"] is True
+    assert calls[1]["write_tool_enabled"] is False
+    assert calls[1]["session"] is None
+    assert "Do not repeat any mutation" in str(calls[1]["prompt"])
+    assert result.tool_receipts == [
+        {
+            "event_id": "event-1",
+            "operation": "update_calendar_event",
+            "status": "success",
+            "title": "KBA_TEST_CALENDAR natural language canary",
+            "tool_name": "update_google_calendar_event",
+            "verification": {"passed": True},
+        }
+    ]
+    assert tool.is_enabled is True
 
 
 def test_run_typed_sdk_agent_preserves_explicit_local_pdf_and_image_inputs(

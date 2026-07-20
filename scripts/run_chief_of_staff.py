@@ -8,7 +8,9 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from keystone_agents.agents.chief_of_staff import (
     chief_of_staff_should_use_specialist_tools,
@@ -19,13 +21,14 @@ from keystone_agents.agents.chief_of_staff import (
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
 from keystone_agents.agents.orchestrator import review_specialist_output, run_orchestrator_preflight
 from keystone_agents.agents.web_query_planner import resolve_web_query_plan
-from keystone_agents.calendar_actions import infer_calendar_action_plan
 from keystone_agents.cli import execute_direct_calendar_action
 from keystone_agents.cli_sdk import add_sdk_session_arguments, sdk_session_from_args
 from keystone_agents.config import load_settings
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.execution_request import attach_execution_public_result
-from keystone_agents.finance_expense_receipts import infer_finance_expense_receipt_target
+from keystone_agents.finance_expense_receipts import (
+    resolve_finance_expense_receipt_target,
+)
 from keystone_agents.local_kni_evidence import (
     build_local_kni_evidence_packet,
     build_local_kni_evidence_packet_for_query,
@@ -34,9 +37,7 @@ from keystone_agents.local_kni_evidence import (
     looks_like_local_kni_evidence_lookup,
 )
 from keystone_agents.manual_request import (
-    looks_like_supplied_context_synthesis_request,
     positive_capability_text,
-    provider_tool_action_bound,
     request_forbids_live_research,
 )
 from keystone_agents.model_provider import get_runtime_agent_model_config
@@ -48,14 +49,24 @@ from keystone_agents.orchestrator.preflight_context import (
     load_orchestrator_preflight_from_env,
     load_specialist_execution_context_from_env,
 )
+from keystone_agents.provider_side_effect_policy import (
+    semantic_provider_side_effect_policy,
+)
 from keystone_agents.quality_budget import AgentQualityBudget, chief_of_staff_quality_budget
 from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
     ChiefOfStaffSourceRef,
 )
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.source_layer_context import runtime_source_layer_policy_context
 from keystone_agents.storage.sqlite_store import redact_secrets
+from keystone_agents.tools.google_calendar_tool import (
+    DEFAULT_CALENDAR_TIMEZONE,
+    GOOGLE_CALENDAR_TIMEZONE_ENV,
+    read_google_calendar_window_impl,
+    resolve_google_calendar_event_impl,
+)
 from keystone_agents.visible_sources import append_visible_source_urls_to_output
 
 
@@ -143,26 +154,21 @@ def _requests_calendar_write(
 ) -> bool:
     """Bind a semantically interpreted Calendar request to Calendar tools only."""
 
-    local_plan = infer_calendar_action_plan(input_text)
-    if local_plan is not None and local_plan.operation in {"create", "update", "delete"}:
-        return True
-    if str(getattr(manual_request_plan, "intent", "") or "") != "business_system_write":
-        return False
-    semantic_context = " ".join(
-        [
-            str(getattr(manual_request_plan, "objective", "") or ""),
-            str(getattr(manual_request_plan, "primary_target", "") or ""),
-            str(getattr(manual_request_plan, "rationale", "") or ""),
-            " ".join(getattr(manual_request_plan, "constraints", []) or []),
-        ]
+    return bool(
+        str(getattr(manual_request_plan, "provider_system", "") or "")
+        == "google_calendar"
+        and str(getattr(manual_request_plan, "intent", "") or "")
+        == "business_system_write"
     )
-    return bool(re.search(r"\b(?:google\s+calendar|calendar\s+event)\b", semantic_context, re.I))
 
 
 def _live_side_effect_policy(
     input_text: str,
     manual_request_plan: object | None = None,
 ) -> str:
+    semantic_policy = semantic_provider_side_effect_policy(manual_request_plan)
+    if semantic_policy is not None:
+        return semantic_policy
     if _requests_calendar_write(input_text, manual_request_plan):
         return (
             "The authenticated operator requested one exact Google Calendar action. "
@@ -307,43 +313,18 @@ def _request_forbids_live_web_research(input_text: str) -> bool:
     return request_forbids_live_research(input_text)
 
 
-def _chief_tool_scope_text(input_text: str) -> str:
-    """Exclude Slack continuation boilerplate from provider-tool admission."""
-
-    text = str(input_text or "")
-    previous = re.search(
-        r"\bPrevious request:\s*(.*?)\s+Previous result title:",
-        text,
-        flags=re.I | re.S,
-    )
-    current = re.search(
-        r"\b(?:Current user request \(authoritative\)|User follow-up):\s*(.*?)"
-        r"(?:\s+Previous request:|\s+Continue the same agent task|\Z)",
-        text,
-        flags=re.I | re.S,
-    )
-    scoped = " ".join(
-        part
-        for part in (
-            previous.group(1).strip() if previous else "",
-            current.group(1).strip() if current else "",
-        )
-        if part
-    )
-    return scoped or text
-
-
 def _chief_of_staff_should_attach_tools(
     input_text: str,
     manual_plan: object | None = None,
 ) -> bool:
-    """Attach tools only for semantically supported research or bound system work."""
+    """Attach the narrow tool set selected by the semantic plan.
 
-    tool_scope_text = _chief_tool_scope_text(input_text)
-    if looks_like_supplied_context_synthesis_request(tool_scope_text):
-        return False
-    if provider_tool_action_bound(tool_scope_text):
-        return True
+    Provider words, supplied examples, and historical thread text cannot attach
+    tools by themselves. A planner-unavailable Chief run remains provider-free
+    rather than guessing from phrases.
+    """
+
+    del input_text
     if manual_plan is None:
         return False
     tool_backed_intents = {
@@ -360,6 +341,9 @@ def _chief_of_staff_should_attach_tools(
     }
     return bool(
         getattr(manual_plan, "requires_live_search", False)
+        or str(getattr(manual_plan, "provider_system", "") or "")
+        != "unspecified"
+        or list(getattr(manual_plan, "provider_operations", []) or [])
         or str(getattr(manual_plan, "intent", "") or "") in tool_backed_intents
         or str(getattr(manual_plan, "task_objective", "") or "") in tool_backed_intents
         or list(getattr(manual_plan, "workflow", []) or [])
@@ -378,7 +362,15 @@ def _chief_web_query_plan_subject(input_text: str, manual_plan: object | None) -
 
 
 def _chief_should_build_web_query_plan(input_text: str, manual_plan: object | None) -> bool:
-    if infer_finance_expense_receipt_target(input_text) is not None:
+    if str(getattr(manual_plan, "provider_system", "") or "") != "unspecified":
+        return False
+    if (
+        resolve_finance_expense_receipt_target(
+            input_text,
+            manual_plan=manual_plan,
+        )
+        is not None
+    ):
         return False
     blocked_plan_values = {
         "business_system_write",
@@ -569,6 +561,248 @@ def _chief_of_staff_human_summary(
     return f"{summary}\n\n{synthesis}"
 
 
+def _normalized_calendar_title(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _calendar_title_tokens(value: object) -> set[str]:
+    return {
+        token
+        for token in _normalized_calendar_title(value).split()
+        if len(token) > 1 and token not in {"the", "and", "for", "with"}
+    }
+
+
+def _calendar_event_when(event: dict[str, object]) -> str:
+    start = str(event.get("start") or event.get("start_date") or "").strip()
+    if not start:
+        return ""
+    date_text = start[:10]
+    if "T" not in start:
+        return f" on {date_text}"
+    try:
+        parsed = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        time_text = parsed.strftime("%-I:%M %p")
+    except ValueError:
+        time_text = start[11:16]
+    return f" on {date_text} at {time_text}"
+
+
+def _calendar_provider_human_summary(
+    *,
+    manual_request_plan: object,
+    receipts: list[dict[str, object]],
+    fallback: str,
+) -> str:
+    """Render provider truth for Calendar without exposing IDs or workflow prose."""
+
+    intent = str(getattr(manual_request_plan, "intent", "") or "")
+    successful = [
+        receipt
+        for receipt in receipts
+        if receipt.get("status") in {"success", "not_found", "ambiguous"}
+        and str(receipt.get("operation") or "").startswith(
+            (
+                "read_calendar",
+                "resolve_calendar",
+                "create_calendar",
+                "update_calendar",
+                "delete_calendar",
+            )
+        )
+    ]
+    if intent == "business_system_write":
+        verified_writes = [
+            receipt
+            for receipt in successful
+            if str(receipt.get("operation") or "").startswith(
+                ("create_calendar", "update_calendar", "delete_calendar")
+            )
+            and isinstance(receipt.get("verification"), dict)
+            and receipt["verification"].get("passed") is True
+        ]
+        if not verified_writes:
+            return fallback
+        receipt = verified_writes[-1]
+        operation = str(receipt.get("operation") or "")
+        verb = (
+            "created"
+            if operation.startswith("create")
+            else "updated"
+            if operation.startswith("update")
+            else "deleted"
+        )
+        title = str(receipt.get("title") or "").strip() or str(
+            getattr(manual_request_plan, "primary_target", "") or ""
+        ).strip()
+        when = _calendar_event_when(receipt)
+        return f'Google Calendar event {verb} and verified: "{title}"{when}.'
+
+    resolved_reads = [
+        receipt
+        for receipt in successful
+        if str(receipt.get("operation") or "").startswith("resolve_calendar")
+    ]
+    if resolved_reads:
+        receipt = resolved_reads[-1]
+        target = str(receipt.get("event_reference") or "").strip() or str(
+            getattr(manual_request_plan, "primary_target", "") or ""
+        ).strip()
+        status = str(receipt.get("status") or "")
+        if status == "not_found":
+            return f'No - I did not find an active event matching "{target}" in Google Calendar.'
+        if status == "ambiguous":
+            return (
+                f'I found multiple active events matching "{target}" in Google Calendar. '
+                "Give me a date or one more title detail and I can identify the right one."
+            )
+        title = str(receipt.get("title") or target).strip()
+        return f'Yes - "{title}" is on your Google Calendar{_calendar_event_when(receipt)}.'
+
+    reads = [
+        receipt
+        for receipt in successful
+        if str(receipt.get("operation") or "").startswith("read_calendar")
+    ]
+    if not reads:
+        return fallback
+    receipt = reads[-1]
+    events = [
+        event
+        for event in list(receipt.get("events") or [])
+        if isinstance(event, dict)
+    ]
+    required_entities = [
+        str(item or "").strip()
+        for item in list(getattr(manual_request_plan, "required_entities", []) or [])
+        if str(item or "").strip()
+    ]
+    target = (
+        required_entities[0]
+        if required_entities
+        else str(getattr(manual_request_plan, "primary_target", "") or "").strip()
+    )
+    normalized_target = _normalized_calendar_title(target)
+    if not normalized_target:
+        return fallback or f"I checked Google Calendar and found {len(events)} active events."
+    exact_matches = [
+        event
+        for event in events
+        if _normalized_calendar_title(event.get("title")) == normalized_target
+    ]
+    matches = exact_matches or [
+        event
+        for event in events
+        if normalized_target in _normalized_calendar_title(event.get("title"))
+        or _normalized_calendar_title(event.get("title")) in normalized_target
+    ]
+    target_tokens = _calendar_title_tokens(target)
+    matches = matches or [
+        event
+        for event in events
+        if len(target_tokens) >= 2
+        and target_tokens.issubset(_calendar_title_tokens(event.get("title")))
+    ]
+    if not matches:
+        if not events:
+            return f'No - I did not find an active event named "{target}" in Google Calendar.'
+        # A semantically equivalent renamed event can require model judgment.
+        # Provider execution is verified here; preserve the model's interpretation
+        # rather than converting a non-exact title comparison into a false "No".
+        return fallback
+    event = matches[0]
+    title = str(event.get("title") or target).strip()
+    return f'Yes - "{title}" is on your Google Calendar{_calendar_event_when(event)}.'
+
+
+def _calendar_context_lookup_target(manual_request_plan: object) -> str:
+    """Use model-resolved provider identity without interpreting request phrases."""
+
+    required_entities = [
+        str(item or "").strip()
+        for item in list(getattr(manual_request_plan, "required_entities", []) or [])
+        if str(item or "").strip()
+    ]
+    return (
+        required_entities[0]
+        if required_entities
+        else str(getattr(manual_request_plan, "primary_target", "") or "").strip()
+    )
+
+
+def _explicit_calendar_date(value: object) -> str:
+    """Extract only an explicit calendar date; semantic intent stays model-owned."""
+
+    text = str(value or "")
+    iso_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    if iso_match:
+        try:
+            return datetime.strptime(iso_match.group(1), "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            return ""
+    named_match = re.search(
+        r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+        r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Sept(?:ember)?|"
+        r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+20\d{2}\b",
+        text,
+        flags=re.I,
+    )
+    if not named_match:
+        return ""
+    raw = named_match.group(0)
+    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
+def _execute_required_calendar_context_lookup(
+    manual_request_plan: object,
+    *,
+    input_text: str = "",
+) -> dict[str, object] | None:
+    """Guarantee one typed provider read when semantic planning requires it.
+
+    The LLM owns intent and target interpretation. Python owns execution of the
+    selected read and receipt capture so a model cannot claim it re-checked
+    Calendar after merely reusing prior thread prose.
+    """
+
+    if (
+        str(getattr(manual_request_plan, "provider_system", "") or "")
+        != "google_calendar"
+        or str(getattr(manual_request_plan, "intent", "") or "") != "context_lookup"
+    ):
+        return None
+    target = _calendar_context_lookup_target(manual_request_plan)
+    if not target:
+        return None
+    resolved = resolve_google_calendar_event_impl(
+        target,
+        live=True,
+    )
+    if resolved.get("status") != "not_found":
+        return resolved
+    explicit_date = _explicit_calendar_date(input_text)
+    if not explicit_date:
+        return resolved
+    timezone_name = (
+        os.getenv(GOOGLE_CALENDAR_TIMEZONE_ENV) or DEFAULT_CALENDAR_TIMEZONE
+    )
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        timezone = ZoneInfo(DEFAULT_CALENDAR_TIMEZONE)
+    start = datetime.fromisoformat(explicit_date).replace(tzinfo=timezone)
+    return read_google_calendar_window_impl(
+        start.isoformat(),
+        (start + timedelta(days=1)).isoformat(),
+        live=True,
+    )
+
+
 def _payload(
     *,
     mode: str,
@@ -586,6 +820,7 @@ def _payload(
     request_cache: object | None = None,
     web_query_plan: object | None = None,
     delegated_work_item_result: object | None = None,
+    tool_receipts: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     dumped = output.model_dump(mode="json") if hasattr(output, "model_dump") else output
     human_summary = _chief_of_staff_human_summary(
@@ -602,6 +837,9 @@ def _payload(
         "send_enabled": False,
         "output": dumped,
     }
+    receipts = list(tool_receipts or [])
+    if receipts:
+        payload["tool_receipts"] = receipts
     if human_summary:
         payload["human_summary"] = human_summary
         payload["slack_display_text"] = human_summary
@@ -626,6 +864,66 @@ def _payload(
             if hasattr(delegated_work_item_result, "model_dump")
             else delegated_work_item_result
         )
+    provider_system = str(
+        getattr(manual_request_plan, "provider_system", "") or ""
+    )
+    if provider_system == "google_calendar":
+        intent = str(getattr(manual_request_plan, "intent", "") or "")
+        matching_receipts = [
+            receipt
+            for receipt in receipts
+            if receipt.get("status") in {"success", "not_found", "ambiguous"}
+            if str(receipt.get("operation") or "").startswith(
+                (
+                    "read_calendar",
+                    "resolve_calendar",
+                    "create_calendar",
+                    "update_calendar",
+                    "delete_calendar",
+                )
+            )
+        ]
+        verified = bool(
+            matching_receipts
+            and (
+                intent != "business_system_write"
+                or any(
+                    isinstance(receipt.get("verification"), dict)
+                    and receipt["verification"].get("passed") is True
+                    for receipt in matching_receipts
+                )
+            )
+        )
+        payload["status"] = "done" if verified else "blocked"
+        payload["side_effects"] = {
+            "calendar_write_performed": bool(
+                intent == "business_system_write" and verified
+            ),
+            "email_sent": False,
+            "slack_message_posted": False,
+        }
+        if not verified:
+            failure_text = (
+                "I could not verify the requested Google Calendar "
+                + (
+                    "write from a provider read-back receipt."
+                    if intent == "business_system_write"
+                    else "read from a provider result."
+                )
+            )
+            payload["human_summary"] = failure_text
+            payload["slack_display_text"] = failure_text
+            payload["display_text"] = failure_text
+            payload["block_kind"] = "calendar_provider_verification_required"
+        else:
+            provider_summary = _calendar_provider_human_summary(
+                manual_request_plan=manual_request_plan,
+                receipts=matching_receipts,
+                fallback=human_summary,
+            )
+            payload["human_summary"] = provider_summary
+            payload["slack_display_text"] = provider_summary
+            payload["display_text"] = provider_summary
     if manual_request_plan is not None:
         payload["manual_request_plan"] = (
             manual_request_plan.model_dump(mode="json")
@@ -648,6 +946,75 @@ def _payload(
         )
     attach_execution_public_result(payload)
     return payload
+
+
+def _sdk_tool_receipts(raw_result: object) -> list[dict[str, object]]:
+    """Extract bounded provider receipts from one SDK run for verification."""
+
+    receipts: list[dict[str, object]] = []
+    for item in list(getattr(raw_result, "new_items", []) or []):
+        if str(getattr(item, "type", "")) != "tool_call_output_item":
+            continue
+        raw_output = getattr(item, "output", "")
+        if isinstance(raw_output, str):
+            try:
+                parsed = json.loads(raw_output)
+            except json.JSONDecodeError:
+                continue
+        elif isinstance(raw_output, dict):
+            parsed = raw_output
+        else:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        receipt = {
+            key: parsed.get(key)
+            for key in (
+                "status",
+                "operation",
+                "calendar_id",
+                "event_id",
+                "event_reference",
+                "match_count",
+                "title",
+                "start_date",
+                "start_time",
+                "end_time",
+                "html_link",
+                "provider_link",
+                "events",
+                "time_min",
+                "time_max",
+                "non_recurring_count",
+                "recurring_count",
+                "all_day",
+                "timezone",
+                "description_present",
+                "verification",
+                "send_enabled",
+            )
+            if key in parsed
+        }
+        if receipt:
+            receipts.append(receipt)
+    return receipts
+
+
+def _merge_tool_receipts(
+    *receipt_groups: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Merge SDK-result and execution-journal receipts without duplicating proof."""
+
+    merged: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for group in receipt_groups:
+        for receipt in group:
+            fingerprint = json.dumps(receipt, ensure_ascii=True, sort_keys=True, default=str)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            merged.append(receipt)
+    return merged
 
 
 def _maybe_execute_recommended_work_item_handoff(
@@ -866,6 +1233,48 @@ def _reference_capture_mismatch(input_text: str, output: object) -> bool:
     return any(marker in lowered for marker in question_or_search_markers)
 
 
+def _semantic_reference_capture_mismatch(
+    manual_request_plan: ManualRequestPlan,
+    output: object,
+    *,
+    input_text: str,
+) -> bool:
+    """Use the LLM plan to detect a false reference-capture result."""
+
+    if manual_request_plan.source != "llm":
+        return _reference_capture_mismatch(input_text, output)
+    route = getattr(output, "recommended_route", None)
+    workflow_type = str(getattr(route, "workflow_type", "") or "")
+    return bool(
+        workflow_type == "reference-capture"
+        and manual_request_plan.intent != "reference_capture"
+    )
+
+
+def _with_live_review_diagnostic(output: object, review: object) -> object:
+    """Preserve live output while recording a non-authoritative review failure."""
+
+    model_copy = getattr(output, "model_copy", None)
+    if not callable(model_copy):
+        return output
+    gaps = [
+        str(item).strip()
+        for item in (getattr(review, "observed_gaps", []) or [])
+        if str(item).strip()
+    ][:3]
+    audit_notes = list(getattr(output, "audit_notes", []) or [])
+    note = (
+        "Post-run review flagged possible request/output misalignment, but the "
+        "live model output and provider receipts were preserved instead of being "
+        "replaced by a deterministic fallback."
+    )
+    if gaps:
+        note += " Review gaps: " + " | ".join(gaps)
+    if note not in audit_notes:
+        audit_notes.append(note)
+    return model_copy(update={"audit_notes": audit_notes})
+
+
 def _output_mentions_local_kni_evidence_path(output: object) -> bool:
     values: list[str] = [
         str(getattr(output, "summary", "") or ""),
@@ -947,6 +1356,24 @@ def _with_local_kni_evidence_path_note(output: object, packet: object | None) ->
 
 def _looks_like_local_kni_evidence_lookup(lowered: str) -> bool:
     return looks_like_local_kni_evidence_lookup(lowered)
+
+
+def _manual_plan_requests_local_kni_evidence(
+    manual_plan: ManualRequestPlan | None,
+    *,
+    input_text: str,
+) -> bool:
+    """Let a live semantic plan select local KNI retrieval."""
+
+    if manual_request_plan := manual_plan:
+        if manual_request_plan.source == "llm":
+            return bool(
+                manual_request_plan.target_agent == "chief_of_staff"
+                and manual_request_plan.intent == "context_lookup"
+                and manual_request_plan.target_type == "local_document_collection"
+                and manual_request_plan.provider_system == "unspecified"
+            )
+    return _looks_like_local_kni_evidence_lookup(input_text.lower())
 
 
 def _fallback_after_unrelated_live_output(
@@ -1058,7 +1485,7 @@ def main(argv: list[str] | None = None) -> int:
     orchestrator_preflight = load_orchestrator_preflight_from_env()
     parent_manual_plan = load_manual_request_plan_from_env()
     specialist_execution_context = load_specialist_execution_context_from_env()
-    local_kni_lookup = _looks_like_local_kni_evidence_lookup(input_text.lower())
+    local_kni_lookup = False
     if args.live_sdk:
         load_settings(force_dotenv=True)
         live_web_research_enabled = bool(
@@ -1069,12 +1496,6 @@ def main(argv: list[str] | None = None) -> int:
         sdk_session = _chief_of_staff_session_from_args(args)
         if parent_manual_plan is not None:
             manual_plan = parent_manual_plan
-        elif local_kni_lookup:
-            manual_plan = resolve_manual_request_plan(
-                input_text,
-                requested_agent="chief_of_staff",
-                live=False,
-            )
         else:
             preflight = run_orchestrator_preflight(
                 input_text,
@@ -1086,20 +1507,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             manual_plan = preflight.manual_request_plan
             orchestrator_preflight = compact_orchestrator_preflight_payload(preflight)
-        calendar_plan = infer_calendar_action_plan(input_text)
-        if calendar_plan is not None:
-            return _run_interpreted_calendar_action(
-                input_text=input_text,
-                plan=calendar_plan,
-                json_output=args.json,
-                openai_requests=1,
-            )
+        local_kni_lookup = _manual_plan_requests_local_kni_evidence(
+            manual_plan,
+            input_text=input_text,
+        )
         budget = chief_of_staff_quality_budget(
             args.quality,
             request_text=input_text,
             live_sdk=True,
+            manual_request_plan=manual_plan,
         )
         typed_result = None
+        tool_receipts: list[dict[str, object]] = []
         original_review = None
         local_kni_evidence = None
         web_query_plan = None
@@ -1152,6 +1571,23 @@ def main(argv: list[str] | None = None) -> int:
                     "chief_of_staff"
                 ),
             }
+            if manual_plan.provider_system == "google_calendar":
+                typed_input["provider_execution_contract"] = {
+                    "provider_system": "google_calendar",
+                    "intent": manual_plan.intent,
+                    "primary_target": manual_plan.primary_target,
+                    "execution_required": True,
+                    "live": True,
+                    "approval_reference": typed_input["approval_reference"],
+                    "instruction": (
+                        "Interpret the raw operator request and bounded execution context. "
+                        "For context_lookup, call read_google_calendar_window with live=true "
+                        "over the smallest relevant date window. For business_system_write, "
+                        "call the one required Calendar mutation tool with live=true and the "
+                        "supplied approval_reference. Use provider output for the answer; do "
+                        "not return a plan when the scoped operation can execute."
+                    ),
+                }
             if specialist_execution_context:
                 typed_input["execution_context"] = specialist_execution_context
                 typed_input["execution_context_instruction"] = (
@@ -1183,6 +1619,26 @@ def main(argv: list[str] | None = None) -> int:
                 attach_tools=bool(typed_input["attach_tools"]),
             )
             result = typed_result.output
+            tool_receipts = _merge_tool_receipts(
+                _sdk_tool_receipts(typed_result.raw_result),
+                list(typed_result.tool_receipts or []),
+            )
+            if (
+                manual_plan.provider_system == "google_calendar"
+                and manual_plan.intent == "context_lookup"
+                and not any(
+                    str(receipt.get("operation") or "").startswith(
+                        ("read_calendar", "resolve_calendar")
+                    )
+                    for receipt in tool_receipts
+                )
+            ):
+                required_read = _execute_required_calendar_context_lookup(
+                    manual_plan,
+                    input_text=input_text,
+                )
+                if required_read is not None:
+                    tool_receipts.append(required_read)
             result = append_visible_source_urls_to_output(result)
             result = _with_cost_tracking_note(
                 result,
@@ -1196,21 +1652,33 @@ def main(argv: list[str] | None = None) -> int:
                 run_type="live_sdk",
             )
             local_kni_missing_path = local_kni_lookup and not _output_mentions_local_kni_evidence_path(result)
-            if _review_detected_unrelated_output(review) or (
-                _reference_capture_mismatch(input_text, result) and not local_kni_missing_path
-            ):
+            review_mismatch = bool(
+                _review_detected_unrelated_output(review)
+                or (
+                    _semantic_reference_capture_mismatch(
+                        manual_plan,
+                        result,
+                        input_text=input_text,
+                    )
+                    and not local_kni_missing_path
+                )
+            )
+            if review_mismatch:
                 original_review = review
-                result = _fallback_after_unrelated_live_output(
-                    input_text=input_text,
-                    slack_repo_path=args.slack_repo_path,
-                    database_url=args.database_url,
-                    manual_request_plan=manual_plan,
-                )
-                review = _chief_of_staff_output_review(
-                    input_text=input_text,
-                    output=result,
-                    run_type="deterministic_fallback_after_live_review",
-                )
+                if manual_plan.source == "llm":
+                    result = _with_live_review_diagnostic(result, review)
+                else:
+                    result = _fallback_after_unrelated_live_output(
+                        input_text=input_text,
+                        slack_repo_path=args.slack_repo_path,
+                        database_url=args.database_url,
+                        manual_request_plan=manual_plan,
+                    )
+                    review = _chief_of_staff_output_review(
+                        input_text=input_text,
+                        output=result,
+                        run_type="deterministic_fallback_after_live_review",
+                    )
             elif local_kni_missing_path:
                 result = _with_local_kni_evidence_path_note(result, local_kni_evidence)
                 review = _chief_of_staff_output_review(
@@ -1264,19 +1732,21 @@ def main(argv: list[str] | None = None) -> int:
             request_cache=typed_result.request_cache if typed_result is not None else None,
             web_query_plan=web_query_plan,
             delegated_work_item_result=delegated_result,
+            tool_receipts=tool_receipts,
         )
     else:
         if args.mode != RunMode.DRY_RUN.value:
             raise SystemExit("Only dry-run planning and --live-sdk model planning are supported.")
-        budget = chief_of_staff_quality_budget(
-            args.quality,
-            request_text=input_text,
-            live_sdk=False,
-        )
         manual_plan = parent_manual_plan or resolve_manual_request_plan(
             input_text,
             requested_agent="chief_of_staff",
             live=False,
+        )
+        budget = chief_of_staff_quality_budget(
+            args.quality,
+            request_text=input_text,
+            live_sdk=False,
+            manual_request_plan=manual_plan,
         )
         result = plan_chief_of_staff_request(
             input_text,
@@ -1321,6 +1791,7 @@ def main(argv: list[str] | None = None) -> int:
             orchestrator_preflight=orchestrator_preflight,
             orchestrator_review=review,
             delegated_work_item_result=delegated_result,
+            tool_receipts=[],
         )
 
     if args.json:

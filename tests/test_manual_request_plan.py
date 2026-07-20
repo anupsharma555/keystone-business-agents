@@ -16,7 +16,10 @@ from keystone_agents.agents.manual_request_planner import (
     resolve_manual_request_plan,
 )
 from keystone_agents.agents.orchestrator import route_request, run_orchestrator_preflight
-from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
+from keystone_agents.gmail_triage.execution_plan import (
+    infer_gmail_execution_plan,
+    resolve_gmail_execution_plan,
+)
 from keystone_agents.manual_request import (
     infer_manual_request_plan,
     is_single_owner_gmail_reply_request,
@@ -45,6 +48,64 @@ def test_manual_plan_preserves_exact_source_table_and_no_broadening_shape() -> N
     assert plan.ask_shape.strict_filter_mode == "exact"
     assert plan.ask_shape.output_form == "table"
     assert plan.ask_shape.stop_condition == "return_zero_without_broadening_if_no_exact_match"
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Check my latest email and summarize it.",
+        "What did the newest message say?",
+        "Could you look at the most recent note in my inbox?",
+    ],
+)
+def test_llm_gmail_plan_keeps_equivalent_read_phrasings_on_one_execution_contract(
+    request_text: str,
+) -> None:
+    manual_plan = ManualRequestPlan(
+        source="llm",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        provider_system="gmail",
+        provider_operations=["search", "read"],
+        primary_target="latest inbox message",
+        target_type="gmail_thread",
+        gmail_query="in:inbox",
+        desired_count=1,
+    )
+
+    plan = resolve_gmail_execution_plan(
+        request_text,
+        manual_plan=manual_plan,
+    )
+
+    assert plan.source == "llm_manual_plan"
+    assert plan.operation == "thread_summary"
+    assert plan.gmail_query == "in:inbox"
+    assert plan.live_read_required is True
+
+
+def test_llm_gmail_plan_uses_typed_update_even_without_canonical_update_words() -> None:
+    manual_plan = ManualRequestPlan(
+        source="llm",
+        target_agent="gmail_triage",
+        intent="business_system_write",
+        task_objective="gmail_triage",
+        provider_system="gmail",
+        provider_operations=["read", "update", "verify"],
+        primary_target="Partnership follow-up",
+        target_type="gmail_thread",
+    )
+
+    plan = resolve_gmail_execution_plan(
+        "Please tighten the saved reply and make sure the revision stuck.",
+        manual_plan=manual_plan,
+    )
+
+    assert plan.operation == "update_draft"
+    assert plan.draft_subject_hint == "Partnership follow-up"
+    assert plan.create_gmail_drafts is True
 
 
 def test_manual_plan_preserves_quick_selected_thread_read_only_shape() -> None:
@@ -425,6 +486,8 @@ def test_manual_planner_prompt_includes_bounded_thread_context() -> None:
     assert "Zotero article resolved" in prompt
     assert "Add this link to the notes" in prompt
     assert prompt.index("Operator request:") < prompt.index("Bounded prior thread/work-item")
+    assert "Local fallback plan for reference:" not in prompt
+    assert "local keyword or phrase classifiers" in prompt
 
 
 def test_manual_planner_prompt_flags_marked_lifecycle_for_semantic_normalization() -> None:
@@ -611,6 +674,76 @@ def test_contextual_follow_up_routes_to_source_owner_without_repeating_system_na
     assert plan.target_agent == target_agent
     assert plan.intent == intent
     assert not any("did not contain enough information" in item for item in plan.planner_warnings)
+
+
+@pytest.mark.parametrize(
+    ("provider_affinity", "follow_up", "target_agent", "intent", "provider_system"),
+    [
+        (
+            "calendar",
+            "What date is the UT Course Orientation Session?",
+            "chief_of_staff",
+            "context_lookup",
+            "google_calendar",
+        ),
+        (
+            "airtable",
+            "Which amount was recorded?",
+            "airtable_context_agent",
+            "context_lookup",
+            "airtable",
+        ),
+        (
+            "google_workspace",
+            "What is the document title?",
+            "google_workspace_context_agent",
+            "context_lookup",
+            "google_workspace",
+        ),
+        (
+            "gmail",
+            "What does the sender need?",
+            "gmail_triage",
+            "gmail_triage",
+            "gmail",
+        ),
+        (
+            "zotero",
+            "Who authored the selected paper?",
+            "zotero_context_agent",
+            "context_lookup",
+            "zotero",
+        ),
+    ],
+)
+def test_typed_provider_affinity_routes_fully_named_followup_without_phrase_dependency(
+    provider_affinity: str,
+    follow_up: str,
+    target_agent: str,
+    intent: str,
+    provider_system: str,
+) -> None:
+    plan = resolve_manual_request_plan(
+        follow_up,
+        workflow_state={
+            "execution_continuation": {
+                "provider_affinity": provider_affinity,
+                "prior_request": "Prior provider-owned request",
+            },
+            "recent_slack_thread": [
+                {"summary": "Historical agent output mentioned Gmail and Airtable."}
+            ],
+        },
+    )
+
+    assert plan.target_agent == target_agent
+    assert plan.intent == intent
+    assert plan.provider_system == provider_system
+    assert plan.workflow == []
+    assert not any(
+        "did not contain enough information" in item
+        for item in plan.planner_warnings
+    )
 
 
 def test_current_request_explicit_source_beats_prior_thread_source() -> None:
@@ -1241,7 +1374,7 @@ def test_owner_reconciliation_requires_bounded_slack_operation_evidence() -> Non
     )
 
 
-def test_manual_plan_merge_does_not_treat_provider_in_supplied_fact_as_owner_evidence() -> None:
+def test_llm_plan_is_not_reclassified_from_provider_word_in_supplied_fact() -> None:
     request = (
         "Using only these supplied facts, summarize them in two bullets: Airtable "
         "reads require bounded record identity; provider receipts verify completion."
@@ -1253,8 +1386,9 @@ def test_manual_plan_merge_does_not_treat_provider_in_supplied_fact_as_owner_evi
     candidate = fallback.model_copy(
         update={
             "source": "llm",
-            "target_agent": "airtable_context_agent",
-            "intent": "context_lookup",
+            "target_agent": "business_research_analyst",
+            "intent": "route_request",
+            "provider_system": "unspecified",
         }
     )
 
@@ -1262,7 +1396,7 @@ def test_manual_plan_merge_does_not_treat_provider_in_supplied_fact_as_owner_evi
 
     assert fallback.target_agent == "business_research_analyst"
     assert merged.target_agent == "business_research_analyst"
-    assert any("explicit named-agent request" in item for item in merged.planner_warnings)
+    assert merged.provider_system == "unspecified"
 
 
 @pytest.mark.parametrize(
@@ -1469,7 +1603,7 @@ def test_manual_plan_counts_compare_how_three_products() -> None:
     assert "comparison-format" in plan.constraints
 
 
-def test_manual_plan_preserves_workflow_when_llm_candidate_misreads_company() -> None:
+def test_llm_plan_is_not_vetoed_by_fallback_workflow_recognizer() -> None:
     fallback = infer_manual_request_plan(
         "run one opportunity-to-outreach loop for behavioral health AI. Top 1 only.",
         requested_agent="orchestrator",
@@ -1485,10 +1619,10 @@ def test_manual_plan_preserves_workflow_when_llm_candidate_misreads_company() ->
 
     merged = merge_manual_request_plan(fallback, bad_candidate)
 
-    assert merged.intent == "opportunity_to_outreach_loop"
-    assert merged.target_agent == "opportunity_scout"
-    assert merged.primary_target == "behavioral health AI"
-    assert any("Ignored planner override" in warning for warning in merged.planner_warnings)
+    assert merged.intent == "company_research"
+    assert merged.target_agent == "business_research_analyst"
+    assert merged.primary_target == "AI. Top"
+    assert merged.workflow == []
 
 
 def test_manual_plan_routes_named_specialist_source_operation_to_owner() -> None:
@@ -1848,7 +1982,8 @@ def test_llm_cannot_turn_negated_drafting_boundary_into_outreach_route() -> None
     assert merged.target_agent == "chief_of_staff"
     assert merged.intent == "route_request"
     assert any(
-        "forbidden capability" in warning for warning in merged.planner_warnings
+        "Removed outreach drafting" in warning
+        for warning in merged.planner_warnings
     )
 
 
@@ -1930,10 +2065,7 @@ def test_negative_constraints_cannot_become_blockers_or_prerequisites(
     assert merged.workflow == []
     assert merged.requires_approved_context is False
     assert merged.requires_live_search is False
-    assert any(
-        "workflow blocker" in warning or "forbidden capability" in warning
-        for warning in merged.planner_warnings
-    )
+    assert merged.planner_warnings
 
 
 @pytest.mark.parametrize(
@@ -2171,7 +2303,7 @@ def test_chief_named_airtable_finance_read_delegates_to_context_owner() -> None:
     assert plan.requires_live_search is False
 
 
-def test_manual_plan_rejects_unanchored_context_agent_reroute() -> None:
+def test_llm_intent_owner_contract_repairs_internal_mismatch() -> None:
     fallback = infer_manual_request_plan(
         "Research Acme Health and summarize its clinical AI product.",
         requested_agent="business_research_analyst",
@@ -2183,10 +2315,39 @@ def test_manual_plan_rejects_unanchored_context_agent_reroute() -> None:
     merged = merge_manual_request_plan(fallback, candidate)
 
     assert merged.target_agent == "business_research_analyst"
-    assert any("Ignored planner override" in warning for warning in merged.planner_warnings)
+    assert any(
+        "structured intent/provider contract" in warning
+        for warning in merged.planner_warnings
+    )
 
 
-def test_manual_plan_merge_preserves_explicit_user_scope_over_llm_candidate() -> None:
+def test_llm_local_document_target_selects_chief_without_keyword_match() -> None:
+    request_text = "Who handled our coverage?"
+    fallback = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="business_research_analyst",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="unspecified",
+        provider_operations=["read", "search"],
+        primary_target="KNI company records",
+        target_type="local_document_collection",
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.target_agent == "chief_of_staff"
+    assert merged.intent == "context_lookup"
+    assert merged.target_type == "local_document_collection"
+
+
+def test_live_manual_plan_owns_mailbox_scope_while_no_draft_safety_is_preserved() -> None:
     fallback = infer_manual_request_plan(
         "Summarize my top three unread emails from today and do not draft replies.",
         requested_agent="orchestrator",
@@ -2206,10 +2367,12 @@ def test_manual_plan_merge_preserves_explicit_user_scope_over_llm_candidate() ->
     merged = merge_manual_request_plan(fallback, candidate)
 
     assert merged.target_agent == "gmail_triage"
-    assert merged.desired_count == 3
-    assert merged.lookback_days == 1
-    assert merged.gmail_query.startswith("is:unread after:")
+    assert merged.desired_count == 8
+    assert merged.lookback_days == 7
+    assert merged.gmail_query == "newer_than:7d"
     assert merged.draft_policy == "no_drafts_requested"
+    assert "create" not in merged.provider_operations
+    assert "update" not in merged.provider_operations
     assert "model-added grouping suggestion" in merged.constraints
 
 
@@ -2683,7 +2846,7 @@ def test_manual_plan_bounded_business_research_smoke_ignores_negated_scouting() 
     assert plan.expected_artifact_type == "research_brief"
 
 
-def test_manual_plan_merge_preserves_unnamed_company_discovery_over_live_company_plan() -> None:
+def test_llm_company_plan_is_not_vetoed_by_discovery_keyword_fallback() -> None:
     fallback = infer_manual_request_plan(
         (
             'research analyst "Compare three software-first companies with '
@@ -2713,14 +2876,13 @@ def test_manual_plan_merge_preserves_unnamed_company_discovery_over_live_company
 
     merged = merge_manual_request_plan(fallback, bad_candidate)
 
-    assert merged.target_agent == "opportunity_scout"
-    assert merged.intent == "opportunity_search"
-    assert merged.target_type == "topic"
-    assert merged.required_entities == []
-    assert any("explicit named-agent request" in warning for warning in merged.planner_warnings)
+    assert merged.target_agent == "business_research_analyst"
+    assert merged.intent == "company_research"
+    assert merged.target_type == "company"
+    assert merged.required_entities == bad_candidate.required_entities
 
 
-def test_manual_plan_merge_preserves_explicit_named_agent_when_llm_misroutes() -> None:
+def test_explicit_named_agent_is_advice_not_llm_owner_authority() -> None:
     fallback = infer_manual_request_plan(
         "research NeuroFlow recent partnerships and clinical AI relevance",
         requested_agent="business research analyst",
@@ -2737,13 +2899,12 @@ def test_manual_plan_merge_preserves_explicit_named_agent_when_llm_misroutes() -
     merged = merge_manual_request_plan(fallback, bad_candidate)
 
     assert merged.requested_agent == "business_research_analyst"
-    assert merged.target_agent == "business_research_analyst"
-    assert merged.intent == "company_research"
-    assert merged.primary_target == "NeuroFlow"
-    assert any("explicit named-agent request" in warning for warning in merged.planner_warnings)
+    assert merged.target_agent == "opportunity_scout"
+    assert merged.intent == "opportunity_search"
+    assert merged.primary_target == "NeuroFlow partnerships"
 
 
-def test_manual_plan_merge_preserves_evidence_based_owner_handoff() -> None:
+def test_llm_owner_is_not_replaced_by_fallback_source_keyword_route() -> None:
     fallback = infer_manual_request_plan(
         "Triage my unread Gmail messages from today.",
         requested_agent="opportunity_scout",
@@ -2759,9 +2920,8 @@ def test_manual_plan_merge_preserves_evidence_based_owner_handoff() -> None:
     merged = merge_manual_request_plan(fallback, bad_candidate)
 
     assert merged.requested_agent == "opportunity_scout"
-    assert merged.target_agent == "gmail_triage"
-    assert merged.intent == "gmail_triage"
-    assert any("explicit named-agent request" in warning for warning in merged.planner_warnings)
+    assert merged.target_agent == "opportunity_scout"
+    assert merged.intent == "opportunity_search"
 
 
 @pytest.mark.parametrize(
@@ -2774,7 +2934,7 @@ def test_manual_plan_merge_preserves_evidence_based_owner_handoff() -> None:
         ("chief of staff", "business_research_analyst"),
     ],
 )
-def test_manual_plan_merge_preserves_all_explicit_named_agents(
+def test_llm_owner_can_refine_all_explicit_named_agent_mentions(
     requested_agent: str,
     bad_target: str,
 ) -> None:
@@ -2793,9 +2953,8 @@ def test_manual_plan_merge_preserves_all_explicit_named_agents(
     merged = merge_manual_request_plan(fallback, bad_candidate)
 
     assert merged.requested_agent == fallback.requested_agent
-    assert merged.target_agent == fallback.target_agent
-    assert merged.intent == fallback.intent
-    assert any("explicit named-agent request" in warning for warning in merged.planner_warnings)
+    assert merged.target_agent == bad_target
+    assert merged.intent == bad_candidate.intent
 
 
 def test_manual_plan_maps_business_research_summary_to_source_summary() -> None:
@@ -2827,7 +2986,7 @@ def test_manual_plan_routes_named_research_browser_diagnostics_to_chief_of_staff
     assert plan.requires_live_search is False
 
 
-def test_manual_plan_preserves_browser_diagnostics_when_llm_candidate_misroutes() -> None:
+def test_llm_research_plan_is_not_vetoed_by_browser_keyword_fallback() -> None:
     fallback = infer_manual_request_plan(
         "Use backend browser diagnostics to check https://example.com for console issues.",
         requested_agent="business research analyst",
@@ -2843,10 +3002,9 @@ def test_manual_plan_preserves_browser_diagnostics_when_llm_candidate_misroutes(
 
     merged = merge_manual_request_plan(fallback, bad_candidate)
 
-    assert merged.intent == "browser_diagnostics"
-    assert merged.target_agent == "chief_of_staff"
-    assert merged.target_type == "url"
-    assert any("Ignored planner override" in warning for warning in merged.planner_warnings)
+    assert merged.intent == "company_research"
+    assert merged.target_agent == "business_research_analyst"
+    assert merged.target_type == "company"
 
 
 def test_manual_plan_keeps_research_route_when_browser_diagnostics_are_optional() -> None:
@@ -3261,9 +3419,11 @@ def test_cos_gmail_read_and_paste_copy_rephrase_keeps_one_gmail_owner() -> None:
     candidate = fallback.model_copy(
         update={
             "source": "llm",
-            "target_agent": "chief_of_staff",
+            "target_agent": "gmail_triage",
             "workflow": [],
-            "intent": "route_request",
+            "intent": "gmail_triage",
+            "provider_system": "gmail",
+            "provider_operations": ["read"],
         }
     )
     merged = merge_manual_request_plan(fallback, candidate)
@@ -3296,7 +3456,7 @@ def test_cos_gmail_reply_with_additional_kni_context_is_not_collapsed() -> None:
     )
 
 
-def test_llm_plan_cannot_expand_single_owner_gmail_slack_copy_to_outreach_graph() -> None:
+def test_llm_plan_keeps_gmail_read_and_slack_copy_with_one_owner() -> None:
     request = (
         'CoS, find the Gmail email with subject "Example". Read its complete thread '
         "and draft a response here in this Slack thread so I can copy it. Do not "
@@ -3306,9 +3466,11 @@ def test_llm_plan_cannot_expand_single_owner_gmail_slack_copy_to_outreach_graph(
     candidate = fallback.model_copy(
         update={
             "source": "llm",
-            "target_agent": "chief_of_staff",
-            "workflow": ["gmail_triage", "outreach_composer"],
-            "intent": "route_request",
+            "target_agent": "gmail_triage",
+            "workflow": [],
+            "intent": "gmail_triage",
+            "provider_system": "gmail",
+            "provider_operations": ["read"],
         }
     )
 
@@ -3317,7 +3479,6 @@ def test_llm_plan_cannot_expand_single_owner_gmail_slack_copy_to_outreach_graph(
     assert merged.target_agent == "gmail_triage"
     assert merged.intent == "gmail_triage"
     assert merged.workflow == []
-    assert any("planner override" in warning.lower() for warning in merged.planner_warnings)
 
 
 def test_llm_plan_preserves_only_grounded_multi_deliverable_sections() -> None:
@@ -3416,7 +3577,7 @@ def test_llm_chief_plan_can_collapse_heuristic_graph_for_supplied_context() -> N
     assert merged.requires_approved_context is False
 
 
-def test_resumable_supplied_context_request_preserves_stateful_workflow() -> None:
+def test_resumable_supplied_context_uses_typed_durable_state_not_forced_workflow() -> None:
     request = (
         "CoS, track this as a resumable internal review. Use only these approved "
         "facts: Northstar Care sells referral-navigation software; it has not "
@@ -3442,7 +3603,8 @@ def test_resumable_supplied_context_request_preserves_stateful_workflow() -> Non
     merged = merge_manual_request_plan(fallback, candidate)
 
     assert len(fallback.workflow) > 1
-    assert merged.workflow == fallback.workflow
+    assert merged.workflow == []
+    assert merged.requires_durable_state is True
     assert merged.requires_live_search is False
     assert merged.requires_approved_context is False
     assert merged.ask_shape.output_constraints.required_sections == [
@@ -3485,7 +3647,7 @@ def test_short_human_cos_note_request_stays_direct_and_provider_free() -> None:
     assert looks_like_supplied_context_synthesis_request(request) is True
 
 
-def test_short_human_cos_stateful_review_preserves_three_owner_workflow() -> None:
+def test_short_human_cos_stateful_review_accepts_llm_direct_durable_plan() -> None:
     request = (
         "CoS: Track this review. Northstar Care sells referral-navigation software "
         "but has no audited outcomes. Assess what is supported, choose the first "
@@ -3524,7 +3686,8 @@ def test_short_human_cos_stateful_review_preserves_three_owner_workflow() -> Non
 
     merged = merge_manual_request_plan(plan, candidate)
 
-    assert merged.workflow == plan.workflow
+    assert merged.workflow == []
+    assert merged.requires_durable_state is True
 
 
 def test_no_search_question_without_asserted_facts_is_not_selected_context() -> None:
@@ -3746,6 +3909,25 @@ def test_cli_live_gmail_priority_grouping_uses_agent_execution_plan(
 def test_cli_live_outreach_backend_fixture_request_stops_at_preflight(monkeypatch, capsys) -> None:
     captured: dict[str, list[str]] = {}
 
+    def fake_preflight(request_text: str, **_kwargs: object):
+        plan = infer_manual_request_plan(
+            request_text,
+            requested_agent="outreach_composer",
+        ).model_copy(update={"source": "llm"})
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent="outreach_composer",
+            advisory_only=True,
+            selected_agent="outreach_composer",
+            blocked_by_orchestrator=True,
+            execution_allowed=False,
+            block_kind="approval",
+            block_reason="Outreach drafting requires approved context.",
+            manual_request_plan=plan,
+            route_result=cli.route_request(request_text, manual_plan=plan),
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
     def fake_run(command, **kwargs):
         captured["command"] = list(command)
         return subprocess.CompletedProcess(
@@ -3762,6 +3944,7 @@ def test_cli_live_outreach_backend_fixture_request_stops_at_preflight(monkeypatc
         )
 
     monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
 
     assert (
         cli.main(
@@ -3782,7 +3965,7 @@ def test_cli_live_outreach_backend_fixture_request_stops_at_preflight(monkeypatc
     )
 
     output = json.loads(capsys.readouterr().out)
-    assert output["selected_agent"] == "outreach_composer"
+    assert output["manual_request_plan"]["target_agent"] == "outreach_composer"
     assert output["status"] == "blocked"
     assert output["requires_approved_context"] is True
     assert output["send_enabled"] is False

@@ -16,6 +16,9 @@ agents, markdown prompts, Pydantic schemas, explicit tool wrappers, context
 packs, deterministic gates, runtime skill bundles under `src/keystone_agents/skills/`,
 and Codex-facing skills under `codex-skills/`.
 
+Use `$kba-new-agent` first when the task creates a new agent family. This skill
+then owns the concrete contract implementation and regression surfaces.
+
 ## First Reads
 
 Read the smallest set that matches the task:

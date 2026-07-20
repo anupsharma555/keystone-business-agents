@@ -60,6 +60,9 @@ Use this workflow for requests like:
 7. When search-heavy scheduled automations delegate to this repo, preserve the
    same Orchestrator preflight, deterministic retrieval, specialist synthesis,
    review, and renderer-owned output path used by manual `@KNI` runs.
+8. For a live Slack research acceptance test, hand the final content and visual
+   review to `$kba-operational-validation`; provider success alone does not
+   prove a useful Slack answer.
 
 ## Provider Boundaries
 

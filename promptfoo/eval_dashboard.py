@@ -222,6 +222,7 @@ def dashboard_payload(
     )
     analysis = _promptfoo_analysis(db_path)
     analysis["latest_run"] = _latest_case_run_summary(cases)
+    database_inventory = _database_inventory_contract(cases)
     return {
         "database_path": str(db_path),
         "database_tables": database_table_summaries(db_path),
@@ -230,6 +231,7 @@ def dashboard_payload(
         "follow_up_queue": _follow_up_queue(cases),
         "analysis": analysis,
         "cases": cases,
+        "database_inventory": database_inventory,
         "summary": summary,
         "dashboard_health": dashboard_health,
         "trace_summary": trace_summary,
@@ -240,6 +242,64 @@ def dashboard_payload(
             "enabled": eval_llm_judge_enabled(),
             "env_flag": JUDGE_ENV_FLAG,
         },
+    }
+
+
+def _database_inventory_contract(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return the stable read-only Database-tab contract without review prose."""
+
+    rows: list[dict[str, Any]] = []
+    allowed_fields = (
+        "prompt_number",
+        "display_prompt_number",
+        "case_id",
+        "display_case_id",
+        "agent",
+        "dimensions",
+        "latest_run_at",
+        "latest_run_source",
+        "latest_run_id",
+        "latest_slack_run_id",
+        "latest_slack_thread_ts",
+        "promptfoo_eval_id",
+        "promptfoo_success",
+        "promptfoo_score",
+        "slack_run_count",
+        "latest_slack_thread_fetch_status",
+        "latest_slack_warning_count",
+        "latest_slack_cost_profile",
+        "latest_slack_source_count",
+        "latest_slack_visible_source_count",
+        "human_average",
+        "human_safety",
+        "human_scores",
+        "orchestrator_judge_average",
+        "orchestrator_judge_safety",
+        "orchestrator_judge_scores",
+        "orchestrator_judge_created_at",
+        "scoring_status",
+        "scoring_status_label",
+        "scoring_completed_at",
+        "analysis_excluded",
+        "analysis_exclusion_reason",
+        "review_url",
+        "case_bundle_url",
+    )
+    for case in cases:
+        rows.append({field: case.get(field) for field in allowed_fields})
+    return {
+        "schema": "keystone.eval.database_inventory.v1",
+        "read_only": True,
+        "rows": rows,
+        "score_dimensions": list(SCORE_DIMENSIONS),
+        "detail_surfaces": ["review_form", "case_bundle", "csv", "json"],
+        "excluded_visible_fields": [
+            "prompt",
+            "response",
+            "human_notes",
+            "orchestrator_rationale",
+            "orchestrator_comment",
+        ],
     }
 
 
@@ -2251,6 +2311,7 @@ def _trace_agentic_summary(event: dict[str, Any]) -> dict[str, Any]:
     thread_evidence = _trace_metadata_object(metadata.get("thread_evidence"))
     slack_context = _trace_metadata_object(metadata.get("slack_context"))
     tool_count = _trace_metadata_int(metadata, ("tooling", "tool_call_count"), ("tool_call_count",))
+    child_step_count = _trace_metadata_int(metadata, ("child_steps", "count"))
     failed_tool_count = _trace_metadata_int(metadata, ("tooling", "failed_tool_call_count"))
     tool_names = _trace_metadata_string_list(tooling.get("tool_names"))
     visible_sources = _trace_metadata_int(
@@ -2338,6 +2399,8 @@ def _trace_agentic_summary(event: dict[str, Any]) -> dict[str, Any]:
         signal = retrieval_text
     elif orchestrator_text:
         signal = f"orchestrator {orchestrator_text}"
+    elif child_step_count:
+        signal = f"{child_step_count} child steps"
     elif model_text:
         signal = "model configured"
     elif warning_count or retry_count:
@@ -2349,6 +2412,11 @@ def _trace_agentic_summary(event: dict[str, Any]) -> dict[str, Any]:
         "route": route,
         "model": model_text or "model metadata pending",
         "tools": tool_text or "tool metadata pending",
+        "child_steps": (
+            f"{child_step_count} bounded steps"
+            if child_step_count
+            else "child-step metadata pending"
+        ),
         "retrieval": retrieval_text or "retrieval metadata pending",
         "orchestrator": orchestrator_text or "orchestrator metadata pending",
         "approval": str(approval.get("status") or "approval not required").strip(),
@@ -2413,6 +2481,16 @@ def _trace_field_readiness(event: dict[str, Any]) -> dict[str, Any]:
                 or _trace_metadata_string_list(tooling.get("tool_names"))
             ),
             "detail": "Tool call count, names, or failure state is present.",
+        },
+        {
+            "key": "child_steps",
+            "label": "Child-step timeline",
+            "complete": bool(
+                diagnostics.get("has_child_step_metadata")
+                or _trace_metadata_int(metadata, ("child_steps", "count"))
+                or tooling.get("child_step_summary")
+            ),
+            "detail": "Bounded ordered WorkItem/tool steps are present.",
         },
         {
             "key": "retrieval",
@@ -5801,7 +5879,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
                 <div class="section-head">
                   <div>
                     <h2>{_label_with_info("Eval Case Database")}</h2>
-                    <div class="subtle">All committed cases plus completed Slack runs, imported Promptfoo machine checks, and human reviews. Pending rows are expected until a case is run or scored.</div>
+                    <div class="subtle">Read-only inventory of case identity, run state, explicit review scores, and evidence. Use Review form or Case bundle for prompts, responses, comments, and rationales.</div>
                   </div>
                   <div class="db-actions">
                     <a class="pill" href="/api/eval-cases.csv">Download CSV</a>
@@ -5809,7 +5887,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
                   </div>
                 </div>
                 <div class="filters">
-                  <input id="database-search" placeholder="Search case, prompt, agent, run id, response">
+                  <input id="database-search" placeholder="Search case, agent, run id, or status">
                   <select id="database-agent-filter"><option value="">All agents</option></select>
                   <select id="database-state-filter">
                     <option value="">All cases</option>
@@ -5828,15 +5906,13 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
                       <col class="time-col">
                       <col class="source-col">
                       <col class="run-col">
-                      <col class="prompt-col">
-                      <col class="response-col">
                       <col class="summary-col">
                       <col class="summary-col">
                       {database_score_cols}
                       <col class="summary-col">
                       <col class="evidence-col">
                       <col class="summary-col">
-                      <col class="notes-col">
+                      <col class="actions-col">
                     </colgroup>
                     <thead>
                       <tr>
@@ -5846,15 +5922,13 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
                         <th><div class="metric-th"><div class="metric-th-title">Latest run time</div><div class="metric-th-detail">Slack, machine, or review</div></div></th>
                         <th>Run source</th>
                         <th>Run id / thread / score</th>
-                        <th>Prompt</th>
-                        <th>Latest response</th>
                         <th>Machine</th>
                         <th>Human review</th>
                         {database_score_headers}
                         <th>Orchestrator Review</th>
                         <th>Evidence</th>
                         <th>Analysis</th>
-                        <th>Review notes</th>
+                        <th>Details</th>
                       </tr>
                     </thead>
                     <tbody id="database-rows"></tbody>
@@ -5869,6 +5943,7 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
   <script>
     const data = JSON.parse(document.getElementById('eval-data').textContent);
     const cases = data.cases;
+    const databaseInventory = data.database_inventory || {{rows: []}};
     const scoreDimensions = data.score_dimensions || [];
     const orchestratorJudge = data.orchestrator_judge || {{}};
     const search = document.getElementById('search');
@@ -8635,14 +8710,13 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
         }}
         function renderDatabaseRows() {{
           const query = databaseSearch.value.trim().toLowerCase();
-          const rows = latestFirstCases(cases.filter(item => {{
+          const rows = latestFirstCases((databaseInventory.rows || []).filter(item => {{
             const haystack = [
               item.prompt_number, item.display_prompt_number, item.case_id, item.display_case_id, item.agent, (item.dimensions || []).join(' '),
               item.latest_run_at, item.latest_run_source, item.latest_run_id,
-              item.user_input, item.response_text, item.latest_slack_summary,
               item.latest_slack_run_id, item.latest_slack_thread_ts, item.promptfoo_eval_id,
               item.latest_slack_context_policy, item.latest_slack_thread_fetch_status,
-              item.latest_slack_cost_profile, item.human_notes
+              item.latest_slack_cost_profile, item.scoring_status, item.scoring_status_label
             ].join(' ').toLowerCase();
             return (!query || haystack.includes(query))
               && (!databaseAgentFilter.value || item.agent === databaseAgentFilter.value)
@@ -8672,13 +8746,11 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             const hasHumanScore = item.human_average !== null && item.human_average !== undefined;
             const hasOrchestratorScore = item.orchestrator_judge_average !== null && item.orchestrator_judge_average !== undefined;
             const humanStatus = hasHumanScore ? 'reviewed' : 'unreviewed';
-            const databaseResponse = item.scored_response_text || item.response_text || item.latest_slack_summary || '';
             const humanSummary = hasHumanScore
               ? `${{pill(humanStatus, item.human_safety === 'fail' ? 'fail' : 'pass')}}<div class="mono subtle">${{scoreValue(item.human_average)}}</div>${{item.human_safety ? `<div class="subtle">${{escapeHtml(item.human_safety)}}</div>` : ''}}`
               : '<span class="db-empty">unreviewed</span>';
-            const orchestratorComment = item.orchestrator_judge_run_comment || item.orchestrator_judge_notes || '';
             const scoringSummary = hasOrchestratorScore
-              ? `${{pill('Orchestrator Review complete', 'pass')}}<div class="mono subtle">${{item.orchestrator_judge_created_at ? formatDateTime(item.orchestrator_judge_created_at) : ''}}</div><div class="subtle">${{scoreValue(item.orchestrator_judge_average)}}</div>${{orchestratorComment ? `<div class="subtle">${{escapeHtml(orchestratorComment)}}</div>` : ''}}`
+              ? `${{pill('Orchestrator Review complete', 'pass')}}<div class="mono subtle">${{item.orchestrator_judge_created_at ? formatDateTime(item.orchestrator_judge_created_at) : ''}}</div><div class="subtle">${{scoreValue(item.orchestrator_judge_average)}}</div>`
               : '<span class="db-empty">orchestrator review missing</span>';
             const scoreDimensionColumns = scoreDimensions.map(dimension => [
               scoreDimensionCell(item.human_scores || {{}}, dimension),
@@ -8694,6 +8766,10 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
             if (Number(item.latest_slack_warning_count || 0) > 0) evidenceParts.push(`${{item.latest_slack_warning_count}} warning${{Number(item.latest_slack_warning_count || 0) === 1 ? '' : 's'}}`);
             if (!evidenceParts.length && item.promptfoo_eval_id) evidenceParts.push('machine check imported');
             const evidenceSummary = evidenceParts.join(' · ');
+            const detailLinks = [
+              item.review_url ? `<a href="${{escapeHtml(item.review_url)}}">Review form</a>` : '',
+              item.case_bundle_url ? `<a href="${{escapeHtml(item.case_bundle_url)}}">Case bundle</a>` : '',
+            ].filter(Boolean).join(' · ');
             return `<tr>
               <td class="mono">${{escapeHtml(item.display_prompt_number || item.prompt_number || '000')}}</td>
               <td class="mono" title="${{escapeHtml(item.case_id || '')}}">${{escapeHtml(item.display_case_id || item.case_id || '')}}</td>
@@ -8701,15 +8777,13 @@ def _dashboard_html(payload: dict[str, Any]) -> str:
               <td class="mono">${{dbMetric(latestRunAt || item.latest_run_at)}}</td>
               <td>${{pill(latestRunSource, latestRunSource === 'pending' ? 'warn' : 'pass')}}</td>
               <td class="mono">${{dbMetric(latestRunInfo)}}</td>
-              <td class="prompt-cell" title="${{escapeHtml(item.user_input || '')}}"><div class="db-cell-text">${{escapeHtml(item.user_input || '')}}</div></td>
-              <td class="response-cell" title="${{escapeHtml(databaseResponse)}}"><div class="db-cell-text subtle">${{escapeHtml(databaseResponse)}}</div></td>
               <td>${{machineSummary}}</td>
               <td>${{humanSummary}}</td>
               ${{scoreDimensionColumns}}
               <td>${{scoringSummary}}</td>
               <td title="${{escapeHtml(evidenceSummary)}}"><div class="db-cell-text">${{dbMetric(evidenceSummary)}}</div></td>
               <td title="${{escapeHtml(analysisState || (item.promptfoo_eval_id ? 'included' : 'tbd'))}}"><div class="db-cell-text">${{dbMetric(analysisState, item.promptfoo_eval_id ? 'included' : 'tbd')}}</div></td>
-              <td title="${{escapeHtml(item.human_notes || orchestratorComment || '')}}"><div class="db-cell-text">${{dbMetric(item.human_notes || orchestratorComment)}}</div></td>
+              <td>${{detailLinks || '<span class="db-empty">unavailable</span>'}}</td>
             </tr>`;
           }}).join('');
         }}

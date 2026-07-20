@@ -65,6 +65,7 @@ class TypedAgentRunResult(Generic[TOutput]):
     cost: dict[str, Any] = field(default_factory=dict)
     budget_guard: dict[str, Any] = field(default_factory=dict)
     request_cache: dict[str, Any] = field(default_factory=dict)
+    tool_receipts: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def final_output(self) -> TOutput:

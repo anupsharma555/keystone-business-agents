@@ -17,18 +17,29 @@ remaining issue-level acceptance rows.
    natural ask does not repeat generic no-send/no-write boilerplate; policy and
    deterministic gates enforce those boundaries. Hard ceiling: 8 OpenAI
    requests and $0.50.
+3. `SLACK-DIRECT-ZOTERO-01`: one direct Zotero authenticated provider read that
+   selects the most recently added journal article and projects only title,
+   authors, and publication title without web search, full text, or mutation.
+   Hard ceiling: 3 OpenAI requests and $0.05. Passing evidence already exists:
+   run `5692` used one request at an estimated `$0.01259775`.
+4. `SLACK-DIRECT-CONSTRAINT-01`: the exact direct Business Research regression,
+   `@KNI BA, who is Abridge and summarize the company in 20 words.` The visible
+   answer must contain exactly 20 words, retain a source URL outside the counted
+   answer, omit generic detailed-summary expansion, and produce one final thread
+   reply. Hard ceiling: 4 OpenAI requests and $0.15.
 
-Combined hard ceiling: 11 OpenAI requests and $0.60. Run serially in
-`#ai-agents-workflow`; stop after the first failed render, retry, missing usage
-receipt, raw Gmail body persistence, duplicate final response, or unexpected
-side effect.
+Registry hard ceiling: 18 OpenAI requests and $0.80 across all four probes.
+All four probes have passing evidence. The exact constraint proof reused KBA run
+`5851`: one request at an estimated `$0.01005225`, an exact 20-word visible
+answer, one final Slack reply, and deterministic Orchestrator review pass. No
+additional allowance or rerun is needed.
 
 ## Approval boundary
 
-Approval must explicitly cover the two Slack posts and the combined request/cost
-ceiling. It does not approve Gmail mutation, Gmail draft creation, email send,
-live search for the graph probe, schedules, files, Airtable/Workspace/Zotero
-writes, or posting outside the exact workflow channel.
+The recorded approvals covered only the exact probes and their ceilings. They
+did not approve Gmail mutation, Gmail draft creation, email send, schedules,
+files, Airtable/Workspace/Zotero writes, or posting outside the exact workflow
+channel.
 
 ## Required evidence
 
@@ -41,9 +52,12 @@ writes, or posting outside the exact workflow channel.
 - Usage, trace, request count, retry count, and cost receipt.
 - Explicit no-unintended-side-effect result.
 
-ANU-60 and the operationalization goal remain incomplete until the two live
-permalinks and receipts exist. Fixture and no-live readiness evidence cannot be
-substituted for visible Slack acceptance.
+All four entrypoint probes across Business Research, the connector-backed Gmail
+graph, direct Zotero, and exact constraint handling have live evidence. Fixture
+and no-live readiness evidence were not substituted for visible Slack
+acceptance.
+Fixture and no-live readiness evidence cannot be substituted for future live
+acceptance claims either.
 
 ## 2026-07-11 direct-probe checkpoint
 
@@ -63,7 +77,8 @@ Airtable:
   the focused-brief prompt requires direct operator language, and focused tests
   cover both regressions.
 
-The two completed model requests cost an estimated $0.0713 from the checked-in
-pricing table, within the direct probe's three-request and $0.10 ceiling. This is
-a useful partial proof, not a passing `SLACK-DIRECT-01` acceptance row; rerun only
-after a separately approved budget confirms the fixed visible output.
+The initial two model requests cost an estimated $0.0713 from the checked-in
+pricing table, within the direct probe's three-request and $0.10 ceiling. A
+later recorded rerun supplied the passing `SLACK-DIRECT-01` permalink, answer-
+first body, source visibility, run identity, cost receipt, and no-side-effect
+evidence. Do not rerun it without a materially new acceptance question.

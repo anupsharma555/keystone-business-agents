@@ -35,6 +35,13 @@ from keystone_agents.models import AgentRunRequest, AgentRunResult, RunMode, Typ
 from keystone_agents.operator_failures import known_exception_to_operator_failure
 from keystone_agents.sdk import AgentLike, repo_instruction_profile_id, run_typed_sdk_sync
 from keystone_agents.sdk_sessions import build_sdk_session_from_env, session_audit_metadata
+from keystone_agents.tool_receipt_journal import (
+    instrument_agent_tools,
+    mutation_tool_names,
+    reset_tool_receipt_journal,
+    retry_receipt_context,
+    tool_receipt_journal,
+)
 from keystone_agents.tools.serper_tool import (
     consume_sdk_search_telemetry,
     reset_sdk_search_telemetry,
@@ -188,6 +195,7 @@ def run_typed_sdk_agent(
         model_name = model_config.model
     resolved_session = session or build_sdk_session_from_env()
     prompt = sdk_input_from_typed_input(typed_input, live=live, provider=model_provider)
+    base_prompt = prompt
     audit_prompt = _sdk_input_audit_text(prompt)
     request_cache = _sdk_request_cache_metadata(
         agent=agent,
@@ -203,6 +211,9 @@ def run_typed_sdk_agent(
         run_config=run_config,
     )
     active_session = resolved_session
+    reset_tool_receipt_journal()
+    instrument_agent_tools(agent)
+    temporarily_disabled_tools: dict[int, tuple[Any, Any]] = {}
     started_at = time.time()
     model_run_mode = "local_sdk" if run_config is not None else ("live_sdk" if live else "sdk")
     while True:
@@ -238,6 +249,23 @@ def run_typed_sdk_agent(
                 # input without a valid assistant response. Retry from the same
                 # bounded prompt without carrying that partial session forward.
                 active_session = None
+                captured_receipts = tool_receipt_journal()
+                if captured_receipts:
+                    prompt = _sdk_prompt_with_recovery_context(
+                        base_prompt,
+                        retry_receipt_context(captured_receipts),
+                    )
+                    disabled_names = mutation_tool_names(captured_receipts)
+                    for tool in list(getattr(agent, "tools", []) or []):
+                        if str(getattr(tool, "name", "") or "") not in disabled_names:
+                            continue
+                        tool_id = id(tool)
+                        if tool_id not in temporarily_disabled_tools:
+                            temporarily_disabled_tools[tool_id] = (
+                                tool,
+                                getattr(tool, "is_enabled", True),
+                            )
+                        tool.is_enabled = False
                 continue
             if (
                 rate_limit_retry_count < max_rate_limit_retries
@@ -252,6 +280,8 @@ def run_typed_sdk_agent(
                 )
                 continue
             else:
+                for tool, prior_is_enabled in temporarily_disabled_tools.values():
+                    tool.is_enabled = prior_is_enabled
                 _record_sdk_run_summary_safely(
                     agent_name=agent.name,
                     model_provider=model_provider,
@@ -273,6 +303,9 @@ def run_typed_sdk_agent(
                     duration_ms=round((time.time() - started_at) * 1000, 3),
                 )
                 raise
+    for tool, prior_is_enabled in temporarily_disabled_tools.values():
+        tool.is_enabled = prior_is_enabled
+    captured_tool_receipts = tool_receipt_journal()
     output = _attach_retrieval_diagnostics(output, search_telemetry)
     search_diagnostics = sdk_search_diagnostics_from_telemetry(search_telemetry)
     usage = _extract_sdk_usage(raw_result)
@@ -347,7 +380,25 @@ def run_typed_sdk_agent(
                 else {}
             ),
         },
+        tool_receipts=captured_tool_receipts,
     )
+
+
+def _sdk_prompt_with_recovery_context(
+    prompt: str | list[dict[str, Any]],
+    recovery_context: str,
+) -> str | list[dict[str, Any]]:
+    """Append bounded retry evidence without dropping local file/image inputs."""
+
+    if isinstance(prompt, str):
+        return prompt + recovery_context
+    return [
+        *prompt,
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": recovery_context}],
+        },
+    ]
 
 
 def _sdk_rate_limit_max_retries(*, live: bool, run_config: Any | None) -> int:
@@ -1025,6 +1076,7 @@ def run_retrieved_sdk_synthesis(
             cost=typed_result.cost,
             budget_guard=typed_result.budget_guard,
             request_cache=typed_result.request_cache,
+            tool_receipts=typed_result.tool_receipts,
         )
         usage = typed_result.usage or _extract_sdk_usage(typed_result.raw_result)
         cost = typed_result.cost or estimate_usage_cost(

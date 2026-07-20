@@ -8,6 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from keystone_agents.calendar_actions import is_calendar_action_candidate
+from keystone_agents.local_kni_evidence import looks_like_local_kni_evidence_lookup
 from keystone_agents.orchestrator.routing import (
     OPPORTUNITY_RE,
     OUTREACH_RE,
@@ -21,6 +22,7 @@ from keystone_agents.orchestrator.routing import (
 from keystone_agents.schemas.manual_request_plan import (
     AskShapePolicy,
     ManualExpectedArtifactType,
+    ManualProviderSystem,
     ManualRequestIntent,
     ManualRequestPlan,
     ManualTargetAgent,
@@ -452,6 +454,12 @@ def infer_manual_request_plan(
             if workflow and inferred_target_type == "unknown"
             else inferred_target_type
         ),
+        provider_system=_provider_system_for_plan(
+            text,
+            target_agent=target_agent,
+            intent=intent,
+        ),
+        provider_operations=_fallback_provider_operations(text, intent=intent),
         objective=_objective(text, intent=intent),
         task_objective=(
             "route_or_continue"
@@ -480,6 +488,9 @@ def infer_manual_request_plan(
         tone=_tone(text) if intent == "outreach_draft" else "",
         requires_live_search=_requires_live_search_for_plan(text, target_agent=target_agent),
         requires_approved_context=intent in {"outreach_draft", "blocked_send"},
+        requires_durable_state=bool(
+            len(workflow) > 1 or looks_like_stateful_work_request(text)
+        ),
         side_effect_policy=(
             "internal_write_approval_required"
             if intent == "business_system_write"
@@ -496,6 +507,67 @@ def infer_manual_request_plan(
             "Send request blocked; external send/write requests remain draft/read-only."
         )
     return plan
+
+
+def _fallback_provider_operations(
+    text: str,
+    *,
+    intent: ManualRequestIntent,
+) -> list[str]:
+    """Best-effort provider operations for offline or planner-unavailable mode.
+
+    Live natural-language execution replaces this fallback with the structured
+    operations interpreted by the LLM planner. These matches must never
+    override an LLM plan or grant provider-write authority.
+    """
+
+    if intent not in {"business_system_write", "context_lookup", "gmail_triage"}:
+        return []
+    positive_text = positive_capability_text(text).lower()
+    patterns = {
+        "read": r"\b(?:read|check|inspect|review|show|list|find|look\s+up)\b",
+        "search": r"\b(?:search|query|locate)\b",
+        "create": r"\b(?:add|create|insert|make|put|save|write)\b",
+        "update": r"\b(?:change|edit|modify|revise|set|tighten|update)\b",
+        "delete": r"\b(?:clean\s*up|delete|remove|throw\s+away|trash)\b",
+        "attach": r"\b(?:attach|upload)\b",
+        "verify": r"\b(?:check|confirm|read[- ]back|verify)\b",
+    }
+    matched = [
+        (match.start(), operation)
+        for operation, pattern in patterns.items()
+        if (match := re.search(pattern, positive_text, re.I)) is not None
+    ]
+    return [operation for _, operation in sorted(matched)]
+
+
+def _provider_system_for_plan(
+    text: str,
+    *,
+    target_agent: ManualTargetAgent,
+    intent: ManualRequestIntent,
+) -> ManualProviderSystem:
+    """Record high-confidence provider ownership without granting tool authority."""
+
+    provider_by_owner = {
+        "gmail_triage": "gmail",
+        "airtable_context_agent": "airtable",
+        "google_workspace_context_agent": "google_workspace",
+        "zotero_context_agent": "zotero",
+    }
+    provider = provider_by_owner.get(target_agent)
+    if provider:
+        return provider
+    positive_text = _without_negated_route_action_clauses(text)
+    if re.search(r"\bgoogle\s+calendar\b", positive_text, re.I) or (
+        target_agent == "chief_of_staff"
+        and intent in {"business_system_write", "context_lookup"}
+        and is_calendar_action_candidate(positive_text)
+    ):
+        return "google_calendar"
+    if intent == "slack_operations":
+        return "slack"
+    return "unspecified"
 
 
 def _infer_goal_workflow(text: str) -> list[ManualTargetAgent]:
@@ -1134,7 +1206,13 @@ def merge_manual_request_plan(
     *,
     allow_contextual_delegation: bool = False,
 ) -> ManualRequestPlan:
-    """Merge an LLM plan over the local fallback while preserving safety defaults."""
+    """Merge semantic interpretation over a planner-unavailable fallback.
+
+    The LLM plan owns meaning: route, workflow, provider, operations, and
+    durability. The local plan may preserve explicit measurable constraints
+    and safety boundaries, but it must not veto a valid LLM interpretation
+    because the request used wording that a heuristic did not recognize.
+    """
 
     if candidate is None:
         return base
@@ -1143,112 +1221,92 @@ def merge_manual_request_plan(
         if isinstance(candidate, ManualRequestPlan)
         else ManualRequestPlan.model_validate(candidate)
     )
-    preserved_intents = {"opportunity_to_outreach_loop", "browser_diagnostics"}
-    if base.intent in preserved_intents and (
-        plan.intent != base.intent or plan.target_agent != base.target_agent
-    ):
-        warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
-        warnings.append(
-            "Ignored planner override that converted a protected manual request "
-            "into a different route."
-        )
-        return base.model_copy(
-            update={
-                "source": plan.source or base.source,
-                "planner_warnings": warnings,
-            }
-        )
-    if _candidate_uses_explicitly_forbidden_capability(base, plan):
-        warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
-        warnings.append(
-            "Ignored planner override that treated an explicitly forbidden capability "
-            "as positive routing evidence."
-        )
-        return base.model_copy(
-            update={
-                "source": plan.source or base.source,
-                "planner_warnings": warnings,
-            }
-        )
-    if _candidate_turns_constraint_into_prerequisite_or_blocker(base, plan):
-        warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
-        warnings.append(
-            "Ignored planner override that turned a negative execution constraint "
-            "into a prerequisite, clarification, or workflow blocker."
-        )
-        return base.model_copy(
-            update={
-                "source": plan.source or base.source,
-                "planner_warnings": warnings,
-            }
-        )
-    if (
-        base.target_agent == "gmail_triage"
-        and is_single_owner_gmail_reply_request(base.objective)
-        and (
-            plan.target_agent != "gmail_triage"
-            or any(route != "gmail_triage" for route in plan.workflow)
-        )
-    ):
-        warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
-        warnings.append(
-            "Collapsed planner expansion because Gmail Triage owns the bounded "
-            "mailbox read and Slack-thread-only reply copy."
-        )
-        plan = plan.model_copy(
-            update={
-                "target_agent": "gmail_triage",
-                "workflow": [],
-                "intent": "gmail_triage",
-                "task_objective": "gmail_triage",
-                "expected_artifact_type": "gmail_triage_report",
-                "side_effect_policy": "draft_or_read_only",
-                "planner_warnings": warnings,
-            }
-        )
-    explicit_agent = base.requested_agent not in {None, "", "orchestrator"}
-    explicit_source_owner = _business_context_target_agent(base.objective)
-    source_owner_delegation = bool(
-        explicit_source_owner
-        and plan.target_agent == explicit_source_owner
-        and plan.target_agent in _CONTEXT_AGENT_TARGETS
-        and _owner_reassignment_supported(
-            requested_agent=base.requested_agent,
-            candidate_agent=plan.target_agent,
-            request=base.objective,
-            text=base.objective,
-            candidate_intent=plan.intent,
-            workflow=plan.workflow,
-        )
-    )
-    contextual_delegation = bool(
-        source_owner_delegation
-        or (
+    llm_interpretation = plan.source == "llm"
+    if not llm_interpretation:
+        preserved_intents = {"opportunity_to_outreach_loop", "browser_diagnostics"}
+        if base.intent in preserved_intents and (
+            plan.intent != base.intent or plan.target_agent != base.target_agent
+        ):
+            warnings = list(
+                dict.fromkeys([*base.planner_warnings, *plan.planner_warnings])
+            )
+            warnings.append(
+                "Ignored non-LLM override that converted a protected manual request "
+                "into a different route."
+            )
+            return base.model_copy(
+                update={
+                    "source": plan.source or base.source,
+                    "planner_warnings": warnings,
+                }
+            )
+        if _candidate_uses_explicitly_forbidden_capability(base, plan):
+            warnings = list(
+                dict.fromkeys([*base.planner_warnings, *plan.planner_warnings])
+            )
+            warnings.append(
+                "Ignored non-LLM override that treated an explicitly forbidden "
+                "capability as positive routing evidence."
+            )
+            return base.model_copy(
+                update={
+                    "source": plan.source or base.source,
+                    "planner_warnings": warnings,
+                }
+            )
+        if _candidate_turns_constraint_into_prerequisite_or_blocker(base, plan):
+            warnings = list(
+                dict.fromkeys([*base.planner_warnings, *plan.planner_warnings])
+            )
+            warnings.append(
+                "Ignored non-LLM override that turned a negative execution constraint "
+                "into a prerequisite, clarification, or workflow blocker."
+            )
+            return base.model_copy(
+                update={
+                    "source": plan.source or base.source,
+                    "planner_warnings": warnings,
+                }
+            )
+        explicit_agent = base.requested_agent not in {None, "", "orchestrator"}
+        contextual_delegation = bool(
             allow_contextual_delegation
             and base.requested_agent == "chief_of_staff"
-            and plan.target_agent
-            in {
-                "gmail_triage",
-                "business_research_analyst",
-                "opportunity_scout",
-                "airtable_context_agent",
-                "google_workspace_context_agent",
-                "zotero_context_agent",
-                "rss_context_agent",
-                "preprints_context_agent",
-            }
+            and plan.target_agent in _CONTEXT_AGENT_TARGETS
         )
-    )
-    if explicit_agent and plan.target_agent != base.target_agent and not contextual_delegation:
-        warnings = list(dict.fromkeys([*base.planner_warnings, *plan.planner_warnings]))
-        warnings.append("Ignored planner override that rerouted an explicit named-agent request.")
-        return base.model_copy(
-            update={
-                "source": plan.source or base.source,
-                "planner_warnings": warnings,
-            }
-        )
-    merged = base.model_copy(update=plan.model_dump(mode="json"))
+        if (
+            explicit_agent
+            and plan.target_agent != base.target_agent
+            and not contextual_delegation
+        ):
+            warnings = list(
+                dict.fromkeys([*base.planner_warnings, *plan.planner_warnings])
+            )
+            warnings.append(
+                "Ignored non-LLM override that rerouted an explicit named-agent request."
+            )
+            return base.model_copy(
+                update={
+                    "source": plan.source or base.source,
+                    "planner_warnings": warnings,
+                }
+            )
+    else:
+        plan = _normalize_llm_plan_contract(plan)
+        plan = _repair_structurally_invalid_llm_plan(base, plan)
+        plan = _prune_forbidden_llm_capabilities(base, plan)
+        plan = _normalize_llm_plan_contract(plan)
+        plan = _repair_structurally_invalid_llm_plan(base, plan)
+        plan = _prune_forbidden_llm_capabilities(base, plan)
+    candidate_values = plan.model_dump(mode="json")
+    if (
+        not llm_interpretation
+        and
+        candidate_values.get("provider_system") == "unspecified"
+        and base.provider_system != "unspecified"
+    ):
+        candidate_values["provider_system"] = base.provider_system
+    merged = base.model_copy(update=candidate_values)
     merged.ask_shape = _merge_ask_shape_policy(
         base.ask_shape,
         plan.ask_shape,
@@ -1261,17 +1319,44 @@ def merge_manual_request_plan(
         merged.primary_target = base.primary_target
     if not merged.objective:
         merged.objective = base.objective
-    merged.constraints = list(dict.fromkeys([*base.constraints, *merged.constraints]))
-    merged.required_entities = list(
-        dict.fromkeys([*base.required_entities, *merged.required_entities])
-    )
-    merged.required_terms = list(dict.fromkeys([*base.required_terms, *merged.required_terms]))
-    if base.gmail_query:
-        merged.gmail_query = base.gmail_query
-    if base.lookback_days is not None:
-        merged.lookback_days = base.lookback_days
-    if base.draft_policy:
-        merged.draft_policy = base.draft_policy
+    if llm_interpretation:
+        explicit_safety_constraints = _explicit_negative_constraints(base.objective)
+        merged.constraints = list(
+            dict.fromkeys([*merged.constraints, *explicit_safety_constraints])
+        )
+    else:
+        merged.constraints = list(dict.fromkeys([*base.constraints, *merged.constraints]))
+        merged.required_entities = list(
+            dict.fromkeys([*base.required_entities, *merged.required_entities])
+        )
+        merged.required_terms = list(
+            dict.fromkeys([*base.required_terms, *merged.required_terms])
+        )
+    # A live LLM plan owns mailbox meaning and scope. The fallback parser may
+    # populate these fields only when no LLM interpretation exists. Preserve
+    # the explicit no-provider-draft boundary as a safety constraint even when
+    # a model candidate accidentally proposes drafts.
+    if not llm_interpretation:
+        if base.gmail_query:
+            merged.gmail_query = base.gmail_query
+        if base.lookback_days is not None:
+            merged.lookback_days = base.lookback_days
+        if base.draft_policy:
+            merged.draft_policy = base.draft_policy
+    elif (
+        base.draft_policy == "no_drafts_requested"
+        and (
+            merged.provider_system == "gmail"
+            or merged.target_agent == "gmail_triage"
+            or merged.intent == "gmail_triage"
+        )
+    ):
+        merged.draft_policy = "no_drafts_requested"
+        merged.provider_operations = [
+            operation
+            for operation in merged.provider_operations
+            if operation not in {"create", "update"}
+        ]
     if not merged.recipient:
         merged.recipient = base.recipient
     if not merged.outreach_channel:
@@ -1280,9 +1365,9 @@ def merge_manual_request_plan(
         merged.tone = base.tone
     base_workflow = list(base.workflow)
     candidate_workflow = list(merged.workflow)
-    supplied_context_chief_resolution = _candidate_resolves_supplied_context_with_chief(
-        base,
-        plan,
+    supplied_context_chief_resolution = bool(
+        not llm_interpretation
+        and _candidate_resolves_supplied_context_with_chief(base, plan)
     )
     if (
         supplied_context_chief_resolution
@@ -1298,7 +1383,7 @@ def merge_manual_request_plan(
                 ]
             )
         )
-    if base_workflow and not supplied_context_chief_resolution:
+    if not llm_interpretation and base_workflow and not supplied_context_chief_resolution:
         # The local workflow inference is a bounded completeness check over
         # explicit deliverables in the raw request. The live planner enriches
         # the plan, but it must not silently drop a requested downstream owner
@@ -1306,7 +1391,9 @@ def merge_manual_request_plan(
         merged.workflow = base_workflow
     else:
         merged.workflow = candidate_workflow if len(candidate_workflow) > 1 else []
-    if base.desired_count != 1:
+    if len(merged.workflow) > 1:
+        merged.requires_durable_state = True
+    if not llm_interpretation and base.desired_count != 1:
         merged.desired_count = base.desired_count
     merged.desired_count = max(1, min(10, merged.desired_count or base.desired_count))
     if base.target_agent == "outreach_composer" or merged.target_agent == "outreach_composer":
@@ -1319,6 +1406,258 @@ def merge_manual_request_plan(
         else "draft_or_read_only"
     )
     return merged
+
+
+def _normalize_llm_plan_contract(candidate: ManualRequestPlan) -> ManualRequestPlan:
+    """Resolve schema contradictions from typed intent/provider relationships."""
+
+    owner_by_intent: dict[str, ManualTargetAgent] = {
+        "company_research": "business_research_analyst",
+        "research_brief": "business_research_analyst",
+        "opportunity_search": "opportunity_scout",
+        "opportunity_to_outreach_loop": "opportunity_scout",
+        "gmail_triage": "gmail_triage",
+        "outreach_draft": "outreach_composer",
+        "slack_operations": "chief_of_staff",
+        "browser_diagnostics": "chief_of_staff",
+        "reference_capture": "chief_of_staff",
+        "continue_work_item": "orchestrator",
+        "blocked_send": "clarification",
+        "clarification": "clarification",
+    }
+    owner_by_provider: dict[str, ManualTargetAgent] = {
+        "google_calendar": "chief_of_staff",
+        "gmail": "gmail_triage",
+        "airtable": "airtable_context_agent",
+        "google_workspace": "google_workspace_context_agent",
+        "zotero": "zotero_context_agent",
+        "slack": "chief_of_staff",
+    }
+    provider_by_owner = {
+        owner: provider
+        for provider, owner in owner_by_provider.items()
+        if owner
+        in {
+            "gmail_triage",
+            "airtable_context_agent",
+            "google_workspace_context_agent",
+            "zotero_context_agent",
+        }
+    }
+    updates: dict[str, Any] = {}
+    warnings = list(candidate.planner_warnings)
+    expected_owner = owner_by_intent.get(candidate.intent)
+    if candidate.target_type == "local_document_collection":
+        expected_owner = "chief_of_staff"
+    if candidate.intent in {"business_system_write", "context_lookup"}:
+        if candidate.provider_system == "unspecified":
+            inferred_provider = provider_by_owner.get(candidate.target_agent)
+            if inferred_provider:
+                updates["provider_system"] = inferred_provider
+        else:
+            expected_owner = owner_by_provider.get(candidate.provider_system)
+    if (
+        expected_owner is not None
+        and candidate.target_agent != expected_owner
+        and len(candidate.workflow) <= 1
+    ):
+        updates["target_agent"] = expected_owner
+        warnings.append(
+            "Aligned the selected owner with the structured intent/provider "
+            "contract; request wording was not reclassified."
+        )
+    if not updates:
+        return candidate
+    updates["planner_warnings"] = list(dict.fromkeys(warnings))
+    return candidate.model_copy(update=updates)
+
+
+def _repair_structurally_invalid_llm_plan(
+    base: ManualRequestPlan,
+    candidate: ManualRequestPlan,
+) -> ManualRequestPlan:
+    """Repair schema contradictions without reclassifying valid LLM meaning."""
+
+    updates: dict[str, Any] = {}
+    warnings = list(candidate.planner_warnings)
+    ungrounded_clarification = bool(
+        (
+            candidate.target_agent == "clarification"
+            or candidate.intent == "clarification"
+        )
+        and not candidate.missing_required_information
+        and base.target_agent != "clarification"
+        and base.intent != "clarification"
+    )
+    unowned_route_only = bool(
+        candidate.target_agent == "orchestrator"
+        and candidate.intent == "route_request"
+        and not candidate.workflow
+        and not candidate.requires_durable_state
+        and base.target_agent not in {"orchestrator", "clarification"}
+    )
+    if ungrounded_clarification or unowned_route_only:
+        updates.update(
+            {
+                "target_agent": base.target_agent,
+                "workflow": base.workflow,
+                "intent": base.intent,
+                "primary_target": base.primary_target,
+                "target_type": base.target_type,
+                "provider_system": base.provider_system,
+                "provider_operations": base.provider_operations,
+                "objective": base.objective,
+                "task_objective": base.task_objective,
+                "expected_artifact_type": base.expected_artifact_type,
+                "requires_live_search": base.requires_live_search,
+                "requires_approved_context": base.requires_approved_context,
+                "requires_durable_state": base.requires_durable_state,
+                "missing_required_information": [],
+            }
+        )
+        warnings.append(
+            "Recovered an executable fallback because the LLM returned a "
+            "clarification or route-only plan without naming material missing "
+            "information."
+        )
+
+    outreach_context_needed = bool(
+        candidate.target_agent == "outreach_composer"
+        or "outreach_composer" in candidate.workflow
+        or candidate.intent in {"outreach_draft", "opportunity_to_outreach_loop"}
+    )
+    if (
+        candidate.requires_approved_context
+        and not outreach_context_needed
+        and "requires_approved_context" not in updates
+    ):
+        updates["requires_approved_context"] = False
+        warnings.append(
+            "Removed an approval-context prerequisite from a non-outreach plan."
+        )
+
+    if len(candidate.workflow) > 1 and not candidate.requires_durable_state:
+        updates["requires_durable_state"] = True
+
+    if not updates:
+        return candidate
+    updates["planner_warnings"] = list(dict.fromkeys(warnings))
+    return candidate.model_copy(update=updates)
+
+
+def _prune_forbidden_llm_capabilities(
+    base: ManualRequestPlan,
+    candidate: ManualRequestPlan,
+) -> ManualRequestPlan:
+    """Enforce explicit negative safety boundaries without choosing an owner.
+
+    This validator can remove a forbidden tool or side effect after semantic
+    interpretation. It cannot replace the LLM route merely because a phrase
+    happened to match a local heuristic, and it must keep the remaining
+    provider-free or read-only task executable.
+    """
+
+    explicit_constraints = _explicit_negative_constraints(base.objective)
+    explicit_constraints.extend(
+        str(item or "")
+        for item in base.constraints
+        if re.match(
+            r"^\s*(?:do\s+not|don't|dont|never|avoid|skip|no|without)\b",
+            str(item or ""),
+            re.I,
+        )
+    )
+    negative_scopes = " ".join(dict.fromkeys(explicit_constraints)).lower()
+    if not negative_scopes:
+        return candidate
+
+    updates: dict[str, Any] = {}
+    warnings = list(candidate.planner_warnings)
+    if candidate.requires_live_search and re.search(
+        r"\b(?:browse|research|search)\b",
+        negative_scopes,
+    ):
+        updates["requires_live_search"] = False
+        warnings.append(
+            "Removed live search because the operator explicitly prohibited it; "
+            "the remaining task stays executable."
+        )
+
+    write_forbidden = bool(
+        re.search(
+            r"\b(?:add|append|attach|change|create|delete|edit|modify|remove|save|"
+            r"update|write)\b",
+            negative_scopes,
+        )
+    )
+    if write_forbidden:
+        retained_operations = [
+            operation
+            for operation in candidate.provider_operations
+            if operation in {"read", "search", "verify"}
+        ]
+        if retained_operations != candidate.provider_operations:
+            updates["provider_operations"] = retained_operations
+            warnings.append(
+                "Removed provider mutations because the operator explicitly "
+                "prohibited writes; read-only work remains available."
+            )
+        if candidate.intent == "business_system_write":
+            provider_read = candidate.provider_system != "unspecified"
+            updates.update(
+                {
+                    "intent": "context_lookup" if provider_read else "route_request",
+                    "task_objective": (
+                        "context_lookup" if provider_read else "route_or_continue"
+                    ),
+                    "expected_artifact_type": (
+                        "context_summary" if provider_read else "none"
+                    ),
+                    "side_effect_policy": "draft_or_read_only",
+                }
+            )
+
+    draft_forbidden = bool(
+        re.search(
+            r"\b(?:draft|drafting|compose|prepare|write)\b",
+            negative_scopes,
+        )
+    )
+    if draft_forbidden and (
+        candidate.target_agent == "outreach_composer"
+        or "outreach_composer" in candidate.workflow
+        or candidate.intent in {"outreach_draft", "opportunity_to_outreach_loop"}
+    ):
+        remaining_workflow = [
+            route for route in candidate.workflow if route != "outreach_composer"
+        ]
+        updates.update(
+            {
+                "target_agent": (
+                    "chief_of_staff"
+                    if candidate.target_agent == "outreach_composer"
+                    else candidate.target_agent
+                ),
+                "workflow": remaining_workflow if len(remaining_workflow) > 1 else [],
+                "requires_durable_state": bool(
+                    base.requires_durable_state or len(remaining_workflow) > 1
+                ),
+                "intent": "route_request",
+                "task_objective": "route_or_continue",
+                "expected_artifact_type": "none",
+                "requires_approved_context": False,
+                "side_effect_policy": "draft_or_read_only",
+            }
+        )
+        warnings.append(
+            "Removed outreach drafting because the operator explicitly prohibited "
+            "it; the remaining internal task stays executable."
+        )
+
+    if not updates:
+        return candidate
+    updates["planner_warnings"] = list(dict.fromkeys(warnings))
+    return candidate.model_copy(update=updates)
 
 
 def _candidate_uses_explicitly_forbidden_capability(
@@ -2028,16 +2367,18 @@ def resolve_manual_request_owner(
     *,
     request_text: str | None = None,
 ) -> ManualTargetAgent:
-    """Resolve a plan suggestion without granting keyword-based route authority.
+    """Resolve one owner without reclassifying an LLM plan from request words.
 
-    This is the shared direct/graph reconciliation boundary. Unnamed requests
-    may follow semantic planning. Explicit named-agent requests retain their
-    owner unless the plan and bounded capability evidence agree on a different
-    specialist.
+    An explicit agent mention remains routing advice. When live semantic
+    planning succeeded, its owner is authoritative and Python only validates
+    whether that owner exists and may perform the scoped operation. Heuristic
+    evidence reconciliation remains a planner-unavailable fallback.
     """
 
     requested = normalize_manual_agent(requested_agent)
     candidate = normalize_manual_agent(str(plan.target_agent or ""))
+    if plan.source == "llm":
+        return candidate or requested or "orchestrator"
     if requested in {None, "orchestrator"}:
         return candidate or requested or "orchestrator"
     if candidate in {None, "orchestrator", "clarification"}:
@@ -2775,6 +3116,11 @@ def _strip_operational_clauses(text: str) -> str:
 
 def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetType:
     lower = text.lower()
+    if (
+        target_agent == "chief_of_staff"
+        and looks_like_local_kni_evidence_lookup(text)
+    ):
+        return "local_document_collection"
     if _looks_like_supplied_context_synthesis_request(text) and not (
         target_agent == "business_research_analyst" and looks_like_company(text)
     ):

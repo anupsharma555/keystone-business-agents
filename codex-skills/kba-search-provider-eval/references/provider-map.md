@@ -79,12 +79,15 @@ Run live evals only with explicit user intent and configured providers:
 ```bash
 .venv/bin/python scripts/run_browser_extraction_eval.py \
   --provider firecrawl \
-  --provider browserless \
   --cases evals/provider/browser_extraction_cases.jsonl \
   --output artifacts/browser_extraction_evals/current-providers \
   --live --no-dry-run \
   --json
 ```
+
+Do not include Browserless, Apify, or other placeholder adapters in production
+live validation until the repo has a reviewed live adapter, flags, credential
+checks, attribution rules, and tests.
 
 ## Promotion Checklist
 

@@ -69,6 +69,7 @@ def resolve_calendar_action_plan(
     request_text: str,
     fallback: CalendarActionPlan | None,
     *,
+    semantic_candidate: bool = False,
     live: bool = False,
     run_config: Any | None = None,
     model: str | None = None,
@@ -77,7 +78,8 @@ def resolve_calendar_action_plan(
     """Use at most one model turn, then reapply deterministic Calendar gates."""
 
     requires_interpretation = bool(
-        (fallback and fallback.operation in {"create", "update", "delete"})
+        semantic_candidate
+        or (fallback and fallback.operation in {"read", "create", "update", "delete"})
         or is_calendar_action_candidate(request_text)
     )
     if not requires_interpretation or (not live and run_config is None):

@@ -609,16 +609,18 @@ def build_sqlite_session(
         session = SQLiteSession(session_id)
     if settings is None:
         return session
-    return _ToolPairSafeBoundedSession(session, settings)
+    return _ResponseItemSafeBoundedSession(session, settings)
 
 
-class _ToolPairSafeBoundedSession:
-    """Bound local history without separating function calls from their outputs.
+class _ResponseItemSafeBoundedSession:
+    """Bound local history without separating dependent Responses API items.
 
     The SDK's raw item-count limit can start a history suffix on a
     ``function_call_output`` item while its matching ``function_call`` is just
-    outside the window. Responses API requests reject that malformed history.
-    This adapter widens the suffix only enough to retain matching calls.
+    outside the window. A widened suffix can then start on that
+    ``function_call`` while omitting the preceding ``reasoning`` item required
+    by the Responses API. This adapter widens the suffix only enough to retain
+    both dependencies.
     """
 
     def __init__(self, session: Any, settings: Any) -> None:
@@ -638,11 +640,11 @@ class _ToolPairSafeBoundedSession:
         items = await self._session.get_items(limit=scan_limit)
         if resolved_limit is None or resolved_limit >= len(items):
             return items
-        return _tool_pair_safe_history_suffix(items, resolved_limit)
+        return _response_item_safe_history_suffix(items, resolved_limit)
 
 
-def _tool_pair_safe_history_suffix(items: list[Any], limit: int) -> list[Any]:
-    """Return a recent suffix whose function outputs have matching calls."""
+def _response_item_safe_history_suffix(items: list[Any], limit: int) -> list[Any]:
+    """Return a recent suffix with complete reasoning/call/output units."""
 
     if limit <= 0:
         return []
@@ -671,21 +673,50 @@ def _tool_pair_safe_history_suffix(items: list[Any], limit: int) -> list[Any]:
             and call_id not in suffix_call_ids
             and call_id in call_positions
         ]
-        if not missing_positions:
-            return [
-                item
-                for item in items[start:]
-                if not (
-                    isinstance(item, Mapping)
-                    and item.get("type") == "function_call_output"
-                    and item.get("call_id")
-                    and str(item["call_id"]) not in suffix_call_ids
-                )
-            ]
-        widened_start = min(missing_positions)
-        if widened_start >= start:
-            return items[start:]
-        start = widened_start
+        if missing_positions:
+            start = min(start, min(missing_positions))
+            continue
+
+        reasoning_positions = [
+            reasoning_position
+            for index, item in enumerate(items[start:], start=start)
+            if isinstance(item, Mapping)
+            and item.get("type") == "function_call"
+            and (reasoning_position := _preceding_reasoning_position(items, index))
+            is not None
+            and reasoning_position < start
+        ]
+        if reasoning_positions:
+            start = min(reasoning_positions)
+            continue
+
+        return [
+            item
+            for item in items[start:]
+            if not (
+                isinstance(item, Mapping)
+                and item.get("type") == "function_call_output"
+                and item.get("call_id")
+                and str(item["call_id"]) not in suffix_call_ids
+            )
+        ]
+
+
+def _preceding_reasoning_position(items: list[Any], call_position: int) -> int | None:
+    """Return reasoning that belongs to a function-call output group, if present."""
+
+    position = call_position - 1
+    while position >= 0:
+        item = items[position]
+        if not isinstance(item, Mapping):
+            return None
+        item_type = str(item.get("type") or "")
+        if item_type == "reasoning":
+            return position
+        if item_type != "function_call":
+            return None
+        position -= 1
+    return None
 
 
 def validate_sandbox_sdk_available() -> bool:

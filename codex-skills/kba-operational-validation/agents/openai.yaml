@@ -1,0 +1,4 @@
+interface:
+  display_name: "KBA Operational Validation"
+  short_description: "Validate KBA routes, execution, and Slack output"
+  default_prompt: "Use $kba-operational-validation to validate the next KBA capability from backend receipt through Slack acceptance."

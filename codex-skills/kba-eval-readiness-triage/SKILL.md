@@ -15,6 +15,11 @@ Default to no live agent API calls and no Slack posting. Live Slack probes are
 read-only and require explicit user intent or an existing command contract that
 states read-only probing.
 
+This skill validates the eval harness and readiness surfaces. It does not
+replace `$kba-operational-validation` for realistic direct-agent, WorkItem,
+provider, or final Slack-output acceptance. Keep Promptfoo deferred unless the
+request is specifically about Promptfoo or eval readiness.
+
 ## First Reads
 
 Read the smallest set that matches the failure:

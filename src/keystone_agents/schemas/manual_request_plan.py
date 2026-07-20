@@ -86,9 +86,30 @@ ManualTargetType = Literal[
     "opportunity",
     "operator_reference",
     "business_system_context",
+    "local_document_collection",
     "slack_channel",
     "url",
     "unknown",
+]
+
+ManualProviderSystem = Literal[
+    "unspecified",
+    "google_calendar",
+    "gmail",
+    "airtable",
+    "google_workspace",
+    "zotero",
+    "slack",
+]
+
+ManualProviderOperation = Literal[
+    "read",
+    "search",
+    "create",
+    "update",
+    "delete",
+    "attach",
+    "verify",
 ]
 
 AskBreadth = Literal["unspecified", "narrow", "bounded", "broad"]
@@ -146,6 +167,8 @@ class ManualRequestPlan(BaseModel):
     intent: ManualRequestIntent = "clarification"
     primary_target: str = ""
     target_type: ManualTargetType = "unknown"
+    provider_system: ManualProviderSystem = "unspecified"
+    provider_operations: list[ManualProviderOperation] = Field(default_factory=list)
     objective: str = ""
     task_objective: ManualTaskObjective = "clarification"
     expected_artifact_type: ManualExpectedArtifactType = "none"
@@ -162,6 +185,8 @@ class ManualRequestPlan(BaseModel):
     tone: str = ""
     requires_live_search: bool = False
     requires_approved_context: bool = False
+    requires_durable_state: bool = False
+    missing_required_information: list[str] = Field(default_factory=list)
     side_effect_policy: str = "draft_or_read_only"
     rationale: str = ""
     planner_warnings: list[str] = Field(default_factory=list)
@@ -188,6 +213,33 @@ class ManualRequestPlan(BaseModel):
                 and item not in {"orchestrator", "chief_of_staff", "clarification"}
             )
         )
+
+    @field_validator("provider_operations", mode="before")
+    @classmethod
+    def _clean_provider_operations(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list | tuple | set) else [value]
+        allowed = set(get_args(ManualProviderOperation))
+        normalized = [
+            str(item or "").strip().lower().replace(" ", "_")
+            for item in values
+        ]
+        return list(dict.fromkeys(item for item in normalized if item in allowed))
+
+    @field_validator("missing_required_information", mode="before")
+    @classmethod
+    def _clean_missing_required_information(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list | tuple | set) else [value]
+        return list(
+            dict.fromkeys(
+                str(item or "").replace("\u2014", "-").strip()
+                for item in values
+                if str(item or "").strip()
+            )
+        )[:8]
 
     @field_validator(
         "source",

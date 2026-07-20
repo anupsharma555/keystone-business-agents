@@ -12,11 +12,24 @@ _TEMPORAL_TERM_RE = re.compile(
 )
 
 
-def temporal_depth_policy(request_text: str, *, tool_budget_exhausted: bool = False) -> dict[str, Any]:
+def temporal_depth_policy(
+    request_text: str,
+    *,
+    tool_budget_exhausted: bool = False,
+    provider_system: str = "unspecified",
+    requires_live_search: bool | None = None,
+) -> dict[str, Any]:
     """Return a prompt-safe transient evidence-depth policy for one request."""
 
     triggers = _temporal_triggers(request_text)
-    has_temporal_intent = bool(triggers)
+    provider_bound = str(provider_system or "unspecified") != "unspecified"
+    has_temporal_intent = bool(triggers) and (
+        bool(requires_live_search)
+        if requires_live_search is not None
+        else not provider_bound
+    )
+    if not has_temporal_intent:
+        triggers = []
     policy = {
         "schema": "keystone.temporal_depth_policy.v1",
         "temporal_intent": has_temporal_intent,

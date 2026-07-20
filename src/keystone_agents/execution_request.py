@@ -97,7 +97,7 @@ def build_execution_request(
     explicit_route = str(requested_agent or mention.route or "").strip()
     current_request = (
         mention.input_text
-        if mention.explicit and requested_agent is None
+        if mention.explicit and (requested_agent is None or is_slack_followup)
         else operator_input
     )
     resolved_entrypoint = entrypoint or (
@@ -126,6 +126,10 @@ def execution_request_planning_text(request: ExecutionRequest) -> str:
         return current
     prior_request = request.continuation.prior_request.strip()[:4000]
     prior_result = request.continuation.prior_result_summary.strip()[:2400]
+    # A typed provider continuation should re-read provider state. Previous bot
+    # prose may describe a failed route and must not become task authority.
+    if request.continuation.provider_affinity:
+        prior_result = ""
     if not prior_request and not prior_result:
         return current
     parts = [prior_request] if prior_request else []
@@ -183,16 +187,30 @@ def attach_execution_public_result(payload: dict[str, Any]) -> ExecutionPublicRe
         if isinstance(output_mapping.get("recommended_route"), Mapping)
         else False
     )
+    manual_plan = payload.get("manual_request_plan")
+    manual_plan_mapping = (
+        manual_plan if isinstance(manual_plan, Mapping) else {}
+    )
+    semantic_plan = str(manual_plan_mapping.get("source") or "") == "llm"
+    plan_requires_clarification = bool(
+        manual_plan_mapping.get("target_agent") == "clarification"
+        or manual_plan_mapping.get("intent") == "clarification"
+        or manual_plan_mapping.get("missing_required_information")
+    )
     clarification = (
         raw_status == "needs_input"
-        or bool(route_recommends_clarification and missing_information)
         or bool(
-        re.search(
-            r"\b(?:need clarification|not enough evidence to confirm|"
-            r"missing context that .* could not safely infer)\b",
-            text[:800],
-            re.IGNORECASE | re.DOTALL,
+            (route_recommends_clarification or plan_requires_clarification)
+            and missing_information
         )
+        or bool(
+            not semantic_plan
+            and re.search(
+                r"\b(?:need clarification|not enough evidence to confirm|"
+                r"missing context that .* could not safely infer)\b",
+                text[:800],
+                re.IGNORECASE | re.DOTALL,
+            )
         )
     )
     failed = raw_status in {"failed", "timeout", "error"}
@@ -306,6 +324,12 @@ def _completed_result_requires_title_omission(
     plan = payload.get("manual_request_plan")
     if not isinstance(plan, Mapping):
         return False
+    if (
+        str(plan.get("provider_system") or "unspecified") != "unspecified"
+        and str(plan.get("intent") or "")
+        in {"business_system_write", "context_lookup"}
+    ):
+        return True
     ask_shape = plan.get("ask_shape")
     if not isinstance(ask_shape, Mapping):
         return False
@@ -468,10 +492,14 @@ def _slack_continuation(raw_request: str) -> ExecutionContinuation:
         flags=re.IGNORECASE,
     )
     prior_requests = _all_envelope_values(raw_request, "Previous request")
+    provider_affinities = _all_envelope_values(raw_request, "Provider affinity")
     prior_titles = _all_envelope_values(raw_request, "Previous result title")
     prior_results = _all_envelope_values(raw_request, "Previous result")
     return ExecutionContinuation(
         work_item_id=linked_ids[-1] if linked_ids else "",
+        provider_affinity=(
+            provider_affinities[-1].lower() if provider_affinities else ""
+        ),
         prior_request=prior_requests[-1] if prior_requests else "",
         prior_result_title=prior_titles[-1] if prior_titles else "",
         prior_result_summary=prior_results[-1] if prior_results else "",

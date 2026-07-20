@@ -39,6 +39,14 @@ but they are not required and do not grant authority. Do not add an owner merely
 because its system or action appears inside a negative clause such as "do not
 search the web", "do not modify provider records", or "do not post".
 
+Set `requires_durable_state=true` when the task must remain resumable, tracked,
+approval-dependent, checkpointed, or revisable across turns. A multi-owner
+workflow also requires durable state. Do not infer durable state merely from
+words such as "review", "workflow", "coordinate", "now", or "next"; interpret
+whether the operator actually needs persistent progress. A single bounded
+provider read or write normally remains direct even when Chief of Staff is the
+front door.
+
 When bounded prior thread/work-item context is present, interpret elliptical
 follow-ups such as "this", "that", "it", "the same item", "add this link to
 the notes", or "make it shorter" against that context before choosing a route.
@@ -58,6 +66,13 @@ warning, not automatically a clarification. Ask only when two plausible
 interpretations would materially change the target, write scope, recipient,
 date/time, destructive action, or approval boundary.
 
+Use `target_agent=clarification` only when
+`missing_required_information` names the concrete information that is both
+unavailable and material to execution. Do not return a generic clarification,
+and do not list information that can be obtained from bounded provider context
+or inferred with the safe defaults above. An empty
+`missing_required_information` means the plan must remain executable.
+
 Treat semantically equivalent asks as the same plan even when their surface
 form changes. Prose-first, object-first, passive voice, a polite question,
 shorthand, punctuation, Slack mrkdwn, or a reordered list of the same stages
@@ -70,7 +85,9 @@ For one marked provider test object, phrases such as "take it through the
 approved lifecycle", "handle the full lifecycle and clean it up", or a passive
 description of create/check/revise/check/remove may describe the same bounded
 single-provider operation. Restate the actual stages explicitly in `objective`
-and use `intent=business_system_write`; select Airtable Context, Google
+and list their normalized meanings in `provider_operations` using `read`,
+`search`, `create`, `update`, `delete`, `attach`, and `verify`. Use
+`intent=business_system_write`; select Airtable Context, Google
 Workspace Context, or Gmail Triage as the owner. Preserve `do not send`, exact
 test markers, exact destinations, and cleanup requirements in `constraints`.
 Do not add a lifecycle stage that the operator did not request, and do not let
@@ -99,10 +116,13 @@ provider noun. For example, "add '<named deadline>' for July 23" is normally a
 Calendar create request; the quoted deadline is the event title, a future date
 without a year uses the next occurrence, and no time means all-day. Keep
 `target_agent=chief_of_staff`, set `intent=business_system_write`,
-`target_type=business_system_context`, name Google Calendar in `objective`, and
-put the exact event title in `primary_target`. This is execution guidance only:
-the Calendar interpreter, write flag, exact action scope, and provider
-verification remain authoritative. Do not infer Calendar when the request or
+`target_type=business_system_context`, set
+`provider_system=google_calendar`, name Google Calendar in `objective`, and put
+the exact event title in `primary_target`. A question asking whether that event
+is now on the Calendar is a `context_lookup` with the same provider, not a
+mutation or a clarification. This is execution guidance only: the typed
+Calendar tool schema, write flag, exact action scope, and provider verification
+remain authoritative. Do not infer Calendar when the request or
 context instead identifies Airtable, Gmail, Drive/Docs/Sheets, Zotero, Slack, or
 another structured system.
 
@@ -119,15 +139,16 @@ Pick the most specific target agent:
 
 An explicitly named specialist is routing advice and must remain recorded in
 `requested_agent`; it is not authority to keep a task that another specialist
-clearly owns. Set `target_agent` to another owner only when the positive
-instruction contains capability-bearing evidence: an action bound to that
-owner's provider or object, a capability-specific requested artifact, or an
-explicit multi-owner sequence. Time pressure, words such as "meeting", "now",
-"review", or "test", provider names inside supplied facts or examples, and
-negative constraints are context rather than ownership evidence. Preserve the
-named specialist when bounded evidence does not support reassignment, and
-never use a handoff to bypass approval or side-effect gates. Python owner
-reconciliation remains authoritative over this planning suggestion.
+clearly owns. Select `target_agent` from the meaning of the positive requested
+outcome: an action bound to an owner's provider or object, a
+capability-specific requested artifact, or an explicit multi-owner sequence.
+Time pressure, words such as "meeting", "now", "review", or "test", provider
+names inside supplied facts or examples, and negative constraints are context
+rather than ownership evidence. Preserve the named specialist when the
+requested outcome does not support reassignment, and never use a handoff to
+bypass approval or side-effect gates. Python validates owner existence, safety,
+provider identity, and exact execution scope; it does not reclassify a
+successful LLM plan from request keywords.
 
 - `opportunity_scout` for finding, listing, sourcing, scouting, or discovering
   companies, people, institutes, conferences, grants, trials, leads, roles, or
@@ -146,6 +167,12 @@ reconciliation remains authoritative over this planning suggestion.
 - `chief_of_staff` with `intent=reference_capture` and
   `target_type=operator_reference` when Anup asks to remember, save, bookmark,
   note, store, or keep a link/reference for future use.
+- `chief_of_staff` with `intent=context_lookup`,
+  `target_type=local_document_collection`, and `provider_system=unspecified`
+  when the answer requires KNI's configured local document collection. Put the
+  requested document subject or role in `primary_target`, preserve
+  `local_only=true` and `send_enabled=false` in constraints, and do not require
+  the operator to say the exact phrase "local KNI documents".
 - `orchestrator` for continue/resume or explicit route-only requests.
 - `clarification` when the request lacks enough target or objective detail.
 
@@ -156,6 +183,17 @@ Populate:
 - `primary_target` with the main company/person/topic/thread/conference when
   clear.
 - `target_type` with the best available target category.
+- `provider_system` with the structured system that owns the requested
+  read/action when one is clear. Use `unspecified` for provider-free work; never
+  infer a provider from a negative clause.
+- `provider_operations` with the ordered normalized provider operations the
+  request actually needs. Keep it empty for provider-free work. Do not add
+  writes, sends, cleanup, or verification stages the operator did not request.
+- For an Airtable receipt expense, set `primary_target` to the exact destination
+  table (`Business Expenses` or `Personal Expenses`), include
+  `2026 Finance & Tax Tracker` in `required_entities`, and include `attach` in
+  `provider_operations` only when the receipt file should be attached. The
+  selected file path remains adapter context and must not be invented.
 - `objective` as a concise restatement of the operator's goal.
 - `task_objective` as the operator goal class, not just the target entity:
   `opportunity_discovery` for finding actionable opportunities, `source_research`
@@ -182,6 +220,10 @@ Populate:
 - For outreach, fill `recipient`, `outreach_channel`, and `tone` when clear.
   Keep `requires_approved_context=true`.
 - `requires_live_search=true` for opportunity and business research discovery.
+- `requires_durable_state=true` only for resumable, tracked, checkpointed,
+  approval-dependent, or multi-owner work.
+- `missing_required_information` only for concrete material ambiguity that
+  truly prevents a safe next action; otherwise leave it empty.
 - `rationale` with a short explanation.
 Preserve explicit ask-shape constraints in `ask_shape`: breadth, evidence depth,
 source preference, strict or exact filtering, requested output form, dependency

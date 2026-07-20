@@ -430,7 +430,7 @@ def run_orchestrator_preflight(
     )
     explicit_agent = manual_plan.requested_agent
     advisory_only = explicit_agent not in {None, "orchestrator"}
-    selected_agent = str(explicit_agent or route_result.route)
+    selected_agent = str(route_result.route or manual_plan.target_agent)
     block_kind, block_reason = _preflight_block(route_result)
     execution_allowed = not bool(block_kind)
     return OrchestratorPreflight(
@@ -2912,6 +2912,7 @@ def _route_from_manual_plan(
     if plan.rationale:
         audit_notes.append(f"Manual plan rationale: {plan.rationale}")
     audit_notes.extend(plan.planner_warnings)
+    semantic_authority = plan.source == "llm"
     if plan.intent == "blocked_send":
         result = _send_refusal(
             approved_context_present=approved_context_present,
@@ -2982,6 +2983,8 @@ def _route_from_manual_plan(
         )
         return _with_crm_write_boundary(result, request_text=request_text)
     if (
+        not semantic_authority
+        and
         not approved_context_present
         and route == "outreach_composer"
         and _requires_research_before_outreach(request_text)
@@ -2998,7 +3001,7 @@ def _route_from_manual_plan(
             else "deterministic",
             audit_notes=audit_notes,
         )
-    if _mixed_outreach_request_requires_context_gate(
+    if not semantic_authority and _mixed_outreach_request_requires_context_gate(
         request_text,
         approved_context_present=approved_context_present,
     ):
@@ -3051,7 +3054,10 @@ def _route_from_manual_plan(
                     "Outreach approval context was not required by the semantic plan.",
                 ],
             )
-        thread_local_draft = _looks_like_thread_local_draft_request(request_text)
+        thread_local_draft = bool(
+            not semantic_authority
+            and _looks_like_thread_local_draft_request(request_text)
+        )
         if not approved_context_present and not thread_local_draft:
             result = _missing_outreach_context_refusal(workflow_state=workflow_state)
             result.audit_notes = [*result.audit_notes, *audit_notes]
@@ -3094,7 +3100,11 @@ def _route_from_manual_plan(
         "opportunity_scout",
         "chief_of_staff",
     }:
-        if route == "opportunity_scout" and _looks_like_discovery_outreach_workflow(request_text):
+        if (
+            not semantic_authority
+            and route == "opportunity_scout"
+            and _looks_like_discovery_outreach_workflow(request_text)
+        ):
             result = _safe_discovery_outreach_workflow_result(
                 request_text=request_text,
                 approved_context_present=approved_context_present,
@@ -3103,9 +3113,13 @@ def _route_from_manual_plan(
             result.audit_notes = [*result.audit_notes, *audit_notes]
             return result
         workflow = None
-        if route == "gmail_triage":
+        if not semantic_authority and route == "gmail_triage":
             workflow = _gmail_cross_agent_workflow(request_text) or None
-        elif workflow is None and plan.requested_agent == "orchestrator":
+        elif (
+            not semantic_authority
+            and workflow is None
+            and plan.requested_agent == "orchestrator"
+        ):
             workflow = _requested_cross_agent_workflow(request_text, start_route=route) or None
         result = _result(
             route=route,
