@@ -1,0 +1,94 @@
+{
+  "schema": "keystone.slack_natural_followup_replay.v1",
+  "message_action_payload": {
+    "type": "message_action",
+    "callback_id": "keystone_run_agent_message",
+    "trigger_id": "fixture-trigger",
+    "team": {
+      "id": "T-FIXTURE",
+      "domain": "fixture"
+    },
+    "channel": {
+      "id": "C-FIXTURE",
+      "name": "ai-agents-workflow"
+    },
+    "user": {
+      "id": "U-OPERATOR",
+      "username": "operator"
+    },
+    "message": {
+      "type": "message",
+      "user": "U-OPERATOR",
+      "ts": "1900000000.100100",
+      "thread_ts": "1900000000.100100",
+      "text": "Chief of Staff, check yesterday's inbox and pick the one email that most needs a reply. Draft it here only and do not change Gmail.",
+      "permalink": "https://fixture.slack.test/archives/C-FIXTURE/p1900000000100100"
+    }
+  },
+  "thread_messages": [
+    {
+      "type": "message",
+      "ts": "1900000000.100100",
+      "user": "U-OPERATOR",
+      "username": "operator",
+      "text": "Chief of Staff, check yesterday's inbox and pick the one email that most needs a reply. Draft it here only and do not change Gmail."
+    },
+    {
+      "type": "message",
+      "subtype": "bot_message",
+      "bot_id": "B-KNI",
+      "ts": "1900000060.200200",
+      "user": "U-KNI",
+      "username": "KNI",
+      "text": "Business Agents Completion Not Confirmed\nNo grounded Gmail reply draft yet.\n\nMetadata\n* Source focus: matched_sample_sources\nEval: case slack_gmail_retry_001. Dashboard: http://127.0.0.1:8769/dashboard?case=slack_gmail_retry_001\nMore research button"
+    },
+    {
+      "type": "message",
+      "ts": "1900000120.300300",
+      "user": "U-OPERATOR",
+      "username": "operator",
+      "text": "Try yesterday once more, but leave Gmail exactly as it is."
+    }
+  ],
+  "current_request": "Actually, leave email alone. Zotero Context Agent, what's the title of the most recently added journal article? Just answer here and don't modify Zotero.",
+  "requested_agent": "zotero_context_agent",
+  "expected": {
+    "selected_agent": "zotero_context_agent",
+    "intent": "context_lookup",
+    "provider_system": "zotero",
+    "workflow": [],
+    "forbidden_transcript_fragments": [
+      "matched_sample_sources",
+      "slack_gmail_retry_001",
+      "127.0.0.1:8769",
+      "More research button"
+    ]
+  },
+  "prior_provider_run": {
+    "agent_name": "gmail_triage",
+    "input_summary": "Check yesterday's inbox read-only.",
+    "output": {
+      "manual_request_plan": {
+        "provider_system": "gmail",
+        "gmail_mailbox_direction": "inbound",
+        "gmail_date_scope": "yesterday"
+      },
+      "user_facing_result_verified": true,
+      "script_payload": {
+        "tool_receipts": [
+          {
+            "provider_read": true,
+            "provider_write": false,
+            "complete": true,
+            "verified": true,
+            "message_count": 4,
+            "query": "to:me -in:sent after:fixture-start before:fixture-end",
+            "timezone": "America/New_York",
+            "window_start": "2026-07-24T00:00:00-04:00",
+            "window_end": "2026-07-25T00:00:00-04:00"
+          }
+        ]
+      }
+    }
+  }
+}

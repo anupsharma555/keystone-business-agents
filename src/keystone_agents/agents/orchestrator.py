@@ -81,6 +81,7 @@ from keystone_agents.sdk import (
     compose_instructions,
     function_tool,
 )
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.source_layer_context import runtime_source_layer_policy_context
 from keystone_agents.specialist_agent_tools import build_specialist_agent_tools
@@ -865,6 +866,8 @@ def _result(
     artifact: tuple[str, str] | None = None,
     approval_scope: ApprovalScope = ApprovalScope.DRAFTING,
     approval_state: ApprovalState = ApprovalState.PENDING,
+    approval_required: bool = True,
+    requires_human_review: bool = True,
     approval_rationale: str = "",
     routing_mode: str = "deterministic",
     workflow_state: Mapping[str, Any] | None = None,
@@ -896,8 +899,8 @@ def _result(
         rationale=rationale,
         clarification_request=clarification_request,
         stop_reason=stop_reason,
-        requires_human_review=True,
-        approval_required=True,
+        requires_human_review=requires_human_review,
+        approval_required=approval_required,
         approval_state=approval_state,
         approval_scope=approval_scope,
         approval_rationale=approval_rationale,
@@ -916,7 +919,11 @@ def _result(
             rejected_routes=rejected_routes,
             safety_gates_applied=[
                 "no_send_enforced",
-                "approval_required",
+                *(
+                    ["approval_required"]
+                    if approval_required
+                    else ["read_only_no_approval_required"]
+                ),
                 "guardrail_assessment",
             ],
             missing_information_blockers=blockers,
@@ -1084,6 +1091,7 @@ def _hard_safety_refusal(
     *,
     approved_context_present: bool,
     workflow_state: Mapping[str, Any],
+    owning_route: RouteName = "clarification",
 ) -> OrchestratorResult | None:
     assessment = assess_text_guardrails(text, check_outreach_claims=False)
     blocking_flags = sorted(_HARD_REFUSAL_FLAGS.intersection(assessment.risk_flags))
@@ -1091,7 +1099,7 @@ def _hard_safety_refusal(
         return None
     reasons = ", ".join(assessment.reasons) or "safety policy"
     return _result(
-        route="clarification",
+        route=owning_route,
         rationale="The request is blocked by deterministic Keystone safety gates.",
         refused=True,
         stop_reason=f"Blocked by Python safety gate: {reasons}.",
@@ -1389,9 +1397,47 @@ def _research_first_outreach_workflow_result(
 def _missing_outreach_context_refusal(
     *,
     workflow_state: Mapping[str, Any],
+    owning_route: RouteName = "outreach_composer",
 ) -> OrchestratorResult:
+    if owning_route == "business_research_analyst":
+        return _result(
+            route=owning_route,
+            rationale=(
+                "The research-first workflow is retained, but the target must be "
+                "identified before research can produce approved outreach context."
+            ),
+            refused=True,
+            stop_reason=(
+                "An exact company or vendor target is required before research; "
+                "approved source-backed context is required before outreach drafting."
+            ),
+            clarification_request=(
+                "Which company or vendor should I review?\n\n"
+                "*Answer:*\n"
+                "I can keep the full research, fit assessment, and draft-only next-step "
+                "workflow, but I need the exact target before searching or drafting.\n\n"
+                "*What I need:*\n"
+                "* Target: company name, URL, or the selected thread item.\n"
+                "* Boundary: research comes first; any outreach uses only approved "
+                "source-backed findings and remains draft-only.\n"
+                "* No search, draft, send, post, CRM write, file write, schedule, "
+                "publish, or external action has been taken.\n\n"
+                "*Reply with:*\n"
+                "\"Target: ...\""
+            ),
+            approval_scope=ApprovalScope.DRAFTING,
+            approval_rationale=(
+                "Research may start after target resolution; outreach drafting remains "
+                "blocked until approved source-backed context exists."
+            ),
+            workflow_state=workflow_state,
+            workflow=["business_research_analyst", "outreach_composer"],
+            audit_notes=[
+                "Target resolution stopped the retained research-first outreach workflow."
+            ],
+        )
     return _result(
-        route="clarification",
+        route=owning_route,
         rationale="Outreach drafting requires approved company or opportunity context.",
         refused=True,
         stop_reason=(
@@ -2887,10 +2933,19 @@ def _manual_plan_for_request(
     enabled: bool,
 ) -> ManualRequestPlan | None:
     if provided is not None:
-        return (
-            provided
-            if isinstance(provided, ManualRequestPlan)
-            else ManualRequestPlan.model_validate(provided)
+        authority = ExecutionIntentAuthority.from_value(provided)
+        if authority.plan is not None:
+            return authority.plan
+        return ManualRequestPlan(
+            source="invalid_supplied_plan",
+            target_agent="clarification",
+            intent="clarification",
+            task_objective="clarification",
+            missing_required_information=["valid canonical manual request plan"],
+            rationale=(
+                "A supplied execution plan was invalid. Orchestrator did not "
+                "reinterpret the raw request through compatibility routing."
+            ),
         )
     if not enabled:
         return None
@@ -2912,7 +2967,7 @@ def _route_from_manual_plan(
     if plan.rationale:
         audit_notes.append(f"Manual plan rationale: {plan.rationale}")
     audit_notes.extend(plan.planner_warnings)
-    semantic_authority = plan.source == "llm"
+    semantic_authority = ExecutionIntentAuthority.from_value(plan).canonical
     if plan.intent == "blocked_send":
         result = _send_refusal(
             approved_context_present=approved_context_present,
@@ -2935,6 +2990,29 @@ def _route_from_manual_plan(
             }
         )
     )
+    if _chief_owns_context_summary_plan(plan):
+        result = _result(
+            route="chief_of_staff",
+            rationale=plan.objective
+            or "Chief of Staff owns the combined read-only context answer.",
+            artifact=("input_type", plan.target_type),
+            approval_required=False,
+            requires_human_review=False,
+            approval_scope=ApprovalScope.RESEARCH,
+            approval_state=ApprovalState.APPROVED_FOR_RESEARCH,
+            approval_rationale=(
+                "The selected sources are read-only advisor inputs; Chief of Staff "
+                "owns the combined answer and no provider write is authorized."
+            ),
+            routing_mode="llm" if semantic_authority else "deterministic",
+            workflow_state=workflow_state,
+            audit_notes=[
+                *audit_notes,
+                "Context workflow entries retained as Chief advisory tools.",
+            ],
+            workflow=planned_workflow,
+        )
+        return _with_crm_write_boundary(result, request_text=request_text)
     if len(planned_workflow) > 1:
         if "outreach_composer" in planned_workflow and not approved_context_present:
             outreach_index = planned_workflow.index("outreach_composer")
@@ -2967,9 +3045,7 @@ def _route_from_manual_plan(
                 "scoped external-use approval permits publication."
             ),
             artifact=("input_type", plan.target_type),
-            routing_mode=plan.source
-            if plan.source in {"llm", "llm_unavailable"}
-            else "deterministic",
+            routing_mode="llm" if semantic_authority else "deterministic",
             workflow_state=workflow_state,
             audit_notes=[
                 *audit_notes,
@@ -2996,9 +3072,7 @@ def _route_from_manual_plan(
         return _research_first_outreach_workflow_result(
             request_text=request_text,
             workflow_state=workflow_state,
-            routing_mode=plan.source
-            if plan.source in {"llm", "llm_unavailable"}
-            else "deterministic",
+            routing_mode="llm" if semantic_authority else "deterministic",
             audit_notes=audit_notes,
         )
     if not semantic_authority and _mixed_outreach_request_requires_context_gate(
@@ -3014,7 +3088,14 @@ def _route_from_manual_plan(
             for step in ("business_research_analyst", "opportunity_scout", "gmail_triage")
         )
         if not has_research_first_path and (route != "gmail_triage" or not _gmail_cross_agent_workflow(request_text)):
-            result = _missing_outreach_context_refusal(workflow_state=workflow_state)
+            result = _missing_outreach_context_refusal(
+                workflow_state=workflow_state,
+                owning_route=(
+                    route
+                    if route not in {"orchestrator", "clarification"}
+                    else "outreach_composer"
+                ),
+            )
             result.audit_notes = [*result.audit_notes, *audit_notes]
             return result
     if route == "clarification":
@@ -3045,9 +3126,7 @@ def _route_from_manual_plan(
                     "No outreach artifact or external-use action was requested; "
                     "ordinary send and publish gates remain unchanged."
                 ),
-                routing_mode=plan.source
-                if plan.source in {"llm", "llm_unavailable"}
-                else "deterministic",
+                routing_mode="llm" if semantic_authority else "deterministic",
                 workflow_state=workflow_state,
                 audit_notes=[
                     *audit_notes,
@@ -3076,9 +3155,7 @@ def _route_from_manual_plan(
                 "Manual request plan selected outreach; any draft remains pending "
                 "external-use approval."
             ),
-            routing_mode=plan.source
-            if plan.source in {"llm", "llm_unavailable"}
-            else "deterministic",
+            routing_mode="llm" if semantic_authority else "deterministic",
             workflow_state=workflow_state,
             audit_notes=audit_notes,
         )
@@ -3088,9 +3165,15 @@ def _route_from_manual_plan(
             rationale=plan.objective
             or f"The manual request plan selected {route} for read-only context lookup.",
             artifact=("input_type", plan.target_type),
-            routing_mode=plan.source
-            if plan.source in {"llm", "llm_unavailable"}
-            else "deterministic",
+            approval_required=False,
+            requires_human_review=False,
+            approval_scope=ApprovalScope.RESEARCH,
+            approval_state=ApprovalState.APPROVED_FOR_RESEARCH,
+            approval_rationale=(
+                "The canonical plan authorizes a read-only provider lookup; no "
+                "separate drafting or external-use approval is required."
+            ),
+            routing_mode="llm" if semantic_authority else "deterministic",
             workflow_state=workflow_state,
             audit_notes=audit_notes,
         )
@@ -3126,9 +3209,7 @@ def _route_from_manual_plan(
             rationale=plan.objective
             or f"The manual request plan selected {route} for this request.",
             artifact=("input_type", plan.target_type),
-            routing_mode=plan.source
-            if plan.source in {"llm", "llm_unavailable"}
-            else "deterministic",
+            routing_mode="llm" if semantic_authority else "deterministic",
             workflow_state=workflow_state,
             audit_notes=audit_notes,
             retrieval_hint=_route_retrieval_hint(
@@ -3139,6 +3220,16 @@ def _route_from_manual_plan(
         )
         return _with_crm_write_boundary(result, request_text=request_text)
     return None
+
+
+def _chief_owns_context_summary_plan(plan: ManualRequestPlan) -> bool:
+    return bool(
+        plan.target_agent == "chief_of_staff"
+        and plan.intent == "context_lookup"
+        and plan.task_objective == "context_lookup"
+        and plan.expected_artifact_type == "context_summary"
+        and plan.ask_shape.permission_state == "read_only"
+    )
 
 
 def _manual_plan_is_read_only_context_lookup(
@@ -3289,6 +3380,13 @@ def route_request(
         text,
         approved_context_present=approved_context_present,
         workflow_state=state_context,
+        owning_route=(
+            resolved_manual_plan.target_agent
+            if resolved_manual_plan is not None
+            and resolved_manual_plan.target_agent
+            not in {"orchestrator", "clarification"}
+            else "clarification"
+        ),
     )
     if safety_refusal is not None:
         return finish(safety_refusal)
@@ -3518,9 +3616,15 @@ def _attach_handoff_metadata(agent: Agent) -> Agent:
     return agent
 
 
-def _build_read_only_specialist_tools() -> list[Any]:
+def _build_read_only_specialist_tools(
+    *,
+    raw_operator_request: str = "",
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+) -> list[Any]:
     return build_specialist_agent_tools(
         manager_agent_name="orchestrator",
+        raw_operator_request=raw_operator_request,
+        manual_request_plan=manual_request_plan,
         include_routes={"business_research_analyst", "opportunity_scout"},
         route_tool_name_overrides={
             "business_research_analyst": BUSINESS_RESEARCH_TOOL_NAME,
@@ -3549,6 +3653,7 @@ def build_orchestrator_agent(
     include_handoffs: bool = True,
     include_specialist_tools: bool | None = None,
     request_text: str = "",
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
@@ -3571,7 +3676,10 @@ def build_orchestrator_agent(
         spec.build_agent() for spec in SPECIALIST_AGENT_SPECS if spec.handoff_enabled
     ] if include_handoffs else []
     specialist_tools = (
-        _build_read_only_specialist_tools()
+        _build_read_only_specialist_tools(
+            raw_operator_request=request_text,
+            manual_request_plan=manual_request_plan,
+        )
         if (
             include_specialist_tools
             if include_specialist_tools is not None
@@ -3680,6 +3788,7 @@ def run_orchestrator_sdk(
     session: Any | None = None,
     include_specialist_tools: bool | None = None,
     tool_tier: str | int | None = None,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
 ) -> TypedAgentRunResult[OrchestratorResult]:
     """Run the orchestrator through the shared typed SDK harness."""
 
@@ -3694,6 +3803,7 @@ def run_orchestrator_sdk(
             include_handoffs=False,
             include_specialist_tools=include_specialist_tools,
             request_text=skill_request_text(typed_input),
+            manual_request_plan=manual_request_plan,
             tool_tier=resolved_tool_tier,
         ),
         typed_input=typed_input_for_run,

@@ -204,6 +204,12 @@ def build_chief_specialist_tool_input(options: Mapping[str, Any]) -> str:
     params = _as_mapping(options.get("params"))
     if not params:
         params = ChiefSpecialistToolInput().model_dump(mode="json")
+    canonical_plan = _as_mapping(params.get("canonical_manual_request_plan"))
+    structured_context = {
+        key: value
+        for key, value in params.items()
+        if key != "canonical_manual_request_plan"
+    }
     summary = str(options.get("summary") or "").strip()
     sections = [
         "You are being called by Chief of Staff as an advisory specialist tool.",
@@ -215,10 +221,28 @@ def build_chief_specialist_tool_input(options: Mapping[str, Any]) -> str:
         "",
         "## Raw Operator Request",
         _compact_text(params.get("raw_operator_request")),
-        "",
-        "## Structured Chief Context",
-        json.dumps(params, ensure_ascii=True, sort_keys=True, indent=2),
     ]
+    if canonical_plan:
+        sections.extend(
+            [
+                "",
+                "## Canonical Manual Request Plan",
+                json.dumps(canonical_plan, ensure_ascii=True, sort_keys=True, indent=2),
+                (
+                    "Use canonical provider, operation, tool, query, scope, field, "
+                    "selection, output, and safety fields as execution authority. "
+                    "You may report a non-safety inconsistency within your admitted "
+                    "capability, but do not silently rewrite this plan."
+                ),
+            ]
+        )
+    sections.extend(
+        [
+            "",
+            "## Structured Chief Context",
+            json.dumps(structured_context, ensure_ascii=True, sort_keys=True, indent=2),
+        ]
+    )
     if summary:
         sections.extend(["", "## Input Schema Summary", summary])
     sections.extend(
@@ -229,6 +253,36 @@ def build_chief_specialist_tool_input(options: Mapping[str, Any]) -> str:
         ]
     )
     return "\n".join(sections).strip()
+
+
+def build_bound_chief_specialist_tool_input(
+    options: Mapping[str, Any],
+    *,
+    raw_operator_request: str = "",
+    manual_request_plan: Mapping[str, Any] | BaseModel | None = None,
+) -> str:
+    """Bind canonical request authority after model tool arguments are validated.
+
+    Chief may refine ``specialist_task`` and the bounded context fields, but it
+    must not rewrite the immutable operator ask or erase the reconciled plan
+    before the selected specialist sees them.
+    """
+
+    params = _as_mapping(options.get("params"))
+    immutable_request = str(raw_operator_request or "").strip()
+    if immutable_request:
+        params["raw_operator_request"] = immutable_request
+    canonical_plan = _jsonable(manual_request_plan)
+    if isinstance(canonical_plan, Mapping) and canonical_plan:
+        params["canonical_manual_request_plan"] = {
+            str(key): value for key, value in canonical_plan.items()
+        }
+    return build_chief_specialist_tool_input(
+        {
+            **_as_mapping(options),
+            "params": params,
+        }
+    )
 
 
 def _nested_output_payload(output: Any) -> tuple[dict[str, Any], str]:
@@ -371,6 +425,8 @@ def build_specialist_agent_tools(
     *,
     manager_agent_name: str,
     mode: SpecialistToolMode = "read_plan",
+    raw_operator_request: str = "",
+    manual_request_plan: Mapping[str, Any] | BaseModel | None = None,
     approval_context: Mapping[str, Any] | None = None,
     specs: Sequence[AgentSpec] = SPECIALIST_AGENT_SPECS,
     route_tool_name_overrides: Mapping[str, str] | None = None,
@@ -412,6 +468,20 @@ def build_specialist_agent_tools(
                 tool_name=resolved_tool_name,
             )
 
+        def input_builder(
+            options: Mapping[str, Any],
+            *,
+            bound_raw_operator_request: str = raw_operator_request,
+            bound_manual_request_plan: Mapping[str, Any] | BaseModel | None = (
+                manual_request_plan
+            ),
+        ) -> str:
+            return build_bound_chief_specialist_tool_input(
+                options,
+                raw_operator_request=bound_raw_operator_request,
+                manual_request_plan=bound_manual_request_plan,
+            )
+
         mode_note = (
             "approved-write planning helper; Chief of Staff owns any actual write tools"
             if mode == "approved_write"
@@ -440,7 +510,7 @@ def build_specialist_agent_tools(
                 tool_name=tool_name,
                 tool_description=description,
                 parameters=ChiefSpecialistToolInput,
-                input_builder=build_chief_specialist_tool_input,
+                input_builder=input_builder,
                 custom_output_extractor=output_extractor,
                 max_turns=max_turns,
             )
@@ -451,7 +521,7 @@ def build_specialist_agent_tools(
         _safe_setattr(tools[-1], "nested_tool_names", tuple(_tool_name(tool) for tool in agent.tools))
         _safe_setattr(tools[-1], "specialist_input_model", ChiefSpecialistToolInput)
         _safe_setattr(tools[-1], "specialist_result_model", ChiefNestedSpecialistResult)
-        _safe_setattr(tools[-1], "specialist_input_builder", build_chief_specialist_tool_input)
+        _safe_setattr(tools[-1], "specialist_input_builder", input_builder)
         _safe_setattr(tools[-1], "specialist_output_extractor", output_extractor)
         _safe_setattr(
             tools[-1],

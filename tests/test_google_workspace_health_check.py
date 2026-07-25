@@ -17,7 +17,14 @@ def test_google_health_check_offline_accepts_configured_tokens(tmp_path: Path) -
     token_payload = {
         "refresh_token": "refresh-secret-value",
         "token": "access-secret-value",
-        "scope": "scope-value",
+        "scopes": [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/documents",
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/calendar.events",
+            "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+        ],
     }
     secret_payload = {
         "installed": {
@@ -80,3 +87,52 @@ def test_google_health_check_offline_warns_for_missing_live_tokens(tmp_path: Pat
     assert checks["google_workspace_oauth"]["details"]["issues"] == ["oauth_token_missing"]
     assert checks["gmail_oauth"]["details"]["issues"] == ["oauth_token_missing"]
     assert checks["calendar_oauth"]["details"]["issues"] == ["oauth_token_missing"]
+
+
+def test_google_health_check_reports_missing_selected_calendar_scope(
+    tmp_path: Path,
+) -> None:
+    token = tmp_path / "token.json"
+    secret = tmp_path / "credentials.json"
+    token.write_text(
+        json.dumps(
+            {
+                "refresh_token": "refresh-secret-value",
+                "token": "access-secret-value",
+                "scopes": [
+                    "https://www.googleapis.com/auth/gmail.modify",
+                    "https://www.googleapis.com/auth/calendar.events",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    secret.write_text(
+        json.dumps(
+            {
+                "installed": {
+                    "client_id": "client-id-value",
+                    "client_secret": "client-secret-value",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = run_google_health_check(
+        {
+            "GOOGLE_TOKEN_FILE": str(token),
+            "GOOGLE_CREDENTIALS_FILE": str(secret),
+            "GMAIL_LIVE_READ_ENABLED": "true",
+        },
+        live=False,
+    )
+
+    assert report["overall_status"] == "warning"
+    checks = {check["name"]: check for check in report["checks"]}
+    assert checks["gmail_oauth"]["status"] == "ok"
+    assert checks["calendar_oauth"]["status"] == "warning"
+    assert checks["calendar_oauth"]["details"]["issues"] == [
+        "oauth_scope_missing:"
+        "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
+    ]

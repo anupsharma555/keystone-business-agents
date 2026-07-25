@@ -34,6 +34,8 @@ from keystone_agents.guardrails import (
     keystone_guardrails,
 )
 from keystone_agents.models import (
+    GmailCandidateRankingSDKInput,
+    GmailContactLookupSDKInput,
     GmailPriorityGroupingSDKInput,
     GmailTriageSDKInput,
     TypedAgentRunResult,
@@ -42,6 +44,8 @@ from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.email_style import EmailStyleProfile
 from keystone_agents.schemas.email_triage import (
     EmailTriageResult,
+    GmailCandidateRankingResult,
+    GmailContactLookupResult,
     GmailMailboxActionPlan,
     GmailMessageEnvelope,
     GmailPriorityGroupedMessage,
@@ -593,6 +597,77 @@ def run_gmail_priority_grouping_sdk(
     return replace(result, output=normalized_output)
 
 
+def run_gmail_candidate_ranking_sdk(
+    typed_input: GmailCandidateRankingSDKInput,
+    *,
+    run_config: Any | None = None,
+    live: bool = False,
+    model: str | None = None,
+    session: Any | None = None,
+    max_turns: int | None = None,
+) -> TypedAgentRunResult[GmailCandidateRankingResult]:
+    """Run selection-only Gmail candidate reasoning through the SDK."""
+
+    agent = build_gmail_candidate_ranking_agent(
+        model=model,
+        request_text=typed_input.operator_request,
+    )
+    turn_policy = resolve_sdk_turn_policy(
+        "gmail_priority_grouping",
+        request_text=typed_input.operator_request,
+        explicit_max_turns=max_turns,
+    )
+    result = run_typed_sdk_agent(
+        agent=agent,
+        typed_input=typed_input,
+        output_type=GmailCandidateRankingResult,
+        run_config=run_config,
+        live=live,
+        session=session,
+        max_turns=turn_policy.max_turns,
+    )
+    if not isinstance(result, TypedAgentRunResult):
+        return result
+    normalized_output = result.final_output.model_copy(
+        update={
+            "request_summary": typed_input.operator_request,
+            "source_message_count": len(typed_input.messages),
+        }
+    )
+    return replace(result, output=normalized_output)
+
+
+def run_gmail_contact_lookup_sdk(
+    typed_input: GmailContactLookupSDKInput,
+    *,
+    run_config: Any | None = None,
+    live: bool = False,
+    model: str | None = None,
+    session: Any | None = None,
+    max_turns: int | None = None,
+) -> TypedAgentRunResult[GmailContactLookupResult]:
+    """Run one bounded Gmail contact-evidence answer through the SDK."""
+
+    agent = build_gmail_contact_lookup_agent(
+        model=model,
+        request_text=typed_input.operator_request,
+    )
+    turn_policy = resolve_sdk_turn_policy(
+        "gmail_triage",
+        request_text=typed_input.operator_request,
+        explicit_max_turns=max_turns,
+    )
+    return run_typed_sdk_agent(
+        agent=agent,
+        typed_input=typed_input,
+        output_type=GmailContactLookupResult,
+        run_config=run_config,
+        live=live,
+        session=session,
+        max_turns=turn_policy.max_turns,
+    )
+
+
 def build_gmail_triage_agent(
     model: str | None = None,
     *,
@@ -742,5 +817,65 @@ def build_gmail_priority_grouping_agent(
         handoff_description=(
             "Use for batch Gmail priority grouping with urgent-only draft guidance and "
             "no live side effects."
+        ),
+    )
+
+
+def build_gmail_candidate_ranking_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+) -> Agent:
+    """Build the selection-only Gmail candidate-ranking agent."""
+
+    return build_sdk_agent(
+        name="gmail_triage",
+        instructions=compose_direct_instructions(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "gmail_candidate_ranking.md",
+            skill_files=select_agent_skill_names(
+                "gmail_triage",
+                request_text=request_text,
+                compact=True,
+            ),
+        ),
+        output_type=GmailCandidateRankingResult,
+        tools=[],
+        guardrails=keystone_guardrails(),
+        model=model,
+        policy_agent_name="gmail_triage",
+        handoff_description=(
+            "Use for read-only semantic selection from one bounded Gmail provider result."
+        ),
+    )
+
+
+def build_gmail_contact_lookup_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+) -> Agent:
+    """Build the no-tool specialist for bounded Gmail contact evidence."""
+
+    return build_sdk_agent(
+        name="gmail_triage",
+        instructions=compose_direct_instructions(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "gmail_contact_lookup.md",
+            skill_files=select_agent_skill_names(
+                "gmail_triage",
+                request_text=request_text,
+                compact=True,
+            ),
+        ),
+        output_type=GmailContactLookupResult,
+        tools=[],
+        guardrails=keystone_guardrails(),
+        model=model,
+        policy_agent_name="gmail_triage",
+        handoff_description=(
+            "Use for read-only known-contact resolution from bounded Gmail evidence."
         ),
     )

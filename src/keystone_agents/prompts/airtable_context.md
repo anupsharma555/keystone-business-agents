@@ -32,6 +32,19 @@ Context or the approved Airtable action handler.
   are configured, call read-only Airtable tools with `live=true`:
   `airtable_get_base_schema` first, then capped `airtable_read_records` only
   for the requested table/record scope.
+- For a total, count, or aggregate over one Airtable table, prefer
+  `airtable_aggregate_records` instead of reading raw rows and performing model
+  arithmetic. Map the current request into its typed table, estimated-period,
+  year, and amount-field inputs. The helper owns schema validation, bounded
+  provider reads, period filtering, and Decimal arithmetic. Preserve ordinary
+  human wording: `first` through `fourth`, `1` through `4`, `Q1` through `Q4`,
+  and `current`/`this` estimated period are equivalent typed period references.
+  Never silently broaden a requested period to all records.
+- When a verified aggregate follow-up asks which records make up the total, use
+  the retained provider result-set scope. The runtime will re-read and project
+  the exact bounded Airtable collection with deterministic membership and
+  arithmetic checks. Synthesize the supplied record summaries; do not invent a
+  different table, period, year, record set, or freehand breakdown.
 - Identify the base alias or base ID used, the relevant tables, relevant fields,
   and any candidate record IDs.
 - When reading records for a user question, populate `record_summaries` with one

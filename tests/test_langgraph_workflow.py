@@ -38,6 +38,7 @@ from keystone_agents.schemas.chief_of_staff import (
 )
 from keystone_agents.schemas.weekly_ops import WeeklyOpsAssemblyInput
 from keystone_agents.schemas.work_item import (
+    UserFacingSummaryAuthority,
     WorkflowRunRequest,
     WorkflowRunResult,
     WorkItem,
@@ -46,6 +47,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemKind,
     WorkItemNextAction,
     WorkItemRoute,
+    WorkItemSourceRef,
     WorkItemStatus,
     WorkItemTarget,
 )
@@ -82,6 +84,70 @@ def test_graph_write_review_does_not_infer_research_from_graph_evidence_wording(
         "chief_of_staff": "completed",
         "approval_checkpoint": "completed",
     }
+
+
+def test_canonical_graph_review_does_not_invent_stages_from_incidental_words() -> None:
+    stages = langgraph_workflow._graph_requested_stage_review(
+        request_text=(
+            "Summarize the supplied note. It mentions Gmail, research, opportunities, "
+            "and outreach only as work that must not be performed."
+        ),
+        manual_request_plan={
+            "source": "canonical",
+            "target_agent": "chief_of_staff",
+            "intent": "route_request",
+            "task_objective": "route_or_continue",
+            "workflow": [],
+        },
+        node_path=["run_chief_of_staff"],
+        loop_steps=[{"route": "chief_of_staff"}],
+        artifact_types=["chief_of_staff_plan"],
+        blocker_codes=set(),
+        checkpoint_required=False,
+        checkpoint_reason="",
+    )
+
+    assert stages == [
+        {
+            "stage": "chief_of_staff",
+            "status": "completed",
+            "evidence": "run_chief_of_staff",
+        }
+    ]
+
+
+@pytest.mark.parametrize("plan_source", ["llm", "heuristic"])
+def test_slack_reply_stage_is_not_cancelled_by_no_gmail_draft(
+    plan_source: str,
+) -> None:
+    stages = langgraph_workflow._graph_requested_stage_review(
+        request_text=(
+            "Check yesterday's inbox, choose one email, and draft a response here. "
+            "Do not send it or create a Gmail draft."
+        ),
+        manual_request_plan={
+            "source": plan_source,
+            "requested_agent": "chief_of_staff",
+            "target_agent": "gmail_triage",
+            "intent": "outreach_draft",
+            "task_objective": "outreach_draft",
+            "expected_artifact_type": "outreach_draft",
+            "workflow": ["gmail_triage", "outreach_composer"],
+            "provider_system": "gmail",
+            "provider_operations": ["read"],
+            "outreach_channel": "internal_slack",
+        },
+        node_path=["run_gmail_triage"],
+        loop_steps=[{"route": "gmail_triage"}],
+        artifact_types=["gmail_triage_report"],
+        blocker_codes=set(),
+        checkpoint_required=False,
+        checkpoint_reason="",
+    )
+
+    stage_statuses = {stage["stage"]: stage["status"] for stage in stages}
+    assert stage_statuses["gmail_triage"] == "completed"
+    assert stage_statuses["outreach_composer"] == "not_completed"
 
 
 def test_manager_loop_continue_keeps_cursor_and_original_objective() -> None:
@@ -178,6 +244,417 @@ def test_llm_plan_without_context_handoff_ignores_all_context_keywords() -> None
     )
     assert not langgraph_workflow._zotero_context_edge_requested(request_text, prepared)
     assert langgraph_workflow._feed_context_edge_kind(request_text, prepared) is None
+
+
+@pytest.mark.parametrize(
+    (
+        "request_text",
+        "workflow",
+        "context_agent",
+        "route_helper",
+        "expected_route",
+    ),
+    [
+        (
+            "Use the RSS history for a research brief. An old note says to rank opportunities.",
+            ["rss_context_agent", "business_research_analyst"],
+            "rss_context_agent",
+            "feed",
+            WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        ),
+        (
+            "Use the RSS history, then give me the most useful next step.",
+            ["rss_context_agent", "opportunity_scout"],
+            "rss_context_agent",
+            "feed",
+            WorkItemRoute.OPPORTUNITY_SCOUT,
+        ),
+        (
+            "Use the selected Zotero evidence. The paper mentions opportunity scoring.",
+            ["zotero_context_agent", "outreach_composer"],
+            "zotero_context_agent",
+            "zotero",
+            WorkItemRoute.OUTREACH_COMPOSER,
+        ),
+    ],
+)
+def test_canonical_plan_owns_route_after_context_staging(
+    request_text: str,
+    workflow: list[str],
+    context_agent: str,
+    route_helper: str,
+    expected_route: WorkItemRoute,
+) -> None:
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        manual_request_plan={
+            "source": "canonical",
+            "target_agent": "chief_of_staff",
+            "workflow": workflow,
+            "intent": "route_request",
+        },
+    )
+    prepared = workflow_runner.PreparedWorkItemStep(
+        request=request,
+        work_item=WorkItem(kind=WorkItemKind.RESEARCH_BRIEF, title="Context route"),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        input_text=request_text,
+        context_pack={},
+    )
+
+    if route_helper == "feed":
+        actual = langgraph_workflow._route_after_feed_context(
+            prepared.route,
+            request_text,
+            prepared=prepared,
+            context_agent=context_agent,
+        )
+    else:
+        actual = langgraph_workflow._route_after_zotero_context(
+            prepared.route,
+            request_text,
+            prepared=prepared,
+        )
+
+    assert actual == expected_route
+
+
+def test_canonical_chief_plan_owns_pre_context_coordination_without_trigger_words() -> None:
+    request_text = "Please handle the selected review and return one combined answer."
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        manual_request_plan={
+            "source": "canonical",
+            "target_agent": "chief_of_staff",
+            "workflow": [
+                "rss_context_agent",
+                "business_research_analyst",
+            ],
+            "intent": "route_request",
+            "requires_durable_state": True,
+        },
+    )
+    prepared = workflow_runner.PreparedWorkItemStep(
+        request=request,
+        work_item=WorkItem(kind=WorkItemKind.RESEARCH_BRIEF, title="Chief review"),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        input_text=request_text,
+        context_pack={},
+    )
+
+    assert langgraph_workflow._chief_coordination_should_run_before_context_edges(
+        {},
+        prepared,
+    )
+
+    after_chief = workflow_runner.PreparedWorkItemStep(
+        request=request,
+        work_item=prepared.work_item.model_copy(
+            update={
+                "artifact_refs": [
+                    WorkItemArtifactRef(
+                        artifact_type="chief_of_staff_plan",
+                        artifact_id="chief-plan-1",
+                        source_agent="chief_of_staff",
+                    )
+                ]
+            }
+        ),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        input_text=request_text,
+        context_pack={},
+    )
+    assert not langgraph_workflow._chief_coordination_should_run_before_context_edges(
+        {},
+        after_chief,
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_system", "helper_name"),
+    [
+        ("airtable", "airtable"),
+        ("google_workspace", "google_workspace"),
+    ],
+)
+def test_canonical_provider_fields_own_graph_write_plan_admission(
+    provider_system: str,
+    helper_name: str,
+) -> None:
+    request_text = (
+        "Use the selected context for review. The old architecture note says to create "
+        "and update a provider record, but that is not this task."
+    )
+
+    def prepared_for(operations: list[str]) -> workflow_runner.PreparedWorkItemStep:
+        request = WorkflowRunRequest(
+            request_text=request_text,
+            manual_request_plan={
+                "source": "canonical",
+                "target_agent": "opportunity_scout",
+                "workflow": [
+                    (
+                        "airtable_context_agent"
+                        if provider_system == "airtable"
+                        else "google_workspace_context_agent"
+                    ),
+                    "opportunity_scout",
+                ],
+                "intent": "route_request",
+                "provider_system": provider_system,
+                "provider_operations": operations,
+            },
+        )
+        return workflow_runner.PreparedWorkItemStep(
+            request=request,
+            work_item=WorkItem(kind=WorkItemKind.OPPORTUNITY, title="Write admission"),
+            route=WorkItemRoute.OPPORTUNITY_SCOUT,
+            input_text=request_text,
+            context_pack={},
+        )
+
+    read_only = prepared_for(["read"])
+    write_requested = prepared_for(["create", "verify"])
+    if helper_name == "airtable":
+        assert not langgraph_workflow._airtable_write_plan_requested(
+            request_text,
+            read_only,
+        )
+        assert langgraph_workflow._airtable_write_plan_requested(
+            "Use the reviewed context and prepare the next step.",
+            write_requested,
+        )
+    else:
+        assert not langgraph_workflow._google_workspace_artifact_plan_requested(
+            request_text,
+            read_only,
+        )
+        assert langgraph_workflow._google_workspace_artifact_plan_requested(
+            "Use the reviewed context and prepare the next step.",
+            write_requested,
+        )
+
+
+def test_older_canonical_plan_without_provider_fields_keeps_bounded_write_fallback() -> None:
+    request_text = "Prepare an Airtable record write plan for approval review."
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        manual_request_plan={
+            "source": "canonical",
+            "target_agent": "chief_of_staff",
+            "workflow": ["airtable_context_agent"],
+            "intent": "route_request",
+        },
+    )
+    prepared = workflow_runner.PreparedWorkItemStep(
+        request=request,
+        work_item=WorkItem(kind=WorkItemKind.OPPORTUNITY, title="Compatibility plan"),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        input_text=request_text,
+        context_pack={},
+    )
+
+    assert langgraph_workflow._airtable_write_plan_requested(
+        request_text,
+        prepared,
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_system", "request_text", "write_helper"),
+    [
+        (
+            "airtable",
+            "Review the current Airtable context and recommend my next actions.",
+            langgraph_workflow._airtable_write_plan_requested,
+        ),
+        (
+            "google_workspace",
+            "Review the current Google Workspace context and recommend my next actions.",
+            langgraph_workflow._google_workspace_artifact_plan_requested,
+        ),
+    ],
+)
+def test_compatibility_read_only_plan_cannot_become_provider_write_plan(
+    provider_system: str,
+    request_text: str,
+    write_helper: object,
+) -> None:
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        manual_request_plan={
+            "source": "heuristic",
+            "requested_agent": "chief_of_staff",
+            "target_agent": "chief_of_staff",
+            "intent": "context_lookup",
+            "task_objective": "context_lookup",
+            "expected_artifact_type": "context_summary",
+            "provider_system": provider_system,
+            "provider_operations": ["read"],
+            "ask_shape": {"permission_state": "read_only"},
+        },
+    )
+    prepared = workflow_runner.PreparedWorkItemStep(
+        request=request,
+        work_item=WorkItem(kind=WorkItemKind.OPPORTUNITY, title="Read-only context"),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        input_text=request_text,
+        context_pack={},
+    )
+
+    assert write_helper(request_text, prepared) is False
+
+
+@pytest.mark.parametrize(
+    ("provider_system", "write_helper"),
+    [
+        ("airtable", langgraph_workflow._airtable_write_plan_requested),
+        (
+            "google_workspace",
+            langgraph_workflow._google_workspace_artifact_plan_requested,
+        ),
+    ],
+)
+def test_canonical_replay_read_only_ceiling_overrides_stored_write_operations(
+    provider_system: str,
+    write_helper: object,
+) -> None:
+    request_text = "Review the selected provider context without changing it."
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        manual_request_plan={
+            "source": "canonical:replay_fixture",
+            "requested_agent": "chief_of_staff",
+            "target_agent": "chief_of_staff",
+            "intent": "business_system_write",
+            "task_objective": "business_system_write",
+            "expected_artifact_type": "business_system_write_plan",
+            "provider_system": provider_system,
+            "provider_operations": ["read", "create", "update", "delete", "attach"],
+            "ask_shape": {"permission_state": "read_only"},
+        },
+    )
+    prepared = workflow_runner.PreparedWorkItemStep(
+        request=request,
+        work_item=WorkItem(kind=WorkItemKind.OPPORTUNITY, title="Read-only replay"),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        input_text=request_text,
+        context_pack={},
+    )
+
+    assert write_helper(request_text, prepared) is False
+
+
+@pytest.mark.parametrize("plan_source", ["llm", "heuristic"])
+def test_chief_context_advisors_are_not_counted_as_post_chief_graph_stages(
+    plan_source: str,
+) -> None:
+    requested_stages = langgraph_workflow._graph_requested_stage_review(
+        request_text="Review the selected context and return one combined answer.",
+        manual_request_plan={
+            "source": plan_source,
+            "requested_agent": "chief_of_staff",
+            "target_agent": "chief_of_staff",
+            "workflow": ["gmail_triage", "airtable_context_agent"],
+            "intent": "context_lookup",
+            "task_objective": "context_lookup",
+            "expected_artifact_type": "context_summary",
+            "ask_shape": {"permission_state": "read_only"},
+            "requires_durable_state": True,
+        },
+        manual_intent="context_lookup",
+        node_path=["run_chief_of_staff"],
+        loop_steps=[{"route": "chief_of_staff"}],
+        artifact_types=["chief_of_staff_plan"],
+        blocker_codes=set(),
+        checkpoint_required=False,
+        checkpoint_reason="",
+    )
+
+    assert requested_stages == [
+        {
+            "stage": "chief_of_staff",
+            "status": "completed",
+            "evidence": "run_chief_of_staff",
+        }
+    ]
+
+
+def test_chief_context_plan_counts_admitted_analytic_owner_as_graph_stage() -> None:
+    requested_stages = langgraph_workflow._graph_requested_stage_review(
+        request_text="Compare the selected Zotero and preprints evidence.",
+        manual_request_plan={
+            "source": "llm",
+            "requested_agent": "chief_of_staff",
+            "target_agent": "chief_of_staff",
+            "workflow": [
+                "preprints_context_agent",
+                "zotero_context_agent",
+                "business_research_analyst",
+            ],
+            "intent": "context_lookup",
+            "task_objective": "context_lookup",
+            "expected_artifact_type": "context_summary",
+            "ask_shape": {"permission_state": "read_only"},
+            "requires_durable_state": True,
+        },
+        manual_intent="context_lookup",
+        node_path=["run_chief_of_staff", "run_business_research"],
+        loop_steps=[
+            {"route": "chief_of_staff"},
+            {"route": "business_research_analyst"},
+        ],
+        artifact_types=["chief_of_staff_plan", "company_profile"],
+        blocker_codes=set(),
+        checkpoint_required=False,
+        checkpoint_reason="",
+    )
+
+    assert [item["stage"] for item in requested_stages] == [
+        "chief_of_staff",
+        "business_research",
+    ]
+    assert all(item["status"] == "completed" for item in requested_stages)
+
+
+def test_canonical_graph_route_survives_incidental_words_after_context_stage(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "Use RSS context for a short research brief on behavioral-health measurement. "
+        "A quoted old note says to rank opportunities, but the current task is research."
+    )
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+            manual_request_plan={
+                "source": "canonical",
+                "target_agent": "business_research_analyst",
+                "workflow": [
+                    "rss_context_agent",
+                    "business_research_analyst",
+                ],
+                "intent": "research_brief",
+                "requires_durable_state": True,
+            },
+        ),
+        manager_loop=True,
+        max_manager_steps=2,
+    )
+
+    rss_artifact = next(
+        artifact
+        for artifact in outcome.result.work_item.artifact_refs
+        if artifact.artifact_type == "rss_context_summary"
+    )
+    assert "stage_feed_context" in outcome.node_path
+    assert "run_business_research" in outcome.node_path
+    assert "run_opportunity_scout" not in outcome.node_path
+    assert rss_artifact.metadata["recommended_downstream_route"] == (
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+    )
 
 
 def test_graph_terminal_summary_integrates_decision_evidence_and_draft() -> None:
@@ -395,6 +872,10 @@ def test_graph_terminal_summary_promotes_research_datasource_evidence() -> None:
     assert "source-provenance and fitness-for-purpose" in enhanced.human_summary
     assert "LangGraph research terminal brief composed deterministically" in " ".join(
         enhanced.audit_notes
+    )
+    assert (
+        enhanced.user_facing_summary_authority
+        == UserFacingSummaryAuthority.CANONICAL
     )
 
 
@@ -835,6 +1316,10 @@ def test_short_human_cos_stateful_review_completes_same_graph_contract(
         "Northstar Care sells referral-navigation software but has no audited outcomes."
     ]
     assert result.work_item.artifact_refs[-1].metadata["internal_slack_copy"] is True
+    assert (
+        result.user_facing_summary_authority
+        == UserFacingSummaryAuthority.REVIEWABLE
+    )
     assert result.human_summary.startswith("*Recommendation:*")
     assert "*Most important validation gap:*" in result.human_summary
     assert "Track this review" not in result.human_summary
@@ -3400,7 +3885,7 @@ def test_backend_selected_manager_loop_uses_graph_for_chief_opportunity_outreach
     assert not graph_completion
 
 
-def test_langgraph_gmail_multistep_preserves_missing_stage_blockers(
+def test_langgraph_gmail_multistep_reports_only_the_immediate_blocker(
     tmp_path: Path,
 ) -> None:
     database_url = _database_url(tmp_path)
@@ -3436,13 +3921,8 @@ def test_langgraph_gmail_multistep_preserves_missing_stage_blockers(
 
     assert outcome.result.route == WorkItemRoute.GMAIL_TRIAGE
     assert outcome.result.status == WorkItemStatus.BLOCKED
-    assert {
-        "gmail_context_required",
-        "manager_loop_research_not_completed",
-        "manager_loop_opportunity_not_created",
-        "manager_loop_outreach_not_drafted",
-    } <= blocker_codes
-    assert missing_codes <= blocker_codes
+    assert blocker_codes == {"gmail_context_required"}
+    assert missing_codes == set()
     assert any(event.event_type == "langgraph_manager_loop_completed" for event in events)
 
 
@@ -3505,6 +3985,177 @@ def test_langgraph_manager_loop_routes_opportunity_to_outreach_gate_when_request
         "outreach_requires_approved_context"
     ]
     assert not graph_completion
+
+
+def test_chief_owned_read_context_plan_runs_chief_after_cli_prefix_is_removed(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "review today's Gmail, open WorkItems, and current Airtable context, then "
+        "recommend my top three actions. Don't change anything."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+            requested_route=WorkItemRoute.CHIEF_OF_STAFF,
+            manual_request_plan=plan.model_dump(mode="json"),
+        ),
+        manager_loop=True,
+        max_manager_steps=4,
+    )
+
+    assert outcome.result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert outcome.result.status == WorkItemStatus.DONE
+    assert outcome.node_path == [
+        "normalize_request",
+        "orchestrator_preflight",
+        "state_followup",
+        "prepare_work_item",
+        "run_chief_of_staff",
+        "finalize_step",
+        "manager_loop_finalize",
+    ]
+    assert [artifact.artifact_type for artifact in outcome.result.artifact_refs] == [
+        "chief_of_staff_plan"
+    ]
+    assert outcome.checkpoint_required is False
+    assert outcome.result.blockers == []
+
+
+def test_natural_opportunity_research_airtable_plan_outreach_uses_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_text = (
+        "Find the best opportunity, research it, create an Airtable record plan, and "
+        "draft outreach for review without sending."
+    )
+    plan = infer_manual_request_plan(request_text, requested_agent="orchestrator")
+
+    def fake_advance_opportunity(
+        work_item: WorkItem,
+        *,
+        request: WorkflowRunRequest,
+        store: SQLiteStore | None,
+    ) -> WorkflowRunResult:
+        del request
+        source = WorkItemSourceRef(
+            source_id="fixture:hj-019:opportunity",
+            title="AffectAI evidence collaboration signal",
+            url="https://affectai.example/evidence-collaboration",
+            source_type="company_page",
+            provider="fixture",
+            extraction_status="supplied_material",
+            source_quality="operator_supplied",
+            supported_claim=(
+                "AffectAI is seeking an independent behavioral-health AI evidence review."
+            ),
+            key_facts=[
+                "AffectAI is seeking an independent behavioral-health AI evidence review."
+            ],
+        )
+        updated = work_item.model_copy(
+            update={
+                "target": work_item.target.model_copy(
+                    update={
+                        "name": "AffectAI Research",
+                        "object_type": "company",
+                    }
+                ),
+                "sources": [source],
+                "facts": [
+                    WorkItemFact(
+                        key="opportunity_signal",
+                        value=source.supported_claim,
+                        confidence=0.9,
+                        source_refs=[source],
+                        approval_state=ApprovalState.APPROVED_FOR_DRAFTING.value,
+                    )
+                ],
+                "artifact_refs": [
+                    WorkItemArtifactRef(
+                        artifact_type="opportunity",
+                        artifact_id="fixture-hj-019-opportunity",
+                        source_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                        approval_state=ApprovalState.APPROVED_FOR_DRAFTING.value,
+                        selected=True,
+                        title="AffectAI Research evidence-review opportunity",
+                        summary=source.supported_claim,
+                        metadata={"source_refs": [source.model_dump(mode="json")]},
+                    )
+                ],
+                "last_agent": WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                "status": WorkItemStatus.DONE,
+                "next_action": None,
+            }
+        ).touch()
+        if store is not None:
+            store.save_work_item(updated)
+        return WorkflowRunResult(
+            work_item=updated,
+            route=WorkItemRoute.OPPORTUNITY_SCOUT,
+            status=WorkItemStatus.DONE,
+            advanced=True,
+            human_summary="Selected a source-backed opportunity for research.",
+        )
+
+    monkeypatch.setattr(workflow_runner, "_advance_opportunity", fake_advance_opportunity)
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_sdk=False,
+            live_search=False,
+            requested_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+            manual_request_plan=plan.model_dump(mode="json"),
+        ),
+        manager_loop=True,
+        max_manager_steps=6,
+    )
+
+    artifact_types = {
+        artifact.artifact_type for artifact in outcome.result.work_item.artifact_refs
+    }
+    assert "run_business_research" in outcome.node_path, outcome.node_path
+    assert outcome.node_path.index("run_opportunity_scout") < outcome.node_path.index(
+        "run_business_research"
+    )
+    assert outcome.node_path.index("run_business_research") < outcome.node_path.index(
+        "stage_airtable_context"
+    )
+    assert outcome.node_path.index("stage_airtable_context") < outcome.node_path.index(
+        "run_outreach_composer"
+    )
+    assert {
+        "opportunity",
+        "company_profile",
+        "airtable_write_plan",
+        "outreach_draft",
+    } <= artifact_types, (
+        outcome.node_path,
+        outcome.result.status,
+        [blocker.code for blocker in outcome.result.blockers],
+        artifact_types,
+    )
+    assert outcome.result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert outcome.checkpoint_required is True
+    assert outcome.node_path[-1] == "approval_checkpoint"
+    assert outcome.result.work_item.request_text == request_text
+    assert outcome.result.work_item.status == WorkItemStatus.NEEDS_APPROVAL
+    assert all(
+        artifact.metadata.get("external_writes_enabled") is not True
+        and artifact.metadata.get("send_enabled") is not True
+        for artifact in outcome.result.work_item.artifact_refs
+    )
 
 
 def test_langgraph_manager_loop_routes_gmail_to_research_to_outreach_gate(
@@ -7683,6 +8334,25 @@ def test_live_semantic_plan_owns_graph_selection_across_natural_phrasings(
 
     assert should_use_langgraph_for_work_item(request, manager_loop=True) is expected
     assert should_use_langgraph_for_work_item(request, manager_loop=False) is expected
+
+
+def test_canonical_source_alias_also_owns_graph_selection() -> None:
+    request = WorkflowRunRequest(
+        request_text=(
+            "The background mentions workflow, approval, research, opportunity, and draft. "
+            "Return the supplied-facts answer only."
+        ),
+        manual_request_plan={
+            "source": "canonical",
+            "target_agent": "chief_of_staff",
+            "intent": "route_request",
+            "task_objective": "route_or_continue",
+            "requires_durable_state": False,
+            "workflow": [],
+        },
+    )
+
+    assert should_use_langgraph_for_work_item(request, manager_loop=True) is False
 
 
 def test_langgraph_work_item_thread_id_is_stable() -> None:

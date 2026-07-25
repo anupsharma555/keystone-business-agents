@@ -378,6 +378,118 @@ def test_orchestrator_workflow_state_keeps_newest_eight_thread_messages() -> Non
     assert state["slack_thread_transcript"].endswith("Use the latest correction.")
 
 
+def test_orchestrator_workflow_state_retains_verified_gmail_result_scope(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    run_id = SQLiteStore(database_url).save_agent_run(
+        agent_name="gmail_triage",
+        input_summary="How many did I receive today?",
+        dry_run=False,
+        output={
+            "manual_request_plan": {
+                "provider_system": "gmail",
+                "gmail_mailbox_direction": "inbound",
+                "gmail_date_scope": "today",
+            },
+            "user_facing_result_verified": True,
+            "script_payload": {
+                "tool_receipts": [
+                    {
+                        "provider_read": True,
+                        "provider_write": False,
+                        "complete": True,
+                        "verified": True,
+                        "message_count": 4,
+                        "query": "to:me -in:sent after:1 before:2",
+                        "timezone": "America/New_York",
+                        "window_start": "2026-07-21T00:00:00-04:00",
+                        "window_end": "2026-07-22T00:00:00-04:00",
+                    }
+                ]
+            },
+        },
+    )
+    context = build_selected_message_context(_message_action_payload())
+    context.prior_agent_runs = [{"run_id": str(run_id), "status": "success"}]
+
+    state = slack_actions_module.orchestrator_workflow_state_from_slack_context(
+        context,
+        request_text="Name them by subject",
+        database_url=database_url,
+    )
+
+    scope = state["prior_provider_result_scope"]
+    assert scope["source_run_id"] == str(run_id)
+    assert scope["provider_system"] == "gmail"
+    assert scope["gmail_mailbox_direction"] == "inbound"
+    assert scope["gmail_date_scope"] == "today"
+    assert scope["query"] == "to:me -in:sent after:1 before:2"
+    assert scope["item_count"] == 4
+    assert scope["complete"] is True
+    assert scope["verified"] is True
+
+
+def test_orchestrator_workflow_state_retains_verified_airtable_aggregate_scope(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    run_id = SQLiteStore(database_url).save_agent_run(
+        agent_name="airtable_context_agent",
+        input_summary="What is the Personal Expenses total for period 3?",
+        dry_run=False,
+        output={
+            "status": "done",
+            "manual_request_plan": {"provider_system": "airtable"},
+            "tool_receipts": [
+                {
+                    "status": "success",
+                    "operation": "aggregate_records",
+                    "provider": "airtable",
+                    "provider_read": True,
+                    "provider_write": False,
+                    "base_alias": "finance_tax_tracker",
+                    "table": "Personal Expenses",
+                    "amount_field": "Total Expenses",
+                    "estimated_period": 3,
+                    "period_field": "Estimated Tax Periods",
+                    "year": 2026,
+                    "date_field": "Date of Expense",
+                    "total": "3041.53",
+                    "currency": "USD",
+                    "matching_records": 4,
+                    "truncated": False,
+                    "verification": {
+                        "passed": True,
+                        "schema_read": True,
+                        "records_read": True,
+                    },
+                }
+            ],
+        },
+    )
+    context = build_selected_message_context(_message_action_payload())
+    context.prior_agent_runs = [{"run_id": str(run_id), "status": "success"}]
+
+    state = slack_actions_module.orchestrator_workflow_state_from_slack_context(
+        context,
+        request_text="Which expenses make up that total?",
+        database_url=database_url,
+    )
+
+    scope = state["prior_provider_result_scope"]
+    assert scope["source_run_id"] == str(run_id)
+    assert scope["provider_system"] == "airtable"
+    assert scope["provider_read_scope"] == "bounded_collection"
+    assert scope["airtable_table"] == "Personal Expenses"
+    assert scope["airtable_estimated_period"] == 3
+    assert scope["airtable_year"] == 2026
+    assert scope["aggregate_total"] == "3041.53"
+    assert scope["item_count"] == 4
+    assert scope["complete"] is True
+    assert scope["verified"] is True
+
+
 def test_message_action_creates_context_file_and_modal(tmp_path: Path) -> None:
     result = handle_run_agent_interaction(
         _message_action_payload(),
@@ -1153,10 +1265,7 @@ def test_modal_submission_gmail_request_uses_gmail_context_gate_not_unsupported_
     assert run_result.stage == "work_item"
     assert run_result.route == "gmail_triage"
     assert run_result.status == "blocked"
-    assert "gmail_context_required" in blocker_codes
-    assert "manager_loop_research_not_completed" in blocker_codes
-    assert "manager_loop_opportunity_not_created" in blocker_codes
-    assert "manager_loop_outreach_not_drafted" in blocker_codes
+    assert blocker_codes == {"gmail_context_required"}
     assert "route_not_supported_in_workitem_phase" not in blocker_codes
     assert result_payload.get("send_enabled", False) is False
     assert result_payload["canonical_status"] == "blocked"
@@ -1166,9 +1275,78 @@ def test_modal_submission_gmail_request_uses_gmail_context_gate_not_unsupported_
     assert "Run explanation:" in result_payload["slack_graph_completion_text"]
     assert "Still needs attention:" in result_payload["slack_graph_completion_text"]
     assert "run_business_research" not in result_payload["slack_graph_completion_text"]
-    assert result_payload["human_summary"] in result_payload["slack_display_text"]
-    assert result_payload["slack_graph_completion_text"] in result_payload["slack_display_text"]
+    assert result_payload["slack_display_text"] == result_payload["human_summary"]
+    assert result_payload["slack_graph_completion_text"] not in result_payload["slack_display_text"]
     assert business_agent_result_display_text(result_payload) == result_payload["slack_display_text"]
+
+
+def test_operator_display_hides_run_explanation_unless_explicitly_requested() -> None:
+    payload = {
+        "status": "completed",
+        "human_summary": "The requested provider read completed.",
+        "slack_graph_completion_text": (
+            "Run explanation:\n"
+            "- Graph path completed: gmail_triage\n"
+            "- Side effects: disabled"
+        ),
+    }
+
+    slack_actions_module._attach_operator_display_fields(payload, result=None)
+
+    assert payload["slack_display_text"] == "The requested provider read completed."
+    assert payload["slack_graph_completion_text"] not in payload["slack_display_text"]
+
+    explicit_payload = {
+        "status": "completed",
+        "human_summary": "The requested provider read completed.",
+        "slack_graph_completion_text": payload["slack_graph_completion_text"],
+    }
+    slack_actions_module._attach_operator_display_fields(
+        explicit_payload,
+        result=None,
+        include_run_explanation=True,
+    )
+
+    assert explicit_payload["slack_graph_completion_text"] in (
+        explicit_payload["slack_display_text"]
+    )
+
+
+def test_planner_context_strips_bot_diagnostics_but_preserves_human_text() -> None:
+    context = build_selected_message_context(
+        _message_action_payload(),
+        thread_messages=[
+            {
+                "ts": "1715366400.000100",
+                "user": "U-HUMAN",
+                "text": "Keep the phrase Eval: case study in my final answer.",
+            },
+            {
+                "ts": "1715366401.000100",
+                "bot_id": "B-KNI",
+                "subtype": "bot_message",
+                "text": (
+                    "The calendar read completed.\n\n"
+                    "*Metadata*\n"
+                    "* Source focus: provider result.\n\n"
+                    "Eval: case `calendar-read-001`."
+                ),
+            },
+        ],
+    )
+
+    state = slack_actions_module.orchestrator_workflow_state_from_slack_context(
+        context,
+        request_text="What did the calendar show?",
+    )
+
+    transcript = state["slack_thread_transcript"]
+    summaries = [item["summary"] for item in state["recent_slack_thread"]]
+    assert "Keep the phrase Eval: case study in my final answer." in transcript
+    assert "The calendar read completed." in transcript
+    assert "Source focus: provider result" not in transcript
+    assert "calendar-read-001" not in transcript
+    assert summaries[-1] == "The calendar read completed."
 
 
 def test_modal_submission_passes_prior_thread_runs_to_orchestrator_preflight(
@@ -1813,6 +1991,87 @@ def test_live_slack_run_reuses_thread_sdk_session_for_preflight(
     )
 
     assert captured["session"] is not None
+
+
+def test_slack_run_uses_canonical_search_intent_not_conflicting_background_prose(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from keystone_agents.agents.orchestrator import run_orchestrator_preflight
+    from keystone_agents.slack_actions import load_selected_message_context_file
+
+    captured: dict[str, object] = {}
+
+    def canonical_search_preflight(_request_text, **kwargs):
+        preflight = run_orchestrator_preflight(
+            "Research current sources for Acme Health.",
+            live_manual_plan=False,
+            database_url=kwargs.get("database_url"),
+        )
+        plan = preflight.manual_request_plan.model_copy(
+            update={"source": "llm", "requires_live_search": True}
+        )
+        return preflight.model_copy(update={"manual_request_plan": plan})
+
+    def capture_manager_loop(request, **_kwargs):
+        captured["request"] = request
+        context = load_selected_message_context_file(request.context_file_path)
+        work_item = WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            status=WorkItemStatus.DONE,
+            title=request.request_text,
+            request_text=request.request_text,
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            target=WorkItemTarget(
+                name="Acme Health",
+                metadata={
+                    "slack_context": {
+                        "channel_id": context.channel_id,
+                        "selected_message_ts": context.selected_message_ts,
+                        "thread_ts": context.thread_ts,
+                    }
+                },
+            ),
+            last_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        )
+        return WorkflowRunResult(
+            work_item=work_item,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=WorkItemStatus.DONE,
+            advanced=True,
+            human_summary="done",
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_actions.run_orchestrator_preflight",
+        canonical_search_preflight,
+    )
+    monkeypatch.setattr(
+        "keystone_agents.slack_actions.advance_work_item_manager_loop_with_optional_langgraph",
+        capture_manager_loop,
+    )
+    modal_result = handle_run_agent_interaction(
+        _message_action_payload(),
+        context_dir=tmp_path / "contexts",
+    )
+
+    handle_run_agent_interaction(
+        _modal_submission(
+            modal_result.modal_view["private_metadata"],
+            task=(
+                "Find current sources for Acme Health. The old note says do not "
+                "search, but that note is background only."
+            ),
+        ),
+        database_url=_database_url(tmp_path),
+        context_dir=tmp_path / "contexts",
+        live_search=True,
+    )
+
+    forwarded_request = captured["request"]
+    assert isinstance(forwarded_request, WorkflowRunRequest)
+    assert forwarded_request.live_search is True
+    assert forwarded_request.manual_request_plan["requires_live_search"] is True
 
 
 def test_slack_thread_follow_up_can_reach_chief_of_staff_live_sdk(

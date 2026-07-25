@@ -21,6 +21,7 @@ from keystone_agents.agents.orchestrator import (
 )
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import AgentRunRequest, RunMode, TypedAgentRunResult
+from keystone_agents.orchestrator.routing import looks_like_send_side_effect
 from keystone_agents.run import run_agent_dry
 from keystone_agents.schemas.approval import ApprovalQueueItem
 from keystone_agents.schemas.company_profile import CompanyProfile
@@ -58,6 +59,52 @@ def test_build_orchestrator_agent_can_opt_into_read_only_specialist_tool() -> No
     assert BUSINESS_RESEARCH_TOOL_NAME in _tool_names(agent)
     assert OPPORTUNITY_SCOUT_TOOL_NAME in _tool_names(agent)
     assert agent.handoffs == []
+
+
+def test_orchestrator_specialist_tool_receives_raw_ask_and_canonical_plan() -> None:
+    raw_request = (
+        "Compare the supplied company evidence and identify the strongest "
+        "source-backed opportunity. Do not write or send anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="orchestrator",
+        target_agent="business_research_analyst",
+        workflow=["business_research_analyst", "opportunity_scout"],
+        intent="company_research",
+        primary_target="supplied company evidence",
+        provider_operations=["read"],
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+    )
+    agent = build_orchestrator_agent(
+        include_handoffs=False,
+        include_specialist_tools=True,
+        request_text=raw_request,
+        manual_request_plan=plan,
+    )
+    specialist_tools = [
+        tool
+        for tool in agent.tools
+        if getattr(tool, "specialist_route_name", "")
+        in {"business_research_analyst", "opportunity_scout"}
+    ]
+
+    assert len(specialist_tools) == 2
+    for tool in specialist_tools:
+        rendered = tool.specialist_input_builder(
+            {
+                "params": {
+                    "raw_operator_request": "Use only a rewritten task.",
+                    "specialist_task": "Return bounded advisory context.",
+                }
+            }
+        )
+        assert "Use only a rewritten task." not in rendered
+        assert raw_request in rendered
+        assert "## Canonical Manual Request Plan" in rendered
+        assert '"business_research_analyst"' in rendered
+        assert '"opportunity_scout"' in rendered
 
 
 def test_build_orchestrator_agent_specialist_tool_env_is_default_off(monkeypatch) -> None:
@@ -126,6 +173,24 @@ def test_negated_capabilities_do_not_create_orchestrator_workflow_or_blocker() -
     assert result.refused is False
     assert result.clarification_request is None
     assert result.decision_trace.missing_information_blockers == []
+
+
+def test_orchestrator_keeps_chief_as_owner_of_multi_source_context_summary() -> None:
+    prompt = (
+        "Act as my chief of staff: review today's Gmail, open WorkItems, and current "
+        "Airtable context, then recommend my top three actions. Don't change anything."
+    )
+    plan = infer_manual_request_plan(prompt, requested_agent="chief_of_staff")
+
+    result = route_request(prompt, manual_plan=plan)
+
+    assert result.route == "chief_of_staff"
+    assert result.workflow == ["gmail_triage", "airtable_context_agent"]
+    assert result.approval_required is False
+    assert result.requires_human_review is False
+    assert result.approval_state == "approved_for_research"
+    assert result.refused is False
+    assert "Context workflow entries retained as Chief advisory tools." in result.audit_notes
 
 
 def test_route_request_source_link_followup_bypasses_pending_approval_gate() -> None:
@@ -627,6 +692,57 @@ def test_gmail_first_cross_agent_request_preserves_downstream_workflow() -> None
     assert result.send_enabled is False
 
 
+@pytest.mark.parametrize(
+    "no_send_clause",
+    [
+        "Don't send it or create a Gmail draft.",
+        "Don’t send it or create a Gmail draft.",
+        "Donʼt send it or create a Gmail draft.",
+        "Do not send it or create a Gmail draft.",
+        "Dont send it or create a Gmail draft.",
+    ],
+)
+def test_gmail_plan_survives_typographic_no_send_variants(
+    no_send_clause: str,
+) -> None:
+    prompt = (
+        "find one email from today that seems worth following up on for KNI and "
+        "draft a brief reply here in this Slack thread. "
+        f"{no_send_clause}"
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        provider_system="gmail",
+        provider_operations=["search", "read"],
+        objective=(
+            "Find one email from today worth following up on, then draft a brief "
+            "Slack-local reply without sending or creating a Gmail draft."
+        ),
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        side_effect_policy="draft_or_read_only",
+    )
+
+    result = route_request(prompt, manual_plan=plan)
+
+    assert looks_like_send_side_effect(prompt) is False
+    assert result.route == "gmail_triage"
+    assert result.routing_mode == "llm"
+    assert "opportunity_scout" not in result.workflow
+    assert result.send_enabled is False
+
+
+def test_affirmative_send_still_blocks_after_match_text_normalization() -> None:
+    result = route_request("Find one email and send the reply.")
+
+    assert looks_like_send_side_effect("Find one email and send the reply.") is True
+    assert result.send_enabled is False
+    assert "send_email" in result.forbidden_actions
+
+
 def test_company_url_routes_to_business_research_analyst() -> None:
     result = route_request("https://www.neuroflow.com")
 
@@ -996,7 +1112,7 @@ def test_orchestrator_routes_operational_planning_to_chief_of_staff(prompt: str)
 def test_outreach_request_without_approved_profile_refuses() -> None:
     result = route_request("draft outreach to NeuroFlow")
 
-    assert result.route == "clarification"
+    assert result.route == "outreach_composer"
     assert result.refused is True
     assert result.approved_context_present is False
     assert "Approved CompanyProfile" in (result.stop_reason or "")
@@ -1023,7 +1139,7 @@ def test_outreach_request_without_approved_profile_has_sectioned_operator_summar
     assert "CompanyProfile" not in result.clarification_request
     assert "OpportunityRecord" not in result.clarification_request
     assert "WorkItem" not in result.clarification_request
-    assert result.route == "clarification"
+    assert result.route == "outreach_composer"
     assert result.refused is True
 
 
@@ -1038,7 +1154,7 @@ def test_orchestrator_preflight_hard_safety_summary_preserves_execution_gate() -
 
     assert preflight.execution_allowed is False
     assert preflight.block_kind == "safety"
-    assert preflight.route_result.route == "clarification"
+    assert preflight.route_result.route == "outreach_composer"
     assert preflight.route_result.clarification_request is not None
     assert "Outreach blocked by safety gate" in preflight.route_result.clarification_request
     assert "*Answer:*" in preflight.route_result.clarification_request
@@ -1050,7 +1166,7 @@ def test_orchestrator_preflight_hard_safety_summary_preserves_execution_gate() -
 def test_generic_outreach_to_this_company_blocks_for_missing_context() -> None:
     result = route_request("Write an outreach email to this company.")
 
-    assert result.route == "clarification"
+    assert result.route == "outreach_composer"
     assert result.refused is True
     assert result.send_enabled is False
     assert "Approved CompanyProfile" in (result.stop_reason or "")
@@ -1063,7 +1179,7 @@ def test_attached_research_brief_outreach_blocks_without_context_object() -> Non
         "traction, or product details."
     )
 
-    assert result.route == "clarification"
+    assert result.route == "outreach_composer"
     assert result.refused is True
     assert result.send_enabled is False
     assert "Approved CompanyProfile" in (result.stop_reason or "")
@@ -1088,7 +1204,7 @@ def test_outreach_test_pack_prompts_block_without_approved_context(spec_id: str)
 
     result = route_request(prompt)
 
-    assert result.route == "clarification"
+    assert result.route == "outreach_composer"
     assert result.refused is True
     assert result.send_enabled is False
     assert "Approved CompanyProfile" in (result.stop_reason or "")
@@ -1629,6 +1745,37 @@ def test_llm_plan_owns_route_across_agents_despite_incidental_words(
     assert result.route == target_agent
     assert result.stop_reason != "uncertain_input"
     assert result.routing_mode == "llm"
+
+
+def test_canonical_read_only_context_plan_clears_drafting_approval_metadata() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="zotero_context_agent",
+        target_agent="zotero_context_agent",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="zotero",
+        provider_operations=["read"],
+        side_effect_policy="read_only",
+        objective="Return the latest Zotero journal article title.",
+    )
+
+    result = route_request(
+        "Earlier we discussed drafting email; now inspect Zotero read-only.",
+        manual_plan=plan,
+    )
+
+    assert result.route == "zotero_context_agent"
+    assert result.approval_required is False
+    assert result.requires_human_review is False
+    assert result.approval_scope == "research"
+    assert result.approval_state == "approved_for_research"
+    assert result.external_use_approval_required is False
+    assert result.approved_context_present is False
+    assert result.decision_trace is not None
+    assert "read_only_no_approval_required" in result.decision_trace.safety_gates_applied
+    assert "approval_required" not in result.decision_trace.safety_gates_applied
 
 
 def test_llm_plan_owns_ordered_graph_despite_different_request_vocabulary() -> None:

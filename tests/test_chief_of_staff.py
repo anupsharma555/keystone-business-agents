@@ -49,7 +49,11 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffSourceRef,
     ChiefSpecialistToolInput,
 )
-from keystone_agents.schemas.email_triage import EmailTriageResult
+from keystone_agents.schemas.email_triage import (
+    EmailTriageResult,
+    GmailPriorityGroupedMessage,
+    GmailPriorityGroupingResult,
+)
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.operational_context import (
     AirtableContextResult,
@@ -59,6 +63,7 @@ from keystone_agents.schemas.operational_context import (
     ZoteroContextResult,
 )
 from keystone_agents.specialist_agent_tools import (
+    build_bound_chief_specialist_tool_input,
     build_chief_specialist_tool_input,
     extract_nested_specialist_result,
 )
@@ -469,6 +474,38 @@ def test_chief_read_only_plan_exposes_no_internal_write_tools() -> None:
     assert "publish_slack_summary" not in tool_names
 
 
+def test_chief_multi_source_context_plan_exposes_exact_advisors_and_workitems() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        workflow=["gmail_triage", "airtable_context_agent"],
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_operations=["read"],
+        target_type="business_system_context",
+        requires_durable_state=True,
+        ask_shape={"permission_state": "read_only"},
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text=(
+            "Review today's Gmail, open WorkItems, and current Airtable context, "
+            "then recommend my top three actions. Don't change anything."
+        ),
+        manual_request_plan=plan,
+        include_specialist_tools=True,
+    )
+    tool_names = {getattr(tool, "name", "") for tool in agent.tools}
+
+    assert tool_names == {
+        specialist_agent_tool_name("gmail_triage"),
+        specialist_agent_tool_name("airtable_context_agent"),
+        "inspect_active_work_items",
+    }
+
+
 @pytest.mark.parametrize(
     "request_text",
     [
@@ -679,6 +716,56 @@ def test_chief_of_staff_can_opt_into_all_specialists_as_tools() -> None:
         assert "human" in getattr(tools_by_name[tool_name], "description", "").lower()
 
 
+@pytest.mark.parametrize(
+    ("target_agent", "intent"),
+    [
+        ("gmail_triage", "gmail_triage"),
+        ("business_research_analyst", "company_research"),
+        ("opportunity_scout", "opportunity_search"),
+        ("outreach_composer", "outreach_draft"),
+    ],
+)
+def test_canonical_chief_plan_admits_only_the_selected_specialist_tool(
+    target_agent: str,
+    intent: str,
+) -> None:
+    plan = ManualRequestPlan(
+        source="canonical",
+        target_agent=target_agent,
+        intent=intent,
+        workflow=[target_agent],
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text="Handle the bounded task in the current thread.",
+        manual_request_plan=plan,
+        include_specialist_tools=True,
+    )
+
+    assert {getattr(tool, "name", "") for tool in agent.tools} == {
+        specialist_agent_tool_name(target_agent)
+    }
+
+
+def test_canonical_chief_plan_cannot_gain_all_specialists_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(chief_of_staff_module.CHIEF_OF_STAFF_SPECIALIST_TOOLS_ENV, "1")
+    plan = ManualRequestPlan(
+        source="canonical",
+        target_agent="chief_of_staff",
+        intent="route_request",
+        workflow=[],
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text="Return the supplied answer only.",
+        manual_request_plan=plan,
+    )
+
+    assert agent.tools == []
+
+
 def test_chief_of_staff_specialist_tool_env_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(chief_of_staff_module.CHIEF_OF_STAFF_SPECIALIST_TOOLS_ENV, "1")
     agent = build_chief_of_staff_agent()
@@ -796,6 +883,98 @@ def test_chief_specialist_tool_input_builder_preserves_context_and_boundaries() 
     assert "approval_context" in rendered
     assert "no_nested_live_write" in rendered
     assert "Do not send, publish, schedule, mutate provider state" in rendered
+
+
+def test_chief_specialist_tool_input_binds_raw_ask_and_canonical_plan() -> None:
+    rendered = build_bound_chief_specialist_tool_input(
+        {
+            "params": ChiefSpecialistToolInput(
+                raw_operator_request="Review only Airtable.",
+                specialist_task="Review the admitted operating context.",
+                provider_call_context={"provider": "airtable"},
+            ).model_dump(mode="json"),
+            "summary": "Chief specialist input schema summary.",
+        },
+        raw_operator_request=(
+            "CoS, review today's Gmail, open WorkItems, and current Airtable "
+            "context, then recommend my top three actions. Don't change anything."
+        ),
+        manual_request_plan=ManualRequestPlan(
+            source="llm",
+            requested_agent="chief_of_staff",
+            target_agent="chief_of_staff",
+            workflow=["gmail_triage", "airtable_context_agent"],
+            intent="context_lookup",
+            provider_operations=["read"],
+            gmail_date_scope="today",
+            task_objective="context_lookup",
+            expected_artifact_type="context_summary",
+            requires_durable_state=True,
+        ),
+    )
+
+    assert "Review only Airtable." not in rendered
+    assert (
+        "CoS, review today's Gmail, open WorkItems, and current Airtable context"
+        in rendered
+    )
+    assert "## Canonical Manual Request Plan" in rendered
+    assert '"workflow": [' in rendered
+    assert '"gmail_triage"' in rendered
+    assert '"airtable_context_agent"' in rendered
+    assert '"gmail_date_scope": "today"' in rendered
+    assert '"provider_operations": [' in rendered
+    assert '"read"' in rendered
+    assert "do not silently rewrite this plan" in rendered
+
+
+def test_chief_agent_binds_authority_into_each_admitted_specialist_tool() -> None:
+    raw_request = (
+        "CoS, review today's Gmail, open WorkItems, and current Airtable context, "
+        "then recommend my top three actions. Don't change anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        workflow=["gmail_triage", "airtable_context_agent"],
+        intent="context_lookup",
+        provider_operations=["read"],
+        gmail_date_scope="today",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        requires_durable_state=True,
+    )
+    agent = build_chief_of_staff_agent(
+        request_text=raw_request,
+        manual_request_plan=plan,
+        include_specialist_tools=True,
+    )
+
+    specialist_tools = [
+        tool
+        for tool in agent.tools
+        if getattr(tool, "specialist_route_name", "")
+        in {"gmail_triage", "airtable_context_agent"}
+    ]
+
+    assert {
+        getattr(tool, "specialist_route_name", "") for tool in specialist_tools
+    } == {"gmail_triage", "airtable_context_agent"}
+    for tool in specialist_tools:
+        rendered = tool.specialist_input_builder(
+            {
+                "params": ChiefSpecialistToolInput(
+                    raw_operator_request="Use a rewritten single-provider ask.",
+                    specialist_task="Return bounded advisory context.",
+                ).model_dump(mode="json"),
+            }
+        )
+        assert "Use a rewritten single-provider ask." not in rendered
+        assert raw_request in rendered
+        assert "## Canonical Manual Request Plan" in rendered
+        assert '"gmail_triage"' in rendered
+        assert '"airtable_context_agent"' in rendered
 
 
 def test_nested_specialist_output_extractor_returns_reviewable_envelope() -> None:
@@ -1631,6 +1810,385 @@ def test_run_script_live_sdk_runs_orchestrator_preflight_when_parent_absent(
     assert captured["sdk_args"][0]["include_specialist_tools"] is False
     assert payload["manual_request_plan"]["source"] == "llm"
     assert payload["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
+
+
+def test_run_script_live_contact_lookup_uses_shared_gmail_workflow_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from keystone_agents.schemas.email_triage import (
+        GmailContactLookupResult,
+        GmailResolvedContact,
+    )
+
+    script = _load_run_chief_of_staff_script()
+    request = (
+        "CoS, what is the email address of the person from Acme Compute who "
+        "set up my startup account?"
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        primary_target="Acme Compute",
+        # The planner may emit a lower-level single-message shape even though
+        # the provider objective clearly requires a bounded contact collection.
+        target_type="unknown",
+        provider_system="gmail",
+        provider_operations=["search", "read"],
+        provider_read_scope="bounded_collection",
+        provider_result_mode="items",
+        gmail_requested_fields=["sender", "subject", "date", "snippet"],
+        objective="Resolve the known account contact from Gmail evidence.",
+        task_objective="contact_discovery",
+        expected_artifact_type="contact_candidates",
+        desired_count=1,
+        gmail_query='"Acme Compute"',
+    )
+    contact_result = GmailContactLookupResult(
+        found=True,
+        answer="The account contact is Alex Rivera.",
+        contacts=[
+            GmailResolvedContact(
+                message_id="msg-1",
+                thread_id="thread-1",
+                contact_name="Alex Rivera",
+                contact_email="alex@acme.example",
+                source_field="from",
+                relationship="Startup account onboarding contact",
+                evidence_summary="The message says Alex set up the startup account.",
+            )
+        ],
+        supporting_message_ids=["msg-1"],
+        rationale="The exact From header and message content support the answer.",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "unused-chief-model"}
+
+    def fake_contact_workflow(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            result=contact_result,
+            human_summary=(
+                "The account contact is Alex Rivera.\n"
+                "- Alex Rivera <alex@acme.example> "
+                "(Startup account onboarding contact)"
+            ),
+            provider_receipt={
+                "provider": "gmail",
+                "operation": "search_and_read_contact_evidence",
+                "query": '"Acme Compute"',
+                "candidate_count": 1,
+                "selected_message_ids": ["msg-1"],
+                "provider_read": True,
+                "provider_write": False,
+                "verified": True,
+            },
+            outcome=SimpleNamespace(
+                typed_input=SimpleNamespace(candidates=[{"id": "msg-1"}]),
+                model_provider="openai",
+                model_name="test-gmail-model",
+                model_run_mode="live_sdk",
+                usage={"requests": 1},
+                cost={"estimated_cost_usd": 0.001},
+                request_cache={},
+            ),
+        )
+
+    monkeypatch.setenv(MANUAL_REQUEST_PLAN_ENV, plan.model_dump_json())
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(
+        script,
+        "run_gmail_contact_lookup_workflow",
+        fake_contact_workflow,
+    )
+    monkeypatch.setattr(
+        script,
+        "run_chief_of_staff_sdk",
+        lambda *_args, **_kwargs: pytest.fail(
+            "The generic Chief model must not rerun a verified Gmail contact lookup."
+        ),
+    )
+
+    assert script.main(["--live-sdk", "--json", "--input", request]) == 0
+
+    payload = _payload(capsys.readouterr().out)
+    assert captured["operator_request"] == request
+    assert captured["gmail_query"] == '"Acme Compute"'
+    assert captured["max_messages"] == 10
+    assert payload["status"] == "done"
+    assert payload["completion_confirmed"] is True
+    assert payload["public_result"]["provider_receipt_verified"] is True
+    assert payload["output"]["recommended_route"]["workflow_type"] == "gmail-triage"
+    assert payload["provider"] == {
+        "provider": "gmail",
+        "operation": "search_and_read_contact_evidence",
+        "query": '"Acme Compute"',
+        "candidate_count": 1,
+        "selected_message_ids": ["msg-1"],
+        "provider_read": True,
+        "provider_write": False,
+        "verified": True,
+    }
+    assert payload["gmail_contact_lookup_result"]["contacts"][0]["contact_email"] == (
+        "alex@acme.example"
+    )
+    assert payload["usage"]["requests"] == 1
+    assert payload["openai_requests"] == 1
+    assert len(payload["workflow_sdk_usage_events"]) == 1
+    assert payload["side_effects"] == {
+        "gmail_read": True,
+        "gmail_write": False,
+        "email_sent": False,
+        "slack_message_posted": False,
+    }
+
+
+def test_run_script_live_priority_grouping_uses_shared_gmail_workflow_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    request = (
+        "CoS, I've been away from email. What arrived today that actually needs me, "
+        "and what can wait? Don't draft, label, archive, or send anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        primary_target="today's inbound email",
+        target_type="gmail_message_collection",
+        provider_system="gmail",
+        provider_operations=["search", "read"],
+        provider_read_scope="bounded_collection",
+        provider_result_mode="items",
+        gmail_mailbox_direction="inbound",
+        gmail_date_scope="today",
+        gmail_requested_fields=["subject", "sender", "date", "snippet"],
+        objective="Identify what needs the operator and what can wait.",
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        draft_policy="no_drafts_requested",
+    )
+    important = GmailPriorityGroupedMessage(
+        message_id="msg-important",
+        thread_id="thread-important",
+        received_at="2026-07-24T09:00:00-04:00",
+        subject="Decision needed",
+        sender_name="Casey",
+        sender_email="casey@example.test",
+        bucket="important",
+        category="collaboration_opportunity",
+        confidence=0.9,
+        priority="high",
+        summary="A decision is requested today.",
+        reasoning="The provider-backed message contains a same-day decision request.",
+        needs_reply=True,
+        recommended_action="Review today.",
+    )
+    grouping_result = GmailPriorityGroupingResult(
+        request_summary=request,
+        source_label="INBOX",
+        lookback_days=1,
+        source_message_count=1,
+        important=[important],
+    )
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "unused-chief-model"}
+
+    def fake_grouping_workflow(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            result=grouping_result,
+            human_summary=(
+                "Needs your attention:\n"
+                "- Decision needed - Casey: Review today.\n\n"
+                "Can wait:\n- None."
+            ),
+            provider_receipt={
+                "provider": "gmail",
+                "operation": "bounded_priority_grouping_read",
+                "query": "to:me -in:sent after:1784865599 before:1784952000",
+                "label": "INBOX",
+                "candidate_count": 1,
+                "selected_message_ids": ["msg-important"],
+                "complete": True,
+                "verified": True,
+                "provider_read": True,
+                "provider_write": False,
+            },
+            outcome=SimpleNamespace(
+                model_provider="openai",
+                model_name="test-gmail-model",
+                model_run_mode="live_sdk",
+                usage={"requests": 1},
+                cost={"estimated_cost_usd": 0.001},
+                request_cache={},
+            ),
+        )
+
+    monkeypatch.setenv(MANUAL_REQUEST_PLAN_ENV, plan.model_dump_json())
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(
+        script,
+        "run_gmail_priority_grouping_workflow",
+        fake_grouping_workflow,
+    )
+    monkeypatch.setattr(
+        script,
+        "run_chief_of_staff_sdk",
+        lambda *_args, **_kwargs: pytest.fail(
+            "The generic Chief model must not rerun verified Gmail priority grouping."
+        ),
+    )
+
+    assert script.main(["--live-sdk", "--json", "--input", request]) == 0
+
+    payload = _payload(capsys.readouterr().out)
+    gmail_plan = captured["gmail_plan"]
+    assert captured["operator_request"] == request
+    assert gmail_plan.operation == "priority_grouping"
+    assert gmail_plan.read_scope == "collection"
+    assert gmail_plan.mailbox_direction == "inbound"
+    assert gmail_plan.date_scope == "today"
+    assert gmail_plan.max_messages == 25
+    assert gmail_plan.draft_replies_in_output is False
+    assert gmail_plan.side_effect_policy == "read_only"
+    assert payload["mode"] == "live_sdk_gmail_priority_grouping"
+    assert payload["status"] == "done"
+    assert payload["completion_confirmed"] is True
+    assert payload["public_result"]["provider_receipt_verified"] is True
+    assert payload["output"]["summary"].startswith("Needs your attention:")
+    assert payload["provider"]["provider_read"] is True
+    assert payload["provider"]["provider_write"] is False
+    assert payload["gmail_priority_grouping_result"]["important"][0]["message_id"] == (
+        "msg-important"
+    )
+    assert payload["usage"]["requests"] == 1
+    assert payload["openai_requests"] == 1
+    assert len(payload["workflow_sdk_usage_events"]) == 1
+    assert payload["side_effects"] == {
+        "gmail_read": True,
+        "gmail_write": False,
+        "email_sent": False,
+        "slack_message_posted": False,
+    }
+
+
+def test_chief_payload_aggregates_preflight_and_specialist_sdk_telemetry() -> None:
+    script = _load_run_chief_of_staff_script()
+    result = ChiefOfStaffResult(
+        mode="llm",
+        intent="Find the verified account contact.",
+        summary="The provider-backed contact is ready.",
+    )
+    preflight = {
+        "request_text": "Find the verified account contact.",
+        "selected_agent": "gmail_triage",
+        "sdk_usage_events": [
+            {
+                "agent_name": "manual_request_planner",
+                "run_stage": "orchestrator_preflight.manual_request_planner",
+                "usage": {
+                    "available": True,
+                    "requests": 1,
+                    "input_tokens": 200,
+                    "output_tokens": 20,
+                    "total_tokens": 220,
+                    "cached_input_tokens": 10,
+                },
+                "cost": {
+                    "amount_usd": 0.002,
+                    "billable_tokens": {
+                        "input_tokens": 190,
+                        "cached_input_tokens": 10,
+                        "output_tokens": 20,
+                    },
+                    "components_usd": {
+                        "input": 0.0015,
+                        "cached_input": 0.0001,
+                        "output": 0.0004,
+                    },
+                },
+                "request_cache": {"tool_count": 0},
+            }
+        ],
+    }
+
+    payload = script._payload(
+        mode="live_sdk_gmail_contact_lookup",
+        live_sdk=True,
+        model={"provider": "openai", "name": "gpt-5.4-mini"},
+        output=result,
+        input_text="Find the verified account contact.",
+        orchestrator_preflight=preflight,
+        usage={
+            "available": True,
+            "requests": 1,
+            "input_tokens": 300,
+            "output_tokens": 30,
+            "total_tokens": 330,
+            "cached_input_tokens": 20,
+        },
+        cost={
+            "estimated_usd": 0.003,
+            "billable_tokens": {
+                "input_tokens": 280,
+                "cached_input_tokens": 20,
+                "output_tokens": 30,
+            },
+            "components_usd": {
+                "input": 0.002,
+                "cached_input": 0.0002,
+                "output": 0.0008,
+            },
+        },
+        request_cache={"tool_count": 0},
+    )
+
+    assert payload["openai_requests"] == 2
+    assert payload["usage"] == {
+        "available": True,
+        "stage_count": 2,
+        "requests": 2,
+        "input_tokens": 500,
+        "output_tokens": 50,
+        "total_tokens": 550,
+        "cached_input_tokens": 30,
+        "reasoning_output_tokens": 0,
+        "cache_hit_rate": 0.06,
+    }
+    assert payload["cost"]["estimated_usd"] == 0.005
+    assert payload["cost"]["stage_count"] == 2
+    assert payload["cost"]["billable_tokens"] == {
+        "cached_input_tokens": 30.0,
+        "input_tokens": 470.0,
+        "output_tokens": 50.0,
+    }
+    assert [
+        event["agent_name"] for event in payload["workflow_sdk_usage_events"]
+    ] == ["manual_request_planner", "gmail_triage"]
 
 
 def test_run_script_live_sdk_passes_web_query_plan_to_chief(
@@ -3271,8 +3829,9 @@ def test_run_script_executes_required_calendar_lookup_from_semantic_plan(
         intent="context_lookup",
         provider_system="google_calendar",
         objective="Find the orientation session date.",
-        primary_target="calendar item wrapper",
-        required_entities=["UT Course Orientation Session"],
+        primary_target="UT Course Orientation Session",
+        required_entities=["Google Calendar"],
+        required_terms=["UT Course Orientation Session"],
     )
     captured: dict[str, object] = {}
 
@@ -3298,6 +3857,37 @@ def test_run_script_executes_required_calendar_lookup_from_semantic_plan(
     }
     assert receipt is not None
     assert receipt["status"] == "success"
+
+
+def test_run_script_does_not_collapse_calendar_collection_into_exact_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        provider_operations=["read"],
+        provider_read_scope="bounded_collection",
+        primary_target="events tomorrow",
+        objective="List all my events tomorrow.",
+    )
+    monkeypatch.setattr(
+        script,
+        "resolve_google_calendar_event_impl",
+        lambda *_args, **_kwargs: pytest.fail(
+            "A collection read must not become one exact event-title lookup."
+        ),
+    )
+
+    receipt = script._execute_required_calendar_context_lookup(
+        plan,
+        input_text="List all my events tomorrow.",
+    )
+
+    assert receipt is None
 
 
 def test_run_script_calendar_lookup_falls_back_to_explicit_date_window(
@@ -3381,15 +3971,19 @@ def test_run_script_recovers_required_calendar_receipt_when_model_skips_tool(
         required_entities=["UT Course Orientation Session"],
     )
     calls: list[str] = []
+    sdk_call: dict[str, object] = {}
 
     class FakeModelConfig:
         def as_log_dict(self) -> dict[str, str]:
             return {"provider": "openai", "name": "gpt-5.4-mini"}
 
     def fake_run_chief_of_staff_sdk(
-        *_args: object,
+        typed_input: object,
         **_kwargs: object,
     ) -> TypedAgentRunResult:
+        calls.append("sdk")
+        sdk_call["typed_input"] = typed_input
+        sdk_call.update(_kwargs)
         return TypedAgentRunResult(
             agent_name="chief_of_staff",
             output=ChiefOfStaffResult(
@@ -3409,7 +4003,7 @@ def test_run_script_recovers_required_calendar_receipt_when_model_skips_tool(
         *,
         input_text: str = "",
     ) -> dict[str, object]:
-        calls.append(input_text)
+        calls.append(f"provider:{input_text}")
         return {
             "status": "success",
             "operation": "resolve_calendar_event",
@@ -3447,7 +4041,19 @@ def test_run_script_recovers_required_calendar_receipt_when_model_skips_tool(
     )
 
     payload = _payload(capsys.readouterr().out)
-    assert calls == ["What date is the UT Course Orientation Session?"]
+    assert calls == [
+        "provider:What date is the UT Course Orientation Session?",
+        "sdk",
+    ]
+    assert sdk_call["attach_tools"] is False
+    assert sdk_call["quality_budget"].max_turns == 1
+    assert sdk_call["quality_budget"].max_tool_calls == 0
+    typed_input = sdk_call["typed_input"]
+    assert isinstance(typed_input, dict)
+    assert typed_input["verified_provider_context"]["operation"] == (
+        "resolve_calendar_event"
+    )
+    assert typed_input["provider_execution_contract"]["execution_complete"] is True
     assert payload["status"] == "done"
     assert payload["human_summary"].startswith(
         'Yes - "UT Course Orientation Session" is on your Google Calendar '

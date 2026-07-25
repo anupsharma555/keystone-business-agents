@@ -7,6 +7,7 @@ import pytest
 
 from keystone_agents.calendar_actions import infer_calendar_action_plan
 from keystone_agents.tools.google_calendar_tool import (
+    GOOGLE_CALENDAR_LIST_READ_SCOPE,
     GOOGLE_CALENDAR_WRITE_ENV,
     GoogleCalendarError,
     GoogleCalendarTool,
@@ -53,9 +54,17 @@ class FakeCalendarTool:
         time_min: str,
         time_max: str,
         max_results: int = 100,
+        query: str = "",
     ) -> list[dict[str, Any]]:
         self.calls.append(("list_window", f"{time_min}|{time_max}"))
-        return list(self.events.values())[:max_results]
+        events = list(self.events.values())
+        if query:
+            events = [
+                event
+                for event in events
+                if query.lower() in str(event.get("summary") or "").lower()
+            ]
+        return events[:max_results]
 
     def update_event(
         self, calendar_id: str, event_id: str, payload: dict[str, Any]
@@ -347,6 +356,43 @@ def test_calendar_event_reference_uses_operator_date_to_disambiguate() -> None:
     assert result["status"] == "success"
     assert result["event_id"] == "event-1"
     assert result["start_date"] == "2026-07-14"
+    assert result["start"] == "2026-07-14T14:00:00-04:00"
+    assert result["start_time"] == "14:00"
+    assert result["all_day"] is False
+
+
+def test_calendar_event_reference_uses_date_window_and_bounded_token_match() -> None:
+    tool = FakeCalendarTool()
+    tool.events = {
+        "orientation": {
+            "id": "orientation",
+            "status": "confirmed",
+            "summary": "UT Course Orientation Session",
+            "start": {"dateTime": "2026-08-22T12:00:00-04:00"},
+        },
+        "course-start": {
+            "id": "course-start",
+            "status": "confirmed",
+            "summary": "UT Austin Course Starts",
+            "start": {"dateTime": "2026-08-15T12:00:00-04:00"},
+            "end": {"dateTime": "2026-08-15T13:00:00-04:00"},
+        },
+    }
+
+    result = resolve_google_calendar_event_impl(
+        "UT course start",
+        start_date="2026-08-15",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+
+    assert result["status"] == "success"
+    assert result["event_id"] == "course-start"
+    assert result["title"] == "UT Austin Course Starts"
+    assert result["start_date"] == "2026-08-15"
+    assert result["start_time"] == "12:00"
+    assert tool.calls[0][0] == "list_window"
+    assert not any(operation == "find" for operation, _value in tool.calls)
 
 
 def test_calendar_window_read_splits_one_time_and_recurring_without_private_bodies() -> None:
@@ -394,6 +440,10 @@ def test_calendar_window_read_splits_one_time_and_recurring_without_private_bodi
         "recurring-instance",
     ]
     assert result["events"][1]["is_recurring"] is True
+    assert result["events"][0]["start_date"] == "2026-07-06"
+    assert result["events"][0]["start_time"] == "10:00"
+    assert result["events"][0]["end_time"] == "11:00"
+    assert result["events"][0]["all_day"] is False
     assert "description" not in result["events"][0]
     assert "attendees" not in result["events"][0]
     assert result["external_writes_enabled"] is False
@@ -412,6 +462,59 @@ def test_calendar_window_read_requires_ordered_timezone_bounds() -> None:
             "2026-07-11T00:00:00-04:00",
             "2026-07-04T00:00:00-04:00",
         )
+
+
+def test_filtered_calendar_window_reads_selected_shared_calendars() -> None:
+    class SelectedCalendarTool(FakeCalendarTool):
+        def list_selected_readable_calendars(self) -> list[dict[str, Any]]:
+            return [
+                {"id": "primary", "primary": True, "selected": True},
+                {"id": "shared@example.com", "selected": True},
+            ]
+
+        def list_events_window(
+            self,
+            calendar_id: str,
+            *,
+            time_min: str,
+            time_max: str,
+            max_results: int = 100,
+            query: str = "",
+        ) -> list[dict[str, Any]]:
+            self.calls.append(("list_window", f"{calendar_id}|{query}"))
+            if calendar_id == "primary":
+                return []
+            return [
+                {
+                    "id": "flight-shared",
+                    "status": "confirmed",
+                    "summary": "Flight to Philadelphia (DL 2131)",
+                    "start": {"dateTime": "2026-07-22T13:00:00-04:00"},
+                    "end": {"dateTime": "2026-07-22T15:00:00-04:00"},
+                }
+            ]
+
+    tool = SelectedCalendarTool()
+
+    result = read_google_calendar_window_impl(
+        "2026-07-22T00:00:00-04:00",
+        "2026-07-23T00:00:00-04:00",
+        calendar_scope="selected_readable",
+        query="flight",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+
+    assert result["status"] == "success"
+    assert result["calendar_scope"] == "selected_readable"
+    assert result["calendar_count"] == 2
+    assert result["query"] == "flight"
+    assert result["events"][0]["event_id"] == "flight-shared"
+    assert result["events"][0]["source_calendar_id"] == "shared@example.com"
+    assert tool.calls == [
+        ("list_window", "primary|flight"),
+        ("list_window", "shared@example.com|flight"),
+    ]
 
 
 def test_calendar_create_update_delete_lifecycle_verifies_provider(
@@ -668,3 +771,27 @@ def test_calendar_error_reports_bounded_provider_reason() -> None:
         match="PERMISSION_DENIED.*accessNotConfigured.*Calendar API",
     ):
         tool.get_event("primary", "event-1")
+
+
+def test_selected_calendar_read_reports_missing_oauth_scope() -> None:
+    session = RetrySession()
+    session.responses = [
+        FakeResponse(
+            403,
+            {
+                "error": {
+                    "status": "PERMISSION_DENIED",
+                    "errors": [{"reason": "insufficientPermissions"}],
+                }
+            },
+        )
+    ]
+    tool = GoogleCalendarTool(live=True, access_token="token", session=session)
+
+    with pytest.raises(
+        GoogleCalendarError,
+        match="Reading selected and shared calendars requires.*calendarlist.readonly",
+    ):
+        tool.list_selected_readable_calendars()
+
+    assert GOOGLE_CALENDAR_LIST_READ_SCOPE.endswith("calendar.calendarlist.readonly")

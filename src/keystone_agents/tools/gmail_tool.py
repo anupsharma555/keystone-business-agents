@@ -49,6 +49,7 @@ DEFAULT_GOOGLE_TOKEN_FILE = "token.json"
 GMAIL_SCOPES = (
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
 )
 GMAIL_LIVE_OPERATIONS = (
     "read",
@@ -1258,6 +1259,238 @@ class GmailTool:
         ]
         return enforce_tool_output_guardrails("gmail_list_recent_messages", output)
 
+    def count_messages(
+        self,
+        *,
+        label: str | None = None,
+        query: str | None = None,
+        page_size: int = 500,
+        max_pages: int = 50,
+    ) -> dict[str, Any]:
+        """Count every Gmail message in a bounded read-only query.
+
+        Gmail's ``resultSizeEstimate`` is not an exact count. This helper follows
+        ``nextPageToken`` until the result set is exhausted and counts unique
+        message IDs. If the defensive page ceiling is reached, ``complete`` is
+        false so callers cannot present the partial count as exact.
+        """
+
+        enforce_tool_input_guardrails(
+            "gmail_count_messages",
+            {
+                "label": label,
+                "query": query,
+                "page_size": page_size,
+                "max_pages": max_pages,
+            },
+        )
+        if not 1 <= page_size <= 500:
+            raise ValueError("page_size must be between 1 and 500.")
+        if not 1 <= max_pages <= 100:
+            raise ValueError("max_pages must be between 1 and 100.")
+        empty = {
+            "message_count": 0,
+            "page_count": 0,
+            "complete": True,
+            "query": str(query or ""),
+            "label": str(label or ""),
+            "provider_read": self.live,
+            "provider_write": False,
+        }
+        if not self.live:
+            return enforce_tool_output_guardrails("gmail_count_messages", empty)
+
+        message_ids: set[str] = set()
+        page_token = ""
+        seen_page_tokens: set[str] = set()
+        page_count = 0
+        complete = False
+        while page_count < max_pages:
+            params: dict[str, Any] = {"maxResults": page_size}
+            if label:
+                params["labelIds"] = label
+            if query:
+                params["q"] = query
+            if page_token:
+                params["pageToken"] = page_token
+            data = self._request(
+                "GET",
+                "messages",
+                operation="count messages",
+                params=params,
+            )
+            page_count += 1
+            for item in data.get("messages", []) or []:
+                if not isinstance(item, Mapping):
+                    continue
+                message_id = str(item.get("id") or "").strip()
+                if message_id:
+                    message_ids.add(message_id)
+            next_token = str(data.get("nextPageToken") or "").strip()
+            if not next_token:
+                complete = True
+                break
+            if next_token == page_token or next_token in seen_page_tokens:
+                break
+            seen_page_tokens.add(next_token)
+            page_token = next_token
+
+        output = {
+            "message_count": len(message_ids),
+            "page_count": page_count,
+            "complete": complete,
+            "query": str(query or ""),
+            "label": str(label or ""),
+            "provider_read": True,
+            "provider_write": False,
+        }
+        return enforce_tool_output_guardrails("gmail_count_messages", output)
+
+    def project_message_summaries(
+        self,
+        *,
+        requested_fields: list[str],
+        label: str | None = None,
+        query: str | None = None,
+        max_items: int = 50,
+        page_size: int = 100,
+        max_pages: int = 50,
+    ) -> dict[str, Any]:
+        """Project selected metadata fields from one complete Gmail result set."""
+
+        allowed = {"subject", "sender", "date", "snippet"}
+        fields = list(
+            dict.fromkeys(
+                str(field or "").strip().lower()
+                for field in requested_fields
+                if str(field or "").strip().lower() in allowed
+            )
+        )
+        enforce_tool_input_guardrails(
+            "gmail_project_message_summaries",
+            {
+                "requested_fields": fields,
+                "label": label,
+                "query": query,
+                "max_items": max_items,
+                "page_size": page_size,
+                "max_pages": max_pages,
+            },
+        )
+        if not fields:
+            raise ValueError("At least one Gmail projection field is required.")
+        if not 1 <= max_items <= 50:
+            raise ValueError("max_items must be between 1 and 50.")
+        if not 1 <= page_size <= 500:
+            raise ValueError("page_size must be between 1 and 500.")
+        if not 1 <= max_pages <= 100:
+            raise ValueError("max_pages must be between 1 and 100.")
+        empty = {
+            "items": [],
+            "item_count": 0,
+            "page_count": 0,
+            "complete": True,
+            "requested_fields": fields,
+            "query": str(query or ""),
+            "label": str(label or ""),
+            "provider_read": self.live,
+            "provider_write": False,
+        }
+        if not self.live:
+            return enforce_tool_output_guardrails(
+                "gmail_project_message_summaries", empty
+            )
+
+        message_ids: list[str] = []
+        seen_message_ids: set[str] = set()
+        page_token = ""
+        seen_page_tokens: set[str] = set()
+        page_count = 0
+        complete = False
+        over_limit = False
+        while page_count < max_pages:
+            params: dict[str, Any] = {"maxResults": min(page_size, max_items + 1)}
+            if label:
+                params["labelIds"] = label
+            if query:
+                params["q"] = query
+            if page_token:
+                params["pageToken"] = page_token
+            data = self._request(
+                "GET",
+                "messages",
+                operation="project message summaries",
+                params=params,
+            )
+            page_count += 1
+            for item in data.get("messages", []) or []:
+                if not isinstance(item, Mapping):
+                    continue
+                message_id = str(item.get("id") or "").strip()
+                if message_id and message_id not in seen_message_ids:
+                    seen_message_ids.add(message_id)
+                    message_ids.append(message_id)
+                if len(message_ids) > max_items:
+                    over_limit = True
+                    break
+            if over_limit:
+                break
+            next_token = str(data.get("nextPageToken") or "").strip()
+            if not next_token:
+                complete = True
+                break
+            if next_token == page_token or next_token in seen_page_tokens:
+                break
+            seen_page_tokens.add(next_token)
+            page_token = next_token
+
+        if not complete or over_limit:
+            output = {
+                **empty,
+                "page_count": page_count,
+                "complete": False,
+                "provider_read": True,
+            }
+            return enforce_tool_output_guardrails(
+                "gmail_project_message_summaries", output
+            )
+
+        projected_items: list[dict[str, str]] = []
+        for message_id in message_ids:
+            data = self._request(
+                "GET",
+                f"messages/{message_id}",
+                operation="get message metadata for projection",
+                params={
+                    "format": "metadata",
+                    "metadataHeaders": ["From", "To", "Subject", "Date"],
+                },
+            )
+            summary = gmail_message_summary_from_api(data)
+            projected: dict[str, str] = {}
+            if "subject" in fields:
+                projected["subject"] = str(summary.get("subject") or "(no subject)")
+            if "sender" in fields:
+                projected["sender"] = str(
+                    summary.get("sender_name") or summary.get("sender_email") or "Unknown sender"
+                )
+            if "date" in fields:
+                projected["date"] = str(summary.get("received_at") or "Unknown date")
+            if "snippet" in fields:
+                projected["snippet"] = str(summary.get("snippet") or "")
+            projected_items.append(projected)
+
+        output = {
+            **empty,
+            "items": projected_items,
+            "item_count": len(projected_items),
+            "page_count": page_count,
+            "provider_read": True,
+        }
+        return enforce_tool_output_guardrails(
+            "gmail_project_message_summaries", output
+        )
+
     def search_message_summaries(
         self,
         label: str | None = None,
@@ -2373,6 +2606,40 @@ def list_recent_messages(
         label=label,
         max_results=max_results,
         query=query,
+    )
+
+
+def count_messages(
+    *,
+    label: str | None = None,
+    query: str | None = None,
+    page_size: int = 500,
+    max_pages: int = 50,
+) -> dict[str, Any]:
+    return GmailTool(live=True).count_messages(
+        label=label,
+        query=query,
+        page_size=page_size,
+        max_pages=max_pages,
+    )
+
+
+def project_message_summaries(
+    *,
+    requested_fields: list[str],
+    label: str | None = None,
+    query: str | None = None,
+    max_items: int = 50,
+    page_size: int = 100,
+    max_pages: int = 50,
+) -> dict[str, Any]:
+    return GmailTool(live=True).project_message_summaries(
+        requested_fields=requested_fields,
+        label=label,
+        query=query,
+        max_items=max_items,
+        page_size=page_size,
+        max_pages=max_pages,
     )
 
 

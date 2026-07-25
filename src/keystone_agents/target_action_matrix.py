@@ -167,7 +167,7 @@ TARGET_ACTION_SCORECARD: tuple[TargetActionCase, ...] = (
         fallback_blocker="missing Gmail scope",
         artifact_backed=False,
         expected_intent="gmail_triage",
-        expected_target_type="gmail_thread",
+        expected_target_type="gmail_message_collection",
         expected_task_objective="gmail_triage",
         expected_artifact_type="gmail_triage_report",
     ),

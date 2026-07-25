@@ -44,7 +44,7 @@ def test_env_contract_exposes_slack_child_env_scrub_keys_and_defaults() -> None:
         "KEYSTONE_TAVILY_SEARCH_FALLBACK": "true",
         "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN": "2",
         "KEYSTONE_EXA_SEARCH_FALLBACK": "true",
-        "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "2",
+        "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "10",
     }
 
 

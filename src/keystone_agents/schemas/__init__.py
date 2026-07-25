@@ -73,10 +73,12 @@ from keystone_agents.schemas.email_triage import (
     EmailTriage,
     EmailTriageResult,
     GmailAttachmentMetadata,
+    GmailContactLookupResult,
     GmailLinkRecord,
     GmailMessageEnvelope,
     GmailPriorityGroupedMessage,
     GmailPriorityGroupingResult,
+    GmailResolvedContact,
 )
 from keystone_agents.schemas.execution_request import (
     DirectAgentResponse,
@@ -232,6 +234,7 @@ from keystone_agents.schemas.web_data import (
     WebDataSchemaMappingResult,
 )
 from keystone_agents.schemas.work_item import (
+    UserFacingSummaryAuthority,
     WorkflowRunRequest,
     WorkflowRunResult,
     WorkItem,
@@ -300,10 +303,12 @@ __all__ = [
     "EmailTriage",
     "EmailTriageResult",
     "GmailAttachmentMetadata",
+    "GmailContactLookupResult",
     "GmailLinkRecord",
     "GmailMessageEnvelope",
     "GmailPriorityGroupedMessage",
     "GmailPriorityGroupingResult",
+    "GmailResolvedContact",
     "ExecutionContinuation",
     "DirectAgentResponse",
     "DirectAgentResponseInput",
@@ -389,6 +394,7 @@ __all__ = [
     "WorkItemSourceRef",
     "WorkItemStatus",
     "WorkItemTarget",
+    "UserFacingSummaryAuthority",
     "WorkflowRunRequest",
     "WorkflowRunResult",
     "StructuredWebRecord",

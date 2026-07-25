@@ -86,10 +86,14 @@ def collect_current_quarter_finance_packet(
         live=True,
         force_sdk_interpretation=False,
         manual_request_plan={
-            "source": "l174_19_finance_packet",
+            "source": "canonical:l174_19_finance_packet",
             "target_agent": "chief_of_staff",
-            "intent": "business_system_context",
+            "intent": "context_lookup",
+            "task_objective": "context_lookup",
             "primary_target": "finance_tax_tracker current quarter",
+            "target_type": "business_system_context",
+            "provider_system": "airtable",
+            "provider_operations": ["read"],
         },
     )
     output = result.output
@@ -277,9 +281,11 @@ def execute_finance_bd_priority_decision(
             for option in packet.options
         ],
         "manual_request_plan": {
-            "source": "l174_19_finance_bd_priority",
+            "source": "canonical:l174_19_finance_bd_priority",
             "target_agent": "chief_of_staff",
-            "intent": "internal_review_handoff",
+            "workflow": ["chief_of_staff", "opportunity_scout"],
+            "intent": "route_request",
+            "task_objective": "route_or_continue",
             "primary_target": "next business-development priority",
         },
         "include_specialist_tools": False,

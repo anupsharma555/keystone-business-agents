@@ -12,6 +12,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from keystone_agents.agents.calendar_action_interpreter import (
+    calendar_lookup_target_from_plan,
+)
 from keystone_agents.agents.chief_of_staff import (
     chief_of_staff_should_use_specialist_tools,
     plan_chief_of_staff_request,
@@ -28,6 +31,13 @@ from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.execution_request import attach_execution_public_result
 from keystone_agents.finance_expense_receipts import (
     resolve_finance_expense_receipt_target,
+)
+from keystone_agents.gmail_triage.contact_lookup import (
+    run_gmail_contact_lookup_workflow,
+)
+from keystone_agents.gmail_triage.execution_plan import resolve_gmail_execution_plan
+from keystone_agents.gmail_triage.priority_grouping import (
+    run_gmail_priority_grouping_workflow,
 )
 from keystone_agents.local_kni_evidence import (
     build_local_kni_evidence_packet,
@@ -59,6 +69,7 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffSourceRef,
 )
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.source_layer_context import runtime_source_layer_policy_context
 from keystone_agents.storage.sqlite_store import redact_secrets
 from keystone_agents.tools.google_calendar_tool import (
@@ -305,6 +316,161 @@ def _run_interpreted_calendar_action(
         for action in actions:
             print(f"- {action}")
     return 0 if passed else 1
+
+
+def _run_interpreted_gmail_contact_lookup(
+    *,
+    input_text: str,
+    manual_plan: ManualRequestPlan,
+    gmail_plan: object,
+    orchestrator_preflight: object | None,
+    quality_budget: AgentQualityBudget,
+    model_override: str | None,
+    json_output: bool,
+) -> int:
+    """Delegate one bounded Gmail read to Gmail Triage and return its verified answer."""
+
+    execution = run_gmail_contact_lookup_workflow(
+        operator_request=input_text,
+        gmail_query=str(getattr(gmail_plan, "gmail_query", "") or "").strip(),
+        max_messages=int(getattr(gmail_plan, "max_messages", 10) or 10),
+        label=str(getattr(gmail_plan, "source_label", "") or "").strip() or None,
+        live_sdk=True,
+        model=model_override,
+    )
+    result = execution.result
+    contact_result = result.model_dump(mode="json")
+    chief_result = ChiefOfStaffResult(
+        mode="llm",
+        intent=input_text,
+        summary=execution.human_summary,
+        operating_capabilities=["gmail_contact_lookup"],
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="gmail-triage",
+            target_channel="current Slack thread",
+            rationale=(
+                "Chief of Staff delegated a bounded read-only Gmail contact lookup "
+                "to the owning specialist."
+            ),
+        ),
+        context_sources_considered=["operator_request", "bounded_gmail_evidence"],
+        retrieval_diagnostics={
+            "provider": "gmail",
+            "query": str(getattr(gmail_plan, "gmail_query", "") or "").strip(),
+            "candidate_count": len(execution.outcome.typed_input.candidates),
+            "selected_message_ids": list(result.supporting_message_ids),
+            "provider_read": True,
+            "provider_write": False,
+            "specialist_output": contact_result,
+        },
+        audit_notes=[
+            "The raw current operator request reached both planning and Gmail Triage.",
+            "The returned address was bound to an exact provider message header.",
+            "No Gmail write, draft, send, label, or external action occurred.",
+        ],
+    )
+    outcome = execution.outcome
+    model = {
+        "provider": outcome.model_provider,
+        "name": outcome.model_name,
+        "run_mode": outcome.model_run_mode,
+    }
+    payload = _payload(
+        mode="live_sdk_gmail_contact_lookup",
+        live_sdk=True,
+        model=model,
+        output=chief_result,
+        input_text=input_text,
+        quality_budget=quality_budget,
+        manual_request_plan=manual_plan,
+        orchestrator_preflight=orchestrator_preflight,
+        usage=outcome.usage,
+        cost=outcome.cost,
+        request_cache=outcome.request_cache,
+        tool_receipts=[execution.provider_receipt],
+    )
+    # The Slack bridge persists the bounded ``provider`` telemetry field but
+    # intentionally does not retain arbitrary tool payloads. Preserve this
+    # already-redacted receipt so backend acceptance can prove which provider
+    # read supported the public answer without exposing message contents.
+    payload["provider"] = dict(execution.provider_receipt)
+    payload["gmail_contact_lookup_result"] = contact_result
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(execution.human_summary)
+    return 0
+
+
+def _run_interpreted_gmail_priority_grouping(
+    *,
+    input_text: str,
+    manual_plan: ManualRequestPlan,
+    gmail_plan: object,
+    orchestrator_preflight: object | None,
+    quality_budget: AgentQualityBudget,
+    model_override: str | None,
+    json_output: bool,
+) -> int:
+    """Run provider-first read-only Gmail collection triage for Chief."""
+
+    execution = run_gmail_priority_grouping_workflow(
+        operator_request=input_text,
+        gmail_plan=gmail_plan,
+        live_sdk=True,
+        model=model_override,
+    )
+    result_payload = execution.result.model_dump(mode="json")
+    chief_result = ChiefOfStaffResult(
+        mode="llm",
+        intent=input_text,
+        summary=execution.human_summary,
+        operating_capabilities=["gmail_priority_grouping"],
+        recommended_route=ChiefOfStaffRouteRecommendation(
+            workflow_type="gmail-triage",
+            target_channel="current Slack thread",
+            rationale=(
+                "Chief of Staff delegated one bounded read-only Gmail collection "
+                "to the owning specialist."
+            ),
+        ),
+        context_sources_considered=["operator_request", "bounded_gmail_collection"],
+        retrieval_diagnostics={
+            **execution.provider_receipt,
+            "specialist_output": result_payload,
+        },
+        audit_notes=[
+            "The raw current operator request reached both planning and Gmail Triage.",
+            "Every displayed message identity was rebound to the provider result.",
+            "No Gmail draft, send, label, archive, or other write occurred.",
+        ],
+    )
+    outcome = execution.outcome
+    payload = _payload(
+        mode="live_sdk_gmail_priority_grouping",
+        live_sdk=True,
+        model={
+            "provider": outcome.model_provider,
+            "name": outcome.model_name,
+            "run_mode": outcome.model_run_mode,
+        },
+        output=chief_result,
+        input_text=input_text,
+        quality_budget=quality_budget,
+        manual_request_plan=manual_plan,
+        orchestrator_preflight=orchestrator_preflight,
+        usage=outcome.usage,
+        cost=outcome.cost,
+        request_cache=outcome.request_cache,
+        tool_receipts=[execution.provider_receipt],
+    )
+    payload["provider"] = dict(execution.provider_receipt)
+    payload["gmail_priority_grouping_result"] = result_payload
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(execution.human_summary)
+    return 0
 
 
 def _request_forbids_live_web_research(input_text: str) -> bool:
@@ -718,15 +884,28 @@ def _calendar_provider_human_summary(
 def _calendar_context_lookup_target(manual_request_plan: object) -> str:
     """Use model-resolved provider identity without interpreting request phrases."""
 
-    required_entities = [
-        str(item or "").strip()
-        for item in list(getattr(manual_request_plan, "required_entities", []) or [])
-        if str(item or "").strip()
-    ]
-    return (
-        required_entities[0]
-        if required_entities
-        else str(getattr(manual_request_plan, "primary_target", "") or "").strip()
+    return calendar_lookup_target_from_plan(manual_request_plan)
+
+
+def _verified_provider_synthesis_budget(
+    budget: AgentQualityBudget,
+) -> AgentQualityBudget:
+    """Use one tool-free Chief turn after a verified provider read is acquired."""
+
+    return budget.model_copy(
+        update={
+            "max_turns": 1,
+            "max_tool_calls": 0,
+            "enable_context_deepening": False,
+            "hosted_web_search_max_calls": 0,
+            "notes": [
+                *budget.notes,
+                (
+                    "A typed provider read completed before Chief synthesis; the "
+                    "model receives verified context and no provider tools."
+                ),
+            ],
+        }
     )
 
 
@@ -776,6 +955,14 @@ def _execute_required_calendar_context_lookup(
         or str(getattr(manual_request_plan, "intent", "") or "") != "context_lookup"
     ):
         return None
+    if (
+        str(getattr(manual_request_plan, "provider_read_scope", "") or "")
+        == "bounded_collection"
+    ):
+        # A collection request such as "list all events tomorrow" has no exact
+        # event identity. Let the Calendar window tool interpret the raw current
+        # ask instead of collapsing the whole request into one title lookup.
+        return None
     target = _calendar_context_lookup_target(manual_request_plan)
     if not target:
         return None
@@ -801,6 +988,166 @@ def _execute_required_calendar_context_lookup(
         (start + timedelta(days=1)).isoformat(),
         live=True,
     )
+
+
+def _workflow_sdk_usage_events(
+    *,
+    orchestrator_preflight: object | None,
+    mode: str,
+    usage: object | None,
+    cost: object | None,
+    request_cache: object | None,
+) -> list[dict[str, object]]:
+    """Return every model stage that belongs to one Chief workflow.
+
+    Orchestrator preflight owns planning usage while the selected specialist
+    owns synthesis usage. Keep both as individual audit events before deriving
+    the top-level workflow totals.
+    """
+
+    preflight = compact_orchestrator_preflight_payload(orchestrator_preflight)
+    raw_events = preflight.get("sdk_usage_events")
+    events = (
+        [dict(event) for event in raw_events if isinstance(event, dict)]
+        if isinstance(raw_events, list)
+        else []
+    )
+    current_usage = dict(usage) if isinstance(usage, dict) else {}
+    current_cost = dict(cost) if isinstance(cost, dict) else {}
+    current_cache = dict(request_cache) if isinstance(request_cache, dict) else {}
+    if current_usage or current_cost or current_cache:
+        agent_name = (
+            "gmail_triage"
+            if mode
+            in {
+                "live_sdk_gmail_contact_lookup",
+                "live_sdk_gmail_priority_grouping",
+            }
+            else "chief_of_staff"
+        )
+        event: dict[str, object] = {
+            "agent_name": agent_name,
+            "run_stage": mode,
+        }
+        if current_usage:
+            event["usage"] = current_usage
+        if current_cost:
+            event["cost"] = current_cost
+        if current_cache:
+            event["request_cache"] = current_cache
+        events.append(event)
+    return events
+
+
+def _aggregate_sdk_usage(events: list[dict[str, object]]) -> dict[str, object]:
+    """Sum model usage without losing the individual workflow-stage events."""
+
+    usage_records = [
+        event.get("usage")
+        for event in events
+        if isinstance(event.get("usage"), dict)
+    ]
+    if not usage_records:
+        return {}
+    numeric_keys = (
+        "requests",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_input_tokens",
+        "reasoning_output_tokens",
+    )
+    aggregate: dict[str, object] = {
+        "available": any(
+            bool(record.get("available"))
+            or any(record.get(key) not in (None, 0, "") for key in numeric_keys)
+            for record in usage_records
+        ),
+        "stage_count": len(usage_records),
+    }
+    for key in numeric_keys:
+        aggregate[key] = sum(
+            _nonnegative_int(record.get(key)) for record in usage_records
+        )
+    if not aggregate["total_tokens"]:
+        aggregate["total_tokens"] = (
+            int(aggregate["input_tokens"]) + int(aggregate["output_tokens"])
+        )
+    input_tokens = int(aggregate["input_tokens"])
+    cached_input_tokens = min(
+        input_tokens,
+        int(aggregate["cached_input_tokens"]),
+    )
+    aggregate["cache_hit_rate"] = (
+        round(cached_input_tokens / input_tokens, 4) if input_tokens else 0.0
+    )
+    return aggregate
+
+
+def _aggregate_sdk_cost(events: list[dict[str, object]]) -> dict[str, object]:
+    """Sum compatible estimated-cost fields across workflow model stages."""
+
+    cost_records = [
+        event.get("cost")
+        for event in events
+        if isinstance(event.get("cost"), dict)
+    ]
+    if not cost_records:
+        return {}
+
+    def amount(record: dict[str, object]) -> float:
+        for key in ("amount_usd", "estimated_usd", "estimated_cost_usd"):
+            if record.get(key) in (None, ""):
+                continue
+            try:
+                return max(0.0, float(record.get(key) or 0.0))
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    total = round(sum(amount(record) for record in cost_records), 8)
+    aggregate: dict[str, object] = {
+        "amount_usd": total,
+        "estimated_usd": total,
+        "estimated_cost_usd": total,
+        "currency": "USD",
+        "source": "aggregated_sdk_stages",
+        "confidence": "estimate",
+        "stage_count": len(cost_records),
+        "note": (
+            "Summed from the audit-safe per-stage SDK estimates for this workflow; "
+            "this is not an invoice record."
+        ),
+    }
+    for nested_key in ("billable_tokens", "components_usd"):
+        nested_records = [
+            record.get(nested_key)
+            for record in cost_records
+            if isinstance(record.get(nested_key), dict)
+        ]
+        if not nested_records:
+            continue
+        nested_names = {
+            key for record in nested_records for key in record
+        }
+        aggregate[nested_key] = {
+            key: round(
+                sum(
+                    max(0.0, float(record.get(key) or 0.0))
+                    for record in nested_records
+                ),
+                8,
+            )
+            for key in sorted(nested_names)
+        }
+    return aggregate
+
+
+def _nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _payload(
@@ -837,6 +1184,13 @@ def _payload(
         "send_enabled": False,
         "output": dumped,
     }
+    workflow_usage_events = _workflow_sdk_usage_events(
+        orchestrator_preflight=orchestrator_preflight,
+        mode=mode,
+        usage=usage,
+        cost=cost,
+        request_cache=request_cache,
+    )
     receipts = list(tool_receipts or [])
     if receipts:
         payload["tool_receipts"] = receipts
@@ -846,10 +1200,15 @@ def _payload(
         payload["display_text"] = human_summary
     if quality_budget is not None:
         payload["quality_budget"] = quality_budget.model_dump(mode="json")
-    if usage is not None:
-        payload["usage"] = usage
-    if cost is not None:
-        payload["cost"] = cost
+    if workflow_usage_events:
+        payload["workflow_sdk_usage_events"] = workflow_usage_events
+    aggregate_usage = _aggregate_sdk_usage(workflow_usage_events)
+    if aggregate_usage:
+        payload["usage"] = aggregate_usage
+        payload["openai_requests"] = int(aggregate_usage.get("requests") or 0)
+    aggregate_cost = _aggregate_sdk_cost(workflow_usage_events)
+    if aggregate_cost:
+        payload["cost"] = aggregate_cost
     if request_cache is not None:
         payload["request_cache"] = request_cache
     if web_query_plan is not None:
@@ -924,6 +1283,94 @@ def _payload(
             payload["human_summary"] = provider_summary
             payload["slack_display_text"] = provider_summary
             payload["display_text"] = provider_summary
+    if (
+        provider_system == "gmail"
+        and str(getattr(manual_request_plan, "task_objective", "") or "")
+        == "contact_discovery"
+    ):
+        matching_receipts = [
+            receipt
+            for receipt in receipts
+            if receipt.get("provider") == "gmail"
+            and receipt.get("operation") == "search_and_read_contact_evidence"
+        ]
+        verified = bool(
+            matching_receipts
+            and all(receipt.get("verified") is True for receipt in matching_receipts)
+        )
+        payload["status"] = "done" if verified else "blocked"
+        payload["completion_confirmed"] = verified
+        payload["side_effects"] = {
+            "gmail_read": bool(matching_receipts),
+            "gmail_write": False,
+            "email_sent": False,
+            "slack_message_posted": False,
+        }
+        if verified:
+            payload["public_result"] = {
+                "status": "completed",
+                "title": "Business Agents Result Ready",
+                "text": human_summary,
+                "completion_confirmed": True,
+                "provider_write_attempted": False,
+                "provider_receipt_verified": True,
+            }
+        else:
+            failure_text = (
+                "I could not verify the requested Gmail contact lookup from a "
+                "bounded provider result."
+            )
+            payload["human_summary"] = failure_text
+            payload["slack_display_text"] = failure_text
+            payload["display_text"] = failure_text
+            payload["block_kind"] = "gmail_contact_provider_verification_required"
+    if (
+        provider_system == "gmail"
+        and str(getattr(manual_request_plan, "task_objective", "") or "")
+        == "gmail_triage"
+    ):
+        matching_receipts = [
+            receipt
+            for receipt in receipts
+            if receipt.get("provider") == "gmail"
+            and receipt.get("operation") == "bounded_priority_grouping_read"
+        ]
+        verified = bool(
+            matching_receipts
+            and all(
+                receipt.get("verified") is True
+                and receipt.get("complete") is True
+                and receipt.get("provider_read") is True
+                and receipt.get("provider_write") is False
+                for receipt in matching_receipts
+            )
+        )
+        payload["status"] = "done" if verified else "blocked"
+        payload["completion_confirmed"] = verified
+        payload["side_effects"] = {
+            "gmail_read": bool(matching_receipts),
+            "gmail_write": False,
+            "email_sent": False,
+            "slack_message_posted": False,
+        }
+        if verified:
+            payload["public_result"] = {
+                "status": "completed",
+                "title": "Business Agents Result Ready",
+                "text": human_summary,
+                "completion_confirmed": True,
+                "provider_write_attempted": False,
+                "provider_receipt_verified": True,
+            }
+        else:
+            failure_text = (
+                "I could not verify the requested Gmail collection triage from a "
+                "complete bounded provider result."
+            )
+            payload["human_summary"] = failure_text
+            payload["slack_display_text"] = failure_text
+            payload["display_text"] = failure_text
+            payload["block_kind"] = "gmail_collection_provider_verification_required"
     if manual_request_plan is not None:
         payload["manual_request_plan"] = (
             manual_request_plan.model_dump(mode="json")
@@ -1517,6 +1964,30 @@ def main(argv: list[str] | None = None) -> int:
             live_sdk=True,
             manual_request_plan=manual_plan,
         )
+        gmail_plan = resolve_gmail_execution_plan(
+            input_text,
+            manual_plan=manual_plan,
+        )
+        if gmail_plan.operation == "contact_lookup":
+            return _run_interpreted_gmail_contact_lookup(
+                input_text=input_text,
+                manual_plan=manual_plan,
+                gmail_plan=gmail_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                quality_budget=budget,
+                model_override=args.model,
+                json_output=args.json,
+            )
+        if gmail_plan.operation == "priority_grouping":
+            return _run_interpreted_gmail_priority_grouping(
+                input_text=input_text,
+                manual_plan=manual_plan,
+                gmail_plan=gmail_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                quality_budget=budget,
+                model_override=args.model,
+                json_output=args.json,
+            )
         typed_result = None
         tool_receipts: list[dict[str, object]] = []
         original_review = None
@@ -1551,6 +2022,19 @@ def main(argv: list[str] | None = None) -> int:
                 )[:4000],
             )
         try:
+            preacquired_calendar_read = None
+            if (
+                ExecutionIntentAuthority.from_value(manual_plan).canonical
+                and manual_plan.provider_system == "google_calendar"
+                and manual_plan.intent == "context_lookup"
+            ):
+                preacquired_calendar_read = _execute_required_calendar_context_lookup(
+                    manual_plan,
+                    input_text=input_text,
+                )
+                if preacquired_calendar_read is not None:
+                    tool_receipts.append(preacquired_calendar_read)
+                    budget = _verified_provider_synthesis_budget(budget)
             typed_input: dict[str, object] = {
                 "request": input_text,
                 "slack_repo_path": args.slack_repo_path,
@@ -1576,18 +2060,32 @@ def main(argv: list[str] | None = None) -> int:
                     "provider_system": "google_calendar",
                     "intent": manual_plan.intent,
                     "primary_target": manual_plan.primary_target,
-                    "execution_required": True,
+                    "execution_required": preacquired_calendar_read is None,
+                    "execution_complete": preacquired_calendar_read is not None,
                     "live": True,
                     "approval_reference": typed_input["approval_reference"],
                     "instruction": (
-                        "Interpret the raw operator request and bounded execution context. "
-                        "For context_lookup, call read_google_calendar_window with live=true "
-                        "over the smallest relevant date window. For business_system_write, "
-                        "call the one required Calendar mutation tool with live=true and the "
-                        "supplied approval_reference. Use provider output for the answer; do "
-                        "not return a plan when the scoped operation can execute."
+                        (
+                            "The typed Calendar read already completed. Answer from "
+                            "verified_provider_context and do not call any provider tool."
+                        )
+                        if preacquired_calendar_read is not None
+                        else (
+                            "Interpret the raw operator request and bounded execution "
+                            "context. For business_system_write, call the one required "
+                            "Calendar mutation tool with live=true and the supplied "
+                            "approval_reference. Use provider output for the answer; do "
+                            "not return a plan when the scoped operation can execute."
+                        )
                     ),
                 }
+            if preacquired_calendar_read is not None:
+                typed_input["verified_provider_context"] = preacquired_calendar_read
+                typed_input["verified_provider_context_instruction"] = (
+                    "This is the current typed Google Calendar provider result. Synthesize "
+                    "the requested answer from it. Provider truth outranks prior Slack text."
+                )
+                typed_input["attach_tools"] = False
             if specialist_execution_context:
                 typed_input["execution_context"] = specialist_execution_context
                 typed_input["execution_context_instruction"] = (
@@ -1620,6 +2118,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             result = typed_result.output
             tool_receipts = _merge_tool_receipts(
+                tool_receipts,
                 _sdk_tool_receipts(typed_result.raw_result),
                 list(typed_result.tool_receipts or []),
             )

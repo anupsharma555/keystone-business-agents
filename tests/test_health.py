@@ -18,6 +18,13 @@ from keystone_agents.health import (
     report_to_json,
     run_health_check,
 )
+from keystone_agents.schemas.work_item import (
+    WorkItem,
+    WorkItemEvent,
+    WorkItemKind,
+    WorkItemStatus,
+)
+from keystone_agents.storage.sqlite_store import SQLiteStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -292,6 +299,67 @@ def test_missing_database_file_is_initialized(tmp_path) -> None:
     assert database_path.exists()
     assert report.database["status"] == STATUS_OK
     assert report.database["required_tables_missing"] == []
+
+
+def test_health_separates_schema_integrity_retention_and_runtime_readiness(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "operator-health.db"
+    database_url = f"sqlite:///{database_path}"
+    with SQLiteStore(database_url) as store:
+        item = WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            status=WorkItemStatus.DONE,
+            title="Completed validation item",
+        )
+        store.save_work_item(item)
+        store.save_work_item_event(
+            item.id,
+            WorkItemEvent(event_type="completed", summary="Completed."),
+        )
+        with store.managed_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO work_item_events (work_item_id, event_type)
+                VALUES ('missing-health-parent', 'advance_started')
+                """
+            )
+
+    report = run_health_check(
+        database_url=database_url,
+        env={
+            "KEYSTONE_TEST_MODE": "1",
+            "KEYSTONE_EVAL_SURFACE": "slack",
+        },
+    )
+
+    assert report.database["state_owner"] == "eval"
+    assert report.database["status"] == STATUS_ERROR
+    assert report.database["schema_readiness"]["status"] == STATUS_OK
+    assert report.database["integrity_readiness"] == {
+        "status": STATUS_ERROR,
+        "orphan_event_count": 1,
+        "orphan_artifact_count": 0,
+        "orphan_child_count": 1,
+        "missing_parent_count": 1,
+        "repair_performed": False,
+    }
+    assert report.database["retention_readiness"]["status"] == STATUS_WARNING
+    assert (
+        report.database["retention_readiness"]["reviewable_unarchived_count"]
+        == 1
+    )
+    assert report.database["runtime_readiness"]["status"] == STATUS_OK
+    assert report.database["runtime_readiness"]["active_process_checked"] is False
+    assert report.database["runtime_readiness"]["active_runtime_status"] == "not_checked"
+    assert report.overall_status == STATUS_ERROR
+    assert any(
+        message.code == "database_integrity_debt" for message in report.messages
+    )
+    assert any(
+        message.code == "database_retention_debt" for message in report.messages
+    )
+    assert "schema=ok integrity=error retention=warning" in format_health_report(report)
 
 
 def test_live_gmail_missing_oauth_files_is_misconfigured(tmp_path) -> None:

@@ -199,3 +199,52 @@ def test_google_doc_agent_tool_lifecycle_uses_one_composite_call(monkeypatch) ->
             "live": True,
         }
     ]
+
+
+def test_google_doc_agent_tool_lifecycle_updates_same_document_before_cleanup(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE", "true")
+    write_calls: list[dict[str, object]] = []
+
+    def fake_write(title, body_text, **kwargs):
+        write_calls.append({"title": title, "body_text": body_text, **kwargs})
+        return {
+            "status": "success",
+            "operation": "write_doc",
+            "document_id": "doc-123",
+            "title": title,
+            "content_verified": True,
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(data_tools, "google_doc_write_impl", fake_write)
+    monkeypatch.setattr(
+        data_tools,
+        "google_doc_trash_impl",
+        lambda document_id, **_kwargs: {
+            "status": "success",
+            "operation": "trash_doc",
+            "document_id": document_id,
+            "trashed": True,
+            "verification": {"passed": True},
+            "send_enabled": False,
+        },
+    )
+
+    result = data_tools.google_doc_test_lifecycle_impl(
+        "KBA_TEST_DOC_VALIDATION",
+        "Original validation.",
+        updated_body_text="Revised validation.",
+        folder_path="KNIOps",
+        approval_reference="ANU-120",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["verification"]["same_document_update_read_back"] is True
+    assert len(write_calls) == 2
+    assert write_calls[0].get("document_id", "") == ""
+    assert write_calls[1]["document_id"] == "doc-123"
+    assert write_calls[1]["body_text"] == "Revised validation."
+    assert write_calls[1]["approval_reference"] == "ANU-120:update"

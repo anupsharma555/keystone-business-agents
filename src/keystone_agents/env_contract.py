@@ -60,6 +60,14 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         default_notes="Comma-separated allowlist of linked context repo env keys that may override local values.",
     ),
     EnvVarContract(
+        "KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY",
+        "model",
+        default_notes=(
+            "Defaults to openai; target and target_with_openai_fallback are "
+            "explicit provider-experiment modes."
+        ),
+    ),
+    EnvVarContract(
         "KEYSTONE_CONTEXT_CONFIG_REPO",
         "context",
         display_safety="path",
@@ -351,7 +359,7 @@ def keystone_env_contract() -> dict[str, Any]:
                 "KEYSTONE_TAVILY_SEARCH_FALLBACK": "true",
                 "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN": "2",
                 "KEYSTONE_EXA_SEARCH_FALLBACK": "true",
-                "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "2",
+                "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "10",
             },
         },
         "notes": [

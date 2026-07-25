@@ -279,11 +279,18 @@ def zotero_read_api_metadata(
     top_level_only: bool = False,
     item_type: str = "",
     require_abstract: bool = False,
+    selection_rank: int = 1,
     live: bool = False,
 ) -> str:
     """Read Zotero API metadata for libraries, collections, or items without mutation."""
 
-    bounded_limit = min(max(int(limit or 25), 1), 100)
+    clean_selection_rank = int(selection_rank or 1)
+    if not 1 <= clean_selection_rank <= 10:
+        raise ValueError("selection_rank must be between 1 and 10.")
+    bounded_limit = min(
+        max(int(limit or 25), clean_selection_rank),
+        100,
+    )
     params = {"limit": bounded_limit}
     if query.strip():
         params["q"] = query.strip()
@@ -345,9 +352,14 @@ def zotero_read_api_metadata(
                 "params": params,
                 "selection_rule": (
                     "first_nonempty_abstract_in_provider_order"
+                    if require_abstract and clean_selection_rank == 1
+                    else "ranked_nonempty_abstract_in_provider_order"
                     if require_abstract
                     else "provider_order"
+                    if clean_selection_rank == 1
+                    else "ranked_item_in_provider_order"
                 ),
+                "selection_rank": clean_selection_rank,
                 "provider_order": {
                     "sort": clean_sort,
                     "direction": clean_direction,
@@ -406,7 +418,9 @@ def zotero_read_api_metadata(
             if isinstance(item, dict)
             and isinstance(item.get("data"), dict)
             and str(item["data"].get("abstractNote") or "").strip()
-        ][:1]
+        ]
+    available_item_count = len(items)
+    items = items[clean_selection_rank - 1 : clean_selection_rank]
     selected_data = (
         items[0].get("data")
         if items and isinstance(items[0], dict) and isinstance(items[0].get("data"), dict)
@@ -422,9 +436,15 @@ def zotero_read_api_metadata(
             "library_id_resolution": library_id_resolution,
             "selection_rule": (
                 "first_nonempty_abstract_in_provider_order"
+                if require_abstract and clean_selection_rank == 1
+                else "ranked_nonempty_abstract_in_provider_order"
                 if require_abstract
                 else "provider_order"
+                if clean_selection_rank == 1
+                else "ranked_item_in_provider_order"
             ),
+            "selection_rank": clean_selection_rank,
+            "available_item_count": available_item_count,
             "provider_order": {
                 "sort": clean_sort,
                 "direction": clean_direction,
@@ -674,18 +694,25 @@ def zotero_read_pdf_attachment_text(
 def read_latest_zotero_journal_metadata(
     *,
     require_abstract: bool = False,
+    selection_rank: int = 1,
 ) -> dict[str, Any]:
-    """Read the provider-selected latest journal article metadata."""
+    """Read a ranked journal article in latest-first provider order."""
 
+    selection_options = (
+        {"selection_rank": selection_rank}
+        if selection_rank != 1
+        else {}
+    )
     payload = json.loads(
         zotero_read_api_metadata(
-            limit=100 if require_abstract else 1,
+            limit=100 if require_abstract else selection_rank,
             sort="dateAdded",
             direction="desc",
             top_level_only=True,
             item_type="journalArticle",
             require_abstract=require_abstract,
             live=True,
+            **selection_options,
         )
     )
     if not isinstance(payload, dict):
@@ -693,10 +720,16 @@ def read_latest_zotero_journal_metadata(
     return payload
 
 
-def read_latest_zotero_journal_abstract_metadata() -> dict[str, Any]:
-    """Read the provider-selected latest journal article with a stored abstract."""
+def read_latest_zotero_journal_abstract_metadata(
+    *,
+    selection_rank: int = 1,
+) -> dict[str, Any]:
+    """Read a ranked journal article with an abstract in latest-first order."""
 
-    return read_latest_zotero_journal_metadata(require_abstract=True)
+    return read_latest_zotero_journal_metadata(
+        require_abstract=True,
+        selection_rank=selection_rank,
+    )
 
 
 _ZOTERO_METADATA_FIELDS: tuple[tuple[str, str], ...] = (
@@ -782,7 +815,8 @@ def _bounded_zotero_provider_value(value: Any, *, depth: int = 0) -> Any:
 def project_zotero_item_metadata(
     item: dict[str, Any],
     *,
-    request_text: str,
+    request_text: str = "",
+    requested_fields: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Project requested Zotero fields without losing provider field identity."""
 
@@ -800,23 +834,36 @@ def project_zotero_item_metadata(
         available["creators"] = creators
 
     normalized_request = " ".join(str(request_text or "").lower().split())
-    requested_fields = [
-        field
-        for field, pattern in _ZOTERO_FIELD_ALIASES
-        if re.search(pattern, normalized_request)
-    ]
-    broad_metadata_request = bool(
-        re.search(
-            r"\b(?:all|available|complete|full)\s+(?:item\s+)?(?:metadata|details|fields|information)\b",
-            normalized_request,
+    if requested_fields is None:
+        selected_fields = [
+            field
+            for field, pattern in _ZOTERO_FIELD_ALIASES
+            if re.search(pattern, normalized_request)
+        ]
+        broad_metadata_request = bool(
+            re.search(
+                r"\b(?:all|available|complete|full)\s+(?:item\s+)?"
+                r"(?:metadata|details|fields|information)\b",
+                normalized_request,
+            )
         )
-    )
+    else:
+        normalized_fields = list(
+            dict.fromkeys(
+                str(field or "").strip().lower() for field in requested_fields
+            )
+        )
+        allowed_fields = {field for field, _pattern in _ZOTERO_FIELD_ALIASES}
+        selected_fields = [
+            field for field in normalized_fields if field in allowed_fields
+        ]
+        broad_metadata_request = "metadata" in normalized_fields
     if broad_metadata_request:
-        requested_fields = list(available)
-    if not requested_fields:
-        requested_fields = ["title"]
-    requested_fields = list(dict.fromkeys(requested_fields))
-    projected = {field: available.get(field, "") for field in requested_fields}
+        selected_fields = list(available)
+    if not selected_fields:
+        selected_fields = ["title"]
+    selected_fields = list(dict.fromkeys(selected_fields))
+    projected = {field: available.get(field, "") for field in selected_fields}
     provider_field_map = dict(_ZOTERO_METADATA_FIELDS)
     provider_field_map.update({"authors": "creators", "creators": "creators"})
     return {
@@ -832,7 +879,7 @@ def project_zotero_item_metadata(
         "available_provider_field_names": sorted(str(key) for key in data),
         "provider_field_map": {
             canonical_name: provider_field_map[canonical_name]
-            for canonical_name in requested_fields
+            for canonical_name in selected_fields
             if canonical_name in provider_field_map
         },
         "provider_fields": (

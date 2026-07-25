@@ -265,10 +265,10 @@ export KEYSTONE_OPPORTUNITY_FOLLOWUP_RESULT_CAP=8
 ```
 
 Manual Slack and CLI calls can add a planning stage before retrieval or routing.
-Use `KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY=target_with_openai_fallback` to try
-the target agent provider first and fall back to the OpenAI Orchestrator planner.
-Set it to `target` or `openai` only when intentionally isolating provider
-behavior. WorkItem-backed `keystone ask` runs persist the resulting
+The default `KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY=openai` uses the dedicated
+OpenAI `gpt-5.4-mini` planner for each new live natural-language ask. Set it to
+`target` or `target_with_openai_fallback` only for controlled provider
+experiments. WorkItem-backed `keystone ask` runs persist the resulting
 `ManualRequestPlan` in WorkItem metadata, timeline event metadata, and JSON
 output for auditability.
 

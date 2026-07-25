@@ -50,8 +50,10 @@ from keystone_agents.agents.chief_of_staff import (
     validate_chief_slack_command_resolution,
 )
 from keystone_agents.agents.gmail_triage import (
+    build_gmail_candidate_ranking_agent,
     build_gmail_priority_grouping_agent,
     build_gmail_triage_agent,
+    run_gmail_candidate_ranking_sdk,
     run_gmail_priority_grouping_sdk,
     run_gmail_triage_sdk,
 )
@@ -94,6 +96,7 @@ from keystone_agents.model_provider import (
 from keystone_agents.models import (
     BusinessResearchFocusedBriefSDKInput,
     BusinessResearchSDKInput,
+    GmailCandidateRankingSDKInput,
     GmailPriorityGroupingSDKInput,
     GmailTriageSDKInput,
     OpportunityScoutSDKInput,
@@ -112,7 +115,11 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefSpecialistToolInput,
 )
 from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
-from keystone_agents.schemas.email_triage import EmailTriageResult, GmailPriorityGroupingResult
+from keystone_agents.schemas.email_triage import (
+    EmailTriageResult,
+    GmailCandidateRankingResult,
+    GmailPriorityGroupingResult,
+)
 from keystone_agents.schemas.operational_context import (
     AirtableContextResult,
     GoogleWorkspaceContextResult,
@@ -2133,6 +2140,70 @@ def test_gmail_gt1_priority_grouping_rejects_non_urgent_draft(
             typed_input,
             run_config=build_local_run_config(provider),
         )
+
+
+def test_gmail_candidate_ranking_sdk_has_selection_only_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    operator_request = "Pick the one message I am most likely to need to answer."
+    typed_input = GmailCandidateRankingSDKInput(
+        messages=[
+            GmailTriageSDKInput(
+                message_id="message-1",
+                thread_id="thread-1",
+                subject="Evaluation follow-up",
+                body="Could we schedule a follow-up discussion?",
+                snippet="Could we schedule a follow-up discussion?",
+            )
+        ],
+        operator_request=operator_request,
+    )
+    model = FakeModel(
+        outputs=[
+            [
+                _structured_message(
+                    {
+                        "request_summary": "model summary",
+                        "source_message_count": 1,
+                        "candidates": [
+                            {
+                                "message_id": "message-1",
+                                "disposition": "candidate",
+                                "relevance_score": 0.92,
+                                "needs_reply": True,
+                                "reasoning": "The sender asked a direct follow-up question.",
+                            }
+                        ],
+                        "audit_notes": [],
+                    }
+                )
+            ]
+        ]
+    )
+
+    result = run_gmail_candidate_ranking_sdk(
+        typed_input,
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    assert isinstance(result.final_output, GmailCandidateRankingResult)
+    assert result.final_output.request_summary == operator_request
+    assert result.final_output.candidates[0].message_id == "message-1"
+    assert {
+        "draft_reply",
+        "draft_created",
+        "send_enabled",
+        "sent",
+    }.isdisjoint(
+        GmailCandidateRankingResult.model_json_schema()["$defs"][
+            "GmailCandidateRankingItem"
+        ]["properties"]
+    )
+    instructions = str(build_gmail_candidate_ranking_agent().instructions)
+    assert "selection-only stage" in instructions
+    assert "Outreach Composer stage owns drafting" in instructions
 
 
 def test_retrieved_sdk_synthesis_harness_validates_and_audits(

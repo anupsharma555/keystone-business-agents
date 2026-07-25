@@ -82,6 +82,7 @@ ManualTargetType = Literal[
     "zotero_article",
     "article_collection",
     "gmail_thread",
+    "gmail_message_collection",
     "topic",
     "opportunity",
     "operator_reference",
@@ -112,6 +113,81 @@ ManualProviderOperation = Literal[
     "verify",
 ]
 
+ManualProviderResourceType = Literal[
+    "unspecified",
+    "calendar_event",
+    "gmail_message",
+    "gmail_thread",
+    "gmail_draft",
+    "airtable_record",
+    "airtable_attachment",
+    "google_drive_file",
+    "google_drive_folder",
+    "google_document",
+    "google_spreadsheet",
+    "google_sheet_row",
+    "google_sheet_tab",
+    "google_slide_deck",
+    "local_presentation",
+    "zotero_collection",
+    "zotero_item",
+    "zotero_note",
+    "zotero_attachment",
+    "slack_message",
+]
+
+ManualProviderReadScope = Literal[
+    "unspecified",
+    "single_item",
+    "bounded_collection",
+]
+
+ManualProviderResultMode = Literal[
+    "unspecified",
+    "items",
+    "count",
+    "aggregate",
+]
+
+ManualProviderSelectionOrder = Literal[
+    "unspecified",
+    "latest",
+    "earliest",
+    "provider_order",
+]
+
+ManualGmailMailboxDirection = Literal[
+    "unspecified",
+    "inbound",
+    "outbound",
+    "any",
+]
+
+ManualGmailDateScope = Literal[
+    "unspecified",
+    "today",
+    "yesterday",
+    "specific_date",
+    "rolling_window",
+]
+
+ManualGmailRequestedField = Literal[
+    "subject",
+    "sender",
+    "date",
+    "snippet",
+]
+
+ManualZoteroRequestedField = Literal[
+    "title",
+    "authors",
+    "publication_title",
+    "abstract",
+    "metadata",
+    "children",
+    "full_text",
+]
+
 AskBreadth = Literal["unspecified", "narrow", "bounded", "broad"]
 EvidenceDepth = Literal["unspecified", "quick", "standard", "deep"]
 StrictFilterMode = Literal["unspecified", "exact", "strict", "flexible"]
@@ -119,6 +195,7 @@ OutputForm = Literal["unspecified", "brief", "bullets", "table", "plan", "draft"
 PriorContextDependency = Literal["unspecified", "none", "selected_context", "required"]
 PermissionState = Literal["unspecified", "read_only", "draft_only", "approval_required"]
 CostMode = Literal["unspecified", "minimize", "balanced", "quality"]
+AudienceScope = Literal["unspecified", "internal", "external"]
 
 
 class AskShapePolicy(BaseModel):
@@ -131,6 +208,7 @@ class AskShapePolicy(BaseModel):
     output_form: OutputForm = "unspecified"
     prior_context_dependency: PriorContextDependency = "unspecified"
     permission_state: PermissionState = "unspecified"
+    audience_scope: AudienceScope = "unspecified"
     cost_mode: CostMode = "unspecified"
     stop_condition: str = ""
     output_constraints: InterpretedOutputConstraints = Field(
@@ -157,6 +235,94 @@ class AskShapePolicy(BaseModel):
         return str(value or "").replace("\u2014", "-").strip()
 
 
+class ManualProviderResultSetScope(BaseModel):
+    """Verified provider collection identity retained for one follow-up turn.
+
+    The semantic planner may refer to this scope but must not invent it. Runtime
+    reconciliation populates it only from a completed, read-only provider
+    receipt associated with the selected Slack thread or WorkItem.
+    """
+
+    source_run_id: str = ""
+    provider_system: ManualProviderSystem = "unspecified"
+    provider_read_scope: ManualProviderReadScope = "unspecified"
+    target_type: ManualTargetType = "unknown"
+    gmail_mailbox_direction: ManualGmailMailboxDirection = "unspecified"
+    gmail_date_scope: ManualGmailDateScope = "unspecified"
+    query: str = ""
+    label: str = ""
+    timezone: str = "America/New_York"
+    window_start: str = ""
+    window_end: str = ""
+    item_count: int | None = Field(default=None, ge=0, le=500)
+    airtable_base_alias: str = ""
+    airtable_table: str = ""
+    airtable_amount_field: str = ""
+    airtable_period_field: str = ""
+    airtable_date_field: str = ""
+    airtable_estimated_period: int | None = Field(default=None, ge=1, le=4)
+    airtable_year: int | None = Field(default=None, ge=2000, le=2200)
+    aggregate_total: str = ""
+    aggregate_currency: str = ""
+    item_refs: list[str] = Field(default_factory=list)
+    complete: bool = False
+    verified: bool = False
+
+    @field_validator(
+        "source_run_id",
+        "query",
+        "label",
+        "timezone",
+        "window_start",
+        "window_end",
+        "airtable_base_alias",
+        "airtable_table",
+        "airtable_amount_field",
+        "airtable_period_field",
+        "airtable_date_field",
+        "aggregate_total",
+        "aggregate_currency",
+        mode="before",
+    )
+    @classmethod
+    def _clean_text(cls, value: object) -> str:
+        return str(value or "").replace("\u2014", "-").strip()
+
+    @field_validator("item_count", mode="before")
+    @classmethod
+    def _clean_item_count(cls, value: object) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return max(0, min(500, int(value)))
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("item_refs", mode="before")
+    @classmethod
+    def _clean_item_refs(cls, value: object) -> list[str]:
+        values = value if isinstance(value, list | tuple | set) else [value]
+        return list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in values
+                if str(item or "").strip()
+            )
+        )[:50]
+
+
+class ManualProviderActionStep(BaseModel):
+    """One provider operation paired with the object it acts on.
+
+    The semantic planner supplies these steps to refine tool admission. Python
+    still owns approval, identity, safety, and provider-receipt gates. A step
+    never grants an operation that is absent from ``provider_operations``.
+    """
+
+    operation: ManualProviderOperation
+    resource_type: ManualProviderResourceType = "unspecified"
+
+
 class ManualRequestPlan(BaseModel):
     """Pre-execution semantic plan for manual CLI and Slack agent calls."""
 
@@ -169,10 +335,28 @@ class ManualRequestPlan(BaseModel):
     target_type: ManualTargetType = "unknown"
     provider_system: ManualProviderSystem = "unspecified"
     provider_operations: list[ManualProviderOperation] = Field(default_factory=list)
+    provider_action_steps: list[ManualProviderActionStep] = Field(default_factory=list)
+    provider_read_scope: ManualProviderReadScope = "unspecified"
+    provider_result_mode: ManualProviderResultMode = "unspecified"
+    provider_selection_order: ManualProviderSelectionOrder = "unspecified"
+    provider_selection_rank: int | None = Field(default=None, ge=1, le=10)
+    gmail_mailbox_direction: ManualGmailMailboxDirection = "unspecified"
+    gmail_date_scope: ManualGmailDateScope = "unspecified"
+    gmail_exclude_threads_with_operator_reply: bool = False
+    gmail_requested_fields: list[ManualGmailRequestedField] = Field(default_factory=list)
+    zotero_requested_fields: list[ManualZoteroRequestedField] = Field(default_factory=list)
+    provider_result_scope: ManualProviderResultSetScope | None = None
     objective: str = ""
     task_objective: ManualTaskObjective = "clarification"
     expected_artifact_type: ManualExpectedArtifactType = "none"
     desired_count: int = Field(default=1, ge=1, le=10)
+    desired_count_explicit: bool = Field(
+        default=False,
+        description=(
+            "True only when the operator explicitly bounded the number of domain "
+            "results; false when desired_count is merely the schema default."
+        ),
+    )
     constraints: list[str] = Field(default_factory=list)
     ask_shape: AskShapePolicy = Field(default_factory=AskShapePolicy)
     required_entities: list[str] = Field(default_factory=list)
@@ -221,6 +405,55 @@ class ManualRequestPlan(BaseModel):
             return []
         values = value if isinstance(value, list | tuple | set) else [value]
         allowed = set(get_args(ManualProviderOperation))
+        normalized = [
+            str(item or "").strip().lower().replace(" ", "_")
+            for item in values
+        ]
+        return list(dict.fromkeys(item for item in normalized if item in allowed))
+
+    @field_validator("provider_action_steps", mode="before")
+    @classmethod
+    def _clean_provider_action_steps(cls, value: object) -> list[object]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list | tuple | set) else [value]
+        deduped: list[object] = []
+        seen: set[tuple[str, str]] = set()
+        for item in values:
+            if isinstance(item, ManualProviderActionStep):
+                operation = item.operation
+                resource_type = item.resource_type
+            elif isinstance(item, dict):
+                operation = str(item.get("operation") or "").strip().lower()
+                resource_type = str(
+                    item.get("resource_type") or "unspecified"
+                ).strip().lower()
+            else:
+                continue
+            key = (operation, resource_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    @field_validator("gmail_requested_fields", mode="before")
+    @classmethod
+    def _clean_gmail_requested_fields(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list | tuple | set) else [value]
+        allowed = set(get_args(ManualGmailRequestedField))
+        normalized = [str(item or "").strip().lower() for item in values]
+        return list(dict.fromkeys(item for item in normalized if item in allowed))
+
+    @field_validator("zotero_requested_fields", mode="before")
+    @classmethod
+    def _clean_zotero_requested_fields(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list | tuple | set) else [value]
+        allowed = set(get_args(ManualZoteroRequestedField))
         normalized = [
             str(item or "").strip().lower().replace(" ", "_")
             for item in values

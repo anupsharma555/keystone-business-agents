@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -8,8 +9,12 @@ import pytest
 from keystone_agents import cli
 from keystone_agents.direct_response import build_direct_supplied_response_agent
 from keystone_agents.manual_request import infer_manual_request_plan, merge_manual_request_plan
-from keystone_agents.schemas.execution_request import DirectAgentResponse
+from keystone_agents.schemas.execution_request import (
+    DirectAgentResponse,
+    DirectAgentResponseInput,
+)
 from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
+from keystone_agents.storage.sqlite_store import SQLiteStore
 
 DIRECT_ROUTES = (
     "chief_of_staff",
@@ -71,6 +76,177 @@ def test_chief_attachment_response_uses_minimal_zero_tool_contract() -> None:
     )
 
 
+def test_missing_local_attachment_blocks_before_model_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    missing_path = tmp_path / "missing-diagram.png"
+    request = (
+        "Looking at this diagram, summarize the three main stages. "
+        "Don't search or change anything.\n"
+        f"Operator-supplied Slack attachment local path: {missing_path}"
+    )
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    monkeypatch.setattr(
+        cli,
+        "run_typed_sdk_agent",
+        lambda **_kwargs: pytest.fail("model must not run without readable attachment bytes"),
+    )
+
+    exit_code = cli._run_direct_supplied_context_response_live(
+        "chief_of_staff",
+        request,
+        json_output=True,
+        manual_plan=plan,
+        orchestrator_preflight=None,
+        sdk_session_spec=None,
+        database_url=f"sqlite:///{tmp_path / 'attachment.db'}",
+    )
+
+    assert exit_code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "blocked"
+    assert payload["block_kind"] == "local_attachment_bytes_unavailable"
+    assert payload["openai_requests"] == 0
+    assert payload["tool_admission"]["tool_count"] == 0
+    assert "reattach the file" in payload["human_summary"].lower()
+
+
+def test_missing_local_attachment_blocks_before_orchestrator_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    missing_path = tmp_path / "missing-slack-image.png"
+    request = (
+        "@KNI CoS, what are the three main stages in this image? "
+        "Don't search or change anything. "
+        f"Operator-supplied Slack attachment local path: {missing_path}"
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_orchestrator_preflight",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Orchestrator must not run without readable attachment bytes"
+        ),
+    )
+
+    exit_code = cli.main(
+        [
+            "ask",
+            "--live-sdk",
+            "--live-manual-plan",
+            "--max-openai-requests",
+            "2",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'missing-attachment.db'}",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["block_kind"] == "local_attachment_bytes_unavailable"
+    assert payload["openai_requests"] == 0
+
+
+def test_explicit_attachment_dry_run_does_not_create_work_item(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    attachment_path = tmp_path / "diagram.png"
+    attachment_path.write_bytes(b"offline-route-fixture")
+    database_path = tmp_path / "attachment-route.db"
+    request = (
+        "@KNI CoS, looking at this diagram, what are the three main stages a request "
+        "goes through? Keep it to three short bullets. Don't search or change anything. "
+        f"Operator-supplied Slack attachment local path: {attachment_path}"
+    )
+    monkeypatch.setattr(
+        cli,
+        "_run_ask_work_item",
+        lambda *_args, **_kwargs: pytest.fail(
+            "bounded attachment synthesis must not create a WorkItem"
+        ),
+    )
+
+    exit_code = cli.main(
+        [
+            "ask",
+            "--no-live-sdk",
+            "--no-live-manual-plan",
+            "--database-url",
+            f"sqlite:///{database_path}",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "dry_run"
+    assert payload["route"] == "chief_of_staff"
+    assert payload["manual_request_plan"]["ask_shape"]["prior_context_dependency"] == (
+        "selected_context"
+    )
+    assert payload["manual_request_plan"]["ask_shape"]["source_type_preference"] == [
+        "local_attachment"
+    ]
+    assert SQLiteStore(f"sqlite:///{database_path}").list_work_items() == []
+
+
+def test_explicit_attachment_live_cli_dispatches_one_direct_specialist(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attachment_path = tmp_path / "diagram.png"
+    attachment_path.write_bytes(b"offline-live-dispatch-fixture")
+    request = (
+        "@KNI CoS, looking at this diagram, what are the three main stages a request "
+        "goes through? Keep it to three short bullets. Don't search or change anything. "
+        f"Operator-supplied Slack attachment local path: {attachment_path}"
+    )
+    captured: dict[str, object] = {}
+
+    def fake_direct(route: str, input_text: str, **kwargs: object) -> int:
+        captured.update(route=route, input_text=input_text, kwargs=kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_direct_supplied_context_response_live", fake_direct)
+    monkeypatch.setattr(
+        cli,
+        "_run_ask_work_item",
+        lambda *_args, **_kwargs: pytest.fail(
+            "bounded attachment synthesis must not enter the WorkItem executor"
+        ),
+    )
+
+    exit_code = cli.main(
+        [
+            "ask",
+            "--live-sdk",
+            "--no-live-manual-plan",
+            "--max-openai-requests",
+            "1",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'attachment-live-route.db'}",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["route"] == "chief_of_staff"
+    assert captured["input_text"] == request.removeprefix("@KNI CoS, ").strip()
+    plan = captured["kwargs"]["manual_plan"]
+    assert isinstance(plan, ManualRequestPlan)
+    assert plan.ask_shape.prior_context_dependency == "selected_context"
+    assert plan.ask_shape.source_type_preference == ["local_attachment"]
+
+
 @pytest.mark.parametrize("route", DIRECT_ROUTES)
 def test_specialist_live_dispatch_uses_shared_provider_free_lane(
     monkeypatch: pytest.MonkeyPatch,
@@ -100,6 +276,142 @@ def test_specialist_live_dispatch_uses_shared_provider_free_lane(
     )
     assert captured["route"] == route
     assert captured["input_text"] == PROMPT
+
+
+def test_specialist_live_dispatch_preserves_bounded_thread_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    followup = (
+        "Make the second bullet a vendor question. Use the same note only. "
+        "Do not search or use providers."
+    )
+    plan = infer_manual_request_plan(
+        followup,
+        requested_agent="business_research_analyst",
+    ).model_copy(
+        update={
+            "source": "llm",
+            "requires_live_search": False,
+            "provider_system": "unspecified",
+            "provider_operations": [],
+        }
+    )
+    execution_context = {
+        "thread_root_request": "Oakline supplies no baseline or sample.",
+        "recent_thread_messages": [followup],
+    }
+    captured: dict[str, object] = {}
+
+    def fake_direct(
+        selected_route: str,
+        input_text: str,
+        **kwargs: object,
+    ) -> int:
+        captured.update(route=selected_route, input_text=input_text, kwargs=kwargs)
+        return 19
+
+    monkeypatch.setattr(cli, "_run_direct_supplied_context_response_live", fake_direct)
+
+    assert (
+        cli._run_ask_specialist_live(
+            "business_research_analyst",
+            followup,
+            json_output=True,
+            manual_plan=plan,
+            execution_context=execution_context,
+        )
+        == 19
+    )
+    assert captured["input_text"] == followup
+    assert captured["kwargs"]["execution_context"] == execution_context
+
+
+def test_direct_response_prompt_keeps_current_request_authoritative() -> None:
+    typed_input = DirectAgentResponseInput(
+        requested_agent="business_research_analyst",
+        original_request="Turn the missing-evidence bullet into a question.",
+        selected_context="Oakline supplies no baseline or sample.",
+    )
+
+    prompt = typed_input.to_prompt()
+
+    assert "Original operator request (authoritative)" in prompt
+    assert "Turn the missing-evidence bullet into a question." in prompt
+    assert "Selected prior context (reference evidence only" in prompt
+    assert "Oakline supplies no baseline or sample." in prompt
+
+
+def test_direct_response_executor_includes_context_in_model_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys,
+) -> None:
+    followup = (
+        "Turn the missing-evidence bullet into a vendor question. "
+        "Keep two bullets and use the same note only."
+    )
+    plan = infer_manual_request_plan(
+        followup,
+        requested_agent="business_research_analyst",
+    )
+    execution_context = {
+        "thread_root_request": (
+            "Oakline says its dashboard reduced missed visits but supplies no "
+            "baseline or sample."
+        ),
+        "recent_thread_messages": [
+            "Supported fact: Oakline says the dashboard reduced missed visits.",
+            followup,
+        ],
+    }
+    answer = (
+        "- Supported fact: Oakline says its dashboard reduced missed visits.\n"
+        "- Vendor question: What baseline and sample support that claim?"
+    )
+    fake_agent = SimpleNamespace(
+        name="business_research_analyst",
+        model="test-model",
+        tools=[],
+    )
+    captured: dict[str, object] = {}
+
+    def fake_sdk_run(**kwargs: object):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            output=DirectAgentResponse(answer=answer),
+            usage={"requests": 1},
+            cost={"estimated_usd": 0.001},
+            budget_guard={"status": "passed"},
+            request_cache={"tool_count": 0},
+        )
+
+    monkeypatch.setattr(
+        cli,
+        "build_direct_supplied_response_agent",
+        lambda *_args, **_kwargs: fake_agent,
+    )
+    monkeypatch.setattr(cli, "run_typed_sdk_agent", fake_sdk_run)
+
+    exit_code = cli._run_direct_supplied_context_response_live(
+        "business_research_analyst",
+        followup,
+        json_output=True,
+        manual_plan=plan,
+        orchestrator_preflight=None,
+        sdk_session_spec=None,
+        database_url=f"sqlite:///{tmp_path / 'followup.db'}",
+        execution_context=execution_context,
+    )
+
+    assert exit_code == 0
+    typed_input = captured["typed_input"]
+    assert isinstance(typed_input, DirectAgentResponseInput)
+    assert typed_input.original_request == followup
+    assert "Oakline says its dashboard reduced missed visits" in typed_input.selected_context
+    assert "baseline or sample" in typed_input.selected_context
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "completed"
+    assert payload["human_summary"] == answer
 
 
 @pytest.mark.parametrize("route", DIRECT_ROUTES)
@@ -202,7 +514,103 @@ def test_internal_slack_copy_uses_two_request_provider_free_lane() -> None:
     ]
 
 
-def test_budget_estimate_uses_semantic_owner_when_named_owner_is_revised() -> None:
+def test_internal_team_followup_uses_typed_provider_free_lane_despite_slack_drift() -> None:
+    request = (
+        "Combine those two points into a single paste-ready sentence for our "
+        "internal team channel. Use only the Oakline note already in this thread; "
+        "no search, email, or provider actions."
+    )
+    fallback = infer_manual_request_plan(
+        request,
+        requested_agent="business_research_analyst",
+    )
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        objective="Compose one internal team sentence from selected context.",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        outreach_channel="team_channel",
+        provider_system="slack",
+        provider_operations=[],
+        requires_approved_context=True,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+            audience_scope="external",
+        ),
+    )
+    plan = merge_manual_request_plan(fallback, candidate)
+
+    assert cli._should_run_direct_supplied_response(
+        request,
+        requested_route="outreach_composer",
+        manual_plan=plan,
+    )
+
+
+def test_outreach_executor_does_not_reparse_internal_typed_plan(
+    monkeypatch,
+) -> None:
+    request = (
+        "Combine those two points into one internal team sentence. "
+        "Use only the selected thread context."
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="outreach_composer")
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        objective="Compose one internal team sentence.",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        outreach_channel="internal_slack",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_approved_context=True,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+            audience_scope="internal",
+        ),
+    )
+    plan = merge_manual_request_plan(fallback, candidate)
+    captured: dict[str, object] = {}
+
+    def fake_direct(route: str, input_text: str, **kwargs: object) -> int:
+        captured.update({"route": route, "input_text": input_text, **kwargs})
+        return 0
+
+    monkeypatch.setattr(
+        cli,
+        "infer_outreach_execution_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy phrase heuristic must not run")
+        ),
+    )
+    monkeypatch.setattr(cli, "_run_direct_supplied_context_response_live", fake_direct)
+
+    exit_code = cli._run_ask_outreach_composer_live(
+        request,
+        json_output=True,
+        manual_plan=plan,
+        orchestrator_preflight=None,
+        sdk_session_spec=None,
+    )
+
+    assert exit_code == 0
+    assert captured["route"] == "outreach_composer"
+    assert captured["manual_plan"] == plan
+
+
+def test_budget_estimate_keeps_named_owner_for_internal_supplied_response() -> None:
     request = (
         "Outreach Composer: Based only on this fact—Northstar Care has no audited "
         "outcomes—write one sentence for our internal Slack recommending the next "
@@ -231,8 +639,9 @@ def test_budget_estimate_uses_semantic_owner_when_named_owner_is_revised() -> No
         max_manager_steps=3,
     )
 
-    assert plan.target_agent == "chief_of_staff"
-    assert cli._route_with_manual_plan_advice("outreach_composer", plan) == "chief_of_staff"
+    assert plan.target_agent == "outreach_composer"
+    assert plan.requires_approved_context is False
+    assert cli._route_with_manual_plan_advice("outreach_composer", plan) == "outreach_composer"
 
     estimate = cli._estimate_ask_openai_requests(
         args,
@@ -246,7 +655,7 @@ def test_budget_estimate_uses_semantic_owner_when_named_owner_is_revised() -> No
     assert estimate["max"] == 2
     assert estimate["stages"] == [
         "manual_request_planner",
-        "chief_of_staff_direct_supplied_response_sdk",
+        "outreach_composer_direct_supplied_response_sdk",
     ]
 
 

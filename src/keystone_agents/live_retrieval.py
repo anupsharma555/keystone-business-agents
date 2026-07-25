@@ -70,7 +70,7 @@ DEFAULT_SANDBOX_SEARCH_REVIEW_CONTEXT_SIZE = "low"
 DEFAULT_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 8
 MAX_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 12
 DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN = 2
-DEFAULT_EXA_SEARCH_MAX_CALLS_PER_RUN = 2
+DEFAULT_EXA_SEARCH_MAX_CALLS_PER_RUN = 10
 DEFAULT_TAVILY_SEARCH_MAX_CALLS_PER_RUN = 2
 DEFAULT_SEARXNG_TRANSIENT_TIMEOUT_SECONDS = 2.0
 
@@ -1540,7 +1540,7 @@ def _company_page_focus_score(item: Mapping[str, Any], *, query_terms: list[str]
 
 
 def _website_extraction_max_pages() -> int:
-    raw = os.getenv("KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES", "4").strip()
+    raw = os.getenv("KEYSTONE_WEBSITE_EXTRACTION_MAX_PAGES", "8").strip()
     try:
         value = int(raw)
     except ValueError:

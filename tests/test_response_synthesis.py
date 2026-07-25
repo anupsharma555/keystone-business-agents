@@ -185,6 +185,69 @@ def test_response_synthesis_excludes_internal_fixture_urls() -> None:
     assert response_synthesis_ordered_sources(result) == []
 
 
+def test_response_synthesis_excludes_local_operational_urls() -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="gmail_triage_report",
+        artifact_id="provider-result",
+        source_agent="gmail_triage",
+        title="Verified Gmail result",
+        summary="No reply-worthy candidate was found.",
+        metadata={
+            "source_refs": [
+                {
+                    "title": "Prior Slack eval dashboard",
+                    "url": "http://127.0.0.1:8769/dashboard?case=prior-failure",
+                    "supported_claim": "The prior Slack attempt failed.",
+                }
+            ],
+            "retrieval_diagnostics": {
+                "provider_result_samples": {
+                    "slack": [
+                        {
+                            "title": "Prior review",
+                            "url": "http://localhost:8769/review?case=prior-failure",
+                            "snippet": "Internal review metadata.",
+                        }
+                    ]
+                }
+            },
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.GMAIL_THREAD,
+            title="Gmail follow-up",
+            artifact_refs=[artifact],
+            sources=[
+                WorkItemSourceRef(
+                    source_type="slack_thread_link",
+                    provider="slack",
+                    title="Prior Slack review",
+                    url="file:///tmp/prior-slack-review.html",
+                )
+            ],
+        ),
+        route=WorkItemRoute.GMAIL_TRIAGE,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="No reply-worthy candidate was found.",
+        context_pack={
+            "ordered_sources": [
+                {
+                    "index": 1,
+                    "title": "Prior local review",
+                    "url": "http://[::1]:8769/review",
+                }
+            ]
+        },
+    )
+
+    assert response_synthesis_sources(result) == []
+    assert response_synthesis_ordered_sources(result) == []
+    assert response_synthesis_provider_results(result) == []
+
+
 def test_visible_sources_updates_mapping_summary_from_structured_sources() -> None:
     output = append_visible_source_urls_to_output(
         {
@@ -1795,6 +1858,55 @@ def test_response_synthesis_uses_context_pack_source_focus_without_retrieval_dia
     assert (
         "Source focus: no_sample_source_matches_focus; 0/1 sample sources matched; terms: mental, health"
         in metadata_lines
+    )
+
+
+def test_response_synthesis_hides_stale_empty_focus_after_context_evidence_arrives() -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="chief_context_evidence",
+        artifact_id="context-1",
+        source_agent=WorkItemRoute.CHIEF_OF_STAFF.value,
+        title="Chief context evidence",
+        metadata={
+            "complete": True,
+            "source_refs": [
+                {
+                    "title": "Gmail message summary",
+                    "source_type": "gmail",
+                    "source_id": "message-1",
+                    "supported_claim": "A provider-backed Gmail message was read.",
+                    "extraction_status": "read",
+                }
+            ],
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            title="Chief context review",
+            current_route=WorkItemRoute.CHIEF_OF_STAFF,
+            artifact_refs=[artifact],
+        ),
+        route=WorkItemRoute.CHIEF_OF_STAFF,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+        human_summary="Provider-backed review.",
+        context_pack={
+            "source_context_focus": {
+                "status": "no_source_context_sample",
+                "terms": [],
+                "sample_count": 0,
+                "matching_sample_count": 0,
+                "matching_urls": [],
+            }
+        },
+    )
+
+    metadata_lines = response_synthesis_metadata_lines(result)
+
+    assert not any(
+        "Source focus: no_source_context_sample" in line for line in metadata_lines
     )
 
 

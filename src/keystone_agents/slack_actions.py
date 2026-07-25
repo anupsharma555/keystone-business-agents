@@ -23,10 +23,14 @@ from keystone_agents.eval_runtime_diagnostics import (
 from keystone_agents.langgraph_workflow import (
     advance_work_item_manager_loop_with_optional_langgraph,
 )
-from keystone_agents.manual_request import infer_manual_request_plan
+from keystone_agents.manual_request import (
+    infer_manual_request_plan,
+    live_search_allowed_for_execution,
+)
 from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
 )
+from keystone_agents.schemas.manual_request_plan import ManualProviderResultSetScope
 from keystone_agents.schemas.work_item import WorkflowRunRequest
 from keystone_agents.sdk_sessions import build_sdk_session, resolve_sdk_session_spec
 from keystone_agents.slack_action_contract import (
@@ -49,9 +53,7 @@ from keystone_agents.slack_query_prompts import (
     resolve_slack_query_prompt,
     slack_query_prompt_external_context,
 )
-from keystone_agents.workflow_runner import (
-    _request_forbids_live_research,
-)
+from keystone_agents.storage.sqlite_store import SQLiteStore
 
 DEFAULT_SLACK_CONTEXT_DIR = Path("artifacts/slack_contexts")
 
@@ -737,8 +739,6 @@ def handle_run_agent_interaction(
             )
         if selected_context is not None:
             context_warnings = selected_context.warnings
-        if live_search and _request_forbids_live_research(submission.requested_task):
-            live_search = False
         feedback_events: list[dict[str, Any]] = []
         slack_feedback_callback = _build_feedback_collector(
             feedback_events,
@@ -810,6 +810,11 @@ def handle_run_agent_interaction(
                 orchestrator_preflight=orchestrator_preflight,
             )
         manual_request_plan = orchestrator_preflight.manual_request_plan.model_dump(mode="json")
+        live_search = live_search_allowed_for_execution(
+            live_search,
+            manual_plan=manual_request_plan,
+            request_text=submission.requested_task,
+        )
         slack_query_prompt = _slack_query_prompt_for_submission(
             submission,
             selected_context,
@@ -869,18 +874,28 @@ def handle_run_agent_interaction(
             run_provenance=run_provenance,
         )
         if eval_record is not None:
-            eval_actions = _eval_slack_actions(eval_record)
             result_payload["eval_record"] = eval_record
-            result_payload["slack_actions"] = eval_actions
-            result_payload["slack_overflow_actions"] = []
-            result_payload["human_summary"] = _append_eval_thread_guidance(
-                str(result_payload.get("human_summary") or ""),
-                eval_record=eval_record,
-            )
+            if _should_surface_slack_eval_controls(
+                submission.requested_task,
+                context=selected_context,
+            ):
+                eval_actions = _eval_slack_actions(eval_record)
+                result_payload["slack_actions"] = eval_actions
+                result_payload["slack_overflow_actions"] = []
+                result_payload["human_summary"] = _append_eval_thread_guidance(
+                    str(result_payload.get("human_summary") or ""),
+                    eval_record=eval_record,
+                )
         graph_completion_text = _slack_graph_completion_text(feedback_events)
         if graph_completion_text:
             result_payload["slack_graph_completion_text"] = graph_completion_text
-        _attach_operator_display_fields(result_payload, result=result)
+        _attach_operator_display_fields(
+            result_payload,
+            result=result,
+            include_run_explanation=_should_surface_slack_run_explanation(
+                submission.requested_task
+            ),
+        )
         return SlackAgentActionResult(
             stage="work_item",
             callback_id=RUN_AGENT_VIEW_CALLBACK_ID,
@@ -897,13 +912,22 @@ def handle_run_agent_interaction(
     raise ValueError(f"Unsupported Slack run-agent payload type: {payload_type or 'unknown'}")
 
 
-def _attach_operator_display_fields(result_payload: dict[str, Any], *, result: Any) -> None:
+def _attach_operator_display_fields(
+    result_payload: dict[str, Any],
+    *,
+    result: Any,
+    include_run_explanation: bool = False,
+) -> None:
     """Add Slack-facing display fields without changing canonical WorkItem state."""
 
     human_summary = str(result_payload.get("human_summary") or "").strip()
     graph_completion_text = str(result_payload.get("slack_graph_completion_text") or "").strip()
     display_text = human_summary
-    if graph_completion_text and graph_completion_text not in display_text:
+    if (
+        include_run_explanation
+        and graph_completion_text
+        and graph_completion_text not in display_text
+    ):
         display_text = (
             f"{display_text}\n\n{graph_completion_text}"
             if display_text
@@ -978,6 +1002,41 @@ def _slack_graph_completion_text(feedback_events: list[dict[str, Any]]) -> str:
             continue
         return "Run explanation:\n" + "\n".join(f"- {line}" for line in lines[:5])
     return ""
+
+
+def _should_surface_slack_run_explanation(request_text: str) -> bool:
+    """Return whether the operator explicitly requested internal run diagnostics."""
+
+    text = " ".join(str(request_text or "").lower().split())
+    if not text:
+        return False
+    diagnostic_phrases = (
+        "run explanation",
+        "explain this run",
+        "explain the run",
+        "show the route",
+        "route metadata",
+        "workflow metadata",
+        "graph completion",
+        "debug trace",
+        "decision trace",
+    )
+    return any(phrase in text for phrase in diagnostic_phrases)
+
+
+def _should_surface_slack_eval_controls(
+    request_text: str,
+    *,
+    context: SlackSelectedMessageContext | None,
+) -> bool:
+    """Keep automatic eval capture internal unless this is an explicit eval run."""
+
+    if context is not None:
+        if _clean_scalar(context.eval_metadata.get("case_id")):
+            return True
+        if _clean_scalar(context.channel_name).lower() == "evals":
+            return True
+    return bool(_extract_eval_case_id_from_request(request_text))
 
 
 def _slack_cost_conservation_request_options(request_text: str) -> dict[str, Any]:
@@ -1912,10 +1971,13 @@ def orchestrator_workflow_state_from_slack_context(
             {
                 "id": message.ts,
                 "source_agent": message.user_id or message.username,
-                "summary": _clean_text(message.text, max_chars=320),
+                "summary": _clean_text(
+                    _prompt_safe_slack_message_text(message),
+                    max_chars=320,
+                ),
             }
             for message in _thread_messages_for_prompt(context)[-8:]
-            if message.text
+            if _prompt_safe_slack_message_text(message)
         ],
         "slack_thread_transcript": _slack_thread_transcript(
             context,
@@ -1925,6 +1987,12 @@ def orchestrator_workflow_state_from_slack_context(
             _compact_prior_agent_run(item) for item in context.prior_agent_runs[-5:]
         ],
     }
+    prior_result_scope = _latest_verified_provider_result_scope(
+        context.prior_agent_runs,
+        database_url=database_url,
+    )
+    if prior_result_scope is not None:
+        state["prior_provider_result_scope"] = prior_result_scope.model_dump(mode="json")
     if _should_include_channel_automation_context(request_text):
         automations = _channel_automation_context(
             context,
@@ -2107,6 +2175,252 @@ def _compact_prior_agent_run(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _latest_verified_provider_result_scope(
+    prior_runs: list[dict[str, Any]],
+    *,
+    database_url: str | None,
+) -> ManualProviderResultSetScope | None:
+    """Resolve one exact read-only provider scope from selected-thread run ids."""
+
+    if not prior_runs:
+        return None
+    candidate_ids = {
+        str(item.get("run_id") or item.get("id") or "").strip()
+        for item in prior_runs
+        if isinstance(item, dict)
+    }
+    candidate_ids.discard("")
+    if not candidate_ids:
+        return None
+
+    try:
+        rows = SQLiteStore(database_url).fetch_all("agent_runs")
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    matching_rows = [
+        row for row in rows if str(row.get("id") or "").strip() in candidate_ids
+    ]
+    for row in reversed(matching_rows):
+        scope = _verified_provider_result_scope_from_agent_run(row)
+        if scope is not None:
+            return scope
+    return None
+
+
+def latest_verified_provider_result_scope_for_slack_thread(
+    *,
+    channel_id: str,
+    thread_ts: str,
+    database_url: str | None,
+) -> ManualProviderResultSetScope | None:
+    """Resolve the newest verified provider scope persisted for one Slack thread.
+
+    Ordinary ``@KNI`` mentions and Slack message actions use different adapter-side
+    run identifiers.  The backend therefore correlates verified provider results
+    with the stable Slack channel/thread identity it received, rather than relying
+    on an adapter-specific run id being forwarded on every follow-up.
+    """
+
+    wanted_channel = str(channel_id or "").strip()
+    wanted_thread = str(thread_ts or "").strip()
+    if not wanted_channel or not wanted_thread:
+        return None
+    try:
+        rows = SQLiteStore(database_url).fetch_all("agent_runs")
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    for row in reversed(rows):
+        payload = _agent_run_output_payload(row)
+        provenance = payload.get("slack_run_provenance")
+        if not isinstance(provenance, dict):
+            provenance = payload.get("run_provenance")
+        if not isinstance(provenance, dict):
+            continue
+        if (
+            str(provenance.get("channel_id") or "").strip() != wanted_channel
+            or str(provenance.get("thread_ts") or "").strip() != wanted_thread
+        ):
+            continue
+        scope = _verified_provider_result_scope_from_agent_run(row)
+        if scope is not None:
+            return scope
+    return None
+
+
+def _agent_run_output_payload(row: dict[str, Any]) -> dict[str, Any]:
+    raw_output = row.get("output_json")
+    try:
+        payload = (
+            json.loads(raw_output)
+            if isinstance(raw_output, str)
+            else dict(raw_output or {})
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _verified_provider_result_scope_from_agent_run(
+    row: dict[str, Any],
+) -> ManualProviderResultSetScope | None:
+    payload = _agent_run_output_payload(row)
+    if not payload:
+        return None
+
+    persisted_scope = payload.get("verified_provider_result_scope")
+    if isinstance(persisted_scope, dict):
+        try:
+            scope = ManualProviderResultSetScope.model_validate(persisted_scope)
+        except (TypeError, ValueError):
+            scope = None
+        if scope is not None and scope.complete and scope.verified:
+            return scope.model_copy(update={"source_run_id": str(row.get("id") or "")})
+
+    script_payload = (
+        payload.get("script_payload")
+        if isinstance(payload.get("script_payload"), dict)
+        else {}
+    )
+    public_verified = bool(
+        payload.get("user_facing_result_verified") is True
+        or script_payload.get("user_facing_result_verified") is True
+    )
+    receipts = script_payload.get("tool_receipts") or payload.get("tool_receipts") or []
+    receipt = next(
+        (
+            item
+            for item in receipts
+            if isinstance(item, dict)
+            and item.get("provider_read") is True
+            and item.get("provider_write") is not True
+            and (
+                (item.get("complete") is True and item.get("verified") is True)
+                or (
+                    isinstance(item.get("verification"), dict)
+                    and item["verification"].get("passed") is True
+                )
+            )
+        ),
+        None,
+    )
+    receipt_verified = bool(
+        receipt is not None
+        and (
+            (receipt.get("complete") is True and receipt.get("verified") is True)
+            or (
+                isinstance(receipt.get("verification"), dict)
+                and receipt["verification"].get("passed") is True
+            )
+        )
+    )
+    completed_direct_result = bool(
+        str(payload.get("status") or "").lower() in {"done", "completed", "success"}
+        and receipt_verified
+    )
+    if not (public_verified or completed_direct_result) or receipt is None:
+        return None
+
+    manual_plan = (
+        payload.get("manual_request_plan")
+        if isinstance(payload.get("manual_request_plan"), dict)
+        else {}
+    )
+    provider_system = str(manual_plan.get("provider_system") or "")
+    if provider_system == "airtable" and receipt.get("operation") == "aggregate_records":
+        verification = receipt.get("verification")
+        if not (
+            isinstance(verification, dict)
+            and verification.get("passed") is True
+            and verification.get("schema_read") is True
+            and verification.get("records_read") is True
+        ):
+            return None
+        raw_scope = receipt.get("result_scope")
+        result_scope = raw_scope if isinstance(raw_scope, dict) else {}
+        item_refs = result_scope.get("item_refs")
+        refs = item_refs if isinstance(item_refs, list) else []
+        return ManualProviderResultSetScope(
+            source_run_id=str(row.get("id") or ""),
+            provider_system="airtable",
+            provider_read_scope="bounded_collection",
+            target_type="business_system_context",
+            item_count=int(receipt.get("matching_records") or len(refs)),
+            airtable_base_alias=str(
+                result_scope.get("base_alias") or receipt.get("base_alias") or ""
+            ),
+            airtable_table=str(
+                result_scope.get("table") or receipt.get("table") or ""
+            ),
+            airtable_amount_field=str(
+                result_scope.get("amount_field") or receipt.get("amount_field") or ""
+            ),
+            airtable_period_field=str(
+                result_scope.get("period_field") or receipt.get("period_field") or ""
+            ),
+            airtable_date_field=str(
+                result_scope.get("date_field") or receipt.get("date_field") or ""
+            ),
+            airtable_estimated_period=(
+                int(result_scope.get("estimated_period") or receipt.get("estimated_period"))
+                if result_scope.get("estimated_period") or receipt.get("estimated_period")
+                else None
+            ),
+            airtable_year=(
+                int(result_scope.get("year") or receipt.get("year"))
+                if result_scope.get("year") or receipt.get("year")
+                else None
+            ),
+            aggregate_total=str(
+                result_scope.get("total") or receipt.get("total") or ""
+            ),
+            aggregate_currency=str(
+                result_scope.get("currency") or receipt.get("currency") or ""
+            ),
+            item_refs=refs,
+            complete=not bool(receipt.get("truncated")),
+            verified=True,
+        )
+    if provider_system != "gmail":
+        return None
+    output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
+    item_count_value = (
+        receipt.get("message_count")
+        if receipt.get("message_count") is not None
+        else receipt.get("item_count")
+    )
+    if item_count_value is None:
+        item_count_value = output.get("message_count") or output.get("item_count")
+    try:
+        item_count = int(item_count_value) if item_count_value is not None else None
+    except (TypeError, ValueError):
+        item_count = None
+
+    return ManualProviderResultSetScope(
+        source_run_id=str(row.get("id") or ""),
+        provider_system="gmail",
+        provider_read_scope="bounded_collection",
+        target_type="gmail_message_collection",
+        gmail_mailbox_direction=str(
+            receipt.get("mailbox_direction")
+            or manual_plan.get("gmail_mailbox_direction")
+            or "unspecified"
+        ),
+        gmail_date_scope=str(
+            receipt.get("date_scope")
+            or manual_plan.get("gmail_date_scope")
+            or "unspecified"
+        ),
+        query=str(receipt.get("query") or ""),
+        label=str(receipt.get("label") or ""),
+        timezone=str(receipt.get("timezone") or "America/New_York"),
+        window_start=str(receipt.get("window_start") or ""),
+        window_end=str(receipt.get("window_end") or ""),
+        item_count=item_count,
+        complete=True,
+        verified=True,
+    )
+
+
 def _slack_run_provenance(
     *,
     submission: SlackAgentRunSubmission,
@@ -2219,6 +2533,10 @@ def _message_from_payload(
         metadata={
             "type": _clean_scalar(message.get("type")),
             "subtype": _clean_scalar(message.get("subtype")),
+            "is_bot": bool(
+                message.get("bot_id")
+                or _clean_scalar(message.get("subtype")) == "bot_message"
+            ),
             "original_text_chars": len(original_text),
             "captured_text_chars": len(captured_text),
             "original_text_sha256": _sha256_text(original_text),
@@ -2566,7 +2884,10 @@ def _slack_thread_transcript(
     ]
     for index, message in enumerate(_thread_messages_for_prompt(context), start=1):
         speaker = message.username or message.user_id or "unknown"
-        text = _clean_text(message.text, max_chars=900)
+        text = _clean_text(
+            _prompt_safe_slack_message_text(message),
+            max_chars=900,
+        )
         if not text:
             continue
         lines.append(f"{index}. [{message.ts}] {speaker}: {text}")
@@ -2579,6 +2900,24 @@ def _slack_thread_transcript(
             ]
         )
     return "\n".join(lines).strip()
+
+
+def _prompt_safe_slack_message_text(message: SlackContextMessage) -> str:
+    """Remove renderer-owned diagnostics from prior bot turns, never human text."""
+
+    text = str(message.text or "").strip()
+    if not text or not bool(message.metadata.get("is_bot")):
+        return text
+    internal_suffix = re.search(
+        r"(?:\s|\n)(?:"
+        r"Eval:\s*case\b|"
+        r"Run explanation:\s*|"
+        r"\*?Metadata\*?\s+(?:[-*]?\s*Source focus:)"
+        r")",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text[: internal_suffix.start()].rstrip() if internal_suffix else text
 
 
 def _message_sort_key(message: SlackContextMessage) -> tuple[float, str]:

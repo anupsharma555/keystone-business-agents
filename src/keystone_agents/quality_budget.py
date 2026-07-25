@@ -8,6 +8,7 @@ from enum import StrEnum
 from pydantic import BaseModel, Field
 
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 
 
 class QualityMode(StrEnum):
@@ -74,9 +75,7 @@ def chief_of_staff_quality_budget(
     """Resolve a Chief of Staff quality budget from explicit mode or request intent."""
 
     explicit = mode is not None and str(mode).strip() != ""
-    semantic_plan = bool(
-        manual_request_plan is not None and manual_request_plan.source == "llm"
-    )
+    semantic_plan = ExecutionIntentAuthority.from_value(manual_request_plan).canonical
     resolved = normalize_quality_mode(
         mode,
         QualityMode.BALANCED if live_sdk else QualityMode.FAST,

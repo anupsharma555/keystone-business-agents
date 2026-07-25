@@ -12,6 +12,7 @@ DEFAULT_PROVIDER = "openai"
 DEFAULT_MODEL = "gpt-5.4-mini"
 OPENAI_BUSINESS_AGENT_DEFAULT_MODEL = "gpt-5.4-mini"
 OPENAI_ORCHESTRATOR_DEFAULT_MODEL = "gpt-5.4-mini"
+OPENAI_MANUAL_PLANNER_DEFAULT_MODEL = "gpt-5.4-mini"
 OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL = "gpt-5.4-mini"
 OPENAI_FALLBACK_DEFAULT_MODEL = OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
 GEMINI_FLASH_DEFAULT_MODEL = "gemini-2.5-flash"
@@ -88,6 +89,14 @@ class RuntimeAgentModelSpec:
 
 
 RUNTIME_AGENT_MODEL_SPECS: dict[str, RuntimeAgentModelSpec] = {
+    "manual_request_planner": RuntimeAgentModelSpec(
+        agent_name="manual_request_planner",
+        model_env="KEYSTONE_MANUAL_PLANNER_MODEL",
+        provider_env="KEYSTONE_MANUAL_PLANNER_MODEL_PROVIDER",
+        base_url_env="KEYSTONE_MANUAL_PLANNER_BASE_URL",
+        default_model=OPENAI_MANUAL_PLANNER_DEFAULT_MODEL,
+        default_provider=DEFAULT_PROVIDER,
+    ),
     "orchestrator": RuntimeAgentModelSpec(
         agent_name="orchestrator",
         model_env="KEYSTONE_ORCHESTRATOR_MODEL",
@@ -493,7 +502,16 @@ def get_runtime_agent_model_config(
             f"Unsupported model provider {provider!r} for agent {agent_name!r}. "
             f"Supported providers: {', '.join(sorted(SUPPORTED_PROVIDERS))}."
         )
-    explicit_base_url = (_env_value(spec.base_url_env) if spec else None) or base.base_url
+    agent_base_url = _env_value(spec.base_url_env) if spec else None
+    explicit_base_url = (
+        agent_base_url
+        if agent_base_url is not None
+        else base.litellm_base_url
+        if base.litellm_base_url and base.base_url == base.litellm_base_url
+        else base.base_url
+        if provider == base.provider
+        else None
+    )
     base_url = _default_base_url_for_provider(provider, explicit_base_url)
     return ModelConfig(
         provider=provider,

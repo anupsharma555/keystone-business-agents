@@ -37,6 +37,10 @@ class CalendarActionPlan:
     """Exact Calendar action inferred from one natural operator request."""
 
     operation: str
+    read_scope: str = "single_event"
+    read_selection: str = "all"
+    date_scope: str = "unspecified"
+    query: str = ""
     title: str = ""
     start_date: str = ""
     end_date: str = ""
@@ -49,6 +53,7 @@ class CalendarActionPlan:
     event_reference: str = ""
     event_reference_date: str = ""
     calendar_id: str = DEFAULT_CALENDAR_ID
+    calendar_scope: str = "configured"
     timezone: str = DEFAULT_CALENDAR_TIMEZONE
     all_day: bool = True
     complete: bool = False
@@ -584,6 +589,20 @@ def _event_dates(text: str, *, today: date | None) -> list[str]:
             continue
         if normalized not in found:
             found.append(normalized)
+    for match in re.finditer(
+        r"\b(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>20\d{2})\b",
+        text,
+    ):
+        try:
+            normalized = date(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+            ).isoformat()
+        except ValueError:
+            continue
+        if normalized not in found:
+            found.append(normalized)
     month_names = "|".join(MONTHS)
     matches = re.finditer(
         rf"\b(?P<month>{month_names})\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?"
@@ -606,6 +625,22 @@ def _event_dates(text: str, *, today: date | None) -> list[str]:
         if normalized not in found:
             found.append(normalized)
     return found
+
+
+def calendar_lookup_date(
+    request_text: str,
+    *,
+    today: date | None = None,
+) -> str:
+    """Return the newest explicit date that can bound a Calendar read."""
+
+    text = " ".join(str(request_text or "").split()).strip()
+    previous_request, latest_followup = _slack_thread_action_context(text)
+    for candidate in (latest_followup, previous_request, text):
+        dates = _event_dates(candidate, today=today) if candidate else []
+        if dates:
+            return dates[-1]
+    return ""
 
 
 def _has_calendar_date_replacement(text: str, event_dates: list[str]) -> bool:

@@ -506,7 +506,7 @@ def test_compare_langgraph_quality_script_runs_chief_context_opportunity_scenari
     assert {"rss_context_agent", "zotero_context_agent"} <= set(
         graph_markers["source_providers"]
     )
-    assert graph_markers["stage_statuses"]["chief_of_staff"] == "not_completed"
+    assert graph_markers["stage_statuses"]["chief_of_staff"] == "completed"
     assert graph_markers["stage_statuses"]["opportunity_scout"] == "completed"
     assert output["comparison"]["same_route"] is True
     assert output["comparison"]["same_status"] is False

@@ -15,10 +15,18 @@ from keystone_agents.schemas.execution_request import (
     ExecutionRequest,
     ExecutionResultStatus,
 )
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.semantic_execution import (
+    ExecutionIntentAuthority,
+    StageOperationBoundary,
+    StageOutputContract,
+    reconcile_stage_output,
+)
+from keystone_agents.terminal_result_consistency import reconcile_failed_review
 
 _SLACK_CONTINUATION_MARKER = "continue this prior slack thread"
 _SLACK_FOLLOWUP_BOUNDARY_RE = re.compile(
-    r"(?=\s+(?:Continue the same agent task\b|Previous request:|"
+    r"(?=\s+(?:Continue the same agent task\b|Prior task owner \(advisory\):|Previous request:|"
     r"Previous result title:|Previous result:|User follow-up:)|$)",
     re.IGNORECASE,
 )
@@ -28,11 +36,6 @@ def latest_slack_operator_request(text: str) -> str:
     """Recover the latest operator ask while preserving explicit route advice."""
 
     raw = str(text or "").strip()
-    original_mention = parse_agent_mention(
-        raw,
-        allow_bare_context_agents=True,
-        allow_bare_agent_aliases=True,
-    )
     if _SLACK_CONTINUATION_MARKER in raw.lower():
         followups = [
             match.group(1).strip()
@@ -45,26 +48,6 @@ def latest_slack_operator_request(text: str) -> str:
         ]
         if followups:
             raw = followups[-1]
-            followup_mention = parse_agent_mention(
-                raw,
-                allow_bare_context_agents=True,
-                allow_bare_agent_aliases=True,
-            )
-            if original_mention.explicit and not followup_mention.explicit:
-                route_prefixes = {
-                    "orchestrator": "orchestrator",
-                    "business_research_analyst": "business research analyst",
-                    "opportunity_scout": "opportunity scout",
-                    "outreach_composer": "outreach composer",
-                    "gmail_triage": "gmail triage",
-                    "chief_of_staff": "chief of staff",
-                    "airtable_context_agent": "airtable context agent",
-                    "google_workspace_context_agent": "google workspace context agent",
-                    "zotero_context_agent": "zotero context agent",
-                }
-                prefix = route_prefixes.get(str(original_mention.route or ""), "")
-                if prefix:
-                    raw = f"{prefix} {raw}"
 
     raw = html.unescape(raw).strip()
     raw = re.sub(r"^\s*>\s*", "", raw)
@@ -107,13 +90,18 @@ def build_execution_request(
         if slack_context_input
         else "cli"
     )
+    continuation = (
+        _slack_continuation(raw, current_request=current_request)
+        if is_slack_followup
+        else ExecutionContinuation()
+    )
     return ExecutionRequest(
         entrypoint=cast(ExecutionEntrypoint, resolved_entrypoint),
         raw_request=raw,
         current_request=current_request,
         requested_agent=explicit_route,
         requested_agent_explicit=bool(requested_agent or mention.explicit),
-        continuation=_slack_continuation(raw) if is_slack_followup else ExecutionContinuation(),
+        continuation=continuation,
         source_context=source_context or {},
     )
 
@@ -126,18 +114,65 @@ def execution_request_planning_text(request: ExecutionRequest) -> str:
         return current
     prior_request = request.continuation.prior_request.strip()[:4000]
     prior_result = request.continuation.prior_result_summary.strip()[:2400]
+    if _normalized_request_identity(prior_request) == _normalized_request_identity(current):
+        prior_request = ""
     # A typed provider continuation should re-read provider state. Previous bot
     # prose may describe a failed route and must not become task authority.
     if request.continuation.provider_affinity:
         prior_result = ""
     if not prior_request and not prior_result:
         return current
-    parts = [prior_request] if prior_request else []
+    parts: list[str] = []
+    if prior_request:
+        parts.append(prior_request)
     if prior_result:
         parts.append(f"Prior result for context: {prior_result}")
     if current:
         parts.append(f"Authoritative follow-up: {current}")
     return "\n".join(parts)
+
+
+def _normalized_request_identity(value: str) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def continuation_owner_advice(
+    request: ExecutionRequest,
+    plan: ManualRequestPlan,
+) -> str:
+    """Retain one prior owner only for a semantic same-artifact continuation.
+
+    The LLM plan establishes that prior context is needed and that the current
+    turn remains a provider-free response transformation. This tie-breaker does
+    not inspect trigger words, grant tool authority, or override a newly named
+    agent, provider action, draft, plan, workflow, or durable task.
+    """
+
+    prior_agent = request.continuation.prior_agent.strip()
+    if not prior_agent or request.requested_agent_explicit:
+        return ""
+    if plan.ask_shape.prior_context_dependency not in {"selected_context", "required"}:
+        return ""
+    if plan.ask_shape.output_form in {"draft", "plan"}:
+        return ""
+    if plan.provider_system != "unspecified" or plan.provider_operations:
+        return ""
+    if plan.workflow or plan.requires_durable_state:
+        return ""
+    if plan.side_effect_policy != "draft_or_read_only":
+        return ""
+    if plan.intent in {
+        "blocked_send",
+        "business_system_write",
+        "clarification",
+        "continue_work_item",
+        "opportunity_to_outreach_loop",
+        "outreach_draft",
+    }:
+        return ""
+    if plan.expected_artifact_type == "outreach_draft":
+        return ""
+    return prior_agent
 
 
 def attach_execution_public_result(payload: dict[str, Any]) -> ExecutionPublicResult:
@@ -146,6 +181,8 @@ def attach_execution_public_result(payload: dict[str, Any]) -> ExecutionPublicRe
     existing = payload.get("public_result")
     if isinstance(existing, Mapping):
         result = ExecutionPublicResult.model_validate(existing)
+        result = reconcile_failed_review(payload, result)
+        payload["public_result"] = result.model_dump(mode="json")
         _mirror_public_result(payload, result)
         return result
 
@@ -188,10 +225,13 @@ def attach_execution_public_result(payload: dict[str, Any]) -> ExecutionPublicRe
         else False
     )
     manual_plan = payload.get("manual_request_plan")
+    plan_authority = ExecutionIntentAuthority.from_value(manual_plan)
     manual_plan_mapping = (
-        manual_plan if isinstance(manual_plan, Mapping) else {}
+        plan_authority.plan.model_dump(mode="python")
+        if plan_authority.plan is not None
+        else {}
     )
-    semantic_plan = str(manual_plan_mapping.get("source") or "") == "llm"
+    semantic_plan = plan_authority.canonical or plan_authority.invalid
     plan_requires_clarification = bool(
         manual_plan_mapping.get("target_agent") == "clarification"
         or manual_plan_mapping.get("intent") == "clarification"
@@ -234,6 +274,18 @@ def attach_execution_public_result(payload: dict[str, Any]) -> ExecutionPublicRe
             str(key).lower(),
         )
         for key, value in side_effect_mapping.items()
+    )
+    result_boundary = _public_result_operation_boundary(plan_authority)
+    stage_output = reconcile_stage_output(
+        payload,
+        contract=StageOutputContract(
+            stage="entrypoint_public_result",
+            operation_boundary=result_boundary,
+            public_output=True,
+        ),
+    )
+    write_side_effect_reported = bool(
+        write_side_effect_reported or stage_output.observed_effect_paths
     )
     provider_write_attempted = bool(write_receipts or write_side_effect_reported)
     provider_receipt_verified = (
@@ -303,9 +355,40 @@ def attach_execution_public_result(payload: dict[str, Any]) -> ExecutionPublicRe
         failure_summary=failure_summary,
         run_id=str(payload.get("agent_run_id") or payload.get("run_id") or ""),
     )
+    result = reconcile_failed_review(payload, result)
     payload["public_result"] = result.model_dump(mode="json")
     _mirror_public_result(payload, result)
     return result
+
+
+def _public_result_operation_boundary(
+    authority: ExecutionIntentAuthority,
+) -> StageOperationBoundary:
+    plan = authority.plan
+    if plan is None:
+        return StageOperationBoundary.READ_ONLY
+    mutation_operations = {
+        "create",
+        "update",
+        "delete",
+        "trash",
+        "send",
+        "post",
+        "write",
+        "modify",
+        "label",
+    }
+    if mutation_operations.intersection(
+        authority.effective_provider_operations(plan.provider_system)
+    ):
+        return StageOperationBoundary.PROVIDER_WRITE
+    if (
+        plan.ask_shape.permission_state == "draft_only"
+        or plan.ask_shape.output_form == "draft"
+        or plan.expected_artifact_type == "outreach_draft"
+    ):
+        return StageOperationBoundary.DRAFT_ONLY
+    return StageOperationBoundary.READ_ONLY
 
 
 def _completed_result_requires_title_omission(
@@ -485,18 +568,50 @@ def _receipt_is_write(receipt: Mapping[str, Any]) -> bool:
     )
 
 
-def _slack_continuation(raw_request: str) -> ExecutionContinuation:
+def slack_work_item_control_requested(current_request: str) -> bool:
+    """Return whether the current human turn explicitly controls prior state.
+
+    Slack adapters may wrap every thread reply as a continuation. That transport
+    marker must not make a linked WorkItem authoritative for an ordinary natural-
+    language ask. Only an explicit current-turn state-control instruction may
+    preserve the linked ID for resume/retry/approval handling.
+    """
+
+    normalized = " ".join(str(current_request or "").strip().lower().split())
+    return bool(
+        re.match(
+            r"^(?:please\s+)?(?:continue|resume|retry|run\s+again|approve|reject)\b",
+            normalized,
+        )
+    )
+
+
+def _slack_continuation(
+    raw_request: str,
+    *,
+    current_request: str = "",
+) -> ExecutionContinuation:
     linked_ids = re.findall(
         r"\bLinked\s+WorkItem:\s*(wi_[A-Za-z0-9_-]+)\b",
         raw_request,
         flags=re.IGNORECASE,
     )
     prior_requests = _all_envelope_values(raw_request, "Previous request")
+    prior_agents = _all_envelope_values(raw_request, "Prior task owner (advisory)")
     provider_affinities = _all_envelope_values(raw_request, "Provider affinity")
     prior_titles = _all_envelope_values(raw_request, "Previous result title")
     prior_results = _all_envelope_values(raw_request, "Previous result")
     return ExecutionContinuation(
-        work_item_id=linked_ids[-1] if linked_ids else "",
+        work_item_id=(
+            linked_ids[-1]
+            if linked_ids and slack_work_item_control_requested(current_request)
+            else ""
+        ),
+        prior_agent=(
+            prior_agents[-1].lower()
+            if prior_agents
+            else _slack_envelope_prior_agent(raw_request)
+        ),
         provider_affinity=(
             provider_affinities[-1].lower() if provider_affinities else ""
         ),
@@ -506,10 +621,26 @@ def _slack_continuation(raw_request: str) -> ExecutionContinuation:
     )
 
 
+def _slack_envelope_prior_agent(raw_request: str) -> str:
+    """Recover an adapter's prior owner without making it a current-turn mention."""
+
+    marker_index = str(raw_request or "").lower().find(_SLACK_CONTINUATION_MARKER)
+    if marker_index < 0:
+        return ""
+    envelope_prefix = str(raw_request or "")[:marker_index].strip()
+    mention = parse_agent_mention(
+        envelope_prefix,
+        allow_bare_context_agents=True,
+        allow_bare_agent_aliases=True,
+    )
+    return str(mention.route or "").strip() if mention.explicit else ""
+
+
 def _all_envelope_values(raw_request: str, label: str) -> list[str]:
     boundary = (
         r"(?=\s+(?:Current user request \(authoritative\):|Linked WorkItem:|"
-        r"Provider affinity:|Previous request:|Previous result title:|"
+        r"Prior task owner \(advisory\):|Provider affinity:|Previous request:|"
+        r"Previous result title:|"
         r"Previous result:|User follow-up:|Continue the same agent task\b)|$)"
     )
     return [
@@ -537,6 +668,8 @@ def _strip_slack_entrypoint_decoration(value: str) -> str:
 __all__ = [
     "attach_execution_public_result",
     "build_execution_request",
+    "continuation_owner_advice",
     "execution_request_planning_text",
     "latest_slack_operator_request",
+    "slack_work_item_control_requested",
 ]

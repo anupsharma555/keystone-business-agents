@@ -140,9 +140,10 @@ def interpreted_output_constraints_text(
     if not constraints.is_explicit():
         return ""
     return (
-        "Interpreted response constraints from Orchestrator planning. The raw operator "
-        "request remains authoritative. Reason about and satisfy these constraints in "
-        "the user-facing fields; deterministic helpers will only validate the result:\n"
+        "Canonical response constraints reconciled against the authoritative current "
+        "operator turn; the raw operator request remains authoritative. Reason about "
+        "and satisfy these constraints in the user-facing fields; deterministic helpers "
+        "will only validate the grounded hard fields:\n"
         + constraints.model_dump_json(indent=2)
     )
 

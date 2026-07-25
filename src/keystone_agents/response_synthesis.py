@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from pydantic import BaseModel, Field
 
@@ -82,7 +82,7 @@ class UserFacingResponseSynthesisInput(BaseModel):
                 "- Treat source_triage_notes as the source-selection contract for Answer and the Detailed Summary. Retained sources may support claims, rejected sources must not support claims, and deepen sources require page reading/extraction before detailed factual summary.",
                 "- Treat request_coverage as the specialist audit of the interpreted ask. If it is partial or blocked, present a precise partial answer or blocker and its next safe action, not a complete result.",
                 "- If request_coverage_required=true but no assessed coverage is present, do not claim that exact filters, requested output form, or stop conditions were verified.",
-                "- Treat manual_plan.ask_shape.output_constraints as the LLM planner's interpreted completion contract. Reason from it together with the raw request and satisfy its response scope, counts, sections, source visibility, forbidden content, and style requirements.",
+                "- Treat manual_plan.ask_shape.output_constraints as the canonical current-turn completion contract after planner reconciliation. Reason from it together with the raw request and satisfy its response scope, counts, sections, source visibility, forbidden content, and style requirements.",
                 "- When output_constraints requests a narrow answer-only response, put the compliant response in answer and leave synthesis and optional sections empty unless the request explicitly requires them. Shared Detailed Summary defaults must not override a narrower operator ask.",
                 "- If source_triage_notes says broaden/deepen is recommended, state what is missing or thin before making strong conclusions; use retained sources first and avoid padding with weak adjacent sources.",
                 "- If source_context_notes says extracted page evidence is missing, do not write a detailed factual synthesis from provider snippets alone; state the limitation and recommend reading/extracting the relevant URLs.",
@@ -243,7 +243,7 @@ def response_synthesis_sources(result: WorkflowRunResult) -> list[dict[str, Any]
         url = str(source.get("url") or "").strip()
         title = str(source.get("title") or "").strip()
         source_id = str(source.get("source_id") or "").strip()
-        if not url or url in seen_urls or _is_internal_fixture_url(url):
+        if not url or url in seen_urls or _is_internal_synthesis_url(url):
             return
         if (
             (source_id and source_id in triage_filter["rejected_ids"])
@@ -507,7 +507,7 @@ def response_synthesis_ordered_sources(result: WorkflowRunResult) -> list[dict[s
             item
             for item in normalized
             if item.get("url")
-            and not _is_internal_fixture_url(str(item.get("url") or ""))
+            and not _is_internal_synthesis_url(str(item.get("url") or ""))
         ]
         if normalized:
             return normalized
@@ -541,6 +541,23 @@ def _is_internal_fixture_url(url: str) -> bool:
     return str(url or "").strip().lower().startswith("fixture://")
 
 
+def _is_internal_synthesis_url(url: str) -> bool:
+    """Keep local diagnostics and synthetic references out of factual synthesis."""
+
+    value = str(url or "").strip()
+    if not value or _is_internal_fixture_url(value):
+        return True
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() == "file":
+        return True
+    return (parsed.hostname or "").strip().lower() in {
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+    }
+
+
 def response_synthesis_provider_results(result: WorkflowRunResult) -> list[dict[str, Any]]:
     """Return compact top search-lane samples for final answer synthesis."""
 
@@ -561,6 +578,8 @@ def response_synthesis_provider_results(result: WorkflowRunResult) -> list[dict[
                 url = str(item.get("url") or "").strip()
                 title = str(item.get("title") or "").strip()
                 if not url and not title:
+                    continue
+                if url and _is_internal_synthesis_url(url):
                     continue
                 key = (provider_name, url or title)
                 if key in seen:
@@ -950,12 +969,15 @@ def _metadata_context_pack_source_focus_line(result: WorkflowRunResult) -> str:
     focus = _result_context_pack_source_focus(result)
     if not focus:
         return ""
+    status = str(focus.get("status") or "").strip()
     sample_count = int(focus.get("sample_count") or 0)
+    if status in {"no_source_context_sample", "no_focus_terms"}:
+        return ""
     matching = int(focus.get("matching_sample_count") or 0)
     terms = ", ".join(str(term) for term in (focus.get("terms") or [])[:5])
     suffix = f"; terms: {terms}" if terms else ""
     return (
-        f"Source focus: {focus.get('status')}; "
+        f"Source focus: {status}; "
         f"{matching}/{sample_count} sample sources matched{suffix}"
     )
 

@@ -24,6 +24,9 @@ GOOGLE_CALENDAR_ID_ENV = "GOOGLE_CALENDAR_ID"
 GOOGLE_CALENDAR_TIMEZONE_ENV = "GOOGLE_CALENDAR_TIMEZONE"
 DEFAULT_CALENDAR_ID = "primary"
 DEFAULT_CALENDAR_TIMEZONE = "America/New_York"
+GOOGLE_CALENDAR_LIST_READ_SCOPE = (
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
+)
 
 
 class GoogleCalendarError(RuntimeError):
@@ -124,6 +127,35 @@ class GoogleCalendarTool:
         items = payload.get("items") or []
         return [item for item in items if isinstance(item, dict)]
 
+    def list_selected_readable_calendars(self) -> list[dict[str, Any]]:
+        """Return calendars selected in the connected account's Calendar UI."""
+
+        params = urlencode(
+            {
+                "minAccessRole": "reader",
+                "showHidden": "false",
+                "maxResults": 250,
+            }
+        )
+        try:
+            payload = self._request("GET", f"users/me/calendarList?{params}")
+        except GoogleCalendarError as exc:
+            if "insufficientPermissions" in str(exc):
+                raise GoogleCalendarError(
+                    "Reading selected and shared calendars requires the read-only "
+                    f"OAuth scope {GOOGLE_CALENDAR_LIST_READ_SCOPE}. Reauthorize the "
+                    "local Google token before retrying."
+                ) from exc
+            raise
+        items = payload.get("items") or []
+        return [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and bool(item.get("selected") or item.get("primary"))
+            and str(item.get("id") or "").strip()
+        ]
+
     def list_events_window(
         self,
         calendar_id: str,
@@ -131,19 +163,22 @@ class GoogleCalendarTool:
         time_min: str,
         time_max: str,
         max_results: int = 100,
+        query: str = "",
     ) -> list[dict[str, Any]]:
         """List bounded event instances in chronological order."""
 
-        params = urlencode(
-            {
-                "timeMin": time_min,
-                "timeMax": time_max,
-                "singleEvents": "true",
-                "showDeleted": "false",
-                "orderBy": "startTime",
-                "maxResults": min(max(int(max_results), 1), 100),
-            }
-        )
+        values = {
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "singleEvents": "true",
+            "showDeleted": "false",
+            "orderBy": "startTime",
+            "maxResults": min(max(int(max_results), 1), 100),
+        }
+        clean_query = " ".join(str(query or "").split()).strip()[:200]
+        if clean_query:
+            values["q"] = clean_query
+        params = urlencode(values)
         payload = self._request(
             "GET",
             f"calendars/{quote(calendar_id, safe='')}/events?{params}",
@@ -228,9 +263,27 @@ def resolve_google_calendar_event_impl(
             "send_enabled": False,
         }
     calendar = tool or GoogleCalendarTool(live=True)
+    if requested_date:
+        zone = ZoneInfo(
+            os.getenv(GOOGLE_CALENDAR_TIMEZONE_ENV, DEFAULT_CALENDAR_TIMEZONE).strip()
+            or DEFAULT_CALENDAR_TIMEZONE
+        )
+        window_start = datetime.combine(
+            date.fromisoformat(requested_date),
+            datetime.min.time(),
+            tzinfo=zone,
+        )
+        candidates = calendar.list_events_window(
+            clean_calendar,
+            time_min=window_start.isoformat(),
+            time_max=(window_start + timedelta(days=1)).isoformat(),
+            max_results=100,
+        )
+    else:
+        candidates = calendar.find_events(clean_calendar, reference, max_results=10)
     candidates = [
         item
-        for item in calendar.find_events(clean_calendar, reference, max_results=10)
+        for item in candidates
         if str(item.get("status") or "confirmed").lower() != "cancelled"
     ]
     normalized_reference = _normalize_event_title(reference)
@@ -246,6 +299,7 @@ def resolve_google_calendar_event_impl(
         and (
             normalized_reference in _normalize_event_title(item.get("summary"))
             or _normalize_event_title(item.get("summary")) in normalized_reference
+            or _event_title_tokens_match(reference, item.get("summary"))
         )
     ]
     if requested_date:
@@ -265,6 +319,10 @@ def resolve_google_calendar_event_impl(
             "send_enabled": False,
         }
     event = matches[0]
+    bounded_event = _bounded_calendar_event(event)
+    start = str(bounded_event.get("start") or "")
+    end = str(bounded_event.get("end") or "")
+    all_day = bool(start and "T" not in start)
     return {
         "status": "success",
         "operation": "resolve_calendar_event",
@@ -275,6 +333,12 @@ def resolve_google_calendar_event_impl(
         "provider_link": str(event.get("htmlLink") or ""),
         "title": str(event.get("summary") or ""),
         "start_date": _provider_event_start_date(event),
+        "start": start,
+        "end": end,
+        "start_time": "" if all_day else start[11:16],
+        "end_time": "" if all_day else end[11:16],
+        "all_day": all_day,
+        "timezone": str((event.get("start") or {}).get("timeZone") or ""),
         "send_enabled": False,
     }
 
@@ -289,6 +353,8 @@ def read_google_calendar_window_impl(
     time_max: str,
     *,
     calendar_id: str = "",
+    calendar_scope: str = "configured",
+    query: str = "",
     max_results: int = 100,
     live: bool = False,
     tool: GoogleCalendarTool | None = None,
@@ -302,12 +368,18 @@ def read_google_calendar_window_impl(
     if parsed_end <= parsed_start:
         raise ValueError("Calendar window end must be after its start.")
     clean_calendar = _calendar_id(calendar_id)
+    clean_scope = str(calendar_scope or "configured").strip().lower()
+    if clean_scope not in {"configured", "selected_readable"}:
+        raise ValueError("Calendar read scope must be configured or selected_readable.")
+    clean_query = " ".join(str(query or "").split()).strip()[:200]
     bounded_max = min(max(int(max_results), 1), 100)
     if not live:
         return {
             "status": "dry-run",
             "operation": "read_calendar_window",
             "calendar_id": clean_calendar,
+            "calendar_scope": clean_scope,
+            "query": clean_query,
             "time_min": start,
             "time_max": end,
             "max_results": bounded_max,
@@ -318,18 +390,38 @@ def read_google_calendar_window_impl(
             "send_enabled": False,
         }
     calendar = tool or GoogleCalendarTool(live=True)
-    raw_events = calendar.list_events_window(
-        clean_calendar,
-        time_min=start,
-        time_max=end,
-        max_results=bounded_max,
+    calendar_entries = (
+        calendar.list_selected_readable_calendars()
+        if clean_scope == "selected_readable"
+        else [{"id": clean_calendar, "primary": clean_calendar == "primary"}]
     )
-    events = [_bounded_calendar_event(event) for event in raw_events]
+    if not calendar_entries:
+        calendar_entries = [{"id": clean_calendar, "primary": True}]
+    events: list[dict[str, Any]] = []
+    for entry in calendar_entries:
+        source_calendar_id = str(entry.get("id") or "").strip()
+        if not source_calendar_id:
+            continue
+        raw_events = calendar.list_events_window(
+            source_calendar_id,
+            time_min=start,
+            time_max=end,
+            max_results=bounded_max,
+            query=clean_query,
+        )
+        for raw_event in raw_events:
+            event = _bounded_calendar_event(raw_event)
+            event["source_calendar_id"] = source_calendar_id
+            events.append(event)
     events = [event for event in events if event["status"] != "cancelled"]
+    events = sorted(events, key=lambda event: str(event.get("start") or ""))[:bounded_max]
     return {
         "status": "success",
         "operation": "read_calendar_window",
         "calendar_id": clean_calendar,
+        "calendar_scope": clean_scope,
+        "calendar_count": len(calendar_entries),
+        "query": clean_query,
         "time_min": start,
         "time_max": end,
         "max_results": bounded_max,
@@ -691,6 +783,26 @@ def _normalize_event_title(value: object) -> str:
     )
 
 
+def _event_title_tokens_match(reference: object, candidate: object) -> bool:
+    """Allow a bounded title match when the operator omits nonessential words."""
+
+    def tokens(value: object) -> set[str]:
+        normalized: set[str] = set()
+        for token in _normalize_event_title(value).split():
+            if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+                token = token[:-1]
+            if token not in {"a", "an", "the", "event"}:
+                normalized.add(token)
+        return normalized
+
+    reference_tokens = tokens(reference)
+    candidate_tokens = tokens(candidate)
+    return bool(
+        len(reference_tokens) >= 2
+        and reference_tokens.issubset(candidate_tokens)
+    )
+
+
 def _iso_date(value: str) -> str:
     cleaned = _required(value, "Calendar event date")
     try:
@@ -713,13 +825,21 @@ def _rfc3339(value: str, label: str) -> str:
 def _bounded_calendar_event(event: dict[str, Any]) -> dict[str, Any]:
     start = event.get("start") if isinstance(event.get("start"), dict) else {}
     end = event.get("end") if isinstance(event.get("end"), dict) else {}
+    start_value = str(start.get("dateTime") or start.get("date") or "")
+    end_value = str(end.get("dateTime") or end.get("date") or "")
+    all_day = bool(start.get("date") and not start.get("dateTime"))
     recurring_event_id = str(event.get("recurringEventId") or "")
     return {
         "event_id": str(event.get("id") or ""),
         "title": " ".join(str(event.get("summary") or "(untitled event)").split())[:240],
         "status": str(event.get("status") or "confirmed").lower(),
-        "start": str(start.get("dateTime") or start.get("date") or ""),
-        "end": str(end.get("dateTime") or end.get("date") or ""),
+        "start_date": start_value[:10],
+        "start": start_value,
+        "end": end_value,
+        "start_time": "" if all_day else start_value[11:16],
+        "end_time": "" if all_day else end_value[11:16],
+        "all_day": all_day,
+        "timezone": str(start.get("timeZone") or ""),
         "html_link": str(event.get("htmlLink") or ""),
         "is_recurring": bool(recurring_event_id),
         "recurring_event_id": recurring_event_id,

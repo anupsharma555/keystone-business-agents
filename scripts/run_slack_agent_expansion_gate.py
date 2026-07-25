@@ -25,7 +25,6 @@ DEFAULT_ROUTE_MINIMUMS = {
     "airtable_context_agent": 2,
     "business_research_analyst": 5,
     "chief_of_staff": 11,
-    "clarification": 1,
     "gmail_triage": 4,
     "google_workspace_context_agent": 2,
     "opportunity_scout": 4,

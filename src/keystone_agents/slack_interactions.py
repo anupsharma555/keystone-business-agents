@@ -24,6 +24,7 @@ from keystone_agents.gmail_triage.draft_actions import (
 from keystone_agents.langgraph_workflow import (
     advance_work_item_manager_loop_with_optional_langgraph,
 )
+from keystone_agents.manual_request import live_search_allowed_for_execution
 from keystone_agents.models import OutreachComposerSDKInput
 from keystone_agents.natural_interaction import resolve_natural_followup
 from keystone_agents.orchestrator.preflight_context import compact_orchestrator_preflight_payload
@@ -95,7 +96,6 @@ from keystone_agents.work_items import (
     select_artifact,
     set_next_action,
 )
-from keystone_agents.workflow_runner import _request_forbids_live_research
 
 ACTION_STATUS_BY_ID = {
     "keystone_approval_yes": ApprovalQueueStatus.APPROVED,
@@ -1129,8 +1129,17 @@ def _handle_chief_of_staff_action(
             live_search_constraint_text = (
                 f"continue {getattr(existing_item, 'request_text', '') or ''}"
             )
-        if live_search and _request_forbids_live_research(live_search_constraint_text):
-            live_search = False
+        existing_manual_plan = (
+            existing_item.target.metadata.get("manual_request_plan")
+            if existing_item is not None
+            and isinstance(existing_item.target.metadata.get("manual_request_plan"), dict)
+            else None
+        )
+        live_search = live_search_allowed_for_execution(
+            live_search,
+            manual_plan=existing_manual_plan,
+            request_text=live_search_constraint_text,
+        )
         live_sdk = _slack_work_item_live_sdk_enabled(default=live_search)
         orchestrator_preflight = run_orchestrator_preflight(
             "continue",
@@ -1528,14 +1537,17 @@ def _advance_work_item_for_intent(
         work_item=existing_work_item,
     )
     live_search = _slack_work_item_live_search_enabled()
-    if live_search and _request_forbids_live_research(request_text):
-        live_search = False
     live_sdk = _slack_work_item_live_sdk_enabled(default=live_search)
     orchestrator_preflight = run_orchestrator_preflight(
         request_text,
         requested_agent=resolved_route.value,
         live_manual_plan=live_sdk,
         database_url=database_url,
+    )
+    live_search = live_search_allowed_for_execution(
+        live_search,
+        manual_plan=orchestrator_preflight.manual_request_plan,
+        request_text=request_text,
     )
     manual_plan = {
         "source": "slack_business_agent_action",

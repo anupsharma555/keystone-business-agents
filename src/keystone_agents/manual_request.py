@@ -3,25 +3,34 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from keystone_agents.calendar_actions import is_calendar_action_candidate
+from keystone_agents.gmail_triage.relationship_query import (
+    extract_known_contact_entity,
+    looks_like_known_contact_relationship,
+)
 from keystone_agents.local_kni_evidence import looks_like_local_kni_evidence_lookup
 from keystone_agents.orchestrator.routing import (
     OPPORTUNITY_RE,
     OUTREACH_RE,
     looks_like_company,
     looks_like_email,
+    looks_like_gmail_collection_read,
     looks_like_resume_request,
     looks_like_send_side_effect,
     looks_like_thread_local_draft_request,
+    normalize_match_text,
     payload_text,
 )
 from keystone_agents.schemas.manual_request_plan import (
     AskShapePolicy,
     ManualExpectedArtifactType,
+    ManualProviderActionStep,
+    ManualProviderResultSetScope,
     ManualProviderSystem,
     ManualRequestIntent,
     ManualRequestPlan,
@@ -30,6 +39,7 @@ from keystone_agents.schemas.manual_request_plan import (
     ManualTaskObjective,
 )
 from keystone_agents.schemas.output_constraints import InterpretedOutputConstraints
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.zotero_research import (
     extract_zotero_article_query,
     extract_zotero_collection_hint,
@@ -40,6 +50,7 @@ from keystone_agents.zotero_research import (
 _AGENT_ALIASES: dict[str, ManualTargetAgent] = {
     "orchestrator": "orchestrator",
     "orchestrator agent": "orchestrator",
+    "business research": "business_research_analyst",
     "business research analyst": "business_research_analyst",
     "business agent analyst": "business_research_analyst",
     "research analyst": "business_research_analyst",
@@ -127,6 +138,15 @@ _MUTABLE_CONTEXT_AGENT_TARGETS: frozenset[ManualTargetAgent] = frozenset(
         "zotero_context_agent",
     }
 )
+_DIRECT_RESPONSE_TARGETS: frozenset[ManualTargetAgent] = frozenset(
+    {
+        "chief_of_staff",
+        "business_research_analyst",
+        "opportunity_scout",
+        "outreach_composer",
+        "gmail_triage",
+    }
+)
 _FINANCE_EXPENSE_RECEIPT_WRITE_RE = re.compile(
     r"\bairtable\b[\s\S]{0,240}\b(?:business|personal)\s+expenses?\b"
     r"|\b(?:business|personal)\s+expenses?\b[\s\S]{0,240}\bairtable\b",
@@ -136,6 +156,12 @@ _LOCAL_ARTIFACT_PATH_RE = re.compile(
     r"(?:~|/Users/|/private/|/tmp/)[^\s\"'<>]+?\.(?:pdf|png|jpe?g|webp|gif)",
     re.I,
 )
+_LOCAL_ATTACHMENT_CONTEXT_RE = re.compile(
+    r"\b(?:attachment|attached|diagram|image|pdf|receipt|screenshot|file|"
+    r"document|photo)\b",
+    re.I,
+)
+_SLACK_ATTACHMENT_PATH_MARKER = "operator-supplied slack attachment local path:"
 _COUNT_RE = re.compile(
     r"\b(?:compare|discover|find|return|list|top|show|identify|source)\s+"
     r"(?:how\s+)?"
@@ -414,31 +440,122 @@ def infer_manual_request_plan(
 
     text = payload_text(request)
     normalized_agent = normalize_manual_agent(requested_agent) or _direct_agent_prefix_agent(text)
+    internal_contact_lookup = _looks_like_internal_gmail_contact_lookup_request(text)
+    gmail_collection_read = looks_like_gmail_collection_read(text)
+    gmail_thread_local_draft = bool(
+        gmail_collection_read and looks_like_thread_local_draft_request(text)
+    )
     desired_count = _desired_count(text)
+    desired_count_explicit = _desired_count_is_domain_limit(text)
     target_agent = _semantic_target_agent(request, text, requested_agent=normalized_agent)
+    chief_context_workflow, chief_work_items_requested = (
+        _chief_multi_source_context_workflow(text)
+        if normalized_agent == "chief_of_staff" or target_agent == "chief_of_staff"
+        else ([], False)
+    )
+    chief_context_summary = bool(
+        (normalized_agent == "chief_of_staff" or target_agent == "chief_of_staff")
+        and (
+            len(chief_context_workflow) >= 2
+            or (chief_context_workflow and chief_work_items_requested)
+        )
+    )
+    opportunity_workflow = _natural_opportunity_to_outreach_workflow(text)
     workflow = (
-        _infer_goal_workflow(text)
+        chief_context_workflow
+        if chief_context_summary
+        else opportunity_workflow
+        if opportunity_workflow
+        else _infer_goal_workflow(text)
         if normalized_agent == "chief_of_staff" or target_agent == "chief_of_staff"
         else []
     )
-    if workflow:
+    if gmail_thread_local_draft:
+        target_agent = "gmail_triage"
+        workflow = ["gmail_triage", "outreach_composer"]
+    if workflow and normalized_agent == "chief_of_staff" and not gmail_thread_local_draft:
         desired_count = max(desired_count, len(workflow))
-    if workflow and normalized_agent == "chief_of_staff":
+    if workflow and normalized_agent == "chief_of_staff" and not gmail_thread_local_draft:
         target_agent = "chief_of_staff"
     inferred_target_type = _target_type(text, target_agent=target_agent)
     inferred_primary_target = (
-        _goal_workflow_primary_target(text)
+        "current operating context"
+        if chief_context_summary
+        else _opportunity_to_outreach_topic(text)
+        if opportunity_workflow
+        else _goal_workflow_primary_target(text)
         if workflow
         else _primary_target(text, target_agent=target_agent)
     )
     workflow_allowed = normalized_agent in {None, "orchestrator"}
     intent = (
-        "route_request"
+        "outreach_draft"
+        if gmail_thread_local_draft
+        else "context_lookup"
+        if chief_context_summary
+        else "opportunity_to_outreach_loop"
+        if opportunity_workflow
+        else "route_request"
         if workflow
         else _intent_for_target(target_agent, text, workflow_allowed=workflow_allowed)
     )
+    airtable_record_plan_requested = bool(
+        opportunity_workflow and "airtable_context_agent" in opportunity_workflow
+    )
+    provider_system = (
+        "airtable"
+        if airtable_record_plan_requested
+        else _provider_system_for_plan(
+            text,
+            target_agent=target_agent,
+            intent=intent,
+        )
+    )
+    zotero_context = bool(
+        provider_system == "zotero" or target_agent == "zotero_context_agent"
+    )
+    zotero_selection_rank = _provider_selection_rank(
+        text,
+        zotero_context=zotero_context,
+    )
+    zotero_selection_order = _provider_selection_order(
+        text,
+        zotero_context=zotero_context,
+    )
+    zotero_fields = _zotero_requested_fields(
+        text,
+        zotero_context=zotero_context,
+    )
     ask_shape = _ask_shape_policy(text)
-    if workflow and ask_shape.output_form == "draft":
+    if chief_context_summary:
+        source_by_route = {
+            "gmail_triage": "gmail",
+            "airtable_context_agent": "airtable",
+            "google_workspace_context_agent": "google_workspace",
+            "zotero_context_agent": "zotero",
+            "rss_context_agent": "rss",
+            "preprints_context_agent": "preprints",
+        }
+        required_context_sources = [
+            source_by_route[route]
+            for route in chief_context_workflow
+            if route in source_by_route
+        ]
+        if chief_work_items_requested:
+            required_context_sources.append("work_items")
+        ask_shape = ask_shape.model_copy(
+            update={
+                "source_type_preference": list(
+                    dict.fromkeys(
+                        [
+                            *ask_shape.source_type_preference,
+                            *required_context_sources,
+                        ]
+                    )
+                )
+            }
+        )
+    if workflow and ask_shape.output_form == "draft" and not gmail_thread_local_draft:
         # In a coordinated review, the draft is one intermediate deliverable.
         # The final operator response should summarize the ordered owner results.
         ask_shape = ask_shape.model_copy(update={"output_form": "bullets"})
@@ -450,22 +567,92 @@ def infer_manual_request_plan(
         intent=intent,
         primary_target=inferred_primary_target,
         target_type=(
-            "topic" if workflow and inferred_target_type == "unknown" else inferred_target_type
+            "business_system_context"
+            if chief_context_summary
+            else "zotero_article"
+            if zotero_selection_rank is not None
+            else "topic"
+            if workflow and inferred_target_type == "unknown"
+            else inferred_target_type
         ),
-        provider_system=_provider_system_for_plan(
+        provider_system=provider_system,
+        provider_operations=(
+            ["read"]
+            if gmail_thread_local_draft
+            or chief_context_summary
+            or zotero_selection_rank is not None
+            else []
+            if airtable_record_plan_requested
+            else _fallback_provider_operations(text, intent=intent)
+        ),
+        provider_read_scope=(
+            "bounded_collection"
+            if internal_contact_lookup
+            or gmail_collection_read
+            or zotero_selection_rank is not None
+            else "unspecified"
+        ),
+        provider_result_mode=(
+            "items"
+            if internal_contact_lookup
+            or gmail_collection_read
+            or zotero_selection_rank is not None
+            else "unspecified"
+        ),
+        provider_selection_order=zotero_selection_order,
+        provider_selection_rank=zotero_selection_rank,
+        gmail_mailbox_direction=(
+            "any"
+            if internal_contact_lookup
+            else "inbound"
+            if gmail_collection_read
+            else "unspecified"
+        ),
+        gmail_date_scope=_explicit_gmail_date_scope(
             text,
-            target_agent=target_agent,
-            intent=intent,
+            gmail_context=bool(
+                gmail_collection_read
+                or target_agent == "gmail_triage"
+                or normalized_agent == "gmail_triage"
+            ),
         ),
-        provider_operations=_fallback_provider_operations(text, intent=intent),
+        gmail_exclude_threads_with_operator_reply=(
+            _explicit_gmail_operator_reply_exclusion(
+                text,
+                gmail_context=bool(
+                    gmail_collection_read
+                    or target_agent == "gmail_triage"
+                    or normalized_agent == "gmail_triage"
+                    or "gmail_triage" in workflow
+                ),
+            )
+        ),
+        gmail_requested_fields=(
+            ["sender", "subject", "date", "snippet"]
+            if internal_contact_lookup
+            else []
+        ),
+        zotero_requested_fields=zotero_fields,
         objective=_objective(text, intent=intent),
         task_objective=(
-            "route_or_continue"
+            "outreach_draft"
+            if gmail_thread_local_draft
+            else "context_lookup"
+            if chief_context_summary
+            else "opportunity_discovery"
+            if opportunity_workflow
+            else "route_or_continue"
             if workflow
             else _task_objective(text, target_agent=target_agent, intent=intent)
         ),
         expected_artifact_type=(
-            "none"
+            "outreach_draft"
+            if gmail_thread_local_draft
+            else "context_summary"
+            if chief_context_summary
+            else "business_system_write_plan"
+            if airtable_record_plan_requested
+            else "none"
             if workflow
             else _expected_artifact_type(
                 text,
@@ -474,19 +661,38 @@ def infer_manual_request_plan(
             )
         ),
         desired_count=desired_count,
+        desired_count_explicit=desired_count_explicit,
         constraints=_constraints(text),
         ask_shape=ask_shape,
         required_entities=_required_entities(text),
         required_terms=_required_terms(text),
         gmail_query=_gmail_query(text) if intent == "gmail_triage" else "",
         lookback_days=_lookback_days(text) if intent == "gmail_triage" else None,
-        draft_policy=_draft_policy(text) if intent == "gmail_triage" else "",
+        draft_policy=(
+            _draft_policy(text)
+            if intent == "gmail_triage" or gmail_thread_local_draft
+            else ""
+        ),
         recipient=_recipient(text) if intent == "outreach_draft" else "",
-        outreach_channel=_outreach_channel(text) if intent == "outreach_draft" else "",
+        outreach_channel=(
+            "internal_slack"
+            if gmail_thread_local_draft
+            else _outreach_channel(text)
+            if intent == "outreach_draft"
+            else ""
+        ),
         tone=_tone(text) if intent == "outreach_draft" else "",
         requires_live_search=_requires_live_search_for_plan(text, target_agent=target_agent),
-        requires_approved_context=intent in {"outreach_draft", "blocked_send"},
-        requires_durable_state=bool(len(workflow) > 1 or looks_like_stateful_work_request(text)),
+        requires_approved_context=(
+            False
+            if gmail_thread_local_draft
+            else intent in {"outreach_draft", "blocked_send"}
+        ),
+        requires_durable_state=bool(
+            chief_work_items_requested
+            or len(workflow) > 1
+            or looks_like_stateful_work_request(text)
+        ),
         side_effect_policy=(
             "internal_write_approval_required"
             if intent == "business_system_write"
@@ -502,7 +708,153 @@ def infer_manual_request_plan(
         plan.planner_warnings.append(
             "Send request blocked; external send/write requests remain draft/read-only."
         )
-    return plan
+    return _apply_typed_provider_permission_ceiling(plan)
+
+
+def _explicit_gmail_date_scope(
+    text: str,
+    *,
+    gmail_context: bool,
+) -> str:
+    """Extract an exact mailbox-day override without granting Gmail authority."""
+
+    if not gmail_context:
+        return "unspecified"
+    normalized = " ".join(str(text or "").lower().split())
+    if re.search(r"\byesterday\b", normalized):
+        return "yesterday"
+    if re.search(r"\b(?:today|this\s+morning|this\s+afternoon)\b", normalized):
+        return "today"
+    return "unspecified"
+
+
+def _provider_selection_order(
+    text: str,
+    *,
+    zotero_context: bool,
+) -> str:
+    """Extract explicit Zotero provider ordering for deterministic fallback."""
+
+    if not zotero_context:
+        return "unspecified"
+    normalized = " ".join(str(text or "").lower().split())
+    if _provider_selection_rank(text, zotero_context=True) is not None:
+        return "latest"
+    if re.search(
+        r"\b(?:most\s+recent(?:ly)?|recently|newly|last)\s+added\b"
+        r"|\bnewest(?:\s+added)?(?:\s+(?:zotero|library))?\s+(?:item|article|record)\b"
+        r"|\b(?:latest|most\s+recent)\s+(?:item|article|record|paper)\b",
+        normalized,
+    ):
+        return "latest"
+    if re.search(
+        r"\b(?:least\s+recently|earliest|first|oldest)\s+added\b",
+        normalized,
+    ):
+        return "earliest"
+    if re.search(r"\bprovider\s+order\b", normalized):
+        return "provider_order"
+    return "unspecified"
+
+
+def _provider_selection_rank(
+    text: str,
+    *,
+    zotero_context: bool,
+) -> int | None:
+    """Extract a bounded ordinal within the typed Zotero provider order."""
+
+    if not zotero_context:
+        return None
+    normalized = " ".join(
+        str(text or "").lower().replace("\u2011", "-").replace("\u2013", "-").split()
+    )
+    if re.search(
+        r"\b(?:item|article|record|paper)\s+(?:immediately\s+)?before\s+"
+        r"(?:the\s+)?latest\b",
+        normalized,
+    ):
+        return 2
+    ordinal_values = {
+        "first": 1,
+        "second": 2,
+        "third": 3,
+        "fourth": 4,
+        "fifth": 5,
+        "sixth": 6,
+        "seventh": 7,
+        "eighth": 8,
+        "ninth": 9,
+        "tenth": 10,
+    }
+    match = re.search(
+        r"\b(?P<rank>first|second|third|fourth|fifth|sixth|seventh|eighth|"
+        r"ninth|tenth|(?:[1-9]|10)(?:st|nd|rd|th))[- ]+"
+        r"(?:most[- ]recent|newest|latest)\b",
+        normalized,
+    )
+    if match is None:
+        return None
+    rank_text = match.group("rank")
+    if rank_text in ordinal_values:
+        return ordinal_values[rank_text]
+    numeric = re.match(r"\d+", rank_text)
+    return int(numeric.group()) if numeric is not None else None
+
+
+def _zotero_requested_fields(
+    text: str,
+    *,
+    zotero_context: bool,
+) -> list[str]:
+    """Project explicit Zotero output fields into the typed fallback contract."""
+
+    if not zotero_context:
+        return []
+    normalized = " ".join(str(text or "").lower().split())
+    fields: list[str] = []
+    title_text = re.sub(r"\bpublication\s+title\b", "", normalized)
+    if re.search(r"\btitle\b", title_text):
+        fields.append("title")
+    if re.search(r"\bauthors?\b|\bcreators?\b", normalized):
+        fields.append("authors")
+    if re.search(r"\bpublication\s+title\b|\bjournal\s+title\b", normalized):
+        fields.append("publication_title")
+    if re.search(r"\babstract\b", normalized):
+        fields.append("abstract")
+    if re.search(r"\bmetadata\b", normalized):
+        fields.append("metadata")
+    if re.search(r"\b(?:children|child\s+items?|attachments?|notes?)\b", normalized):
+        fields.append("children")
+    if re.search(r"\b(?:full\s*text|pdf\s+text|read\s+the\s+pdf)\b", normalized):
+        fields.append("full_text")
+    return fields
+
+
+def _explicit_gmail_operator_reply_exclusion(
+    text: str,
+    *,
+    gmail_context: bool,
+) -> bool:
+    """Type an explicit current-turn exclusion without granting Gmail authority."""
+
+    if not gmail_context:
+        return False
+    normalized = " ".join(normalize_match_text(text).lower().split())
+    return bool(
+        re.search(
+            r"\b(?:if\s+)?(?:i(?:'ve)?|the\s+operator|user)\s+(?:have\s+)?"
+            r"(?:already\s+)?(?:repl(?:y|ied)|answer(?:ed)?)\b.{0,50}"
+            r"\b(?:do\s+not|don't|dont|skip|exclude|avoid|not)\b"
+            r"|"
+            r"\b(?:do\s+not|don't|dont|skip|exclude|avoid)\b.{0,50}"
+            r"\b(?:threads?|emails?|messages?|anything|anyone|any\s+one|"
+            r"any\s+of\s+them|one|those|them|it)\b.{0,50}"
+            r"\b(?:i(?:'ve)?|the\s+operator|user)\s+(?:have\s+)?(?:already\s+)?"
+            r"(?:repl(?:y|ied)|answer(?:ed)?)\b(?:\s+to\b)?",
+            normalized,
+        )
+    )
 
 
 def _fallback_provider_operations(
@@ -519,6 +871,10 @@ def _fallback_provider_operations(
 
     if intent not in {"business_system_write", "context_lookup", "gmail_triage"}:
         return []
+    if intent == "gmail_triage" and _looks_like_internal_gmail_contact_lookup_request(text):
+        return ["search", "read"]
+    if intent == "gmail_triage" and looks_like_gmail_collection_read(text):
+        return ["read"]
     positive_text = positive_capability_text(text).lower()
     patterns = {
         "read": r"\b(?:read|check|inspect|review|show|list|find|look\s+up)\b",
@@ -537,6 +893,58 @@ def _fallback_provider_operations(
     return [operation for _, operation in sorted(matched)]
 
 
+def _apply_typed_provider_permission_ceiling(
+    plan: ManualRequestPlan,
+) -> ManualRequestPlan:
+    """Prevent typed read-only/output policy from granting provider mutations.
+
+    Inline reply or draft text is a reader-facing artifact, not provider-create
+    authority. This ceiling is deliberately provider-agnostic for read-only
+    plans, with one Gmail-specific refinement for an explicit no-draft policy.
+    Executors still enforce their own mutation boundary independently.
+    """
+
+    retained_operations = list(plan.provider_operations)
+    if (
+        plan.ask_shape.permission_state == "read_only"
+        and plan.intent != "business_system_write"
+    ):
+        retained_operations = [
+            operation
+            for operation in retained_operations
+            if operation in {"read", "search", "verify"}
+        ]
+    if plan.provider_system == "gmail" and plan.draft_policy == "no_drafts_requested":
+        retained_operations = [
+            operation
+            for operation in retained_operations
+            if operation not in {"create", "update"}
+        ]
+    if retained_operations == plan.provider_operations:
+        return plan
+
+    retained_set = set(retained_operations)
+    return plan.model_copy(
+        update={
+            "provider_operations": retained_operations,
+            "provider_action_steps": [
+                step
+                for step in plan.provider_action_steps
+                if step.operation in retained_set
+            ],
+            "planner_warnings": list(
+                dict.fromkeys(
+                    [
+                        *plan.planner_warnings,
+                        "Removed provider mutations that exceeded the typed "
+                        "read-only or no-draft permission boundary.",
+                    ]
+                )
+            ),
+        }
+    )
+
+
 def _provider_system_for_plan(
     text: str,
     *,
@@ -545,6 +953,15 @@ def _provider_system_for_plan(
 ) -> ManualProviderSystem:
     """Record high-confidence provider ownership without granting tool authority."""
 
+    if target_agent == "gmail_triage" and _request_forbids_provider_access(
+        text,
+        provider="gmail",
+    ):
+        # A named specialist can still answer a bounded transformation from
+        # facts supplied in the current turn. Its organizational identity does
+        # not authorize Gmail access when the operator explicitly forbids tools
+        # or providers.
+        return "unspecified"
     provider_by_owner = {
         "gmail_triage": "gmail",
         "airtable_context_agent": "airtable",
@@ -564,6 +981,73 @@ def _provider_system_for_plan(
     if intent == "slack_operations":
         return "slack"
     return "unspecified"
+
+
+def _chief_multi_source_context_workflow(
+    text: str,
+) -> tuple[list[ManualTargetAgent], bool]:
+    """Compile explicitly named read sources for one Chief-owned synthesis.
+
+    This compatibility fallback recognizes provider/context identities only.
+    It does not infer a research owner from generic words such as ``review`` or
+    ``recommend``. The live planner still owns semantic interpretation; this
+    helper prevents clearly named context sources from being collapsed into an
+    unrelated specialist workflow before the Chief can consult them as tools.
+    """
+
+    current_turn = _without_reported_quoted_text(str(text or ""))
+    source_patterns: tuple[
+        tuple[ManualTargetAgent, str | None, re.Pattern[str]], ...
+    ] = (
+        (
+            "gmail_triage",
+            "gmail",
+            re.compile(r"\b(?:gmail|inbox|mailbox)\b", re.I),
+        ),
+        (
+            "airtable_context_agent",
+            "airtable",
+            re.compile(r"\bairtable\b", re.I),
+        ),
+        (
+            "google_workspace_context_agent",
+            "google_workspace",
+            re.compile(
+                r"\b(?:google\s+workspace|google\s+drive|google\s+docs?|"
+                r"google\s+sheets?|drive\s+folder)\b",
+                re.I,
+            ),
+        ),
+        (
+            "zotero_context_agent",
+            "zotero",
+            re.compile(r"\bzotero\b", re.I),
+        ),
+        (
+            "rss_context_agent",
+            None,
+            re.compile(r"\b(?:rss|feed\s+context|announcement\s+history)\b", re.I),
+        ),
+        (
+            "preprints_context_agent",
+            None,
+            re.compile(r"\bpreprints?\b", re.I),
+        ),
+    )
+    ordered: list[tuple[int, ManualTargetAgent]] = []
+    for route, provider, pattern in source_patterns:
+        if provider and _request_forbids_provider_access(text, provider=provider):
+            continue
+        match = pattern.search(current_turn)
+        if match is not None:
+            ordered.append((match.start(), route))
+    work_items_requested = bool(
+        re.search(r"\bwork\s*items?\b", current_turn, re.I)
+    )
+    if len(ordered) + int(work_items_requested) < 2:
+        return [], False
+    workflow = list(dict.fromkeys(route for _, route in sorted(ordered)))
+    return workflow, work_items_requested
 
 
 def _infer_goal_workflow(text: str) -> list[ManualTargetAgent]:
@@ -636,6 +1120,11 @@ def _infer_goal_workflow(text: str) -> list[ManualTargetAgent]:
     )
     ordered: list[tuple[int, ManualTargetAgent]] = []
     for route, pattern in patterns:
+        if route == "gmail_triage" and _request_forbids_provider_access(
+            text,
+            provider="gmail",
+        ):
+            continue
         match = pattern.search(cleaned)
         if match is not None:
             ordered.append((match.start(), route))
@@ -682,13 +1171,60 @@ def _requires_live_search_for_plan(text: str, *, target_agent: ManualTargetAgent
 def request_forbids_live_research(text: str) -> bool:
     """Return whether the operator explicitly bounded work away from live research."""
 
-    return bool(_NO_EXTERNAL_RESEARCH_RE.search(" ".join(str(text or "").split())))
+    source = _without_reported_quoted_text(text)
+    explicit_constraints = _explicit_negative_constraints(source)
+    if any(_negative_constraint_forbids_live_search(item) for item in explicit_constraints):
+        return True
+    normalized = " ".join(source.lower().split())
+    if re.search(
+        r"\b(?:live\s+(?:web\s+)?search|web\s+search|external\s+(?:search|research)|"
+        r"browser\s+automation)\b[^.;\n]{0,80}\b"
+        r"(?:not\s+approved|not\s+allowed|not\s+permitted|disabled|off-limits)\b",
+        normalized,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:use|using|based)\s+only(?:\s+on)?\b"
+            r"[^.;\n]{0,160}\b"
+            r"(?:context|note|packet|materials?|facts?|(?:selected\s+)?thread|email)\b",
+            " ".join(source.split()),
+            re.I,
+        )
+    )
+
+
+def live_search_allowed_for_execution(
+    enabled: bool,
+    *,
+    manual_plan: object | None,
+    request_text: str,
+) -> bool:
+    """Resolve search intent once without letting prose override a canonical plan.
+
+    The runtime flag controls whether live search is available. A canonical
+    Orchestrator plan controls whether this task requests it. Raw wording is
+    consulted only for planner-unavailable and compatibility execution.
+    """
+
+    if not enabled:
+        return False
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if authority.canonical and authority.field_supplied("requires_live_search"):
+        assert authority.plan is not None
+        return authority.plan.requires_live_search
+    if authority.invalid:
+        return False
+    return not request_forbids_live_research(request_text)
 
 
 def _ask_shape_policy(text: str) -> AskShapePolicy:
     """Extract only explicit cross-cutting request constraints."""
 
     lower = " ".join(str(text or "").lower().split())
+    positive_lower = " ".join(positive_capability_text(text).lower().split())
+    output_constraints = _interpreted_output_constraints(text)
+    local_attachment_context = has_explicit_local_attachment_context(text)
     exact = bool(
         re.search(
             r"\b(exact(?:ly)?|exact matches? only|no adjacent|no padding|do not broaden|"
@@ -706,6 +1242,7 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
         )
         or _has_supplied_context_boundary(lower)
         or _looks_like_inline_fact_packet_synthesis(text)
+        or local_attachment_context
     )
     source_types = [
         label
@@ -725,39 +1262,41 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
         )
         if phrase in lower
     ]
+    if local_attachment_context:
+        source_types.append("local_attachment")
+    source_types = list(dict.fromkeys(source_types))
     read_only = bool(
         re.search(
-            r"\b(read[- ]only|do not (?:add|insert|send|post|create|remove|modify|change|write|publish)|"
-            r"without (?:adding|inserting|sending|posting|creating|removing|modifying|changing|writing|publishing))\b",
+            r"\b(read[- ]only|(?:do\s+not|don't|dont|never) "
+            r"(?:add|insert|send|post|create|remove|modify|change|write|publish|"
+            r"draft|label|archive)|"
+            r"without (?:adding|inserting|sending|posting|creating|removing|modifying|"
+            r"changing|writing|publishing|drafting|labeling|archiving))\b",
             lower,
         )
         or re.search(
-            r"\bdo not [^.]{0,80}\b(?:add|insert|send|post|create|remove|modify|change|write|publish)\b",
+            r"\b(?:do\s+not|don't|dont|never) [^.]{0,80}\b"
+            r"(?:add|insert|send|post|create|remove|modify|change|write|publish|"
+            r"draft|label|archive)\b",
             lower,
         )
         or bool(re.search(r"\b(?:make|perform) no changes?\b|\bno changes?\b", lower))
     )
     draft_requested = bool(
-        re.search(r"\b(draft|prepare (?:a )?reply|reply copy)\b", lower)
-        and not re.search(r"\bdo not [^.]{0,40}\bdraft\b", lower)
+        re.search(r"\b(draft|prepare (?:a )?reply|reply copy)\b", positive_lower)
     )
     approval_required = bool(
         re.search(r"\b(?:after|before|pending|requires?) (?:human )?approval\b", lower)
         or "only after approval" in lower
-    )
-    requested_word_limit = re.search(
-        r"\b(?:no\s+more\s+than|at\s+most|under|within|max(?:imum)?|"
-        r"in|exactly)\s+([1-9]\d{0,2})\s+words?\b",
-        lower,
     )
     stop_condition = ""
     if exact and re.search(r"\b(zero .* if .*none|do not broaden|no adjacent|no padding)\b", lower):
         stop_condition = "return_zero_without_broadening_if_no_exact_match"
     elif approval_required:
         stop_condition = "stop_before_external_action_until_approval"
-    elif requested_word_limit:
-        stop_condition = f"stop_after_{requested_word_limit.group(1)}_word_summary"
-    elif exact and re.search(r"\b(?:sentence|sentences)\b", lower):
+    elif output_constraints.word_count is not None:
+        stop_condition = f"stop_after_{output_constraints.word_count}_word_summary"
+    elif output_constraints.sentence_count is not None:
         stop_condition = "stop_after_exact_requested_sentence_count"
     elif "stop after" in lower:
         stop_condition = "honor_explicit_stop_after_boundary"
@@ -790,7 +1329,9 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
             else "unspecified"
         ),
         output_form=(
-            "table"
+            "brief"
+            if output_constraints.sentence_count is not None
+            else "table"
             if re.search(r"\btable\b", lower)
             else "bullets"
             if re.search(r"\b(?:bullets?|bulleted|talking\s+points?)\b", lower)
@@ -822,6 +1363,7 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
             if read_only
             else "unspecified"
         ),
+        audience_scope=_explicit_audience_scope(lower),
         cost_mode=(
             "minimize"
             if re.search(r"\b(low[- ]cost|minimi[sz]e cost|quick|cheap)\b", lower)
@@ -830,7 +1372,7 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
             else "unspecified"
         ),
         stop_condition=stop_condition,
-        output_constraints=_interpreted_output_constraints(text),
+        output_constraints=output_constraints,
     )
 
 
@@ -849,54 +1391,167 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         r"(?P<count>[1-9]\d{0,3})\s+words?\b",
         lower,
     )
-    sentence_match = re.search(
-        r"\b(?P<mode>exactly|no\s+more\s+than|at\s+most|under|within|"
-        r"max(?:imum)?(?:\s+of)?|minimum(?:\s+of)?|at\s+least)\s+"
-        r"(?P<count>[1-9]\d?)\s+sentences?\b",
-        lower,
+    sentence_mode_matches = list(
+        re.finditer(
+            r"\b(?P<mode>exactly|no\s+more\s+than|at\s+most|under|within|"
+            r"max(?:imum)?(?:\s+of)?|minimum(?:\s+of)?|at\s+least)\s+"
+            r"(?P<count>[1-9]\d?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+            r"(?:concise\s+|short\s+|brief\s+){0,2}sentences?\b",
+            lower,
+        )
     )
+    sentence_exact_matches = list(
+        re.finditer(
+            r"\b(?P<count>[1-9]\d?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+            r"(?:concise\s+|short\s+|brief\s+|internal\s+|slack\s+|team\s+){0,4}"
+            r"sentences?\b",
+            lower,
+        )
+    )
+
+    def count_match_has_response_shape_authority(match: re.Match[str] | None) -> bool:
+        """Require a grammatical link between a count and the requested response.
+
+        Counts reported inside source material, policies, titles, or examples are
+        task content. They must not become a validator for the agent's answer.
+        """
+
+        if match is None:
+            return False
+        prefix = lower[max(0, match.start() - 100) : match.start()]
+        suffix = lower[match.end() : match.end() + 100]
+        if re.match(
+            r"\s+(?:above\b|into\b|to\s+(?:become|write|create|make|produce|"
+            r"form|draft|summari[sz]e)\b)",
+            suffix,
+        ):
+            return False
+        if re.match(
+            r"\s+(?:are|is|was|were|may|must|can|could|should|would)\b",
+            suffix,
+        ):
+            return False
+        request_verb = (
+            r"(?:answer|respond|reply|return|give(?:\s+me)?|provide|write|"
+            r"summari[sz]e|explain|describe|keep|limit|shorten|condense|"
+            r"turn|convert|reformat|combine)"
+        )
+        prefix_clause = re.split(r"[.;:!?\n]", prefix)[-1]
+        if re.search(rf"\b{request_verb}\b[^.;:!?\n]{{0,45}}$", prefix_clause):
+            return True
+        if re.match(r"\s+only\b", suffix):
+            return True
+        return bool(
+            re.match(
+                rf"\s*[,;:\-]?\s*{request_verb}\b",
+                suffix,
+            )
+        )
+
+    word_match = word_match if count_match_has_response_shape_authority(word_match) else None
+    grounded_sentence_mode_matches = [
+        match for match in sentence_mode_matches if count_match_has_response_shape_authority(match)
+    ]
+    grounded_sentence_exact_matches = [
+        match for match in sentence_exact_matches if count_match_has_response_shape_authority(match)
+    ]
+
+    def parsed_count(match: re.Match[str]) -> int | None:
+        raw = match.group("count").lower()
+        return int(raw) if raw.isdigit() else _COUNT_WORDS.get(raw)
+
+    grounded_sentence_counts = {
+        count
+        for count in (
+            parsed_count(match)
+            for match in [
+                *grounded_sentence_mode_matches,
+                *grounded_sentence_exact_matches,
+            ]
+        )
+        if count is not None
+    }
+    # Two different current-turn sentence counts are ambiguous. Keep them as
+    # planner-visible prose, but do not turn either into a blocker-grade rule.
+    sentence_mode_match = (
+        grounded_sentence_mode_matches[0]
+        if len(grounded_sentence_counts) == 1 and grounded_sentence_mode_matches
+        else None
+    )
+    sentence_exact_match = (
+        grounded_sentence_exact_matches[0]
+        if len(grounded_sentence_counts) == 1 and grounded_sentence_exact_matches
+        else None
+    )
+    sentence_match = sentence_mode_match or sentence_exact_match
+
     item_range = re.search(
         r"\b(?P<minimum>[1-9]\d?)\s*[-\u2013]\s*(?P<maximum>[1-9]\d?)\s+"
         r"(?:bullets?|items?|results?|options?|recommendations?)\b",
         lower,
     )
-    item_exact = re.search(
-        r"\b(?:exactly\s+)?"
-        r"(?P<count>[1-9]\d?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
-        r"(?:[a-z][\w-]*\s+){0,2}"
-        r"(?P<item_kind>bullets?|items?|results?|options?|recommendations?|"
-        r"points?|talking\s+points?)\b",
-        lower,
+    item_range = item_range if count_match_has_response_shape_authority(item_range) else None
+    item_exact_matches = list(
+        re.finditer(
+            r"\b(?:exactly\s+)?"
+            r"(?P<count>[1-9]\d?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+            r"(?:[a-z][\w-]*\s+){0,2}"
+            r"(?P<item_kind>bullets?|items?|results?|options?|recommendations?|"
+            r"points?|talking\s+points?)\b",
+            lower,
+        )
     )
 
     def item_match_has_response_shape_authority(match: re.Match[str]) -> bool:
         """Reject task-local singular choices as whole-response cardinality.
 
-        Multi-item requests are strong response-shape evidence. A singular
-        phrase needs an explicit cardinality marker or response-format verb;
-        otherwise wording such as "make one useful point" remains content for
-        the language model to interpret.
+        A counted phrase is authoritative only when its grammar describes the
+        response. References such as "turn those two bullets into one sentence"
+        describe source material and must not become a two-item validator.
         """
 
-        raw_count = match.group("count").lower()
-        parsed_count = int(raw_count) if raw_count.isdigit() else _COUNT_WORDS.get(raw_count)
-        if parsed_count != 1:
-            return True
+        suffix = lower[match.end() : match.end() + 80]
+        if re.match(r"\s+(?:above\b|into\b|to\s+become\b)", suffix):
+            return False
         matched_text = match.group(0)
-        if matched_text.startswith("exactly "):
+        prefix = lower[max(0, match.start() - 120) : match.start()]
+        source_reference = re.search(
+            r"\b(?:these|those|existing|previous|prior)\s*$",
+            prefix,
+        )
+        if source_reference and not re.search(
+            r"\b(?:return|keep|preserve|repeat)\b[^.;:!?\n]{0,45}$",
+            prefix,
+        ):
+            return False
+        if matched_text.startswith("exactly ") and not source_reference:
             return True
-        prefix = lower[max(0, match.start() - 80) : match.start()]
         response_shape_verb = re.search(
             r"\b(?:return|give(?:\s+me)?|list|provide|include|show|write|"
-            r"respond\s+with|reply\s+with|format(?:\s+\w+){0,3}\s+as|"
-            r"turn(?:\s+\w+){0,5}\s+into)\s*$",
+            r"respond\s+with|reply\s+with|keep|preserve|repeat|"
+            r"format(?:\s+\w+){0,3}\s+as|turn(?:\s+\w+){0,5}\s+into)\s+"
+            r"(?:only\s+|exact\s+|exactly\s+|the\s+|same\s+){0,3}$",
+            prefix,
+        )
+        response_shape_preposition = re.search(
+            r"\b(?:in|as|into)\s+(?:only\s+|exactly\s+){0,2}$",
             prefix,
         )
         trailing_only = re.match(r"\s+only\b", lower[match.end() :])
-        return bool(response_shape_verb or trailing_only)
+        return bool(response_shape_verb or response_shape_preposition or trailing_only)
 
+    grounded_item_exact_matches = [
+        match for match in item_exact_matches if item_match_has_response_shape_authority(match)
+    ]
+    grounded_item_counts = {
+        count
+        for count in (parsed_count(match) for match in grounded_item_exact_matches)
+        if count is not None
+    }
     authoritative_item_exact = (
-        item_exact if item_exact and item_match_has_response_shape_authority(item_exact) else None
+        grounded_item_exact_matches[0]
+        if len(grounded_item_counts) == 1 and grounded_item_exact_matches
+        else None
     )
 
     def count_mode(label: str) -> str:
@@ -932,7 +1587,14 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
     )
 
     word_count = int(word_match.group("count")) if word_match else None
-    sentence_count = int(sentence_match.group("count")) if sentence_match else None
+    sentence_count = None
+    if sentence_match:
+        raw_sentence_count = sentence_match.group("count").lower()
+        sentence_count = (
+            int(raw_sentence_count)
+            if raw_sentence_count.isdigit()
+            else _COUNT_WORDS.get(raw_sentence_count)
+        )
     minimum_items = int(item_range.group("minimum")) if item_range else None
     maximum_items = int(item_range.group("maximum")) if item_range else None
     if authoritative_item_exact and not item_range:
@@ -971,7 +1633,8 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         )
     if sentence_match:
         interpretation_parts.append(
-            f"{count_mode(sentence_match.group('mode'))} {sentence_count}-sentence answer"
+            f"{count_mode(sentence_mode_match.group('mode')) if sentence_mode_match else 'exact'} "
+            f"{sentence_count}-sentence answer"
         )
     if minimum_items is not None or maximum_items is not None:
         interpretation_parts.append(
@@ -986,7 +1649,11 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         word_count_mode=count_mode(word_match.group("mode")) if word_match else "unspecified",
         word_count=word_count,
         sentence_count_mode=(
-            count_mode(sentence_match.group("mode")) if sentence_match else "unspecified"
+            count_mode(sentence_mode_match.group("mode"))
+            if sentence_mode_match
+            else "exact"
+            if sentence_exact_match
+            else "unspecified"
         ),
         sentence_count=sentence_count,
         item_count_mode=(
@@ -1010,29 +1677,51 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
     )
 
 
-def _merge_ask_shape_policy(
+def _reconcile_current_turn_ask_shape(
     base: AskShapePolicy,
     candidate: AskShapePolicy,
     *,
     prefer_candidate_output_constraints: bool = False,
     request_text: str = "",
 ) -> AskShapePolicy:
-    """Preserve explicit local constraints while accepting nonconflicting additions."""
+    """Build one canonical output contract from the authoritative current turn.
+
+    Semantic planning may add interpretation and style. Only hard requirements
+    grounded by the current-turn parser can reach deterministic validators; prior
+    thread shapes and planner-only counts remain advisory.
+    """
 
     resolved_candidate = AskShapePolicy.model_validate(candidate)
     values = resolved_candidate.model_dump(mode="json")
-    for field_name in (
-        "ask_breadth",
-        "evidence_depth",
-        "strict_filter_mode",
-        "output_form",
-        "prior_context_dependency",
-        "permission_state",
-        "cost_mode",
-    ):
+    preserved_fields = (
+        (
+            "strict_filter_mode",
+            "output_form",
+        )
+        if prefer_candidate_output_constraints
+        else (
+            "ask_breadth",
+            "evidence_depth",
+            "strict_filter_mode",
+            "output_form",
+            "prior_context_dependency",
+            "permission_state",
+            "audience_scope",
+            "cost_mode",
+        )
+    )
+    for field_name in preserved_fields:
         base_value = getattr(base, field_name)
         if base_value != "unspecified":
             values[field_name] = base_value
+    # A plainly stated internal/external audience belongs to the authoritative
+    # current turn even when the LLM owns the rest of semantic interpretation.
+    # This field may relax an external-drafting prerequisite, but it cannot
+    # grant a provider action.
+    if base.audience_scope != "unspecified":
+        values["audience_scope"] = base.audience_scope
+    if prefer_candidate_output_constraints and base.permission_state == "approval_required":
+        values["permission_state"] = "approval_required"
     values["source_type_preference"] = list(
         dict.fromkeys([*base.source_type_preference, *resolved_candidate.source_type_preference])
     )
@@ -1102,6 +1791,31 @@ def _merge_ask_shape_policy(
     elif base_constraints.is_explicit():
         values["output_constraints"] = base_constraints.model_dump(mode="json")
     return AskShapePolicy.model_validate(values)
+
+
+def _planner_hard_output_contract_differs(
+    grounded: InterpretedOutputConstraints,
+    candidate: InterpretedOutputConstraints,
+) -> bool:
+    """Report planner hard fields that cannot become current-turn authority."""
+
+    count_fields = (
+        "word_count",
+        "sentence_count",
+        "minimum_items",
+        "maximum_items",
+    )
+    if any(
+        getattr(candidate, field_name) is not None
+        and getattr(candidate, field_name) != getattr(grounded, field_name)
+        for field_name in count_fields
+    ):
+        return True
+    return bool(
+        set(candidate.forbidden_phrases) - set(grounded.forbidden_phrases)
+        or (candidate.forbid_em_dash and not grounded.forbid_em_dash)
+        or (candidate.include_source_urls and not grounded.include_source_urls)
+    )
 
 
 _SECTION_GROUNDING_STOPWORDS = frozenset(
@@ -1244,6 +1958,13 @@ def merge_manual_request_plan(
         plan = _repair_structurally_invalid_llm_plan(base, plan)
         plan = _prune_forbidden_llm_capabilities(base, plan)
     candidate_values = plan.model_dump(mode="json")
+    if base.requested_agent not in {None, ""}:
+        # ``requested_agent`` records the human entry surface. The semantic
+        # planner may select a better execution owner in ``target_agent``, but
+        # it must not rewrite which named agent the operator addressed. Keeping
+        # these fields distinct also lets later review explain a delegation
+        # without treating it as a new user instruction.
+        candidate_values["requested_agent"] = base.requested_agent
     if (
         not llm_interpretation
         and candidate_values.get("provider_system") == "unspecified"
@@ -1251,12 +1972,81 @@ def merge_manual_request_plan(
     ):
         candidate_values["provider_system"] = base.provider_system
     merged = base.model_copy(update=candidate_values)
-    merged.ask_shape = _merge_ask_shape_policy(
+    merged.provider_action_steps = [
+        (
+            step
+            if isinstance(step, ManualProviderActionStep)
+            else ManualProviderActionStep.model_validate(step)
+        )
+        for step in merged.provider_action_steps
+    ]
+    if (
+        llm_interpretation
+        and base.provider_system == "zotero"
+        and merged.provider_system == "zotero"
+    ):
+        if base.provider_selection_order != "unspecified":
+            merged.provider_selection_order = base.provider_selection_order
+        if base.provider_selection_rank is not None:
+            merged.provider_selection_rank = base.provider_selection_rank
+        if base.zotero_requested_fields:
+            if base.ask_shape.strict_filter_mode in {"exact", "strict"}:
+                merged.zotero_requested_fields = list(base.zotero_requested_fields)
+            else:
+                merged.zotero_requested_fields = list(
+                    dict.fromkeys(
+                        [
+                            *merged.zotero_requested_fields,
+                            *base.zotero_requested_fields,
+                        ]
+                    )
+                )
+    planner_contract_reconciled = bool(
+        llm_interpretation
+        and _planner_hard_output_contract_differs(
+            base.ask_shape.output_constraints,
+            plan.ask_shape.output_constraints,
+        )
+    )
+    merged.ask_shape = _reconcile_current_turn_ask_shape(
         base.ask_shape,
         plan.ask_shape,
         prefer_candidate_output_constraints=plan.source == "llm",
         request_text=base.objective,
     )
+    bounded_local_attachment_response = bool(
+        has_explicit_local_attachment_context(base.objective)
+        and _looks_like_supplied_context_synthesis_request(base.objective)
+        and not looks_like_stateful_work_request(base.objective)
+        and not provider_tool_action_bound(base.objective)
+        and merged.target_agent in _DIRECT_RESPONSE_TARGETS
+        and not merged.workflow
+    )
+    if bounded_local_attachment_response and (
+        merged.provider_system != "unspecified" or merged.provider_operations
+    ):
+        merged.provider_system = "unspecified"
+        merged.provider_operations = []
+        merged.provider_action_steps = []
+        merged.planner_warnings = list(
+            dict.fromkeys(
+                [
+                    *merged.planner_warnings,
+                    "Ignored an unrequested provider read because the selected local "
+                    "attachment already supplies the bounded evidence.",
+                ]
+            )
+        )
+    if planner_contract_reconciled:
+        merged.planner_warnings = list(
+            dict.fromkeys(
+                [
+                    *merged.planner_warnings,
+                    "Reconciled planner hard-output fields to the constraints grounded "
+                    "in the authoritative current turn; ungrounded counts remain advisory.",
+                ]
+            )
+        )
     if not merged.requested_agent:
         merged.requested_agent = base.requested_agent
     if not merged.primary_target:
@@ -1274,10 +2064,26 @@ def merge_manual_request_plan(
             dict.fromkeys([*base.required_entities, *merged.required_entities])
         )
         merged.required_terms = list(dict.fromkeys([*base.required_terms, *merged.required_terms]))
-    # A live LLM plan owns mailbox meaning and scope. The fallback parser may
-    # populate these fields only when no LLM interpretation exists. Preserve
-    # the explicit no-provider-draft boundary as a safety constraint even when
-    # a model candidate accidentally proposes drafts.
+    # A live LLM plan normally owns mailbox meaning and scope. The fallback
+    # parser may populate these fields only when no LLM interpretation exists.
+    #
+    # Known-relationship contact recovery is a narrower contract: once both
+    # layers agree that the current request is a Gmail contact lookup, the
+    # distinctive organization/account term and any explicit date boundary
+    # can be extracted exactly from the authoritative current turn. Preserve
+    # those bounded fields so an LLM cannot accidentally turn ``"Acme
+    # Compute"`` into Gmail's cumulative ``Acme Compute startup account
+    # setup`` query or invent an unrequested mailbox direction/date filter.
+    # This reconciles provider query shape; it does not choose the semantic
+    # route when the planner selected a different task.
+    bounded_known_contact_lookup = bool(
+        llm_interpretation
+        and base.task_objective == "contact_discovery"
+        and merged.task_objective == "contact_discovery"
+        and base.provider_system == "gmail"
+        and merged.provider_system == "gmail"
+        and base.gmail_query
+    )
     if not llm_interpretation:
         if base.gmail_query:
             merged.gmail_query = base.gmail_query
@@ -1285,17 +2091,77 @@ def merge_manual_request_plan(
             merged.lookback_days = base.lookback_days
         if base.draft_policy:
             merged.draft_policy = base.draft_policy
+    elif bounded_known_contact_lookup:
+        merged.primary_target = base.primary_target
+        merged.provider_read_scope = base.provider_read_scope
+        merged.provider_result_mode = base.provider_result_mode
+        merged.gmail_mailbox_direction = base.gmail_mailbox_direction
+        merged.gmail_date_scope = base.gmail_date_scope
+        merged.gmail_requested_fields = list(base.gmail_requested_fields)
+        merged.gmail_query = base.gmail_query
+        merged.lookback_days = base.lookback_days
+        if base.draft_policy == "no_drafts_requested":
+            merged.draft_policy = "no_drafts_requested"
+            if merged.ask_shape.output_form == "draft":
+                merged.ask_shape = merged.ask_shape.model_copy(
+                    update={"output_form": base.ask_shape.output_form}
+                )
+            merged.provider_operations = [
+                operation
+                for operation in merged.provider_operations
+                if operation not in {"create", "update"}
+            ]
+            merged.provider_action_steps = [
+                step
+                for step in merged.provider_action_steps
+                if step.operation not in {"create", "update"}
+            ]
+        merged.planner_warnings = list(
+            dict.fromkeys(
+                [
+                    *merged.planner_warnings,
+                    "Reconciled the known-contact Gmail query to the distinctive "
+                    "organization/account term and explicit time scope in the "
+                    "authoritative current turn.",
+                ]
+            )
+        )
     elif base.draft_policy == "no_drafts_requested" and (
         merged.provider_system == "gmail"
         or merged.target_agent == "gmail_triage"
         or merged.intent == "gmail_triage"
     ):
         merged.draft_policy = "no_drafts_requested"
+        if merged.ask_shape.output_form == "draft":
+            merged.ask_shape = merged.ask_shape.model_copy(
+                update={"output_form": base.ask_shape.output_form}
+            )
         merged.provider_operations = [
             operation
             for operation in merged.provider_operations
             if operation not in {"create", "update"}
         ]
+        merged.provider_action_steps = [
+            step
+            for step in merged.provider_action_steps
+            if step.operation not in {"create", "update"}
+        ]
+    if (
+        llm_interpretation
+        and base.gmail_date_scope != "unspecified"
+        and (
+            merged.provider_system == "gmail"
+            or merged.target_agent == "gmail_triage"
+            or "gmail_triage" in merged.workflow
+        )
+    ):
+        merged.gmail_date_scope = base.gmail_date_scope
+    if base.gmail_exclude_threads_with_operator_reply and (
+        merged.provider_system == "gmail"
+        or merged.target_agent == "gmail_triage"
+        or "gmail_triage" in merged.workflow
+    ):
+        merged.gmail_exclude_threads_with_operator_reply = True
     if not merged.recipient:
         merged.recipient = base.recipient
     if not merged.outreach_channel:
@@ -1304,6 +2170,12 @@ def merge_manual_request_plan(
         merged.tone = base.tone
     base_workflow = list(base.workflow)
     candidate_workflow = list(merged.workflow)
+    bounded_chief_multi_source_context = (
+        _bounded_chief_multi_source_context_obligation(base)
+    )
+    bounded_provider_to_internal_draft = (
+        _bounded_provider_to_internal_draft_obligation(base)
+    )
     supplied_context_chief_resolution = bool(
         not llm_interpretation and _candidate_resolves_supplied_context_with_chief(base, plan)
     )
@@ -1321,7 +2193,69 @@ def merge_manual_request_plan(
                 ]
             )
         )
-    if not llm_interpretation and base_workflow and not supplied_context_chief_resolution:
+    if bounded_chief_multi_source_context:
+        # Explicitly named read sources and open WorkItem state are measurable
+        # current-turn deliverables. The LLM still interprets and synthesizes
+        # evidence within each admitted stage, but a single-provider plan
+        # cannot erase the other sources or replace the Chief as manager.
+        merged.target_agent = base.target_agent
+        merged.workflow = base_workflow
+        merged.intent = base.intent
+        merged.primary_target = base.primary_target
+        merged.target_type = base.target_type
+        merged.provider_system = base.provider_system
+        merged.provider_operations = list(base.provider_operations)
+        merged.provider_action_steps = list(base.provider_action_steps)
+        merged.provider_read_scope = base.provider_read_scope
+        merged.provider_result_mode = base.provider_result_mode
+        merged.gmail_mailbox_direction = base.gmail_mailbox_direction
+        merged.gmail_date_scope = base.gmail_date_scope
+        merged.gmail_requested_fields = list(base.gmail_requested_fields)
+        merged.task_objective = base.task_objective
+        merged.expected_artifact_type = base.expected_artifact_type
+        merged.requires_durable_state = True
+        merged.requires_approved_context = base.requires_approved_context
+        merged.planner_warnings = list(
+            dict.fromkeys(
+                [
+                    *merged.planner_warnings,
+                    "Preserved the current turn's Chief-owned multi-source read "
+                    "contract after the planner collapsed it to one provider.",
+                ]
+            )
+        )
+    elif bounded_provider_to_internal_draft:
+        # The current turn explicitly asks for both a bounded provider read and
+        # an internal draft artifact. The LLM still owns semantic selection
+        # within those stages, but it cannot silently erase either deliverable
+        # and strand execution at a direct-draft context gate.
+        merged.target_agent = base.target_agent
+        merged.workflow = base_workflow
+        merged.intent = base.intent
+        merged.task_objective = base.task_objective
+        merged.expected_artifact_type = base.expected_artifact_type
+        merged.provider_system = base.provider_system
+        merged.provider_operations = list(base.provider_operations)
+        merged.provider_read_scope = base.provider_read_scope
+        merged.provider_result_mode = base.provider_result_mode
+        merged.gmail_mailbox_direction = base.gmail_mailbox_direction
+        merged.gmail_date_scope = base.gmail_date_scope
+        merged.outreach_channel = base.outreach_channel
+        merged.recipient = base.recipient
+        merged.requires_approved_context = base.requires_approved_context
+        merged.missing_required_information = list(
+            base.missing_required_information
+        )
+        merged.planner_warnings = list(
+            dict.fromkeys(
+                [
+                    *merged.planner_warnings,
+                    "Preserved the current turn's bounded provider-read and internal-draft "
+                    "deliverables after the planner omitted one execution stage.",
+                ]
+            )
+        )
+    elif not llm_interpretation and base_workflow and not supplied_context_chief_resolution:
         # The local workflow inference is a bounded completeness check over
         # explicit deliverables in the raw request. The live planner enriches
         # the plan, but it must not silently drop a requested downstream owner
@@ -1331,27 +2265,201 @@ def merge_manual_request_plan(
         merged.workflow = candidate_workflow if len(candidate_workflow) > 1 else []
     if len(merged.workflow) > 1:
         merged.requires_durable_state = True
-    if not llm_interpretation and base.desired_count != 1:
+    if base.desired_count_explicit:
         merged.desired_count = base.desired_count
+        merged.desired_count_explicit = True
     merged.desired_count = max(1, min(10, merged.desired_count or base.desired_count))
+    merged.side_effect_policy = (
+        "internal_write_approval_required"
+        if merged.intent == "business_system_write"
+        else "draft_or_read_only"
+    )
     if is_internal_slack_composition_plan(merged):
         # Internal copy is a draft artifact returned to the operator, not an
         # external outreach action. The selected facts are already the bounded
         # context, so external-claim approval must not become an execution
         # prerequisite.
         merged.requires_approved_context = False
+        if merged.provider_system == "slack" and not merged.provider_operations:
+            # A planner may describe the intended response surface as Slack.
+            # Without a typed Slack operation, that is an audience description,
+            # not provider authority.
+            merged.provider_system = "unspecified"
     elif merged.target_agent == "outreach_composer" or (
         not llm_interpretation and base.target_agent == "outreach_composer"
     ):
         merged.requires_approved_context = True
     elif supplied_context_chief_resolution:
         merged.requires_approved_context = False
-    merged.side_effect_policy = (
-        "internal_write_approval_required"
-        if merged.intent == "business_system_write"
-        else "draft_or_read_only"
+    return _apply_typed_provider_permission_ceiling(merged)
+
+
+def _bounded_chief_multi_source_context_obligation(
+    plan: ManualRequestPlan,
+) -> bool:
+    """Recognize a typed Chief synthesis that must retain every read source."""
+
+    read_operations = set(plan.provider_operations)
+    return bool(
+        plan.requested_agent == "chief_of_staff"
+        and plan.target_agent == "chief_of_staff"
+        and plan.intent == "context_lookup"
+        and plan.task_objective == "context_lookup"
+        and plan.expected_artifact_type == "context_summary"
+        and plan.target_type == "business_system_context"
+        and plan.ask_shape.permission_state == "read_only"
+        and read_operations
+        and read_operations <= {"read", "search", "verify"}
+        and (
+            len(plan.workflow) >= 2
+            or (len(plan.workflow) == 1 and plan.requires_durable_state)
+        )
     )
-    return merged
+
+
+def _bounded_provider_to_internal_draft_obligation(
+    plan: ManualRequestPlan,
+) -> bool:
+    """Recognize a complete read-then-draft contract from typed current-turn fields."""
+
+    operations = set(plan.provider_operations)
+    return bool(
+        len(plan.workflow) > 1
+        and plan.requires_durable_state
+        and plan.provider_system != "unspecified"
+        and operations
+        and operations <= {"read", "search", "verify"}
+        and bool(operations & {"read", "search"})
+        and plan.provider_read_scope == "bounded_collection"
+        and plan.provider_result_mode == "items"
+        and plan.expected_artifact_type == "outreach_draft"
+        and plan.task_objective == "outreach_draft"
+        and plan.ask_shape.output_form == "draft"
+        and (
+            plan.ask_shape.audience_scope == "internal"
+            or plan.outreach_channel == "internal_slack"
+        )
+        and plan.side_effect_policy == "draft_or_read_only"
+        and not plan.requires_approved_context
+    )
+
+
+def reconcile_manual_request_followup(
+    plan: ManualRequestPlan,
+    *,
+    workflow_context: Mapping[str, Any] | None = None,
+) -> ManualRequestPlan:
+    """Reconcile a typed follow-up delta with one verified provider result set.
+
+    The current semantic plan still owns the requested output. A prior provider
+    receipt may preserve collection identity and exact read scope, but never
+    grants a write or selects an unrelated route. A requested item projection
+    is incompatible with an aggregate-only count operation, so that structural
+    contradiction is repaired before the Gmail executor sees the plan.
+    """
+
+    trusted_scope = _trusted_prior_provider_result_scope(workflow_context)
+    requested_fields = list(plan.gmail_requested_fields)
+    warnings = list(plan.planner_warnings)
+    updates: dict[str, Any] = {"provider_result_scope": None}
+
+    if requested_fields and plan.provider_result_mode == "count":
+        updates["provider_result_mode"] = "items"
+        warnings.append(
+            "Reconciled aggregate count to item projection because the current turn "
+            "requested provider fields that a count cannot supply."
+        )
+
+    gmail_scope_matches = bool(
+        trusted_scope is not None
+        and requested_fields
+        and trusted_scope.provider_system == "gmail"
+        and plan.target_agent == "gmail_triage"
+        and plan.provider_system in {"unspecified", "gmail"}
+        and plan.gmail_date_scope
+        in {"unspecified", trusted_scope.gmail_date_scope}
+        and plan.gmail_mailbox_direction
+        in {"unspecified", trusted_scope.gmail_mailbox_direction}
+    )
+    if gmail_scope_matches:
+        assert trusted_scope is not None
+        updates.update(
+            {
+                "provider_system": trusted_scope.provider_system,
+                "provider_operations": ["search", "read"],
+                "provider_read_scope": trusted_scope.provider_read_scope,
+                "provider_result_mode": "items",
+                "gmail_mailbox_direction": trusted_scope.gmail_mailbox_direction,
+                "gmail_date_scope": trusted_scope.gmail_date_scope,
+                "gmail_query": "",
+                "target_type": trusted_scope.target_type,
+                "side_effect_policy": "draft_or_read_only",
+                "provider_result_scope": trusted_scope,
+            }
+        )
+        if trusted_scope.item_count is not None:
+            updates["desired_count"] = max(1, min(10, trusted_scope.item_count))
+        warnings.append(
+            "Preserved the verified prior provider result-set scope while applying "
+            "the current typed item-field projection."
+        )
+
+    airtable_scope_matches = bool(
+        trusted_scope is not None
+        and trusted_scope.provider_system == "airtable"
+        and trusted_scope.airtable_table
+        and plan.target_agent == "airtable_context_agent"
+        and plan.provider_system in {"unspecified", "airtable"}
+        and plan.provider_result_mode == "items"
+        and (
+            not plan.primary_target.strip()
+            or trusted_scope.airtable_table.casefold() in plan.primary_target.strip().casefold()
+        )
+    )
+    if airtable_scope_matches:
+        assert trusted_scope is not None
+        updates.update(
+            {
+                "provider_system": "airtable",
+                "provider_operations": ["read"],
+                "provider_read_scope": "bounded_collection",
+                "provider_result_mode": "items",
+                "primary_target": trusted_scope.airtable_table,
+                "target_type": "business_system_context",
+                "task_objective": "context_lookup",
+                "expected_artifact_type": "context_summary",
+                "side_effect_policy": "draft_or_read_only",
+                "provider_result_scope": trusted_scope,
+            }
+        )
+        if trusted_scope.item_count is not None:
+            updates["desired_count"] = max(1, min(10, trusted_scope.item_count))
+        warnings.append(
+            "Preserved the verified Airtable aggregate scope while applying the "
+            "current typed item projection."
+        )
+
+    updates["planner_warnings"] = list(dict.fromkeys(warnings))
+    return plan.model_copy(update=updates)
+
+
+def _trusted_prior_provider_result_scope(
+    workflow_context: Mapping[str, Any] | None,
+) -> ManualProviderResultSetScope | None:
+    if not workflow_context:
+        return None
+    value = workflow_context.get("prior_provider_result_scope")
+    if value in (None, "", {}):
+        return None
+    try:
+        scope = ManualProviderResultSetScope.model_validate(value)
+    except (TypeError, ValueError):
+        return None
+    if not scope.verified or not scope.complete:
+        return None
+    if scope.provider_read_scope != "bounded_collection":
+        return None
+    return scope
 
 
 def is_internal_slack_composition_plan(plan: ManualRequestPlan) -> bool:
@@ -1363,24 +2471,74 @@ def is_internal_slack_composition_plan(plan: ManualRequestPlan) -> bool:
     """
 
     channel = re.sub(r"[\s-]+", "_", str(plan.outreach_channel or "").strip().lower())
+    internal_audience = bool(
+        plan.ask_shape.audience_scope == "internal"
+        or channel
+        in {
+            "slack",
+            "slack_only",
+            "slack_thread",
+            "team_channel",
+            "internal_slack",
+            "internal_team_slack",
+            "internal_team_channel",
+        }
+    )
     return bool(
         plan.target_agent == "outreach_composer"
-        and channel in {"slack_only", "internal_slack", "internal_team_slack"}
+        and internal_audience
         and not plan.recipient
         and plan.intent in {"route_request", "outreach_draft"}
         and not plan.workflow
         and not plan.requires_durable_state
         and not plan.requires_live_search
-        and plan.provider_system == "unspecified"
+        and plan.provider_system in {"unspecified", "slack"}
         and not plan.provider_operations
-        and plan.ask_shape.prior_context_dependency != "required"
         and plan.side_effect_policy == "draft_or_read_only"
     )
+
+
+def _explicit_audience_scope(lower: str) -> str:
+    """Extract only an explicit audience boundary from the current turn.
+
+    Audience scope can relax an external-outreach prerequisite, but it never
+    selects an owner, provider, tool, or write path. Ambiguous audience wording
+    remains planner-owned.
+    """
+
+    if re.search(
+        r"\b(?:internal|our)\s+(?:slack|team(?:\s+(?:slack|channel))?|"
+        r"staff(?:\s+channel)?|workspace(?:\s+channel)?)\b"
+        r"|\b(?:slack|team)\s+(?:internal\s+)?(?:note|update|sentence)\b"
+        r"|\b(?:in|within|keep\s+it\s+in)\s+this\s+(?:slack\s+)?thread\s+only\b",
+        lower,
+    ):
+        return "internal"
+    if re.search(
+        r"\b(?:external|customer|client|prospect|partner)\s+"
+        r"(?:email|message|outreach|copy|audience)\b"
+        r"|\b(?:email|linkedin)\s+(?:to|for)\s+(?:the\s+)?"
+        r"(?:customer|client|prospect|partner)\b",
+        lower,
+    ):
+        return "external"
+    return "unspecified"
 
 
 def _normalize_llm_plan_contract(candidate: ManualRequestPlan) -> ManualRequestPlan:
     """Resolve schema contradictions from typed intent/provider relationships."""
 
+    internal_gmail_collection_draft = bool(
+        candidate.provider_system == "gmail"
+        and candidate.target_type == "gmail_message_collection"
+        and candidate.provider_read_scope == "bounded_collection"
+        and candidate.provider_result_mode == "items"
+        and candidate.ask_shape.output_form == "draft"
+        and candidate.ask_shape.audience_scope == "internal"
+        and candidate.provider_operations
+        and set(candidate.provider_operations) <= {"read", "search", "verify"}
+        and not candidate.recipient
+    )
     owner_by_intent: dict[str, ManualTargetAgent] = {
         "company_research": "business_research_analyst",
         "research_brief": "business_research_analyst",
@@ -1416,7 +2574,27 @@ def _normalize_llm_plan_contract(candidate: ManualRequestPlan) -> ManualRequestP
     }
     updates: dict[str, Any] = {}
     warnings = list(candidate.planner_warnings)
+    if internal_gmail_collection_draft:
+        updates.update(
+            {
+                "target_agent": "gmail_triage",
+                "workflow": ["gmail_triage", "outreach_composer"],
+                "intent": "outreach_draft",
+                "task_objective": "outreach_draft",
+                "expected_artifact_type": "outreach_draft",
+                "outreach_channel": candidate.outreach_channel or "internal_slack",
+                "requires_approved_context": False,
+                "requires_durable_state": True,
+            }
+        )
+        warnings.append(
+            "Separated the bounded Gmail candidate read from the requested internal "
+            "draft: Gmail Triage selects provider evidence before Outreach Composer "
+            "writes one Slack-visible draft."
+        )
     expected_owner = owner_by_intent.get(candidate.intent)
+    if internal_gmail_collection_draft:
+        expected_owner = "gmail_triage"
     if candidate.target_type == "local_document_collection":
         expected_owner = "chief_of_staff"
     if candidate.intent in {"business_system_write", "context_lookup"}:
@@ -1460,7 +2638,19 @@ def _repair_structurally_invalid_llm_plan(
         and not candidate.workflow
         and not candidate.requires_durable_state
     )
-    if ungrounded_clarification or unowned_route_only:
+    ownerless_single_owner_execution = bool(
+        candidate.target_agent == "orchestrator"
+        and candidate.intent != "continue_work_item"
+        and not candidate.workflow
+        and not candidate.requires_durable_state
+        and (
+            candidate.provider_system != "unspecified"
+            or candidate.provider_operations
+            or candidate.task_objective
+            not in {"clarification", "route_or_continue"}
+        )
+    )
+    if ungrounded_clarification or unowned_route_only or ownerless_single_owner_execution:
         owner_by_provider: dict[str, ManualTargetAgent] = {
             "google_calendar": "chief_of_staff",
             "gmail": "gmail_triage",
@@ -1470,7 +2660,16 @@ def _repair_structurally_invalid_llm_plan(
             "slack": "chief_of_staff",
         }
         explicit_owner = candidate.requested_agent or base.requested_agent
-        recovery_owner = owner_by_provider.get(candidate.provider_system)
+        recovered_provider = candidate.provider_system
+        if (
+            recovered_provider == "unspecified"
+            and ownerless_single_owner_execution
+            and explicit_owner not in {None, "orchestrator", "clarification"}
+            and base.provider_system != "unspecified"
+            and base.target_agent not in {"clarification", "orchestrator"}
+        ):
+            recovered_provider = base.provider_system
+        recovery_owner = owner_by_provider.get(recovered_provider)
         if recovery_owner is None and explicit_owner not in {
             None,
             "orchestrator",
@@ -1479,12 +2678,15 @@ def _repair_structurally_invalid_llm_plan(
             recovery_owner = explicit_owner
         if recovery_owner is None:
             recovery_owner = "chief_of_staff"
-        operations = set(candidate.provider_operations)
+        recovered_operations = list(candidate.provider_operations)
+        if not recovered_operations and recovered_provider == base.provider_system:
+            recovered_operations = list(base.provider_operations)
+        operations = set(recovered_operations)
         if operations & {"create", "update", "delete", "attach"}:
             recovered_intent: ManualRequestIntent = "business_system_write"
             recovered_task: ManualTaskObjective = "business_system_write"
             recovered_artifact: ManualExpectedArtifactType = "business_system_write_plan"
-        elif candidate.provider_system != "unspecified" and operations <= {
+        elif recovered_provider != "unspecified" and operations <= {
             "read",
             "search",
             "verify",
@@ -1496,12 +2698,25 @@ def _repair_structurally_invalid_llm_plan(
             recovered_intent = "route_request"
             recovered_task = "route_or_continue"
             recovered_artifact = "none"
+        if (
+            recovered_provider == base.provider_system
+            and recovery_owner == base.target_agent
+            and base.task_objective
+            not in {"clarification", "route_or_continue", "context_lookup"}
+            and candidate.task_objective
+            in {"clarification", "route_or_continue", "context_lookup"}
+        ):
+            recovered_intent = base.intent
+            recovered_task = base.task_objective
+            recovered_artifact = base.expected_artifact_type
         updates.update(
             {
                 "target_agent": recovery_owner,
                 "workflow": [],
                 "intent": recovered_intent,
                 "objective": candidate.objective or base.objective,
+                "provider_system": recovered_provider,
+                "provider_operations": recovered_operations,
                 "task_objective": recovered_task,
                 "expected_artifact_type": recovered_artifact,
                 "requires_durable_state": False,
@@ -1564,9 +2779,68 @@ def _prune_forbidden_llm_capabilities(
 
     updates: dict[str, Any] = {}
     warnings = list(candidate.planner_warnings)
-    if candidate.requires_live_search and re.search(
-        r"\b(?:browse|research|search)\b",
-        negative_scopes,
+    forbidden_provider_access = {
+        provider
+        for provider in _NEGATIVE_SCOPE_PROVIDER_TERMS
+        if any(
+            _negative_constraint_forbids_provider_access(item, provider=provider)
+            for item in explicit_constraints
+        )
+    }
+    owner_provider = {
+        "gmail_triage": "gmail",
+        "airtable_context_agent": "airtable",
+        "google_workspace_context_agent": "google_workspace",
+        "zotero_context_agent": "zotero",
+    }
+    candidate_owner_provider = owner_provider.get(candidate.target_agent)
+    provider_access_forbidden = bool(
+        candidate.provider_system in forbidden_provider_access
+        or candidate_owner_provider in forbidden_provider_access
+    )
+    if provider_access_forbidden:
+        base_owner_provider = owner_provider.get(base.target_agent)
+        recovery_owner = (
+            base.target_agent
+            if base.target_agent not in {"clarification", "orchestrator"}
+            and base_owner_provider not in forbidden_provider_access
+            else "chief_of_staff"
+        )
+        retained_workflow = [
+            route
+            for route in candidate.workflow
+            if owner_provider.get(route) not in forbidden_provider_access
+        ]
+        updates.update(
+            {
+                "target_agent": recovery_owner,
+                "workflow": retained_workflow if len(retained_workflow) > 1 else [],
+                "provider_system": (
+                    "unspecified"
+                    if candidate.provider_system in forbidden_provider_access
+                    else candidate.provider_system
+                ),
+                "provider_operations": [],
+                "provider_action_steps": [],
+                "intent": "route_request",
+                "task_objective": "route_or_continue",
+                "expected_artifact_type": "none",
+                "requires_durable_state": bool(
+                    base.requires_durable_state or len(retained_workflow) > 1
+                ),
+                "requires_approved_context": False,
+                "gmail_query": "",
+                "lookback_days": None,
+                "draft_policy": "no_drafts_requested",
+                "side_effect_policy": "draft_or_read_only",
+            }
+        )
+        warnings.append(
+            "Removed a provider owner because the operator explicitly prohibited "
+            "access to that provider; the remaining provider-free task stays executable."
+        )
+    if candidate.requires_live_search and any(
+        _negative_constraint_forbids_live_search(item) for item in explicit_constraints
     ):
         updates["requires_live_search"] = False
         warnings.append(
@@ -1574,12 +2848,9 @@ def _prune_forbidden_llm_capabilities(
             "the remaining task stays executable."
         )
 
-    write_forbidden = bool(
-        re.search(
-            r"\b(?:add|append|attach|change|create|delete|edit|modify|remove|save|"
-            r"update|write)\b",
-            negative_scopes,
-        )
+    write_forbidden = any(
+        _negative_constraint_forbids_candidate_write(item, candidate)
+        for item in explicit_constraints
     )
     if write_forbidden:
         retained_operations = [
@@ -1589,6 +2860,11 @@ def _prune_forbidden_llm_capabilities(
         ]
         if retained_operations != candidate.provider_operations:
             updates["provider_operations"] = retained_operations
+            updates["provider_action_steps"] = [
+                step
+                for step in candidate.provider_action_steps
+                if step.operation in retained_operations
+            ]
             warnings.append(
                 "Removed provider mutations because the operator explicitly "
                 "prohibited writes; read-only work remains available."
@@ -1604,11 +2880,8 @@ def _prune_forbidden_llm_capabilities(
                 }
             )
 
-    draft_forbidden = bool(
-        re.search(
-            r"\b(?:draft|drafting|compose|prepare|write)\b",
-            negative_scopes,
-        )
+    draft_forbidden = any(
+        _negative_constraint_forbids_composition(item) for item in explicit_constraints
     )
     if (
         draft_forbidden
@@ -1675,18 +2948,17 @@ def _candidate_uses_explicitly_forbidden_capability(
             or "outreach_composer" in candidate.workflow
             or candidate.intent in {"outreach_draft", "opportunity_to_outreach_loop"}
         )
-        and re.search(r"\b(?:draft|drafting|compose|write|prepare)\b", negative_scopes)
+        and any(_negative_constraint_forbids_composition(item) for item in explicit_constraints)
     ):
         return True
-    if candidate.intent == "business_system_write" and re.search(
-        r"\b(?:add|append|attach|change|create|delete|edit|modify|remove|save|"
-        r"update|write)\b",
-        negative_scopes,
+    if candidate.intent == "business_system_write" and any(
+        _negative_constraint_forbids_candidate_write(item, candidate)
+        for item in explicit_constraints
     ):
         return True
     return bool(
         candidate.requires_live_search
-        and re.search(r"\b(?:browse|research|search)\b", negative_scopes)
+        and any(_negative_constraint_forbids_live_search(item) for item in explicit_constraints)
     )
 
 
@@ -1804,6 +3076,16 @@ def _semantic_target_agent(
         return "business_research_analyst"
     if _looks_like_unnamed_company_set_discovery(route_text):
         return "opportunity_scout"
+    if (
+        requested_agent in {None, "orchestrator", "chief_of_staff"}
+        and has_explicit_local_attachment_context(route_text)
+        and _local_attachment_company_target(route_text)
+        and _looks_like_source_summary_request(lower)
+    ):
+        # A selected source packet about a named company is bounded Business
+        # Research evidence. Chief may still be the human-facing front door,
+        # but the source-summary specialist owns interpretation.
+        return "business_research_analyst"
     if requested_agent in {
         None,
         "orchestrator",
@@ -1822,6 +3104,34 @@ def _semantic_target_agent(
         "chief_of_staff",
     } and _looks_like_internal_handoff_request(route_text):
         return "chief_of_staff"
+    if requested_agent == "chief_of_staff" and _request_forbids_provider_access(
+        text,
+        provider="gmail",
+    ):
+        # Inline email text can be interpreted directly. A provider name in the
+        # task does not authorize that provider when the operator explicitly
+        # says not to use it.
+        return "chief_of_staff"
+    if requested_agent in {
+        None,
+        "orchestrator",
+        "chief_of_staff",
+    } and _looks_like_internal_gmail_contact_lookup_request(route_text):
+        # A known relationship in the operator's own mailbox is a bounded
+        # Gmail evidence question, not public contact discovery. Chief remains
+        # the requested front door while Gmail Triage owns the provider read
+        # and evidence-backed specialist answer.
+        return "gmail_triage"
+    if requested_agent in {
+        None,
+        "orchestrator",
+        "chief_of_staff",
+    } and looks_like_gmail_collection_read(
+        route_text
+    ) and not _looks_like_orchestrator_owned_workflow(route_text):
+        # A broad mailbox read is still single-owner provider work. Chief stays
+        # the operator-facing front door while Gmail Triage owns interpretation.
+        return "gmail_triage"
     if requested_agent == "chief_of_staff" and is_single_owner_gmail_reply_request(route_text):
         # Chief remains the operator-facing manager, while the one specialist
         # that can read the selected thread and synthesize reply copy owns
@@ -1966,7 +3276,9 @@ def _looks_like_supplied_context_synthesis_request(text: str) -> bool:
     lower = normalized.lower()
     supplied_context = _has_supplied_context_boundary(
         lower
-    ) or _looks_like_inline_fact_packet_synthesis(normalized)
+    ) or _looks_like_inline_fact_packet_synthesis(
+        normalized
+    ) or has_explicit_local_attachment_context(normalized)
     if not supplied_context:
         return False
     explicit_source_operation = provider_tool_action_bound(text)
@@ -1975,6 +3287,35 @@ def _looks_like_supplied_context_synthesis_request(text: str) -> bool:
     # interpreting assess/decide/prepare and equivalent wording while Python
     # continues to block an actual provider operation.
     return not explicit_source_operation
+
+
+def has_explicit_local_attachment_context(text: str) -> bool:
+    """Return whether the current turn supplies a bounded local PDF/image.
+
+    The Slack bridge appends a trusted marker after it downloads attachment
+    bytes. Direct CLI tests may instead name the attached artifact naturally.
+    A path alone is not enough: requiring either that marker or attachment
+    language avoids treating an incidental filename in prose as selected
+    evidence.
+    """
+
+    source = str(text or "")
+    if not _LOCAL_ARTIFACT_PATH_RE.search(source):
+        return False
+    return bool(
+        has_materialized_slack_attachment_context(source)
+        or _LOCAL_ATTACHMENT_CONTEXT_RE.search(positive_capability_text(source))
+    )
+
+
+def has_materialized_slack_attachment_context(text: str) -> bool:
+    """Return whether the Slack bridge supplied a local attachment reference."""
+
+    source = str(text or "")
+    return bool(
+        _LOCAL_ARTIFACT_PATH_RE.search(source)
+        and _SLACK_ATTACHMENT_PATH_MARKER in " ".join(source.lower().split())
+    )
 
 
 def _looks_like_inline_fact_packet_synthesis(text: str) -> bool:
@@ -2158,8 +3499,29 @@ def _has_clear_task_ownership(
     lower = " ".join(route_text.lower().split())
     context_owner = _business_context_target_agent(route_text)
     if agent in _CONTEXT_AGENT_TARGETS:
+        # Direct-agent prefixes are removed before ordinary task inference so
+        # the mention itself cannot become generic routing authority. For a
+        # context specialist, however, that prefix also names the provider
+        # boundary. Recover the original operator text only to prove the narrow
+        # combination of the same provider owner plus a bounded provider
+        # operation. This retains ``Zotero Context Agent, read ...`` while still
+        # allowing ``Zotero Context Agent, research this on the web`` to
+        # delegate because the latter does not request a Zotero tool action.
+        original_route_text = _without_negated_route_action_clauses(
+            payload_text(request)
+        )
+        original_context_owner = _business_context_target_agent(
+            original_route_text
+        )
         return bool(
             context_owner == agent and _looks_like_explicit_business_context_operation(route_text)
+            or (
+                original_context_owner == agent
+                and _looks_like_explicit_business_context_operation(
+                    original_route_text
+                )
+            )
+            or _named_context_agent_task_is_bounded(agent, route_text)
         )
     if agent == "gmail_triage":
         return bool(
@@ -2358,7 +3720,7 @@ def resolve_manual_request_owner(
 
     requested = normalize_manual_agent(requested_agent)
     candidate = normalize_manual_agent(str(plan.target_agent or ""))
-    if plan.source == "llm":
+    if ExecutionIntentAuthority.from_value(plan).canonical:
         return candidate or requested or "orchestrator"
     if requested in {None, "orchestrator"}:
         return candidate or requested or "orchestrator"
@@ -2429,6 +3791,13 @@ def _intent_for_target(
     workflow_allowed: bool = True,
 ) -> ManualRequestIntent:
     lower = _without_negated_route_action_clauses(text).lower()
+    if (
+        target_agent == "business_research_analyst"
+        and has_explicit_local_attachment_context(text)
+        and _local_attachment_company_target(text)
+        and _looks_like_source_summary_request(lower)
+    ):
+        return "company_research"
     if _looks_like_supplied_context_synthesis_request(text):
         return "route_request"
     if _looks_like_browser_diagnostics_only_request(text):
@@ -2491,6 +3860,39 @@ def _looks_like_contact_discovery_request(text: str) -> bool:
         )
     )
     return has_discovery and has_contact and not has_drafting
+
+
+def _looks_like_internal_gmail_contact_lookup_request(text: str) -> bool:
+    """Recognize a known-contact question that should use bounded Gmail evidence.
+
+    This is intentionally about the relationship shape, not a company or
+    provider name. Public prospecting remains Business Research work.
+    """
+
+    source = _without_negated_route_action_clauses(str(text or ""))
+    lower = " ".join(source.lower().split())
+    if _request_forbids_provider_access(source, provider="gmail"):
+        return False
+    if re.search(
+        r"\b(?:public|website|web|linkedin|decision[- ]maker|sales\s+lead|"
+        r"partnerships?\s+lead|business\s+development\s+lead)\b",
+        lower,
+    ):
+        return False
+    if re.search(
+        r"\b(?:draft|write|compose|prepare)\b[^.\n]{0,100}\b"
+        r"(?:email|message|outreach|reply)\b",
+        lower,
+    ):
+        return False
+    return looks_like_known_contact_relationship(lower)
+
+
+def _internal_gmail_contact_lookup_entity(text: str) -> str:
+    """Extract a distinctive organization/account term for a Gmail query."""
+
+    source = _strip_direct_agent_prefix(str(text or ""))
+    return extract_known_contact_entity(source)
 
 
 def _looks_like_slack_operations_request(lower: str) -> bool:
@@ -2738,10 +4140,69 @@ def _looks_like_explicit_business_context_operation(text: str) -> bool:
     )
 
 
+def _named_context_agent_task_is_bounded(
+    agent: ManualTargetAgent,
+    text: str,
+) -> bool:
+    """Validate a provider-local task after an adapter removes its agent prefix.
+
+    The captured named agent supplies the provider boundary; the remaining text
+    must still contain both a concrete provider operation and a resource shape
+    owned by that agent. Explicitly naming another provider prevents retention.
+    """
+
+    actionable = " ".join(positive_capability_text(text).lower().split())
+    if not actionable:
+        return False
+    if re.search(
+        r"\b(?:web|internet|online|gmail|e-?mail|inbox|airtable|calendar|"
+        r"google\s+(?:calendar|drive|docs?|sheets?|workspace)|zotero|"
+        r"rss(?:\s+feed)?|announcement\s+feed|preprints?(?:\s+context)?|"
+        r"local\s+(?:file|document)|repository|repo|website|url|https?://)\b",
+        actionable,
+        re.I,
+    ):
+        return False
+    if not re.search(
+        r"\b(?:read|search|look\s+up|find|list|inspect|review|check|query|open|"
+        r"fetch|get|create|add|update|change|modify|edit|delete|remove|trash|"
+        r"upload|attach|save)\b",
+        actionable,
+        re.I,
+    ):
+        return False
+    resource_patterns: dict[ManualTargetAgent, str] = {
+        "airtable_context_agent": (
+            r"\b(?:base|table|record|row|field|view|expense|income|airtable)\b"
+        ),
+        "google_workspace_context_agent": (
+            r"\b(?:document|doc|folder|sheet|spreadsheet|slide|deck|file|workspace)\b"
+        ),
+        "zotero_context_agent": (
+            r"\b(?:abstract|article|journal|paper|item|library|collection|citation|"
+            r"author|metadata|note|tag|attachment)\b"
+        ),
+        "rss_context_agent": r"\b(?:feed|announcement|entry|headline|item)\b",
+        "preprints_context_agent": (
+            r"\b(?:preprint|abstract|paper|article|study|trial|history|item)\b"
+        ),
+    }
+    pattern = resource_patterns.get(agent)
+    return bool(pattern and re.search(pattern, actionable, re.I))
+
+
 def _looks_like_zotero_context_request(text: str) -> bool:
     lower = " ".join(str(text or "").lower().split())
     return bool(
         "zotero context" in lower
+        or (
+            "zotero" in lower
+            and _provider_selection_rank(lower, zotero_context=True) is not None
+            and re.search(
+                r"\b(?:article|paper|item|record|journal|library)\b",
+                lower,
+            )
+        )
         or re.search(r"\bzotero\s+context\s+agent\b", lower)
         or re.search(r"\buse\s+zotero\b[^.\n;]{0,80}\bas\s+context\b", lower)
         or ("zotero" in lower and re.search(r"\bitem\s+keys?\b", lower))
@@ -2964,6 +4425,20 @@ def _desired_count(text: str) -> int:
     return _COUNT_WORDS.get(raw_word, 1)
 
 
+def _desired_count_is_domain_limit(text: str) -> bool:
+    """Distinguish an explicit domain-result limit from response formatting."""
+
+    if _COUNT_RE.search(text) is None and _COUNT_WORD_RE.search(text) is None:
+        return False
+    if re.search(
+        r"\b(?:bullets?|talking\s+points?|sentences?|paragraphs?|words?)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
+
+
 def _primary_target(text: str, *, target_agent: ManualTargetAgent) -> str:
     cleaned = _strip_direct_agent_prefix(text).strip()
     if _looks_like_browser_diagnostics_request(cleaned):
@@ -3009,7 +4484,16 @@ def _primary_target(text: str, *, target_agent: ManualTargetAgent) -> str:
         )
     cleaned = _PREFIX_RE.sub("", _strip_operational_clauses(cleaned)).strip()
     if target_agent == "gmail_triage":
-        return _first_nonempty(_quoted_text(cleaned), _subject_text(cleaned), cleaned[:120])
+        return _first_nonempty(
+            (
+                _internal_gmail_contact_lookup_entity(cleaned)
+                if _looks_like_internal_gmail_contact_lookup_request(cleaned)
+                else ""
+            ),
+            _quoted_text(cleaned),
+            _subject_text(cleaned),
+            cleaned[:120],
+        )
     if target_agent == "outreach_composer":
         return _first_nonempty(_quoted_text(cleaned), _companyish_target(cleaned), cleaned[:120])
     if target_agent == "business_research_analyst":
@@ -3095,6 +4579,11 @@ def _strip_operational_clauses(text: str) -> str:
 
 def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetType:
     lower = text.lower()
+    if target_agent == "gmail_triage" and (
+        _looks_like_internal_gmail_contact_lookup_request(text)
+        or looks_like_gmail_collection_read(text)
+    ):
+        return "gmail_message_collection"
     if target_agent == "chief_of_staff" and looks_like_local_kni_evidence_lookup(text):
         return "local_document_collection"
     if _looks_like_supplied_context_synthesis_request(text) and not (
@@ -3213,6 +4702,8 @@ def _task_objective(
         return "business_system_write"
     if intent == "context_lookup":
         return "context_lookup"
+    if target_agent == "gmail_triage" and _looks_like_internal_gmail_contact_lookup_request(text):
+        return "contact_discovery"
     if intent == "gmail_triage":
         return "gmail_triage"
     if intent == "outreach_draft":
@@ -3307,6 +4798,32 @@ def _looks_like_source_summary_request(lower: str) -> bool:
             "what happened",
         )
     )
+
+
+def _local_attachment_company_target(text: str) -> str:
+    """Extract a company explicitly bound to the selected local attachment."""
+
+    source = str(text or "")
+    attachment = (
+        r"(?i:source\s+packet|research\s+packet|research\s+brief|company\s+brief|"
+        r"company\s+profile|file|image|pdf|document)"
+    )
+    company = (
+        r"(?P<name>(?:[A-Z][\w&.-]*|[A-Z]{2,})"
+        r"(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})"
+    )
+    for pattern in (
+        re.compile(rf"\b{attachment}\s+(?i:for|about|on)\s+{company}\b"),
+        re.compile(rf"\b(?i:attached)\s+{company}\s+{attachment}\b"),
+        re.compile(rf"\b(?i:for)\s+{company}\b"),
+    ):
+        match = pattern.search(source)
+        if match is None:
+            continue
+        candidate = _clean_company_candidate(match.group("name"))
+        if candidate and _plausible_company_profile_target(candidate):
+            return candidate
+    return ""
 
 
 def _looks_like_actionable_opportunity_request(lower: str) -> bool:
@@ -3619,7 +5136,9 @@ def _exclusion_constraints(text: str) -> list[str]:
 def _explicit_negative_constraints(text: str) -> list[str]:
     """Preserve operator restrictions verbatim without using them for routing."""
 
-    source = str(text or "")
+    source = _separate_mixed_negative_positive_clauses(
+        _without_reported_quoted_text(text)
+    )
     constraints: list[str] = []
     for match in _LEADING_NEGATED_CAPABILITY_PREFIX_RE.finditer(source):
         cleaned = " ".join(match.group(0).split()).strip(" ,:;-")
@@ -3638,6 +5157,215 @@ def _explicit_negative_constraints(text: str) -> list[str]:
     return list(dict.fromkeys(constraints))
 
 
+def _without_reported_quoted_text(text: str) -> str:
+    """Remove quoted source/example prose before inferring operator prohibitions."""
+
+    source = str(text or "")
+    patterns = (
+        r'"[^"\n]{0,600}"',
+        r"“[^”\n]{0,600}”",
+        r"‘[^’\n]{0,600}’",
+        r"(?<!\w)'[^'\n]{0,600}'(?!\w)",
+    )
+    for pattern in patterns:
+        source = re.sub(pattern, " ", source)
+    return source
+
+
+_NEGATIVE_SCOPE_PROVIDER_TERMS: dict[str, tuple[str, ...]] = {
+    "google_calendar": ("calendar", "event", "schedule"),
+    "gmail": ("gmail", "email", "draft", "label", "archive", "mailbox"),
+    "airtable": ("airtable", "record", "row", "table", "base", "expense"),
+    "google_workspace": (
+        "google workspace",
+        "google drive",
+        "google doc",
+        "document",
+        "file",
+        "folder",
+        "sheet",
+    ),
+    "zotero": ("zotero", "note", "item", "collection"),
+    "slack": ("slack", "channel", "thread", "post"),
+}
+
+
+def _negative_constraint_provider_scopes(constraint: str) -> set[str]:
+    normalized = " ".join(str(constraint or "").lower().split())
+    return {
+        provider
+        for provider, terms in _NEGATIVE_SCOPE_PROVIDER_TERMS.items()
+        if any(re.search(rf"\b{re.escape(term)}s?\b", normalized) for term in terms)
+    }
+
+
+def _negative_constraint_forbids_provider_access(
+    constraint: str,
+    *,
+    provider: str,
+) -> bool:
+    """Return whether one negative clause forbids reading or using a provider.
+
+    Mutation-only boundaries such as ``do not create a Gmail draft`` do not
+    disable a permitted provider read. This gate is deliberately narrower than
+    provider write enforcement.
+    """
+
+    normalized = " ".join(str(constraint or "").lower().split())
+    if (
+        re.search(
+            r"\b(?:use|access|read|check|query|search|browse|fetch|retrieve|open|connect\s+to)\b",
+            normalized,
+        )
+        is None
+    ):
+        return False
+    if re.search(
+        r"\b(?:any\s+providers?|provider\s+(?:tools?|systems?)|external\s+"
+        r"(?:tools?|providers?|systems?)|tools?\s+or\s+providers?|"
+        r"providers?\s+or\s+tools?)\b",
+        normalized,
+    ):
+        return True
+    access_provider_terms: dict[str, tuple[str, ...]] = {
+        "google_calendar": ("google calendar", "calendar"),
+        "gmail": ("gmail", "mailbox", "inbox"),
+        "airtable": ("airtable",),
+        "google_workspace": (
+            "google workspace",
+            "google drive",
+            "google docs",
+            "google sheets",
+        ),
+        "zotero": ("zotero",),
+        "slack": ("slack",),
+    }
+    return any(
+        re.search(rf"\b{re.escape(term)}\b", normalized)
+        for term in access_provider_terms.get(provider, ())
+    )
+
+
+def _request_forbids_provider_access(text: str, *, provider: str) -> bool:
+    return any(
+        _negative_constraint_forbids_provider_access(item, provider=provider)
+        for item in _explicit_negative_constraints(_without_reported_quoted_text(text))
+    )
+
+
+def _negative_constraint_forbids_candidate_write(
+    constraint: str,
+    candidate: ManualRequestPlan,
+) -> bool:
+    normalized = " ".join(str(constraint or "").lower().split())
+    if not re.search(
+        r"\b(?:add|append|attach|change|create|delete|edit|modify|remove|save|"
+        r"update|write|make\s+changes?)\b",
+        normalized,
+    ):
+        return False
+    if re.search(
+        r"\b(?:any(?:thing|\s+provider)|provider\s+(?:records?|systems?)|"
+        r"external\s+(?:records?|systems?)|externally)\b",
+        normalized,
+    ):
+        return True
+    provider_scopes = _negative_constraint_provider_scopes(normalized)
+    if provider_scopes:
+        return candidate.provider_system in provider_scopes
+    return True
+
+
+def _negative_constraint_forbids_composition(constraint: str) -> bool:
+    """Return whether a negative clause actually forbids writing the response.
+
+    A provider-artifact boundary such as ``do not create a Gmail draft`` or
+    ``no provider draft`` must not cancel a simultaneously requested,
+    provider-free composition in Slack. Deterministic pruning acts only on a
+    direct prohibition of drafting/writing the substantive copy; ambiguous
+    artifact language remains part of the canonical plan for the model to
+    interpret.
+    """
+
+    normalized = " ".join(str(constraint or "").lower().split())
+    direct = re.search(
+        r"\b(?:do\s+not|don't|dont|never|without|avoid|skip)\s+"
+        r"(?:an?\s+)?"
+        r"(?P<action>draft|drafting|compose|composing|prepare|preparing|"
+        r"write|writing)\b(?P<scope>[^,;.]*)",
+        normalized,
+    )
+    if direct is not None:
+        scope = direct.group("scope").strip()
+        if re.match(
+            r"^(?:to|in|into|on)\s+(?:gmail|a\s+provider|the\s+provider|"
+            r"airtable|google\s+(?:docs?|drive|workspace)|slack)\b",
+            scope,
+        ):
+            return False
+        return True
+    if re.search(
+        r"\b(?:do\s+not|don't|dont|never|without|avoid|skip)\b"
+        r"[^.;!?]{0,180}\b(?:drafting|composing|preparing|writing)\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        r"\b(?:do\s+not|don't|dont|never|without|avoid|skip)\b"
+        r"[^.;!?]{0,180}\b(?:draft|compose|prepare|write)\s+"
+        r"(?:anything|copy|outreach|an?\s+(?:email|reply|response|message|note)|"
+        r"the\s+(?:email|reply|response|message|note))\b",
+        normalized,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\bno\s+(?:draft|drafting|composition|composing|written\s+"
+            r"(?:reply|response)|outreach\s+copy|email\s+copy|reply)\b",
+            normalized,
+        )
+    )
+
+
+def request_forbids_response_composition(text: str) -> bool:
+    """Return whether the current ask directly prohibits composing response copy.
+
+    Provider boundaries such as no-send, no-post, and no-provider-draft remain
+    safety constraints but do not cancel a simultaneously requested local draft.
+    """
+
+    return any(
+        _negative_constraint_forbids_composition(constraint)
+        for constraint in _explicit_negative_constraints(text)
+    )
+
+
+def _negative_constraint_forbids_live_search(constraint: str) -> bool:
+    normalized = " ".join(str(constraint or "").lower().split())
+    if re.search(r"\b(?:external\s+tools?|browser\s+automation)\b", normalized):
+        return True
+    if not re.search(r"\b(?:browse|research|search)\b", normalized):
+        return False
+    if re.search(
+        r"\b(?:web|internet|external|live|browser|online|externally)\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        r"\b(?:do\s+not|don't|dont|never|no|without|avoid|skip)\s+"
+        r"(?:search|browse|research)\b(?:\s*[,;]|$)",
+        normalized,
+    ):
+        return True
+    action_match = re.search(
+        r"\b(?:search|browse|research)\b(?P<scope>[^,;.]*)",
+        normalized,
+    )
+    scoped_text = action_match.group("scope") if action_match is not None else normalized
+    provider_scopes = _negative_constraint_provider_scopes(scoped_text)
+    return not bool(provider_scopes)
+
+
 def looks_like_opportunity_to_outreach_loop(text: str) -> bool:
     """Return whether text asks for the integrated opportunity -> outreach workflow."""
 
@@ -3645,6 +5373,71 @@ def looks_like_opportunity_to_outreach_loop(text: str) -> bool:
     if _NO_OUTREACH_DRAFT_RE.search(raw_text):
         return False
     return bool(_OPPORTUNITY_TO_OUTREACH_RE.search(raw_text))
+
+
+def _natural_opportunity_to_outreach_workflow(
+    text: str,
+) -> list[ManualTargetAgent]:
+    """Compile separate natural deliverables into the durable workflow.
+
+    The explicit legacy ``run ... opportunity-to-outreach loop`` command keeps
+    its compatibility controller. Natural asks that name distinct discovery,
+    research, provider-plan, and drafting work use the WorkItem graph.
+    """
+
+    actionable = _without_negated_route_action_clauses(text)
+    if not looks_like_opportunity_to_outreach_loop(actionable):
+        return []
+    if re.search(
+        r"\b(?:run|start|execute|do)\b[^.;\n]{0,50}"
+        r"\bopportunit(?:y|ies)\s*(?:-|to\s+)?outreach\b[^.;\n]{0,30}"
+        r"\b(?:loop|workflow|process)\b",
+        actionable,
+        re.I,
+    ):
+        return []
+    patterns: tuple[tuple[ManualTargetAgent, re.Pattern[str]], ...] = (
+        (
+            "opportunity_scout",
+            re.compile(
+                r"\b(?:find|identify|source|select|choose|rank|recommend)\b"
+                r"[^.;\n]{0,120}\bopportunit(?:y|ies)\b",
+                re.I,
+            ),
+        ),
+        (
+            "business_research_analyst",
+            re.compile(r"\b(?:research|investigate|validate)\b", re.I),
+        ),
+        (
+            "airtable_context_agent",
+            re.compile(
+                r"\b(?:create|prepare|draft|make)\b[^.;\n]{0,100}\bairtable\b"
+                r"[^.;\n]{0,100}\b(?:record|write)\s+plan\b"
+                r"|\bairtable\b[^.;\n]{0,100}\b(?:record|write)\s+plan\b",
+                re.I,
+            ),
+        ),
+        (
+            "outreach_composer",
+            re.compile(
+                r"\b(?:draft|compose|prepare|write)\b[^.;\n]{0,120}\boutreach\b",
+                re.I,
+            ),
+        ),
+    )
+    ordered = [
+        (match.start(), route)
+        for route, pattern in patterns
+        if (match := pattern.search(actionable)) is not None
+    ]
+    workflow = list(dict.fromkeys(route for _, route in sorted(ordered)))
+    if {
+        "opportunity_scout",
+        "outreach_composer",
+    }.issubset(workflow) and len(workflow) >= 3:
+        return workflow
+    return []
 
 
 def _looks_like_discovery_outreach_workflow(text: str) -> bool:
@@ -3664,9 +5457,10 @@ def positive_capability_text(text: str) -> str:
     after ``but``, ``however``, or ``instead`` remains eligible.
     """
 
+    separated_clauses = _separate_mixed_negative_positive_clauses(text)
     without_reporting_examples = _CONDITIONAL_AGENT_REPORTING_CLAUSE_RE.sub(
         " ",
-        str(text or ""),
+        separated_clauses,
     )
     without_leading_boundaries = _LEADING_NEGATED_CAPABILITY_PREFIX_RE.sub(
         " ",
@@ -3681,6 +5475,29 @@ def positive_capability_text(text: str) -> str:
         without_capability_boundaries,
     )
     return _NEGATED_BUSINESS_SYSTEM_ACTION_CLAUSE_RE.sub(" ", without_route_actions)
+
+
+def _separate_mixed_negative_positive_clauses(text: str) -> str:
+    """Keep a positive instruction that follows a bounded negative clause.
+
+    Natural requests often combine a filter or safety boundary with the desired
+    action in one sentence, for example, ``skip threads I answered, and draft a
+    response here``. The negative clause remains available to safety parsing,
+    while the positive clause remains eligible for semantic planning.
+    """
+
+    return re.sub(
+        r"(?P<negative>\b(?:do\s+not|don't|dont|never|avoid|skip|no|without)\b"
+        r"(?:(?![.;\n]).){0,220}?),\s*and\s+"
+        r"(?=(?:then\s+|please\s+)?"
+        r"(?:answer|use|draft|compose|write|prepare|return|give|provide|"
+        r"summari[sz]e|review|assess|explain|reformat|list|read|query|"
+        r"find|select|choose|create|add|schedule|verify|check|confirm|"
+        r"update|modify|edit|delete|remove)\b)",
+        r"\g<negative>. ",
+        str(text or ""),
+        flags=re.I,
+    )
 
 
 def provider_tool_action_bound(text: str) -> bool:
@@ -3795,9 +5612,22 @@ def _strip_kni_direct_prefix(text: str) -> str:
 
 def _opportunity_to_outreach_topic(text: str) -> str:
     cleaned = _strip_direct_agent_prefix(text).strip()
+    best_match = re.search(
+        r"\b(?P<topic>(?:best|top|strongest|highest[- ]value)\s+opportunity)\b",
+        cleaned,
+        re.I,
+    )
     match = re.search(r"\bfor\s+(?P<topic>.+)$", cleaned, re.I)
-    if match:
+    if best_match is not None:
+        candidate = best_match.group("topic").strip()
+    elif match:
         candidate = match.group("topic").strip()
+        if re.match(
+            r"^(?:review|approval|human\s+review|internal\s+review|later)\b",
+            candidate,
+            re.I,
+        ):
+            candidate = ""
     else:
         candidate = re.sub(
             r"^\s*(?:run|start|do|execute|find|source|identify)\s+"
@@ -3886,18 +5716,7 @@ def _draft_policy(text: str) -> str:
     lower = text.lower()
     if "draft" not in lower and "reply" not in lower:
         return "no_drafts_requested"
-    review_copy_scope = re.sub(
-        r"\b(?:do\s+not|don't|dont|never|without)\s+"
-        r"(?:create|save|write)\s+(?:a\s+|any\s+)?"
-        r"(?:gmail\s+|provider\s+)?drafts?\b",
-        "",
-        lower,
-    )
-    if re.search(
-        r"\b(?:do\s+not|don't|dont|never|no|without)\b[^,.;\n]{0,80}"
-        r"\b(?:draft|drafting|reply|replies)\b",
-        review_copy_scope,
-    ):
+    if request_forbids_response_composition(text):
         return "no_drafts_requested"
     if "urgent" in lower:
         return "draft_only_for_urgent"
@@ -3921,6 +5740,10 @@ def _gmail_query(text: str) -> str:
     sender_hint = _gmail_sender_hint(text)
     if sender_hint:
         parts.append(f'"{sender_hint}"')
+    elif _looks_like_internal_gmail_contact_lookup_request(text):
+        entity = _internal_gmail_contact_lookup_entity(text)
+        if entity:
+            parts.append(f'"{entity}"')
     return " ".join(parts)
 
 

@@ -11,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from keystone_agents.schemas.work_item import WorkItemRoute
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 
 SLACK_QUERY_PROMPT_SCHEMA = "keystone.slack.query_prompt.v1"
 SLACK_QUERY_PROMPT_VERSION = "2026-06-11.v1"
@@ -253,9 +254,12 @@ def slack_query_prompt_external_context(
 
 
 def _detect_prompt_kind(prompt_input: SlackQueryPromptInput) -> SlackQueryPromptKind | None:
-    semantic_plan = _semantic_manual_plan(prompt_input)
-    if semantic_plan is not None:
-        return _semantic_prompt_kind(semantic_plan)
+    authority = ExecutionIntentAuthority.from_value(prompt_input.manual_plan)
+    if authority.invalid:
+        return None
+    if authority.canonical:
+        assert authority.plan is not None
+        return _semantic_prompt_kind(authority.plan.model_dump(mode="json"))
 
     text = " ".join(
         item
@@ -332,12 +336,13 @@ def _detect_prompt_kind(prompt_input: SlackQueryPromptInput) -> SlackQueryPrompt
 
 
 def _semantic_manual_plan(prompt_input: SlackQueryPromptInput) -> dict[str, Any] | None:
-    """Return a live semantic plan, excluding fallback phrase classifications."""
+    """Return a validated canonical plan, regardless of compatible plan source."""
 
-    plan = prompt_input.manual_plan
-    if not isinstance(plan, dict) or str(plan.get("source") or "") != "llm":
+    authority = ExecutionIntentAuthority.from_value(prompt_input.manual_plan)
+    if not authority.canonical:
         return None
-    return plan
+    assert authority.plan is not None
+    return authority.plan.model_dump(mode="json")
 
 
 def _semantic_prompt_kind(plan: dict[str, Any]) -> SlackQueryPromptKind | None:

@@ -156,6 +156,40 @@ def test_work_item_integrity_cli_strict_mode_fails_on_orphans(
     assert payload["missing_work_item_ids"] == ["missing-cli-item"]
 
 
+def test_work_item_retention_audit_reports_reviewable_unarchived_rows(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+    for status in (
+        WorkItemStatus.DONE,
+        WorkItemStatus.BLOCKED,
+        WorkItemStatus.IN_PROGRESS,
+        WorkItemStatus.ARCHIVED,
+    ):
+        store.save_work_item(
+            WorkItem(
+                kind=WorkItemKind.RESEARCH_BRIEF,
+                status=status,
+                title=f"Retention {status.value}",
+            )
+        )
+
+    audit = store.audit_work_item_retention()
+
+    assert audit["status"] == "attention"
+    assert audit["status_counts"] == {
+        "archived": 1,
+        "blocked": 1,
+        "done": 1,
+        "in_progress": 1,
+    }
+    assert audit["archived_count"] == 1
+    assert audit["unarchived_count"] == 3
+    assert audit["reviewable_unarchived_count"] == 2
+    assert audit["policy"] == "operator_review_required_no_automatic_deletion"
+    assert audit["repair_performed"] is False
+
+
 def test_storage_tool_lists_work_items(tmp_path: Path) -> None:
     tool = StorageTool(_database_url(tmp_path))
     item = WorkItem(kind=WorkItemKind.OPPORTUNITY, title="Scout opportunities")

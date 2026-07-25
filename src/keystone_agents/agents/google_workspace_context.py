@@ -8,6 +8,7 @@ from typing import Any
 
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
 from keystone_agents.guardrails import keystone_guardrails
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.operational_context import GoogleWorkspaceContextResult
 from keystone_agents.sdk import (
     Agent,
@@ -15,6 +16,7 @@ from keystone_agents.sdk import (
     compose_direct_instructions,
     compose_instructions,
 )
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.tools.internal_data_tools import (
     google_doc_read,
@@ -44,11 +46,149 @@ from keystone_agents.tools.internal_data_tools import (
     presentation_search_local,
 )
 
+_WORKSPACE_READ_TOOLS_BY_RESOURCE: dict[str, frozenset[str]] = {
+    "google_document": frozenset(
+        {
+            "google_drive_search_files",
+            "google_drive_get_file_metadata",
+            "google_doc_read",
+        }
+    ),
+    "google_spreadsheet": frozenset(
+        {
+            "google_drive_search_files",
+            "google_sheet_list",
+            "google_sheet_read_table",
+        }
+    ),
+    "google_sheet_row": frozenset(
+        {
+            "google_drive_search_files",
+            "google_sheet_list",
+            "google_sheet_read_table",
+        }
+    ),
+    "google_sheet_tab": frozenset(
+        {
+            "google_drive_search_files",
+            "google_sheet_list",
+            "google_sheet_read_table",
+        }
+    ),
+    "google_drive_file": frozenset(
+        {
+            "google_drive_list_folder",
+            "google_drive_search_files",
+            "google_drive_get_file_metadata",
+        }
+    ),
+    "google_drive_folder": frozenset(
+        {
+            "google_drive_list_folder",
+            "google_drive_search_files",
+            "google_drive_get_file_metadata",
+        }
+    ),
+    "google_slide_deck": frozenset(
+        {
+            "google_drive_search_files",
+            "google_drive_get_file_metadata",
+            "google_slide_deck_read",
+        }
+    ),
+    "local_presentation": frozenset(
+        {
+            "presentation_search_local",
+            "presentation_read_local",
+        }
+    ),
+}
+
+_WORKSPACE_WRITE_TOOLS_BY_ACTION: dict[tuple[str, str], frozenset[str]] = {
+    ("create", "google_document"): frozenset({"google_doc_write"}),
+    ("update", "google_document"): frozenset({"google_doc_write"}),
+    ("delete", "google_document"): frozenset({"google_doc_trash"}),
+    ("create", "google_spreadsheet"): frozenset({"google_sheet_create"}),
+    ("delete", "google_spreadsheet"): frozenset({"google_sheet_trash"}),
+    ("create", "google_sheet_row"): frozenset({"google_sheet_append_rows"}),
+    ("update", "google_sheet_row"): frozenset({"google_sheet_update_row"}),
+    ("delete", "google_sheet_row"): frozenset({"google_sheet_delete_rows"}),
+    ("create", "google_sheet_tab"): frozenset({"google_sheet_create_tab"}),
+    ("update", "google_sheet_tab"): frozenset({"google_sheet_update_tab"}),
+    ("delete", "google_sheet_tab"): frozenset({"google_sheet_remove_tab"}),
+    ("create", "google_drive_folder"): frozenset({"google_drive_create_folder"}),
+    ("update", "google_drive_folder"): frozenset({"google_drive_rename_folder"}),
+    ("delete", "google_drive_folder"): frozenset({"google_drive_remove_folder"}),
+    ("create", "local_presentation"): frozenset(
+        {"presentation_extract_slide_copy_local"}
+    ),
+    ("delete", "local_presentation"): frozenset(
+        {"presentation_delete_test_artifact_local"}
+    ),
+}
+
+
+def _canonical_google_workspace_tool_names(
+    authority: ExecutionIntentAuthority,
+    *,
+    request_text: str,
+) -> set[str]:
+    """Map canonical provider-object steps to the smallest Workspace tool set."""
+
+    plan = authority.plan
+    if plan is None or not authority.authorizes_provider("google_workspace"):
+        return set()
+    operations = set(authority.effective_provider_operations("google_workspace"))
+    if not operations:
+        return set()
+    steps = authority.provider_action_steps("google_workspace")
+    normalized = " ".join(str(request_text or "").lower().split())
+    if steps:
+        doc_operations = {
+            step.operation
+            for step in steps
+            if step.resource_type == "google_document"
+        }
+        marked_test = bool(re.search(r"\bkba_test_doc(?:_[a-z0-9]+)*\b", normalized))
+        if marked_test and {"create", "delete"} <= doc_operations:
+            return {"google_doc_test_lifecycle"}
+        selected: set[str] = set()
+        for step in steps:
+            if step.operation in {"read", "search", "verify"}:
+                selected.update(
+                    _WORKSPACE_READ_TOOLS_BY_RESOURCE.get(
+                        step.resource_type,
+                        frozenset(),
+                    )
+                )
+            else:
+                selected.update(
+                    _WORKSPACE_WRITE_TOOLS_BY_ACTION.get(
+                        (step.operation, step.resource_type),
+                        frozenset(),
+                    )
+                )
+        return selected
+
+    # Older canonical producers may not yet supply resource-level steps. Keep
+    # execution available, but bound the fallback by typed operations rather
+    # than allowing raw wording to choose or enlarge a provider capability.
+    selected = set()
+    if operations & {"read", "search", "verify"}:
+        for names in _WORKSPACE_READ_TOOLS_BY_RESOURCE.values():
+            selected.update(names)
+    for operation in operations & {"create", "update", "delete"}:
+        for (action, _resource_type), names in _WORKSPACE_WRITE_TOOLS_BY_ACTION.items():
+            if action == operation:
+                selected.update(names)
+    return selected
+
 
 def _google_workspace_context_tools(
     *,
     tool_tier: str | int | None = None,
     request_text: str = "",
+    manual_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
 ) -> list[Any]:
     tools: list[Any] = [
         google_drive_list_folder,
@@ -80,6 +220,17 @@ def _google_workspace_context_tools(
     if tool_tier is None:
         return tools
     filtered = filter_tools_for_tier("google_workspace_context_agent", tools, tool_tier)
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if authority.canonical:
+        selected_names = _canonical_google_workspace_tool_names(
+            authority,
+            request_text=request_text,
+        )
+        return [
+            tool for tool in filtered if getattr(tool, "name", "") in selected_names
+        ]
+    if authority.invalid:
+        return []
     normalized = " ".join(str(request_text or "").lower().split())
     tier = str(tool_tier)
     if tier not in {"core_read", "internal_write"}:
@@ -199,6 +350,7 @@ def build_google_workspace_context_agent(
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
     compact_instructions: bool = False,
+    manual_plan: ManualRequestPlan | None = None,
 ) -> Agent:
     """Build the Google Workspace context specialist."""
 
@@ -228,6 +380,7 @@ def build_google_workspace_context_agent(
         tools=_google_workspace_context_tools(
             tool_tier=tool_tier,
             request_text=request_text,
+            manual_plan=manual_plan,
         ),
         guardrails=keystone_guardrails(),
         model=model,

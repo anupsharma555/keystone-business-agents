@@ -1,0 +1,52 @@
+{
+  "schema": "keystone.slack_opportunity_airtable_outreach_replay.v1",
+  "current_request": "@KNI This looks promising: AffectAI says it wants an independent behavioral-health AI evidence review. Check the fit, sketch the Airtable entry we'd use, and write a short first-contact note for me to review. Keep everything here—don't save or send anything.",
+  "manual_request_plan": {
+    "source": "llm",
+    "requested_agent": "orchestrator",
+    "target_agent": "opportunity_scout",
+    "workflow": [
+      "opportunity_scout",
+      "business_research_analyst",
+      "airtable_context_agent",
+      "outreach_composer"
+    ],
+    "intent": "opportunity_to_outreach_loop",
+    "primary_target": "AffectAI evidence-review opportunity",
+    "target_type": "opportunity",
+    "provider_system": "airtable",
+    "provider_operations": [],
+    "task_objective": "opportunity_discovery",
+    "expected_artifact_type": "business_system_write_plan",
+    "requires_durable_state": true,
+    "requires_live_search": true,
+    "side_effect_policy": "draft_or_read_only",
+    "constraints": [
+      "use only the supplied note",
+      "outline but do not save the Airtable record",
+      "draft but do not send outreach"
+    ],
+    "ask_shape": {
+      "permission_state": "draft_only",
+      "audience_scope": "internal",
+      "output_form": "plan"
+    }
+  },
+  "expected": {
+    "route": "outreach_composer",
+    "status": "needs_approval",
+    "artifact_types": [
+      "opportunity",
+      "company_profile",
+      "airtable_write_plan",
+      "outreach_draft"
+    ],
+    "node_order": [
+      "run_opportunity_scout",
+      "run_business_research",
+      "stage_airtable_context",
+      "run_outreach_composer",
+      "approval_checkpoint"
+    ]
+  }
+}

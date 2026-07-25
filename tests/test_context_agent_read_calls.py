@@ -13,6 +13,7 @@ from keystone_agents.context_env import context_env_path
 from keystone_agents.schemas.operational_context import AirtableContextResult
 from keystone_agents.tools import internal_data_tools, local_context_tool
 from keystone_agents.tools.internal_data_tools import (
+    airtable_aggregate_records_impl,
     airtable_get_base_schema,
     airtable_read_records,
     google_doc_read,
@@ -113,6 +114,243 @@ def test_airtable_context_finance_base_name_uses_finance_alias(
     assert resolved["base_id"] == "appFinance"
     assert records["request"]["url"] == "https://api.airtable.com/v0/<base_id>/Tax%20Payments"  # type: ignore[index]
     assert records["request"]["table"] == "Tax Payments"  # type: ignore[index]
+
+
+def test_airtable_aggregate_records_is_schema_first_period_bounded_and_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_schema(**kwargs: object) -> dict[str, object]:
+        calls.append(("schema", dict(kwargs)))
+        return {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Personal Expenses",
+                        "fields": [
+                            {"name": "Date of Expense"},
+                            {"name": "Estimated Tax Periods"},
+                            {"name": "Total Expenses"},
+                        ],
+                    }
+                ]
+            },
+        }
+
+    def fake_read(table: str, **kwargs: object) -> dict[str, object]:
+        calls.append(("records", {"table": table, **kwargs}))
+        return {
+            "status": "success",
+            "records": [
+                {
+                    "id": "recOne",
+                    "fields": {
+                        "Date of Expense": "2026-06-20",
+                        "Estimated Tax Periods": "Q3",
+                        "Total Expenses": "100.10",
+                    },
+                },
+                {
+                    "id": "recTwo",
+                    "fields": {
+                        "Date of Expense": "2026-07-01",
+                        "Estimated Tax Periods": ["3"],
+                        "Total Expenses": "$20.20",
+                    },
+                },
+                {
+                    "id": "recWrongPeriod",
+                    "fields": {
+                        "Date of Expense": "2026-05-01",
+                        "Estimated Tax Periods": "2",
+                        "Total Expenses": "999.00",
+                    },
+                },
+                {
+                    "id": "recWrongYear",
+                    "fields": {
+                        "Date of Expense": "2025-07-01",
+                        "Estimated Tax Periods": "third",
+                        "Total Expenses": "500.00",
+                    },
+                },
+                {
+                    "id": "recNoYear",
+                    "fields": {
+                        "Estimated Tax Periods": "3",
+                        "Total Expenses": "700.00",
+                    },
+                },
+            ],
+            "record_limit": 500,
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(internal_data_tools, "airtable_get_base_schema_impl", fake_schema)
+    monkeypatch.setattr(internal_data_tools, "airtable_read_records_impl", fake_read)
+
+    result = airtable_aggregate_records_impl(
+        table="Personal Expenses",
+        estimated_period="third estimated period",
+        year=2026,
+        live=True,
+    )
+
+    assert [name for name, _ in calls] == ["schema", "records"]
+    assert calls[1][1]["table"] == "Personal Expenses"
+    assert calls[1][1]["base_alias"] == "finance_tax_tracker"
+    assert calls[1][1]["fetch_all"] is True
+    assert result["status"] == "success"
+    assert result["total"] == "120.30"
+    assert result["estimated_period"] == 3
+    assert result["year"] == 2026
+    assert result["matching_records"] == 2
+    assert result["verification"]["passed"] is True  # type: ignore[index]
+    assert "records" not in result
+    assert result["result_scope"]["item_refs"] == ["recOne", "recTwo"]  # type: ignore[index]
+    assert "matching_record_summaries" not in result
+
+
+def test_airtable_aggregate_projects_verified_matching_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Personal Expenses",
+                        "fields": [
+                            {"name": "Item"},
+                            {"name": "Merchant"},
+                            {"name": "Date of Expense"},
+                            {"name": "Estimated Tax Periods"},
+                            {"name": "Total Expenses"},
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_read_records_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "records": [
+                {
+                    "id": "recOne",
+                    "fields": {
+                        "Item": "Course registration",
+                        "Merchant": "Alpha Learning",
+                        "Date of Expense": "2026-06-20",
+                        "Estimated Tax Periods": "Q3",
+                        "Total Expenses": "100.10",
+                    },
+                },
+                {
+                    "id": "recTwo",
+                    "fields": {
+                        "Item": "Software subscription",
+                        "Merchant": "Beta Tools",
+                        "Date of Expense": "2026-07-01",
+                        "Estimated Tax Periods": "3",
+                        "Total Expenses": "20.20",
+                    },
+                },
+            ],
+            "record_limit": 500,
+            "truncated": False,
+        },
+    )
+
+    result = airtable_aggregate_records_impl(
+        table="Personal Expenses",
+        estimated_period="third",
+        year=2026,
+        include_matching_records=True,
+        expected_record_ids=["recTwo", "recOne"],
+        expected_total="$120.30",
+        live=True,
+    )
+
+    assert result["complete"] is True
+    assert result["verified"] is True
+    assert result["verification"]["scope_membership_match"] is True  # type: ignore[index]
+    assert result["verification"]["prior_total_match"] is True  # type: ignore[index]
+    assert result["result_scope"]["item_refs"] == ["recOne", "recTwo"]  # type: ignore[index]
+    assert result["matching_record_summaries"] == [
+        {
+            "key": "Course registration",
+            "value": (
+                "Merchant: Alpha Learning; Date of Expense: 2026-06-20; "
+                "Total Expenses: $100.10"
+            ),
+            "note": "Estimated Tax Periods: Q3",
+        },
+        {
+            "key": "Software subscription",
+            "value": (
+                "Merchant: Beta Tools; Date of Expense: 2026-07-01; "
+                "Total Expenses: $20.20"
+            ),
+            "note": "Estimated Tax Periods: 3",
+        },
+    ]
+
+
+def test_airtable_aggregate_records_blocks_when_period_evidence_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_get_base_schema_impl",
+        lambda **_kwargs: {
+            "status": "success",
+            "schema": {
+                "tables": [
+                    {
+                        "name": "Personal Expenses",
+                        "fields": [
+                            {"name": "Date of Expense"},
+                            {"name": "Total Expenses"},
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_read_records_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "records": [{"fields": {"Total Expenses": "25.00"}}],
+            "truncated": False,
+        },
+    )
+
+    result = airtable_aggregate_records_impl(
+        table="Personal Expenses",
+        estimated_period="Q3",
+        year=2026,
+        live=True,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "estimated_period_not_resolvable_from_provider_fields"
+
+
+@pytest.mark.parametrize("value", ["3", "Q3", "third", "third estimated period"])
+def test_airtable_estimated_period_normalization_accepts_equivalent_phrasings(
+    value: str,
+) -> None:
+    assert internal_data_tools._airtable_estimated_period_number(value) == 3
 
 
 def test_airtable_context_result_preserves_bounded_record_summaries() -> None:
@@ -663,6 +901,104 @@ def test_latest_zotero_journal_helper_does_not_require_abstract(
         zotero_read_api_metadata(library_id="12345", item_type="attachment", live=False)
 
 
+def test_ranked_zotero_journal_helper_requests_only_the_bounded_provider_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_read(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return json.dumps({"status": "success", "provider_read": True, "items": []})
+
+    monkeypatch.setattr(
+        "keystone_agents.tools.zotero_context_tools.zotero_read_api_metadata",
+        fake_read,
+    )
+
+    payload = read_latest_zotero_journal_metadata(selection_rank=3)
+
+    assert payload["provider_read"] is True
+    assert captured == {
+        "limit": 3,
+        "sort": "dateAdded",
+        "direction": "desc",
+        "top_level_only": True,
+        "item_type": "journalArticle",
+        "require_abstract": False,
+        "selection_rank": 3,
+        "live": True,
+    }
+    dry_run = _loads(
+        zotero_read_api_metadata(
+            library_id="12345",
+            limit=1,
+            sort="dateAdded",
+            direction="desc",
+            selection_rank=3,
+            live=False,
+        )
+    )
+    assert dry_run["params"]["limit"] == 3
+    assert dry_run["selection_rank"] == 3
+    assert dry_run["selection_rule"] == "ranked_item_in_provider_order"
+
+    with pytest.raises(ValueError, match="between 1 and 10"):
+        zotero_read_api_metadata(selection_rank=11, live=False)
+
+
+def test_ranked_zotero_metadata_selects_exact_provider_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    items = [
+        {
+            "key": f"ITEM{rank}",
+            "data": {
+                "title": f"Provider article {rank}",
+                "dateAdded": f"2026-07-{30 - rank:02d}T12:00:00Z",
+            },
+        }
+        for rank in range(1, 4)
+    ]
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "12345")
+    monkeypatch.setattr(
+        "keystone_agents.tools.zotero_context_tools._read_zotero_api_json",
+        lambda *_args, **_kwargs: items,
+    )
+
+    selected = _loads(
+        zotero_read_api_metadata(
+            sort="dateAdded",
+            direction="desc",
+            top_level_only=True,
+            item_type="journalArticle",
+            selection_rank=2,
+            live=True,
+        )
+    )
+    missing = _loads(
+        zotero_read_api_metadata(
+            sort="dateAdded",
+            direction="desc",
+            top_level_only=True,
+            item_type="journalArticle",
+            selection_rank=4,
+            live=True,
+        )
+    )
+
+    assert selected["status"] == "success"
+    assert selected["selection_rank"] == 2
+    assert selected["available_item_count"] == 3
+    assert selected["selected_item_key"] == "ITEM2"
+    assert selected["selected_item_title"] == "Provider article 2"
+    assert [item["key"] for item in selected["items"]] == ["ITEM2"]
+    assert missing["status"] == "not_found"
+    assert missing["selection_rank"] == 4
+    assert missing["available_item_count"] == 3
+    assert missing["items"] == []
+
+
 def test_zotero_metadata_projection_preserves_requested_provider_fields() -> None:
     projection = project_zotero_item_metadata(
         {
@@ -690,6 +1026,29 @@ def test_zotero_metadata_projection_preserves_requested_provider_fields() -> Non
     assert projection["missing_requested_fields"] == []
     assert projection["provider_field_map"]["authors"] == "creators"
     assert projection["provider_field_map"]["publication_title"] == "publicationTitle"
+
+
+def test_zotero_metadata_projection_uses_typed_fields_without_reparsing_prose() -> None:
+    projection = project_zotero_item_metadata(
+        {
+            "key": "ITEM1",
+            "data": {
+                "itemType": "journalArticle",
+                "title": "A structured article",
+                "creators": [{"firstName": "Ada", "lastName": "Lovelace"}],
+                "abstractNote": "Stored abstract.",
+            },
+        },
+        request_text="The historical note mentioned an abstract and all metadata.",
+        requested_fields=["title", "authors"],
+    )
+
+    assert projection["requested_fields"] == ["title", "authors"]
+    assert projection["fields"] == {
+        "title": "A structured article",
+        "authors": ["Ada Lovelace"],
+    }
+    assert projection["provider_fields"] == {}
 
 
 def test_zotero_broad_metadata_projection_retains_bounded_unknown_provider_fields() -> None:

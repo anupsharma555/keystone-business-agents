@@ -73,6 +73,16 @@ def test_collect_finance_packet_requires_verified_deterministic_provider_result(
     assert packet.finance_receipt["raw_records_persisted"] is False
     assert "read-only" in captured["request"].casefold()
     assert captured["kwargs"]["force_sdk_interpretation"] is False
+    assert captured["kwargs"]["manual_request_plan"] == {
+        "source": "canonical:l174_19_finance_packet",
+        "target_agent": "chief_of_staff",
+        "intent": "context_lookup",
+        "task_objective": "context_lookup",
+        "primary_target": "finance_tax_tracker current quarter",
+        "target_type": "business_system_context",
+        "provider_system": "airtable",
+        "provider_operations": ["read"],
+    }
 
 
 def test_offline_decision_plan_is_sanitized_and_no_write() -> None:
@@ -178,6 +188,14 @@ def test_fake_model_decision_compares_both_selects_one_and_preserves_receipts() 
     assert captured["kwargs"]["attach_tools"] is False
     assert captured["kwargs"]["include_specialist_tools"] is False
     assert captured["kwargs"]["quality_budget"].max_turns == 1
+    assert captured["sdk_input"]["manual_request_plan"] == {
+        "source": "canonical:l174_19_finance_bd_priority",
+        "target_agent": "chief_of_staff",
+        "workflow": ["chief_of_staff", "opportunity_scout"],
+        "intent": "route_request",
+        "task_objective": "route_or_continue",
+        "primary_target": "next business-development priority",
+    }
     assert packet.finance_summary not in str(captured["sdk_input"]["finance_context"])
     assert captured["sdk_input"]["finance_context"]["proof_scope"] == (
         "sanitized_context_proof"

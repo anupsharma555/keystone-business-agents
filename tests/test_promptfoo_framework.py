@@ -6967,6 +6967,73 @@ def test_promptfoo_provider_handles_missing_route_result(monkeypatch) -> None:
     assert output["side_effects"]["approval_ref"] == ""
 
 
+def test_promptfoo_provider_isolates_child_state_from_operator_database(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///keystone_agents.db")
+    monkeypatch.setenv("KEYSTONE_HOME", "/operator/keystone-home")
+    monkeypatch.setenv(
+        "KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB",
+        "/operator/human-reviews.sqlite",
+    )
+    monkeypatch.setenv("KEYSTONE_TRACE_SUMMARY_DB", "/operator/trace-summaries.sqlite")
+
+    def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        env = dict(kwargs["env"])
+        captured["env"] = env
+        database_url = str(env["DATABASE_URL"])
+        database_path = Path(database_url.removeprefix("sqlite:///"))
+        captured["state_directory"] = database_path.parent
+        assert database_path.parent.is_dir()
+        assert database_path != Path("keystone_agents.db")
+        database_path.write_text("isolated test state", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "status": "done",
+                    "route": "chief_of_staff",
+                    "human_summary": "Offline result.",
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(keystone_agent_provider.subprocess, "run", fake_run)
+    result = keystone_agent_provider.call_api(
+        '@KNI chief of staff "summarize this note"',
+        {"config": {"python": ".venv/bin/python", "agent": "chief_of_staff"}},
+        {
+            "vars": {
+                "surface": "slack",
+                "user_input": '@KNI chief of staff "summarize this note"',
+            }
+        },
+    )
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["PYTHON_DOTENV_DISABLED"] == "1"
+    assert env["KEYSTONE_TEST_MODE"] == "1"
+    assert env["DATABASE_URL"] != "sqlite:///keystone_agents.db"
+    assert env["KEYSTONE_HOME"] != "/operator/keystone-home"
+    assert env["KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB"] != "/operator/human-reviews.sqlite"
+    assert env["KEYSTONE_TRACE_SUMMARY_DB"] != "/operator/trace-summaries.sqlite"
+    state_directory = captured["state_directory"]
+    assert isinstance(state_directory, Path)
+    assert not state_directory.exists()
+
+    output = json.loads(result["output"])
+    assert output["state_isolation"] == {
+        "schema": "keystone.promptfoo.state_isolation.v1",
+        "isolated": True,
+        "storage_scope": "per_case_temporary",
+        "operator_database_used": False,
+        "dotenv_loading_disabled": True,
+        "test_mode": True,
+    }
+
+
 def test_promptfoo_provider_normalizes_missing_safe_side_effect_evidence(monkeypatch) -> None:
     stdout_payload = {
         "status": "done",

@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.tools.gmail_tool import GMAIL_SCOPES as KBA_GOOGLE_SCOPES
+
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - dependency is declared for the repo.
@@ -29,8 +31,8 @@ WORKSPACE_SCOPES = (
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/spreadsheets",
 )
-GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
-CALENDAR_SCOPES = ("https://www.googleapis.com/auth/calendar.readonly",)
+GMAIL_SCOPES = tuple(scope for scope in KBA_GOOGLE_SCOPES if "/auth/gmail." in scope)
+CALENDAR_SCOPES = tuple(scope for scope in KBA_GOOGLE_SCOPES if "/auth/calendar." in scope)
 
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 DOC_MIME_TYPE = "application/vnd.google-apps.document"
@@ -77,6 +79,11 @@ def _json_file_status(path: Path | None) -> dict[str, Any]:
     if not isinstance(payload, dict):
         details["error"] = "not_object"
         return details
+    raw_scopes = payload.get("scopes")
+    if isinstance(raw_scopes, list | tuple | set):
+        granted_scopes = [str(scope).strip() for scope in raw_scopes if str(scope).strip()]
+    else:
+        granted_scopes = str(payload.get("scope") or "").split()
     details.update(
         {
             "valid_json": True,
@@ -84,7 +91,8 @@ def _json_file_status(path: Path | None) -> dict[str, Any]:
             "has_access_token": bool(
                 str(payload.get("token") or payload.get("access_token") or "").strip()
             ),
-            "scope_field_present": bool(str(payload.get("scope") or "").strip()),
+            "scope_field_present": bool(granted_scopes),
+            "granted_scopes": sorted(set(granted_scopes)),
         }
     )
     return details
@@ -95,6 +103,7 @@ def _client_secret_status(path: Path | None) -> dict[str, Any]:
     details.pop("has_access_token", None)
     details.pop("has_refresh_token", None)
     details.pop("scope_field_present", None)
+    details.pop("granted_scopes", None)
     details["has_client_config"] = False
     if not details.get("valid_json") or path is None:
         return details
@@ -128,6 +137,16 @@ def _offline_oauth_check(
             issues.append("oauth_token_invalid")
         elif not token.get("has_refresh_token"):
             issues.append("refresh_token_missing")
+        if token.get("valid_json"):
+            granted_scopes = set(token.get("granted_scopes") or [])
+            if not granted_scopes:
+                issues.append("oauth_scope_metadata_missing")
+            else:
+                issues.extend(
+                    f"oauth_scope_missing:{scope}"
+                    for scope in required_scopes
+                    if scope not in granted_scopes
+                )
         if client_secret_path and not secret["present"]:
             issues.append("oauth_client_secret_missing")
         elif client_secret_path and not secret["valid_json"]:
@@ -412,7 +431,11 @@ def _live_gmail_check(env: Mapping[str, str]) -> HealthCheck:
 
 
 def _live_calendar_check(env: Mapping[str, str]) -> HealthCheck:
-    token_path = _path(_env(env, "CALENDAR_OAUTH_TOKEN_PATH"))
+    token_path = _path(
+        _env(env, "CALENDAR_OAUTH_TOKEN_PATH")
+        or _env(env, "GMAIL_OAUTH_TOKEN_PATH")
+        or _env(env, "GOOGLE_TOKEN_FILE")
+    )
     if token_path is None:
         return HealthCheck(
             name="google_calendar",
@@ -452,8 +475,16 @@ def run_google_health_check(
     gmail_secret = _path(
         _env(source, "GMAIL_OAUTH_CLIENT_SECRET_PATH") or _env(source, "GOOGLE_CREDENTIALS_FILE")
     )
-    calendar_token = _path(_env(source, "CALENDAR_OAUTH_TOKEN_PATH"))
-    calendar_secret = _path(_env(source, "CALENDAR_OAUTH_CLIENT_SECRET_PATH"))
+    calendar_token = _path(
+        _env(source, "CALENDAR_OAUTH_TOKEN_PATH")
+        or _env(source, "GMAIL_OAUTH_TOKEN_PATH")
+        or _env(source, "GOOGLE_TOKEN_FILE")
+    )
+    calendar_secret = _path(
+        _env(source, "CALENDAR_OAUTH_CLIENT_SECRET_PATH")
+        or _env(source, "GMAIL_OAUTH_CLIENT_SECRET_PATH")
+        or _env(source, "GOOGLE_CREDENTIALS_FILE")
+    )
 
     checks = [
         _offline_oauth_check(
