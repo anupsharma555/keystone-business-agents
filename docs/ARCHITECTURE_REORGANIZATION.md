@@ -200,3 +200,20 @@ offline tranche passes. Before publication:
 4. publish only focused, reviewable commits or stacked pull requests;
 5. run live direct, Slack, provider, and LangGraph acceptance only as a
    separately authorized, serial, cost-bounded step.
+
+Before any live architecture acceptance, use an architecture-worktree virtual
+environment rather than the frozen checkout's shared interpreter and run:
+
+```bash
+.venv/bin/python scripts/assert_runtime_checkout.py \
+  --expected-root /Users/anup/gitProjects/keystone-business-agents-architecture \
+  --require-worktree-venv \
+  --json
+```
+
+The gate must show that `keystone_agents`, `keystone_agents.cli`, and
+`keystone_agents.authority.semantic` all resolve under the intended architecture
+checkout. A Slack worker must not be restarted for architecture acceptance until
+this gate passes and its `KNI_BUSINESS_AGENTS_PYTHON` and
+`KNI_BUSINESS_AGENTS_REPO` runtime overrides point to that environment and
+checkout.
