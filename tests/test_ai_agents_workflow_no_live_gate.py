@@ -25,6 +25,12 @@ def test_current_no_live_gate_excludes_legacy_promptfoo_and_live_flags() -> None
     assert "tests/test_semantic_execution.py" in commands[0]
     assert "tests/test_semantic_routing_variations.py" in commands[0]
     assert any("run_slack_agent_expansion_gate.py --quiet" in row for row in rendered)
+    expansion_command = next(
+        command
+        for command in commands
+        if any(part.endswith("run_slack_agent_expansion_gate.py") for part in command)
+    )
+    assert expansion_command[-2:] == ["--python", module.sys.executable]
     assert any("run_advanced_manager_acceptance.py" in row for row in rendered)
     assert any("run_manager_delegation_readiness.py" in row for row in rendered)
     assert any("run_slack_entrypoint_readiness.py" in row for row in rendered)
