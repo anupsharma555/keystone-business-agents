@@ -97,10 +97,10 @@ scripts/benchmark_architecture_latency.py \
   --json-output docs/architecture/pre_reorganization_latency.json
 ```
 
-Initial targets, measured against the same-machine tagged baseline:
+First-tranche targets, measured against the same-machine tagged baseline:
 
 - reduce median cold CLI help time by at least 40%;
-- reduce p95 fake direct and continuation framework overhead by at least 25%;
+- reduce p95 cold CLI import and help time by at least 40%;
 - plan once and compile capabilities once for a new request;
 - perform zero planner calls for an unchanged literal continuation with a
   valid persisted plan;
@@ -109,6 +109,11 @@ Initial targets, measured against the same-machine tagged baseline:
   lower;
 - complete two independent fake read stages at least 25% faster while keeping
   mutations, approvals, receipts, and provider verification serialized.
+
+The p95 fake direct/continuation overhead target remains deferred until those
+benchmark surfaces are added and recorded. Its acceptance threshold will be at
+least a 25% reduction from the tagged baseline. It is not represented by the
+current CLI-only post-tranche artifact.
 
 Latency improvements must not skip Orchestrator interpretation for new asks,
 deterministic safety gates, approvals, provider read-back, receipt
@@ -173,6 +178,10 @@ baseline. Results are recorded in
 | --- | ---: | ---: | ---: |
 | `import keystone_agents.cli` | 1,427.809 ms | 20.868 ms | 98.54% |
 | `python -m keystone_agents.cli --help` | 1,425.694 ms | 24.650 ms | 98.27% |
+
+The corresponding p95 reductions are 98.22% for CLI import and 98.00% for CLI
+help. The recorded-report test enforces at least a 40% reduction for both
+median and p95 on both CLI surfaces.
 
 This improvement comes from deferring the heavyweight CLI implementation until
 a command actually needs it. It does not bypass planning, safety checks,
