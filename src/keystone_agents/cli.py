@@ -125,6 +125,7 @@ from keystone_agents.orchestrator.preflight_context import (
 )
 from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
 from keystone_agents.quality_budget import is_bounded_chief_response_only_request
+from keystone_agents.receipts.mutations import receipt_reports_possible_write
 from keystone_agents.reporting import (
     render_markdown_table,
     render_work_item_result_text,
@@ -9139,31 +9140,7 @@ def _airtable_write_execution_blocker(
 def _context_agent_receipt_is_write(receipt: dict[str, object]) -> bool:
     """Return whether a bounded tool receipt represents a provider mutation."""
 
-    write_operations = {
-        "create",
-        "update",
-        "delete",
-        "delete_test_record",
-        "test_record_lifecycle",
-        "test_note_lifecycle",
-        "delete_test_note",
-        "create_sheet",
-        "append_rows",
-        "update_row",
-        "delete_rows",
-        "trash_sheet",
-        "create_note",
-        "update_note",
-        "link_attachment",
-        "create_expense_from_receipt",
-        "reconcile_duplicate_expense",
-        "extract_slide_copy",
-        "delete_test_slide_artifact",
-    }
-    return bool(
-        receipt.get("operation") in write_operations
-        or str(receipt.get("approval_reference") or "").strip()
-    )
+    return receipt_reports_possible_write(receipt)
 
 
 def _reconcile_context_agent_executed_write_plan(

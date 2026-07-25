@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from keystone_agents.agent_mentions import parse_agent_mention
+from keystone_agents.receipts.mutations import receipt_reports_possible_write
 from keystone_agents.schemas.execution_request import (
     ExecutionContinuation,
     ExecutionEntrypoint,
@@ -553,19 +554,7 @@ def _payload_receipts(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 
 def _receipt_is_write(receipt: Mapping[str, Any]) -> bool:
-    operation = str(
-        receipt.get("operation")
-        or receipt.get("action")
-        or receipt.get("operation_type")
-        or ""
-    ).lower()
-    return bool(
-        re.search(
-            r"(?:^|_)(?:append|attach|create|delete|label|lifecycle|link|modify|"
-            r"post|reconcile|remove|send|trash|update|upload|write)(?:_|$)",
-            operation,
-        )
-    )
+    return receipt_reports_possible_write(receipt)
 
 
 def slack_work_item_control_requested(current_request: str) -> bool:
