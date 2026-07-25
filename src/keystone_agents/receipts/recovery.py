@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, TypeVar
 
+from keystone_agents.receipts.mutations import receipt_reports_possible_write
 from keystone_agents.receipts.normalization import (
     normalize_provider_mutation_receipt,
     payload_digest,
@@ -20,6 +21,16 @@ from keystone_agents.schemas.provider_recovery import (
 T = TypeVar("T")
 
 _CHECKPOINT_SCHEMA = "keystone.provider_recovery_checkpoint.v1"
+_FAILED_MUTATION_STATUSES = {
+    "blocked",
+    "cancelled",
+    "denied",
+    "error",
+    "failed",
+    "rejected",
+}
+
+
 class ProviderRecoveryError(RuntimeError):
     """Base error for invalid or conflicting provider recovery state."""
 
@@ -72,13 +83,15 @@ class ProviderRecoveryStore:
         """Persist one successful mutation receipt before downstream work continues."""
 
         receipt = normalize_provider_mutation_receipt(raw_receipt)
+        status = str(receipt.payload.get("status") or "").strip().lower()
         if (
-            str(receipt.payload.get("status") or "").lower() != "success"
+            status in _FAILED_MUTATION_STATUSES
+            or not receipt_reports_possible_write(receipt.payload)
             or not receipt.object_id
             or receipt.verification_passed is not True
         ):
             raise ProviderRecoveryError(
-                "Only a successful, identity-bearing, provider-verified mutation "
+                "Only a non-dry-run, identity-bearing, provider-verified mutation "
                 "receipt may be checkpointed."
             )
         existing = next(
