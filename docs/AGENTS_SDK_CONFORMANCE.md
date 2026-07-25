@@ -16,8 +16,16 @@ concept in an explicit local boundary.
 | Function tools and integration boundaries | `src/keystone_agents/tools/` |
 | Structured output types | `src/keystone_agents/schemas/` |
 | Guardrails and approval checks | `src/keystone_agents/guardrails.py`, `src/keystone_agents/schemas/approval.py` |
+| Semantic execution authority | `src/keystone_agents/authority/semantic.py`; public facade: `src/keystone_agents/semantic_execution.py` |
+| Bounded compatibility planning | `src/keystone_agents/planning/compatibility.py`; public facade: `src/keystone_agents/manual_request.py` |
+| Capability admission | `src/keystone_agents/capabilities/profile.py`; public facade: `src/keystone_agents/capability_profile.py` |
+| Mutation receipts, idempotency, and provider recovery | `src/keystone_agents/receipts/`; public facades: `src/keystone_agents/provider_recovery.py`, `src/keystone_agents/tool_receipt_journal.py` |
+| Request-scoped runtime composition | `src/keystone_agents/runtime/request.py` |
 | Handoffs and orchestration | `src/keystone_agents/agents/orchestrator.py` |
+| Public executable-stage boundary | `src/keystone_agents/orchestration/stages.py`; execution kernel: `src/keystone_agents/workflow_runner.py` |
 | Results, local state, and audit storage | `src/keystone_agents/run.py`, `src/keystone_agents/storage/` |
+| Public-result assembly and rendering | `src/keystone_agents/presentation/`; public facades: `src/keystone_agents/reporting.py`, `src/keystone_agents/terminal_result_consistency.py` |
+| CLI entrypoint | Public facade: `src/keystone_agents/cli.py`; implementation: `src/keystone_agents/entrypoints/cli_impl.py` |
 | Optional LangGraph WorkItem orchestration | `src/keystone_agents/langgraph_workflow.py`, `docs/LANGGRAPH_OPTION.md` |
 | Evals and regression tests | `tests/`, `evals/` |
 | Future improvement test pack | `docs/AGENT_IMPROVEMENT_TEST_PACK.md` |
@@ -41,6 +49,9 @@ concept in an explicit local boundary.
   guarded function wrappers.
 - Storage and approval state are local-first and do not create send, schedule, or
   publish side effects.
+- Supported top-level compatibility modules remain stable import surfaces, but
+  new semantic and business logic belongs in the canonical implementation
+  packages listed above.
 - Orchestrator preflight is the first model control-plane step for
   natural-language Slack, CLI, WorkItem, scheduled-automation, and explicit
   named-agent paths. Specialists still receive the raw request plus compact
