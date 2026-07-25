@@ -56,7 +56,9 @@ SDK_EXECUTION_SURFACE_ALLOWLIST = {
     Path("src/keystone_agents/run.py"): (
         "typed live-synthesis bridge that calls the central wrapper"
     ),
-    Path("src/keystone_agents/cli.py"): "legacy CLI adapter that calls the central wrapper",
+    Path("src/keystone_agents/entrypoints/cli_impl.py"): (
+        "full CLI command implementation that calls the central wrapper"
+    ),
     Path("src/keystone_agents/sandboxing.py"): "separately gated sandbox execution boundary",
 }
 
