@@ -19,6 +19,23 @@ from keystone_agents.manual_request import (
     positive_capability_text,
     request_forbids_response_composition,
 )
+from keystone_agents.orchestration.stages import (
+    MANAGER_LOOP_STOP_STATUSES,
+    PreparedWorkItemStep,
+    advance_work_item,
+    advance_work_item_manager_loop,
+    answer_work_item_state_followup,
+    apply_planned_workflow_continuation,
+    finalize_manager_loop_result,
+    finalize_prepared_work_item_step,
+    manager_loop_request_is_planning_only,
+    manual_plan_requests_manager_continuation,
+    normalize_workflow_request_for_graph,
+    operator_requested_manager_continuation,
+    prepare_work_item_step,
+    run_prepared_work_item_specialist,
+    synthesize_terminal_work_item_response,
+)
 from keystone_agents.schemas.approval import ApprovalState
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.work_item import (
@@ -42,23 +59,10 @@ from keystone_agents.tools.announcement_context_tools import (
 from keystone_agents.tools.zotero_context_tools import (
     read_latest_zotero_journal_abstract_metadata,
 )
-from keystone_agents.work_items import attach_artifact, build_context_pack_for_route, record_event
-from keystone_agents.workflow_runner import (
-    _MANAGER_LOOP_STOP_STATUSES,
-    PreparedWorkItemStep,
-    _apply_planned_workflow_continuation,
-    _finalize_manager_loop_result,
-    _manager_loop_request_is_planning_only,
-    _manual_plan_requests_manager_continuation,
-    _operator_requested_manager_continuation,
-    advance_work_item,
-    advance_work_item_manager_loop,
-    answer_work_item_state_followup,
-    finalize_prepared_work_item_step,
-    normalize_workflow_request_for_graph,
-    prepare_work_item_step,
-    run_prepared_work_item_specialist,
-    synthesize_terminal_work_item_response,
+from keystone_agents.work_items import (
+    attach_artifact,
+    build_context_pack_for_route,
+    record_event,
 )
 
 LANGGRAPH_WORKITEM_ENV_KEYS = (
@@ -151,7 +155,7 @@ def should_use_langgraph_for_work_item(
     authority = ExecutionIntentAuthority.from_value(request.manual_request_plan)
     semantic_plan = authority.plan if authority.canonical else None
     if semantic_plan is not None:
-        if _manager_loop_request_is_planning_only(
+        if manager_loop_request_is_planning_only(
             request.request_text,
             manual_request_plan=request.manual_request_plan,
         ):
@@ -170,15 +174,15 @@ def should_use_langgraph_for_work_item(
         return False
     if not manager_loop:
         return _request_has_graph_worthy_single_step_boundary(normalized)
-    if _manager_loop_request_is_planning_only(
+    if manager_loop_request_is_planning_only(
         normalized,
         manual_request_plan=request.manual_request_plan,
     ):
         return False
-    if _operator_requested_manager_continuation(normalized):
+    if operator_requested_manager_continuation(normalized):
         return True
     if any(
-        _operator_requested_manager_continuation(normalized, next_action_agent=agent)
+        operator_requested_manager_continuation(normalized, next_action_agent=agent)
         for agent in (
             WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
             WorkItemRoute.OPPORTUNITY_SCOUT,
@@ -1573,7 +1577,7 @@ def _manager_loop_stop_reason(state: WorkItemGraphState) -> str:
     max_steps = max(1, min(5, int(state.get("max_manager_steps") or 3)))
     if not result.advanced:
         return "stopped because the current graph step did not safely advance"
-    if result.status in _MANAGER_LOOP_STOP_STATUSES:
+    if result.status in MANAGER_LOOP_STOP_STATUSES:
         return f"stopped at WorkItem status {result.status.value}"
     if step_index >= max_steps:
         return f"stopped at graph manager loop max_steps={max_steps}"
@@ -1595,8 +1599,8 @@ def _manager_loop_stop_reason(state: WorkItemGraphState) -> str:
             state.get("original_request") or state.get("request") or {}
         )
         if not (
-            _manual_plan_requests_manager_continuation(original_request, result)
-            or _operator_requested_manager_continuation(
+            manual_plan_requests_manager_continuation(original_request, result)
+            or operator_requested_manager_continuation(
                 original_request.request_text,
                 next_action_agent=result.next_action.agent,
             )
@@ -1644,7 +1648,7 @@ def _manager_loop_finalize_node(state: WorkItemGraphState) -> WorkItemGraphState
         if original_request.save
         else None
     )
-    result = _finalize_manager_loop_result(
+    result = finalize_manager_loop_result(
         result,
         original_request=original_request,
         stop_reason=stop_reason,
@@ -2554,7 +2558,7 @@ def _finalize_step_node(state: WorkItemGraphState) -> WorkItemGraphState:
             if original_request.save
             else None
         )
-        result = _apply_planned_workflow_continuation(
+        result = apply_planned_workflow_continuation(
             result,
             original_request=original_request,
             completed_steps=loop_steps,
