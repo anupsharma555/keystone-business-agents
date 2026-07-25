@@ -7,8 +7,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 
 
 class QualityMode(StrEnum):

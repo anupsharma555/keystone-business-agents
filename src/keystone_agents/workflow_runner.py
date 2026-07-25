@@ -36,6 +36,7 @@ from keystone_agents.agents.outreach_composer import (
     load_style_profile,
 )
 from keystone_agents.agents.web_query_planner import resolve_web_query_plan
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.cli_sdk import jsonable
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.config import cli_default_live_gmail, load_settings
@@ -177,7 +178,6 @@ from keystone_agents.sdk_sessions import (
     context_file_session_components,
     resolve_sdk_session_spec,
 )
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.skill_contract_gates import evaluate_work_item_skill_gates
 from keystone_agents.skill_sets import (
     AGENT_SKILL_NAMES,

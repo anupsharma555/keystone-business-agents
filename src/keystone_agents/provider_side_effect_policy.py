@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 
 
 def semantic_provider_side_effect_policy(

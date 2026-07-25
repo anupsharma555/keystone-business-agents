@@ -22,6 +22,7 @@ from keystone_agents.agent_tool_policy import (
     PUBLISH_TOOL_NAMES,
     tool_name_for_policy,
 )
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.automation_inventory import build_automation_inventory_report
 from keystone_agents.calendar_actions import infer_calendar_action_plan
 from keystone_agents.config import parse_bool
@@ -79,7 +80,6 @@ from keystone_agents.sdk import (
     compose_instructions,
     load_prompt,
 )
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.specialist_agent_tools import (
     SpecialistToolMode,

@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.finance_expense_receipts import (
     resolve_finance_expense_receipt_target,
 )
@@ -18,7 +19,6 @@ from keystone_agents.sdk import (
     compose_direct_instructions,
     compose_instructions,
 )
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.tools.internal_data_tools import (
     airtable_aggregate_records,

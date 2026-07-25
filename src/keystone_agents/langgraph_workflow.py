@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.manual_request import (
     positive_capability_text,
     request_forbids_response_composition,
@@ -50,7 +51,6 @@ from keystone_agents.schemas.work_item import (
     WorkItemSourceRef,
     WorkItemStatus,
 )
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.announcement_context_tools import (
     retrieve_preprint_announcement_history_impl,

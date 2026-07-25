@@ -9,6 +9,11 @@ from keystone_agents.agents.gmail_triage import (
     build_gmail_priority_grouping_agent,
     run_gmail_candidate_ranking_sdk,
 )
+from keystone_agents.authority.semantic import (
+    StageOperationBoundary,
+    StageOutputContract,
+    reconcile_stage_output,
+)
 from keystone_agents.gmail_triage.execution_plan import gmail_provider_read_scope
 from keystone_agents.models import (
     GmailCandidateRankingSDKInput,
@@ -25,11 +30,6 @@ from keystone_agents.schemas.email_triage import (
 )
 from keystone_agents.schemas.gmail_execution_plan import GmailExecutionPlan
 from keystone_agents.sdk import ToolGuardrailViolation
-from keystone_agents.semantic_execution import (
-    StageOperationBoundary,
-    StageOutputContract,
-    reconcile_stage_output,
-)
 from keystone_agents.tools.gmail_tool import (
     GmailTool,
     gmail_message_envelope_from_dict,

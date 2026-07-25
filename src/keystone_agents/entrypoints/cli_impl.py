@@ -36,6 +36,7 @@ from keystone_agents.agents.orchestrator import (
     run_orchestrator_preflight,
     run_orchestrator_sdk,
 )
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.automation_inventory import (
     build_automation_inventory_report,
     ensure_default_automation_inventory,
@@ -188,7 +189,6 @@ from keystone_agents.sdk_sessions import (
     resolve_sdk_session_spec,
     sdk_session_env,
 )
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.slack_action_contract import (
     KBA_EVAL_ORCHESTRATOR_JUDGE,
     KBA_EVAL_REVIEW,

@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.calendar_actions import is_calendar_action_candidate
 from keystone_agents.gmail_triage.relationship_query import (
     extract_known_contact_entity,
@@ -39,7 +40,6 @@ from keystone_agents.schemas.manual_request_plan import (
     ManualTaskObjective,
 )
 from keystone_agents.schemas.output_constraints import InterpretedOutputConstraints
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.zotero_research import (
     extract_zotero_article_query,
     extract_zotero_collection_hint,
