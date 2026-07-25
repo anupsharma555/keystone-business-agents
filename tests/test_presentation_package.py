@@ -24,6 +24,8 @@ def test_legacy_terminal_consistency_import_is_a_compatibility_facade() -> None:
 
 
 def test_public_result_boundary_preserves_legacy_assembly_contract() -> None:
+    assert legacy_attach_execution_public_result is attach_execution_public_result
+
     payload = {
         "status": "done",
         "human_summary": "The bounded read completed.",
