@@ -16,7 +16,16 @@ _MUTATION_OPERATION = re.compile(
 # Preserve existing exact context-agent classifications whose names do not
 # necessarily contain a mutation verb.
 _EXACT_MUTATION_OPERATIONS = {
+    "apply_gmail_labels",
     "extract_slide_copy",
+    "mark_important",
+    "mark_not_important",
+    "mark_read",
+    "mark_unread",
+    "restore",
+    "star",
+    "unarchive",
+    "unstar",
 }
 
 
@@ -39,6 +48,8 @@ def receipt_reports_possible_write(receipt: Mapping[str, Any]) -> bool:
     status = str(receipt.get("status") or "").strip().lower().replace("_", "-")
     if receipt.get("dry_run") is True or status == "dry-run":
         return False
+    if receipt.get("provider_write") is True:
+        return True
     if str(receipt.get("approval_reference") or "").strip():
         return True
     return any(

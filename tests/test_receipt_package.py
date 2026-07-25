@@ -29,6 +29,15 @@ from keystone_agents.receipts.normalization import normalize_tool_output_receipt
         "trash_sheet",
         "update_note",
         "extract_slide_copy",
+        "apply_gmail_labels",
+        "star",
+        "unstar",
+        "mark_read",
+        "mark_unread",
+        "mark_important",
+        "mark_not_important",
+        "restore",
+        "unarchive",
     ],
 )
 def test_shared_mutation_classifier_covers_existing_write_families(
@@ -73,6 +82,63 @@ def test_shared_mutation_classifier_uses_tool_name_and_approval_evidence() -> No
         "airtable_create_record",
         "workspace_lookup",
     }
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "star",
+        "unstar",
+        "mark_read",
+        "mark_unread",
+        "mark_important",
+        "mark_not_important",
+        "restore",
+        "unarchive",
+    ],
+)
+def test_shared_classifier_recognizes_exact_gmail_mailbox_mutations(
+    operation: str,
+) -> None:
+    assert operation_is_mutation(operation) is True
+
+
+def test_shared_classifier_does_not_use_a_broad_mark_keyword_rule() -> None:
+    assert operation_is_mutation("mark_for_review") is False
+
+
+def test_shared_classifier_recognizes_realistic_gmail_label_receipt() -> None:
+    receipt = {
+        "status": "labels_applied",
+        "tool_name": "apply_gmail_labels",
+        "provider_write": True,
+        "label_ids": ["Label_fixture"],
+    }
+
+    assert receipt_reports_possible_write(receipt) is True
+    assert mutation_tool_names([receipt]) == {"apply_gmail_labels"}
+    assert normalize_tool_output_receipt("apply_gmail_labels", receipt) == {
+        "status": "labels_applied",
+        "provider_write": True,
+        "tool_name": "apply_gmail_labels",
+    }
+
+
+def test_provider_write_true_is_authoritative_except_for_dry_run() -> None:
+    assert receipt_reports_possible_write(
+        {
+            "status": "success",
+            "tool_name": "provider_fixture",
+            "provider_write": True,
+        }
+    )
+    assert not receipt_reports_possible_write(
+        {
+            "status": "dry-run",
+            "tool_name": "apply_gmail_labels",
+            "provider_write": True,
+        }
+    )
 
 
 def test_tool_output_normalization_preserves_the_existing_bounded_contract() -> None:
