@@ -7,9 +7,9 @@ from dataclasses import dataclass
 
 _COST_TRACKING_DIRECTIVE_RE = re.compile(
     r"(?:^|\b)(?:also\s+)?(?:keep|track|include|show|record|report)\s+"
-    r"(?:track\s+of\s+)?(?:this\s+run\s+)?costs?\b"
-    r"|(?:^|\b)cost\s+tracking\b"
-    r"|(?:^|\b)track\s+(?:this\s+)?run\s+costs?\b",
+    r"(?:track\s+of\s+)?(?:this\s+|the\s+|current\s+)?run\s+costs?\b"
+    r"|(?:^|\b)(?:this\s+run\s+|run\s+)?cost\s+tracking\b"
+    r"|(?:^|\b)track\s+(?:this\s+|the\s+|current\s+)?run\s+costs?\b",
     flags=re.I,
 )
 

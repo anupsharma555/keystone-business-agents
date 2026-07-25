@@ -92,6 +92,7 @@ def call_api(prompt: str, options: dict[str, Any], context: dict[str, Any]) -> d
     context_file = _write_slack_context(vars_)
     if context_file:
         command.extend(["--context-file", str(context_file)])
+    state_directory = Path(tempfile.mkdtemp(prefix="kba-promptfoo-state-"))
 
     started = time.monotonic()
     allowed_credential_categories = _allowed_credential_categories(
@@ -106,6 +107,7 @@ def call_api(prompt: str, options: dict[str, Any], context: dict[str, Any]) -> d
         live_sdk=live_sdk,
         live_search=live_search,
         allowed_credential_categories=allowed_credential_categories,
+        state_directory=state_directory,
     )
     try:
         completed = subprocess.run(
@@ -127,6 +129,7 @@ def call_api(prompt: str, options: dict[str, Any], context: dict[str, Any]) -> d
         )
     finally:
         _cleanup_promptfoo_context_file(context_file, keep=_truthy(config.get("keep_context_file")))
+        shutil.rmtree(state_directory, ignore_errors=True)
 
     elapsed_seconds = round(time.monotonic() - started, 3)
     if completed.returncode != 0:
@@ -183,6 +186,14 @@ def call_api(prompt: str, options: dict[str, Any], context: dict[str, Any]) -> d
             "provider_status": "ok",
             "elapsed_seconds": elapsed_seconds,
             "surface": str(vars_.get("surface") or "slack"),
+            "state_isolation": {
+                "schema": "keystone.promptfoo.state_isolation.v1",
+                "isolated": True,
+                "storage_scope": "per_case_temporary",
+                "operator_database_used": False,
+                "dotenv_loading_disabled": True,
+                "test_mode": True,
+            },
             "provenance": _eval_provenance(
                 vars_,
                 config,
@@ -583,6 +594,7 @@ def _child_env(
     live_sdk: bool,
     live_search: bool,
     allowed_credential_categories: list[str],
+    state_directory: Path,
 ) -> dict[str, str]:
     env: dict[str, str] = {}
     for key in (
@@ -593,9 +605,6 @@ def _child_env(
         "VIRTUAL_ENV",
         "LANG",
         "LC_ALL",
-        "KEYSTONE_HOME",
-        "KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB",
-        "KEYSTONE_TRACE_SUMMARY_DB",
         "KEYSTONE_TRACE_PROCESSOR",
         "KEYSTONE_TRACE_INCLUDE_SENSITIVE_DATA",
         "KEYSTONE_TRACING_DISABLED",
@@ -609,6 +618,15 @@ def _child_env(
             "KEYSTONE_EVAL_SURFACE": str(vars_.get("surface") or "slack"),
             "KEYSTONE_ENABLE_LIVE_RESEARCH": "true" if live_search else "false",
             "KEYSTONE_DRY_RUN": "false" if live_sdk else "true",
+            "PYTHON_DOTENV_DISABLED": "1",
+            "KEYSTONE_TEST_MODE": "1",
+            "KEYSTONE_HOME": str(state_directory / ".keystone"),
+            "KEYSTONE_RUNTIME_STATE_DIR": str(state_directory),
+            "DATABASE_URL": f"sqlite:///{state_directory / 'keystone_agents.db'}",
+            "KEYSTONE_PROMPTFOO_HUMAN_REVIEW_DB": str(
+                state_directory / "human-reviews.sqlite"
+            ),
+            "KEYSTONE_TRACE_SUMMARY_DB": str(state_directory / "trace-summaries.sqlite"),
         }
     )
     model_provider = str(vars_.get("model_provider") or config.get("model_provider") or "openai").strip().lower()

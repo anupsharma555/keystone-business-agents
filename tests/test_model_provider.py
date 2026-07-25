@@ -19,6 +19,7 @@ from keystone_agents.model_provider import (
     MASKED_SECRET,
     OPENAI_BUSINESS_AGENT_DEFAULT_MODEL,
     OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL,
+    OPENAI_MANUAL_PLANNER_DEFAULT_MODEL,
     OPENAI_ORCHESTRATOR_DEFAULT_MODEL,
     MissingOpenAIAPIKeyError,
     ModelConfig,
@@ -63,6 +64,9 @@ MODEL_ENV_VARS = (
     "KEYSTONE_ORCHESTRATOR_MODEL",
     "KEYSTONE_ORCHESTRATOR_MODEL_PROVIDER",
     "KEYSTONE_ORCHESTRATOR_BASE_URL",
+    "KEYSTONE_MANUAL_PLANNER_MODEL",
+    "KEYSTONE_MANUAL_PLANNER_MODEL_PROVIDER",
+    "KEYSTONE_MANUAL_PLANNER_BASE_URL",
     "KEYSTONE_GMAIL_TRIAGE_MODEL",
     "KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER",
     "KEYSTONE_GMAIL_TRIAGE_BASE_URL",
@@ -104,6 +108,22 @@ def test_get_model_config_defaults_without_api_key(monkeypatch: pytest.MonkeyPat
     assert config.model == DEFAULT_MODEL
     assert config.base_url is None
     assert config.api_key_present is False
+
+
+def test_manual_planner_profile_defaults_to_dedicated_openai_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_model_env(monkeypatch)
+    monkeypatch.setenv("MODEL_PROVIDER", "gemini")
+    monkeypatch.setenv("KEYSTONE_OPENAI_MODEL", "gemini-global-model")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test")
+
+    config = get_runtime_agent_model_config("manual_request_planner")
+
+    assert config.provider == "openai"
+    assert config.model == OPENAI_MANUAL_PLANNER_DEFAULT_MODEL
+    assert config.model == "gpt-5.4-mini"
+    assert config.base_url is None
 
 
 def test_validate_sdk_available() -> None:

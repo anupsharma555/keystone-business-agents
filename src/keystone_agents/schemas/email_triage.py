@@ -21,6 +21,7 @@ EmailCategory = Literal[
 ]
 EmailPriority = Literal["low", "normal", "high", "urgent"]
 GmailPriorityBucket = Literal["urgent", "important", "can_wait", "ignore"]
+GmailCandidateDisposition = Literal["candidate", "exclude", "manual_review"]
 EmailRiskFlag = Literal[
     "finance",
     "legal",
@@ -479,6 +480,69 @@ class GmailClarificationResult(BaseModel):
         return value
 
 
+class GmailResolvedContact(BaseModel):
+    """One contact selected from an exact provider-returned Gmail message."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1)
+    thread_id: str = ""
+    contact_name: str = ""
+    contact_email: str = Field(min_length=3)
+    source_field: Literal["from", "to"]
+    relationship: str = ""
+    evidence_summary: str = Field(min_length=1)
+
+    @field_validator(
+        "message_id",
+        "thread_id",
+        "contact_name",
+        "contact_email",
+        "relationship",
+        "evidence_summary",
+    )
+    @classmethod
+    def clean_contact_fields(cls, value: str) -> str:
+        return " ".join(value.replace("\u2014", "-").split())
+
+
+class GmailContactLookupResult(BaseModel):
+    """Read-only Agents SDK answer grounded in bounded Gmail candidates."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    found: bool
+    answer: str = Field(min_length=1)
+    contacts: list[GmailResolvedContact] = Field(default_factory=list, max_length=5)
+    supporting_message_ids: list[str] = Field(default_factory=list, max_length=10)
+    rationale: str = Field(min_length=1)
+    uncertainty: str = ""
+    send_enabled: Literal[False] = False
+    provider_write: Literal[False] = False
+
+    @field_validator("answer", "rationale", "uncertainty")
+    @classmethod
+    def clean_answer_fields(cls, value: str) -> str:
+        return " ".join(value.replace("\u2014", "-").split())
+
+    @field_validator("supporting_message_ids")
+    @classmethod
+    def normalize_message_ids(cls, values: list[str]) -> list[str]:
+        return list(
+            dict.fromkeys(str(value or "").strip() for value in values if str(value or "").strip())
+        )
+
+    @model_validator(mode="after")
+    def require_source_when_found(self) -> GmailContactLookupResult:
+        if self.found and not self.contacts:
+            raise ValueError("A found Gmail contact requires at least one source-bound contact.")
+        if self.found and not self.supporting_message_ids:
+            raise ValueError("A found Gmail contact requires supporting_message_ids.")
+        if not self.found and self.contacts:
+            raise ValueError("A no-match Gmail contact result cannot include contacts.")
+        return self
+
+
 class GmailPriorityGroupedMessage(BaseModel):
     """One message assigned to a GT-1 priority bucket by the Gmail LLM path."""
 
@@ -546,8 +610,7 @@ class GmailPriorityGroupedMessage(BaseModel):
         }
         if self.priority not in allowed_priorities[self.bucket]:
             raise ValueError(
-                f"Priority {self.priority!r} is inconsistent with Gmail bucket "
-                f"{self.bucket!r}."
+                f"Priority {self.priority!r} is inconsistent with Gmail bucket {self.bucket!r}."
             )
         if self.bucket != "urgent" and (self.draft_reply or self.draft_created):
             raise ValueError("Only urgent messages may include draft replies.")
@@ -556,6 +619,59 @@ class GmailPriorityGroupedMessage(BaseModel):
                 raise ValueError("Draft replies require needs_reply=true.")
             if not self.approval_required:
                 raise ValueError("Draft replies require approval_required=true.")
+        return self
+
+
+class GmailCandidateRankingItem(BaseModel):
+    """Selection-only assessment of one bounded Gmail provider candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1)
+    disposition: GmailCandidateDisposition
+    relevance_score: float = Field(ge=0.0, le=1.0)
+    needs_reply: bool = False
+    reasoning: str = Field(min_length=1)
+
+    @field_validator("message_id", "reasoning")
+    @classmethod
+    def clean_candidate_text(cls, value: str) -> str:
+        return " ".join(value.replace("\u2014", "-").split())
+
+
+class GmailCandidateRankingResult(BaseModel):
+    """Read-only semantic ranking with no drafting or provider-write fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_summary: str = Field(min_length=1)
+    source_message_count: int = Field(default=0, ge=0)
+    candidates: list[GmailCandidateRankingItem] = Field(default_factory=list)
+    audit_notes: list[str] = Field(default_factory=list)
+
+    @field_validator("request_summary")
+    @classmethod
+    def clean_request_summary(cls, value: str) -> str:
+        return " ".join(value.replace("\u2014", "-").split())
+
+    @field_validator("audit_notes")
+    @classmethod
+    def clean_candidate_notes(cls, values: list[str]) -> list[str]:
+        return list(
+            dict.fromkeys(
+                text
+                for value in values
+                if (text := " ".join(value.replace("\u2014", "-").split()))
+            )
+        )
+
+    @model_validator(mode="after")
+    def validate_candidate_coverage_shape(self) -> GmailCandidateRankingResult:
+        message_ids = [item.message_id for item in self.candidates]
+        if len(message_ids) != len(set(message_ids)):
+            raise ValueError("Gmail candidate ranking cannot repeat a message identity.")
+        if not self.source_message_count:
+            self.source_message_count = len(self.candidates)
         return self
 
 

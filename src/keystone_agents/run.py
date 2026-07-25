@@ -33,6 +33,11 @@ from keystone_agents.model_provider import (
 )
 from keystone_agents.models import AgentRunRequest, AgentRunResult, RunMode, TypedAgentRunResult
 from keystone_agents.operator_failures import known_exception_to_operator_failure
+from keystone_agents.provider_recovery import (
+    ProviderPartialSuccessError,
+    ProviderRecoveryStore,
+    failure_stage_from_exception,
+)
 from keystone_agents.sdk import AgentLike, repo_instruction_profile_id, run_typed_sdk_sync
 from keystone_agents.sdk_sessions import build_sdk_session_from_env, session_audit_metadata
 from keystone_agents.tool_receipt_journal import (
@@ -176,6 +181,7 @@ def run_typed_sdk_agent(
     trace_include_sensitive_data: bool | None = None,
     trace_config: TraceConfig | None = None,
     max_turns: int | None = None,
+    recovery_store: ProviderRecoveryStore | None = None,
 ) -> TypedAgentRunResult[TOutput]:
     """Run an SDK agent through a typed, credential-safe execution path."""
 
@@ -211,9 +217,23 @@ def run_typed_sdk_agent(
         run_config=run_config,
     )
     active_session = resolved_session
-    reset_tool_receipt_journal()
+    prior_receipts = recovery_store.receipts if recovery_store is not None else []
+    reset_tool_receipt_journal(
+        prior_receipts,
+        receipt_sink=recovery_store.record_receipt if recovery_store is not None else None,
+    )
     instrument_agent_tools(agent)
     temporarily_disabled_tools: dict[int, tuple[Any, Any]] = {}
+    if prior_receipts:
+        prompt = _sdk_prompt_with_recovery_context(
+            base_prompt,
+            retry_receipt_context(prior_receipts),
+        )
+        _disable_completed_mutation_tools(
+            agent,
+            prior_receipts,
+            temporarily_disabled_tools,
+        )
     started_at = time.time()
     model_run_mode = "local_sdk" if run_config is not None else ("live_sdk" if live else "sdk")
     while True:
@@ -255,17 +275,11 @@ def run_typed_sdk_agent(
                         base_prompt,
                         retry_receipt_context(captured_receipts),
                     )
-                    disabled_names = mutation_tool_names(captured_receipts)
-                    for tool in list(getattr(agent, "tools", []) or []):
-                        if str(getattr(tool, "name", "") or "") not in disabled_names:
-                            continue
-                        tool_id = id(tool)
-                        if tool_id not in temporarily_disabled_tools:
-                            temporarily_disabled_tools[tool_id] = (
-                                tool,
-                                getattr(tool, "is_enabled", True),
-                            )
-                        tool.is_enabled = False
+                    _disable_completed_mutation_tools(
+                        agent,
+                        captured_receipts,
+                        temporarily_disabled_tools,
+                    )
                 continue
             if (
                 rate_limit_retry_count < max_rate_limit_retries
@@ -302,6 +316,16 @@ def run_typed_sdk_agent(
                     ),
                     duration_ms=round((time.time() - started_at) * 1000, 3),
                 )
+                if recovery_store is not None and recovery_store.receipts:
+                    partial_success = recovery_store.mark_failed(
+                        stage=failure_stage_from_exception(exc),
+                        failure_code=_failure_kind(exc),
+                        failure_summary=str(exc),
+                    )
+                    raise ProviderPartialSuccessError(
+                        partial_success,
+                        cause=exc,
+                    ) from exc
                 raise
     for tool, prior_is_enabled in temporarily_disabled_tools.values():
         tool.is_enabled = prior_is_enabled
@@ -382,6 +406,23 @@ def run_typed_sdk_agent(
         },
         tool_receipts=captured_tool_receipts,
     )
+
+
+def _disable_completed_mutation_tools(
+    agent: AgentLike,
+    receipts: list[dict[str, Any]],
+    disabled_tools: dict[int, tuple[Any, Any]],
+) -> None:
+    """Disable mutation tools represented by an authoritative saved receipt."""
+
+    disabled_names = mutation_tool_names(receipts)
+    for tool in list(getattr(agent, "tools", []) or []):
+        if str(getattr(tool, "name", "") or "") not in disabled_names:
+            continue
+        tool_id = id(tool)
+        if tool_id not in disabled_tools:
+            disabled_tools[tool_id] = (tool, getattr(tool, "is_enabled", True))
+        tool.is_enabled = False
 
 
 def _sdk_prompt_with_recovery_context(

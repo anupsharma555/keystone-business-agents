@@ -8,6 +8,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.capability_profile import (
+    RequestCapabilityProfile,
+    compile_request_capability_profile,
+)
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.founder_profile import FounderFitProfile, founder_profile_claims
 from keystone_agents.guardrails import assess_unsupported_outreach_claims, keystone_guardrails
@@ -45,6 +49,7 @@ from keystone_agents.schemas.approval import ApprovalScope
 from keystone_agents.schemas.company_profile import ClaimEvidenceRecord, CompanyProfile
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
 from keystone_agents.schemas.email_style import EmailStyleProfile
+from keystone_agents.schemas.execution_request import ExecutionEntrypoint
 from keystone_agents.schemas.outreach import (
     ApprovedOutreachDraftingContext,
     CallPrepArtifact,
@@ -1787,10 +1792,15 @@ def run_outreach_composer_sdk(
     max_turns: int | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
+    entrypoint: ExecutionEntrypoint = "direct_sdk",
 ) -> TypedAgentRunResult[OutreachDraft]:
     """Run Outreach Composer through the typed SDK harness."""
 
-    include_tools = attach_tools
+    supplied_context_profile = isinstance(typed_input, OutreachComposerSDKInput)
+    include_tools = bool(attach_tools and not supplied_context_profile)
+    resolved_compact_instructions = bool(
+        compact_instructions or supplied_context_profile
+    )
     provider_is_gemini = False
     if live and run_config is None:
         from keystone_agents.model_provider import (
@@ -1813,20 +1823,83 @@ def run_outreach_composer_sdk(
         request_text=skill_request_text(typed_input),
         explicit_max_turns=max_turns,
     )
-    return run_typed_sdk_agent(
-        agent=build_outreach_composer_agent(
-            model=model,
-            include_tools=include_tools,
-            request_text=skill_request_text(typed_input),
-            context_flags=context_flags,
-            compact_instructions=compact_instructions,
+    agent = build_outreach_composer_agent(
+        model=model,
+        include_tools=include_tools,
+        request_text=skill_request_text(typed_input),
+        context_flags=context_flags,
+        compact_instructions=resolved_compact_instructions,
+    )
+    capability_profile = compile_request_capability_profile(
+        entrypoint=entrypoint,
+        agent=agent,
+        execution_shape=(
+            "supplied_context_draft"
+            if supplied_context_profile
+            else "legacy_context_acquisition"
         ),
+        prompt_profile=(
+            "outreach_compact"
+            if resolved_compact_instructions
+            else "outreach_full"
+        ),
+        max_turns=turn_policy.max_turns,
+        retrieval_enabled=bool(include_tools),
+        provider_operations=(),
+        write_enabled=False,
+        send_enabled=False,
+    )
+    result = run_typed_sdk_agent(
+        agent=agent,
         typed_input=typed_input,
         output_type=OutreachDraft,
         run_config=run_config,
         live=live,
         session=session,
+        trace_metadata={
+            "capability_profile": capability_profile.receipt(),
+        },
         max_turns=turn_policy.max_turns,
+    )
+    # TypedAgentRunResult is frozen, but its audit metadata mapping is
+    # intentionally mutable so wrappers can add route-specific receipts. Keep
+    # compatibility with lightweight test doubles that return another shape.
+    request_cache = getattr(result, "request_cache", None)
+    if isinstance(request_cache, dict):
+        request_cache["capability_profile"] = capability_profile.receipt()
+    return result
+
+
+def compile_outreach_request_capability_profile(
+    typed_input: OutreachComposerSDKInput,
+    *,
+    entrypoint: ExecutionEntrypoint,
+    model: str | None = None,
+    max_turns: int | None = None,
+) -> RequestCapabilityProfile:
+    """Compile the provider-free Outreach profile used by every entrypoint."""
+
+    turn_policy = resolve_sdk_turn_policy(
+        "outreach_composer",
+        request_text=skill_request_text(typed_input),
+        explicit_max_turns=max_turns,
+    )
+    agent = build_outreach_composer_agent(
+        model=model,
+        include_tools=False,
+        request_text=skill_request_text(typed_input),
+        compact_instructions=True,
+    )
+    return compile_request_capability_profile(
+        entrypoint=entrypoint,
+        agent=agent,
+        execution_shape="supplied_context_draft",
+        prompt_profile="outreach_compact",
+        max_turns=turn_policy.max_turns,
+        retrieval_enabled=False,
+        provider_operations=(),
+        write_enabled=False,
+        send_enabled=False,
     )
 
 

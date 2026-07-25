@@ -345,6 +345,34 @@
     },
     {
       "category": "model",
+      "default_notes": "Base URL override for manual_request_planner.",
+      "display_safety": "url",
+      "name": "KEYSTONE_MANUAL_PLANNER_BASE_URL",
+      "secret": false
+    },
+    {
+      "category": "model",
+      "default_notes": "Model override for manual_request_planner.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_MANUAL_PLANNER_MODEL",
+      "secret": false
+    },
+    {
+      "category": "model",
+      "default_notes": "Provider override for manual_request_planner.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_MANUAL_PLANNER_MODEL_PROVIDER",
+      "secret": false
+    },
+    {
+      "category": "model",
+      "default_notes": "Defaults to openai; target and target_with_openai_fallback are explicit provider-experiment modes.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY",
+      "secret": false
+    },
+    {
+      "category": "model",
       "default_notes": "",
       "display_safety": "secret",
       "name": "KEYSTONE_OPENAI_API_KEY",
@@ -668,7 +696,7 @@
   "slack_child_env": {
     "default_overlays": {
       "KEYSTONE_EXA_SEARCH_FALLBACK": "true",
-      "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "2",
+      "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN": "10",
       "KEYSTONE_SEARXNG_TRANSIENT": "true",
       "KEYSTONE_TAVILY_SEARCH_FALLBACK": "true",
       "KEYSTONE_TAVILY_SEARCH_MAX_CALLS_PER_RUN": "2",
@@ -730,6 +758,10 @@
       "KEYSTONE_LIVE_MODE",
       "KEYSTONE_LIVE_MODEL_MAX_RETRIES",
       "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS",
+      "KEYSTONE_MANUAL_PLANNER_BASE_URL",
+      "KEYSTONE_MANUAL_PLANNER_MODEL",
+      "KEYSTONE_MANUAL_PLANNER_MODEL_PROVIDER",
+      "KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY",
       "KEYSTONE_OPENAI_API_KEY",
       "KEYSTONE_OPENAI_BASE_URL",
       "KEYSTONE_OPENAI_FALLBACK_BASE_URL",

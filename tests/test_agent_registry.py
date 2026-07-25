@@ -46,57 +46,57 @@ SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "6128f9275b9cca7432ccc7e3cb467440daf867cd975e2388e2e02ac65a4dfcce",
+        "instructions_sha256": "050d964165f1f7db418585ed3aad7cdf7eceb3377b505c8f566fb10c080c87f0",
         "tool_names_sha256": "ee36d9e7d7f2340fc94887c18d726abe4ce97e82f18d0b5ce189a04b8268f8ea",
         "output_schema_sha256": "e1a026effe1e04882613026e7e6a2e27da7de6c51e1dde08289c88462866e4f5",
     },
     "business_research_analyst": {
-        "instructions_sha256": "aded6ce64c12396f51327dc9f4ccba2f8ee99581fd99b3996f3455f3acde7b25",
+        "instructions_sha256": "abdc42ae3644c40374cbb13d6951de279d8557e61abbbe39121229ead333ea72",
         "tool_names_sha256": "a9f26c0e0237174742fdc53f1c4e7ce5c8936f492b353f5ef6e3adfb4c34a35e",
         "output_schema_sha256": "2692dd7ff8ec994408d46ce397c174fa115bf7cf19453cbe6a4a4ad5d303667d",
     },
     "opportunity_scout": {
-        "instructions_sha256": "926aa43649ab9c1f49097eba991c1886cea5e655f215fb3833613df6019a001a",
+        "instructions_sha256": "4425eadde360e2a7ac626fb1260b87c270b1728d8853a06ff52f67ac8eb5004c",
         "tool_names_sha256": "ace37ad8d7eef4c988ac31f6848c03a502b9dfb1efe502400c1720e9cc194ce1",
         "output_schema_sha256": "4af554b78c7f1ed345bf17c96c42e83198632aa244f5989bdf4c9e26cfa4bc5d",
     },
     "outreach_composer": {
-        "instructions_sha256": "06ca698ce0d301e0ba783b16c9b8c3d7c6bafa873035ff5436e3b1defcee96af",
+        "instructions_sha256": "991ffb15918d475c6a486ee201286555a282eec961b2b22fd1ce3b4506ae7e2b",
         "tool_names_sha256": "6092ed57d03b82170c380457199725a537ab0d16cf199a5393920a1b096815fe",
         "output_schema_sha256": "3f8204f88ba20d29b12d01686c2a7bb7e08b036464d23fcac49dc35570d81ea4",
     },
     "airtable_context_agent": {
-        "instructions_sha256": "eb3fac4ad1e1c8fbfaa34e97efbf8482ee015854fcd426c3c5958adbec098b6c",
-        "tool_names_sha256": "c82ec575dd75a80622321d7595728b610434f9792e5d6816c326f18aded20866",
+        "instructions_sha256": "6047986019c757b36ec361e711e46ce91d49b9f16a39fc1b129e09df97524e36",
+        "tool_names_sha256": "979b646d14a50a835564d06261d641e28eba27076c11a1dee1d32e374dd9c375",
         "output_schema_sha256": "7d4017a4e6833b52f2c408fe16352594a5fa2b393e740433a25b77b2934c4984",
     },
     "google_workspace_context_agent": {
-        "instructions_sha256": "c41e05475f1a84d1c6778d3ceb6a3c00ab36331ecc658e8f45082148464bbfc9",
+        "instructions_sha256": "eeb17574ead1a9fdc8aa6a2d36a5ecdec74f9cc3a367e802a9894090b3a95ab1",
         "tool_names_sha256": "de65bc3bd0d7a52816c8aa81108ba89fc9c3ac1f230b83ac92348d8646cb8f00",
         "output_schema_sha256": "0867caddb9fe5c3340ac958ea02ddb62d972f31d5f164f9fbc722d55386c55c8",
     },
     "zotero_context_agent": {
-        "instructions_sha256": "5341ee5d81d3d9a03fa80eaeabd4aa71a5d4e0dac931ef1775a9440a09e11216",
+        "instructions_sha256": "6d3ea6ac7c037c623f996ca2e27b64afa99022d3ad108f33cc74da41feb01d3c",
         "tool_names_sha256": "157efe138d475b9b0eb13961c0e598b47f58037480732babd614b98019ecc526",
         "output_schema_sha256": "efa1b731da05cfd915b319d730cf84019d76dd22d0a5f199818546deedac5bb8",
     },
     "rss_context_agent": {
-        "instructions_sha256": "df23697a6e76f3866a8bb86f9b240541b67bcd7f6588815178f32eb0e1f28496",
+        "instructions_sha256": "1bc8ceacf2dfa3eccd4961527fe0679af05948ac0c634395cb90b01ebeddfd8e",
         "tool_names_sha256": "f31fcf99ce67500ab85ceb6130f6c81c8fdeea9668c82ffd10eaf4862b47a55f",
         "output_schema_sha256": "c81421b84589b67baca97d6ae5bc0a8468adbe9bd3b10d1c13639a3148d68936",
     },
     "preprints_context_agent": {
-        "instructions_sha256": "1607a2db59ead8ac7850f0c747741c7bd7519c12f8ca5cabee469b5f8653cc48",
+        "instructions_sha256": "5a6098dde4ebc5a9031f592e257897413a57821fe31d56ebfe3010df525de062",
         "tool_names_sha256": "985bb3e5f395ac4fdab0e2243e450e60eaeab20c34646431415a94dbbb9bef08",
         "output_schema_sha256": "0c360ba87ef900bd5c658029374a445b6c14c22b9067207d8b7ad083c4b1d702",
     },
     "orchestrator": {
-        "instructions_sha256": "ccdb00b9b3d488edbbc80d66e510e7505ece919c4dce0ceab9c4b667d60329c9",
+        "instructions_sha256": "c1982ffa6a1563608505a8e08ebf70404dec3fed0d74b3640ec60d1e5503173b",
         "tool_names_sha256": "d1452b1d9a45ccd89c167d726fc4d4cdf612b8834f6616f7e08524efa4ae0817",
         "output_schema_sha256": "98f0e154658a465df86c498fbf9b1a6c84028fbd02eedef97d1549ef5b5887e7",
     },
     "chief_of_staff": {
-        "instructions_sha256": "19355cfb1099a324d5449824886488c9c2e231cd7ac960fe4425e7fd2556954b",
+        "instructions_sha256": "4dfa7df09a4cf8a16fd2b8d71b2b676213e2386c1ad13777917df7cd64cbf931",
         "tool_names_sha256": "5d10d910810cfa07005226805bbaf378f7420af4d3133d8d88d9db8667f804ff",
         "output_schema_sha256": "c172f11e63550cf751d67a22c72020c661cf35d7a9f6b118274dd7ffdea1e5b9",
     },
@@ -261,7 +261,11 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     rss_tool_names = _tool_names(rss)
     preprints_tool_names = _tool_names(preprints)
 
-    assert {"airtable_get_base_schema", "airtable_read_records"} <= airtable_tool_names
+    assert {
+        "airtable_get_base_schema",
+        "airtable_read_records",
+        "airtable_aggregate_records",
+    } <= airtable_tool_names
     assert "airtable_write_record" in airtable_tool_names
     assert "airtable_upload_attachment" in airtable_tool_names
     assert "airtable_link_attachment" in airtable_tool_names

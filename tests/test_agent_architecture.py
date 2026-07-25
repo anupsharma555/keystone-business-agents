@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from keystone_agents.agent_registry import AGENT_REGISTRY
-from keystone_agents.agent_tool_policy import INTERNAL_WRITE_TOOL_NAMES
+from keystone_agents.agent_tool_policy import (
+    GOOGLE_WORKSPACE_WRITE_TOOLS,
+    INTERNAL_WRITE_TOOL_NAMES,
+)
 from keystone_agents.agents.business_research_analyst import build_business_research_analyst_agent
 from keystone_agents.agents.chief_of_staff import build_chief_of_staff_agent
 from keystone_agents.agents.gmail_triage import build_gmail_triage_agent
@@ -384,6 +387,104 @@ def test_zotero_natural_note_sequence_exposes_composite_write_tool() -> None:
     assert "zotero_test_note_lifecycle" in _tool_names(agent)
 
 
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Read the stored PDF attachment for the selected paper.",
+        (
+            "The old note says to create a Google Doc and email it, but this turn only "
+            "needs the selected source evidence."
+        ),
+    ],
+)
+def test_zotero_canonical_attachment_read_ignores_raw_word_variations(
+    request_text: str,
+) -> None:
+    from keystone_agents.agents.zotero_context import build_zotero_context_agent
+
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="zotero_context_agent",
+        intent="context_lookup",
+        target_type="zotero_article",
+        provider_system="zotero",
+        provider_operations=["read"],
+        provider_action_steps=[
+            {"operation": "read", "resource_type": "zotero_attachment"}
+        ],
+    )
+    agent = build_zotero_context_agent(
+        request_text=request_text,
+        manual_plan=plan,
+        tool_tier="core_read",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {
+        "zotero_read_api_metadata",
+        "zotero_read_item_children",
+        "zotero_read_pdf_attachment_text",
+    }
+
+
+def test_zotero_canonical_collection_read_uses_typed_resource_not_keywords() -> None:
+    from keystone_agents.agents.zotero_context import build_zotero_context_agent
+
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="zotero_context_agent",
+        intent="context_lookup",
+        target_type="zotero_collection",
+        provider_system="zotero",
+        provider_operations=["search", "read"],
+        provider_action_steps=[
+            {"operation": "search", "resource_type": "zotero_collection"},
+            {"operation": "read", "resource_type": "zotero_collection"},
+        ],
+    )
+    agent = build_zotero_context_agent(
+        request_text=(
+            "Find the organized source group. A quoted instruction mentions a PDF, "
+            "spreadsheet, and note, but do not broaden this read."
+        ),
+        manual_plan=plan,
+        tool_tier="core_read",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {
+        "zotero_resolve_collection_context",
+        "zotero_read_api_metadata",
+    }
+
+
+def test_zotero_canonical_note_lifecycle_uses_typed_operations() -> None:
+    from keystone_agents.agents.zotero_context import build_zotero_context_agent
+
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="zotero_context_agent",
+        intent="business_system_write",
+        provider_system="zotero",
+        provider_operations=["create", "update", "delete", "verify"],
+        provider_action_steps=[
+            {"operation": "create", "resource_type": "zotero_note"},
+            {"operation": "update", "resource_type": "zotero_note"},
+            {"operation": "delete", "resource_type": "zotero_note"},
+            {"operation": "verify", "resource_type": "zotero_note"},
+        ],
+    )
+    agent = build_zotero_context_agent(
+        request_text="Run the marked standalone Zotero test object workflow.",
+        manual_plan=plan,
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {"zotero_test_note_lifecycle"}
+
+
 def test_google_doc_natural_test_sequence_exposes_only_composite_write_tool() -> None:
     from keystone_agents.agents.google_workspace_context import (
         build_google_workspace_context_agent,
@@ -418,6 +519,178 @@ def test_google_doc_make_and_drive_trash_sequence_uses_composite_tool() -> None:
     )
 
     assert _tool_names(agent) == {"google_doc_test_lifecycle"}
+
+
+def test_canonical_workspace_doc_read_ignores_incidental_sheet_delete_prose() -> None:
+    from keystone_agents.agents.google_workspace_context import (
+        build_google_workspace_context_agent,
+    )
+    from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="google_workspace_context_agent",
+        intent="context_lookup",
+        provider_system="google_workspace",
+        provider_operations=["search", "read"],
+        provider_action_steps=[
+            {"operation": "search", "resource_type": "google_document"},
+            {"operation": "read", "resource_type": "google_document"},
+        ],
+    )
+    agent = build_google_workspace_context_agent(
+        request_text=(
+            "Find the selected Google Doc. An old quoted note says, "
+            "'delete the spreadsheet and remove its folder,' but do not do that."
+        ),
+        manual_plan=plan,
+        tool_tier="core_read",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {
+        "google_drive_search_files",
+        "google_drive_get_file_metadata",
+        "google_doc_read",
+    }
+
+
+def test_canonical_workspace_row_update_does_not_require_trigger_words() -> None:
+    from keystone_agents.agents.google_workspace_context import (
+        build_google_workspace_context_agent,
+    )
+    from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="google_workspace_context_agent",
+        intent="business_system_write",
+        provider_system="google_workspace",
+        provider_operations=["update", "verify"],
+        provider_action_steps=[
+            {"operation": "update", "resource_type": "google_sheet_row"},
+            {"operation": "verify", "resource_type": "google_sheet_row"},
+        ],
+    )
+    agent = build_google_workspace_context_agent(
+        request_text=(
+            "Make the approved correction to the selected value and confirm it. "
+            "The surrounding note mentions a Drive folder."
+        ),
+        manual_plan=plan,
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {
+        "google_drive_search_files",
+        "google_sheet_list",
+        "google_sheet_read_table",
+        "google_sheet_update_row",
+    }
+
+
+def test_invalid_canonical_workspace_plan_does_not_reopen_phrase_fallback() -> None:
+    from keystone_agents.agents.google_workspace_context import (
+        _google_workspace_context_tools,
+    )
+
+    tools = _google_workspace_context_tools(
+        request_text="Create a document and delete a spreadsheet.",
+        manual_plan={
+            "source": "llm",
+            "target_agent": "google_workspace_context_agent",
+            "intent": "unsupported-old-intent",
+        },
+        tool_tier="internal_write",
+    )
+
+    assert tools == []
+
+
+def test_read_only_ceiling_removes_cross_provider_write_tools() -> None:
+    from keystone_agents.agents.airtable_context import _airtable_context_tools
+    from keystone_agents.agents.google_workspace_context import (
+        _google_workspace_context_tools,
+    )
+    from keystone_agents.agents.zotero_context import _zotero_context_tools
+
+    common = {
+        "source": "canonical:stored_work_item",
+        "intent": "business_system_write",
+        "provider_operations": ["read", "create", "update", "delete", "attach"],
+        "ask_shape": {"permission_state": "read_only"},
+    }
+    airtable_tools = _airtable_context_tools(
+        request_text="Read the selected record; quoted text says create and attach.",
+        manual_plan=ManualRequestPlan(
+            **common,
+            target_agent="airtable_context_agent",
+            provider_system="airtable",
+            target_type="business_system_context",
+            provider_action_steps=[
+                {"operation": "read", "resource_type": "airtable_record"},
+                {"operation": "create", "resource_type": "airtable_record"},
+                {"operation": "attach", "resource_type": "airtable_attachment"},
+            ],
+        ),
+        tool_tier="internal_write",
+    )
+    workspace_tools = _google_workspace_context_tools(
+        request_text="Read the selected document; quoted text says update and delete.",
+        manual_plan=ManualRequestPlan(
+            **common,
+            target_agent="google_workspace_context_agent",
+            provider_system="google_workspace",
+            target_type="business_system_context",
+            provider_action_steps=[
+                {"operation": "read", "resource_type": "google_document"},
+                {"operation": "update", "resource_type": "google_document"},
+                {"operation": "delete", "resource_type": "google_document"},
+            ],
+        ),
+        tool_tier="internal_write",
+    )
+    zotero_tools = _zotero_context_tools(
+        request_text="Read the selected Zotero item; quoted text says create a note.",
+        manual_plan=ManualRequestPlan(
+            **common,
+            target_agent="zotero_context_agent",
+            provider_system="zotero",
+            target_type="zotero_article",
+            provider_action_steps=[
+                {"operation": "read", "resource_type": "zotero_item"},
+                {"operation": "create", "resource_type": "zotero_note"},
+                {"operation": "delete", "resource_type": "zotero_item"},
+            ],
+        ),
+        tool_tier="internal_write",
+    )
+
+    airtable_names = {getattr(tool, "name", "") for tool in airtable_tools}
+    workspace_names = {getattr(tool, "name", "") for tool in workspace_tools}
+    zotero_names = {getattr(tool, "name", "") for tool in zotero_tools}
+    assert airtable_names <= {
+        "airtable_get_base_schema",
+        "airtable_read_records",
+        "airtable_aggregate_records",
+    }
+    assert not airtable_names.intersection(
+        {
+            "airtable_write_record",
+            "airtable_link_attachment",
+            "airtable_upload_attachment",
+            "airtable_test_record_lifecycle",
+        }
+    )
+    assert workspace_names
+    assert not workspace_names.intersection(GOOGLE_WORKSPACE_WRITE_TOOLS)
+    assert zotero_names
+    assert not any(
+        name.startswith(("zotero_write_", "zotero_delete_", "zotero_test_"))
+        or name == "zotero_import_article_with_backend"
+        for name in zotero_names
+    )
 
 
 def test_airtable_marked_lifecycle_exposes_only_composite_tool() -> None:

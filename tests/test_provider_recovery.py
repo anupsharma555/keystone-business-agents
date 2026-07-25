@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from keystone_agents.provider_recovery import (
+    ProviderPartialSuccessError,
+    ProviderRecoveryError,
+    ProviderRecoveryStore,
+)
+from keystone_agents.run import run_typed_sdk_agent
+
+
+def _verified_create_receipt() -> dict[str, Any]:
+    return {
+        "status": "success",
+        "operation": "create_record",
+        "provider": "fixture",
+        "record_id": "rec_fixture_001",
+        "provider_link": "https://provider.example.test/rec_fixture_001",
+        "verification": {"passed": True, "status": "verified_present"},
+    }
+
+
+@pytest.mark.parametrize("failed_stage", ["attachment", "provider_verification", "rendering"])
+def test_partial_success_reuses_verified_object_after_downstream_failure(
+    tmp_path: Path,
+    failed_stage: str,
+) -> None:
+    checkpoint = tmp_path / f"{failed_stage}.json"
+    create_calls = 0
+
+    def create_record() -> dict[str, Any]:
+        nonlocal create_calls
+        create_calls += 1
+        return _verified_create_receipt()
+
+    first = ProviderRecoveryStore(
+        checkpoint,
+        idempotency_key=f"fixture-{failed_stage}",
+    )
+    created = first.reuse_or_execute_mutation(
+        tool_name="airtable_create_record",
+        operation="create_record",
+        execute=create_record,
+    )
+
+    with pytest.raises(ProviderPartialSuccessError) as raised:
+        first.run_downstream_stage(
+            failed_stage,
+            lambda: (_ for _ in ()).throw(RuntimeError(f"{failed_stage} failed")),
+        )
+
+    assert created["record_id"] == "rec_fixture_001"
+    assert raised.value.partial_success.status == "partial_success"
+    assert raised.value.partial_success.failed_stage == failed_stage
+    assert raised.value.partial_success.receipts[0].object_id == "rec_fixture_001"
+
+    resumed = ProviderRecoveryStore(
+        checkpoint,
+        idempotency_key=f"fixture-{failed_stage}",
+    )
+    reused = resumed.reuse_or_execute_mutation(
+        tool_name="airtable_create_record",
+        operation="create_record",
+        execute=create_record,
+    )
+    resumed.run_downstream_stage(failed_stage, lambda: "verified")
+    completed = resumed.mark_completed()
+
+    assert reused["record_id"] == "rec_fixture_001"
+    assert create_calls == 1
+    assert completed.status == "completed"
+    assert completed.retry_reused is True
+    assert failed_stage in completed.completed_stages
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        {
+            **_verified_create_receipt(),
+            "verification": {"passed": False},
+        },
+        {
+            **_verified_create_receipt(),
+            "record_id": "",
+        },
+        {
+            **_verified_create_receipt(),
+            "status": "blocked",
+        },
+    ],
+)
+def test_checkpoint_rejects_unverified_or_identity_free_mutation(
+    tmp_path: Path,
+    receipt: dict[str, Any],
+) -> None:
+    checkpoint = tmp_path / "recovery.json"
+    store = ProviderRecoveryStore(checkpoint, idempotency_key="fixture-unverified")
+
+    with pytest.raises(ProviderRecoveryError, match="provider-verified"):
+        store.record_receipt({**receipt, "tool_name": "airtable_create_record"})
+
+    assert checkpoint.exists() is False
+
+
+def test_checkpoint_checksum_and_idempotency_key_are_verified(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "recovery.json"
+    store = ProviderRecoveryStore(checkpoint, idempotency_key="fixture-checksum")
+    store.record_receipt(
+        {**_verified_create_receipt(), "tool_name": "airtable_create_record"}
+    )
+    wrapper = json.loads(checkpoint.read_text(encoding="utf-8"))
+    wrapper["payload"]["receipts"][0]["object_id"] = "rec_tampered"
+    checkpoint.write_text(json.dumps(wrapper), encoding="utf-8")
+
+    with pytest.raises(ProviderRecoveryError, match="checksum mismatch"):
+        ProviderRecoveryStore(checkpoint, idempotency_key="fixture-checksum")
+
+
+def test_sdk_retry_loads_checkpoint_and_disables_only_completed_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "sdk-recovery.json"
+    create_calls = 0
+
+    def create_tool_output(_context: Any, _tool_input: str) -> dict[str, Any]:
+        nonlocal create_calls
+        create_calls += 1
+        return _verified_create_receipt()
+
+    create_tool = SimpleNamespace(
+        name="airtable_create_record",
+        is_enabled=True,
+        on_invoke_tool=create_tool_output,
+    )
+    read_tool = SimpleNamespace(
+        name="airtable_get_record",
+        is_enabled=True,
+        on_invoke_tool=lambda _context, _input: {"status": "success"},
+    )
+    compensate_tool = SimpleNamespace(
+        name="airtable_delete_record",
+        is_enabled=True,
+        on_invoke_tool=lambda _context, _input: {"status": "dry-run"},
+    )
+    agent = SimpleNamespace(
+        name="fixture_agent",
+        model="fixture-model",
+        tools=[create_tool, read_tool, compensate_tool],
+    )
+    first_attempt = True
+
+    def fake_run_typed_sdk_sync(
+        _agent: Any,
+        prompt: Any,
+        _output_type: Any,
+        **_kwargs: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        nonlocal first_attempt
+        if first_attempt:
+            first_attempt = False
+            assert create_tool.is_enabled is True
+            asyncio.run(create_tool.on_invoke_tool(None, "{}"))
+            raise RuntimeError("attachment read-back failed after provider mutation")
+        assert create_tool.is_enabled is False
+        assert read_tool.is_enabled is True
+        assert compensate_tool.is_enabled is True
+        assert "Provider receipts:" in str(prompt)
+        return SimpleNamespace(usage=None), {"status": "recovered"}
+
+    monkeypatch.setattr(
+        "keystone_agents.run.run_typed_sdk_sync",
+        fake_run_typed_sdk_sync,
+    )
+    run_config = SimpleNamespace(model="fixture-model")
+    first_store = ProviderRecoveryStore(
+        checkpoint,
+        idempotency_key="fixture-sdk-retry",
+    )
+
+    with pytest.raises(ProviderPartialSuccessError) as raised:
+        run_typed_sdk_agent(
+            agent=agent,
+            typed_input={"request": "create then attach"},
+            output_type=dict,
+            run_config=run_config,
+            recovery_store=first_store,
+        )
+
+    assert raised.value.partial_success.failed_stage == "attachment"
+    assert create_calls == 1
+
+    resumed_store = ProviderRecoveryStore(
+        checkpoint,
+        idempotency_key="fixture-sdk-retry",
+    )
+    result = run_typed_sdk_agent(
+        agent=agent,
+        typed_input={"request": "create then attach"},
+        output_type=dict,
+        run_config=run_config,
+        recovery_store=resumed_store,
+    )
+
+    assert result.output == {"status": "recovered"}
+    assert create_calls == 1
+    assert create_tool.is_enabled is True
+    assert read_tool.is_enabled is True
+    assert compensate_tool.is_enabled is True

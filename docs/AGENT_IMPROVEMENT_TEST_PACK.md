@@ -28,19 +28,24 @@ remain authoritative.
 
 ### Semantic-equivalence acceptance
 
-`evals/static/semantic_routing_variations.json` holds five ordinary phrasings
-for each of five goals: marked Airtable, Google Docs, and Gmail lifecycles;
-Opportunity Scout discovery; and Chief of Staff operational prioritization.
-The forms include direct and delegated asks, passive voice, questions,
-object-first wording, and lifecycle shorthand.
+`evals/static/semantic_routing_variations.json` holds at least five ordinary
+phrasings for every executable agent family and its covered goals. The matrix
+includes marked provider lifecycles, bounded provider reads, supplied-context
+analysis and drafting, opportunity discovery, context specialists, Chief of
+Staff prioritization, and a natural multi-owner supplied-evidence review. The
+forms include direct and delegated asks, passive voice, questions, object-first
+wording, lifecycle shorthand, time pressure, and revision-oriented follow-ups.
 
 `tests/test_semantic_routing_variations.py` checks that a correct LLM planner
 interpretation survives explicit-agent advice, fallback-plan merging, and the
 direct single-owner lifecycle gate without a phrase-specific routing branch.
-This is an offline control-plane acceptance test. It proves that Python does not
-veto an equivalent interpretation; it does not prove that the live model will
-produce the correct interpretation for every paraphrase. Live paraphrase
-quality remains a separately budgeted Slack acceptance check.
+For the multi-owner case, it also proves that equivalent requests retain one
+ordered workflow, require a WorkItem, and preserve the raw request, constraints,
+and ask shape in each specialist's typed context pack. This is an offline
+control-plane acceptance test. It proves that Python does not veto or erode an
+equivalent interpretation; it does not prove that the live model will produce
+the correct interpretation for every paraphrase. Live paraphrase quality
+remains a separately budgeted Slack acceptance check.
 
 For WorkItem/LangGraph execution, the same interpreted `constraints` list must
 be copied into the typed context pack for Business Research, Opportunity Scout,
@@ -56,6 +61,44 @@ transcript. Raw Slack message fields (`ts`, `user_id`, and `text`) must normaliz
 into the planner's compact identity/source/summary shape instead of becoming
 empty objects. Record counts and dropped-oldest/retained sizes in a redacted
 compaction receipt; never include private message content in the receipt.
+
+An adapter-generated continuation prefix names the prior task owner, not an
+agent explicitly selected by the operator in the current turn. Preserve that
+owner only in typed continuation context. Do not prepend it to the current
+request or serialize it into specialist prose. A newly named current-turn agent
+or a newly interpreted capability supersedes the prior owner; a provider-free
+same-artifact formatting request may retain the prior owner as advice.
+
+After a canonical plan exists, downstream executors may extract exact fields
+such as a date, title, sender, record ID, attachment path, or guarded test
+marker, and may enforce safety, approval, identity, and receipt checks. They
+must not re-scan prose to change the selected owner, provider, tool family,
+graph shape, target count, comparison mode, Zotero mode, or live-search intent.
+Exercise both directions: nuisance prose must not broaden a narrow plan, and a
+structured multi-target, provider, or search decision must not require legacy
+trigger words to execute. Planner-unavailable and explicitly compatibility-only
+plans may retain bounded phrase fallback.
+
+A planner proposal must also cover every explicit current-turn task
+obligation. When the typed request requires both a bounded provider read and a
+separate internal artifact, such as selecting one Gmail thread and returning a
+Slack-local draft, omitting either stage is an incomplete plan rather than a
+valid simplification. Reconcile the safe provider scope, requested artifact,
+output surface, and no-write boundary before execution. Test this by supplying
+an intentionally incomplete live-plan fixture and proving that the same
+WorkItem path is selected without inspecting different magic phrases.
+
+Renderers and entrypoint adapters must apply the same rule to visible
+continuation actions. A Slack button, CLI suggestion, or follow-up menu may be
+derived only from the canonical plan, typed `next_action`, selected artifacts,
+and approval state. A terminal read-only result with no typed next action must
+render no primary continuation action. Route names, provider names, or the
+absence of a phrase such as `do not search` are not evidence that the operator
+wants more research, drafting, contact discovery, or another provider action.
+Exercise this invariant across terminal Gmail, Calendar, Airtable, Workspace,
+research, opportunity, and outreach results, including both direct and
+WorkItem paths. Bounded route-based action inference is compatibility-only for
+legacy payloads that lack canonical result semantics.
 
 For a continuing WorkItem, bounded planner context must also include the
 canonical WorkItem route/status, prior request, exact target name/object
@@ -300,6 +343,7 @@ Expanded scenario queue:
 | Ask type | Representative asks | Evaluation focus | Candidate coverage |
 | --- | --- | --- | --- |
 | Diverse / open-ended | `review recent email and tell me what matters for Keystone`; `summarize this thread and action items`; `what needs follow-up this week?` | Reads available thread/message context, prioritizes usefully, flags missing context, and suggests draft-only next steps. | `GT-1`, `GT-4`, `GT-5`. |
+| Bounded collection prioritization | `I've been away from email. What arrived today that actually needs me, and what can wait? Don't draft, label, archive, or send anything.` plus count, date-window, and wording variants. | Reads the bounded provider collection before synthesis; preserves the raw ask; classifies every admitted provider ID exactly once; rejects unknown/duplicate IDs; quarantines only unsafe messages; conservatively surfaces model omissions; and verifies zero writes. | `test_provider_first_priority_grouping_binds_complete_read_only_collection`, `test_provider_first_priority_grouping_surfaces_omitted_message_for_review`, `test_provider_first_priority_grouping_rejects_unknown_model_message_id`, `test_provider_first_priority_grouping_quarantines_one_unsafe_message`, and the Chief shared-workflow regression. |
 | Deterministic / exact | `draft a reply asking for the COI, do not send`; `reply and send now`; `label these messages as follow-up candidates`. | Preserves no-send behavior, requires approval for draft creation, separates labels/drafts/sending, and does not infer unavailable dates or recipients. | `GT-2`, `GT-3`, Gmail safety tests. |
 | Prior Slack regression shapes | Slack asks that reference email, broker/COI follow-up, or `confirm next week works` without a visible thread. | Slack bridge must pass enough context; Gmail agent must ask for missing email/thread context instead of fabricating. | Existing GT ambiguity and draft-only specs plus Slack context checks. |
 
@@ -338,6 +382,13 @@ Expanded scenario queue:
 | Diverse / open-ended | `find good opportunities for me in digital health`; `find behavioral health AI partners`; `look for advisory opportunities from recent Slack context`. | Narrows broad asks, states assumptions, applies Keystone fit, and does not pad weak results. | `OS-1`, `OS-3`, `OS-5`. |
 | Deterministic / exact | `find up to 5 active remote roles posted in the last 7 days`; `exclude AI tutor roles`; `save top 3 to CRM`; `filter out unpaid/on-site roles`. | Applies hard filters exactly, preserves no-write approval gates, produces no-result explanations, and uses deterministic ranking/filtering helpers. | `OS-2`, `OS-4`, Scout filter tests. |
 | Prior Slack regression shapes | `find opportunities`, `weekly opportunities`, channel automation opportunity posts, and repeated follow-up requests. | Scheduled automation context should not pollute manual scout asks; repeated asks should rerun or reuse explicitly. | Add automation-vs-manual and dedup/stale-output regressions. |
+
+The automation-versus-manual boundary now has an executable regression in
+`tests/test_manual_after_automation_authority.py`. A new human Scout ask retains
+its behavioral-health partnership objective and read-only/no-post constraints
+without inheriting GitHub, language, star-count, top-five, scheduling, or Slack
+posting filters from a prior weekly automation. Repeated-ask deduplication and
+explicit rerun-versus-reuse behavior remain separate coverage.
 
 Expanded scenario queue:
 
@@ -916,6 +967,33 @@ Check:
 - Orchestrator can route discovery, research, and draft-only steps.
 - Send is blocked.
 - Approval and audit requirements are explicit.
+
+### CA-6: Provider Context To Internal Slack Artifact
+
+Workflow:
+
+1. Chief receives a natural request to read one bounded provider context.
+2. The owning context stage returns typed evidence and a provider receipt.
+3. Outreach Composer turns that evidence into a short internal Slack artifact.
+4. The renderer returns only the requested copy and no continuation control
+   unless a typed `next_action` exists.
+
+Run separately for Gmail first, then Airtable, Google Workspace, Zotero, and
+Calendar only after each context owner has an explicit executable-stage or
+adapter contract. That contract must produce a typed evidence artifact,
+provider receipt, and completion identity; mapping the owner to Chief without
+those outputs does not satisfy this case.
+
+Check:
+
+- The current raw request reaches both the context owner and artifact owner.
+- The planner cannot drop either the provider read or requested artifact.
+- The manager loop advances from the actual executable route rather than
+  reinterpreting provider or artifact words.
+- The artifact owner receives typed provider evidence rather than only a Chief
+  prose summary.
+- Read-only provider receipts remain inspectable.
+- No provider mutation, send, Slack post, or unrelated tool family is admitted.
 
 ## Future Conversion Targets
 

@@ -9,11 +9,13 @@ from keystone_agents.agents import calendar_action_interpreter as interpreter
 from keystone_agents.calendar_actions import (
     CalendarActionPlan,
     calendar_interpretation_context,
+    calendar_lookup_date,
     compact_calendar_interpretation_request,
     infer_calendar_action_plan,
     is_calendar_action_candidate,
 )
 from keystone_agents.schemas.calendar_action import CalendarActionInterpretation
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 
 REQUEST = (
     "add this event to the calendar: "
@@ -943,3 +945,331 @@ def test_source_anchored_model_operation_can_repair_wrong_word_based_route() -> 
     assert plan.operation == "create"
     assert plan.complete is True
     assert plan.description == "The team will move down the building during inspection."
+
+
+def test_canonical_calendar_operation_cannot_be_reopened_by_request_wording() -> None:
+    request = "Create a calendar event called Product Review on August 8, 2026."
+    fallback = infer_calendar_action_plan(request, today=date(2026, 7, 21))
+    assert fallback is not None
+    assert fallback.operation == "create"
+
+    resolution = interpreter.resolve_calendar_action_plan(
+        request,
+        fallback,
+        manual_plan=ManualRequestPlan(
+            source="canonical",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+        ),
+        today=date(2026, 7, 21),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.plan.operation == "read"
+
+
+def test_canonical_calendar_target_replaces_stale_thread_event_for_read() -> None:
+    request = (
+        "business agents continue this prior Slack thread. "
+        "Previous request: What about the UT course start? "
+        "User follow-up: The course start is 08/15/2026 "
+        "Continue the same agent task."
+    )
+    stale_plan = CalendarActionPlan(
+        operation="read",
+        event_reference="UT Course Orientation Session",
+        complete=True,
+    )
+
+    plan, warnings = interpreter._apply_canonical_calendar_lookup_target(
+        request,
+        stale_plan,
+        manual_plan=ManualRequestPlan(
+            source="canonical",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            primary_target="UT course start",
+        ),
+        today=date(2026, 7, 21),
+    )
+
+    assert plan is not None
+    assert plan.event_reference == "UT course start"
+    assert plan.event_reference_date == "2026-08-15"
+    assert plan.complete is True
+    assert warnings
+
+
+def test_numeric_followup_date_can_bound_calendar_lookup() -> None:
+    request = (
+        "business agents continue this prior Slack thread. "
+        "Previous request: What about the UT course start? "
+        "User follow-up: The course start is 08/15/2026 "
+        "Continue the same agent task."
+    )
+
+    assert calendar_lookup_date(request, today=date(2026, 7, 21)) == "2026-08-15"
+
+
+def test_canonical_bounded_calendar_read_uses_current_window_not_prior_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = (
+        "business agents continue this prior Slack thread. "
+        "Previous request: The course start is 08/15/2026 "
+        "Previous result: The course event was found. "
+        "User follow-up: What is next calendar event for today? "
+        "Continue the same agent task."
+    )
+    stale_plan = CalendarActionPlan(
+        operation="read",
+        event_reference="UT course start",
+        event_reference_date="2026-08-15",
+        complete=True,
+    )
+
+    monkeypatch.setattr(
+        interpreter,
+        "run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=CalendarActionInterpretation(
+                operation="read",
+                operation_source_text="What is next calendar event for today?",
+                read_scope="single_event",
+                read_selection="next",
+                read_selection_source_text="next",
+                date_scope="today",
+                event_reference="Google Calendar today's next event",
+                event_reference_source_text="next calendar event for today",
+                date_source_text="today",
+            )
+        ),
+    )
+
+    resolution = interpreter.resolve_calendar_action_plan(
+        request,
+        stale_plan,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            primary_target="Google Calendar today's next event",
+        ),
+        live=True,
+        today=date(2026, 7, 21),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.plan.operation == "read"
+    assert resolution.plan.read_scope == "time_window"
+    assert resolution.plan.read_selection == "next"
+    assert resolution.plan.date_scope == "today"
+    assert resolution.plan.start_date == "2026-07-21"
+    assert resolution.plan.event_reference == ""
+    assert resolution.plan.event_reference_date == ""
+    assert resolution.plan.complete is True
+
+
+def test_current_filtered_calendar_followup_discards_prior_next_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = (
+        "business agents continue this prior Slack thread. "
+        "Previous request: What is first calendar event tomorrow? "
+        "Previous result: The first event is KNI Calendar Today. "
+        "User follow-up: List the flight event tomorrow "
+        "Continue the same agent task."
+    )
+    stale_plan = CalendarActionPlan(
+        operation="read",
+        read_scope="time_window",
+        read_selection="next",
+        date_scope="tomorrow",
+        start_date="2026-07-22",
+        complete=True,
+    )
+
+    monkeypatch.setattr(
+        interpreter,
+        "run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=CalendarActionInterpretation(
+                operation="read",
+                operation_source_text="List the flight event tomorrow",
+                read_scope="filtered_window",
+                read_selection="next",
+                read_selection_source_text="first calendar event",
+                date_scope="tomorrow",
+                date_source_text="tomorrow",
+                query="flight",
+                query_source_text="flight event",
+            )
+        ),
+    )
+
+    resolution = interpreter.resolve_calendar_action_plan(
+        request,
+        stale_plan,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            primary_target="flight event tomorrow",
+        ),
+        live=True,
+        today=date(2026, 7, 21),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.plan.read_scope == "filtered_window"
+    assert resolution.plan.query == "flight"
+    assert resolution.plan.read_selection == "all"
+    assert resolution.plan.date_scope == "tomorrow"
+    assert resolution.plan.start_date == "2026-07-22"
+    assert resolution.plan.calendar_scope == "selected_readable"
+    assert resolution.plan.event_reference == ""
+    assert resolution.plan.complete is True
+
+
+def test_all_events_does_not_expand_calendar_account_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = (
+        "business agents continue this prior Slack thread. "
+        "Previous request: List flight events tomorrow from every Google Calendar I can read. "
+        "User follow-up: List all my events tomorrow "
+        "Continue the same agent task."
+    )
+    monkeypatch.setattr(
+        interpreter,
+        "run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=CalendarActionInterpretation(
+                operation="read",
+                operation_source_text="List all my events tomorrow",
+                read_scope="filtered_window",
+                read_selection="all",
+                calendar_scope="selected_readable",
+                calendar_scope_source_text="all",
+                query="all my events",
+                query_source_text="all my events",
+                date_scope="tomorrow",
+                date_source_text="tomorrow",
+            )
+        ),
+    )
+
+    resolution = interpreter.resolve_calendar_action_plan(
+        request,
+        None,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            provider_result_mode="items",
+            primary_target="events tomorrow",
+        ),
+        live=True,
+        today=date(2026, 7, 21),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.plan.read_scope == "time_window"
+    assert resolution.plan.read_selection == "all"
+    assert resolution.plan.query == ""
+    assert resolution.plan.calendar_scope == "configured"
+    assert resolution.plan.start_date == "2026-07-22"
+    assert resolution.plan.complete is True
+
+
+def test_replayed_read_only_calendar_plan_cannot_admit_create_operation() -> None:
+    fallback = infer_calendar_action_plan(
+        'Create "Architecture review" on my calendar on July 30.',
+        today=date(2026, 7, 25),
+    )
+    assert fallback is not None
+    assert fallback.operation == "create"
+
+    resolution = interpreter.resolve_calendar_action_plan(
+        'Create "Architecture review" on my calendar on July 30.',
+        fallback,
+        manual_plan=ManualRequestPlan(
+            source="canonical:replay_fixture",
+            target_agent="chief_of_staff",
+            intent="business_system_write",
+            task_objective="business_system_write",
+            provider_system="google_calendar",
+            provider_operations=["read", "create"],
+            ask_shape={"permission_state": "read_only"},
+        ),
+        live=False,
+        today=date(2026, 7, 25),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.plan.operation == "read"
+
+
+def test_explicit_every_readable_calendar_scope_is_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "List all events tomorrow from every Google Calendar I can read."
+    monkeypatch.setattr(
+        interpreter,
+        "run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=CalendarActionInterpretation(
+                operation="read",
+                operation_source_text=request,
+                read_scope="time_window",
+                read_selection="all",
+                calendar_scope="selected_readable",
+                calendar_scope_source_text="every Google Calendar I can read",
+                date_scope="tomorrow",
+                date_source_text="tomorrow",
+            )
+        ),
+    )
+
+    resolution = interpreter.resolve_calendar_action_plan(
+        request,
+        None,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            provider_result_mode="items",
+            primary_target="events tomorrow",
+        ),
+        live=True,
+        today=date(2026, 7, 21),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.plan.read_scope == "time_window"
+    assert resolution.plan.query == ""
+    assert resolution.plan.calendar_scope == "selected_readable"
+    assert resolution.plan.start_date == "2026-07-22"
+    assert resolution.plan.complete is True

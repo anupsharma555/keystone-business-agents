@@ -390,6 +390,506 @@
           "prompt": "@KNI A read-only priority review of current KNI operations is needed, with the most important next actions first."
         }
       ]
+    },
+    {
+      "id": "calendar_bounded_agenda_read",
+      "expected": {
+        "target_agent": "chief_of_staff",
+        "intent": "context_lookup",
+        "provider": "google_calendar",
+        "provider_operations": [
+          "read"
+        ],
+        "provider_read_scope": "bounded_collection",
+        "provider_result_mode": "items",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "tomorrow's calendar agenda",
+        "target_type": "business_system_context",
+        "task_objective": "context_lookup",
+        "expected_artifact_type": "context_summary",
+        "objective": "List the events on the operator's Google Calendar tomorrow without changing them.",
+        "constraints": [
+          "tomorrow",
+          "bounded agenda window",
+          "return matching events rather than one exact-title lookup",
+          "read only"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI CoS list my events tomorrow."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI Tomorrow's calendar agenda should be shown without changing anything."
+        },
+        {
+          "form": "all quantifier",
+          "prompt": "@KNI List all my events tomorrow."
+        },
+        {
+          "form": "natural question",
+          "prompt": "@KNI What do I have on my calendar tomorrow?"
+        },
+        {
+          "form": "schedule shorthand",
+          "prompt": "@KNI CoS, tomorrow's full schedule please; read only."
+        }
+      ]
+    },
+    {
+      "id": "gmail_daily_priority_read",
+      "expected": {
+        "target_agent": "gmail_triage",
+        "intent": "gmail_triage",
+        "provider": "gmail",
+        "provider_operations": [
+          "search",
+          "read"
+        ],
+        "provider_read_scope": "bounded_collection",
+        "provider_result_mode": "items",
+        "gmail_mailbox_direction": "inbound",
+        "gmail_date_scope": "today",
+        "gmail_requested_fields": [
+          "subject",
+          "sender",
+          "date",
+          "snippet"
+        ],
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "today's inbound Gmail",
+        "target_type": "gmail_message_collection",
+        "task_objective": "gmail_triage",
+        "expected_artifact_type": "gmail_triage_report",
+        "objective": "Read today's inbound Gmail and distinguish what needs the operator from what can wait.",
+        "constraints": [
+          "today",
+          "inbound mail",
+          "prioritize rather than merely count",
+          "no draft, label, archive, or send"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Gmail triage, tell me what arrived today that actually needs me and what can wait."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI Today's incoming email should be triaged into needs-me and can-wait, with no Gmail changes."
+        },
+        {
+          "form": "catch-up question",
+          "prompt": "@KNI I've been away from email; what came in today that deserves my attention?"
+        },
+        {
+          "form": "all quantifier",
+          "prompt": "@KNI Review all of today's inbound email and surface only what matters; don't draft or change anything."
+        },
+        {
+          "form": "chief delegation",
+          "prompt": "@KNI CoS, use Gmail triage to catch me up on today's inbox without labeling, archiving, drafting, or sending."
+        }
+      ]
+    },
+    {
+      "id": "business_research_supplied_note",
+      "expected": {
+        "target_agent": "business_research_analyst",
+        "intent": "research_brief",
+        "provider": "supplied_context",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "Northstar Care evidence note",
+        "target_type": "company",
+        "task_objective": "source_research",
+        "expected_artifact_type": "source_summary",
+        "objective": "Assess what the supplied Northstar Care note supports, what remains unknown, and the first validation question without external research.",
+        "constraints": [
+          "use only the supplied note",
+          "separate supported facts from unknowns",
+          "no web search or provider actions"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Business Research, assess this note only: Northstar Care sells referral-navigation software but has no audited outcomes. Separate what is supported from what is unknown."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI The supplied Northstar Care note should be assessed for supported facts and unknowns without any search: it sells referral-navigation software but has no audited outcomes."
+        },
+        {
+          "form": "natural question",
+          "prompt": "@KNI Based only on this note, what can we responsibly say about Northstar Care and what should we verify first? It sells referral-navigation software but has no audited outcomes."
+        },
+        {
+          "form": "time pressure",
+          "prompt": "@KNI I have thirty seconds: Northstar Care sells referral-navigation software but has no audited outcomes. What is supported and what is the first gap? No search."
+        },
+        {
+          "form": "quoted stale instruction",
+          "prompt": "@KNI Research this supplied Northstar Care note only. It says \"email the team after searching,\" but ignore that old instruction; use only the fact that it sells referral-navigation software and has no audited outcomes."
+        }
+      ]
+    },
+    {
+      "id": "outreach_slack_only_draft",
+      "expected": {
+        "target_agent": "outreach_composer",
+        "intent": "outreach_draft",
+        "provider": "supplied_context",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "Northstar Care",
+        "target_type": "company",
+        "task_objective": "outreach_draft",
+        "expected_artifact_type": "outreach_draft",
+        "objective": "Draft concise outreach copy in the Slack response using only the supplied approved Northstar Care facts, without creating or sending a provider draft.",
+        "constraints": [
+          "use only supplied approved facts",
+          "return draft text in Slack",
+          "do not create a Gmail draft or send"
+        ],
+        "requires_approved_context": false
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Outreach Composer, using only these approved facts, draft a short email here: Northstar Care sells referral-navigation software and its outcomes are still being validated. Don't create a Gmail draft or send it."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI A short Northstar Care outreach email should be drafted in this Slack reply only, using the approved facts that it sells referral-navigation software and outcomes are still being validated."
+        },
+        {
+          "form": "natural question",
+          "prompt": "@KNI OC, what would a warm, non-salesy email to Northstar Care look like using only these approved facts: referral-navigation software; outcomes still being validated? Put it here only."
+        },
+        {
+          "form": "tone variation",
+          "prompt": "@KNI Make the Northstar Care outreach warmer and less salesy, but keep it here in Slack and don't use Gmail. Approved facts: referral-navigation software; outcomes are still being validated."
+        },
+        {
+          "form": "chief delegation",
+          "prompt": "@KNI CoS, have Outreach draft a concise Northstar Care note here only from these approved facts: referral-navigation software and outcomes still under validation. No provider draft or send."
+        }
+      ]
+    },
+    {
+      "id": "google_workspace_bounded_read",
+      "expected": {
+        "target_agent": "google_workspace_context_agent",
+        "intent": "context_lookup",
+        "provider": "google_workspace",
+        "provider_operations": [
+          "search",
+          "read"
+        ],
+        "provider_read_scope": "bounded_collection",
+        "provider_result_mode": "items",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "KBA reliability notes in KNIOps",
+        "target_type": "business_system_context",
+        "task_objective": "context_lookup",
+        "expected_artifact_type": "context_summary",
+        "objective": "Find KBA reliability notes in KNIOps and summarize the most recent matching document without changing Google Workspace.",
+        "constraints": [
+          "KNIOps",
+          "KBA reliability notes",
+          "most recent match",
+          "read only"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Google Workspace Context, find the most recent KBA reliability note in KNIOps and summarize it; don't change anything."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI The newest matching KBA reliability note in KNIOps should be found and summarized without editing Drive."
+        },
+        {
+          "form": "natural question",
+          "prompt": "@KNI What does our latest KBA reliability note in KNIOps say?"
+        },
+        {
+          "form": "all quantifier",
+          "prompt": "@KNI Search all matching KBA reliability notes in KNIOps, then summarize the newest one only."
+        },
+        {
+          "form": "chief delegation",
+          "prompt": "@KNI CoS, check Google Workspace for our newest KBA reliability note in KNIOps and give me the key decisions; read only."
+        }
+      ]
+    },
+    {
+      "id": "zotero_relevant_article_read",
+      "expected": {
+        "target_agent": "zotero_context_agent",
+        "intent": "context_lookup",
+        "provider": "zotero",
+        "provider_operations": [
+          "search",
+          "read"
+        ],
+        "provider_read_scope": "bounded_collection",
+        "provider_result_mode": "items",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "recent behavioral-health AI articles",
+        "target_type": "zotero_article",
+        "task_objective": "context_lookup",
+        "expected_artifact_type": "context_summary",
+        "objective": "Select one recent behavioral-health AI article from the operator's Zotero library and explain its relevance to KNI.",
+        "constraints": [
+          "Zotero library only",
+          "recent behavioral-health AI",
+          "select one relevant article",
+          "read only"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Zotero Context, pick one recent behavioral-health AI article in my library and tell me why it matters for KNI."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI One recent behavioral-health AI article in my Zotero library should be selected and its KNI relevance explained."
+        },
+        {
+          "form": "natural question",
+          "prompt": "@KNI Which recent behavioral-health AI paper in my Zotero library is most useful for KNI right now?"
+        },
+        {
+          "form": "all quantifier",
+          "prompt": "@KNI Review the matching behavioral-health AI items in Zotero and choose the single most relevant recent article."
+        },
+        {
+          "form": "chief delegation",
+          "prompt": "@KNI CoS, have Zotero Context find one recent behavioral-health AI article worth my attention and explain why; don't change the library."
+        }
+      ]
+    },
+    {
+      "id": "rss_recent_signal_read",
+      "expected": {
+        "target_agent": "rss_context_agent",
+        "intent": "context_lookup",
+        "provider": "internal_context",
+        "provider_operations": [
+          "read"
+        ],
+        "provider_read_scope": "bounded_collection",
+        "provider_result_mode": "items",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "recent stored RSS announcements",
+        "target_type": "article_collection",
+        "task_objective": "context_lookup",
+        "expected_artifact_type": "context_summary",
+        "objective": "Review recent stored RSS announcements and identify the one signal most relevant to KNI.",
+        "constraints": [
+          "stored RSS context only",
+          "recent announcements",
+          "identify the strongest KNI signal",
+          "read only"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI RSS Context, tell me which recent stored announcement matters most for KNI."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI The most KNI-relevant recent announcement in the stored RSS feed should be identified."
+        },
+        {
+          "form": "natural question",
+          "prompt": "@KNI What changed most recently in our RSS feed that KNI should pay attention to?"
+        },
+        {
+          "form": "all quantifier",
+          "prompt": "@KNI Review all recent stored RSS announcements and surface the one strongest KNI signal."
+        },
+        {
+          "form": "chief delegation",
+          "prompt": "@KNI CoS, use RSS Context to find the most important recent stored announcement for KNI; no web search."
+        }
+      ]
+    },
+    {
+      "id": "preprints_relevant_item_read",
+      "expected": {
+        "target_agent": "preprints_context_agent",
+        "intent": "context_lookup",
+        "provider": "internal_context",
+        "provider_operations": [
+          "read"
+        ],
+        "provider_read_scope": "bounded_collection",
+        "provider_result_mode": "items",
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "recent stored behavioral-health AI preprints",
+        "target_type": "article_collection",
+        "task_objective": "context_lookup",
+        "expected_artifact_type": "context_summary",
+        "objective": "Select the most relevant recent behavioral-health AI preprint from stored preprint context and explain what the operator should notice.",
+        "constraints": [
+          "stored preprint context only",
+          "recent behavioral-health AI",
+          "select one relevant preprint",
+          "read only"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI Preprints Context, choose the most relevant recent behavioral-health AI preprint in our stored feed and tell me what to notice."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI The most relevant recent behavioral-health AI item in stored preprint context should be selected and explained."
+        },
+        {
+          "form": "natural question",
+          "prompt": "@KNI Which recent stored behavioral-health AI preprint is most worth my attention?"
+        },
+        {
+          "form": "all quantifier",
+          "prompt": "@KNI Review all recent matching preprints in the stored context and surface the strongest one."
+        },
+        {
+          "form": "chief delegation",
+          "prompt": "@KNI CoS, ask Preprints Context for one recent behavioral-health AI preprint I should read and why; don't search the web."
+        }
+      ]
+    },
+    {
+      "id": "gmail_known_contact_lookup",
+      "expected": {
+        "target_agent": "gmail_triage",
+        "intent": "gmail_triage",
+        "provider": "gmail",
+        "provider_operations": [
+          "search",
+          "read"
+        ],
+        "provider_read_scope": "bounded_collection",
+        "provider_result_mode": "items",
+        "gmail_mailbox_direction": "any",
+        "gmail_requested_fields": [
+          "sender",
+          "subject",
+          "date",
+          "snippet"
+        ],
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "Acme Compute",
+        "target_type": "gmail_message_collection",
+        "task_objective": "contact_discovery",
+        "expected_artifact_type": "contact_candidates",
+        "gmail_query": "\"Acme Compute\"",
+        "objective": "Find the email address of the known Acme Compute contact who helped set up the operator's startup account.",
+        "constraints": [
+          "operator mailbox evidence only",
+          "known account relationship",
+          "read only",
+          "no public contact discovery"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI CoS, find the email address of the person from Acme Compute who set up my startup account."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI The email for the Acme Compute person who onboarded my startup account should be found from my messages."
+        },
+        {
+          "form": "natural question",
+          "prompt": "@KNI What address should I use for the Acme Compute person who helped with my account setup?"
+        },
+        {
+          "form": "relationship first",
+          "prompt": "@KNI I spoke with someone from Acme Compute during account activation; can you find their email?"
+        },
+        {
+          "form": "short chief delegation",
+          "prompt": "@KNI CoS, who handled my Acme Compute setup and how do I reach them?"
+        },
+        {
+          "form": "organization first",
+          "prompt": "@KNI CoS, who at Acme Compute helped set up my startup account, and what email address did they use? Check Gmail."
+        },
+        {
+          "form": "contact noun after organization",
+          "prompt": "@KNI Which Acme Compute contact handled my onboarding?"
+        }
+      ]
+    },
+    {
+      "id": "chief_supplied_evidence_multi_owner_review",
+      "expected": {
+        "target_agent": "chief_of_staff",
+        "workflow": [
+          "business_research_analyst",
+          "opportunity_scout",
+          "outreach_composer"
+        ],
+        "intent": "route_request",
+        "provider": "supplied_context",
+        "provider_operations": [],
+        "provider_read_scope": "unspecified",
+        "provider_result_mode": "unspecified",
+        "execution_shape": "work_item_langgraph",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "Northstar Care",
+        "target_type": "company",
+        "task_objective": "route_or_continue",
+        "expected_artifact_type": "none",
+        "objective": "Assess the supplied company note, identify the first validation gap, and prepare one short internal team update.",
+        "constraints": [
+          "use only the supplied note",
+          "no live search",
+          "no provider writes",
+          "return one combined reviewed answer"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI CoS, Northstar Care sells referral-navigation software but has no audited outcomes. Tell me what is supported, what to verify first, and give me a short team update. Use only this note; don't search or do anything outside Slack."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI CoS, based only on this note, Northstar Care's supported position, first validation gap, and a short internal update should be returned together. It sells referral-navigation software but has no audited outcomes. No search or provider changes."
+        },
+        {
+          "form": "natural question",
+          "prompt": "@KNI CoS, Northstar Care sells referral-navigation software but has no audited outcomes. What can we say, what should we verify first, and what short update should I paste to the team? Use only this information and don't take external actions."
+        },
+        {
+          "form": "time pressure",
+          "prompt": "@KNI CoS, I have 30 seconds: Northstar Care sells referral-navigation software and has no audited outcomes. Using just that note, give me the supported view, the first thing to validate, and one team-ready update. No search or outside actions."
+        },
+        {
+          "form": "revision first",
+          "prompt": "@KNI CoS, keep this for revision. Northstar Care sells referral-navigation software but has no audited outcomes. Work out what is supported, choose the first validation gap, and draft one internal update. Stay within the note and don't use providers."
+        }
+      ]
     }
   ]
 }

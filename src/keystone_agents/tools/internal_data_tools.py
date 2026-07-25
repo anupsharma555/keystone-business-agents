@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 from keystone_agents.config import parse_bool
 from keystone_agents.context_env import context_env_path, context_env_value
@@ -553,6 +554,463 @@ def airtable_read_records(
             filter_formula=filter_formula,
             max_records=max_records,
             fetch_all=fetch_all,
+            live=live or _airtable_live_reads_default(),
+        ),
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    )
+
+
+_AIRTABLE_ESTIMATED_PERIOD_WORDS = {
+    "first": 1,
+    "one": 1,
+    "second": 2,
+    "two": 2,
+    "third": 3,
+    "three": 3,
+    "fourth": 4,
+    "four": 4,
+}
+
+
+def _airtable_estimated_period_number(value: object) -> int | None:
+    """Normalize one estimated-tax period reference without routing on prose."""
+
+    text = " ".join(str(value or "").strip().lower().split())
+    if not text:
+        return None
+    if text in {"current", "this", "current period", "this period"}:
+        month = datetime.now(ZoneInfo("America/New_York")).month
+        if month <= 3:
+            return 1
+        if month <= 5:
+            return 2
+        if month <= 8:
+            return 3
+        return 4
+    direct = re.fullmatch(r"(?:q|period\s*)?([1-4])", text)
+    if direct:
+        return int(direct.group(1))
+    for word, number in _AIRTABLE_ESTIMATED_PERIOD_WORDS.items():
+        if re.search(rf"\b{word}\b", text):
+            return number
+    match = re.search(r"\b(?:q|period\s*)?([1-4])\b", text)
+    return int(match.group(1)) if match else None
+
+
+def _airtable_field_values(value: object) -> list[object]:
+    if isinstance(value, list | tuple | set):
+        return [item for item in value]
+    if isinstance(value, Mapping):
+        return [
+            value.get(key)
+            for key in ("name", "label", "value")
+            if value.get(key) not in (None, "")
+        ]
+    return [value]
+
+
+def _airtable_record_estimated_period(
+    fields: Mapping[str, Any],
+    *,
+    period_field: str,
+    date_field: str,
+) -> int | None:
+    if period_field:
+        for value in _airtable_field_values(fields.get(period_field)):
+            period = _airtable_estimated_period_number(value)
+            if period is not None:
+                return period
+    if not date_field:
+        return None
+    value = str(fields.get(date_field) or "").strip()
+    match = re.search(r"\b(?P<year>20\d{2})-(?P<month>\d{1,2})-\d{1,2}\b", value)
+    if not match:
+        match = re.search(r"\b(?P<month>\d{1,2})/\d{1,2}/(?P<year>20\d{2})\b", value)
+    if not match:
+        return None
+    month = int(match.group("month"))
+    if month <= 3:
+        return 1
+    if month <= 5:
+        return 2
+    if month <= 8:
+        return 3
+    return 4
+
+
+def _airtable_record_year(fields: Mapping[str, Any], *, date_field: str) -> int | None:
+    if not date_field:
+        return None
+    match = re.search(r"\b(20\d{2})\b", str(fields.get(date_field) or ""))
+    return int(match.group(1)) if match else None
+
+
+def _airtable_schema_table_fields(
+    schema_result: Mapping[str, Any],
+    *,
+    table: str,
+) -> list[str]:
+    schema = schema_result.get("schema")
+    raw_tables = schema.get("tables") if isinstance(schema, Mapping) else None
+    if not isinstance(raw_tables, list):
+        return []
+    for raw_table in raw_tables:
+        if not isinstance(raw_table, Mapping):
+            continue
+        if str(raw_table.get("name") or "").strip() != table:
+            continue
+        raw_fields = raw_table.get("fields")
+        if not isinstance(raw_fields, list):
+            return []
+        return [
+            str(field.get("name") or "").strip()
+            for field in raw_fields
+            if isinstance(field, Mapping) and str(field.get("name") or "").strip()
+        ]
+    return []
+
+
+def _first_schema_field(fields: list[str], candidates: tuple[str, ...]) -> str:
+    by_normalized = {" ".join(field.lower().split()): field for field in fields}
+    for candidate in candidates:
+        found = by_normalized.get(" ".join(candidate.lower().split()))
+        if found:
+            return found
+    return ""
+
+
+def _airtable_money_decimal(value: object) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    cleaned = str(value).strip().replace("$", "").replace(",", "")
+    if not cleaned:
+        return None
+    try:
+        return Decimal(cleaned)
+    except InvalidOperation:
+        return None
+
+
+_AIRTABLE_RECORD_LABEL_TERMS = (
+    "item",
+    "description",
+    "name",
+    "title",
+    "merchant",
+    "vendor",
+    "payee",
+    "category",
+    "type",
+    "expense",
+)
+
+
+def _airtable_scalar_text(value: object) -> str:
+    """Return one short display-safe scalar value from an Airtable field."""
+
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, int | float | Decimal | str):
+        return " ".join(str(value).split())[:240]
+    return ""
+
+
+def _airtable_matching_record_summary(
+    fields: Mapping[str, Any],
+    *,
+    amount_field: str,
+    period_field: str,
+    date_field: str,
+) -> dict[str, str]:
+    """Project one finance row without attachments or raw provider identity."""
+
+    reserved = {amount_field, period_field, date_field}
+    labels: list[tuple[str, str]] = []
+    for term in _AIRTABLE_RECORD_LABEL_TERMS:
+        for field_name, raw_value in fields.items():
+            clean_name = str(field_name or "").strip()
+            if (
+                clean_name in reserved
+                or any(existing_name == clean_name for existing_name, _ in labels)
+                or term not in clean_name.casefold()
+            ):
+                continue
+            candidate = _airtable_scalar_text(raw_value)
+            if candidate:
+                labels.append((clean_name, candidate))
+                break
+        if len(labels) >= 3:
+            break
+    date_value = _airtable_scalar_text(fields.get(date_field)) if date_field else ""
+    amount = _airtable_money_decimal(fields.get(amount_field))
+    amount_value = (
+        f"${format(amount.quantize(Decimal('0.01')), 'f')}" if amount is not None else ""
+    )
+    key = labels[0][1] if labels else (
+        f"Expense on {date_value}" if date_value else "Expense record"
+    )
+    values = [f"{field_name}: {value}" for field_name, value in labels[1:]]
+    if date_field and date_value:
+        values.append(f"{date_field}: {date_value}")
+    if amount_field and amount_value:
+        values.append(f"{amount_field}: {amount_value}")
+    period_value = _airtable_scalar_text(fields.get(period_field)) if period_field else ""
+    note = f"{period_field}: {period_value}" if period_field and period_value else ""
+    return {"key": key, "value": "; ".join(values), "note": note}
+
+
+def airtable_aggregate_records_impl(
+    *,
+    table: str,
+    base_alias: str = "finance_tax_tracker",
+    amount_field: str = "",
+    estimated_period: str = "",
+    period_field: str = "",
+    year: int = 0,
+    date_field: str = "",
+    max_records: int = 0,
+    include_matching_records: bool = False,
+    expected_record_ids: Sequence[str] | None = None,
+    expected_total: str = "",
+    live: bool = False,
+) -> dict[str, Any]:
+    """Schema-validate, filter, and deterministically sum one Airtable table."""
+
+    clean_table = str(table or "").strip()
+    if not clean_table:
+        raise ValueError("table is required for a bounded Airtable aggregate")
+    clean_alias = str(base_alias or "finance_tax_tracker").strip()
+    requested_period = _airtable_estimated_period_number(estimated_period)
+    if str(estimated_period or "").strip() and requested_period is None:
+        raise ValueError("estimated_period must resolve to one of periods 1 through 4")
+    requested_year = int(year or datetime.now(ZoneInfo("America/New_York")).year)
+    schema = airtable_get_base_schema_impl(base_alias=clean_alias, live=live)
+    fields = _airtable_schema_table_fields(schema, table=clean_table)
+    if live and not fields:
+        return {
+            "status": "blocked",
+            "operation": "aggregate_records",
+            "table": clean_table,
+            "reason": "table_or_schema_fields_not_found",
+            "send_enabled": False,
+        }
+    resolved_amount_field = str(amount_field or "").strip() or _first_schema_field(
+        fields,
+        ("Total Expenses", "Total Expense", "Amount", "Total Paid"),
+    )
+    resolved_period_field = str(period_field or "").strip() or _first_schema_field(
+        fields,
+        ("Estimated Tax Periods", "Estimated Tax Period", "Quarter", "Tax Period"),
+    )
+    resolved_date_field = str(date_field or "").strip() or _first_schema_field(
+        fields,
+        ("Date of Expense", "Expense Date", "Payment Date", "Date"),
+    )
+    missing_fields = [
+        field
+        for field in (resolved_amount_field, resolved_period_field, resolved_date_field)
+        if field and fields and field not in fields
+    ]
+    if missing_fields or (live and not resolved_amount_field):
+        return {
+            "status": "blocked",
+            "operation": "aggregate_records",
+            "table": clean_table,
+            "reason": "requested_fields_not_found",
+            "missing_fields": missing_fields or ["numeric amount field"],
+            "send_enabled": False,
+        }
+    if live and requested_year and not resolved_date_field:
+        return {
+            "status": "blocked",
+            "operation": "aggregate_records",
+            "table": clean_table,
+            "reason": "year_filter_not_resolvable_from_provider_schema",
+            "year": requested_year,
+            "send_enabled": False,
+        }
+    if not live:
+        return {
+            "status": "dry-run",
+            "operation": "aggregate_records",
+            "base_alias": clean_alias,
+            "table": clean_table,
+            "amount_field": resolved_amount_field or amount_field,
+            "estimated_period": requested_period,
+            "period_field": resolved_period_field or period_field,
+            "year": requested_year,
+            "date_field": resolved_date_field or date_field,
+            "fetch_all": True,
+            "record_limit": int(max_records or 0),
+            "include_matching_records": bool(include_matching_records),
+            "send_enabled": False,
+        }
+    read = airtable_read_records_impl(
+        clean_table,
+        base_alias=clean_alias,
+        max_records=max_records,
+        fetch_all=True,
+        live=True,
+    )
+    records = read.get("records") if isinstance(read, Mapping) else None
+    if not isinstance(records, list):
+        records = []
+    total = Decimal("0")
+    matching_records = 0
+    contributing_records = 0
+    period_evidence_count = 0
+    matching_record_ids: list[str] = []
+    matching_record_summaries: list[dict[str, str]] = []
+    for record in records:
+        raw_fields = record.get("fields") if isinstance(record, Mapping) else None
+        if not isinstance(raw_fields, Mapping):
+            continue
+        record_period = _airtable_record_estimated_period(
+            raw_fields,
+            period_field=resolved_period_field,
+            date_field=resolved_date_field,
+        )
+        if record_period is not None:
+            period_evidence_count += 1
+        if requested_period is not None and record_period != requested_period:
+            continue
+        record_year = _airtable_record_year(raw_fields, date_field=resolved_date_field)
+        if requested_year and record_year != requested_year:
+            continue
+        amount = _airtable_money_decimal(raw_fields.get(resolved_amount_field))
+        if amount is None:
+            continue
+        matching_records += 1
+        total += amount
+        record_id = str(record.get("id") or "").strip()
+        if record_id and record_id not in matching_record_ids:
+            matching_record_ids.append(record_id)
+        if include_matching_records and len(matching_record_summaries) < 10:
+            matching_record_summaries.append(
+                _airtable_matching_record_summary(
+                    raw_fields,
+                    amount_field=resolved_amount_field,
+                    period_field=resolved_period_field,
+                    date_field=resolved_date_field,
+                )
+            )
+        if amount != Decimal("0"):
+            contributing_records += 1
+    if requested_period is not None and records and period_evidence_count == 0:
+        return {
+            "status": "blocked",
+            "operation": "aggregate_records",
+            "table": clean_table,
+            "reason": "estimated_period_not_resolvable_from_provider_fields",
+            "amount_field": resolved_amount_field,
+            "period_field": resolved_period_field,
+            "date_field": resolved_date_field,
+            "send_enabled": False,
+        }
+    total_text = format(total.quantize(Decimal("0.01")), "f")
+    expected_ids = {
+        str(item or "").strip()
+        for item in (expected_record_ids or ())
+        if str(item or "").strip()
+    }
+    scope_membership_match = (
+        set(matching_record_ids) == expected_ids if expected_ids else None
+    )
+    expected_total_decimal = _airtable_money_decimal(expected_total)
+    prior_total_match = (
+        total.quantize(Decimal("0.01"))
+        == expected_total_decimal.quantize(Decimal("0.01"))
+        if expected_total_decimal is not None
+        else None
+    )
+    verification_passed = not bool(read.get("truncated"))
+    result = {
+        "status": "success",
+        "operation": "aggregate_records",
+        "provider": "airtable",
+        "provider_read": True,
+        "provider_write": False,
+        "complete": verification_passed,
+        "verified": verification_passed,
+        "base_alias": clean_alias,
+        "table": clean_table,
+        "amount_field": resolved_amount_field,
+        "estimated_period": requested_period,
+        "period_field": resolved_period_field,
+        "year": requested_year,
+        "date_field": resolved_date_field,
+        "total": total_text,
+        "currency": "USD",
+        "matching_records": matching_records,
+        "contributing_records": contributing_records,
+        "records_checked": len(records),
+        "record_limit": read.get("record_limit"),
+        "truncated": bool(read.get("truncated")),
+        "verification": {
+            "status": "verified",
+            "passed": verification_passed,
+            "schema_read": True,
+            "records_read": True,
+            "period_filter_applied": requested_period is not None,
+            "deterministic_arithmetic": "decimal_sum",
+            "scope_membership_match": scope_membership_match,
+            "prior_total_match": prior_total_match,
+            "record_projection_count": len(matching_record_summaries),
+        },
+        "result_scope": {
+            "base_alias": clean_alias,
+            "table": clean_table,
+            "amount_field": resolved_amount_field,
+            "estimated_period": requested_period,
+            "period_field": resolved_period_field,
+            "year": requested_year,
+            "date_field": resolved_date_field,
+            "total": total_text,
+            "currency": "USD",
+            "item_refs": matching_record_ids,
+        },
+        "send_enabled": False,
+    }
+    if include_matching_records:
+        result["matching_record_summaries"] = matching_record_summaries
+    return result
+
+
+@function_tool(**keystone_tool_guardrail_kwargs())
+def airtable_aggregate_records(
+    table: str,
+    base_alias: str = "finance_tax_tracker",
+    amount_field: str = "",
+    estimated_period: str = "",
+    period_field: str = "",
+    year: int = 0,
+    date_field: str = "",
+    max_records: int = 0,
+    include_matching_records: bool = False,
+    live: bool = False,
+) -> str:
+    """Return a schema-verified deterministic sum for one bounded Airtable table.
+
+    Use for total/count questions instead of reading raw records and doing model
+    arithmetic. `estimated_period` accepts current/this, 1-4, Q1-Q4, and ordinal
+    wording. The tool resolves provider field names from schema, fetches the one
+    selected table under AIRTABLE_READ_ALL_MAX_RECORDS, filters the requested
+    estimated-tax period/year, and returns no raw transaction rows.
+    """
+
+    return json.dumps(
+        airtable_aggregate_records_impl(
+            table=table,
+            base_alias=base_alias,
+            amount_field=amount_field,
+            estimated_period=estimated_period,
+            period_field=period_field,
+            year=year,
+            date_field=date_field,
+            max_records=max_records,
+            include_matching_records=include_matching_records,
             live=live or _airtable_live_reads_default(),
         ),
         ensure_ascii=True,
@@ -3019,14 +3477,16 @@ def google_doc_test_lifecycle_impl(
     title: str,
     body_text: str,
     *,
+    updated_body_text: str = "",
     folder_path: str = "",
     approval_reference: str = "",
     live: bool = False,
 ) -> dict[str, Any]:
-    """Create, verify, trash, and reverify one explicitly marked test Doc."""
+    """Create, optionally update, and trash one explicitly marked test Doc."""
 
     cleaned_title = " ".join(str(title or "").split())
     body = str(body_text or "").strip()
+    updated_body = str(updated_body_text or "").strip()
     clean_approval = str(approval_reference or "").strip()
     if "KBA_TEST_DOC" not in cleaned_title.upper():
         raise ValueError("The Google Doc test lifecycle requires KBA_TEST_DOC in the title.")
@@ -3045,6 +3505,7 @@ def google_doc_test_lifecycle_impl(
         )
 
     create_result: dict[str, Any] = {}
+    update_result: dict[str, Any] = {}
     trash_result: dict[str, Any] = {}
     document_id = ""
     failure = ""
@@ -3069,6 +3530,18 @@ def google_doc_test_lifecycle_impl(
             }
         if not document_id or create_result.get("content_verified") is not True:
             failure = "Google Doc create did not pass provider read-back verification."
+        elif updated_body:
+            update_result = google_doc_write_impl(
+                cleaned_title,
+                updated_body,
+                document_id=document_id,
+                content_mode="replace",
+                folder_path=folder_path,
+                approval_reference=f"{clean_approval}:update",
+                live=True,
+            )
+            if update_result.get("content_verified") is not True:
+                failure = "Google Doc update did not pass provider read-back verification."
     except Exception as exc:  # preserve a bounded receipt and still attempt cleanup
         failure = f"{type(exc).__name__}: {exc}"
     finally:
@@ -3094,13 +3567,28 @@ def google_doc_test_lifecycle_impl(
         and create_result.get("content_verified") is True
         and document_id
     )
+    update_passed = bool(
+        not updated_body
+        or (
+            update_result.get("status") == "success"
+            and update_result.get("document_id") == document_id
+            and update_result.get("content_verified") is True
+        )
+    )
     trash_verification = trash_result.get("verification")
     cleanup_passed = bool(
         isinstance(trash_verification, Mapping)
         and trash_verification.get("passed")
         and trash_result.get("trashed") is True
     )
-    passed = create_passed and cleanup_passed and not failure
+    passed = create_passed and update_passed and cleanup_passed and not failure
+    verification: dict[str, Any] = {
+        "passed": passed,
+        "create_read_back": create_passed,
+        "document_trashed_after_cleanup": cleanup_passed,
+    }
+    if updated_body:
+        verification["same_document_update_read_back"] = update_passed
     return {
         "status": "success" if passed else "failed",
         "operation": "test_doc_lifecycle",
@@ -3112,12 +3600,13 @@ def google_doc_test_lifecycle_impl(
         "required_marker": "KBA_TEST_DOC",
         "approval_reference": clean_approval,
         "create": _google_doc_lifecycle_step_receipt(create_result),
+        **(
+            {"update": _google_doc_lifecycle_step_receipt(update_result)}
+            if updated_body
+            else {}
+        ),
         "trash": _google_doc_lifecycle_step_receipt(trash_result),
-        "verification": {
-            "passed": passed,
-            "create_read_back": create_passed,
-            "document_trashed_after_cleanup": cleanup_passed,
-        },
+        "verification": verification,
         "failure": failure,
         "send_enabled": False,
     }
@@ -3147,16 +3636,18 @@ def _google_doc_lifecycle_step_receipt(result: Mapping[str, Any]) -> dict[str, A
 def google_doc_test_lifecycle(
     title: str,
     body_text: str,
+    updated_body_text: str = "",
     folder_path: str = "",
     approval_reference: str = "",
     live: bool = False,
 ) -> str:
-    """Run one approved KBA_TEST_DOC create/verify/trash lifecycle."""
+    """Run one approved KBA_TEST_DOC create/update/verify/trash lifecycle."""
 
     return json.dumps(
         google_doc_test_lifecycle_impl(
             title,
             body_text,
+            updated_body_text=updated_body_text,
             folder_path=folder_path,
             approval_reference=approval_reference,
             live=live,

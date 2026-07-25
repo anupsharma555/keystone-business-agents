@@ -13,6 +13,18 @@ class CalendarActionInterpretation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     operation: Literal["none", "read", "create", "update", "delete"]
+    read_scope: Literal["single_event", "time_window", "filtered_window"] = (
+        "single_event"
+    )
+    read_selection: Literal["all", "next"] = "all"
+    read_selection_source_text: str = ""
+    calendar_scope: Literal["configured", "selected_readable"] = "configured"
+    calendar_scope_source_text: str = ""
+    query: str = ""
+    query_source_text: str = ""
+    date_scope: Literal["unspecified", "today", "tomorrow", "specific_date"] = (
+        "unspecified"
+    )
     operation_source_text: str = ""
     title: str = ""
     title_source_text: str = ""
@@ -41,6 +53,10 @@ class CalendarActionInterpretation(BaseModel):
         "title",
         "title_source_text",
         "operation_source_text",
+        "read_selection_source_text",
+        "calendar_scope_source_text",
+        "query",
+        "query_source_text",
         "start_date",
         "date_source_text",
         "end_date",

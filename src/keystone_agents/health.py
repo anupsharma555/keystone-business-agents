@@ -23,7 +23,7 @@ from keystone_agents.model_provider import (
     UnsupportedModelProviderError,
     get_model_config,
 )
-from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
+from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.tools.gmail_tool import gmail_oauth_readiness
 
 STATUS_OK = "ok"
@@ -503,55 +503,200 @@ def check_agent_builders() -> list[CheckItem]:
     return items
 
 
-def check_database(database_url: str | Path | None = None) -> dict[str, Any]:
-    """Check local SQLite accessibility and required tables without live calls."""
+def _database_state_owner(
+    env: Mapping[str, str],
+    *,
+    database_url_source: str,
+    configured_url: str | Path | None,
+) -> str:
+    if database_url_source == "memory_probe":
+        return "health_probe"
+    benchmark_url = _env_value(env, "KEYSTONE_BENCHMARK_DB")
+    if benchmark_url and str(configured_url or "") == benchmark_url:
+        return "benchmark"
+    if _env_value(env, "KEYSTONE_EVAL_SURFACE"):
+        return "eval"
+    if _bool_from_env(_env_value(env, "KEYSTONE_TEST_MODE")):
+        return "test"
+    return "operator"
 
-    explicit_database_url = database_url is not None or bool(os.getenv("DATABASE_URL"))
-    configured_url: str | Path | None = database_url or (
-        database_url_from_env() if explicit_database_url else None
-    )
+
+def _database_readiness(
+    store: SQLiteStore,
+    *,
+    tables: set[str],
+    missing: list[str],
+) -> dict[str, Any]:
+    schema_status = STATUS_ERROR if missing else STATUS_OK
+    schema_readiness = {
+        "status": schema_status,
+        "required_tables_present": sorted(set(REQUIRED_TABLES) & tables),
+        "required_tables_missing": missing,
+        "schema_version": store.current_schema_version(),
+    }
+    integrity_readiness: dict[str, Any] = {
+        "status": "not_checked",
+        "reason": "work_item_tables_missing",
+    }
+    retention_readiness: dict[str, Any] = {
+        "status": "not_checked",
+        "reason": "work_items_table_missing",
+    }
+    if {"work_items", "work_item_events", "work_item_artifacts"} <= tables:
+        integrity = store.audit_work_item_integrity(id_limit=1)
+        integrity_readiness = {
+            "status": (
+                STATUS_OK if integrity.get("status") == "pass" else STATUS_ERROR
+            ),
+            "orphan_event_count": int(integrity.get("orphan_event_count") or 0),
+            "orphan_artifact_count": int(
+                integrity.get("orphan_artifact_count") or 0
+            ),
+            "orphan_child_count": int(integrity.get("orphan_child_count") or 0),
+            "missing_parent_count": int(
+                integrity.get("missing_parent_count") or 0
+            ),
+            "repair_performed": bool(integrity.get("repair_performed")),
+        }
+    if "work_items" in tables:
+        retention = store.audit_work_item_retention()
+        retention_readiness = {
+            "status": (
+                STATUS_OK
+                if retention.get("status") == "pass"
+                else STATUS_WARNING
+            ),
+            "status_counts": dict(retention.get("status_counts") or {}),
+            "archived_count": int(retention.get("archived_count") or 0),
+            "unarchived_count": int(retention.get("unarchived_count") or 0),
+            "reviewable_unarchived_count": int(
+                retention.get("reviewable_unarchived_count") or 0
+            ),
+            "reviewable_statuses": list(
+                retention.get("reviewable_statuses") or []
+            ),
+            "policy": str(retention.get("policy") or ""),
+            "repair_performed": bool(retention.get("repair_performed")),
+        }
+    if schema_status == STATUS_ERROR or integrity_readiness["status"] == STATUS_ERROR:
+        status = STATUS_ERROR
+    elif retention_readiness["status"] == STATUS_WARNING:
+        status = STATUS_WARNING
+    else:
+        status = STATUS_OK
+    return {
+        "status": status,
+        "schema_readiness": schema_readiness,
+        "integrity_readiness": integrity_readiness,
+        "retention_readiness": retention_readiness,
+        "runtime_readiness": {
+            "status": STATUS_OK if schema_status == STATUS_OK else STATUS_ERROR,
+            "storage_accessible": True,
+            "schema_ready": schema_status == STATUS_OK,
+            "active_process_checked": False,
+            "active_runtime_status": "not_checked",
+            "scope": "offline_storage_readiness",
+        },
+    }
+
+
+def check_database(
+    database_url: str | Path | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Check SQLite schema, integrity, retention, and offline runtime readiness."""
+
+    source_env = os.environ if env is None else env
+    configured_from_env = _env_value(source_env, "DATABASE_URL")
+    explicit_database_url = database_url is not None or configured_from_env is not None
+    configured_url: str | Path | None = database_url or configured_from_env
+    database_url_source = "explicit" if explicit_database_url else "memory_probe"
     details: dict[str, Any] = {
         "status": STATUS_OK,
-        "database_url_source": "explicit" if explicit_database_url else "memory_probe",
+        "database_url_source": database_url_source,
+        "state_owner": _database_state_owner(
+            source_env,
+            database_url_source=database_url_source,
+            configured_url=configured_url,
+        ),
         "path": "",
         "required_tables_present": [],
         "required_tables_missing": [],
         "schema_version": None,
+        "schema_readiness": {"status": "not_checked"},
+        "integrity_readiness": {"status": "not_checked"},
+        "retention_readiness": {"status": "not_checked"},
+        "runtime_readiness": {
+            "status": "not_checked",
+            "active_process_checked": False,
+            "active_runtime_status": "not_checked",
+        },
     }
     try:
         if configured_url is None or str(configured_url) == ":memory:":
             with tempfile.TemporaryDirectory(prefix="keystone-health-") as tmpdir:
-                store = SQLiteStore(Path(tmpdir) / "health.db")
-                tables = store.table_names()
-                missing = sorted(set(REQUIRED_TABLES) - tables)
-                details.update(
-                    {
-                        "status": STATUS_ERROR if missing else STATUS_OK,
-                        "path": ":temporary:",
-                        "required_tables_present": sorted(set(REQUIRED_TABLES) & tables),
-                        "required_tables_missing": missing,
-                        "schema_version": store.current_schema_version(),
-                    }
-                )
+                with SQLiteStore(Path(tmpdir) / "health.db") as store:
+                    tables = store.table_names()
+                    missing = sorted(set(REQUIRED_TABLES) - tables)
+                    readiness = _database_readiness(
+                        store,
+                        tables=tables,
+                        missing=missing,
+                    )
+                    details.update(readiness)
+                    details.update(
+                        {
+                            "path": ":temporary:",
+                            "required_tables_present": readiness[
+                                "schema_readiness"
+                            ]["required_tables_present"],
+                            "required_tables_missing": missing,
+                            "schema_version": readiness["schema_readiness"][
+                                "schema_version"
+                            ],
+                        }
+                    )
                 return details
 
-        store = SQLiteStore(configured_url)
-        tables = store.table_names()
-        missing = sorted(set(REQUIRED_TABLES) - tables)
-        details.update(
-            {
-                "status": STATUS_ERROR if missing else STATUS_OK,
-                "path": store.path,
-                "required_tables_present": sorted(set(REQUIRED_TABLES) & tables),
-                "required_tables_missing": missing,
-                "schema_version": store.current_schema_version(),
-            }
-        )
+        with SQLiteStore(configured_url) as store:
+            tables = store.table_names()
+            missing = sorted(set(REQUIRED_TABLES) - tables)
+            readiness = _database_readiness(
+                store,
+                tables=tables,
+                missing=missing,
+            )
+            details.update(readiness)
+            details.update(
+                {
+                    "path": store.path,
+                    "required_tables_present": readiness["schema_readiness"][
+                        "required_tables_present"
+                    ],
+                    "required_tables_missing": missing,
+                    "schema_version": readiness["schema_readiness"][
+                        "schema_version"
+                    ],
+                }
+            )
     except Exception as exc:
         details.update(
             {
                 "status": STATUS_ERROR,
                 "error": f"{type(exc).__name__}: {exc}",
+                "schema_readiness": {
+                    "status": STATUS_ERROR,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                "runtime_readiness": {
+                    "status": STATUS_ERROR,
+                    "storage_accessible": False,
+                    "schema_ready": False,
+                    "active_process_checked": False,
+                    "active_runtime_status": "not_checked",
+                    "scope": "offline_storage_readiness",
+                },
             }
         )
     return details
@@ -954,14 +1099,43 @@ def build_messages(
                 )
             )
 
-    if database.get("status") == STATUS_ERROR:
-        missing_tables = database.get("required_tables_missing") or []
+    schema_readiness = dict(database.get("schema_readiness") or {})
+    integrity_readiness = dict(database.get("integrity_readiness") or {})
+    retention_readiness = dict(database.get("retention_readiness") or {})
+    if schema_readiness.get("status") == STATUS_ERROR:
+        missing_tables = schema_readiness.get("required_tables_missing") or []
         if missing_tables:
             message = f"Database is missing required tables: {', '.join(missing_tables)}."
         else:
             message = f"Database is not accessible: {database.get('error', 'unknown error')}."
         messages.append(
             HealthMessage(code="database_unhealthy", severity=SEVERITY_ERROR, message=message)
+        )
+    if integrity_readiness.get("status") == STATUS_ERROR:
+        messages.append(
+            HealthMessage(
+                code="database_integrity_debt",
+                severity=SEVERITY_ERROR,
+                message=(
+                    "Database schema is readable, but WorkItem parent integrity failed: "
+                    f"{int(integrity_readiness.get('orphan_child_count') or 0)} orphan "
+                    "child rows across "
+                    f"{int(integrity_readiness.get('missing_parent_count') or 0)} "
+                    "missing parents. No repair was performed."
+                ),
+            )
+        )
+    if retention_readiness.get("status") == STATUS_WARNING:
+        messages.append(
+            HealthMessage(
+                code="database_retention_debt",
+                severity=SEVERITY_WARNING,
+                message=(
+                    f"{int(retention_readiness.get('reviewable_unarchived_count') or 0)} "
+                    "reviewable WorkItems remain unarchived. Retention cleanup requires "
+                    "explicit operator review; no deletion was performed."
+                ),
+            )
         )
 
     if model_provider.get("status") == STATUS_ERROR:
@@ -1079,7 +1253,7 @@ def run_health_check(
     imports = check_imports()
     prompts = check_prompts(prompts_root)
     agent_builders = check_agent_builders()
-    database = check_database(database_url)
+    database = check_database(database_url, env=source_env)
     dry_run_scripts = check_dry_run_scripts(scripts_root)
     environment = check_environment(source_env)
     live_integrations = check_live_integrations(source_env)
@@ -1159,6 +1333,14 @@ def format_health_report(report: HealthReport, *, verbose: bool = False) -> str:
             "Database: "
             f"{report.database.get('status')} "
             f"({report.database.get('database_url_source')})"
+        ),
+        (
+            "Database readiness: "
+            f"schema={report.database.get('schema_readiness', {}).get('status')} "
+            f"integrity={report.database.get('integrity_readiness', {}).get('status')} "
+            f"retention={report.database.get('retention_readiness', {}).get('status')} "
+            f"runtime={report.database.get('runtime_readiness', {}).get('active_runtime_status')} "
+            f"owner={report.database.get('state_owner')}"
         ),
         (
             "Auto-send: "

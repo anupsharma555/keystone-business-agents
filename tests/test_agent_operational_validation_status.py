@@ -8,6 +8,12 @@ STATUS_DOC = Path("docs/AGENT_OPERATIONAL_VALIDATION_STATUS.md")
 LINEAR_BACKLOG = Path("LINEAR_BACKLOG.MD")
 
 
+def _normalized_document_text(path: Path) -> str:
+    """Compare prose evidence without making Markdown wrapping authoritative."""
+
+    return " ".join(path.read_text().split())
+
+
 def test_operational_status_covers_every_registered_agent_family() -> None:
     text = STATUS_DOC.read_text()
     display_names = {
@@ -49,19 +55,22 @@ def test_operational_status_preserves_evidence_dimensions_and_eval_boundary() ->
 def test_airtable_backlog_matches_current_attachment_evidence_boundary(
     require_local_evidence,
 ) -> None:
-    backlog = require_local_evidence(LINEAR_BACKLOG).read_text()
+    backlog = _normalized_document_text(require_local_evidence(LINEAR_BACKLOG))
 
     assert "private-PNG lifecycle also passed" in backlog
-    assert "Fake-model\n   SDK execution now distinguishes HTTPS URLs" in backlog
-    assert "do not\n   claim a joined natural attachment pass" in backlog
-    assert "Structural base/table/field/view creation is a\n   separate ANU-211 boundary" in backlog
-    assert "local-file\n   local-file receipt upload" not in backlog
+    assert "Fake-model SDK execution now distinguishes HTTPS URLs" in backlog
+    assert "do not claim a joined natural attachment pass" in backlog
+    assert (
+        "Structural base/table/field/view creation is a separate ANU-211 boundary"
+        in backlog
+    )
+    assert "local-file local-file receipt upload" not in backlog
 
 
 def test_workspace_backlog_matches_current_live_and_structural_evidence(
     require_local_evidence,
 ) -> None:
-    backlog = require_local_evidence(LINEAR_BACKLOG).read_text()
+    backlog = _normalized_document_text(require_local_evidence(LINEAR_BACKLOG))
 
     assert "natural selected-file read/synthesis, a natural marked-Sheet lifecycle" in backlog
     assert "separate folder/Doc lifecycles, exact identity/read-back/cleanup" in backlog

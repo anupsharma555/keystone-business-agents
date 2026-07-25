@@ -3,8 +3,10 @@ from __future__ import annotations
 from keystone_agents.execution_request import (
     attach_execution_public_result,
     build_execution_request,
+    continuation_owner_advice,
     execution_request_planning_text,
 )
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 
 
 def test_equivalent_cli_and_slack_root_asks_share_semantic_input() -> None:
@@ -21,12 +23,38 @@ def test_equivalent_cli_and_slack_root_asks_share_semantic_input() -> None:
     assert slack_request.requested_agent_explicit is True
 
 
+def test_slack_adapter_must_preserve_explicit_chief_multi_source_entry_owner() -> None:
+    raw = (
+        "@KNI CoS, review today's Gmail, open WorkItems, and current Airtable "
+        "context, then recommend my top three actions. Don't change anything."
+    )
+
+    preserved = build_execution_request(raw, slack_context_input=True)
+    ownerless = build_execution_request(
+        (
+            "review today's Gmail, open WorkItems, and current Airtable context, "
+            "then recommend my top three actions. Don't change anything."
+        ),
+        slack_context_input=True,
+    )
+
+    assert preserved.entrypoint == "slack_root"
+    assert preserved.raw_request == raw
+    assert preserved.current_request.startswith("review today's Gmail")
+    assert preserved.requested_agent == "chief_of_staff"
+    assert preserved.requested_agent_explicit is True
+    assert ownerless.requested_agent == ""
+    assert ownerless.requested_agent_explicit is False
+    assert ownerless.raw_request != preserved.raw_request
+
+
 def test_slack_followup_keeps_current_request_authoritative_and_prior_state_bounded() -> None:
     envelope = "\n".join(
         [
             "chief of staff continue this prior Slack thread.",
             "Current user request (authoritative): Make that three bullets.",
             "Linked WorkItem: wi_example",
+            "Prior task owner (advisory): business_research_analyst",
             "Provider affinity: calendar",
             "Previous request: Summarize the supplied note.",
             "Previous result title: Business Agents Chief of Staff",
@@ -40,8 +68,10 @@ def test_slack_followup_keeps_current_request_authoritative_and_prior_state_boun
 
     assert request.entrypoint == "slack_followup"
     assert request.current_request == "Make that three bullets."
-    assert request.requested_agent == "chief_of_staff"
-    assert request.continuation.work_item_id == "wi_example"
+    assert request.requested_agent == ""
+    assert request.requested_agent_explicit is False
+    assert request.continuation.work_item_id == ""
+    assert request.continuation.prior_agent == "business_research_analyst"
     assert request.continuation.provider_affinity == "calendar"
     assert request.continuation.prior_request == "Summarize the supplied note."
     assert request.continuation.prior_result_title == "Business Agents Chief of Staff"
@@ -106,6 +136,23 @@ def test_slack_followup_planning_text_keeps_prior_context_and_latest_ask_last() 
     )
 
 
+def test_slack_followup_planning_text_deduplicates_repeated_current_request() -> None:
+    current_ask = "Pick one email from yesterday and draft the reply here only."
+    request = build_execution_request(
+        "\n".join(
+            [
+                "gmail triage continue this prior Slack thread.",
+                "Provider affinity: gmail",
+                f"Previous request: {current_ask.upper()}",
+                f"User follow-up: {current_ask}",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+
+    assert execution_request_planning_text(request) == current_ask
+
+
 def test_provider_followup_planning_text_drops_prior_failed_bot_prose() -> None:
     request = build_execution_request(
         "\n".join(
@@ -163,8 +210,155 @@ def test_neutral_slack_followup_envelope_does_not_synthesize_prior_agent_authori
         assert request.current_request == current_ask
         assert request.requested_agent == ""
         assert request.requested_agent_explicit is False
-        assert request.continuation.work_item_id == "wi_context_only"
+        assert request.continuation.work_item_id == ""
         assert request.continuation.prior_request == f"prior {prior_route} task"
+
+
+def test_slack_followup_retains_linked_workitem_only_for_explicit_state_control() -> None:
+    ordinary = build_execution_request(
+        "\n".join(
+            [
+                "business agents continue this prior Slack thread.",
+                "Linked WorkItem: wi_blocked_history",
+                (
+                    "User follow-up: OC, pick one relevant email from today and draft "
+                    "a short KNI outreach email here only. Don’t create a Gmail draft or send."
+                ),
+                "Continue the same agent task.",
+            ]
+        )
+    )
+    explicit_retry = build_execution_request(
+        "\n".join(
+            [
+                "business agents continue this prior Slack thread.",
+                "Linked WorkItem: wi_blocked_history",
+                "User follow-up: Retry the same WorkItem after the provider reconnects.",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+
+    assert ordinary.current_request.startswith("pick one relevant email from today")
+    assert ordinary.continuation.work_item_id == ""
+    assert explicit_retry.current_request.startswith("Retry the same WorkItem")
+    assert explicit_retry.continuation.work_item_id == "wi_blocked_history"
+
+
+def test_typed_prior_owner_is_advice_without_becoming_explicit_authority() -> None:
+    current_ask = "Turn the missing-evidence bullet into a vendor question."
+    request = build_execution_request(
+        "\n".join(
+            [
+                "business agents continue this prior Slack thread.",
+                f"Current user request (authoritative): {current_ask}",
+                "Prior task owner (advisory): business_research_analyst",
+                "Previous request: Assess the supplied company note.",
+                "Previous result: Two research bullets.",
+                f"User follow-up: {current_ask}",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+
+    assert request.current_request == current_ask
+    assert request.requested_agent == ""
+    assert request.requested_agent_explicit is False
+    assert request.continuation.prior_agent == "business_research_analyst"
+    planning_text = execution_request_planning_text(request)
+    assert planning_text.startswith("Assess the supplied company note.")
+    assert "Prior task owner" not in planning_text
+    assert planning_text.endswith(f"Authoritative follow-up: {current_ask}")
+
+
+def test_semantic_same_artifact_plan_retains_prior_owner_without_keyword_rules() -> None:
+    request = build_execution_request(
+        "\n".join(
+            [
+                "business agents continue this prior Slack thread.",
+                "Prior task owner (advisory): business_research_analyst",
+                "Previous request: Assess a supplied company note.",
+                "User follow-up: Reframe the second item for the vendor.",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="outreach_composer",
+        intent="route_request",
+        objective="Revise the prior supplied-context answer.",
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="bullets",
+            prior_context_dependency="required",
+        ),
+    )
+
+    assert continuation_owner_advice(request, plan) == "business_research_analyst"
+
+
+def test_semantic_owner_advice_yields_to_new_capability_or_explicit_agent() -> None:
+    base_lines = [
+        "business agents continue this prior Slack thread.",
+        "Prior task owner (advisory): business_research_analyst",
+        "Previous request: Assess a supplied company note.",
+        "User follow-up: Draft an email from it.",
+        "Continue the same agent task.",
+    ]
+    request = build_execution_request("\n".join(base_lines))
+    draft_plan = ManualRequestPlan(
+        source="llm",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        objective="Draft an email from the prior research.",
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="required",
+        ),
+    )
+    explicit_request = build_execution_request(
+        "\n".join(
+            [
+                *base_lines[:-2],
+                "User follow-up: CoS turn it into a decision note.",
+                base_lines[-1],
+            ]
+        )
+    )
+
+    assert continuation_owner_advice(request, draft_plan) == ""
+    assert explicit_request.requested_agent_explicit is True
+    assert continuation_owner_advice(explicit_request, draft_plan) == ""
+
+
+def test_semantic_owner_advice_yields_to_typed_outreach_even_if_shape_is_inconsistent() -> None:
+    request = build_execution_request(
+        "\n".join(
+            [
+                "business agents continue this prior Slack thread.",
+                "Prior task owner (advisory): business_research_analyst",
+                "Previous request: Assess a supplied company note.",
+                "User follow-up: Turn it into one internal Slack sentence.",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        objective="Compose an internal Slack sentence from the prior result.",
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="bullets",
+            prior_context_dependency="required",
+        ),
+    )
+
+    assert continuation_owner_advice(request, plan) == ""
 
 
 def test_new_explicit_agent_in_followup_supersedes_prior_owner() -> None:
@@ -185,6 +379,28 @@ def test_new_explicit_agent_in_followup_supersedes_prior_owner() -> None:
     assert request.requested_agent == "chief_of_staff"
 
 
+def test_adapter_prior_owner_is_typed_advice_not_current_turn_authority() -> None:
+    envelope = "\n".join(
+        [
+            "business research analyst continue this prior Slack thread.",
+            "Previous request: Assess the supplied company note.",
+            "Previous result: Two evidence bullets.",
+            "User follow-up: Turn the second gap into one vendor question.",
+            "Continue the same agent task.",
+        ]
+    )
+
+    request = build_execution_request(envelope)
+
+    assert request.current_request == "Turn the second gap into one vendor question."
+    assert request.requested_agent == ""
+    assert request.requested_agent_explicit is False
+    assert request.continuation.prior_agent == "business_research_analyst"
+    assert execution_request_planning_text(request).startswith(
+        "Assess the supplied company note."
+    )
+
+
 def test_missing_optional_continuation_state_does_not_block_normalization() -> None:
     request = build_execution_request(
         "CoS continue this prior Slack thread. User follow-up: Make it shorter."
@@ -192,7 +408,9 @@ def test_missing_optional_continuation_state_does_not_block_normalization() -> N
 
     assert request.entrypoint == "slack_followup"
     assert request.current_request == "Make it shorter."
-    assert request.requested_agent == "chief_of_staff"
+    assert request.requested_agent == ""
+    assert request.requested_agent_explicit is False
+    assert request.continuation.prior_agent == "chief_of_staff"
     assert request.continuation.work_item_id == ""
     assert request.continuation.prior_result_summary == ""
 
@@ -282,6 +500,64 @@ def test_verified_write_receipt_list_confirms_provider_completion() -> None:
     assert result.completion_confirmed is True
     assert result.provider_write_attempted is True
     assert result.provider_receipt_verified is True
+
+
+def test_read_only_public_result_blocks_cross_provider_mutation_claims() -> None:
+    for mutation_field in (
+        "gmail_draft_created",
+        "event_updated",
+        "record_created",
+        "document_trashed",
+        "posted",
+    ):
+        payload = {
+            "status": "done",
+            "human_summary": "The requested read completed.",
+            "manual_request_plan": {
+                "source": "llm",
+                "target_agent": "chief_of_staff",
+                "intent": "context_lookup",
+                "provider_system": "google_workspace",
+                "provider_operations": ["read"],
+            },
+            "output": {mutation_field: True},
+        }
+
+        result = attach_execution_public_result(payload)
+
+        assert result.status == "blocked", mutation_field
+        assert result.completion_confirmed is False, mutation_field
+        assert result.provider_write_attempted is True, mutation_field
+        assert result.provider_receipt_verified is False, mutation_field
+
+
+def test_draft_only_public_result_preserves_plain_text_without_claiming_write() -> None:
+    payload = {
+        "status": "done",
+        "human_summary": "Draft reply: Thanks for reaching out.",
+        "manual_request_plan": {
+            "source": "llm",
+            "target_agent": "outreach_composer",
+            "intent": "outreach_draft",
+            "expected_artifact_type": "outreach_draft",
+            "provider_operations": [],
+            "ask_shape": {
+                "output_form": "draft",
+                "permission_state": "draft_only",
+            },
+        },
+        "output": {
+            "draft_reply": "Thanks for reaching out.",
+            "draft_created": False,
+            "send_enabled": False,
+        },
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "completed"
+    assert result.completion_confirmed is True
+    assert result.provider_write_attempted is False
 
 
 def test_nested_child_write_without_receipt_verification_cannot_complete() -> None:

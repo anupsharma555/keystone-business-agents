@@ -1416,10 +1416,15 @@ specialists run. If the planner cannot run, Keystone falls back to local
 structured planning. The provider policy is controlled by
 `KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY`:
 
+- `openai` (default): use the dedicated OpenAI `gpt-5.4-mini` manual planner
+  profile for each new live natural-language ask.
 - `target_with_openai_fallback`: try the target agent provider first, then
-  OpenAI Orchestrator fallback.
+  the dedicated OpenAI planner.
 - `target`: use only the target agent provider.
-- `openai`: always use the OpenAI Orchestrator planner provider.
+
+Use the target-provider policies only for controlled provider experiments.
+Target-agent provider overrides otherwise apply to specialist execution, not
+the planner.
 
 With live SDK enabled, the CLI uses the supported script-backed execution paths
 for Business Research Analyst, Opportunity Scout, and Gmail Triage. Outreach

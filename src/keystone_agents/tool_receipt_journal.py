@@ -10,12 +10,16 @@ from __future__ import annotations
 import inspect
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from typing import Any
 
 _TOOL_RECEIPT_JOURNAL: ContextVar[list[dict[str, Any]] | None] = ContextVar(
     "keystone_tool_receipt_journal",
+    default=None,
+)
+_TOOL_RECEIPT_SINK: ContextVar[Callable[[Mapping[str, Any]], Any] | None] = ContextVar(
+    "keystone_tool_receipt_sink",
     default=None,
 )
 _WRITE_OPERATION = re.compile(
@@ -59,10 +63,15 @@ _SAFE_RECEIPT_KEYS = {
 }
 
 
-def reset_tool_receipt_journal() -> None:
+def reset_tool_receipt_journal(
+    initial_receipts: list[dict[str, Any]] | None = None,
+    *,
+    receipt_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+) -> None:
     """Start one isolated receipt journal for the current SDK execution."""
 
-    _TOOL_RECEIPT_JOURNAL.set([])
+    _TOOL_RECEIPT_JOURNAL.set([dict(item) for item in (initial_receipts or [])])
+    _TOOL_RECEIPT_SINK.set(receipt_sink)
 
 
 def tool_receipt_journal() -> list[dict[str, Any]]:
@@ -120,6 +129,9 @@ def record_tool_output(tool_name: str, output: Any) -> None:
     if journal is None:
         return
     journal.append(receipt)
+    receipt_sink = _TOOL_RECEIPT_SINK.get()
+    if receipt_sink is not None and receipt_reports_possible_write(receipt):
+        receipt_sink(receipt)
 
 
 def instrument_agent_tools(agent: Any) -> None:

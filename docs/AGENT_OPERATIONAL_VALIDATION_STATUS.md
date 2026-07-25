@@ -14,6 +14,389 @@ Status vocabulary:
 - **Blocked:** the required context/provider state is currently absent.
 - **N/A:** the dimension does not apply to that control-plane or read-only agent.
 
+## 2026-07-25 Zotero Latest-Abstract Natural Ask
+
+The final serialized row in the authorized live window is **Proven**. A normal
+Slack request asked Zotero Context to read the abstract of the most recently
+added journal article, identify the one finding that matters most for KNI, and
+make no changes. The explicit context-agent owner survived adapter prefix
+stripping, while the canonical plan remained a bounded Zotero read of the
+latest item with no search, workflow, approval, or mutation.
+
+Backend run 6622 persisted a fresh verified
+`read_latest_journal_metadata` receipt. The receipt records the exact selected
+item, `dateAdded`-descending provider order, a nonempty abstract, and a provider
+link. The typed result, Slack connector thread, and desktop Slack showed the
+same useful synthesis. Provider side-effect flags were all false.
+
+OpenAI Admin Usage independently recorded exactly two
+`gpt-5.4-mini-2026-03-17` requests in the run minute, with 33,301 input tokens
+and 1,323 output tokens. The shared live ledger is therefore **25/25 used, with
+zero requests remaining**. No further model-backed validation is authorized.
+
+Before the row, the shared planner boundary was hardened so an explicitly named
+context agent supplies provider ownership without preventing a clear
+cross-domain delegation. Adapter-stripped named-context requests now retain
+bounded same-provider read ownership. Typed read-only and no-draft permissions
+also remove provider mutations during planning, and Gmail independently refuses
+provider draft creation from a contradictory canonical plan while still
+allowing local inline reply text. The planner, Gmail, and CLI verification gate
+passes 795 tests, with Ruff, compilation, and diff checks clean.
+
+## 2026-07-25 Shared Read-Only Execution Ceiling
+
+The next offline architecture checkpoint is **Proven offline**. Read-only is
+now one shared execution ceiling: after a semantic plan is accepted, effective
+provider operations are limited to read, search, and verify. Airtable, Google
+Workspace, Zotero, Calendar, Gmail, Chief, CLI, LangGraph, WorkflowRunner,
+finance receipt resolution, result policy, and shared provider policy consume
+that bounded operation set instead of trusting a contradictory raw operation
+list.
+
+This closes the stored/replay/manual-producer gap where a plan could say
+`permission_state=read_only` while still carrying create, update, delete, or
+attachment operations. Legitimate `draft_only` and `approval_required`
+operations remain available, and Gmail may still return local inline draft text
+without creating a provider draft.
+
+Adversarial provider and replay gates passed 26 tests, the broader provider and
+agent contract gate passed 249 tests with one existing skip, and five
+workflow/CLI admission replays passed. The final merged offline gate, including
+the manual-after-automation authority regression, passed 1,091 tests with one
+existing skip. An independent focused review passed 15 tests across the shared
+authority, provider policies, tool admission, Calendar, Gmail, CLI, LangGraph,
+and stale-automation boundary. Ruff lint, Python compilation, and diff checks
+passed. No model, provider, Slack, or operator-database call was made.
+
+The new automation boundary also proves that a current human Opportunity Scout
+ask does not inherit GitHub, language, popularity, result-count, or posting
+filters from a prior scheduled Scout run. The current raw ask remains the
+executable objective.
+
+This is defense in depth, not a new live acceptance row. The shared live ledger
+remains **25/25 used, with zero requests remaining**.
+
+## 2026-07-25 Chief Multi-Source Context Live Test
+
+The natural Chief request to review today's Gmail, open WorkItems, and current
+Airtable context was **Partial**. The new pre-synthesis evidence path worked:
+it completed verified bounded reads for all three sources, persisted their
+receipts, performed no search or write, and gave Chief enough evidence to
+produce a useful combined priority answer.
+
+The run then exposed two downstream defects. KBA's manager-loop completion
+review required a Gmail specialist route even though the verified Gmail read
+had already completed through the typed Chief evidence artifact. That false
+missing-stage blocker changed a successful read into `Completion Not
+Confirmed`. Separately, a neutral internal `no_source_context_sample; 0/0`
+sentinel leaked through public response metadata. The sibling Slack bridge
+also inferred a `More research` button from a generic route fallback even
+though the typed next action was only internal Chief review.
+
+The offline repair now counts only a complete, verified, provider-read Chief
+receipt as satisfying the matching Gmail obligation; unverified or incomplete
+evidence still blocks. Neutral zero-sample focus sentinels remain internal,
+while real positive source-mismatch warnings remain visible. The Slack bridge
+now renders `More research` only for a research-capable route, an exact typed
+more-research action, or an allowlisted research-evidence blocker.
+
+Verification after the repair:
+
+- 1,512 combined KBA workflow, graph, response, CLI, execution, Chief, and
+  planner tests passed.
+- The isolated no-live gate passed 1,030 focused tests, all seven LangGraph
+  scenarios, all 36 Slack expansion cases, manager/delegation/entrypoint
+  readiness, and the ANU-60 preflight with operator SQLite state unchanged.
+- The sibling Slack bridge/admission gate passed 233 tests.
+- Ruff, Python compilation, and diff checks passed.
+
+The live row used three model requests: planner, Chief synthesis, and final
+user-response synthesis. OpenAI Admin Usage independently recorded three
+requests, 115,543 input tokens, and 2,335 output tokens in the exact run
+minute. The shared live ledger is **23/25 used, with 2 requests remaining**.
+No unchanged retry has been run after these offline fixes.
+
+## 2026-07-25 Decorated Root Admission and Gmail Contact Acceptance
+
+The sibling Slack runtime now admits an operator-authored root that Slack
+decorates as sent through ChatGPT only when the message has an explicit `@KNI`
+mention, an allowlisted human operator, an approved decorator, and the
+recognized footer. Natural replies without a repeated mention remain accepted
+only inside a verified KBA-owned thread. Self-output, unauthorized users,
+arbitrary apps, missing root mentions, change/join subtypes, and duplicate
+Socket/poll delivery remain rejected. The Slack worker was restarted with a
+fresh PID, loaded one authorized operator and one approved decorator, and
+reported a connected healthy Socket Mode session.
+
+The unchanged Gmail contact request then reached KBA exactly once. Its planner
+correctly selected a bounded read-only Gmail contact lookup, but run 6615 failed
+after the specialist returned a provider-present direct address with the
+message ID of a routed alias in the same Gmail thread. The binder previously
+checked the selected message before looking for the exact address elsewhere in
+that verified thread, so it rejected safe evidence rather than remapping the
+citation. The failed row used two model requests: one planner and one Gmail
+specialist.
+
+The provider binder now remaps only when one exact provider message in the same
+thread contains the returned address in the requested header. Invented
+addresses, cross-thread matches, and ambiguous same-thread matches remain
+blocked. The exact failure shape and the cross-thread negative case pass with
+the adjacent Gmail suite, for 99 focused tests plus Ruff and diff checks.
+Independent Gmail connector evidence confirmed that the routed and direct E2B
+addresses occur in the same provider thread and that the preferred direct
+address appears in one exact sender header.
+
+The unchanged retry is **Proven** for this row. Run 6616 used two model requests,
+persisted one verified Gmail search/read receipt, resolved one person and one
+stable direct address, and recorded Gmail read `true`, Gmail write `false`, and
+email sent `false`. The typed child result and terminal public result are
+completed, and the child-result promotion receipt is reader-ready from verified
+provider evidence plus the typed display contract. Slack connector and desktop
+Slack show the same concise answer with no duplicate identity rows or internal
+metadata. The shared ledger is now 8/25 used, with 17 requests remaining.
+
+## 2026-07-25 Chief Context-Advisor Entry-Owner Checkpoint
+
+The isolated no-live workflow gate exposed one stale quality assertion and one
+Chief entry-routing defect after the planner-authority changes. The graph
+quality scenario now correctly records Chief of Staff as completed when Chief
+owns the request and coordinates the downstream opportunity assessment.
+
+A separate natural eval-gap request correctly planned Chief ownership with
+Airtable and Google Workspace as advisory context routes, but the CLI tried to
+use the first advisor as the WorkItem entry route. That provider-context agent
+is not a WorkItem execution owner, so the child process failed schema
+validation before Chief could run. The entry-route contract now keeps Chief as
+owner when every planned route is a context advisor. Gmail is treated as a
+Chief context advisor only for the typed `context_lookup` / `context_summary`
+shape; ordinary Gmail specialist workflows retain their existing route.
+
+Focused entry-owner and advisory-summary tests pass, and the Slack expansion
+gate passes all 36 natural cases across every registered route. The complete
+isolated no-live gate then passed 1,024 core tests, all seven LangGraph quality
+scenarios, the 36-case expansion gate, advanced-manager and delegation
+readiness, Slack entrypoint readiness, and the ANU-60 preflight. Operator
+SQLite table and orphan counts were unchanged. The released ANU-209
+CLI/capability/terminal-result gate also passes 351 tests. Ruff and
+`git diff --check` pass. No model, provider, Slack, search, or other live call
+ran.
+
+## 2026-07-25 Connector-Originated Root Admission Failure (Closed)
+
+The first post-ANU-209 Gmail contact row stopped before KBA planning. The exact
+natural Slack root asked Chief of Staff to identify the person who handled E2B
+startup onboarding, return the preferred email address from Gmail, answer only
+in the current thread, and make no changes. Slack accepted the root at
+`1784996937.195569`, and the Socket Mode listener received and acknowledged its
+`events_api` envelope one second later. No thread reply, `agent_runs` row,
+provider read, model request, draft, send, label change, or other write followed.
+The operator database still ended at run 6614 at that checkpoint, so the shared
+live ledger remained 4/25 used with 21 requests available before the admission
+repair and serial Gmail rows documented above.
+
+Slack connector and desktop inspection agree that the root is visible with
+Slack's `Sent using @ChatGPT` decoration and has no reply. The admission defect
+is owned by the sibling `keystone-slack` runtime, before this repository's
+planner or Gmail contracts run. Its Socket Mode root predicate rejects every
+`app_mention` carrying `bot_id`; the polling fallback rejects every message
+carrying either `bot_id` or any subtype. A synthetic predicate probe reproduced
+the exact shape: an operator-authored explicit `@KNI` root decorated with a
+ChatGPT app identity was rejected, while a plain operator mention was accepted.
+KNI bot output and arbitrary app messages were also rejected.
+
+The required repair belonged in
+`keystone-slack/kni_integrations/slack_socket_mode.py`, with regressions in its
+app-mention tests. Admission should require an authorized operator identity and
+explicit `@KNI` intent, even when Slack attaches an approved app/source
+decoration. It must continue rejecting KNI's own bot output and arbitrary
+bot/app messages. The repair, runtime activation, and successful unchanged
+Gmail retry are now recorded in the acceptance checkpoint above.
+
+## 2026-07-25 Isolated Same-Thread Subject-Change Preparation
+
+A read-only Slack connector review of the latest 15
+`#ai-agents-workflow` roots and replies found one shared continuation hazard:
+a retry had treated failed bot prose, local eval links, and renderer metadata as
+source evidence instead of executing the newest human request. The preparatory
+regression uses a synthetic same-thread replay that begins with a Gmail task and
+then switches to an exact read-only Zotero request.
+
+The replay proves that verified prior Gmail scope remains available as bounded
+evidence, while the newest human request becomes authoritative, selects Zotero,
+admits no Gmail operation, and receives no bot-owned eval, source-focus,
+dashboard, or action-button text. Its SQLite state is temporary and does not
+depend on operator rows.
+
+The no-live gate now gives every child process a temporary database, runtime
+home, SDK-session store, review database, and trace database; disables dotenv
+loading and live providers; removes live credentials from the child
+environment; and checks operator table and orphan counts before and after the
+run. The first complete run passed 1,008 focused tests, seven LangGraph
+scenarios, 36 Slack expansion routes, manager/delegation/readiness checks, and
+the ANU-60 preflight. Operator SQLite counts were unchanged.
+
+A later rerun after the planner/workflow changes settled passed 1,011 focused
+tests, all seven LangGraph scenarios, all 36 Slack expansion routes, the
+manager/delegation/readiness checks, and the ANU-60 preflight. The isolated
+runner again reported unchanged operator SQLite table and orphan counts.
+
+The prepared same-thread Zotero row then ran live. The authoritative newest
+turn explicitly abandoned email and requested only the title of the most
+recently added journal article without modifying Zotero. Backend state proves:
+
+- the OpenAI manual planner selected `zotero_context_agent` with
+  `context_lookup`, a bounded read, latest-first provider ordering, and no
+  workflow;
+- the Zotero receipt selected one top-level `journalArticle` by
+  `dateAdded desc`;
+- the specialist and provider receipt agreed on the selected title;
+- exactly two model requests ran, one planner and one specialist;
+- no Gmail operation, WorkItem, LangGraph workflow, search, provider write, or
+  external side effect occurred; and
+- stored run state, the Slack connector, and desktop Slack showed the same
+  result.
+
+This row is not yet a complete acceptance pass because the visible renderer
+repeated the selected title in both `Title` and `Summary` lines even though the
+typed stop condition required the title only. The defect was isolated to the
+shared strict renderer, not interpretation, provider execution, continuation,
+or stored state. A no-live regression now requires a title-only Zotero plan to
+render only the provider title. No second live row should run until the
+operator-state isolation window closes and this renderer fix is eligible for a
+serial retry.
+
+The unchanged serial retry verified the renderer and approval-state repairs:
+the canonical plan carried `zotero_requested_fields=["title"]`, Slack connector
+and desktop Slack showed exactly one title line, and the read-only route no
+longer claimed drafting approval or human review was required. The retry used
+one model request, so the shared global ledger reached 3/25 used.
+
+That retry remains **Partial**, not Proven. Its stored run had no fresh
+`tool_receipts` or `verified_provider_links`, even though the session-backed
+specialist output repeated the earlier provider title and source. The typed
+preflight required an item-scoped resource while the canonical latest-item plan
+used a collection-scoped ordered query, so provider acquisition was skipped and
+prior evidence reuse was not linked. The offline repair now recognizes that a
+typed collection query may select an item, persists the selected item key,
+verification state, and provider link, and keeps title-only rendering intact.
+Do not spend another live retry until the merged no-live gate passes and the
+next serial test is coordinated against the shared ledger.
+
+The final unchanged retry is **Proven** across the complete acceptance surface.
+The merged quiet-window gate first passed 4,446 tests with one intentional
+skip, every readiness command, and unchanged operator state. The live row then:
+
+- used one `gpt-5.4-mini` model request, bringing the shared ledger to 4/25;
+- preserved the authoritative newest Slack turn and direct
+  `zotero_context_agent` route;
+- persisted a fresh `read_latest_journal_metadata` receipt with the exact item
+  key, verified `dateAdded desc` provider order, and provider-returned link;
+- stored `zotero_requested_fields=["title"]`, read-only permission, no
+  workflow, and no approval requirement;
+- recorded no search, Gmail action, WorkItem, LangGraph workflow, provider
+  write, or external side effect; and
+- showed the same exact one-line article title in backend state, Slack
+  connector thread content, and desktop Slack.
+
+This closes the interpretation, provider, continuation, content, rendering, and
+stored-state defects for this row. It does not generalize live proof to other
+agent families or multi-agent workflows.
+
+## 2026-07-25 Bounded Gmail Read-To-Reply Checkpoint
+
+A realistic Chief-of-Staff request asked KBA to inspect yesterday's inbox,
+exclude threads the operator had already answered, choose the one message most
+likely to need a response, and return a short draft in the Slack thread without
+sending or creating a Gmail draft.
+
+The first Slack attempt reached the live manual planner but stopped at the
+legacy direct Gmail draft-context gate. The planner retained the bounded Gmail
+read but omitted the requested downstream internal-draft stage. This was a
+plan-completeness failure, not a Gmail credential, provider, or wording
+failure.
+
+The repair reconciles a complete typed current-turn contract after planning. A
+bounded provider read plus an internal draft artifact remains a read-then-draft
+workflow even when the planner proposes only the provider stage. The current
+provider scope, result shape, final artifact, output surface, and no-write
+boundary are preserved; Gmail Triage and Outreach Composer still interpret the
+raw request inside those obligations.
+
+The unchanged 5:08 AM Slack test passed end to end:
+
+- Slack thread `1784970533.415769` returned a terminal result with no primary
+  continuation button or workflow metadata.
+- WorkItem `wi_a5d55745de2a46139a5b67819bc9d7aa` completed through the Gmail
+  read-only route.
+- Gmail reviewed four bounded candidates and selected none as sufficiently
+  reply-suitable; no reply text was invented.
+- No Gmail draft, send, label change, Slack post, or external write occurred.
+- The run used two model requests: one manual-planner request and one Gmail
+  semantic candidate-ranking request. The local usage estimate was about
+  `$0.028`; this is not an invoice record.
+- Backend state, provider evidence, the stored Slack run record, and desktop
+  Slack show the same result.
+
+The audit also found a separate architecture boundary. Gmail is a first-class
+WorkItem stage, so Gmail-to-Outreach sequencing is executable. Airtable,
+Google Workspace, Zotero, and some Calendar context work is still partly
+represented as Chief tools or route aliases rather than consistently
+advanceable graph stages. Do not generalize provider-read-to-artifact workflows
+to those context owners until each has either a first-class WorkItem stage or
+an execution adapter that emits the same typed evidence artifact, provider
+receipt, and completion identity. A route alias to Chief alone is insufficient
+because the next specialist must receive inspectable provider evidence, not
+only a prose summary. This is a graph/context-stage issue, not a reason to add
+more phrase triggers.
+
+Focused verification passes 710 tests across plan merge, workflow execution,
+shared semantic authority, and terminal no-candidate rendering. The
+no-candidate copy now describes a reply-suitable email rather than narrowing
+every request to “KNI outreach.”
+
+## 2026-07-21 Same-Thread Audience-Scope Checkpoint
+
+The ninth run in the current ten-run Slack/backend allowance used a natural
+capability switch in the existing Oakline thread: combine the two prior points
+into one paste-ready sentence for an internal team channel, using only the
+thread note and no search, email, or provider action. The previous two-item
+output-contract failure did not recur. The run instead selected Outreach
+Composer and stopped before specialist execution because its older admission
+path treated internal team copy as external outreach requiring approved
+company or research context.
+
+Backend state, the Slack connector, the stored thread record, and desktop Slack
+show the same blocker. No specialist `agent_runs` row, tool event, provider
+operation, WorkItem, graph, or external side effect was created. The stored
+last-completed result remained the earlier successful Business Research
+answer, so the failed attempt did not become semantic continuation authority.
+
+The repair makes audience scope a typed ask-shape field rather than another
+route keyword. An explicit current-turn internal or external audience is
+reconciled after model planning; it cannot select an owner or grant a provider
+operation. A planner value of `provider_system=slack` with no typed Slack
+operation is normalized as an audience description. Internal copy therefore
+uses the existing one-specialist, zero-tool direct-response lane, while
+external outreach continues to require approved context and provider writes
+continue to require typed operations and approval gates.
+
+Offline verification passes the focused planner/CLI/Orchestrator contract and
+the full repository gate (4,180 passed, 1 intentional skip). The Outreach
+executor regression also proves that a canonical internal plan never calls the
+legacy phrase heuristic. Ruff passes.
+
+The tenth and final authorized live run repeated the unchanged request in the
+same thread. Backend run 6418 completed through Outreach Composer with
+`audience_scope=internal`, `provider_system=unspecified`, no provider
+operations, zero admitted tools, no WorkItem or graph, and no external side
+effect. It used two model requests: one semantic planner request and one
+specialist request. The local usage-based estimate was $0.0294405 in total;
+this is not an invoice record. Slack returned only the requested sentence, and
+the stored last-completed route/result advanced to this successful run. The
+Slack connector, backend, and desktop Slack agree: the visible thread contains
+only the requested sentence with no title, route metadata, action button, or
+unrelated output. All ten authorized live runs are now consumed.
+
 ## 2026-07-19 Gmail-to-Slack Draft Acceptance Checkpoint
 
 Five Slack/backend runs isolated the current boundary. Five runs from the
@@ -2054,6 +2437,555 @@ resolve the correct company target. This does not affect the public answer,
 route, tools, or safety outcome, but should be corrected before WorkItem titles
 are treated as a primary operator-facing navigation surface.
 
+### 2026-07-24 Chief-to-Gmail known-contact checkpoint
+
+A natural Chief-of-Staff request asked KBA to identify the person who set up a
+startup account and return that person's email address from Gmail. The request
+did not name a Gmail message, thread, tool, provider ID, or internal workflow.
+The correct operation is a bounded Gmail evidence search followed by specialist
+interpretation and exact source-header binding; Gmail remains read-only and the
+answer belongs only in the Slack thread.
+
+Two live Slack tests failed for separate implementation reasons. The first
+entered the sibling Slack bridge's generic Chief path, whose nested Gmail agent
+could read an exact known message ID but could not search the mailbox. The
+second reached the new Gmail contact objective, but an inconsistent lower-level
+target-shape field still vetoed the bounded workflow and reopened generic Chief
+execution. Runs `sbar_41dabe5d5ae943dd80d838ee10987ec4` and
+`sbar_828f43171a224f668391fa29fe699bf1` used five and four model requests,
+respectively, for nine total requests and local maintained estimates of
+`$0.08354025` and `$0.08093715`. Neither run wrote Gmail state.
+
+The repair introduces one shared `run_gmail_contact_lookup_workflow()` used by
+both direct Gmail and Chief script entrypoints. It owns the provider search,
+typed specialist input containing the immutable current ask, one no-tool Gmail
+specialist interpretation, exact `From`/`To` header binding, provider receipt,
+and reader-facing answer. The Chief path returns that specialist result
+directly instead of asking a generic Chief model to reinterpret it. Provider,
+contact objective, and authorized read/search operations are sufficient
+execution authority; a lower-level target shape cannot cancel them.
+
+The connected Gmail provider independently returned ten bounded candidates for
+the organization query, and every sampled candidate contained both `From` and
+`To` headers. This provider check used no model and performed no write.
+Offline wording variants cover who/which/find/look-through phrasing, and an
+entrypoint-equivalence test fails if generic Chief synthesis runs after the
+verified Gmail workflow.
+
+The same review found a separate collection-cardinality defect. The schema
+default `desired_count=1` was treated as an explicit one-message provider limit,
+so broad asks such as “what arrived today?” could not exhaust the result set.
+`desired_count_explicit` now distinguishes a human-supplied result limit from
+the default. Broad Gmail collections use a bounded 25-message ceiling, while
+“show one email” still limits the read to one; an explicit human count also
+overrides a conflicting planner count.
+
+The unchanged natural Slack ask was then exercised through five serial
+one-request live iterations while the shared implementation defects were
+removed. The iterations exposed, in order: overly literal relationship
+matching, missing provider-receipt persistence, duplicate public rendering,
+and inconsistent address selection for the same person. The final iteration
+passed all acceptance surfaces:
+
+- the Gmail specialist interpreted the informal account-setup relationship;
+- the answer was bound to an exact provider `From` header;
+- backend telemetry recorded ten candidates, a verified provider read, and no
+  provider write;
+- Slack rendered one concise answer with no route metadata, action button,
+  duplicate bullet, or alternate-address conflict; and
+- Computer inspection matched the Slack API and backend result.
+
+Those five live requests used an estimated `$0.04133595` in total. No Gmail
+draft, send, label, archive, or other provider mutation occurred. Verification
+passes 960 affected Chief, Gmail, planner, CLI, and semantic tests plus Ruff
+and diff checks. One unrelated Calendar test remains intentionally excluded
+because it is date-stale: after July 23, 2026, its next-occurrence behavior
+correctly selects July 23, 2027 while the fixture still expects 2026.
+
+### 2026-07-24 Chief-to-Gmail priority-grouping checkpoint
+
+A second natural Chief request asked what arrived today, what needed the
+operator, and what could wait, while explicitly prohibiting Gmail mutations.
+The request did not name a Gmail query, message ID, specialist, priority
+taxonomy, or internal workflow. Acceptance required a bounded provider read,
+specialist interpretation of the full admitted collection, one useful Slack
+answer, and zero Gmail writes.
+
+Four serial learning attempts exposed shared implementation defects before the
+unchanged request passed: generic Chief execution exposed no provider evidence;
+requested output fields overrode the semantic Gmail operation; one guardrail-
+blocked message aborted the whole collection; and strict model-coverage
+validation rejected an otherwise useful result when one provider message was
+omitted. The shared repair now gives the typed Gmail operation precedence,
+reads provider data before synthesis, quarantines only unsafe messages, rejects
+unknown or duplicate provider IDs, and conservatively surfaces model-omitted
+provider messages for manual review instead of silently classifying them as
+safe to defer.
+
+The final unchanged Slack test passed every acceptance surface:
+
+- backend telemetry recorded one `gpt-5.4-mini` request and one verified,
+  bounded Gmail read;
+- the provider receipt recorded 11 candidates, 10 safely admitted messages,
+  one quarantined message, complete coverage, and `provider_write=false`;
+- Slack rendered separate “Needs your attention” and “Can wait” sections plus
+  a concise safety disclosure, with no workflow metadata or action button; and
+- Slack API and Computer inspection matched the backend result.
+
+The five live attempts recorded nine model requests and an estimated
+`$0.19353765`; one failed post-provider attempt did not persist model usage, so
+the testing ledger conservatively counts ten requests. No Gmail draft, send,
+label, archive, or other provider mutation occurred. The affected Chief/Gmail
+gate passes 1,822 tests plus Ruff. This closes the priority-grouping row, not
+all semantic-routing work: novel collection asks and thread follow-ups still
+belong in the ANU-311 variation matrix.
+
+### 2026-07-24 Slack attachment-context checkpoint
+
+An exact Slack-style request asked Chief of Staff to inspect the integrated
+architecture diagram and summarize its flow. KBA already supported bounded
+PDF/image inputs, but the fallback semantic plan did not mark the bridge-
+materialized file as selected context. The CLI therefore entered a generic
+WorkItem/research path before the image-input capability could run.
+
+The shared repair now treats a bridge-materialized PDF/image as selected
+context, keeps a bounded no-provider transformation on the named Chief or
+specialist path, and prevents a later LLM plan from adding an unrequested
+provider read. A missing bridge-materialized file stops before Orchestrator
+planning, model execution, WorkItem creation, or provider execution with a
+reattach instruction. Explicit provider operations remain distinct: for
+example, a receipt plus an Airtable create request still follows the typed
+Airtable write path.
+
+The exact prompt now selects Chief of Staff, admits no provider tools, and
+creates zero WorkItems. The affected planner/direct-response/CLI/semantic gate
+passes 403 focused tests. The complete repository gate passes 4,311 tests with
+one skip; file-input encoding checks, Ruff, and `git diff --check` also pass.
+A company-bound source packet now delegates to Business Research with a
+company-research intent, while a generic diagram remains with Chief. Naming
+Gmail no longer authorizes Gmail access when the current turn explicitly
+forbids tools/providers and supplies all required facts. The one exact WorkItem
+accidentally created by the pre-fix offline diagnostic was removed with its
+related events and artifact.
+
+The internal architecture PNG was not transmitted because its privacy approval
+remained unresolved. Instead, the final authorized call used a synthetic image
+containing four ordered boxes and no personal or provider data. Chief read the
+labels correctly as `REQUEST, PLAN, SPECIALIST, VERIFIED RESPONSE` with one
+`gpt-5.4-mini` request, 4,800 input tokens, 39 output tokens, zero tools, zero
+WorkItems/events, and no provider or external mutation. The estimated cost was
+$0.0037755. The verified backend result was mirrored to
+`#ai-agents-workflow`, clearly labeled as a backend result rather than a
+Slack-ingress `@KNI` run, and Computer inspection confirmed the visible text.
+The live-test ledger is now 25 of 25. This proves the local attachment-to-model
+read path and Slack rendering surface; it does not claim that the normal
+planner-plus-Chief Slack ingress fits a one-call ceiling.
+
+### 2026-07-24 Multi-owner semantic-equivalence checkpoint
+
+The semantic-variation matrix now includes a supplied-evidence Chief request
+that needs three capabilities without requiring the operator to name any
+specialist: assess what the note supports, choose the first validation gap, and
+prepare one internal update. Five natural forms cover direct, passive,
+question-led, time-pressured, and revision-oriented wording.
+
+For every form, the same interpreted plan keeps Business Research, Opportunity
+Scout, and Outreach Composer in order; admits durable WorkItem execution; and
+preserves the unmodified current ask, no-search/no-write boundaries, combined-
+answer requirement, and output shape in all three typed specialist context
+packs. The focused offline gate passes 10 tests. This proves deterministic
+compatibility with a correct semantic plan across direct and graph contracts;
+it does not claim fresh live-model paraphrase proof. The live-test ledger
+remains 25 of 25.
+
+### 2026-07-24 Continuation owner-authority checkpoint
+
+A shared Slack continuation audit found that an adapter-generated prefix such
+as `business research analyst continue this prior Slack thread` was being
+reinserted into the latest human message. That made the prior owner look like a
+new explicit agent mention and also leaked routing metadata into specialist
+prose; in a three-bullet formatting case, the metadata became the first bullet
+and displaced a real supplied fact.
+
+The continuation contract now keeps the adapter owner only in typed advisory
+context. The current human follow-up remains unmodified and authoritative.
+Prior human evidence may be included for reference, but prior-owner metadata is
+not serialized into the task prose. A newly named agent or newly interpreted
+Gmail, opportunity, or other capability supersedes the prior owner, while a
+provider-free same-artifact formatting request may retain the prior owner
+without gaining provider or write authority.
+
+The affected entrypoint, planner, Chief, Slack, Orchestrator, CLI, and semantic
+gate passes 1,084 tests; Ruff passes. No API or provider call was used, and the
+live-test ledger remains 25 of 25. Fresh Slack follow-up proof remains pending a
+new live allowance.
+
+### 2026-07-24 Downstream semantic-authority checkpoint
+
+The post-plan audit classified downstream parsing into three groups. Exact
+field extraction and deterministic safety checks remain valid: dates, titles,
+sender or record identity, attachment paths, guarded test markers, mutation
+scope, approvals, and provider receipts may still be resolved or verified after
+planning. Legacy phrase recognition remains only for planner-unavailable or
+explicitly compatibility-only execution. Route, provider, tool family, graph
+shape, target count, and search intent belong to the canonical plan.
+
+Three competing-authority defects were removed. First, Business Research could
+turn a canonical single-company plan into a two-company comparison or
+multi-target discovery run by re-reading incidental comparison/count words.
+Second, Zotero words in background prose could select a Zotero article or
+collection path even when the plan selected ordinary company research. Third,
+CLI, Slack, Business Research, and Opportunity execution could disable live
+research by re-reading `do not search` prose after a canonical plan explicitly
+authorized search. The shared search rule now separates availability from
+intent: the live flag makes search possible, the canonical plan decides whether
+the current task requests it, and prose is consulted only when canonical
+planning is absent.
+
+Natural regressions cover both directions: nuisance prose cannot broaden or
+replace a narrow plan, and structured comparison, multi-target, Zotero, and
+search decisions do not require legacy trigger words. The affected gate passes
+1,069 tests; the complete repository gate passes 4,327 tests with one skip.
+Ruff and `git diff --check` pass. All work in this checkpoint is offline; no
+model, provider, Slack post, or external mutation was used. The live-test ledger
+remains 25 of 25, so fresh Slack proof requires a new allowance.
+
+### 2026-07-25 LangGraph semantic-authority checkpoint
+
+The same canonical-plan rule now reaches the remaining graph executor
+decisions. After RSS, preprint, or Zotero context is staged, the explicit
+workflow order and target select Business Research, Opportunity Scout, Outreach
+Composer, Gmail Triage, or Chief of Staff. Incidental words in the raw request
+can no longer silently replace that route. A canonical Chief plan also owns
+whether Chief coordinates before context specialists, without requiring a
+legacy trigger phrase.
+
+Airtable and Google Workspace artifact-plan admission now follows typed
+provider, operation, permission, artifact, intent, and objective fields. An
+explicit read-only plan cannot become a write plan because old write language
+appears in background prose, while an explicit create or update plan no longer
+depends on matching one legacy phrase. Older callers that omit these newer
+fields keep the bounded compatibility fallback.
+
+Natural regression coverage includes plan-versus-prose conflicts in both
+directions and an end-to-end dependency-free graph proving that RSS context
+stages to the planned Business Research route rather than an incidental
+Opportunity route. The focused LangGraph gate passes 125 tests, the affected
+semantic gate passes 805 tests, and the complete repository gate passes 4,335
+tests with one skip. Ruff and `git diff --check` pass. This checkpoint is
+offline only: no model, provider, Slack post, or external mutation was used, and
+the live-test ledger remains 25 of 25.
+
+### 2026-07-25 Gmail contact-binding follow-up
+
+One separately authorized Slack test used a natural Chief request to identify a
+startup-account contact and the address used in Gmail. The semantic path was
+correct: the planner selected Gmail contact discovery, preserved the unmodified
+current ask, admitted bounded search/read operations only, and prohibited
+drafts, sends, labels, archive, and other mutations. Gmail returned the bounded
+candidate set and the contact specialist ran.
+
+The run failed after synthesis because a redundant model-supplied
+`supporting_message_ids` value was rejected before the exact contact/header
+binding ran. That list is no longer evidence authority. The binder now derives
+receipt message IDs only from contacts that resolve to an exact provider
+message and exact From/To address. It may normalize a thread identifier only
+when the provider candidates and selected address identify one unique message.
+Unknown addresses, unknown messages, and ambiguous thread matches still fail.
+
+Slack API, the stored run record, and Computer inspection show the same terminal
+failure. An independent read-only Gmail connector search confirmed that the
+connected `wisegrow05@gmail.com` mailbox contains the relevant direct
+correspondence; no Gmail write occurred. OpenAI Admin Usage recorded two model
+requests, 31,296 input tokens, and 920 output tokens in the exact run window.
+The first request was the planner and the second was the Gmail specialist.
+
+Offline verification after the repair passes 91 focused Gmail tests and the
+complete repository gate of 4,338 tests with one skip; Ruff and
+`git diff --check` pass. The authorized Slack run was not retried. The live-test
+ledger is now 26 of 26.
+
+### 2026-07-25 Post-plan capability-profile checkpoint
+
+The downstream semantic-authority audit found two remaining execution
+decisions that still gave raw words more authority than the canonical plan.
+Business Research contact enrichment could be enabled by its default request
+flag or by incidental `contact`, `email`, or `outreach` wording. Outreach
+rendering could classify an external email draft as internal Slack copy because
+quoted or historical Slack-copy language appeared in the request, while a
+typed multi-owner internal Slack artifact still depended on phrase recognition.
+
+Both decisions now use the shared canonical execution contract. Contact
+enrichment requires the typed `contact_discovery` objective or
+`contact_candidates` artifact. Internal Slack artifact mode requires the typed
+internal audience/channel, Outreach owner or workflow step, draft artifact,
+provider-free scope, and no-side-effect policy. Invalid canonical plans fail
+closed; planner-unavailable and compatibility-only callers retain the older
+bounded fallback.
+
+Natural regressions prove both directions across the shared authority helper and
+WorkItem execution: nuisance wording cannot broaden a normal research or
+external-email plan, and correctly typed contact or internal-Slack work needs no
+trigger phrase. An end-to-end fixture WorkItem preserves the company profile
+without manufacturing a contact artifact. The affected entrypoint and WorkItem
+gate passes 1,010 tests; the complete repository gate passes 4,347 tests with
+one intentional skip. Full Ruff and `git diff --check` pass. This checkpoint used
+no model, provider, Slack, or other live call; the live-test ledger remains
+26 of 26.
+
+### 2026-07-25 Provider-object tool-admission checkpoint
+
+The post-plan audit found one missing piece between semantic planning and
+provider tools: `provider_operations` could say read, update, or delete, but it
+did not identify whether the operation applied to a Google Doc, Sheet row,
+worksheet tab, Drive folder, or slide deck. Google Workspace therefore
+re-scanned the request for object and action words, allowing quoted or
+historical text to add tools and requiring some valid paraphrases to contain a
+legacy verb.
+
+The canonical plan now carries compact ordered provider-action steps: each
+already-authorized operation is paired with its provider object. These steps
+only narrow tool admission; they cannot add an operation, change providers, or
+bypass approval, identity, safety, or receipt gates. Direct Workspace execution
+uses the steps to expose only the relevant tools. Older canonical plans without
+object steps remain executable with an operation-bounded tool set, while
+planner-unavailable compatibility callers retain the legacy bounded parser.
+Invalid canonical plans expose no Workspace tools.
+
+The same typed steps and provider read/result fields now survive WorkItem and
+LangGraph plan persistence instead of being dropped by the event allowlist.
+Natural regressions prove that quoted Sheet/folder deletion language cannot
+broaden a Doc read, and a Sheet-row correction can select its update/read-back
+tools without requiring `row`, `edit`, or `update` in the raw request. The
+complete repository gate passes 4,352 tests with one intentional skip; Ruff and
+`git diff --check` pass. No model, provider, Slack, or external mutation was
+used at that checkpoint, and the live-test ledger was 26 of 26.
+
+### 2026-07-25 Chief/Gmail contact live acceptance
+
+The operator authorized one additional live test after the offline contact and
+provider-object gates passed. The natural Slack request asked Chief of Staff for
+the email address of the person who set up the operator's E2B startup account.
+It completed through the shared Gmail contact workflow without clarification,
+route metadata, a generic WorkItem result, or a provider mutation.
+
+The child run record captured one `gpt-5.4-mini` specialist request with 11,098
+input tokens, 465 output tokens, zero model-exposed tools, and an estimated cost
+of $0.010416. OpenAI Admin Usage recorded two requests in the matching minute,
+which corresponds to the planner plus the specialist. The Chief payload had
+reported only the specialist event; the shared payload assembler now preserves
+and aggregates planner/preflight and specialist events rather than presenting
+the last event as the whole run.
+
+The bounded Gmail operation considered ten candidate messages, selected two
+exact messages from the relevant startup-account conversation, verified the
+provider read, and performed no write. Independent Gmail inspection confirmed
+the same sender identities and conversation, and Computer inspection confirmed
+the clean rendered Slack answer.
+
+This accepts the migrated Chief/Gmail contact slice, not every provider-object
+profile or entrypoint. The cumulative live-test ledger is now 27 runs, including
+this separately authorized one-run extension.
+
+### 2026-07-25 Chief/Google Workspace lifecycle live acceptance
+
+One natural Slack request asked Chief of Staff to take one temporary marked
+Google Doc through an approved create, read-back, same-document update,
+read-back, trash, and trash-verification lifecycle. The planner produced the
+canonical Google Workspace owner, ordered create/read/update/delete/verify
+operations, and matching `google_document` action steps. Execution used the
+single bounded lifecycle helper rather than exposing a broad Workspace toolbox.
+
+The provider receipt proves the same document ID was used for create, update,
+and trash; both content writes passed provider read-back and the final Drive
+metadata reported `trashed=true`. A separate read-only provider metadata check
+confirmed the exact title, Google Doc MIME type, KNIOps scope, and trashed
+state. Slack API and Computer inspection show the same concise terminal answer
+with no WorkItem, route, command, or provider-identity metadata. The two
+Workspace write gates were enabled only for the approved test window and were
+disabled immediately after cleanup.
+
+The natural lifecycle wrapper now supports the same-ID update stage already
+available in the provider tools. The complete repository gate passes 4,355
+tests with one intentional skip; Ruff passes. The persisted planner event used
+one `gpt-5.4-mini` request with 20,138 input and 677 output tokens and a local
+estimate of $0.01815. The Admin Usage endpoint had not surfaced that minute by
+the final reconciliation query, so the backend event remains the current
+request-count evidence.
+
+This is cumulative live run 28. In the current separately authorized 25-call
+test window, three model calls have been used—two for the prior Chief/Gmail
+test and one for this planner-plus-deterministic Workspace lifecycle—leaving 22.
+
+### 2026-07-25 Chief/Gmail Slack-local draft typography failure
+
+The next bounded natural Slack test asked Chief of Staff to choose one email
+from today that seemed worth following up on for KNI and draft a brief reply in
+the Slack thread without sending or creating a Gmail draft. The LLM planner
+interpreted the request correctly: Gmail Triage, today's inbound collection,
+read-only search/read, one selected result, and a Slack-local no-send draft.
+
+Execution did not reach Gmail. A deterministic send-safety matcher did not
+recognize the curly apostrophe in the Slack/mobile wording `Don’t`. It therefore
+treated the negative clause as an affirmative send and replaced the canonical
+Gmail route with a generic Opportunity Scout workflow. The generated eval case
+and fixture artifacts were consequences of that wrong owner selection, not the
+cause. No Gmail read or write occurred.
+
+The shared matching boundary now normalizes Unicode apostrophes, quotes, dashes,
+and non-breaking spaces in a derived matching copy only. The raw operator
+request remains unchanged for planner and specialist reasoning, traces, and
+public output. Five ordinary no-send typography variants route identically,
+while an affirmative send request remains blocked. Replaying the exact captured
+live planner object offline now selects Gmail Triage with LLM routing authority.
+The complete repository gate passes 4,363 tests with one intentional skip; Ruff
+and `git diff --check` pass.
+
+The failed live test used two model requests: one planner request and one
+blocked-result synthesis request. OpenAI Admin Usage confirmed 36,207 input
+tokens and 1,321 output tokens across those two requests; persisted local
+estimates total $0.03309975. The follow-up and any retry were deliberately not
+run. The current 25-call test window has used five model requests and has 20
+remaining.
+
+### 2026-07-25 Gmail follow-up and final-answer authority checkpoint
+
+The next thread test kept the same natural operator objective while changing
+the bounded Gmail window from today to yesterday. The first follow-up exposed
+two shared defects: explicit date scope was weakened by prior provider context,
+and the operational Slack response exposed evaluation metadata and an unrelated
+action. The shared path now preserves the current turn's date, direction,
+selection, and Slack-only constraints; reads complete bounded threads when
+reply history matters; and treats both "answered" and "replied" as the same
+operator-reply exclusion.
+
+The one approved live retry passed at the provider/execution boundary. The
+planner selected yesterday's inbound Gmail, read four bounded threads, excluded
+two because the operator had already replied, rejected the other two as
+automated or not reply-worthy, and returned an honest no-candidate result. No
+Gmail draft, send, label, archive, or other mutation ran.
+
+The visible Slack answer still failed acceptance. A generic final-response
+synthesizer replaced the verified no-candidate result with research prose built
+from stale Slack links and exposed a "More research" action. This was not a
+Gmail retrieval or model-selection failure: the provider artifact already held
+the correct terminal answer. Provider-backed terminal results now carry a typed
+summary-authority field. Canonical terminal summaries cannot be overwritten by
+generic research synthesis; reviewable specialist summaries still pass through
+the existing Orchestrator review path. The earlier artifact-metadata marker
+remains only as a compatibility shim for persisted older results. The same
+typed contract is covered across Gmail, Chief of Staff, Opportunity Scout,
+deterministic state-followups, and the deterministic research-only graph
+terminal.
+
+The persisted failing WorkItem also showed that local Slack dashboard and
+review URLs had been admitted as factual synthesis sources. Response synthesis
+now excludes fixture, file, localhost, loopback, and other local diagnostic
+URLs from source summaries and provider-result samples. They remain available
+to internal diagnostics but cannot steer the user-facing answer.
+
+Focused planner, Gmail-thread, workflow, and response-synthesis verification
+passes 728 tests. Cross-path typed-result and source-hygiene verification passes
+857 tests. The complete repository gate after the shared contract patch passes
+4,374 tests with one intentional skip; Ruff and `git diff --check`
+pass. Slack API and Computer inspection show the failed
+research-style recast, while an independent Gmail connector read confirms zero
+drafts. No second live retry was run. The current 25-call test window has used
+11 model requests and has 14 remaining.
+
+### 2026-07-25 Gmail phase-boundary failure and cross-agent hardening
+
+The unchanged Gmail acceptance retry reached the correct canonical plan and
+performed the correct bounded read-only Gmail candidate pass. It then failed
+inside the Gmail semantic-ranking phase because the model included a
+plain-text reply suggestion in a schema that permits one. A deterministic
+validator treated that harmless text as if a provider Gmail draft had been
+created. No Gmail draft, send, label change, or other provider mutation
+occurred. The failed run used three model requests: planner, Gmail candidate
+ranking, and blocked-result synthesis. The current 25-call window has therefore
+used 14 requests and has 11 remaining.
+
+The repair is phase-based rather than Gmail-phrase-specific. A shared stage
+output contract now distinguishes read-only ranking, draft-only composition,
+approval checkpoints, and provider-write execution. Unrequested text artifacts
+may be discarded with an audit note without blocking the task. Structured
+claims that Gmail, Calendar, Airtable, Google Docs, or Slack actually mutated a
+provider are detected across nested results and cannot confirm completion
+without a verified provider receipt.
+
+The same failure also exposed two presentation defects. The manager reported
+future stages as separate blockers even though the immediate Gmail prerequisite
+had already failed, and Slack appended graph/eval diagnostics to the ordinary
+answer. Manager finalization now reports the first actionable blocker while
+retaining independent safety blockers. Graph explanations and eval controls
+remain persisted for diagnostics but are reader-visible only when the operator
+explicitly requests run diagnostics or starts an eval run.
+
+Follow-up context is also hardened before the next live test. A repeated
+current request is deduplicated before planning. Historical human wording is
+preserved, while renderer-owned eval, source-focus, and graph diagnostics are
+removed from prior bot turns before they reach later planners or specialists.
+This reduces stale-state influence and avoids paying model tokens for internal
+UI metadata.
+
+Focused shared-boundary verification passes 193 tests. The cross-agent offline
+matrix passes 1,072 tests across planning, Gmail, Calendar, Google Docs,
+context agents, Chief of Staff, WorkItem/LangGraph, response synthesis, and
+Slack. The complete repository gate passes 4,384 tests with one intentional
+skip; Ruff and `git diff --check` pass. No additional live Slack or provider
+run was used after the failed retry.
+
+### 2026-07-25 Decorated Slack admission, Gmail identity, and Chief context
+
+The decorated `@KNI` admission repair is active in the sibling Slack worker.
+One authorized human request with an approved decorator now enters exactly
+once, while self-output, arbitrary apps, unauthorized users, missing root
+mentions, and duplicate deliveries remain rejected.
+
+The first admitted Gmail contact row exposed a provider-identity binding gap:
+the specialist selected a stable direct address but cited a routed-alias
+message from the same verified Gmail thread. The binder now remaps only when
+one unique provider message in that same thread contains the exact requested
+address. Cross-thread, invented, and ambiguous matches still fail. The
+unchanged retry returned one resolved person and the stable address, with a
+verified Gmail read receipt, no Gmail write, and the same concise answer in the
+backend, Slack connector, and Computer UI.
+
+The next row asked Chief of Staff to review today's Gmail, open WorkItems, and
+current Airtable context, then recommend three actions without changing
+anything. It stopped after the first defect. The planner retained all three
+sources in its typed objective and source preferences but incorrectly assigned
+the task to Airtable alone, removed the workflow, and disabled durable state.
+Tool admission therefore exposed only Airtable reads; Gmail and WorkItems were
+never attempted. This was a plan-completeness failure, not missing operator
+detail or an Airtable outage.
+
+The shared merge now preserves a typed Chief-owned multi-source read contract:
+an explicit Chief owner, multiple named read advisers, read-only context
+summary, and durable WorkItem state cannot be collapsed to one provider. The
+LLM still interprets and synthesizes evidence inside each admitted stage.
+Replaying the exact captured planner object now restores Chief ownership,
+Gmail plus Airtable advisers, today's Gmail scope, read-only permission, and
+durable execution. Focused planner and semantic tests pass 370 cases; the
+cross-path Chief/CLI/workflow/graph slice passes 11 cases; Ruff and diff checks
+pass.
+
+The unchanged live retry exposed an earlier entry-adapter defect before that
+merge could apply. The Slack bridge recognized the explicit `CoS` prefix, then
+used the first provider noun in the remaining text to invoke Airtable directly.
+It removed the Chief prefix before KBA preflight, so the backend again received
+an Airtable-owned single-provider request and never admitted Gmail, WorkItems,
+or Chief synthesis. This is not a new planner-merge failure or an Airtable
+provider failure. The live lane is paused while the sibling bridge replaces
+that manager-bypassing shortcut with the canonical Chief path for multi-source
+requests; direct specialist aliases and exact single-provider lifecycle
+operations remain separate compatibility cases.
+
+The current 25-call window has used 12 model requests and has 13 remaining:
+four before this acceptance slice, two for the initial Gmail row, two for its
+successful unchanged retry, two for the stopped Chief multi-source row, and two
+for the unchanged retry that isolated the Slack bridge defect.
+
 ## Priority Order
 
 1. Finish ANU-309/209/206 as one shared contract slice: semantic interpretation
@@ -2062,6 +2994,9 @@ are treated as a primary operator-facing navigation surface.
    Deterministic validation should remain authoritative only for safety,
    provider identity, exact mutation scope, receipts, and unambiguous measurable
    output constraints.
+   Treat intermediate model/helper output according to its typed phase; prose
+   from read/rank/review cannot become provider-mutation evidence or an
+   unrelated downstream blocker.
 2. Continue ANU-205 incrementally so direct, Slack, continuation, WorkItem, and
    LangGraph paths consume those same typed contracts instead of independently
    re-parsing request prose.

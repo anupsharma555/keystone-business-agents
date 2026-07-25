@@ -1,6 +1,6 @@
 <!--
 prompt_name: calendar_action_interpreter
-prompt_version: 2026-07-16.6
+prompt_version: 2026-07-21.2
 prompt_purpose: Interpret one live Calendar read, create, update, or delete request into source-grounded structured fields before deterministic validation and provider access.
 prompt_safety_notes: No tools or provider access; one model turn; Python validates read/write scope and exact provider identity after interpretation; interpretation never grants approval.
 prompt_eval_datasets: tests/test_calendar_action_interpreter.py, tests/test_cli.py
@@ -33,6 +33,34 @@ Rules:
 - Use operation `read` when the operator asks whether a referenced event is on
   the Calendar, asks to verify/check its current Calendar state, or asks to
   retrieve that exact event without changing it.
+- For an exact referenced event read, set `read_scope=single_event`. For an
+  unfiltered agenda or bounded Calendar-window question, set
+  `read_scope=time_window` and do not invent an `event_reference`. For a query
+  that combines a current subject with a bounded date or time window, such as
+  asking for the flight event tomorrow, set `read_scope=filtered_window`, copy
+  only the subject text into `query`, and put its exact current-directive span
+  in `query_source_text`.
+- Set `read_selection=next` only when the current operator directive asks for
+  the first or next matching event, and copy that exact phrase into
+  `read_selection_source_text`. Otherwise set `read_selection=all` and leave
+  `read_selection_source_text` empty. Never inherit a prior turn's first/next
+  selection for a new current subject.
+- Calendar result quantity and Calendar account scope are independent. Words
+  such as `all`, `every`, `list`, or `show` that modify events affect the result
+  selection only; they do not authorize reading additional calendars. Set
+  `calendar_scope=selected_readable` only when the current directive explicitly
+  asks for selected, shared, or every readable Calendar, and copy the exact
+  Calendar-scope phrase into `calendar_scope_source_text`. Otherwise set
+  `calendar_scope=configured` and leave `calendar_scope_source_text` empty.
+- Do not use generic object phrases such as `events`, `all events`, `my events`,
+  or `calendar events` as a provider query. An unfiltered request for those
+  objects is a `time_window` read. Use `filtered_window` only when the current
+  directive supplies a discriminating subject such as `flight`, `orientation`,
+  or an event-title fragment.
+- Set `date_scope=today` or `tomorrow` only when the current operator directive
+  uses that relative date. Set `specific_date` only for a date in the current
+  directive. Prior thread dates may identify an exact prior event, but they
+  must not replace the current date scope of a new agenda/window question.
 - Use operation `none` when the request is not a Calendar read or mutation.
 - For update/delete, put the existing event identity in `event_id` or
   `event_reference`; use `title` only for a requested new title.
@@ -40,6 +68,9 @@ Rules:
   `User follow-up` sections. Treat the latest `User follow-up` as the requested
   operation and changes; use the prior sections only to resolve the existing
   event identity and unchanged context.
+- A new subject in the latest `User follow-up` replaces the prior subject. A
+  prior result may not supply `query`, `read_selection`, or date scope for a
+  new bounded read.
 - In a continuation, `this event` or `it` is not ambiguous when the prior
   request identifies exactly one event title (and optional date), or the prior
   result supplies one exact event ID. Copy that prior title into

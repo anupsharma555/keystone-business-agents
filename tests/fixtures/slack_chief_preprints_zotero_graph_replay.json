@@ -1,0 +1,72 @@
+{
+  "current_request": "@KNI CoS, compare what our newest Zotero journal article and most recent relevant preprint say about NeuroFlow's evidence. Tell me what looks established, what is still preliminary, and the first KNI question worth validating. If there is no relevant preprint, say so. Keep it internal: don't search the web, create files, change Zotero, draft, send, or post anything.",
+  "manual_request_plan": {
+    "source": "llm",
+    "requested_agent": "chief_of_staff",
+    "target_agent": "chief_of_staff",
+    "intent": "route_request",
+    "task_objective": "route_or_continue",
+    "primary_target": "NeuroFlow",
+    "target_type": "company",
+    "requires_durable_state": true,
+    "requires_live_search": false,
+    "workflow": [
+      "business_research_analyst"
+    ],
+    "constraints": [
+      "use existing Zotero and preprint context",
+      "state when no relevant preprint is available",
+      "no web search",
+      "no provider writes",
+      "keep the answer internal"
+    ],
+    "ask_shape": {
+      "permission_state": "read_only",
+      "audience_scope": "internal",
+      "output_form": "brief"
+    }
+  },
+  "preprint_fixture": {
+    "title": "Preprint on NeuroFlow behavioral-health outcomes evidence",
+    "url": "https://doi.org/10.1101/2026.03.07.456789",
+    "source": "medRxiv",
+    "feed": "preprints",
+    "doi": "10.1101/2026.03.07.456789",
+    "tags": [
+      "preprint",
+      "behavioral health",
+      "outcomes evidence"
+    ],
+    "selection_reason": "Relevant preliminary evidence for an internal NeuroFlow evidence-maturity review.",
+    "summary": "A preprint discusses NeuroFlow outcomes-evidence workflow needs."
+  },
+  "expected": {
+    "route": "business_research_analyst",
+    "status": "done",
+    "context_agents": [
+      "preprints_context_agent",
+      "zotero_context_agent"
+    ],
+    "artifact_types": [
+      "chief_of_staff_plan",
+      "preprints_context_summary",
+      "zotero_context_summary",
+      "company_profile"
+    ],
+    "node_path": [
+      "normalize_request",
+      "orchestrator_preflight",
+      "state_followup",
+      "prepare_work_item",
+      "run_chief_of_staff",
+      "finalize_step",
+      "manager_loop_continue",
+      "prepare_work_item",
+      "stage_feed_context",
+      "stage_zotero_context",
+      "run_business_research",
+      "finalize_step",
+      "manager_loop_finalize"
+    ]
+  }
+}

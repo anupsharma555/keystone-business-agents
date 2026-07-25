@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 
 
 def semantic_provider_side_effect_policy(
@@ -15,18 +15,16 @@ def semantic_provider_side_effect_policy(
     checks remain authoritative at the tool boundary.
     """
 
-    plan = _plan_mapping(manual_plan)
-    if str(plan.get("source") or "") != "llm":
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if not authority.canonical:
         return None
-    provider = str(plan.get("provider_system") or "").strip()
+    assert authority.plan is not None
+    plan = authority.plan
+    provider = plan.provider_system
     if provider == "unspecified":
         return None
-    operations = [
-        str(item or "").strip().lower()
-        for item in (plan.get("provider_operations") or [])
-        if str(item or "").strip()
-    ]
-    target = str(plan.get("primary_target") or "").strip() or "the selected object"
+    operations = list(authority.effective_provider_operations(provider))
+    target = plan.primary_target or "the selected object"
     mutation_operations = [
         operation
         for operation in operations
@@ -101,14 +99,3 @@ def semantic_provider_side_effect_policy(
         "approval, identity, live-flag, and verification gates. No unrelated action is "
         "permitted."
     )
-
-
-def _plan_mapping(value: object | None) -> Mapping[str, object]:
-    if isinstance(value, Mapping):
-        return value
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        payload = model_dump(mode="python")
-        if isinstance(payload, Mapping):
-            return payload
-    return {}

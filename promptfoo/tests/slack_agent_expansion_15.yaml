@@ -747,10 +747,10 @@
     user_input: '@KNI outreach composer "using only these approved facts, draft a LinkedIn note under 450 characters: Company runs measurement-based behavioral health programs; Keystone can help with evaluation design; draft only and do not post"'
     expected_route: outreach_composer
     expected_pack_type: outreach
-    expected_status: blocked
-    require_done_status: false
+    expected_status: done
+    require_done_status: true
     require_visible_sources: false
-    required_terms: approved
+    required_terms: Approval
     forbidden_terms: sent successfully, posted to LinkedIn, email sent
     max_elapsed_seconds: 15
     slack_context:
@@ -865,8 +865,9 @@
     eval_dimensions: multi_agent_routing, clarification, approval_gate
     surface: slack
     user_input: '@KNI "research this vendor, decide if it is worth contacting, and draft next steps without sending anything"'
-    expected_route: clarification
+    expected_route: business_research_analyst
     expected_status: blocked
+    expected_pack_type: research
     expected_approval_required: true
     require_done_status: false
     require_visible_sources: false

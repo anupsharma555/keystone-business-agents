@@ -32,7 +32,13 @@ GOOGLE_WORKSPACE_READ_TOOLS = frozenset(
     }
 )
 GOOGLE_WORKSPACE_WRITE_TOOLS = GOOGLE_WORKSPACE_ALLOWED_TOOLS - GOOGLE_WORKSPACE_READ_TOOLS
-AIRTABLE_READ_ALLOWED_TOOLS = frozenset({"airtable_get_base_schema", "airtable_read_records"})
+AIRTABLE_READ_ALLOWED_TOOLS = frozenset(
+    {
+        "airtable_get_base_schema",
+        "airtable_read_records",
+        "airtable_aggregate_records",
+    }
+)
 AIRTABLE_WRITE_ALLOWED_TOOLS = frozenset(
     {
         "airtable_write_record",

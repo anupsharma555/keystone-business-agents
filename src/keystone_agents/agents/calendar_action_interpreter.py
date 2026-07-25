@@ -5,13 +5,15 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from keystone_agents.calendar_actions import (
     CalendarActionPlan,
     calendar_interpretation_context,
+    calendar_lookup_date,
     calendar_thread_event_context,
+    current_calendar_date,
     default_calendar_end_time,
     infer_calendar_action_plan,
     is_calendar_action_candidate,
@@ -21,7 +23,9 @@ from keystone_agents.schemas.calendar_action import (
     CalendarActionInterpretation,
     CalendarActionInterpretationInput,
 )
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.sdk import Agent, build_model_settings, build_sdk_agent, compose_instructions
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.tools.google_calendar_tool import (
     DEFAULT_CALENDAR_ID,
     DEFAULT_CALENDAR_TIMEZONE,
@@ -69,6 +73,7 @@ def resolve_calendar_action_plan(
     request_text: str,
     fallback: CalendarActionPlan | None,
     *,
+    manual_plan: ManualRequestPlan | dict[str, object] | None = None,
     semantic_candidate: bool = False,
     live: bool = False,
     run_config: Any | None = None,
@@ -77,10 +82,55 @@ def resolve_calendar_action_plan(
 ) -> CalendarActionResolution:
     """Use at most one model turn, then reapply deterministic Calendar gates."""
 
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    allowed_operations: frozenset[str] | None = None
+    canonical_read_scope = "unspecified"
+    if authority.invalid:
+        return CalendarActionResolution(
+            plan=None,
+            warnings=(
+                "Supplied canonical plan was invalid; Calendar execution did not "
+                "fall back to request keywords.",
+            ),
+        )
+    if authority.canonical:
+        assert authority.plan is not None
+        if not authority.authorizes_provider(
+            "google_calendar",
+            allowed_agents={"chief_of_staff"},
+            allowed_intents={"business_system_write", "context_lookup"},
+        ):
+            return CalendarActionResolution(
+                plan=None,
+                warnings=(
+                    "Canonical plan did not authorize a Google Calendar action.",
+                ),
+            )
+        allowed_operations = frozenset(
+            operation
+            for operation in authority.effective_provider_operations(
+                "google_calendar"
+            )
+            if operation in {"read", "create", "update", "delete"}
+        )
+        canonical_read_scope = authority.plan.provider_read_scope
+        if not allowed_operations:
+            return CalendarActionResolution(
+                plan=None,
+                warnings=(
+                    "Canonical plan did not specify an executable Calendar operation.",
+                ),
+            )
+        fallback = _calendar_fallback_for_authorized_operations(
+            fallback,
+            allowed_operations=allowed_operations,
+        )
+
     requires_interpretation = bool(
-        semantic_candidate
+        allowed_operations
+        or semantic_candidate
         or (fallback and fallback.operation in {"read", "create", "update", "delete"})
-        or is_calendar_action_candidate(request_text)
+        or (authority.fallback_allowed and is_calendar_action_candidate(request_text))
     )
     if not requires_interpretation or (not live and run_config is None):
         return CalendarActionResolution(plan=fallback)
@@ -90,6 +140,8 @@ def resolve_calendar_action_plan(
         for key, value in (fallback.__dict__.items() if fallback else [])
         if key != "description"
     }
+    if canonical_read_scope != "unspecified":
+        deterministic_plan["provider_read_scope"] = canonical_read_scope
     if interpretation_context.description_payload:
         deterministic_plan["description"] = {
             "source": "operator_payload",
@@ -143,27 +195,171 @@ def resolve_calendar_action_plan(
                 + (f": {warning_detail}" if warning_detail else ""),
             ),
         )
-    if result.output.operation == "none":
+    interpretation = result.output
+    if allowed_operations is not None:
+        if len(allowed_operations) == 1:
+            authorized_operation = next(iter(allowed_operations))
+            interpretation = interpretation.model_copy(
+                update={"operation": authorized_operation}
+            )
+        elif interpretation.operation not in allowed_operations:
+            return CalendarActionResolution(
+                plan=(
+                    _blocked_plan(
+                        fallback,
+                        "calendar operation was not authorized by the canonical plan",
+                    )
+                    if fallback is not None
+                    else None
+                ),
+                interpreter_used=True,
+                openai_requests=1,
+                warnings=(
+                    "Calendar interpreter proposed an operation outside the canonical plan.",
+                ),
+            )
+    if interpretation.operation == "read":
+        if canonical_read_scope == "bounded_collection":
+            interpretation = _refine_bounded_calendar_read(
+                request_text,
+                interpretation,
+            )
+        elif canonical_read_scope == "single_item":
+            interpretation = interpretation.model_copy(
+                update={"read_scope": "single_event"}
+            )
+    if interpretation.operation == "none":
         plan, warnings = None, ()
     elif fallback is None:
         plan, warnings = _plan_from_model_interpretation(
             request_text,
-            result.output,
+            interpretation,
             today=today,
         )
     else:
         plan, warnings = _validated_interpretation_plan(
             request_text,
             fallback,
-            result.output,
+            interpretation,
             today=today,
         )
+    plan, semantic_warnings = _apply_canonical_calendar_lookup_target(
+        request_text,
+        plan,
+        manual_plan=manual_plan,
+        today=today,
+    )
     return CalendarActionResolution(
         plan=plan,
         interpreter_used=True,
         openai_requests=1,
-        warnings=warnings,
+        warnings=tuple((*warnings, *semantic_warnings)),
     )
+
+
+def calendar_lookup_target_from_plan(
+    manual_plan: ManualRequestPlan | dict[str, object] | None,
+) -> str:
+    """Return the event identity already selected by a typed semantic plan."""
+
+    if manual_plan is None:
+        return ""
+    if isinstance(manual_plan, dict):
+        try:
+            plan = ManualRequestPlan.model_validate(manual_plan)
+        except ValueError:
+            return ""
+    else:
+        plan = manual_plan
+    generic_targets = {"calendar", "google calendar", "my calendar"}
+    for candidate in (
+        plan.primary_target,
+        *plan.required_terms,
+        *plan.required_entities,
+    ):
+        clean = _clean_source_value(str(candidate or ""))
+        if clean and _normalize_source_text(clean) not in generic_targets:
+            return clean
+    return ""
+
+
+def _apply_canonical_calendar_lookup_target(
+    request_text: str,
+    plan: CalendarActionPlan | None,
+    *,
+    manual_plan: ManualRequestPlan | dict[str, object] | None,
+    today: date | None,
+) -> tuple[CalendarActionPlan | None, tuple[str, ...]]:
+    """Keep the semantic plan authoritative over a stale thread event reference."""
+
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if (
+        not authority.canonical
+        or not authority.authorizes_provider(
+            "google_calendar",
+            allowed_agents={"chief_of_staff"},
+            allowed_intents={"context_lookup"},
+        )
+        or authority.plan is None
+        or "read"
+        not in authority.effective_provider_operations("google_calendar")
+    ):
+        return plan, ()
+    if authority.plan.provider_read_scope == "bounded_collection":
+        # A bounded collection/window is not an event identity. In particular,
+        # planner prose such as "today's next event" must never be handed to
+        # the exact-title resolver or inherit an unrelated prior event date.
+        return plan, ()
+    target = calendar_lookup_target_from_plan(manual_plan)
+    if not target or plan is None or plan.operation != "read":
+        return plan, ()
+    identity_blockers = {
+        "event name or exact event id",
+        "LLM interpretation did not verify the event name",
+        "LLM and deterministic event references disagree",
+    }
+    blockers = tuple(
+        blocker for blocker in plan.blockers if blocker not in identity_blockers
+    )
+    lookup_date = plan.event_reference_date or plan.start_date or calendar_lookup_date(
+        request_text,
+        today=today,
+    )
+    changed = not _titles_compatible(plan.event_reference, target)
+    return (
+        replace(
+            plan,
+            event_reference=target,
+            event_reference_date=lookup_date,
+            complete=not blockers,
+            blockers=blockers,
+        ),
+        (
+            (
+                "Canonical Calendar target replaced a conflicting continuation "
+                "reference before the provider read."
+            ),
+        )
+        if changed
+        else (),
+    )
+
+
+def _calendar_fallback_for_authorized_operations(
+    fallback: CalendarActionPlan | None,
+    *,
+    allowed_operations: frozenset[str],
+) -> CalendarActionPlan | None:
+    """Keep prose-derived fields while making the canonical operation authoritative."""
+
+    if fallback is None or fallback.operation in allowed_operations:
+        return fallback
+    if len(allowed_operations) != 1:
+        return _blocked_plan(
+            fallback,
+            "calendar operation was ambiguous in the canonical plan",
+        )
+    return replace(fallback, operation=next(iter(allowed_operations)))
 
 
 def _plan_from_model_interpretation(
@@ -173,6 +369,16 @@ def _plan_from_model_interpretation(
     today: date | None,
 ) -> tuple[CalendarActionPlan, tuple[str, ...]]:
     """Build a bounded plan when deterministic parsing could not understand the wording."""
+
+    if interpretation.operation == "read" and interpretation.read_scope in {
+        "time_window",
+        "filtered_window",
+    }:
+        return _calendar_time_window_plan_from_interpretation(
+            request_text,
+            interpretation,
+            today=today,
+        )
 
     request_context = calendar_interpretation_context(request_text)
     current_request = request_text
@@ -291,6 +497,202 @@ def _field_is_current(value: str, evidence: str, current_request: str) -> bool:
     )
 
 
+def _refine_bounded_calendar_read(
+    request_text: str,
+    interpretation: CalendarActionInterpretation,
+) -> CalendarActionInterpretation:
+    """Refine a route-level bounded read without inheriting prior semantics."""
+
+    directive = calendar_interpretation_context(request_text).directive_text
+    query = _current_calendar_query(interpretation, directive)
+    if query:
+        return interpretation.model_copy(
+            update={
+                "read_scope": "filtered_window",
+                "query": query,
+                "read_selection": _current_calendar_read_selection(
+                    interpretation,
+                    directive,
+                ),
+            }
+        )
+    return interpretation.model_copy(
+        update={
+            "read_scope": "time_window",
+            "read_selection": _current_calendar_read_selection(
+                interpretation,
+                directive,
+            ),
+        }
+    )
+
+
+def _current_calendar_query(
+    interpretation: CalendarActionInterpretation,
+    directive: str,
+) -> str:
+    """Return only a provider query grounded in the current operator directive."""
+
+    candidates = [(interpretation.query, interpretation.query_source_text)]
+    # Compatibility for older interpreter outputs: an exact current event
+    # reference can refine a bounded read into a filter. A typed next/first
+    # agenda is never a query, even if an older model populated event_reference.
+    if interpretation.read_selection != "next":
+        candidates.extend(
+            (
+                (interpretation.event_reference, interpretation.event_reference_source_text),
+                (interpretation.title, interpretation.title_source_text),
+            )
+        )
+    for value, evidence in candidates:
+        clean = _clean_source_value(value)
+        if (
+            _calendar_query_is_discriminating(clean)
+            and _field_is_current(clean, evidence, directive)
+        ):
+            return clean
+    return ""
+
+
+def _calendar_query_is_discriminating(value: str) -> bool:
+    """Reject generic Calendar-object words that cannot narrow a provider read."""
+
+    tokens = set(re.findall(r"[a-z0-9]+", _normalize_source_text(value)))
+    generic_tokens = {
+        "all",
+        "any",
+        "calendar",
+        "calendars",
+        "event",
+        "events",
+        "my",
+        "our",
+        "the",
+    }
+    return bool(tokens - generic_tokens)
+
+
+def _current_calendar_scope(
+    interpretation: CalendarActionInterpretation,
+    directive: str,
+) -> str:
+    """Broaden Calendar account scope only from explicit current-turn evidence."""
+
+    if interpretation.calendar_scope != "selected_readable":
+        return "configured"
+    evidence = _normalize_source_text(interpretation.calendar_scope_source_text)
+    normalized_directive = _normalize_source_text(directive)
+    if not evidence or evidence not in normalized_directive:
+        return "configured"
+    explicitly_names_calendar_set = bool(
+        re.search(
+            r"\b(?:all|every|readable|selected|shared)\b[^.!?;]{0,80}"
+            r"\bcalendars?\b|\bcalendars?\b[^.!?;]{0,80}"
+            r"\b(?:all|every|readable|selected|shared|i\s+can\s+read)\b",
+            evidence,
+        )
+    )
+    return "selected_readable" if explicitly_names_calendar_set else "configured"
+
+
+def _current_calendar_read_selection(
+    interpretation: CalendarActionInterpretation,
+    directive: str,
+) -> str:
+    """Discard a prior first/next selection unless the current turn supports it."""
+
+    if interpretation.read_selection != "next":
+        return "all"
+    return (
+        "next"
+        if _field_is_current(
+            interpretation.read_selection,
+            interpretation.read_selection_source_text,
+            directive,
+        )
+        else "all"
+    )
+
+
+def _calendar_time_window_plan_from_interpretation(
+    request_text: str,
+    interpretation: CalendarActionInterpretation,
+    *,
+    today: date | None,
+) -> tuple[CalendarActionPlan, tuple[str, ...]]:
+    """Normalize one model-selected Calendar window into exact provider bounds."""
+
+    directive = calendar_interpretation_context(request_text).directive_text
+    reference_date = today or current_calendar_date()
+    normalized_directive = _normalize_source_text(directive)
+    window_date = ""
+    blockers: list[str] = []
+    if interpretation.date_scope == "today":
+        if re.search(r"\btoday\b", normalized_directive):
+            window_date = reference_date.isoformat()
+        else:
+            blockers.append("calendar window date was not source verified")
+    elif interpretation.date_scope == "tomorrow":
+        if re.search(r"\btomorrow\b", normalized_directive):
+            window_date = (reference_date + timedelta(days=1)).isoformat()
+        else:
+            blockers.append("calendar window date was not source verified")
+    elif interpretation.date_scope == "specific_date":
+        parsed_date = calendar_lookup_date(directive, today=reference_date)
+        if parsed_date and parsed_date == interpretation.start_date:
+            window_date = parsed_date
+        else:
+            blockers.append("calendar window date was not source verified")
+    else:
+        blockers.append("calendar window date")
+
+    query = ""
+    if interpretation.read_scope == "filtered_window":
+        query = _current_calendar_query(interpretation, directive)
+        if not query:
+            blockers.append("calendar window query was not source verified")
+    read_selection = _current_calendar_read_selection(interpretation, directive)
+    calendar_scope = _current_calendar_scope(interpretation, directive)
+    if (
+        calendar_scope == "configured"
+        and interpretation.read_scope == "filtered_window"
+    ):
+        # Preserve the established cross-calendar default for subject-filtered
+        # reads. Generic agenda reads remain on the configured calendar unless
+        # the current turn explicitly requests a broader Calendar set.
+        calendar_scope = "selected_readable"
+    warnings = tuple(
+        f"Calendar interpretation note: {item}" for item in interpretation.ambiguities
+    )
+    return (
+        CalendarActionPlan(
+            operation="read",
+            read_scope=interpretation.read_scope,
+            read_selection=read_selection,
+            date_scope=interpretation.date_scope,
+            query=query,
+            start_date=window_date,
+            calendar_id=(
+                os.getenv(GOOGLE_CALENDAR_ID_ENV, DEFAULT_CALENDAR_ID).strip()
+                or DEFAULT_CALENDAR_ID
+            ),
+            calendar_scope=calendar_scope,
+            timezone=(
+                interpretation.timezone
+                or os.getenv(
+                    GOOGLE_CALENDAR_TIMEZONE_ENV,
+                    DEFAULT_CALENDAR_TIMEZONE,
+                ).strip()
+                or DEFAULT_CALENDAR_TIMEZONE
+            ),
+            all_day=False,
+            complete=not blockers,
+            blockers=tuple(blockers),
+        ),
+        warnings,
+    )
+
+
 def _validated_interpretation_plan(
     request_text: str,
     fallback: CalendarActionPlan,
@@ -299,6 +701,15 @@ def _validated_interpretation_plan(
     today: date | None,
 ) -> tuple[CalendarActionPlan, tuple[str, ...]]:
     warnings: list[str] = []
+    if interpretation.operation == "read" and interpretation.read_scope in {
+        "time_window",
+        "filtered_window",
+    }:
+        return _calendar_time_window_plan_from_interpretation(
+            request_text,
+            interpretation,
+            today=today,
+        )
     if interpretation.operation != fallback.operation:
         if not _operation_source_anchored(request_text, interpretation):
             return (

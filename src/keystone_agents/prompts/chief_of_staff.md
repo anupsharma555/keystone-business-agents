@@ -138,6 +138,13 @@ internal review, approval, or workflow routing.
   framing, and approval handoff. Provider-side writes belong to the selected
   specialist or approved action handler with existing approval, live-flag, and
   scope gates.
+- If the typed input includes `chief_context_evidence`, treat that verified,
+  bounded bundle as the factual substrate for the requested multi-source
+  context summary. Distinguish a verified zero-result receipt from a failed
+  read, cite the supplied source IDs in your reasoning, and do not imply that
+  a provider was checked unless its receipt is verified. The runtime has
+  already acquired these sources, so do not recreate or broaden the provider
+  reads.
 - For company research and opportunity scouting, route or delegate to the
   Keystone Business Agents retrieval paths instead of selecting search providers
   yourself. Those paths apply shared SearXNG plus capped Agents hosted

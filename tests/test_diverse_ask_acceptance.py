@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from keystone_agents.agent_registry import AGENT_REGISTRY
 from keystone_agents.diverse_ask_acceptance import (
     DIVERSE_ASK_ACCEPTANCE_CASES,
+    MAJOR_AGENT_ROUTES,
     DiverseAskAcceptanceCase,
     automated_proof_nodeids,
     build_diverse_ask_acceptance_report,
@@ -14,11 +16,16 @@ def test_matrix_has_one_diverse_and_deterministic_case_per_major_agent() -> None
 
     assert report["status"] == "complete"
     assert report["structurally_complete"] is True
-    assert report["case_count"] == 16
-    assert report["agent_count"] == 8
+    assert report["case_count"] == 22
+    assert report["agent_count"] == 11
     assert report["missing_route_family_pairs"] == []
+    assert report["unexpected_routes"] == []
     assert report["duplicate_case_ids"] == []
     assert report["behavioral_pass_claimed"] is False
+
+
+def test_major_agent_routes_stay_aligned_with_the_canonical_registry() -> None:
+    assert set(MAJOR_AGENT_ROUTES) == set(AGENT_REGISTRY)
 
 
 def test_each_matrix_row_has_explicit_execution_and_failure_boundaries() -> None:
@@ -35,7 +42,7 @@ def test_each_matrix_row_has_explicit_execution_and_failure_boundaries() -> None
 def test_automated_rows_expose_unique_executable_pytest_nodes() -> None:
     nodeids = automated_proof_nodeids()
 
-    assert len(nodeids) == 17
+    assert len(nodeids) == 23
     assert len(nodeids) == len(set(nodeids))
     assert all(nodeid.startswith("tests/") and "::" in nodeid for nodeid in nodeids)
 

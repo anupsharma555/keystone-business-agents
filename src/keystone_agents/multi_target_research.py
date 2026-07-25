@@ -20,6 +20,7 @@ from keystone_agents.retrieval_policy import (
 )
 from keystone_agents.schemas.company_profile import CompanyProfile, SourceRecord
 from keystone_agents.schemas.retrieval import RetrievalHint
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.source_triage import triage_source_candidates
 from keystone_agents.tools.search_provider import build_search_provider
 
@@ -250,6 +251,24 @@ def should_run_multi_target_research(
     target: str,
 ) -> bool:
     """Return true when a Business Research request needs target discovery first."""
+
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if authority.canonical:
+        assert authority.plan is not None
+        plan = authority.plan
+        return bool(
+            plan.target_agent == "business_research_analyst"
+            and plan.intent in {"company_research", "research_brief"}
+            and (
+                (plan.desired_count_explicit and plan.desired_count > 1)
+                or (
+                    plan.target_type == "company"
+                    and len(set(plan.required_entities)) > 1
+                )
+            )
+        )
+    if authority.invalid:
+        return False
 
     plan = manual_plan if isinstance(manual_plan, dict) else {}
     explicit_desired_count = _explicit_desired_count(plan, request_text)

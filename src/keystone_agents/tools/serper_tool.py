@@ -532,9 +532,9 @@ def _sdk_agents_web_search_max_calls() -> int:
 def _sdk_exa_search_max_calls() -> int:
     raw = os.getenv("KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN", "").strip()
     try:
-        cap = int(raw) if raw else 2
+        cap = int(raw) if raw else 10
     except ValueError:
-        cap = 2
+        cap = 10
     return max(0, cap)
 
 

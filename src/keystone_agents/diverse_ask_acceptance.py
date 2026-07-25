@@ -7,20 +7,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from keystone_agents.agent_registry import list_agent_specs
+
 AskFamily = Literal["diverse", "deterministic"]
 CoverageStatus = Literal["automated", "partial", "planned"]
 ToolTier = Literal["none", "read_only", "draft_only", "write_gated"]
 
-MAJOR_AGENT_ROUTES: tuple[str, ...] = (
-    "orchestrator",
-    "chief_of_staff",
-    "gmail_triage",
-    "business_research_analyst",
-    "opportunity_scout",
-    "outreach_composer",
-    "zotero_context_agent",
-    "google_workspace_context_agent",
-)
+MAJOR_AGENT_ROUTES: tuple[str, ...] = tuple(spec.route_name for spec in list_agent_specs())
 
 
 class DiverseAskAcceptanceCase(BaseModel):
@@ -247,6 +240,34 @@ DIVERSE_ASK_ACCEPTANCE_CASES: tuple[DiverseAskAcceptanceCase, ...] = (
         "tests/test_outreach_composer.py::test_selected_draft_revision_preserves_identity_cta_recipient_and_word_limit",
     ),
     _case(
+        "DA-AT-1",
+        "diverse",
+        "Read the bounded Airtable records for this operating question and summarize them.",
+        "airtable_context_agent",
+        ("exact base and table scope", "live schema", "bounded record query"),
+        "read_only",
+        "no Airtable mutation",
+        "block when the base, table, or readable field scope is unavailable",
+        "stop after the bounded schema and record packet",
+        "source-bounded Airtable summary",
+        "automated",
+        "tests/test_context_agent_read_calls.py::test_airtable_context_read_tools_return_bounded_context_packets",
+    ),
+    _case(
+        "DA-AT-2",
+        "deterministic",
+        "Update this exact approved Airtable record and verify the same record.",
+        "airtable_context_agent",
+        ("exact record identity", "typed update operation", "approval reference", "live schema"),
+        "write_gated",
+        "one exact approved update plus provider read-back only",
+        "block when identity, operation, approval, schema, or live gate is missing",
+        "stop after same-record read-back or the first blocker",
+        "verified Airtable mutation receipt",
+        "automated",
+        "tests/test_cli.py::test_live_semantic_airtable_operations_override_raw_verb_noise",
+    ),
+    _case(
         "DA-ZO-1",
         "diverse",
         (
@@ -306,6 +327,68 @@ DIVERSE_ASK_ACCEPTANCE_CASES: tuple[DiverseAskAcceptanceCase, ...] = (
         "automated",
         "tests/test_agent_registry.py::test_direct_google_workspace_write_catalog_is_target_and_operation_scoped",
     ),
+    _case(
+        "DA-RSS-1",
+        "diverse",
+        (
+            "What recent RSS announcements matter to Keystone? Rank the themes, "
+            "link each source, and distinguish stored signals from verified current facts."
+        ),
+        "rss_context_agent",
+        ("bounded announcement history", "topic relevance", "source URLs"),
+        "read_only",
+        "no Slack post or source mutation",
+        "state when stored feed history does not verify current status",
+        "stop before weak or unrelated result padding",
+        "ranked source-linked monitoring brief",
+        "automated",
+        "tests/test_workflow_runner.py::test_natural_rss_request_executes_explicit_read_only_slack_provider",
+    ),
+    _case(
+        "DA-RSS-2",
+        "deterministic",
+        "Read matching RSS history only when the explicit provider-read gate is enabled.",
+        "rss_context_agent",
+        ("bounded query", "configured Slack source", "explicit live-read gate"),
+        "read_only",
+        "read-only provider access; never post",
+        "return no matches without calling Slack when the process gate is absent",
+        "stop before any provider call when the gate is absent",
+        "bounded feed-history packet or exact blocker",
+        "automated",
+        "tests/test_announcement_context_tools.py::test_rss_context_live_slack_fallback_requires_process_gate",
+    ),
+    _case(
+        "DA-PP-1",
+        "diverse",
+        (
+            "Find three recent psychiatry or clinical AI preprints relevant to Keystone, "
+            "rank them, link each source, and label preliminary evidence."
+        ),
+        "preprints_context_agent",
+        ("bounded preprint history", "topic relevance", "publication identity"),
+        "read_only",
+        "no source mutation, post, or unsupported current-fact claim",
+        "state when evidence is preliminary or only a stored discovery candidate",
+        "stop after the requested unique ranked set",
+        "ranked source-linked preliminary-evidence brief",
+        "automated",
+        "tests/test_workflow_runner.py::test_natural_preprints_request_executes_ranked_read_only_context_provider",
+    ),
+    _case(
+        "DA-PP-2",
+        "deterministic",
+        "Return selected matching preprints only; do not substitute unselected discovery records.",
+        "preprints_context_agent",
+        ("selected-only constraint", "bounded preprint store"),
+        "read_only",
+        "no fallback broadening or source mutation",
+        "return zero matches when the selected-only store has no result",
+        "stop without consulting the linked discovery fallback",
+        "strict filtered preprint packet",
+        "automated",
+        "tests/test_announcement_context_tools.py::test_preprint_context_does_not_fallback_for_selected_only_query",
+    ),
 )
 
 
@@ -323,7 +406,10 @@ def build_diverse_ask_acceptance_report() -> dict[str, object]:
         if route_family_counts[(route, family)] != 1
     ]
     duplicate_ids = sorted(case_id for case_id, count in Counter(ids).items() if count > 1)
-    structurally_complete = not missing_pairs and not duplicate_ids
+    expected_routes = set(MAJOR_AGENT_ROUTES)
+    observed_routes = {case.expected_route for case in DIVERSE_ASK_ACCEPTANCE_CASES}
+    unexpected_routes = sorted(observed_routes - expected_routes)
+    structurally_complete = not missing_pairs and not duplicate_ids and not unexpected_routes
     return {
         "schema": "keystone.diverse_ask_acceptance.v1",
         "status": "complete" if structurally_complete else "incomplete",
@@ -334,6 +420,7 @@ def build_diverse_ask_acceptance_report() -> dict[str, object]:
             sorted(Counter(case.coverage_status for case in DIVERSE_ASK_ACCEPTANCE_CASES).items())
         ),
         "missing_route_family_pairs": missing_pairs,
+        "unexpected_routes": unexpected_routes,
         "duplicate_case_ids": duplicate_ids,
         "behavioral_pass_claimed": False,
         "cases": [case.model_dump(mode="json") for case in DIVERSE_ASK_ACCEPTANCE_CASES],
@@ -355,6 +442,7 @@ def automated_proof_nodeids() -> tuple[str, ...]:
 
 __all__ = [
     "DIVERSE_ASK_ACCEPTANCE_CASES",
+    "MAJOR_AGENT_ROUTES",
     "DiverseAskAcceptanceCase",
     "automated_proof_nodeids",
     "build_diverse_ask_acceptance_report",

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from keystone_agents.local_file_inputs import read_supported_local_file
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 
 FINANCE_TAX_TRACKER_BASE_ALIAS = "finance_tax_tracker"
 FINANCE_TAX_TRACKER_BASE_NAME = "2026 Finance & Tax Tracker"
@@ -160,25 +161,27 @@ def resolve_finance_expense_receipt_target(
     retained solely for dry-run or planner-unavailable execution.
     """
 
-    plan = _manual_plan_mapping(manual_plan)
-    if str(plan.get("source") or "") != "llm":
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if authority.fallback_allowed:
         return infer_finance_expense_receipt_target(text)
-    if str(plan.get("provider_system") or "") != "airtable":
+    if authority.invalid:
         return None
-    if str(plan.get("intent") or "") not in {
+    assert authority.plan is not None
+    plan_model = authority.plan
+    if plan_model.provider_system != "airtable":
+        return None
+    if plan_model.intent not in {
         "business_system_write",
         "context_lookup",
     }:
         return None
 
+    plan = plan_model.model_dump(mode="python")
+
     table = _semantic_expense_table(plan)
     if not table:
         return None
-    operations = [
-        str(item or "").strip().lower()
-        for item in (plan.get("provider_operations") or [])
-        if str(item or "").strip()
-    ]
+    operations = list(authority.effective_provider_operations("airtable"))
     paths = _local_receipt_paths(str(text or ""))
     if not paths and "attach" not in operations:
         return None

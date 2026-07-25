@@ -15,10 +15,14 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from keystone_agents.manual_request import positive_capability_text
+from keystone_agents.manual_request import (
+    positive_capability_text,
+    request_forbids_response_composition,
+)
 from keystone_agents.schemas.approval import ApprovalState
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.work_item import (
+    UserFacingSummaryAuthority,
     WorkflowRunRequest,
     WorkflowRunResult,
     WorkItem,
@@ -29,6 +33,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemSourceRef,
     WorkItemStatus,
 )
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.announcement_context_tools import (
     retrieve_preprint_announcement_history_impl,
@@ -143,7 +148,8 @@ def should_use_langgraph_for_work_item(
 
     if request.work_item_id:
         return True
-    semantic_plan = _semantic_manual_request_plan(request.manual_request_plan)
+    authority = ExecutionIntentAuthority.from_value(request.manual_request_plan)
+    semantic_plan = authority.plan if authority.canonical else None
     if semantic_plan is not None:
         if _manager_loop_request_is_planning_only(
             request.request_text,
@@ -155,6 +161,8 @@ def should_use_langgraph_for_work_item(
             or len(semantic_plan.workflow) > 1
             or semantic_plan.intent == "continue_work_item"
         )
+    if authority.invalid:
+        return False
     normalized = " ".join(
         positive_capability_text(request.request_text or "").lower().split()
     )
@@ -188,18 +196,10 @@ def should_use_langgraph_for_work_item(
 
 
 def _semantic_manual_request_plan(value: Any) -> ManualRequestPlan | None:
-    """Return a valid live semantic plan without falling back to request words."""
+    """Return a validated canonical plan without falling back to request words."""
 
-    if isinstance(value, ManualRequestPlan):
-        plan = value
-    elif isinstance(value, dict):
-        try:
-            plan = ManualRequestPlan.model_validate(value)
-        except (TypeError, ValueError):
-            return None
-    else:
-        return None
-    return plan if plan.source == "llm" else None
+    authority = ExecutionIntentAuthority.from_value(value)
+    return authority.plan if authority.canonical else None
 
 
 def _request_has_graph_worthy_single_step_boundary(normalized: str) -> bool:
@@ -861,6 +861,7 @@ def _graph_completion_review(
     ]
     requested_stages = _graph_requested_stage_review(
         request_text=original_request.request_text,
+        manual_request_plan=original_request.manual_request_plan,
         manual_intent=str(
             (original_request.manual_request_plan or {}).get("intent")
             if isinstance(original_request.manual_request_plan, dict)
@@ -964,6 +965,7 @@ def _enhance_graph_terminal_summary(
         return result.model_copy(
             update={
                 "human_summary": research_summary,
+                "user_facing_summary_authority": UserFacingSummaryAuthority.CANONICAL,
                 "audit_notes": [
                     *result.audit_notes,
                     (
@@ -1344,6 +1346,7 @@ def _graph_research_terminal_summary(
 def _graph_requested_stage_review(
     *,
     request_text: str,
+    manual_request_plan: Any = None,
     manual_intent: str = "",
     node_path: list[str],
     loop_steps: list[dict[str, Any]],
@@ -1352,6 +1355,33 @@ def _graph_requested_stage_review(
     checkpoint_required: bool,
     checkpoint_reason: str,
 ) -> list[dict[str, str]]:
+    authority = ExecutionIntentAuthority.from_value(manual_request_plan)
+    typed_plan = authority.plan
+    typed_workflow = set(typed_plan.workflow) if typed_plan is not None else set()
+    downstream_artifact_owners = {
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        WorkItemRoute.OPPORTUNITY_SCOUT.value,
+        WorkItemRoute.OUTREACH_COMPOSER.value,
+    }
+    chief_owns_context_summary = bool(
+        typed_plan is not None
+        and typed_plan.target_agent == WorkItemRoute.CHIEF_OF_STAFF.value
+        and typed_plan.intent == "context_lookup"
+        and typed_plan.task_objective == "context_lookup"
+        and typed_plan.expected_artifact_type == "context_summary"
+        and typed_plan.ask_shape.permission_state == "read_only"
+        and not typed_workflow.intersection(downstream_artifact_owners)
+    )
+    semantic_plan = (
+        typed_plan if authority.canonical or chief_owns_context_summary else None
+    )
+    planned_routes = (
+        {semantic_plan.target_agent}
+        if chief_owns_context_summary
+        else {semantic_plan.target_agent, *semantic_plan.workflow}
+        if semantic_plan is not None
+        else set()
+    )
     normalized = " ".join(str(request_text or "").lower().split())
     stages: list[dict[str, str]] = []
     route_values = {str(step.get("route") or "") for step in loop_steps}
@@ -1389,16 +1419,24 @@ def _graph_requested_stage_review(
 
     add_stage(
         "chief_of_staff",
-        requested=("chief of staff" in normalized or "run_chief_of_staff" in node_path),
+        requested=(
+            "chief_of_staff" in planned_routes or "run_chief_of_staff" in node_path
+            if semantic_plan is not None
+            else "chief of staff" in normalized or "run_chief_of_staff" in node_path
+        ),
         node="run_chief_of_staff",
         route=WorkItemRoute.CHIEF_OF_STAFF,
         artifacts=("chief_of_staff_plan",),
     )
     add_stage(
         "gmail_triage",
-        requested=bool(
-            re.search(r"\b(?:gmail|inbound email|email thread|triage)\b", normalized)
-            or "run_gmail_triage" in node_path
+        requested=(
+            "gmail_triage" in planned_routes or "run_gmail_triage" in node_path
+            if semantic_plan is not None
+            else bool(
+                re.search(r"\b(?:gmail|inbound email|email thread|triage)\b", normalized)
+                or "run_gmail_triage" in node_path
+            )
         ),
         node="run_gmail_triage",
         route=WorkItemRoute.GMAIL_TRIAGE,
@@ -1407,13 +1445,18 @@ def _graph_requested_stage_review(
     )
     add_stage(
         "business_research",
-        requested=bool(
-            re.search(r"\b(?:research|source-backed|company profile)\b", normalized)
-            or (
-                manual_intent != "business_system_write"
-                and re.search(r"\bevidence\b", normalized)
-            )
+        requested=(
+            "business_research_analyst" in planned_routes
             or "run_business_research" in node_path
+            if semantic_plan is not None
+            else bool(
+                re.search(r"\b(?:research|source-backed|company profile)\b", normalized)
+                or (
+                    manual_intent != "business_system_write"
+                    and re.search(r"\bevidence\b", normalized)
+                )
+                or "run_business_research" in node_path
+            )
         ),
         node="run_business_research",
         route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
@@ -1422,38 +1465,38 @@ def _graph_requested_stage_review(
     )
     add_stage(
         "opportunity_scout",
-        requested=bool(
-            re.search(
-                r"\b(?:opportunit|advisory/research|advisory|research opportunity)\b",
-                normalized,
+        requested=(
+            "opportunity_scout" in planned_routes or "run_opportunity_scout" in node_path
+            if semantic_plan is not None
+            else bool(
+                re.search(
+                    r"\b(?:opportunit|advisory/research|advisory|research opportunity)\b",
+                    normalized,
+                )
+                or "run_opportunity_scout" in node_path
             )
-            or "run_opportunity_scout" in node_path
         ),
         node="run_opportunity_scout",
         route=WorkItemRoute.OPPORTUNITY_SCOUT,
         artifacts=("opportunity",),
         blocker_code="manager_loop_opportunity_not_created",
     )
-    outreach_constraint_text = re.sub(
-        r"\b(?:do\s+not|don't|dont|never|without)\s+"
-        r"(?:create|save|write)\s+(?:a\s+|any\s+)?"
-        r"(?:gmail\s+|provider\s+)?drafts?\b",
-        "",
-        normalized,
+    no_outreach = (
+        False
+        if semantic_plan is not None
+        else request_forbids_response_composition(request_text)
     )
-    no_outreach = bool(
-        re.search(
-            r"\b(?:do not|don't|no|without)\b[^,.\n;]{0,120}"
-            r"\b(?:draft|outreach|email|gmail draft|post|send)\b",
-            outreach_constraint_text,
+    outreach_requested = (
+        "outreach_composer" in planned_routes or "run_outreach_composer" in node_path
+        if semantic_plan is not None
+        else bool(
+            re.search(
+                r"\b(?:draft-only|draft only|sample outreach|outreach|reply|"
+                r"response|email draft)\b",
+                normalized,
+            )
+            or "run_outreach_composer" in node_path
         )
-    )
-    outreach_requested = bool(
-        re.search(
-            r"\b(?:draft-only|draft only|sample outreach|outreach|reply|response|email draft)\b",
-            normalized,
-        )
-        or "run_outreach_composer" in node_path
     )
     add_stage(
         "outreach_composer",
@@ -1464,10 +1507,19 @@ def _graph_requested_stage_review(
         blocker_code="manager_loop_outreach_not_drafted",
         intentionally_skipped=no_outreach,
     )
-    approval_requested = bool(
-        re.search(r"\b(?:approval checkpoint|approval|approve|review before)\b", normalized)
+    approval_requested = (
+        semantic_plan.ask_shape.permission_state == "approval_required"
         or checkpoint_required
         or "approval_checkpoint" in node_path
+        if semantic_plan is not None
+        else bool(
+            re.search(
+                r"\b(?:approval checkpoint|approval|approve|review before)\b",
+                normalized,
+            )
+            or checkpoint_required
+            or "approval_checkpoint" in node_path
+        )
     )
     if approval_requested:
         if checkpoint_required or "approval_checkpoint" in node_path:
@@ -1728,12 +1780,19 @@ def _stage_feed_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         request_text=request_text,
         retrieval=retrieval,
     )
+    route = _route_after_feed_context(
+        prepared.route,
+        request_text,
+        prepared=prepared,
+        context_agent=agent_name,
+    )
     artifact = _feed_context_artifact(
         work_item_id=work_item.id,
         kind=kind,
         request_text=request_text,
         retrieval=retrieval,
         source_refs=source_refs,
+        downstream_route=route,
     )
     existing_source_ids = {source.source_id for source in work_item.sources}
     sources = list(work_item.sources)
@@ -1761,7 +1820,6 @@ def _stage_feed_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         ),
         artifact,
     )
-    route = _route_after_feed_context(prepared.route, request_text)
     store = None
     if prepared.request.save:
         store = SQLiteStore(prepared.request.database_url or database_url_from_env())
@@ -1863,7 +1921,11 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         ),
         artifact,
     )
-    route = _route_after_zotero_context(prepared.route, request_text)
+    route = _route_after_zotero_context(
+        prepared.route,
+        request_text,
+        prepared=prepared,
+    )
     store = None
     if prepared.request.save:
         store = SQLiteStore(prepared.request.database_url or database_url_from_env())
@@ -2025,6 +2087,93 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
             "external_writes_enabled": False,
         },
     }
+    if _typed_provider_plan_only(prepared, provider_system="airtable"):
+        artifact = artifact.model_copy(
+            update={
+                "approval_state": "approved_for_research",
+                "summary": (
+                    "Airtable record plan staged for review. This artifact does not "
+                    "authorize or perform an Airtable mutation."
+                ),
+                "metadata": {
+                    **artifact.metadata,
+                    "mode": "plan_only_no_provider_write",
+                    "provider_write_authorized": False,
+                    "recommended_next_action": "continue_typed_workflow",
+                },
+            }
+        )
+        next_route = (
+            _semantic_route_after_context(
+                prepared,
+                context_agent="airtable_context_agent",
+            )
+            or prepared.route
+        )
+        work_item = attach_artifact(
+            work_item.model_copy(
+                update={
+                    "sources": sources,
+                    "target": work_item.target.model_copy(
+                        update={"metadata": target_metadata}
+                    ),
+                    "current_route": next_route,
+                    "next_action": None,
+                    "status": WorkItemStatus.IN_PROGRESS,
+                    "last_agent": "airtable_context_agent",
+                    "audit_notes": [
+                        *work_item.audit_notes,
+                        (
+                            "Airtable record plan staged as a non-authorizing "
+                            "artifact; no provider write was admitted."
+                        ),
+                    ],
+                }
+            ),
+            artifact,
+        ).touch()
+        store = None
+        if prepared.request.save:
+            store = SQLiteStore(
+                prepared.request.database_url or database_url_from_env()
+            )
+            store.save_work_item(work_item)
+            record_event(
+                work_item,
+                event_type="context_evidence_staged",
+                actor="airtable_context_agent",
+                summary="Staged a plan-only Airtable record artifact.",
+                metadata={
+                    "artifact_type": artifact.artifact_type,
+                    "artifact_id": artifact.artifact_id,
+                    "source_id": source_ref.source_id,
+                    "downstream_route": next_route.value,
+                    "provider_write_authorized": False,
+                    "external_writes_enabled": False,
+                },
+                store=store,
+            )
+        prepared = PreparedWorkItemStep(
+            request=prepared.request,
+            work_item=work_item,
+            route=next_route,
+            input_text=prepared.input_text,
+            context_pack=build_context_pack_for_route(
+                work_item,
+                next_route,
+                store=store,
+            ),
+        )
+        return {
+            **state,
+            "prepared_step": _prepared_step_payload(prepared),
+            "route": next_route.value,
+            "status": work_item.status.value,
+            "node_path": [
+                *state.get("node_path", []),
+                "stage_airtable_context",
+            ],
+        }
     approval_gate = WorkItemApprovalGate(
         scope="airtable_write_plan",
         state="pending",
@@ -2515,6 +2664,44 @@ def _chief_coordination_should_run_before_context_edges(
 ) -> bool:
     if prepared.route != WorkItemRoute.CHIEF_OF_STAFF:
         return False
+    authority = _manual_plan_authority_for_context_edges(prepared)
+    chief_owns_read_context_summary = bool(
+        authority.plan is not None
+        and authority.plan.target_agent == WorkItemRoute.CHIEF_OF_STAFF.value
+        and authority.plan.intent == "context_lookup"
+        and authority.plan.task_objective == "context_lookup"
+        and authority.plan.expected_artifact_type == "context_summary"
+        and authority.plan.ask_shape.permission_state == "read_only"
+    )
+    if chief_owns_read_context_summary:
+        return not any(
+            artifact.artifact_type == "chief_of_staff_plan"
+            for artifact in prepared.work_item.artifact_refs
+        )
+    if authority.canonical:
+        assert authority.plan is not None
+        if any(
+            artifact.artifact_type == "chief_of_staff_plan"
+            for artifact in prepared.work_item.artifact_refs
+        ):
+            return False
+        specialist_routes = {
+            "gmail_triage",
+            "business_research_analyst",
+            "opportunity_scout",
+            "outreach_composer",
+            "rss_context_agent",
+            "preprints_context_agent",
+            "zotero_context_agent",
+            "airtable_context_agent",
+            "google_workspace_context_agent",
+        }
+        return bool(
+            authority.plan.target_agent == WorkItemRoute.CHIEF_OF_STAFF.value
+            and specialist_routes.intersection(authority.plan.workflow)
+        )
+    if authority.invalid:
+        return False
     request_text = _context_edge_request_text(state, prepared)
     normalized = " ".join(str(request_text or "").lower().split())
     if "chief of staff" not in normalized and not _chief_context_advisory_only_request(
@@ -2703,12 +2890,22 @@ def _semantic_manual_plan_for_context_edges(
 ) -> dict[str, Any] | None:
     """Return the typed LLM plan that owns graph context-edge selection."""
 
+    authority = _manual_plan_authority_for_context_edges(prepared)
+    if not authority.canonical:
+        return None
+    assert authority.plan is not None
+    return authority.plan.model_dump(mode="json")
+
+
+def _manual_plan_authority_for_context_edges(
+    prepared: PreparedWorkItemStep,
+) -> ExecutionIntentAuthority:
+    """Return plan authority without erasing which fields were supplied."""
+
     value = prepared.request.manual_request_plan
     if not isinstance(value, dict):
         value = prepared.work_item.target.metadata.get("manual_request_plan")
-    if not isinstance(value, dict) or str(value.get("source") or "") != "llm":
-        return None
-    return value
+    return ExecutionIntentAuthority.from_value(value)
 
 
 def _semantic_context_handoff(
@@ -2763,6 +2960,128 @@ def _semantic_context_stages_before_route(
         return False
     before_agent = str(handoff.get("before_agent") or "").strip()
     return not before_agent or before_agent == prepared.route.value
+
+
+def _semantic_route_after_context(
+    prepared: PreparedWorkItemStep,
+    *,
+    context_agent: str,
+) -> WorkItemRoute | None:
+    """Resolve the durable route after a typed context-agent stage."""
+
+    authority = _manual_plan_authority_for_context_edges(prepared)
+    if authority.plan is None or authority.invalid:
+        return None
+    executable_routes = {
+        WorkItemRoute.GMAIL_TRIAGE.value,
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        WorkItemRoute.OPPORTUNITY_SCOUT.value,
+        WorkItemRoute.OUTREACH_COMPOSER.value,
+        WorkItemRoute.CHIEF_OF_STAFF.value,
+    }
+    workflow = list(authority.plan.workflow)
+    if context_agent not in workflow:
+        return None
+    if context_agent in workflow:
+        workflow = workflow[workflow.index(context_agent) + 1 :]
+    for route_name in workflow:
+        if route_name in executable_routes:
+            return WorkItemRoute(route_name)
+    if authority.plan.target_agent in executable_routes:
+        return WorkItemRoute(authority.plan.target_agent)
+    return prepared.route
+
+
+def _typed_context_stage_follows_route(
+    prepared: PreparedWorkItemStep,
+    *,
+    context_agent: str,
+) -> bool | None:
+    """Return whether a typed workflow places context after the current route."""
+
+    authority = _manual_plan_authority_for_context_edges(prepared)
+    if authority.plan is None or authority.invalid:
+        return None
+    workflow = list(authority.plan.workflow)
+    if context_agent not in workflow or prepared.route.value not in workflow:
+        return None
+    route_index = workflow.index(prepared.route.value)
+    context_index = workflow.index(context_agent)
+    if route_index >= context_index:
+        return False
+    executable_routes = {
+        WorkItemRoute.GMAIL_TRIAGE.value,
+        WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        WorkItemRoute.OPPORTUNITY_SCOUT.value,
+        WorkItemRoute.OUTREACH_COMPOSER.value,
+        WorkItemRoute.CHIEF_OF_STAFF.value,
+    }
+    return not any(
+        route in executable_routes
+        for route in workflow[route_index + 1 : context_index]
+    )
+
+
+def _typed_provider_plan_only(
+    prepared: PreparedWorkItemStep,
+    *,
+    provider_system: str,
+) -> bool:
+    """Return whether the requested artifact plans a write without granting one."""
+
+    authority = _manual_plan_authority_for_context_edges(prepared)
+    if authority.plan is None or authority.invalid:
+        return False
+    plan = authority.plan
+    return bool(
+        plan.provider_system == provider_system
+        and plan.expected_artifact_type == "business_system_write_plan"
+        and not {"create", "update", "delete", "attach"}.intersection(
+            authority.effective_provider_operations(provider_system)
+        )
+        and plan.ask_shape.permission_state != "read_only"
+    )
+
+
+def _canonical_provider_write_plan_decision(
+    prepared: PreparedWorkItemStep,
+    *,
+    provider_system: str,
+) -> bool | None:
+    """Return an explicit typed write-plan decision, if one was supplied.
+
+    Canonical plans own provider/tool admission. A validated compatibility plan
+    may additionally enforce an explicit read-only ceiling, but it cannot grant
+    a write or choose a provider.
+    """
+
+    authority = _manual_plan_authority_for_context_edges(prepared)
+    if authority.plan is None:
+        return None
+    plan = authority.plan
+    if plan.ask_shape.permission_state == "read_only":
+        return False
+    if not authority.canonical:
+        return None
+    if authority.field_supplied("provider_system"):
+        if plan.provider_system != provider_system:
+            return False
+    else:
+        return None
+    mutation_operations = {"create", "update", "delete", "attach"}
+    if authority.field_supplied("provider_operations"):
+        return bool(
+            mutation_operations.intersection(
+                authority.effective_provider_operations(provider_system)
+            )
+        )
+    if authority.field_supplied("expected_artifact_type"):
+        return plan.expected_artifact_type == "business_system_write_plan"
+    if authority.field_supplied("intent"):
+        return plan.intent == "business_system_write"
+    if authority.field_supplied("task_objective"):
+        return plan.task_objective == "business_system_write"
+    return None
 
 
 def _zotero_context_edge_requested(
@@ -2919,7 +3238,19 @@ def _airtable_context_should_stage_before_specialist(
     )
 
 
-def _airtable_write_plan_requested(request_text: str) -> bool:
+def _airtable_write_plan_requested(
+    request_text: str,
+    prepared: PreparedWorkItemStep | None = None,
+) -> bool:
+    if prepared is not None:
+        if _typed_provider_plan_only(prepared, provider_system="airtable"):
+            return True
+        canonical_decision = _canonical_provider_write_plan_decision(
+            prepared,
+            provider_system="airtable",
+        )
+        if canonical_decision is not None:
+            return canonical_decision
     normalized = " ".join(str(request_text or "").lower().split())
     if "airtable" not in normalized:
         return False
@@ -2977,10 +3308,16 @@ def _airtable_context_after_specialist_requested(state: WorkItemGraphState) -> b
         input_text=prepared.input_text,
         context_pack=result.context_pack or prepared.context_pack,
     )
+    typed_order = _typed_context_stage_follows_route(
+        prepared,
+        context_agent="airtable_context_agent",
+    )
+    if typed_order is False:
+        return False
     request_text = _context_edge_request_text(state, prepared)
     if any(ref.artifact_type == "airtable_write_plan" for ref in prepared.work_item.artifact_refs):
         return False
-    return _airtable_write_plan_requested(request_text) and (
+    return _airtable_write_plan_requested(request_text, prepared) and (
         _airtable_context_edge_requested(request_text, prepared)
         or _airtable_context_summary_artifact_exists(prepared)
     )
@@ -3038,7 +3375,7 @@ def _google_workspace_context_edge_requested(
         return False
     if not (
         _google_workspace_context_should_stage_before_specialist(request_text, prepared)
-        or _google_workspace_artifact_plan_requested(request_text)
+        or _google_workspace_artifact_plan_requested(request_text, prepared)
     ):
         return False
     return prepared.route in {
@@ -3119,7 +3456,17 @@ def _google_workspace_context_should_stage_before_specialist(
     )
 
 
-def _google_workspace_artifact_plan_requested(request_text: str) -> bool:
+def _google_workspace_artifact_plan_requested(
+    request_text: str,
+    prepared: PreparedWorkItemStep | None = None,
+) -> bool:
+    if prepared is not None:
+        canonical_decision = _canonical_provider_write_plan_decision(
+            prepared,
+            provider_system="google_workspace",
+        )
+        if canonical_decision is not None:
+            return canonical_decision
     normalized = " ".join(str(request_text or "").lower().split())
     if not re.search(
         r"\b(?:google workspace|google drive|google docs|google sheets)\b",
@@ -3184,7 +3531,8 @@ def _google_workspace_context_after_specialist_requested(state: WorkItemGraphSta
     ):
         return False
     artifact_plan_requested = _google_workspace_artifact_plan_requested(
-        request_text
+        request_text,
+        prepared,
     ) or _context_backed_internal_artifact_plan_requested(request_text, prepared)
     return artifact_plan_requested and (
         _google_workspace_context_edge_requested(request_text, prepared)
@@ -3236,7 +3584,20 @@ def _feed_context_edge_kind(
     return kind
 
 
-def _route_after_feed_context(route: WorkItemRoute, request_text: str) -> WorkItemRoute:
+def _route_after_feed_context(
+    route: WorkItemRoute,
+    request_text: str,
+    *,
+    prepared: PreparedWorkItemStep | None = None,
+    context_agent: str = "rss_context_agent",
+) -> WorkItemRoute:
+    if prepared is not None:
+        semantic_route = _semantic_route_after_context(
+            prepared,
+            context_agent=context_agent,
+        )
+        if semantic_route is not None:
+            return semantic_route
     if route == WorkItemRoute.OPPORTUNITY_SCOUT:
         return route
     if _context_request_prefers_opportunity_scout(request_text):
@@ -3246,7 +3607,19 @@ def _route_after_feed_context(route: WorkItemRoute, request_text: str) -> WorkIt
     return WorkItemRoute.BUSINESS_RESEARCH_ANALYST
 
 
-def _route_after_zotero_context(route: WorkItemRoute, request_text: str) -> WorkItemRoute:
+def _route_after_zotero_context(
+    route: WorkItemRoute,
+    request_text: str,
+    *,
+    prepared: PreparedWorkItemStep | None = None,
+) -> WorkItemRoute:
+    if prepared is not None:
+        semantic_route = _semantic_route_after_context(
+            prepared,
+            context_agent="zotero_context_agent",
+        )
+        if semantic_route is not None:
+            return semantic_route
     if route in {
         WorkItemRoute.CHIEF_OF_STAFF,
         WorkItemRoute.ORCHESTRATOR,
@@ -3290,6 +3663,12 @@ def _context_backed_internal_artifact_plan_requested(
         for artifact in prepared.work_item.artifact_refs
     ):
         return False
+    canonical_decision = _canonical_provider_write_plan_decision(
+        prepared,
+        provider_system="google_workspace",
+    )
+    if canonical_decision is not None:
+        return canonical_decision
     normalized = " ".join(str(request_text or "").lower().split())
     if re.search(
         r"\b(?:do not|don't|dont|no|without|skip|avoid)\b[^.\n]{0,100}"
@@ -3403,9 +3782,13 @@ def _feed_context_artifact(
     request_text: str,
     retrieval: Mapping[str, Any],
     source_refs: list[WorkItemSourceRef],
+    downstream_route: WorkItemRoute | None = None,
 ) -> WorkItemArtifactRef:
     agent_name = _feed_context_agent_name(kind)
-    route = _route_after_feed_context(WorkItemRoute.CHIEF_OF_STAFF, request_text)
+    route = downstream_route or _route_after_feed_context(
+        WorkItemRoute.CHIEF_OF_STAFF,
+        request_text,
+    )
     item_count = int(retrieval.get("item_count") or 0)
     return WorkItemArtifactRef(
         artifact_type=f"{kind}_context_summary",

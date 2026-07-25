@@ -25,6 +25,14 @@ Official OpenAI guidance:
   https://developers.openai.com/api/docs/guides/agents/integrations-observability#mcp
 - Python SDK MCP reference:
   https://openai.github.io/openai-agents-python/mcp/
+- Python SDK manager, handoff, and code-orchestration patterns:
+  https://openai.github.io/openai-agents-python/multi_agent/
+- Python SDK function tools and agents-as-tools:
+  https://openai.github.io/openai-agents-python/tools/
+- Python SDK local context and model-visible input:
+  https://openai.github.io/openai-agents-python/context/
+- Python SDK handoff conversation and input behavior:
+  https://openai.github.io/openai-agents-python/handoffs/
 
 Representative public implementations:
 
@@ -57,6 +65,104 @@ The biggest remaining architectural risk is not missing SDK primitives. It is
 allowing new context sources or provider wrappers to enter the system as
 prompt-only conventions instead of explicit tool, schema, registry, safety, and
 test surfaces.
+
+## 2026-07-25 Official SDK Re-check
+
+Before this review, the manual planner was not globally pinned in code. The
+local configuration happened to resolve the global model and every normalized
+planner target to OpenAI `gpt-5.4-mini`, so the former
+`target_with_openai_fallback` default produced one OpenAI planner attempt. That
+was a configuration fact, not an invariant: a future target-agent provider
+override would have become the first planner attempt.
+
+New live natural-language asks now default to a dedicated OpenAI
+`gpt-5.4-mini` planner profile. Target-agent provider overrides continue to
+control specialist execution, while `target` and
+`target_with_openai_fallback` remain explicit experiment modes. This creates a
+stable audited interpretation layer without changing execution authority: the
+planner remains tool-free, emits `ManualRequestPlan`, and Python reconciliation
+still owns structural repair and safety gates. Offline, planner-disabled, and
+provider-failure paths continue to use the deterministic fallback and identify
+that provenance rather than claiming an LLM planner call.
+
+The current Chief-to-specialist design remains the right SDK pattern. Chief of
+Staff owns the combined operator answer, so specialists are exposed as typed
+agent tools rather than receiving an unconditional handoff. The
+`ChiefSpecialistToolInput` contract carries the unmodified current request,
+planning memo, selected target, coordination context, and provider context into
+the specialist's model-visible input. This is important because SDK
+`RunContextWrapper.context` is local application state and is not automatically
+visible to the model.
+
+Keystone-owned Gmail, Calendar, Airtable, and Workspace integrations should
+remain bounded function tools. A separate MCP server for every provider would
+add another protocol and permission surface without fixing semantic planning or
+tool selection. MCP is justified only when the same integration needs
+cross-client reuse or an independently useful permission and audit boundary.
+
+The remaining graph mismatch was downstream semantic reinterpretation, not an
+SDK orchestration gap. After a canonical plan selected a route, RSS, preprint,
+or Zotero context staging could still re-read incidental prose to choose the
+durable specialist; similar prose checks could decide whether Airtable or
+Google Workspace write plans existed and whether Chief ran before context
+specialists. Those decisions now consume explicit canonical-plan fields.
+Phrase fallback remains only when an older or compatibility caller did not
+supply the relevant fields. Deterministic code still owns safety, approvals,
+exact record identity, mutation scope, and provider receipt verification.
+
+The same execution-authority contract now also compiles two downstream
+capabilities that previously remained phrase-sensitive. Contact enrichment is
+enabled only when the typed objective or expected artifact requests contact
+candidates; quoted or historical words such as `contact`, `email`, or
+`outreach` cannot silently broaden an ordinary research run. Internal Slack
+artifact formatting follows the typed audience, channel, owner/workflow,
+artifact, provider, and side-effect fields; incidental Slack-copy wording
+cannot turn an external email draft into an internal note, and a correctly
+typed internal note needs no magic phrase. Older callers without a canonical
+plan retain bounded compatibility parsing.
+
+Provider tool selection now has the missing object-level refinement. The
+planner pairs each normalized provider operation with a typed resource such as
+a Gmail message, Airtable record, Google Doc, Sheet row, worksheet tab, Drive
+folder, or slide deck. The operation remains the authorization ceiling; the
+resource only narrows the function tools exposed to the specialist. This keeps
+tool admission stable across equivalent wording and preserves the same contract
+through direct, WorkItem, and LangGraph paths. It also confirms that MCP is not
+the missing abstraction here: a protocol wrapper would still need the same
+typed operation/object contract before selecting an MCP tool.
+
+The result-to-renderer boundary needs the same semantic authority. KBA already
+returns the canonical plan, terminal status, typed `next_action`, artifact
+references, and approval state. Slack and other adapters should render
+continuation controls from those fields and default to no primary action for a
+terminal result with no `next_action`. Inferring actions from a route name or
+from whether the request contains a phrase such as `do not search` recreates
+the same downstream reinterpretation defect after the agent has already
+completed correctly. Such inference is appropriate only as an explicit
+compatibility fallback for older payloads without canonical result semantics.
+
+Planner authority also needs a task-completeness boundary. The model may choose
+the best owner and refine how a request is executed, but it must not silently
+drop an explicit current-turn deliverable. For example, a bounded mailbox read
+followed by one Slack-local draft is one read-then-compose contract even if the
+planner returns only the Gmail stage. Reconciliation should preserve the typed
+provider scope, requested artifact, output surface, and no-write boundary, then
+let the specialists interpret the raw request inside those obligations. This is
+different from keyword routing: it validates that the proposed plan covers the
+work the operator actually requested without dictating the substantive answer.
+
+That completeness rule must not be generalized by pretending every context
+helper is already an executable graph stage. Gmail Triage is currently a
+first-class WorkItem route, so a typed `Gmail read -> Outreach draft` sequence
+can advance directly. Airtable, Google Workspace, Zotero, and some Calendar
+context paths still pass through Chief-owned tools or route aliases. Before
+compiling those providers into equivalent multi-stage graphs, define one
+execution-stage contract. Each context owner must either become a first-class
+WorkItem route or use an adapter that emits the same typed evidence artifact,
+provider receipt, and completion identity. Merely aliasing the context owner to
+Chief is not sufficient: it can preserve routing while still collapsing the
+provider result into prose before the artifact owner receives it. The manager
+must advance from typed stage output without falling back to request prose.
 
 ## 2026-06-09 Current Repo Assessment
 

@@ -77,6 +77,42 @@ def test_single_company_deeper_comparison_does_not_trigger_multi_target_branch()
     )
 
 
+def test_canonical_single_target_plan_is_not_broadened_by_comparison_prose() -> None:
+    assert not should_run_multi_target_research(
+        request_text="Compare three products, but answer only for the selected company.",
+        manual_plan={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "primary_target": "Selected Health",
+            "target_type": "company",
+            "desired_count": 1,
+            "desired_count_explicit": True,
+            "task_objective": "entity_research",
+            "expected_artifact_type": "research_brief",
+        },
+        target="Selected Health",
+    )
+
+
+def test_canonical_multi_target_plan_does_not_need_trigger_words_downstream() -> None:
+    assert should_run_multi_target_research(
+        request_text="Review the selected market scope.",
+        manual_plan={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "primary_target": "behavioral-health navigation vendors",
+            "target_type": "topic",
+            "desired_count": 3,
+            "desired_count_explicit": True,
+            "task_objective": "entity_research",
+            "expected_artifact_type": "research_brief",
+        },
+        target="behavioral-health navigation vendors",
+    )
+
+
 def test_parallel_discovery_keeps_candidates_from_productive_lane() -> None:
     plan = MultiTargetResearchPlan(
         topic="public AI companion products",

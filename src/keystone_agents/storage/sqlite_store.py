@@ -1862,6 +1862,64 @@ class SQLiteStore:
             "repair_performed": False,
         }
 
+    def audit_work_item_retention(self) -> dict[str, Any]:
+        """Report reviewable unarchived WorkItem state without mutating it."""
+
+        reviewable_statuses = (
+            WorkItemStatus.NEEDS_CONTEXT.value,
+            WorkItemStatus.NEEDS_APPROVAL.value,
+            WorkItemStatus.BLOCKED.value,
+            WorkItemStatus.DONE.value,
+        )
+        placeholders = ", ".join("?" for _ in reviewable_statuses)
+        with self.managed_connection() as connection:
+            status_rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS row_count
+                FROM work_items
+                GROUP BY status
+                ORDER BY status
+                """
+            ).fetchall()
+            archived_rows = connection.execute(
+                """
+                SELECT archived, COUNT(*) AS row_count
+                FROM work_items
+                GROUP BY archived
+                ORDER BY archived
+                """
+            ).fetchall()
+            reviewable_unarchived_count = int(
+                connection.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM work_items
+                    WHERE archived = 0 AND status IN ({placeholders})
+                    """,
+                    reviewable_statuses,
+                ).fetchone()[0]
+            )
+        status_counts = {
+            str(row["status"]): int(row["row_count"]) for row in status_rows
+        }
+        archived_count = sum(
+            int(row["row_count"]) for row in archived_rows if bool(row["archived"])
+        )
+        unarchived_count = sum(
+            int(row["row_count"]) for row in archived_rows if not bool(row["archived"])
+        )
+        return {
+            "schema": "keystone.work_item_retention_audit.v1",
+            "status": "attention" if reviewable_unarchived_count else "pass",
+            "status_counts": status_counts,
+            "archived_count": archived_count,
+            "unarchived_count": unarchived_count,
+            "reviewable_unarchived_count": reviewable_unarchived_count,
+            "reviewable_statuses": list(reviewable_statuses),
+            "policy": "operator_review_required_no_automatic_deletion",
+            "repair_performed": False,
+        }
+
     def save_automation_spec(self, spec: AutomationSpec) -> str:
         """Upsert an automation spec."""
 

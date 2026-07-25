@@ -18,8 +18,10 @@ from keystone_agents.sdk import (
     compose_direct_instructions,
     compose_instructions,
 )
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.tools.internal_data_tools import (
+    airtable_aggregate_records,
     airtable_create_expense_from_receipt,
     airtable_delete_test_record,
     airtable_get_base_schema,
@@ -41,6 +43,7 @@ def _airtable_context_tools(
     tools: list[Any] = [
         airtable_get_base_schema,
         airtable_read_records,
+        airtable_aggregate_records,
         airtable_reconcile_duplicate_expense,
         airtable_write_record,
         airtable_link_attachment,
@@ -52,17 +55,22 @@ def _airtable_context_tools(
     if tool_tier is not None:
         tools = filter_tools_for_tier("airtable_context_agent", tools, tool_tier)
     normalized = " ".join(str(request_text or "").lower().split())
-    plan_source = str(getattr(manual_plan, "source", "") or "")
-    provider_operations = {
-        str(item or "").strip().lower()
-        for item in (getattr(manual_plan, "provider_operations", []) or [])
-        if str(item or "").strip()
-    }
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if authority.invalid:
+        return []
+    plan = authority.plan if authority.canonical else None
+    if plan is not None and plan.provider_system != "airtable":
+        return []
+    provider_operations = (
+        set(authority.effective_provider_operations("airtable"))
+        if plan is not None
+        else set()
+    )
     marked_lifecycle = bool(
         re.search(r"\bkba_test_record(?:_[a-z0-9]+)*\b", normalized)
         and (
             {"create", "update", "delete"} <= provider_operations
-            if plan_source == "llm"
+            if plan is not None
             else (
                 re.search(r"\b(?:add|create|make|write|insert)\b", normalized)
                 and re.search(r"\b(?:update|change|modify|revise|edit|set)\b", normalized)
@@ -107,6 +115,20 @@ def _airtable_context_tools(
             if getattr(tool, "name", "")
             in {"airtable_get_base_schema", "airtable_read_records"}
         ]
+    if plan is not None:
+        allowed = {"airtable_get_base_schema"}
+        if provider_operations.intersection({"read", "search", "verify"}):
+            allowed.update({"airtable_read_records", "airtable_aggregate_records"})
+        if provider_operations.intersection({"create", "update"}):
+            allowed.add("airtable_write_record")
+        if "attach" in provider_operations:
+            allowed.update(
+                {
+                    "airtable_link_attachment",
+                    "airtable_upload_attachment",
+                }
+            )
+        return [tool for tool in tools if getattr(tool, "name", "") in allowed]
     return tools
 
 

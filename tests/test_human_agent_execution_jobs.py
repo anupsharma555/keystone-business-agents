@@ -143,6 +143,17 @@ def test_representative_zotero_proof_keeps_provider_identity_internal() -> None:
     assert "version-aware verification" in proof
 
 
+def test_google_doc_update_job_records_the_completed_natural_lifecycle() -> None:
+    google_doc = next(row for row in _job_rows() if row["id"] == "HJ-013")
+    proof = google_doc["proof"].lower()
+
+    assert proof.startswith("pass:")
+    assert "natural chief request" in proof
+    assert "updated the same provider identity" in proof
+    assert "verified `trashed=true`" in proof
+    assert "no test doc remained" in proof
+
+
 def test_human_job_contract_requires_reasoning_execution_verification_and_cleanup() -> None:
     text = " ".join(JOBS_DOC.read_text(encoding="utf-8").split())
 

@@ -201,6 +201,9 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "safety_policy.md",
             "tools.md",
             "gmail_triage.md",
+            "gmail_contact_lookup.md",
+            "gmail_candidate_ranking.md",
+            "gmail_priority_grouping.md",
         ),
         skills=AGENT_SKILL_NAMES["gmail_triage"],
         tools=(
@@ -438,6 +441,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         tools=(
             "airtable_get_base_schema",
             "airtable_read_records",
+            "airtable_aggregate_records",
             "airtable_write_record",
             "airtable_upload_attachment",
             "airtable_link_attachment",

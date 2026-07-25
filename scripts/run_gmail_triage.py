@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from keystone_agents.agents.gmail_triage import (
+    build_gmail_contact_lookup_agent,
     build_gmail_priority_grouping_agent,
     build_gmail_triage_agent,
     email_fixture_to_envelope,
@@ -46,6 +47,9 @@ from keystone_agents.founder_profile import (
     founder_drafting_context,
     founder_profile_audit_payload,
     load_founder_fit_profile,
+)
+from keystone_agents.gmail_triage.contact_lookup import (
+    run_gmail_contact_lookup_workflow,
 )
 from keystone_agents.gmail_triage.draft_actions import (
     execute_approved_gmail_draft_action,
@@ -570,6 +574,47 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--message-count",
+        action="store_true",
+        default=False,
+        help="Count a bounded Gmail result set with read-only pagination.",
+    )
+    parser.add_argument(
+        "--message-projection",
+        action="store_true",
+        default=False,
+        help="Return selected metadata fields for one bounded Gmail result set.",
+    )
+    parser.add_argument(
+        "--contact-lookup",
+        action="store_true",
+        default=False,
+        help=(
+            "Answer one known-contact question from a bounded Gmail search using "
+            "the read-only Agents SDK specialist path."
+        ),
+    )
+    parser.add_argument(
+        "--requested-field",
+        action="append",
+        choices=["subject", "sender", "date", "snippet"],
+        default=[],
+    )
+    parser.add_argument("--expected-result-count", type=int, default=None)
+    parser.add_argument(
+        "--mailbox-direction",
+        choices=["unspecified", "inbound", "outbound", "any"],
+        default="unspecified",
+    )
+    parser.add_argument(
+        "--date-scope",
+        choices=["unspecified", "today", "yesterday", "specific_date", "rolling_window"],
+        default="unspecified",
+    )
+    parser.add_argument("--provider-timezone", default="America/New_York")
+    parser.add_argument("--window-start", default="")
+    parser.add_argument("--window-end", default="")
+    parser.add_argument(
         "--max-messages", type=int, default=1, help="Maximum Gmail messages to process."
     )
     parser.add_argument(
@@ -695,7 +740,7 @@ def _apply_live_test_defaults(args: argparse.Namespace) -> argparse.Namespace:
     """Promote env-backed live test defaults for SDK-only Gmail paths."""
 
     if (
-        args.priority_grouping
+        (args.priority_grouping or args.contact_lookup)
         and not args.sdk
         and not sdk_execution_requested(args)
         and cli_default_live_sdk()
@@ -800,8 +845,7 @@ def _run_sdk_synthesis(
         if not str(args.expected_account or "").strip():
             raise SystemExit("Gmail draft writes require --expected-account for scoping.")
     if args.update_draft and not (
-        str(args.draft_subject_hint or "").strip()
-        or str(args.draft_recipient_hint or "").strip()
+        str(args.draft_subject_hint or "").strip() or str(args.draft_recipient_hint or "").strip()
     ):
         raise SystemExit(
             "--update-draft requires a natural subject or recipient hint; no draft was changed."
@@ -931,9 +975,7 @@ def _run_sdk_synthesis(
         draft_result = _create_verified_sdk_reply_draft(args, outcome)
         payload["gmail_draft_result"] = draft_result
         payload["side_effects"] = {
-            "gmail_draft_created": bool(
-                draft_result.get("verification", {}).get("passed")
-            ),
+            "gmail_draft_created": bool(draft_result.get("verification", {}).get("passed")),
             "gmail_draft_updated": False,
             "email_sent": False,
             "send_enabled": False,
@@ -944,9 +986,7 @@ def _run_sdk_synthesis(
         payload["gmail_draft_result"] = draft_result
         payload["side_effects"] = {
             "gmail_draft_created": False,
-            "gmail_draft_updated": bool(
-                draft_result.get("verification", {}).get("passed")
-            ),
+            "gmail_draft_updated": bool(draft_result.get("verification", {}).get("passed")),
             "email_sent": False,
             "send_enabled": False,
             "approval_reference": str(args.approval_reference),
@@ -1106,7 +1146,9 @@ def _fallback_recommended_action(output: dict[str, Any]) -> str:
             "Review the message and prepare a concise reply for human approval before "
             "taking any external action."
         )
-    return "No reply appears required from the sanitized context; review manually if context changes."
+    return (
+        "No reply appears required from the sanitized context; review manually if context changes."
+    )
 
 
 def _priority_grouping_source_label(args: argparse.Namespace) -> str:
@@ -1599,6 +1641,93 @@ def _run_priority_grouping_sdk_synthesis(
     return payload
 
 
+def _run_contact_lookup_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
+    """Retrieve bounded Gmail candidates, then let the SDK specialist interpret them."""
+
+    reject_sdk_side_effect_flags(
+        args,
+        {
+            "live_slack": "--live-slack",
+            "request_approval": "--request-approval",
+            "create_draft": "--create-draft",
+            "update_draft": "--update-draft",
+            "apply_labels": "--apply-labels",
+            "preview_labels": "--preview-labels",
+            "cleanup_labels": "--cleanup-labels",
+        },
+    )
+    if not str(args.request or "").strip():
+        raise RuntimeError("--contact-lookup requires the current operator --request.")
+    if not str(args.gmail_query or "").strip():
+        raise RuntimeError(
+            "--contact-lookup requires a bounded --gmail-query; broad mailbox reads "
+            "are not allowed for contact resolution."
+        )
+    if args.live_gmail:
+        require_cli_live_confirmation(
+            dry_run=args.dry_run,
+            live_flag=True,
+            flag_name="--live-gmail",
+            live_action="read-only Gmail contact evidence retrieval",
+        )
+    run_config, live = resolve_sdk_execution(
+        args,
+        run_config_factory=SDK_RUN_CONFIG_FACTORY,
+    )
+    query = str(args.gmail_query or "").strip()
+    execution = run_gmail_contact_lookup_workflow(
+        operator_request=str(args.request or "").strip(),
+        gmail_query=query,
+        max_messages=args.max_messages,
+        label=args.label_filter,
+        gmail_tool=GmailTool(live=True) if args.live_gmail else None,
+        run_config=run_config,
+        live_sdk=live,
+        trace_include_sensitive_data=args.trace_include_sensitive_data,
+    )
+    outcome = execution.outcome
+    result = execution.result
+    receipt = execution.provider_receipt
+    human_summary = execution.human_summary
+    payload = sdk_synthesis_payload(
+        outcome,
+        include_provider_cost_window=args.include_provider_cost_window,
+        provider_cost_window_seconds=args.provider_cost_window_seconds,
+        openai_cost_project_id=args.openai_cost_project_id,
+    )
+    payload.update(
+        {
+            "status": "completed",
+            "contact_lookup": True,
+            "human_summary": human_summary,
+            "tool_receipts": [receipt],
+            "retrieval_diagnostics": {
+                "provider": "gmail",
+                "query": query,
+                "candidate_count": len(outcome.typed_input.candidates),
+                "selected_count": len(result.contacts),
+                "provider_read": True,
+                "provider_write": False,
+            },
+            "user_facing_result_verified": True,
+            "public_result": {
+                "status": "completed",
+                "completion_confirmed": True,
+                "provider_write_attempted": False,
+                "provider_receipt_verified": True,
+                "summary": human_summary,
+            },
+            "side_effects": {
+                "gmail_read": True,
+                "gmail_write": False,
+                "email_sent": False,
+            },
+        }
+    )
+    attach_orchestrator_preflight_payload(payload, args)
+    return payload
+
+
 def _priority_grouping_request_context(args: argparse.Namespace, preflight_context: str) -> str:
     operator_request = str(getattr(args, "request", "") or "").strip()
     return "\n\n".join(
@@ -1686,6 +1815,204 @@ def _run_live_thread_summary(
     }
 
 
+def _run_live_message_count(
+    *,
+    args: argparse.Namespace,
+    gmail: GmailTool,
+) -> dict[str, Any]:
+    """Return one receipt-backed exact count for a typed Gmail collection read."""
+
+    receipt = gmail.count_messages(
+        label=args.label_filter or None,
+        query=args.gmail_query or "",
+    )
+    complete = receipt.get("complete") is True
+    count = int(receipt.get("message_count") or 0)
+    direction = str(args.mailbox_direction or "unspecified")
+    date_scope = str(args.date_scope or "unspecified")
+    if complete:
+        if direction == "inbound" and date_scope == "today":
+            summary = f"You received {count} email{'s' if count != 1 else ''} today."
+        elif direction == "outbound" and date_scope == "today":
+            summary = f"You sent {count} email{'s' if count != 1 else ''} today."
+        else:
+            summary = f"I found {count} matching email{'s' if count != 1 else ''}."
+        status = "completed"
+        block_kind = ""
+    else:
+        summary = (
+            f"I counted at least {count} matching emails, but the bounded provider read "
+            "did not exhaust every Gmail result page, so I cannot report an exact total."
+        )
+        status = "blocked"
+        block_kind = "gmail_count_incomplete"
+    provider_receipt = {
+        **receipt,
+        "operation": "message_count",
+        "mailbox_direction": direction,
+        "date_scope": date_scope,
+        "timezone": str(args.provider_timezone or "America/New_York"),
+        "window_start": str(args.window_start or ""),
+        "window_end": str(args.window_end or ""),
+        "verified": complete,
+    }
+    output = {
+        "status": status,
+        "summary": summary,
+        "message_count": count,
+        "mailbox_direction": direction,
+        "date_scope": date_scope,
+        "timezone": provider_receipt["timezone"],
+        "window_start": provider_receipt["window_start"],
+        "window_end": provider_receipt["window_end"],
+        "provider_read": True,
+        "provider_write": False,
+        "send_enabled": False,
+        "draft_created": False,
+        "labels_modified": False,
+    }
+    public_result = {
+        "schema_name": "keystone.execution_public_result.v1",
+        "status": status,
+        "title": "Business Agents Result Ready" if complete else "Business Agents Blocked",
+        "omit_title": False,
+        "text": summary,
+        "completion_confirmed": complete,
+        "provider_write_attempted": False,
+        "provider_receipt_verified": complete,
+        "recovery_used": False,
+        "recovery_notice": "",
+        "failure_code": block_kind,
+        "failure_summary": "" if complete else summary,
+        "run_id": "",
+    }
+    return {
+        "mode": "live-gmail-message-count",
+        "status": status,
+        "block_kind": block_kind,
+        "send_enabled": False,
+        "human_summary": summary,
+        "output_type": "GmailMessageCountResult",
+        "output": output,
+        "retrieval_diagnostics": provider_receipt,
+        "tool_receipts": [provider_receipt],
+        "user_facing_result_verified": complete,
+        "public_result": public_result,
+        "side_effects": {
+            "gmail_draft_created": False,
+            "gmail_draft_updated": False,
+            "labels_modified": False,
+            "email_sent": False,
+            "send_enabled": False,
+        },
+    }
+
+
+def _run_live_message_projection(
+    *,
+    args: argparse.Namespace,
+    gmail: GmailTool,
+) -> dict[str, Any]:
+    """Return selected metadata for the exact complete Gmail result set."""
+
+    receipt = gmail.project_message_summaries(
+        requested_fields=list(args.requested_field or []),
+        label=args.label_filter or None,
+        query=args.gmail_query or "",
+        max_items=args.max_messages,
+    )
+    complete = receipt.get("complete") is True
+    count = int(receipt.get("item_count") or 0)
+    expected_count = args.expected_result_count
+    count_matches = expected_count is None or count == expected_count
+    verified = complete and count_matches
+    items = receipt.get("items") if verified else []
+    if not isinstance(items, list):
+        items = []
+    if verified:
+        lines = [_render_gmail_projection_item(item, args.requested_field) for item in items]
+        summary = "\n".join(f"- {line}" for line in lines) if lines else "No matching emails."
+        status = "completed"
+        block_kind = ""
+    elif not complete:
+        summary = (
+            "I could not exhaust the bounded Gmail result set, so I did not return a partial list."
+        )
+        status = "blocked"
+        block_kind = "gmail_projection_incomplete"
+    else:
+        summary = (
+            "The Gmail result set changed after the prior verified read, so I did not "
+            "claim this was the same set."
+        )
+        status = "blocked"
+        block_kind = "gmail_projection_scope_changed"
+    provider_receipt = {
+        **receipt,
+        "operation": "message_projection",
+        "mailbox_direction": str(args.mailbox_direction or "unspecified"),
+        "date_scope": str(args.date_scope or "unspecified"),
+        "timezone": str(args.provider_timezone or "America/New_York"),
+        "window_start": str(args.window_start or ""),
+        "window_end": str(args.window_end or ""),
+        "expected_result_count": expected_count,
+        "verified": verified,
+    }
+    output = {
+        "status": status,
+        "summary": summary,
+        "items": items,
+        "item_count": count,
+        "requested_fields": list(args.requested_field or []),
+        "provider_read": True,
+        "provider_write": False,
+        "send_enabled": False,
+        "draft_created": False,
+        "labels_modified": False,
+    }
+    return {
+        "mode": "live-gmail-message-projection",
+        "status": status,
+        "block_kind": block_kind,
+        "send_enabled": False,
+        "human_summary": summary,
+        "output_type": "GmailMessageProjectionResult",
+        "output": output,
+        "retrieval_diagnostics": provider_receipt,
+        "tool_receipts": [provider_receipt],
+        "user_facing_result_verified": verified,
+        "public_result": {
+            "schema_name": "keystone.execution_public_result.v1",
+            "status": status,
+            "title": ("Business Agents Result Ready" if verified else "Business Agents Blocked"),
+            "omit_title": False,
+            "text": summary,
+            "completion_confirmed": verified,
+            "provider_write_attempted": False,
+            "provider_receipt_verified": verified,
+            "recovery_used": False,
+            "recovery_notice": "",
+            "failure_code": block_kind,
+            "failure_summary": "" if verified else summary,
+            "run_id": "",
+        },
+        "side_effects": {
+            "gmail_draft_created": False,
+            "gmail_draft_updated": False,
+            "labels_modified": False,
+            "email_sent": False,
+            "send_enabled": False,
+        },
+    }
+
+
+def _render_gmail_projection_item(item: object, fields: list[str]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    values = [str(item.get(field) or "").strip() for field in fields]
+    return " | ".join(value for value in values if value)
+
+
 @with_cli_environment()
 def main() -> int:
     args = apply_orchestrator_preflight_to_args(
@@ -1697,12 +2024,28 @@ def main() -> int:
         raise SystemExit("--lookback-days must be at least 1.")
     if args.test_pack_report_dir and not args.priority_grouping:
         raise SystemExit("--test-pack-report-dir is only supported with --priority-grouping.")
+    if (args.message_count or args.message_projection or args.contact_lookup) and any(
+        (
+            args.create_draft,
+            args.update_draft,
+            args.apply_labels,
+            args.preview_labels,
+            args.cleanup_labels,
+            args.request_approval,
+            args.live_slack,
+        )
+    ):
+        raise SystemExit("Gmail collection reads cannot be combined with Gmail mutations.")
+    if args.message_projection and not args.requested_field:
+        raise SystemExit("--message-projection requires at least one --requested-field.")
     email_style_profile = _load_requested_style_profile(args)
     founder_fit_profile = load_founder_fit_profile(args.founder_fit_profile)
 
     if sdk_execution_requested(args):
         try:
-            if args.priority_grouping:
+            if args.contact_lookup:
+                payload = _run_contact_lookup_sdk_synthesis(args)
+            elif args.priority_grouping:
                 payload = _run_priority_grouping_sdk_synthesis(
                     args,
                     email_style_profile=email_style_profile,
@@ -1763,7 +2106,9 @@ def main() -> int:
 
     if args.sdk:
         agent = (
-            build_gmail_priority_grouping_agent()
+            build_gmail_contact_lookup_agent()
+            if args.contact_lookup
+            else build_gmail_priority_grouping_agent()
             if args.priority_grouping
             else build_gmail_triage_agent()
         )
@@ -1772,6 +2117,7 @@ def main() -> int:
             "dry_run": True,
             "live_sdk": False,
             "priority_grouping": bool(args.priority_grouping),
+            "contact_lookup": bool(args.contact_lookup),
             "agent": sdk_agent_description(agent),
             "audit_notes": [
                 "--sdk constructs the agent boundary only.",
@@ -1797,6 +2143,8 @@ def main() -> int:
 
     if args.priority_grouping:
         raise SystemExit("--priority-grouping requires --run-sdk or --live-sdk to invoke the LLM.")
+    if args.contact_lookup:
+        raise SystemExit("--contact-lookup requires --run-sdk or --live-sdk to invoke the LLM.")
 
     if args.live_gmail:
         if not args.label_filter and not args.allow_inbox:
@@ -1807,7 +2155,11 @@ def main() -> int:
         gmail = GmailTool(live=True)
         label = args.label_filter or "INBOX"
         try:
-            if args.thread_summary or args.thread_id:
+            if args.message_projection:
+                payload = _run_live_message_projection(args=args, gmail=gmail)
+            elif args.message_count:
+                payload = _run_live_message_count(args=args, gmail=gmail)
+            elif args.thread_summary or args.thread_id:
                 payload = _run_live_thread_summary(args=args, gmail=gmail, label=label)
             else:
                 message_refs = gmail.list_recent_messages(

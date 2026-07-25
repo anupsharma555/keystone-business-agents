@@ -12,13 +12,20 @@ from dataclasses import dataclass
 from typing import Any
 
 from keystone_agents.manual_request import (
+    _provider_selection_order,
+    _provider_selection_rank,
+    _zotero_requested_fields,
     infer_manual_request_plan,
     merge_manual_request_plan,
     normalize_manual_agent,
+    reconcile_manual_request_followup,
 )
 from keystone_agents.model_provider import ModelConfig, get_runtime_agent_model_config
 from keystone_agents.run import run_typed_sdk_agent
-from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.schemas.manual_request_plan import (
+    ManualProviderResultSetScope,
+    ManualRequestPlan,
+)
 from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
 
 _MAX_PLANNER_THREAD_MESSAGES = 8
@@ -141,10 +148,13 @@ def resolve_manual_request_plan(
             continue
         if cost_callback is not None:
             cost_callback(result)
-        return merge_manual_request_plan(
-            fallback,
-            result.output.model_copy(update={"source": "llm"}),
-            allow_contextual_delegation=bool(workflow_context),
+        return reconcile_manual_request_followup(
+            merge_manual_request_plan(
+                fallback,
+                result.output.model_copy(update={"source": "llm"}),
+                allow_contextual_delegation=bool(workflow_context),
+            ),
+            workflow_context=workflow_context,
         )
     return fallback.model_copy(
         update={
@@ -250,6 +260,23 @@ def _compact_manual_planner_context(
                 ),
             }
         )
+    prior_result_scope = state.get("prior_provider_result_scope")
+    if isinstance(prior_result_scope, Mapping):
+        try:
+            verified_scope = ManualProviderResultSetScope.model_validate(
+                prior_result_scope
+            )
+        except (TypeError, ValueError):
+            verified_scope = None
+        if (
+            verified_scope is not None
+            and verified_scope.verified
+            and verified_scope.complete
+        ):
+            compact["prior_provider_result_scope"] = verified_scope.model_dump(
+                mode="json"
+            )
+            receipt["verified_provider_result_scope_retained"] = True
     if nested_slack_context:
         compact["slack_context"] = {
             key: str(nested_slack_context.get(key) or "")[:300]
@@ -275,6 +302,7 @@ def _compact_manual_planner_context(
             key: str(execution_continuation.get(key) or "")[:limit]
             for key, limit in (
                 ("work_item_id", 100),
+                ("prior_agent", 100),
                 ("provider_affinity", 100),
                 ("prior_request", 2400),
             )
@@ -376,6 +404,24 @@ def _apply_contextual_route_hint(
         if isinstance(continuation, Mapping)
         else ""
     )
+    prior_owner = (
+        str(continuation.get("prior_agent") or "").strip().lower()
+        if isinstance(continuation, Mapping)
+        else ""
+    )
+    if prior_owner not in {
+        "airtable_context_agent",
+        "business_research_analyst",
+        "chief_of_staff",
+        "gmail_triage",
+        "google_workspace_context_agent",
+        "opportunity_scout",
+        "outreach_composer",
+        "preprints_context_agent",
+        "rss_context_agent",
+        "zotero_context_agent",
+    }:
+        prior_owner = ""
     affinity_owners = {
         "airtable": "airtable_context_agent",
         "calendar": "chief_of_staff",
@@ -386,6 +432,12 @@ def _apply_contextual_route_hint(
         "google workspace": "google_workspace_context_agent",
         "zotero": "zotero_context_agent",
     }
+    if not provider_affinity:
+        provider_affinity = _verified_provider_affinity_from_prior_owner(
+            workflow_context,
+            prior_owner=prior_owner,
+            affinity_owners=affinity_owners,
+        )
     affinity_owner = affinity_owners.get(provider_affinity)
     if not _depends_on_prior_context(request_text) and affinity_owner is None:
         return fallback
@@ -418,11 +470,45 @@ def _apply_contextual_route_hint(
                 ],
             }
         )
-    target = affinity_owner or (owner_candidates[0] if owner_candidates else None)
+    prior_owner_advice = (
+        prior_owner
+        if prior_owner
+        and (
+            requested in {None, "orchestrator"}
+            or requested == prior_owner
+        )
+        else None
+    )
+    current_capability_owner = (
+        str(fallback.target_agent)
+        if fallback.target_agent != prior_owner
+        and (
+            fallback.provider_system != "unspecified"
+            or fallback.target_agent in {"opportunity_scout", "outreach_composer"}
+            or fallback.intent in {"browser_diagnostics", "reference_capture"}
+        )
+        else None
+    )
+    zotero_selection_rank = (
+        _provider_selection_rank(request_text, zotero_context=True)
+        if affinity_owner == "zotero_context_agent"
+        else None
+    )
+    if zotero_selection_rank is not None:
+        # An ordinal such as "second-most-recent" is a delta over the
+        # provider-affine collection, not a request to switch to web research.
+        current_capability_owner = None
+    target = (
+        current_capability_owner
+        or affinity_owner
+        or (owner_candidates[0] if owner_candidates else None)
+        or prior_owner_advice
+    )
     if target is None:
         return fallback
     write_requested = bool(
-        re.search(
+        fallback.ask_shape.permission_state != "read_only"
+        and re.search(
             r"\b(?:add|append|attach|change|create|delete|edit|label|mark|modify|move|"
             r"remove|rename|replace|revise|save|set|shorten|tag|update|write)\b",
             request_text,
@@ -469,6 +555,25 @@ def _apply_contextual_route_hint(
                 ),
             }
         )
+        if target == "zotero_context_agent" and zotero_selection_rank is not None:
+            updates.update(
+                {
+                    "provider_operations": ["read"],
+                    "provider_read_scope": "bounded_collection",
+                    "provider_result_mode": "items",
+                    "provider_selection_order": _provider_selection_order(
+                        request_text,
+                        zotero_context=True,
+                    ),
+                    "provider_selection_rank": zotero_selection_rank,
+                    "zotero_requested_fields": _zotero_requested_fields(
+                        request_text,
+                        zotero_context=True,
+                    ),
+                    "target_type": "zotero_article",
+                    "requires_live_search": False,
+                }
+            )
     elif target == "gmail_triage":
         updates.update(
             {
@@ -480,7 +585,19 @@ def _apply_contextual_route_hint(
             }
         )
     elif target == "chief_of_staff":
-        if provider_affinity in {"calendar", "google_calendar", "google calendar"}:
+        if prior_owner_advice == "chief_of_staff" and affinity_owner is None:
+            updates.update(
+                {
+                    "intent": "route_request",
+                    "provider_system": "unspecified",
+                    "provider_operations": [],
+                    "target_type": "topic",
+                    "task_objective": "route_or_continue",
+                    "expected_artifact_type": "none",
+                    "side_effect_policy": "draft_or_read_only",
+                }
+            )
+        elif provider_affinity in {"calendar", "google_calendar", "google calendar"}:
             updates.update(
                 {
                     "intent": (
@@ -522,6 +639,29 @@ def _apply_contextual_route_hint(
             }
         )
     return fallback.model_copy(update=updates)
+
+
+def _verified_provider_affinity_from_prior_owner(
+    workflow_context: Mapping[str, Any],
+    *,
+    prior_owner: str,
+    affinity_owners: Mapping[str, str],
+) -> str:
+    """Recover provider continuity only when verified scope and owner agree."""
+
+    value = workflow_context.get("prior_provider_result_scope")
+    if not prior_owner or not isinstance(value, Mapping):
+        return ""
+    try:
+        scope = ManualProviderResultSetScope.model_validate(value)
+    except (TypeError, ValueError):
+        return ""
+    if not scope.complete or not scope.verified:
+        return ""
+    provider = str(scope.provider_system or "").strip().lower()
+    if affinity_owners.get(provider) != prior_owner:
+        return ""
+    return provider
 
 
 def _context_owner_candidates_from_workflow_context(
@@ -610,7 +750,7 @@ def _depends_on_prior_context(request_text: str) -> bool:
         return False
     explicit_dependency = bool(
         re.search(
-            r"\b(?:above|current|earlier|it|prior|previous|same|that|these|this|those)\b"
+            r"\b(?:above|current|earlier|instead|it|prior|previous|same|that|these|this|those)\b"
             r"|\blink\s+\d+\b|\b(?:prior|previous)\s+results?\b",
             text,
         )
@@ -693,14 +833,16 @@ def _planner_model_configs(
     requested_agent: str | None,
     model: str | None = None,
 ) -> list[ModelConfig]:
-    """Return provider-aware planner configs with bounded fallback."""
+    """Return the dedicated planner config or an explicit experimental override."""
 
-    policy = os.getenv("KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY", "target_with_openai_fallback")
-    policy = policy.strip().lower() or "target_with_openai_fallback"
+    policy = os.getenv("KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY", "openai")
+    policy = policy.strip().lower() or "openai"
+    if policy not in {"openai", "target", "target_with_openai_fallback"}:
+        policy = "openai"
     target_agent = normalize_manual_agent(requested_agent) or "orchestrator"
     target_config = get_runtime_agent_model_config(target_agent, model_override=model)
     openai_config = get_runtime_agent_model_config(
-        "orchestrator",
+        "manual_request_planner",
         model_override=model,
         provider_override="openai",
     )

@@ -41,6 +41,13 @@ class WorkItemStatus(StrEnum):
     ARCHIVED = "archived"
 
 
+class UserFacingSummaryAuthority(StrEnum):
+    """Whether final review may recast the current operator-facing summary."""
+
+    REVIEWABLE = "reviewable"
+    CANONICAL = "canonical"
+
+
 class WorkItemRoute(StrEnum):
     ORCHESTRATOR = "orchestrator"
     GMAIL_TRIAGE = "gmail_triage"
@@ -252,6 +259,9 @@ class WorkflowRunResult(BaseModel):
     blockers: list[WorkItemBlocker] = Field(default_factory=list)
     next_action: WorkItemNextAction | None = None
     human_summary: str = ""
+    user_facing_summary_authority: UserFacingSummaryAuthority = (
+        UserFacingSummaryAuthority.REVIEWABLE
+    )
     audit_notes: list[str] = Field(default_factory=list)
     manual_request_plan: dict[str, Any] | None = None
     orchestrator_preflight: dict[str, Any] | None = None

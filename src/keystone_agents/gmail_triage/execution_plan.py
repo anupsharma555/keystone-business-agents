@@ -4,10 +4,27 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+from keystone_agents.gmail_triage.relationship_query import (
+    known_contact_gmail_query,
+    looks_like_known_contact_relationship,
+)
+from keystone_agents.manual_request import positive_capability_text
+from keystone_agents.orchestrator.routing import looks_like_gmail_collection_read
 from keystone_agents.schemas.gmail_execution_plan import GmailExecutionPlan
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
+
+_GMAIL_OPERATOR_TIMEZONE = "America/New_York"
+_GMAIL_OWNED_DATE_QUERY_RE = re.compile(
+    r"(?:^|\s)(?:after|before|newer|older|newer_than|older_than):\S+(?=\s|$)",
+    re.IGNORECASE,
+)
+_GMAIL_OWNED_DIRECTION_QUERY_RE = re.compile(
+    r"(?:^|\s)-?(?:in:sent|to:me|from:me)(?=\s|$)",
+    re.IGNORECASE,
+)
 
 
 def resolve_gmail_execution_plan(
@@ -18,16 +35,56 @@ def resolve_gmail_execution_plan(
 ) -> GmailExecutionPlan:
     """Use the LLM semantic plan when available, otherwise use local fallback."""
 
-    plan = _manual_plan_mapping(manual_plan)
-    if str(plan.get("source") or "") != "llm":
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if authority.fallback_allowed:
         return infer_gmail_execution_plan(request_text, source=source)
-    if (
-        str(plan.get("provider_system") or "") != "gmail"
-        and str(plan.get("target_agent") or "") != "gmail_triage"
-        and "gmail_triage" not in (plan.get("workflow") or [])
-    ):
-        return infer_gmail_execution_plan(request_text, source=source)
-    return _gmail_execution_plan_from_semantic_plan(plan)
+    if authority.invalid:
+        return _gmail_execution_plan_not_authorized(
+            source="invalid_canonical_plan",
+            rationale=(
+                "A supplied canonical plan was invalid. Gmail execution stopped "
+                "without reinterpreting raw request wording."
+            ),
+        )
+    plan = authority.plan
+    assert plan is not None
+    if not (plan.provider_system == "gmail" or authority.requests_route("gmail_triage")):
+        return _gmail_execution_plan_not_authorized(
+            source="canonical_plan_mismatch",
+            rationale=(
+                "The canonical plan did not authorize Gmail or Gmail Triage. Raw "
+                "request wording cannot grant a Gmail read, draft, label, or send action."
+            ),
+        )
+    payload = plan.model_dump(mode="python")
+    payload["provider_operations"] = list(
+        authority.effective_provider_operations("gmail")
+    )
+    return _gmail_execution_plan_from_semantic_plan(payload)
+
+
+def _gmail_execution_plan_not_authorized(
+    *,
+    source: str,
+    rationale: str,
+) -> GmailExecutionPlan:
+    return GmailExecutionPlan(
+        source=source,
+        operation="clarification",
+        read_scope="message",
+        max_messages=1,
+        source_label="NONE",
+        create_gmail_drafts=False,
+        draft_replies_in_output=False,
+        live_read_required=False,
+        candidate_helpers=[],
+        artifact_policy="no_artifact",
+        side_effect_policy="no_gmail_action",
+        rationale=rationale,
+        planner_warnings=[
+            "Canonical-plan admission stopped Gmail execution before any provider action."
+        ],
+    )
 
 
 def _gmail_execution_plan_from_semantic_plan(
@@ -39,18 +96,12 @@ def _gmail_execution_plan_from_semantic_plan(
         if str(item or "").strip()
     ]
     workflow = [
-        str(item or "").strip()
-        for item in (plan.get("workflow") or [])
-        if str(item or "").strip()
+        str(item or "").strip() for item in (plan.get("workflow") or []) if str(item or "").strip()
     ]
-    ask_shape = plan.get("ask_shape")
-    ask_shape_mapping = ask_shape if isinstance(ask_shape, Mapping) else {}
-    selected_context = (
-        str(ask_shape_mapping.get("prior_context_dependency") or "")
-        == "selected_context"
-    )
     lookback_days = _bounded_int(plan.get("lookback_days"), default=3, lower=1, upper=365)
     desired_count = _bounded_int(plan.get("desired_count"), default=1, lower=1, upper=50)
+    desired_count_explicit = plan.get("desired_count_explicit") is True
+    collection_max_messages = desired_count if desired_count_explicit else 25
     query = str(plan.get("gmail_query") or "").strip()
     primary_target = str(plan.get("primary_target") or "").strip()
     recipient = str(plan.get("recipient") or "").strip()
@@ -58,12 +109,64 @@ def _gmail_execution_plan_from_semantic_plan(
     expected_artifact = str(plan.get("expected_artifact_type") or "")
     draft_policy = str(plan.get("draft_policy") or "")
     task_objective = str(plan.get("task_objective") or "")
+    raw_ask_shape = plan.get("ask_shape")
+    ask_shape = raw_ask_shape if isinstance(raw_ask_shape, Mapping) else {}
+    permission_state = str(ask_shape.get("permission_state") or "")
+    if permission_state == "read_only":
+        operations = [
+            operation
+            for operation in operations
+            if operation in {"read", "search", "verify"}
+        ]
+    if draft_policy == "no_drafts_requested":
+        operations = [
+            operation
+            for operation in operations
+            if operation not in {"create", "update"}
+        ]
+    provider_result_mode = str(plan.get("provider_result_mode") or "unspecified")
+    mailbox_direction = str(plan.get("gmail_mailbox_direction") or "unspecified")
+    date_scope = str(plan.get("gmail_date_scope") or "unspecified")
+    requested_fields = [
+        str(item or "").strip().lower()
+        for item in (plan.get("gmail_requested_fields") or [])
+        if str(item or "").strip().lower() in {"subject", "sender", "date", "snippet"}
+    ]
+    raw_result_scope = plan.get("provider_result_scope")
+    result_scope = raw_result_scope if isinstance(raw_result_scope, Mapping) else {}
+    trusted_result_scope = bool(
+        result_scope.get("verified") is True
+        and result_scope.get("complete") is True
+        and str(result_scope.get("provider_system") or "") == "gmail"
+        and str(result_scope.get("provider_read_scope") or "") == "bounded_collection"
+    )
 
     common = {
         "source": "llm_manual_plan",
         "lookback_days": lookback_days,
         "gmail_query": query,
-        "live_read_required": not selected_context,
+        # A generic planner dependency such as ``selected_context`` cannot
+        # prove that selected Gmail evidence exists. The executor owns that
+        # evidence check; canonical provider read/search operations therefore
+        # remain live-read candidates until a typed Gmail artifact is present.
+        "live_read_required": bool({"read", "search"}.intersection(operations)),
+        "mailbox_direction": mailbox_direction,
+        "date_scope": date_scope,
+        "requested_fields": requested_fields,
+        "provider_query": (str(result_scope.get("query") or "") if trusted_result_scope else ""),
+        "provider_label": (str(result_scope.get("label") or "") if trusted_result_scope else ""),
+        "provider_timezone": (
+            str(result_scope.get("timezone") or _GMAIL_OPERATOR_TIMEZONE)
+            if trusted_result_scope
+            else _GMAIL_OPERATOR_TIMEZONE
+        ),
+        "provider_window_start": (
+            str(result_scope.get("window_start") or "") if trusted_result_scope else ""
+        ),
+        "provider_window_end": (
+            str(result_scope.get("window_end") or "") if trusted_result_scope else ""
+        ),
+        "expected_result_count": (result_scope.get("item_count") if trusted_result_scope else None),
         "rationale": (
             "Derived from the LLM semantic plan; raw request wording does not "
             "reclassify the Gmail operation."
@@ -117,18 +220,66 @@ def _gmail_execution_plan_from_semantic_plan(
             artifact_policy="draft_text_in_output",
             side_effect_policy="read_only_or_draft_only",
         )
-    if desired_count > 1:
+    if (
+        task_objective == "contact_discovery"
+        and {"read", "search"}.intersection(operations)
+    ):
         return GmailExecutionPlan(
             **common,
-            operation="priority_grouping",
-            max_messages=desired_count,
-            source_label="INBOX",
+            operation="contact_lookup",
+            read_scope="collection",
+            max_messages=max(10, min(25, desired_count)),
+            source_label="",
+            create_gmail_drafts=False,
+            draft_replies_in_output=False,
             candidate_helpers=[
-                "gmail_search_summaries",
-                "gmail_batch_message_read",
-                "gmail_thread_expansion_when_needed",
-                "gmail_priority_grouping_sdk",
+                "gmail_search_message_summaries",
+                "gmail_contact_lookup_sdk",
+                "gmail_contact_source_binding",
             ],
+            artifact_policy="verified_contact_evidence",
+            side_effect_policy="read_only",
+        )
+    if requested_fields and (
+        task_objective != "gmail_triage"
+        or desired_count_explicit
+        or trusted_result_scope
+    ):
+        return GmailExecutionPlan(
+            **common,
+            operation="message_projection",
+            read_scope="collection",
+            max_messages=min(
+                50,
+                max(
+                    collection_max_messages,
+                    int(result_scope.get("item_count") or 1),
+                ),
+            ),
+            source_label="",
+            create_gmail_drafts=False,
+            draft_replies_in_output=False,
+            candidate_helpers=["gmail_paginated_message_projection"],
+            artifact_policy="no_artifact",
+            side_effect_policy="read_only",
+            planner_warnings=(
+                ["A field projection cannot execute as count-only; item mode was selected."]
+                if provider_result_mode == "count"
+                else []
+            ),
+        )
+    if provider_result_mode == "count":
+        return GmailExecutionPlan(
+            **common,
+            operation="message_count",
+            read_scope="collection",
+            max_messages=desired_count,
+            source_label="",
+            create_gmail_drafts=False,
+            draft_replies_in_output=False,
+            candidate_helpers=["gmail_paginated_message_count"],
+            artifact_policy="no_artifact",
+            side_effect_policy="read_only",
         )
     if target_type == "gmail_thread" and task_objective == "gmail_triage":
         return GmailExecutionPlan(
@@ -139,30 +290,39 @@ def _gmail_execution_plan_from_semantic_plan(
             source_label="INBOX",
             candidate_helpers=["gmail_thread_summary"],
         )
+    if (
+        str(plan.get("provider_read_scope") or "") == "bounded_collection"
+        or desired_count > 1
+    ):
+        draft_replies = draft_policy not in {"", "no_drafts_requested"}
+        return GmailExecutionPlan(
+            **common,
+            operation="priority_grouping",
+            read_scope="collection",
+            max_messages=collection_max_messages,
+            source_label="INBOX",
+            draft_replies_in_output=draft_replies,
+            candidate_helpers=[
+                "gmail_search_summaries",
+                "gmail_batch_message_read",
+                "gmail_thread_expansion_when_needed",
+                "gmail_priority_grouping_sdk",
+            ],
+            side_effect_policy=(
+                "read_only_or_draft_only" if draft_replies else "read_only"
+            ),
+        )
     return GmailExecutionPlan(
         **common,
         operation="single_message_triage",
         read_scope="message",
         max_messages=desired_count,
-        source_label="INBOX" if not selected_context else "inline_context",
+        source_label="INBOX",
         candidate_helpers=[
-            "gmail_message_triage"
-            if selected_context
-            else "gmail_single_message_read",
+            "gmail_single_message_read",
             "gmail_triage_sdk",
         ],
     )
-
-
-def _manual_plan_mapping(value: object | None) -> Mapping[str, object]:
-    if isinstance(value, Mapping):
-        return value
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        payload = model_dump(mode="python")
-        if isinstance(payload, Mapping):
-            return payload
-    return {}
 
 
 def _bounded_int(value: object, *, default: int, lower: int, upper: int) -> int:
@@ -170,6 +330,77 @@ def _bounded_int(value: object, *, default: int, lower: int, upper: int) -> int:
         return max(lower, min(upper, int(value)))
     except (TypeError, ValueError):
         return default
+
+
+def gmail_provider_read_scope(
+    plan: GmailExecutionPlan,
+    *,
+    now: datetime | None = None,
+) -> dict[str, str]:
+    """Materialize typed Gmail date/direction fields into one provider query."""
+
+    timezone = ZoneInfo(plan.provider_timezone or _GMAIL_OPERATOR_TIMEZONE)
+    if plan.provider_query:
+        return {
+            "query": plan.provider_query,
+            "label": plan.provider_label,
+            "mailbox_direction": plan.mailbox_direction,
+            "date_scope": plan.date_scope,
+            "timezone": timezone.key,
+            "window_start": plan.provider_window_start,
+            "window_end": plan.provider_window_end,
+        }
+    reference = now.astimezone(timezone) if now is not None else datetime.now(timezone)
+    extra_query = " ".join(str(plan.gmail_query or "").split()).strip()
+    if plan.date_scope in {"today", "yesterday"}:
+        extra_query = _GMAIL_OWNED_DATE_QUERY_RE.sub(" ", extra_query)
+    if plan.mailbox_direction != "unspecified":
+        extra_query = _GMAIL_OWNED_DIRECTION_QUERY_RE.sub(" ", extra_query)
+    query_parts: list[str] = []
+    if plan.mailbox_direction == "inbound":
+        query_parts.extend(["to:me", "-in:sent"])
+    elif plan.mailbox_direction == "outbound":
+        query_parts.append("in:sent")
+
+    window_start = ""
+    window_end = ""
+    if plan.date_scope in {"today", "yesterday"}:
+        day = reference.date()
+        if plan.date_scope == "yesterday":
+            day -= timedelta(days=1)
+        start = datetime.combine(day, time.min, tzinfo=timezone)
+        end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=timezone)
+        # Gmail's after: operator is exclusive. Subtract one second so a message
+        # timestamped exactly at local midnight remains in the requested day.
+        query_parts.extend(
+            [
+                f"after:{int(start.timestamp()) - 1}",
+                f"before:{int(end.timestamp())}",
+            ]
+        )
+        window_start = start.isoformat()
+        window_end = end.isoformat()
+    if extra_query:
+        query_parts.append(" ".join(extra_query.split()))
+    return {
+        "query": " ".join(query_parts).strip(),
+        "label": "" if plan.source_label in {"", "ALL"} else plan.source_label,
+        "mailbox_direction": plan.mailbox_direction,
+        "date_scope": plan.date_scope,
+        "timezone": timezone.key,
+        "window_start": window_start,
+        "window_end": window_end,
+    }
+
+
+def gmail_message_count_scope(
+    plan: GmailExecutionPlan,
+    *,
+    now: datetime | None = None,
+) -> dict[str, str]:
+    """Backward-compatible name for the shared typed Gmail read scope."""
+
+    return gmail_provider_read_scope(plan, now=now)
 
 
 def infer_gmail_execution_plan(
@@ -213,6 +444,32 @@ def infer_gmail_execution_plan(
             ),
         )
 
+    if _contact_lookup_request(lowered):
+        contact_query = _contact_lookup_query(text)
+        return GmailExecutionPlan(
+            source=source,
+            operation="contact_lookup",
+            read_scope="collection",
+            lookback_days=lookback_days,
+            max_messages=10,
+            gmail_query=contact_query,
+            source_label="",
+            create_gmail_drafts=False,
+            draft_replies_in_output=False,
+            live_read_required=True,
+            candidate_helpers=[
+                "gmail_search_message_summaries",
+                "gmail_contact_lookup_sdk",
+                "gmail_contact_source_binding",
+            ],
+            artifact_policy="verified_contact_evidence",
+            side_effect_policy="read_only",
+            rationale=(
+                "Compatibility fallback recognized a known-contact question. The "
+                "canonical semantic plan remains authoritative when present."
+            ),
+        )
+
     if _style_profile_request(lowered):
         return GmailExecutionPlan(
             source=source,
@@ -243,15 +500,18 @@ def infer_gmail_execution_plan(
 
     if _priority_grouping_request(lowered):
         priority_query = _date_scope_query(lowered, lookback_days)
+        collection_read = looks_like_gmail_collection_read(lowered)
+        draft_replies = _draft_requested(lowered)
         return GmailExecutionPlan(
             source=source,
             operation="priority_grouping",
+            read_scope="collection",
             lookback_days=lookback_days,
-            max_messages=_requested_count(lowered) or 10,
+            max_messages=_requested_count(lowered) or (25 if collection_read else 10),
             gmail_query=priority_query,
             source_label="INBOX",
             create_gmail_drafts=False,
-            draft_replies_in_output=_draft_requested(lowered),
+            draft_replies_in_output=draft_replies,
             live_read_required=True,
             candidate_helpers=[
                 "gmail_search_summaries",
@@ -259,6 +519,9 @@ def infer_gmail_execution_plan(
                 "gmail_thread_expansion_when_needed",
                 "gmail_priority_grouping_sdk",
             ],
+            side_effect_policy=(
+                "read_only_or_draft_only" if draft_replies else "read_only"
+            ),
             rationale=(
                 "Request asks for recent Gmail threads/messages to be ranked and summarized; "
                 "use broad bounded retrieval before relevance filtering so Gmail search "
@@ -328,16 +591,10 @@ def infer_gmail_execution_plan(
             candidate_helpers=[
                 "gmail_single_message_read",
                 "gmail_triage_sdk",
-                *(
-                    ["gmail_verified_reply_draft_create"]
-                    if create_provider_draft
-                    else []
-                ),
+                *(["gmail_verified_reply_draft_create"] if create_provider_draft else []),
             ],
             artifact_policy=(
-                "create_verified_gmail_draft"
-                if create_provider_draft
-                else "draft_text_in_output"
+                "create_verified_gmail_draft" if create_provider_draft else "draft_text_in_output"
             ),
             side_effect_policy=(
                 "scoped_gmail_draft_write_no_send"
@@ -381,7 +638,19 @@ def _single_message_request(lowered: str) -> bool:
     )
 
 
+def _contact_lookup_request(lowered: str) -> bool:
+    """Compatibility-only hint for a known contact in the operator's mailbox."""
+
+    return looks_like_known_contact_relationship(lowered)
+
+
+def _contact_lookup_query(text: str) -> str:
+    return known_contact_gmail_query(text)
+
+
 def _priority_grouping_request(lowered: str) -> bool:
+    if looks_like_gmail_collection_read(lowered):
+        return True
     if any(marker in lowered for marker in ("top ", "top 3", "priority", "actionable")):
         return True
     if "recent" in lowered and ("threads" in lowered or "messages" in lowered):
@@ -429,7 +698,8 @@ def _inline_context_request(lowered: str) -> bool:
 
 
 def _draft_requested(lowered: str) -> bool:
-    return any(marker in lowered for marker in ("draft", "reply", "respond"))
+    actionable = positive_capability_text(lowered).lower()
+    return any(marker in actionable for marker in ("draft", "reply", "respond"))
 
 
 def _provider_draft_write_requested(lowered: str) -> bool:
