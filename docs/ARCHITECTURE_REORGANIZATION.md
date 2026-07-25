@@ -113,3 +113,81 @@ Initial targets, measured against the same-machine tagged baseline:
 Latency improvements must not skip Orchestrator interpretation for new asks,
 deterministic safety gates, approvals, provider read-back, receipt
 checkpointing, recovery, source attribution, or result validation.
+
+## Implemented first tranche
+
+The first behavior-preserving tranche now establishes these canonical
+boundaries:
+
+- `authority/semantic.py` owns semantic execution authority;
+- `planning/compatibility.py` owns the existing bounded compatibility planner;
+- `capabilities/profile.py` owns capability-profile compilation;
+- `receipts/` owns mutation classification, journaling, normalization, and
+  provider recovery;
+- `orchestration/stages.py` exposes the one existing executable-stage kernel;
+- `runtime/request.py` composes request-scoped stores and session services;
+- `presentation/` owns public-result assembly, terminal consistency, and
+  renderers;
+- `entrypoints/cli_impl.py` owns the existing CLI command implementation while
+  `keystone_agents.cli` remains a lightweight public entry facade.
+
+Legacy module paths remain import-compatible facades, so operational scripts,
+tests, direct calls, Slack, WorkItem, manager-loop, and LangGraph consumers can
+migrate independently. The moved implementations preserve their original
+behavior and structured schemas; no parallel planner, execution kernel,
+provider adapter, result contract, or phrase-specific parser was introduced.
+
+The current `tools/` package remains the provider integration boundary.
+Creating a second provider abstraction or an empty `operations/` hierarchy
+would add ambiguity without improving reliability, so provider-neutral
+operation extraction is deferred until a concrete operation can move with
+parity coverage. Likewise, adaptive retrieval and new read concurrency are
+deferred until their ordering, budget, source-attribution, and cancellation
+contracts can be proven independently.
+
+The large compatibility implementations in `planning/compatibility.py` and
+`entrypoints/cli_impl.py` are intentionally transitional. Later slices may
+extract cohesive planner services and CLI command families from them, one
+behavior-covered seam at a time. They must not be replaced wholesale.
+
+## First-tranche evidence
+
+The corrected isolated no-live gate completed with 4,599 tests passed, 15
+skipped, and two worktree-host checks deselected. Those two checks require
+worktree-local ignored dashboard/runtime paths and were run or assessed
+separately; neither exercises live model or provider behavior. Additional
+offline gates passed:
+
+- 7/7 graph scenarios;
+- 36/36 Slack expansion scenarios;
+- 12/12 advanced manager acceptance scenarios;
+- manager delegation and Slack entrypoint readiness;
+- zero OpenAI API requests in the acceptance gates.
+
+The post-tranche cold-process benchmark used the same Python version, machine,
+30 samples, three warmups, and credential-free environment as the tagged
+baseline. Results are recorded in
+`docs/architecture/post_reorganization_latency.json`.
+
+| Surface | Baseline median | Tranche median | Reduction |
+| --- | ---: | ---: | ---: |
+| `import keystone_agents.cli` | 1,427.809 ms | 20.868 ms | 98.54% |
+| `python -m keystone_agents.cli --help` | 1,425.694 ms | 24.650 ms | 98.27% |
+
+This improvement comes from deferring the heavyweight CLI implementation until
+a command actually needs it. It does not bypass planning, safety checks,
+provider verification, receipts, or result validation during execution.
+
+## Remaining acceptance boundary
+
+The frozen baseline checkout and tag remain unchanged. Architecture work stays
+on the sibling worktree and is not ready for publication solely because the
+offline tranche passes. Before publication:
+
+1. obtain independent read-only validation for every remaining slice;
+2. rerun the complete no-live gate on the exact proposed head;
+3. review the cumulative diff against the baseline for schema and safety
+   drift;
+4. publish only focused, reviewable commits or stacked pull requests;
+5. run live direct, Slack, provider, and LangGraph acceptance only as a
+   separately authorized, serial, cost-bounded step.

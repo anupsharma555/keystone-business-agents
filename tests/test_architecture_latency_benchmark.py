@@ -9,6 +9,8 @@ from types import ModuleType
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_ROOT / "scripts" / "benchmark_architecture_latency.py"
+BASELINE_REPORT_PATH = PROJECT_ROOT / "docs" / "architecture" / "pre_reorganization_latency.json"
+POST_REPORT_PATH = PROJECT_ROOT / "docs" / "architecture" / "post_reorganization_latency.json"
 
 
 def _load_benchmark_module() -> ModuleType:
@@ -54,3 +56,25 @@ def test_benchmark_runs_one_credential_free_import() -> None:
     assert report["iterations"] == 1
     assert report["metrics"][0]["name"] == "execution_request_import"
     assert report["metrics"][0]["median_ms"] > 0
+
+
+def test_recorded_cli_latency_exceeds_the_acceptance_target() -> None:
+    baseline = json.loads(BASELINE_REPORT_PATH.read_text(encoding="utf-8"))
+    post = json.loads(POST_REPORT_PATH.read_text(encoding="utf-8"))
+    baseline_metrics = {item["name"]: item for item in baseline["metrics"]}
+    post_metrics = {item["name"]: item for item in post["metrics"]}
+
+    assert post["schema_name"] == baseline["schema_name"]
+    assert post["baseline_ref"] == baseline["baseline_ref"]
+    assert post["offline"] is True
+    assert post["iterations"] == baseline["iterations"] == 30
+    assert post["warmups"] == baseline["warmups"] == 3
+    assert post["python_version"] == baseline["python_version"]
+
+    for name in ("cli_import", "cli_help"):
+        baseline_metric = baseline_metrics[name]
+        post_metric = post_metrics[name]
+        assert post_metric["iterations"] == 30
+        assert len(post_metric["samples_ms"]) == 30
+        assert post_metric["median_ms"] <= baseline_metric["median_ms"] * 0.60
+        assert post_metric["p95_ms"] <= baseline_metric["p95_ms"] * 0.60
