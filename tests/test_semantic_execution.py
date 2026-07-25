@@ -403,6 +403,8 @@ def test_downstream_modules_do_not_reimplement_plan_source_authority() -> None:
     allowed = {
         package / "manual_request.py",
         package / "semantic_execution.py",
+        package / "authority" / "semantic.py",
+        package / "planning" / "compatibility.py",
     }
     violations: list[str] = []
     for path in package.rglob("*.py"):

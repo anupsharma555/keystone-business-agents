@@ -581,7 +581,7 @@ def is_bounded_chief_response_only_request(text: str) -> bool:
     if not bounded_context:
         # Reuse the planner's shared supplied-context grammar so preposed and
         # postposed "only" forms receive the same compact cost/tool profile.
-        from keystone_agents.manual_request import (
+        from keystone_agents.planning.compatibility import (
             looks_like_supplied_context_synthesis_request,
         )
 

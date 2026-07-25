@@ -68,14 +68,6 @@ from keystone_agents.local_kni_evidence import (
     local_kni_live_instruction,
     looks_like_local_kni_evidence_lookup,
 )
-from keystone_agents.manual_request import (
-    infer_manual_request_plan,
-    live_search_allowed_for_execution,
-    looks_like_supplied_context_synthesis_request,
-    positive_capability_text,
-    request_forbids_live_research,
-    resolve_manual_request_owner,
-)
 from keystone_agents.memory import (
     MANAGER_LOOP_EFFICIENCY_METRIC_NAME,
     MANAGER_LOOP_EFFICIENCY_METRIC_VERSION,
@@ -95,6 +87,14 @@ from keystone_agents.operator_failures import redact_operator_text
 from keystone_agents.orchestrator.routing import (
     looks_like_send_side_effect,
     looks_like_thread_local_draft_request,
+)
+from keystone_agents.planning.compatibility import (
+    infer_manual_request_plan,
+    live_search_allowed_for_execution,
+    looks_like_supplied_context_synthesis_request,
+    positive_capability_text,
+    request_forbids_live_research,
+    resolve_manual_request_owner,
 )
 from keystone_agents.provider_side_effect_policy import (
     semantic_provider_side_effect_policy,

@@ -20,10 +20,6 @@ from keystone_agents.guardrails import (
     keystone_guardrails,
     keystone_tool_guardrail_kwargs,
 )
-from keystone_agents.manual_request import (
-    infer_manual_request_plan,
-    positive_capability_text,
-)
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.orchestrator.routing import (
     OPPORTUNITY_RE as _OPPORTUNITY_RE,
@@ -51,6 +47,10 @@ from keystone_agents.orchestrator.routing import (
 )
 from keystone_agents.orchestrator.routing import (
     payload_text as _payload_text,
+)
+from keystone_agents.planning.compatibility import (
+    infer_manual_request_plan,
+    positive_capability_text,
 )
 from keystone_agents.quality_budget import business_research_quality_budget
 from keystone_agents.retrieval_policy import derive_request_autonomy_hint

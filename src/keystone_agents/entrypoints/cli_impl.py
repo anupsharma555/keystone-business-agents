@@ -101,18 +101,6 @@ from keystone_agents.instruction_following import (
     resolve_instruction_following_response,
 )
 from keystone_agents.local_file_inputs import local_file_input_bundle_from_text
-from keystone_agents.manual_request import (
-    has_explicit_local_attachment_context,
-    has_materialized_slack_attachment_context,
-    infer_manual_request_plan,
-    is_internal_slack_composition_plan,
-    live_search_allowed_for_execution,
-    looks_like_stateful_work_request,
-    looks_like_supplied_context_synthesis_request,
-    positive_capability_text,
-    request_forbids_live_research,
-    resolve_manual_request_owner,
-)
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
 from keystone_agents.operator_failures import (
@@ -131,6 +119,18 @@ from keystone_agents.orchestrator.preflight_context import (
     specialist_execution_context_text,
 )
 from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
+from keystone_agents.planning.compatibility import (
+    has_explicit_local_attachment_context,
+    has_materialized_slack_attachment_context,
+    infer_manual_request_plan,
+    is_internal_slack_composition_plan,
+    live_search_allowed_for_execution,
+    looks_like_stateful_work_request,
+    looks_like_supplied_context_synthesis_request,
+    positive_capability_text,
+    request_forbids_live_research,
+    resolve_manual_request_owner,
+)
 from keystone_agents.presentation.public_result import attach_execution_public_result
 from keystone_agents.presentation.renderers import (
     render_markdown_table,

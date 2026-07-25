@@ -24,10 +24,10 @@ from keystone_agents.gmail_triage.draft_actions import (
 from keystone_agents.langgraph_workflow import (
     advance_work_item_manager_loop_with_optional_langgraph,
 )
-from keystone_agents.manual_request import live_search_allowed_for_execution
 from keystone_agents.models import OutreachComposerSDKInput
 from keystone_agents.natural_interaction import resolve_natural_followup
 from keystone_agents.orchestrator.preflight_context import compact_orchestrator_preflight_payload
+from keystone_agents.planning.compatibility import live_search_allowed_for_execution
 from keystone_agents.run import run_retrieved_sdk_synthesis
 from keystone_agents.schemas.approval import ApprovalQueueObjectType, ApprovalQueueStatus
 from keystone_agents.schemas.outreach import OutreachLLMDraftPayload

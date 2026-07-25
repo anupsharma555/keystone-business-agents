@@ -16,10 +16,6 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from keystone_agents.authority.semantic import ExecutionIntentAuthority
-from keystone_agents.manual_request import (
-    positive_capability_text,
-    request_forbids_response_composition,
-)
 from keystone_agents.orchestration.stages import (
     MANAGER_LOOP_STOP_STATUSES,
     PreparedWorkItemStep,
@@ -36,6 +32,10 @@ from keystone_agents.orchestration.stages import (
     prepare_work_item_step,
     run_prepared_work_item_specialist,
     synthesize_terminal_work_item_response,
+)
+from keystone_agents.planning.compatibility import (
+    positive_capability_text,
+    request_forbids_response_composition,
 )
 from keystone_agents.schemas.approval import ApprovalState
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
