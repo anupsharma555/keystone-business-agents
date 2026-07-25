@@ -68,7 +68,6 @@ from keystone_agents.execution_admission import (
     admit_provider_action,
 )
 from keystone_agents.execution_request import (
-    attach_execution_public_result,
     build_execution_request,
     continuation_owner_advice,
     execution_request_planning_text,
@@ -124,13 +123,14 @@ from keystone_agents.orchestrator.preflight_context import (
     specialist_execution_context_text,
 )
 from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
-from keystone_agents.quality_budget import is_bounded_chief_response_only_request
-from keystone_agents.receipts.mutations import receipt_reports_possible_write
-from keystone_agents.reporting import (
+from keystone_agents.presentation.public_result import attach_execution_public_result
+from keystone_agents.presentation.renderers import (
     render_markdown_table,
     render_work_item_result_text,
     sensitive_text_summary,
 )
+from keystone_agents.quality_budget import is_bounded_chief_response_only_request
+from keystone_agents.receipts.mutations import receipt_reports_possible_write
 from keystone_agents.run import (
     extract_sdk_usage,
     run_typed_sdk_agent,

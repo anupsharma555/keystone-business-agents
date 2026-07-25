@@ -52,7 +52,7 @@ from keystone_agents.models import (
     OpportunityScoutSDKInput,
     OutreachComposerSDKInput,
 )
-from keystone_agents.reporting import render_pipeline_report
+from keystone_agents.presentation.renderers import render_pipeline_report
 from keystone_agents.run import run_retrieved_sdk_synthesis
 from keystone_agents.schemas.approval import (
     ApprovalCheckpoint,

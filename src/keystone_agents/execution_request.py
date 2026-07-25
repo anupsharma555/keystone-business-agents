@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from keystone_agents.agent_mentions import parse_agent_mention
+from keystone_agents.presentation.consistency import reconcile_failed_review
 from keystone_agents.receipts.mutations import receipt_reports_possible_write
 from keystone_agents.schemas.execution_request import (
     ExecutionContinuation,
@@ -23,7 +24,6 @@ from keystone_agents.semantic_execution import (
     StageOutputContract,
     reconcile_stage_output,
 )
-from keystone_agents.terminal_result_consistency import reconcile_failed_review
 
 _SLACK_CONTINUATION_MARKER = "continue this prior slack thread"
 _SLACK_FOLLOWUP_BOUNDARY_RE = re.compile(
