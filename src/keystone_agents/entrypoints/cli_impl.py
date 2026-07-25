@@ -119,6 +119,11 @@ from keystone_agents.operator_failures import (
     operator_failure_from_mapping,
     redact_operator_text,
 )
+from keystone_agents.orchestration.stages import (
+    advance_work_item_manager_loop,
+    chief_workflow_requests_marked_airtable_test_lifecycle,
+    inline_gmail_fixture_from_request,
+)
 from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
     orchestrator_preflight_env,
@@ -230,11 +235,6 @@ from keystone_agents.work_items import (
     record_event,
     select_artifact,
     set_next_action,
-)
-from keystone_agents.workflow_runner import (
-    _chief_workflow_requests_marked_airtable_test_lifecycle,
-    _inline_gmail_fixture_from_request,
-    advance_work_item_manager_loop,
 )
 from keystone_agents.workflows import (
     pipeline_markdown_report,
@@ -7703,7 +7703,7 @@ def _direct_context_agent_write_admitted(
             return False
         if manual_plan.intent == "business_system_write":
             return True
-    return _chief_workflow_requests_marked_airtable_test_lifecycle(input_text)
+    return chief_workflow_requests_marked_airtable_test_lifecycle(input_text)
 
 
 def _direct_airtable_allowed_operation(
@@ -7715,7 +7715,7 @@ def _direct_airtable_allowed_operation(
 
     if manual_plan is None or manual_plan.intent != "business_system_write":
         return ""
-    if _chief_workflow_requests_marked_airtable_test_lifecycle(input_text):
+    if chief_workflow_requests_marked_airtable_test_lifecycle(input_text):
         return ""
     receipt_target = resolve_finance_expense_receipt_target(
         input_text,
@@ -9579,7 +9579,7 @@ def _run_ask_gmail_triage_live(
                 }
             )
     explicit_fixture_path = _gmail_direct_fixture_path(input_text)
-    inline_fixture = _inline_gmail_fixture_from_request(input_text)
+    inline_fixture = inline_gmail_fixture_from_request(input_text)
     if gmail_plan.operation == "clarification":
         return _print_ask_clarification(
             "gmail_triage",
