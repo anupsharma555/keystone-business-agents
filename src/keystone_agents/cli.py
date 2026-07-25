@@ -44,7 +44,7 @@ from keystone_agents.calendar_actions import (
     infer_calendar_action_plan,
     is_calendar_action_candidate,
 )
-from keystone_agents.capability_profile import (
+from keystone_agents.capabilities.profile import (
     compile_child_result_promotion_receipt,
 )
 from keystone_agents.child_process import run_isolated_child_process

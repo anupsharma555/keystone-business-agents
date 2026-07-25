@@ -7,7 +7,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.utils import parseaddr
 from pathlib import Path
 from time import perf_counter
@@ -113,6 +113,7 @@ from keystone_agents.response_synthesis import (
     synthesize_user_facing_work_item_response_sdk_result,
 )
 from keystone_agents.run import run_retrieved_sdk_synthesis
+from keystone_agents.runtime.request import RequestRuntime
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.chief_context import ChiefContextEvidenceBundle
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffSourceRef
@@ -286,6 +287,7 @@ class PreparedWorkItemStep:
     route: WorkItemRoute
     input_text: str
     context_pack: dict[str, Any]
+    runtime: RequestRuntime | None = field(default=None, repr=False, compare=False)
 _KEYSTONE_APPLICABILITY_RE = re.compile(
     r"\b(?:small\s+business|for[- ]profit|commercial|company|companies|startup|vendor|"
     r"contractor|subcontract(?:or|ing)?|partner(?:ship|s)?|collaborat(?:or|ion|e)|"
@@ -915,22 +917,35 @@ def _work_item_has_slack_context(work_item: WorkItem) -> bool:
 def advance_work_item(request: WorkflowRunRequest) -> WorkflowRunResult:
     """Advance a WorkItem by one deterministic, side-effect-safe step."""
 
+    runtime = RequestRuntime.from_workflow_request(request)
     request = _normalize_workflow_request_for_context(request)
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
-    state_followup = _maybe_answer_manager_loop_state_followup(request, store=store)
+    runtime = runtime.with_request(request)
+    state_followup = _maybe_answer_manager_loop_state_followup(
+        request,
+        store=runtime.store,
+    )
     if state_followup is not None:
-        return _attach_execution_provenance(state_followup, request=request, store=store)
-    return _advance_work_item_one_step(request, synthesize_user_response=True)
+        return _attach_execution_provenance(
+            state_followup,
+            request=request,
+            store=runtime.store,
+        )
+    return _advance_work_item_one_step(
+        request,
+        synthesize_user_response=True,
+        runtime=runtime,
+    )
 
 
 def _advance_work_item_one_step(
     request: WorkflowRunRequest,
     *,
     synthesize_user_response: bool,
+    runtime: RequestRuntime | None = None,
 ) -> WorkflowRunResult:
     """Advance one WorkItem step, optionally deferring final response synthesis."""
 
-    prepared = prepare_work_item_step(request)
+    prepared = prepare_work_item_step(request, runtime=runtime)
     result = run_prepared_work_item_specialist(prepared)
     return finalize_prepared_work_item_step(
         prepared,
@@ -954,14 +969,21 @@ def answer_work_item_state_followup(request: WorkflowRunRequest) -> WorkflowRunR
     return _maybe_answer_manager_loop_state_followup(request, store=store)
 
 
-def prepare_work_item_step(request: WorkflowRunRequest) -> PreparedWorkItemStep:
+def prepare_work_item_step(
+    request: WorkflowRunRequest,
+    *,
+    runtime: RequestRuntime | None = None,
+) -> PreparedWorkItemStep:
     """Prepare WorkItem state, context, and audit records for one specialist step."""
 
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    runtime = runtime or RequestRuntime.from_workflow_request(request)
+    runtime = runtime.with_request(request)
+    store = runtime.store
     cost_directive = parse_cost_tracking_directive(request.request_text)
     cost_tracking_requested = bool(request.cost_tracking_requested or cost_directive.requested)
     input_text = (cost_directive.cleaned_text or request.request_text).strip()
     request = request.model_copy(update={"request_text": input_text})
+    runtime = runtime.with_request(request)
     request = _attach_inferred_manual_request_plan(request, input_text)
     route = _select_route(request, input_text, store)
     work_item = create_or_load_work_item(
@@ -1062,6 +1084,7 @@ def prepare_work_item_step(request: WorkflowRunRequest) -> PreparedWorkItemStep:
         route=route,
         input_text=input_text,
         context_pack=context_pack.model_dump(mode="json"),
+        runtime=runtime,
     )
 
 
@@ -1071,9 +1094,18 @@ def run_prepared_work_item_specialist(prepared: PreparedWorkItemStep) -> Workflo
     request = prepared.request
     work_item = prepared.work_item
     route = prepared.route
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    runtime = prepared.runtime or RequestRuntime.from_workflow_request(request)
+    runtime = runtime.with_request(request)
+    store = runtime.store
     sdk_session_spec = _sdk_session_spec_for_work_item(request, work_item)
-    sdk_session = build_sdk_session(sdk_session_spec) if request.live_sdk else None
+    sdk_session = (
+        runtime.service(
+            f"sdk_session:{sdk_session_spec.session_id}:{sdk_session_spec.database_path}",
+            lambda: build_sdk_session(sdk_session_spec),
+        )
+        if request.live_sdk
+        else None
+    )
 
     source_bundle_mismatch = next(
         (
@@ -1164,9 +1196,18 @@ def finalize_prepared_work_item_step(
     """Attach final context, synthesize user response, and persist one graph step."""
 
     request = prepared.request
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    runtime = prepared.runtime or RequestRuntime.from_workflow_request(request)
+    runtime = runtime.with_request(request)
+    store = runtime.store
     sdk_session_spec = _sdk_session_spec_for_work_item(request, result.work_item)
-    sdk_session = build_sdk_session(sdk_session_spec) if request.live_sdk else None
+    sdk_session = (
+        runtime.service(
+            f"sdk_session:{sdk_session_spec.session_id}:{sdk_session_spec.database_path}",
+            lambda: build_sdk_session(sdk_session_spec),
+        )
+        if request.live_sdk
+        else None
+    )
     final_context_pack = (
         None
         if (
@@ -1525,7 +1566,8 @@ def advance_work_item_manager_loop(
 
     step_limit = max(1, min(5, int(max_steps or DEFAULT_MANAGER_LOOP_MAX_STEPS)))
     started_at = perf_counter()
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    runtime = RequestRuntime.from_workflow_request(request)
+    store = runtime.store
     cost_directive = parse_cost_tracking_directive(request.request_text)
     if cost_directive.requested and not request.cost_tracking_requested:
         request = request.model_copy(
@@ -1535,6 +1577,7 @@ def advance_work_item_manager_loop(
             }
         )
     request = _normalize_workflow_request_for_context(request, store=store)
+    runtime = runtime.with_request(request)
     state_followup = _maybe_answer_manager_loop_state_followup(request, store=store)
     if state_followup is not None:
         return state_followup
@@ -1544,7 +1587,11 @@ def advance_work_item_manager_loop(
     repair_attempts_by_route: dict[str, int] = {}
 
     for step_index in range(1, step_limit + 1):
-        result = _advance_work_item_one_step(current_request, synthesize_user_response=False)
+        result = _advance_work_item_one_step(
+            current_request,
+            synthesize_user_response=False,
+            runtime=runtime,
+        )
         result = _review_manager_loop_step(
             result,
             original_request=request,
@@ -1570,6 +1617,7 @@ def advance_work_item_manager_loop(
                     step_index=step_index,
                     store=store,
                     feedback_callback=feedback_callback,
+                    runtime=runtime,
                 )
             except Exception as exc:
                 result = _manager_loop_repair_failed_result(
@@ -1622,9 +1670,20 @@ def advance_work_item_manager_loop(
         )
 
     if final_result is None:
-        final_result = _advance_work_item_one_step(request, synthesize_user_response=False)
+        final_result = _advance_work_item_one_step(
+            request,
+            synthesize_user_response=False,
+            runtime=runtime,
+        )
+    final_session_spec = _sdk_session_spec_for_work_item(
+        request,
+        final_result.work_item,
+    )
     final_sdk_session = (
-        build_sdk_session(_sdk_session_spec_for_work_item(request, final_result.work_item))
+        runtime.service(
+            f"sdk_session:{final_session_spec.session_id}:{final_session_spec.database_path}",
+            lambda: build_sdk_session(final_session_spec),
+        )
         if request.live_sdk
         else None
     )
@@ -3175,6 +3234,7 @@ def _attempt_manager_loop_repair(
     step_index: int,
     store: SQLiteStore | None,
     feedback_callback: Callable[[str, dict[str, Any]], None] | None,
+    runtime: RequestRuntime | None = None,
 ) -> WorkflowRunResult:
     review_context = _manager_loop_latest_review(result.work_item)
     repair_payload = {
@@ -3217,7 +3277,11 @@ def _attempt_manager_loop_repair(
             ),
         }
     )
-    repaired = _advance_work_item_one_step(repair_request, synthesize_user_response=False)
+    repaired = _advance_work_item_one_step(
+        repair_request,
+        synthesize_user_response=False,
+        runtime=runtime,
+    )
     repaired = _review_manager_loop_step(
         repaired,
         original_request=original_request,
