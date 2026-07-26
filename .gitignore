@@ -19,7 +19,10 @@ authorized_user*.json
 .cache/
 artifacts/
 output/
-images/
+images/*
+!images/diagram.svg
+!images/emerge/
+!images/emerge/**
 LINEAR_BACKLOG.MD
 kni-slack-dashboard-*.png
 __pycache__/
