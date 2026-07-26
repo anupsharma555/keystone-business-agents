@@ -328,6 +328,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional selected-context JSON file to attach to a WorkItem run.",
     )
+    ask.add_argument(
+        "--linked-work-item-id",
+        default="",
+        help=argparse.SUPPRESS,
+    )
     ask.add_argument("--live-search", action="store_true", help="Use live search in WorkItem mode.")
     ask.add_argument(
         "--live-rss-slack-read",
@@ -1113,6 +1118,11 @@ def _run_live_ask_with_environment(args: argparse.Namespace) -> int:
 def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     raw_input = _ask_input(args)
     slack_context_input = _context_file_is_slack_context(args.context_file)
+    linked_work_item = _validated_slack_linked_work_item(
+        work_item_id=str(getattr(args, "linked_work_item_id", "") or "").strip(),
+        database_url=args.database_url,
+        context_file_path=args.context_file,
+    )
     execution_request = build_execution_request(
         raw_input,
         requested_agent=args.agent,
@@ -1256,6 +1266,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         context_file_path=args.context_file,
         request_text=input_text,
         database_url=args.database_url,
+        work_item=linked_work_item,
     )
     if slack_continuation:
         direct_workflow_state = _merge_direct_workflow_state(
@@ -1481,6 +1492,30 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 "route": "clarification",
                 "block_kind": "clarification_required",
             },
+        )
+    if _manual_plan_reuses_linked_work_item(
+        manual_plan,
+        work_item=linked_work_item,
+    ):
+        return _run_ask_work_item(
+            semantic_input_text,
+            database_url=args.database_url,
+            live_search=live_search,
+            live_sdk=live_sdk,
+            live_rss_slack_read=args.live_rss_slack_read,
+            max_results=args.max_results,
+            max_manager_steps=args.max_manager_steps,
+            json_output=args.json,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            context_file_path=args.context_file,
+            sdk_session_enabled=args.sdk_session,
+            sdk_session_id=args.sdk_session_id,
+            sdk_session_db_path=args.sdk_session_db,
+            sdk_session_history_limit=args.sdk_session_history_limit,
+            cost_tracking_requested=cost_directive.requested,
+            requested_route=str(manual_plan.target_agent or "").strip() or None,
+            explicit_work_item_id=linked_work_item.id,
         )
     if live_sdk:
         lifecycle_route = interpreted_lifecycle_route
@@ -4363,6 +4398,74 @@ def _slack_context_payload(context_file_path: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _validated_slack_linked_work_item(
+    *,
+    work_item_id: str,
+    database_url: str | None,
+    context_file_path: str,
+) -> WorkItem | None:
+    """Load an adapter-linked WorkItem only for its authenticated Slack thread."""
+
+    if not work_item_id:
+        return None
+    if not _context_file_is_slack_context(context_file_path):
+        raise SystemExit("A linked WorkItem requires authenticated Slack context.")
+    payload = _slack_context_payload(context_file_path)
+    channel_id = str(payload.get("channel_id") or "").strip()
+    thread_ts = str(payload.get("thread_ts") or "").strip()
+    if not channel_id or not thread_ts:
+        raise SystemExit("Linked WorkItem Slack context is missing channel or thread identity.")
+
+    store = SQLiteStore(database_url or database_url_from_env())
+    work_item = store.get_work_item(work_item_id)
+    if work_item is None:
+        raise SystemExit(f"Linked WorkItem not found: {work_item_id}")
+    metadata = work_item.target.metadata if isinstance(work_item.target.metadata, dict) else {}
+    stored_context = metadata.get("slack_context")
+    if not isinstance(stored_context, dict):
+        raise SystemExit("Linked WorkItem has no stored Slack thread binding.")
+    stored_channel_id = str(stored_context.get("channel_id") or "").strip()
+    stored_thread_ts = str(stored_context.get("thread_ts") or "").strip()
+    if channel_id != stored_channel_id or thread_ts != stored_thread_ts:
+        raise SystemExit("Linked WorkItem does not match the authenticated Slack thread.")
+    return work_item
+
+
+def _manual_plan_reuses_linked_work_item(
+    manual_plan: ManualRequestPlan,
+    *,
+    work_item: WorkItem | None,
+) -> bool:
+    """Reuse linked state only for a safe revision of one selected artifact."""
+
+    if work_item is None:
+        return False
+    if work_item.status in {
+        WorkItemStatus.BLOCKED,
+        WorkItemStatus.ARCHIVED,
+        WorkItemStatus.NEEDS_CONTEXT,
+    }:
+        return False
+    if manual_plan.ask_shape.prior_context_dependency != "selected_context":
+        return False
+    if (
+        manual_plan.intent == "business_system_write"
+        or manual_plan.provider_operations
+        or manual_plan.side_effect_policy not in {"read_only", "draft_or_read_only"}
+    ):
+        return False
+    expected_type = str(manual_plan.expected_artifact_type or "").strip()
+    target_agent = str(manual_plan.target_agent or "").strip()
+    if not expected_type or not target_agent:
+        return False
+    return any(
+        artifact.selected
+        and artifact.artifact_type == expected_type
+        and artifact.source_agent == target_agent
+        for artifact in work_item.artifact_refs
+    )
+
+
 def _eval_context_fields(context_file_path: str) -> dict[str, str]:
     """Infer eval identifiers from a Slack context file for natural follow-ups."""
 
@@ -4513,6 +4616,7 @@ def _run_ask_work_item(
     sdk_session_history_limit: int | None = None,
     cost_tracking_requested: bool = False,
     requested_route: str | None = None,
+    explicit_work_item_id: str | None = None,
 ) -> int:
     try:
         live_search = live_search_allowed_for_execution(
@@ -4524,7 +4628,7 @@ def _run_ask_work_item(
         work_item_id = _resolve_continue_work_item_id(
             store,
             input_text=input_text,
-            explicit_work_item_id=None,
+            explicit_work_item_id=explicit_work_item_id,
             json_output=json_output,
         )
         existing_work_item = store.get_work_item(work_item_id) if work_item_id else None
@@ -12040,9 +12144,10 @@ def _print_work_item_result(
     result, user_facing_result_verified = _ensure_work_item_user_facing_summary(result)
     if json_output:
         payload = result.model_dump(mode="json")
+        result_status = str(getattr(result.status, "value", result.status))
         completion_confirmed = bool(
             user_facing_result_verified
-            and str(getattr(result.status, "value", result.status)) == "done"
+            and result_status == "done"
             and not result.blockers
         )
         payload["user_facing_result_verified"] = user_facing_result_verified
@@ -12050,7 +12155,11 @@ def _print_work_item_result(
         payload["slack_display_title"] = (
             "Business Agents Result Ready"
             if completion_confirmed
-            else "Business Agents Completion Not Confirmed"
+            else (
+                "Business Agents Awaiting Approval"
+                if result_status == "needs_approval"
+                else "Business Agents Completion Not Confirmed"
+            )
         )
         payload["slack_display_text"] = result.human_summary
         payload["display_text"] = result.human_summary

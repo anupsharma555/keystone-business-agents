@@ -22,6 +22,10 @@ RECOVERY_SAFE_RECEIPT_KEYS = {
     "draft_id",
     "document_id",
     "file_id",
+    "folder_id",
+    "spreadsheet_id",
+    "item_key",
+    "collection_key",
     "message_id",
     "thread_id",
     "html_link",
@@ -46,6 +50,10 @@ JOURNAL_SAFE_RECEIPT_KEYS = {
     "draft_id",
     "document_id",
     "file_id",
+    "folder_id",
+    "spreadsheet_id",
+    "item_key",
+    "collection_key",
     "message_id",
     "thread_id",
     "match_count",
@@ -74,8 +82,27 @@ OBJECT_ID_KEYS = (
     "draft_id",
     "document_id",
     "file_id",
+    "folder_id",
+    "spreadsheet_id",
+    "item_key",
+    "collection_key",
     "message_id",
     "thread_id",
+)
+RECOVERY_IDENTITY_KEYS_BY_TOOL_OPERATION = {
+    ("zotero_write_test_item", "create"): ("item_key",),
+    ("zotero_write_test_item", "update"): ("item_key",),
+    ("zotero_delete_test_item", "delete_test_item"): ("item_key",),
+    ("zotero_write_test_collection", "create"): ("collection_key",),
+    ("zotero_write_test_collection", "update"): ("collection_key",),
+    ("zotero_delete_test_collection", "delete_test_collection"): (
+        "collection_key",
+    ),
+    ("google_sheet_create", "create_sheet"): ("spreadsheet_id",),
+    ("google_drive_create_folder", "create_folder"): ("folder_id",),
+}
+RECOVERY_IDENTITY_GUARDED_TOOLS = frozenset(
+    tool_name for tool_name, _operation in RECOVERY_IDENTITY_KEYS_BY_TOOL_OPERATION
 )
 
 
@@ -157,10 +184,14 @@ def normalize_provider_mutation_receipt(
     provider = str(
         payload.get("provider") or payload.get("provider_system") or ""
     ).strip()
+    identity_keys = RECOVERY_IDENTITY_KEYS_BY_TOOL_OPERATION.get(
+        (tool_name, operation),
+        () if tool_name in RECOVERY_IDENTITY_GUARDED_TOOLS else OBJECT_ID_KEYS,
+    )
     object_id = next(
         (
             str(payload.get(key) or "").strip()
-            for key in OBJECT_ID_KEYS
+            for key in identity_keys
             if payload.get(key)
         ),
         "",
@@ -190,6 +221,8 @@ def normalize_provider_mutation_receipt(
 __all__ = [
     "JOURNAL_SAFE_RECEIPT_KEYS",
     "OBJECT_ID_KEYS",
+    "RECOVERY_IDENTITY_GUARDED_TOOLS",
+    "RECOVERY_IDENTITY_KEYS_BY_TOOL_OPERATION",
     "RECOVERY_SAFE_RECEIPT_KEYS",
     "bounded_value",
     "normalize_provider_mutation_receipt",

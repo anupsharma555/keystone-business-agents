@@ -825,7 +825,8 @@ def test_explicit_provider_draft_action_remains_unconfirmed_pending_approval(
     assert payload["status"] == "needs_approval"
     assert payload["completion_confirmed"] is False
     assert payload["public_result"]["status"] == "blocked"
-    assert payload["slack_display_title"] == "Business Agents Completion Not Confirmed"
+    assert payload["public_result"]["title"] == "Business Agents Awaiting Approval"
+    assert payload["slack_display_title"] == "Business Agents Awaiting Approval"
 
 
 def test_cli_init_db_uses_explicit_database_url(tmp_path: Path, capsys) -> None:
@@ -5840,6 +5841,211 @@ def test_slack_context_file_does_not_replace_current_workitem_identity(
     assert state["slack_context"]["channel_id"] == "C123"
     assert state["recent_slack_thread"][0]["summary"] == "Revise the same draft."
     assert state["current_work_item"]["target"]["external_id"] == "draftExact123"
+
+
+def test_linked_work_item_requires_exact_authenticated_slack_thread(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'linked-work-item.db'}"
+    context_path = tmp_path / "slack-history-context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1770000000.000100",
+                "read_context": "Bounded thread history.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    work_item = WorkItem(
+        id="wi_linked_outreach",
+        kind=WorkItemKind.OUTREACH,
+        title="Revise the selected outreach draft",
+        current_route=WorkItemRoute.OUTREACH_COMPOSER,
+        status=WorkItemStatus.DONE,
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            object_type="company",
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1770000000.000100",
+                }
+            },
+        ),
+    )
+    SQLiteStore(database_url).save_work_item(work_item)
+
+    resolved = cli._validated_slack_linked_work_item(
+        work_item_id=work_item.id,
+        database_url=database_url,
+        context_file_path=str(context_path),
+    )
+    assert resolved is not None
+    assert resolved.id == work_item.id
+
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1770000000.999999",
+                "read_context": "Wrong thread.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="does not match"):
+        cli._validated_slack_linked_work_item(
+            work_item_id=work_item.id,
+            database_url=database_url,
+            context_file_path=str(context_path),
+        )
+
+
+def test_selected_context_plan_reuses_only_matching_safe_linked_artifact() -> None:
+    work_item = WorkItem(
+        id="wi_linked_outreach",
+        kind=WorkItemKind.OUTREACH,
+        title="Revise the selected outreach draft",
+        current_route=WorkItemRoute.OUTREACH_COMPOSER,
+        status=WorkItemStatus.DONE,
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="outreach_draft",
+                artifact_id="58",
+                source_agent=WorkItemRoute.OUTREACH_COMPOSER.value,
+                selected=True,
+            )
+        ],
+    )
+    revision_plan = ManualRequestPlan(
+        source="llm",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(prior_context_dependency="selected_context"),
+    )
+    unrelated_plan = revision_plan.model_copy(
+        update={
+            "target_agent": "business_research_analyst",
+            "expected_artifact_type": "company_profile",
+        }
+    )
+    write_plan = revision_plan.model_copy(update={"intent": "business_system_write"})
+
+    assert cli._manual_plan_reuses_linked_work_item(
+        revision_plan,
+        work_item=work_item,
+    )
+    assert not cli._manual_plan_reuses_linked_work_item(
+        unrelated_plan,
+        work_item=work_item,
+    )
+    assert not cli._manual_plan_reuses_linked_work_item(
+        write_plan,
+        work_item=work_item,
+    )
+
+
+def test_cli_selected_context_revision_dispatches_exact_linked_work_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'linked-revision.db'}"
+    context_path = tmp_path / "slack-history-context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1770000000.000100",
+                "request_ts": "1770000000.000300",
+                "read_context": "The thread contains a selected draft for revision.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    work_item = WorkItem(
+        id="wi_linked_revision",
+        kind=WorkItemKind.OUTREACH,
+        title="Revise the selected outreach draft",
+        current_route=WorkItemRoute.OUTREACH_COMPOSER,
+        status=WorkItemStatus.DONE,
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            object_type="company",
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1770000000.000100",
+                }
+            },
+        ),
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="outreach_draft",
+                artifact_id="58",
+                source_agent=WorkItemRoute.OUTREACH_COMPOSER.value,
+                selected=True,
+            )
+        ],
+    )
+    SQLiteStore(database_url).save_work_item(work_item)
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(prior_context_dependency="selected_context"),
+    )
+    route_result = cli.route_request(
+        "Shorten the same draft to at most 65 words.",
+        manual_plan=plan,
+    )
+    preflight = cli.OrchestratorPreflight(
+        request_text="Shorten the same draft to at most 65 words.",
+        requested_agent=None,
+        advisory_only=False,
+        selected_agent="outreach_composer",
+        blocked_by_orchestrator=False,
+        execution_allowed=True,
+        block_kind="",
+        block_reason="",
+        manual_request_plan=plan,
+        route_result=route_result,
+    )
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", lambda *_args, **_kwargs: preflight)
+    captured: dict[str, object] = {}
+
+    def fake_run_work_item(input_text: str, **kwargs) -> int:
+        captured["input_text"] = input_text
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_run_work_item)
+    args = cli.build_parser().parse_args(
+        [
+            "ask",
+            "--database-url",
+            database_url,
+            "--context-file",
+            str(context_path),
+            "--linked-work-item-id",
+            work_item.id,
+            "--no-live-sdk",
+            "Shorten the same draft to at most 65 words.",
+        ]
+    )
+
+    assert cli._run_ask_with_current_environment(args) == 0
+    assert captured["input_text"] == "Shorten the same draft to at most 65 words."
+    assert captured["explicit_work_item_id"] == work_item.id
+    assert captured["requested_route"] == "outreach_composer"
 
 
 def test_slack_history_context_preserves_root_and_speaker_roles_for_direct_and_graph_paths(

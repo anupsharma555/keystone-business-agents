@@ -13,6 +13,7 @@ from keystone_agents.provider_recovery import (
     ProviderRecoveryError,
     ProviderRecoveryStore,
 )
+from keystone_agents.receipts.normalization import normalize_tool_output_receipt
 from keystone_agents.run import run_typed_sdk_agent
 
 
@@ -122,6 +123,155 @@ def test_checkpoint_checksum_and_idempotency_key_are_verified(tmp_path: Path) ->
 
     with pytest.raises(ProviderRecoveryError, match="checksum mismatch"):
         ProviderRecoveryStore(checkpoint, idempotency_key="fixture-checksum")
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "operation", "identity_key", "identity_value", "receipt"),
+    [
+        (
+            "zotero_write_test_item",
+            "create",
+            "item_key",
+            "ITEMKBA1",
+            {
+                "status": "success",
+                "operation": "create",
+                "item_key": "ITEMKBA1",
+                "collection_key": "COLLKBA1",
+                "title": "KBA_TEST_ITEM fixture",
+                "approval_reference": "approval:item",
+                "verification": {"passed": True, "status": "verified"},
+            },
+        ),
+        (
+            "zotero_write_test_collection",
+            "create",
+            "collection_key",
+            "COLLKBA1",
+            {
+                "status": "success",
+                "operation": "create",
+                "collection_key": "COLLKBA1",
+                "name": "KBA_TEST_COLLECTION fixture",
+                "approval_reference": "approval:collection",
+                "verification": {"passed": True, "status": "verified"},
+            },
+        ),
+        (
+            "google_sheet_create",
+            "create_sheet",
+            "spreadsheet_id",
+            "sheetKBA1",
+            {
+                "status": "success",
+                "operation": "create_sheet",
+                "spreadsheet_id": "sheetKBA1",
+                "title": "KBA_TEST_SHEET fixture",
+                "approval_reference": "approval:sheet",
+                "verification": {"passed": True, "status": "verified"},
+            },
+        ),
+        (
+            "google_drive_create_folder",
+            "create_folder",
+            "folder_id",
+            "folderKBA1",
+            {
+                "status": "success",
+                "folder_id": "folderKBA1",
+                "approval_reference": "approval:folder",
+                "verification": {"passed": True, "status": "verified"},
+            },
+        ),
+    ],
+)
+def test_provider_neutral_identity_receipts_checkpoint_reload_and_reuse(
+    tmp_path: Path,
+    tool_name: str,
+    operation: str,
+    identity_key: str,
+    identity_value: str,
+    receipt: dict[str, Any],
+) -> None:
+    checkpoint = tmp_path / f"{identity_key}.json"
+    store = ProviderRecoveryStore(
+        checkpoint,
+        idempotency_key=f"fixture-{identity_key}",
+    )
+
+    stored = store.reuse_or_execute_mutation(
+        tool_name=tool_name,
+        operation=operation,
+        execute=lambda: receipt,
+    )
+    resumed = ProviderRecoveryStore(
+        checkpoint,
+        idempotency_key=f"fixture-{identity_key}",
+    )
+    execute_calls = 0
+
+    def repeat_mutation() -> dict[str, Any]:
+        nonlocal execute_calls
+        execute_calls += 1
+        return receipt
+
+    reused = resumed.reuse_or_execute_mutation(
+        tool_name=tool_name,
+        operation=operation,
+        execute=repeat_mutation,
+    )
+    journal_receipt = normalize_tool_output_receipt(tool_name, receipt)
+
+    assert stored[identity_key] == identity_value
+    assert journal_receipt is not None
+    assert journal_receipt[identity_key] == identity_value
+    assert resumed.state.receipts[0].object_id == identity_value
+    assert resumed.state.receipts[0].payload[identity_key] == identity_value
+    assert reused[identity_key] == identity_value
+    assert execute_calls == 0
+    assert resumed.state.retry_reused is True
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "operation", "wrong_identity"),
+    [
+        (
+            "zotero_write_test_item",
+            "create",
+            {"collection_key": "COLLKBA1"},
+        ),
+        (
+            "google_sheet_create",
+            "create_sheet",
+            {"folder_id": "folderKBA1"},
+        ),
+    ],
+)
+def test_provider_recovery_rejects_identity_from_another_object_family(
+    tmp_path: Path,
+    tool_name: str,
+    operation: str,
+    wrong_identity: dict[str, str],
+) -> None:
+    store = ProviderRecoveryStore(
+        tmp_path / "mismatched-identity.json",
+        idempotency_key=f"fixture-{tool_name}",
+    )
+
+    with pytest.raises(ProviderRecoveryError, match="identity-bearing"):
+        store.reuse_or_execute_mutation(
+            tool_name=tool_name,
+            operation=operation,
+            execute=lambda: {
+                "status": "success",
+                "operation": operation,
+                **wrong_identity,
+                "approval_reference": "approval:mismatch",
+                "verification": {"passed": True},
+            },
+        )
+
+    assert store.path.exists() is False
 
 
 def test_sdk_retry_loads_checkpoint_and_disables_only_completed_mutation(

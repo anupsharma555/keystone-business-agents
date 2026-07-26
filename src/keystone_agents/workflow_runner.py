@@ -9423,6 +9423,7 @@ def _apply_slack_selected_context(
     *,
     context_file_path: str,
 ) -> WorkItem:
+    _assert_slack_context_matches_work_item_binding(work_item, context)
     selected = (
         context.get("selected_message") if isinstance(context.get("selected_message"), dict) else {}
     )
@@ -9630,6 +9631,7 @@ def _apply_slack_history_context(
     *,
     context_file_path: str,
 ) -> WorkItem:
+    _assert_slack_context_matches_work_item_binding(work_item, context)
     read_context = _compact_context_text(context.get("read_context"), max_chars=4000)
     channel_id = _compact_context_text(context.get("channel_id"), max_chars=80)
     thread_ts = _compact_context_text(context.get("thread_ts"), max_chars=80)
@@ -9674,7 +9676,7 @@ def _apply_slack_history_context(
         "thread_ts": thread_ts,
         "request_ts": request_ts,
         "thread_fetch_status": _compact_context_text(
-            context.get("thread_fetch_status") or ("ok" if read_context else "missing"),
+            context.get("thread_fetch_status") or ("ok" if read_context else "not_requested"),
             max_chars=40,
         ),
         "read_context": read_context,
@@ -9736,6 +9738,52 @@ def _apply_slack_history_context(
             "audit_notes": audit_notes,
         }
     ).touch()
+
+
+def _assert_slack_context_matches_work_item_binding(
+    work_item: WorkItem,
+    context: dict[str, Any],
+) -> None:
+    metadata = work_item.target.metadata
+    stored = metadata.get("slack_context")
+    if not isinstance(stored, dict):
+        return
+    stored_channel_id = _compact_context_text(stored.get("channel_id"), max_chars=80)
+    stored_thread_ts = _compact_context_text(
+        stored.get("thread_ts") or stored.get("selected_message_ts"),
+        max_chars=80,
+    )
+    incoming_channel_id = _compact_context_text(context.get("channel_id"), max_chars=80)
+    incoming_thread_ts = _compact_context_text(
+        context.get("thread_ts")
+        or context.get("selected_message_ts")
+        or context.get("request_ts"),
+        max_chars=80,
+    )
+    stored_binding_present = bool(stored_channel_id or stored_thread_ts)
+    if stored_binding_present and (
+        not stored_channel_id
+        or not stored_thread_ts
+        or not incoming_channel_id
+        or not incoming_thread_ts
+    ):
+        raise ValueError(
+            "Slack context does not match the stored WorkItem thread binding."
+        )
+    channel_conflict = (
+        stored_channel_id
+        and incoming_channel_id
+        and stored_channel_id != incoming_channel_id
+    )
+    thread_conflict = (
+        stored_thread_ts
+        and incoming_thread_ts
+        and stored_thread_ts != incoming_thread_ts
+    )
+    if channel_conflict or thread_conflict:
+        raise ValueError(
+            "Slack context does not match the stored WorkItem thread binding."
+        )
 
 
 def _external_context_event_payload(
@@ -19484,7 +19532,11 @@ def _advance_outreach(
 
     company_ref = selected_artifacts(work_item, "company_profile")[0]
     try:
-        company_profile = store.load_company_profile(int(company_ref.artifact_id))
+        company_profile = _resolve_company_profile_artifact(company_ref, store=store)
+        if company_profile is None:
+            raise ValueError(
+                f"unsupported company profile artifact: {company_ref.artifact_id}"
+            )
     except (KeyError, TypeError, ValueError) as exc:
         blocker = WorkItemBlocker(
             code="selected_company_profile_unavailable",
@@ -22358,6 +22410,70 @@ def _company_profile_from_inline_outreach_context(context: dict[str, Any]) -> Co
             "No live contact channel was selected.",
             "No external-use approval has been granted.",
         ],
+    )
+
+
+def _resolve_company_profile_artifact(
+    artifact: WorkItemArtifactRef,
+    *,
+    store: SQLiteStore,
+) -> CompanyProfile | None:
+    """Load a persisted profile or rebuild a bounded source-provided profile."""
+
+    try:
+        return store.load_company_profile(int(artifact.artifact_id))
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {}
+    if (
+        not artifact.selected
+        or artifact.approval_state
+        not in {
+            ApprovalState.APPROVED_FOR_DRAFTING.value,
+            ApprovalState.APPROVED_FOR_EXTERNAL_USE.value,
+        }
+        or metadata.get("schema") != "keystone.source_provided_business_research.v1"
+        or metadata.get("source_provided") is not True
+    ):
+        return None
+
+    raw_refs = metadata.get("source_refs")
+    if not isinstance(raw_refs, list):
+        return None
+    source_refs: list[WorkItemSourceRef] = []
+    for raw_ref in raw_refs[:8]:
+        if not isinstance(raw_ref, dict):
+            continue
+        try:
+            source_refs.append(WorkItemSourceRef.model_validate(raw_ref))
+        except ValueError:
+            continue
+    if not source_refs:
+        return None
+
+    facts = list(
+        dict.fromkeys(
+            _compact_outreach_summary_text(fact)
+            for source in source_refs
+            for fact in [
+                *source.key_facts,
+                source.supported_claim,
+                source.evidence_excerpt,
+            ]
+            if _compact_outreach_summary_text(fact)
+        )
+    )[:12]
+    if not facts:
+        return None
+    source = next((item for item in source_refs if str(item.url or "").strip()), source_refs[0])
+    return _company_profile_from_inline_outreach_context(
+        {
+            "company": artifact.title,
+            "facts": facts,
+            "source_url": source.url,
+            "source_label": source.title,
+        }
     )
 
 
