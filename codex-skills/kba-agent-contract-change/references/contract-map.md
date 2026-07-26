@@ -16,6 +16,21 @@ Load this reference when changing Keystone SDK agent contracts in
 - Structured outputs: `src/keystone_agents/schemas/`.
 - Context packs: `src/keystone_agents/schemas/context_pack.py` and
   route-specific builders/tests.
+- Semantic execution authority:
+  `src/keystone_agents/authority/semantic.py`.
+- Bounded compatibility planning:
+  `src/keystone_agents/planning/compatibility.py`.
+- Compiled capability admission:
+  `src/keystone_agents/capabilities/profile.py`.
+- Mutation receipts, normalization, idempotency, and recovery:
+  `src/keystone_agents/receipts/`.
+- Request-scoped composition: `src/keystone_agents/runtime/request.py`.
+- Public executable-stage boundary:
+  `src/keystone_agents/orchestration/stages.py`.
+- Public-result assembly and rendering:
+  `src/keystone_agents/presentation/`.
+- CLI command implementation:
+  `src/keystone_agents/entrypoints/cli_impl.py`.
 - WorkItems and lifecycle: `src/keystone_agents/work_items.py`,
   `src/keystone_agents/workflow_runner.py`.
 - Optional LangGraph orchestration: `docs/LANGGRAPH_OPTION.md`,
@@ -23,6 +38,14 @@ Load this reference when changing Keystone SDK agent contracts in
   `src/keystone_agents/langgraph_plan.py`,
   `src/keystone_agents/langgraph_quality.py`.
 - Orchestrator preflight: `src/keystone_agents/orchestrator/preflight_context.py`.
+
+The supported top-level `cli.py`, `manual_request.py`,
+`semantic_execution.py`, `capability_profile.py`, `provider_recovery.py`,
+`tool_receipt_journal.py`, `reporting.py`, and
+`terminal_result_consistency.py` modules are compatibility facades for these
+owners. Do not add new semantic or business logic to the facades. Consult
+`docs/ARCHITECTURE_REORGANIZATION.md` before moving another implementation
+boundary.
 
 ## Common Change Lanes
 

@@ -22,11 +22,19 @@ them as the canonical business state unless the repo architecture changes.
 
 - Codex `@KNI` shorthand:
   `.venv/bin/python scripts/ask_agent.py @KNI <agent words> "<request>"`.
-- Generic stateful ask path: `scripts/ask_agent.py` and
-  `src/keystone_agents/cli.py`.
+- Generic stateful ask path: `scripts/ask_agent.py` and the supported public
+  facade `src/keystone_agents/cli.py`; command implementation lives in
+  `src/keystone_agents/entrypoints/cli_impl.py`.
+- Bounded compatibility planning: the supported public facade
+  `src/keystone_agents/manual_request.py`; implementation lives in
+  `src/keystone_agents/planning/compatibility.py`.
+- Semantic execution authority:
+  `src/keystone_agents/authority/semantic.py`.
 - Orchestrator preflight: `src/keystone_agents/agents/orchestrator.py` and
   `src/keystone_agents/orchestrator/preflight_context.py`.
-- WorkItem advancement: `src/keystone_agents/workflow_runner.py`.
+- Public executable-stage boundary:
+  `src/keystone_agents/orchestration/stages.py`; WorkItem advancement remains
+  implemented in `src/keystone_agents/workflow_runner.py`.
 - Optional LangGraph orchestration: `docs/LANGGRAPH_OPTION.md`,
   `src/keystone_agents/langgraph_workflow.py`,
   `src/keystone_agents/langgraph_plan.py`.

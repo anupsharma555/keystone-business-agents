@@ -32,6 +32,20 @@ card source for navigation, CLI inspection, and extension tests. Keep registry
 metadata current when adding prompts, tools, schemas, live flags, or eval
 coverage.
 
+Canonical implementation ownership is now split across
+`authority/semantic.py`, `planning/compatibility.py`,
+`capabilities/profile.py`, `receipts/`, `orchestration/stages.py`,
+`runtime/request.py`, `presentation/`, and `entrypoints/cli_impl.py` under
+`src/keystone_agents/`. The top-level `cli.py`, `manual_request.py`,
+`semantic_execution.py`, `capability_profile.py`, `provider_recovery.py`,
+`tool_receipt_journal.py`, `reporting.py`, and
+`terminal_result_consistency.py` modules remain supported compatibility
+facades; do not add new semantic or business logic to them.
+`workflow_runner.py` and `langgraph_workflow.py` still own their existing
+execution behavior. See
+[`docs/ARCHITECTURE_REORGANIZATION.md`](docs/ARCHITECTURE_REORGANIZATION.md)
+for current migration status and validation boundaries.
+
 The Orchestrator is the first LLM control plane for natural-language `@KNI`,
 Slack, WorkItem, scheduled-automation, and explicit named-agent requests. It
 reads the raw request, compact Slack/thread context, WorkItem state,

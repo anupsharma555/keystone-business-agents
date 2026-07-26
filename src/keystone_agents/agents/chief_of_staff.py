@@ -22,6 +22,7 @@ from keystone_agents.agent_tool_policy import (
     PUBLISH_TOOL_NAMES,
     tool_name_for_policy,
 )
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.automation_inventory import build_automation_inventory_report
 from keystone_agents.calendar_actions import infer_calendar_action_plan
 from keystone_agents.config import parse_bool
@@ -38,10 +39,6 @@ from keystone_agents.local_kni_evidence import (
     build_local_kni_evidence_packet_for_query,
     looks_like_local_kni_evidence_lookup,
 )
-from keystone_agents.manual_request import (
-    infer_manual_request_plan,
-    looks_like_supplied_context_synthesis_request,
-)
 from keystone_agents.memory import (
     build_chief_of_staff_memory_context,
     chief_of_staff_memory_item,
@@ -49,6 +46,10 @@ from keystone_agents.memory import (
 )
 from keystone_agents.model_provider import get_runtime_agent_model
 from keystone_agents.models import TypedAgentRunResult
+from keystone_agents.planning.compatibility import (
+    infer_manual_request_plan,
+    looks_like_supplied_context_synthesis_request,
+)
 from keystone_agents.quality_budget import (
     AgentQualityBudget,
     QualityMode,
@@ -79,7 +80,6 @@ from keystone_agents.sdk import (
     compose_instructions,
     load_prompt,
 )
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.specialist_agent_tools import (
     SpecialistToolMode,

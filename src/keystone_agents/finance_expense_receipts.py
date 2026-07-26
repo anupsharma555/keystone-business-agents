@@ -13,8 +13,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.local_file_inputs import read_supported_local_file
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 
 FINANCE_TAX_TRACKER_BASE_ALIAS = "finance_tax_tracker"
 FINANCE_TAX_TRACKER_BASE_NAME = "2026 Finance & Tax Tracker"

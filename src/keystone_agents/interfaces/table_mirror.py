@@ -14,7 +14,10 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel
 
-from keystone_agents.reporting import safe_export_text, sensitive_text_summary
+from keystone_agents.presentation.renderers import (
+    safe_export_text,
+    sensitive_text_summary,
+)
 from keystone_agents.schemas.approval import ApprovalState, normalize_approval_state
 from keystone_agents.schemas.contact_context import (
     ContactRecord,

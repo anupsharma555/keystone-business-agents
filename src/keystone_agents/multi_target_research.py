@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field, field_validator
 
 from keystone_agents.agents.business_research_analyst import build_company_research_queries
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.config import load_settings
 from keystone_agents.quality_budget import AgentQualityBudget
 from keystone_agents.retrieval_policy import (
@@ -20,7 +21,6 @@ from keystone_agents.retrieval_policy import (
 )
 from keystone_agents.schemas.company_profile import CompanyProfile, SourceRecord
 from keystone_agents.schemas.retrieval import RetrievalHint
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.source_triage import triage_source_candidates
 from keystone_agents.tools.search_provider import build_search_provider
 

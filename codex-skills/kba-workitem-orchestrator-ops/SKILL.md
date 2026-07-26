@@ -23,10 +23,12 @@ content/visual review after a live run.
 Read the smallest set that matches the task:
 
 - Natural-language or `@KNI` entrypoint: `AGENTS.md`, `README.md`,
-  `scripts/ask_agent.py`, `src/keystone_agents/cli.py`.
+  `scripts/ask_agent.py`, the public facade `src/keystone_agents/cli.py`, and
+  its implementation owner `src/keystone_agents/entrypoints/cli_impl.py`.
 - Orchestrator preflight or routing: `src/keystone_agents/agents/orchestrator.py`,
   `src/keystone_agents/orchestrator/preflight_context.py`,
-  `src/keystone_agents/manual_request.py`.
+  the public facade `src/keystone_agents/manual_request.py`, and its
+  implementation owner `src/keystone_agents/planning/compatibility.py`.
 - WorkItem lifecycle: `src/keystone_agents/work_items.py`,
   `src/keystone_agents/workflow_runner.py`,
   `src/keystone_agents/schemas/work_item.py`.
@@ -39,6 +41,10 @@ Read the smallest set that matches the task:
   `src/keystone_agents/slack_action_contract.py`,
   `scripts/handle_slack_agent_action.py`.
 - Command map and failure anchors: `references/workitem-flow.md`.
+
+Do not add new routing, planning, or command semantics to the `cli.py` or
+`manual_request.py` compatibility facades. Follow the canonical ownership map
+in `docs/ARCHITECTURE_REORGANIZATION.md`.
 
 ## Request Shapes
 

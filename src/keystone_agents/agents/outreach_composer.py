@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from keystone_agents.capability_profile import (
+from keystone_agents.capabilities.profile import (
     RequestCapabilityProfile,
     compile_request_capability_profile,
 )

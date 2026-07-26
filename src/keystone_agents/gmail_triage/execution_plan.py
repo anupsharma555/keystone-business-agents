@@ -7,14 +7,14 @@ from collections.abc import Mapping
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.gmail_triage.relationship_query import (
     known_contact_gmail_query,
     looks_like_known_contact_relationship,
 )
-from keystone_agents.manual_request import positive_capability_text
 from keystone_agents.orchestrator.routing import looks_like_gmail_collection_read
+from keystone_agents.planning.compatibility import positive_capability_text
 from keystone_agents.schemas.gmail_execution_plan import GmailExecutionPlan
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 
 _GMAIL_OPERATOR_TIMEZONE = "America/New_York"
 _GMAIL_OWNED_DATE_QUERY_RE = re.compile(

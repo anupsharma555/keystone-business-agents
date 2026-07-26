@@ -1,6 +1,10 @@
 # Keystone Business Agents Repository Review
 
-Review date: 2026-06-10
+Review date: 2026-07-25
+
+Architecture snapshot: canonical-ownership tranche through `74fa4c66`. See
+`docs/ARCHITECTURE_REORGANIZATION.md` for its immutable baseline, migration
+status, compatibility boundary, and offline evidence.
 
 This is a documentation-only review of the current implemented state. It does
 not add features, run live agents, or imply live capabilities beyond the code
@@ -21,6 +25,10 @@ live integrations only behind explicit flags and credentials.
 
 Current review update:
 
+- The 2026-07-25 architecture tranche established canonical implementation
+  packages behind supported top-level compatibility facades. It did not change
+  the agent graph, public schemas, provider boundaries, or operational command
+  surface.
 - The repo is now closer to a production Agents SDK integration than a plain
   scripting project. The main review concern is runtime precision and efficiency
   across Slack, CLI, WorkItem, and direct SDK paths.
@@ -38,8 +46,13 @@ Current review update:
   support, prompt-cache metadata, usage capture, sessions, and credential-gated live SDK execution.
 - Runtime layer: `src/keystone_agents/run.py` provides typed SDK execution helpers that
   convert typed inputs into prompts and validate Pydantic final outputs.
+- Request composition: `src/keystone_agents/runtime/request.py` owns
+  request-scoped store and session-service composition.
 - Model layer: `model_provider.py` and `config.py` define provider settings, OpenAI or
   compatible base URL handling, tracing settings, and live credential validation.
+- Capability admission: `src/keystone_agents/capabilities/profile.py` owns the
+  compiled capability profile used to bound model, tool, retrieval, and write
+  access.
 - Registry layer: `agent_registry.py` is the canonical agent card source for
   builders, schemas, prompts, tools, live flags, eval paths, handoff
   descriptions, and safety notes.
@@ -49,6 +62,12 @@ Current review update:
 - Schema layer: `src/keystone_agents/schemas/*.py` defines Pydantic outputs, source
   records, approval states, contact context, feedback, WorkItems, context packs,
   manual request plans, and table mirror objects.
+- Semantic authority: `src/keystone_agents/authority/semantic.py` owns
+  canonical execution intent and semantic reconciliation.
+- Planning compatibility:
+  `src/keystone_agents/planning/compatibility.py` owns bounded compatibility
+  planning; `src/keystone_agents/manual_request.py` remains its supported
+  public facade.
 - Tool layer: `src/keystone_agents/tools/*.py` owns Gmail, Slack,
   SearchProvider, website extraction, storage, approval, Apify, Browserless,
   and web-scrape boundaries.
@@ -58,13 +77,25 @@ Current review update:
 - Skill layer: `skills/*/SKILL.md` holds reusable reasoning and output
   contracts selected per agent/request, replacing dependence on one monolithic
   skills prompt for registered agents.
-- Workflow layer: `workflow_runner.py`, `work_items.py`, and context-pack
-  builders coordinate Orchestrator preflight, deterministic gates, specialist
-  execution, review, artifact creation, and final user-facing synthesis.
+- Receipt and recovery layer: `src/keystone_agents/receipts/` owns mutation
+  classification, receipt journaling and normalization, idempotency, and
+  provider recovery behind the supported legacy imports.
+- Workflow layer: `src/keystone_agents/orchestration/stages.py` exposes the
+  public executable-stage boundary. `workflow_runner.py`, `work_items.py`, and
+  context-pack builders still own WorkItem execution, Orchestrator preflight,
+  deterministic gates, specialist execution, review, and artifact creation.
+- Optional graph layer: `src/keystone_agents/langgraph_workflow.py` remains the
+  LangGraph execution backend over the same WorkItem and public-stage
+  contracts.
+- Presentation layer: `src/keystone_agents/presentation/` owns public-result
+  assembly, terminal consistency, and renderers behind supported legacy
+  imports.
 - Storage layer: `src/keystone_agents/storage/sqlite_store.py` persists local audit and
   review state.
-- CLI layer: `scripts/*.py` exposes fixture workflows, health checks, evals, approval
-  administration, feedback, and table exports.
+- CLI layer: `src/keystone_agents/cli.py` is the supported lightweight public
+  facade; `src/keystone_agents/entrypoints/cli_impl.py` owns the command
+  implementation. `scripts/*.py` exposes fixture workflows, health checks,
+  evals, approval administration, feedback, and table exports.
 - Test layer: `tests/*.py` validates SDK construction and fake execution, live safety
   gates, schemas, guardrails, fixtures, mocked integrations, storage, evals, and reporting.
 

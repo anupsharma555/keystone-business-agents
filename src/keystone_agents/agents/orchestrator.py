@@ -12,16 +12,13 @@ from pydantic import BaseModel, Field
 
 from keystone_agents.agent_registry import SPECIALIST_AGENT_SPECS, specialist_handoff_specs
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.feedback import build_operator_feedback_request
 from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.guardrails import (
     assess_text_guardrails,
     keystone_guardrails,
     keystone_tool_guardrail_kwargs,
-)
-from keystone_agents.manual_request import (
-    infer_manual_request_plan,
-    positive_capability_text,
 )
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.orchestrator.routing import (
@@ -50,6 +47,10 @@ from keystone_agents.orchestrator.routing import (
 )
 from keystone_agents.orchestrator.routing import (
     payload_text as _payload_text,
+)
+from keystone_agents.planning.compatibility import (
+    infer_manual_request_plan,
+    positive_capability_text,
 )
 from keystone_agents.quality_budget import business_research_quality_budget
 from keystone_agents.retrieval_policy import derive_request_autonomy_hint
@@ -81,7 +82,6 @@ from keystone_agents.sdk import (
     compose_instructions,
     function_tool,
 )
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.source_layer_context import runtime_source_layer_policy_context
 from keystone_agents.specialist_agent_tools import build_specialist_agent_tools

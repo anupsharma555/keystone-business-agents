@@ -3778,6 +3778,257 @@ def test_slack_history_context_preserves_structured_root_and_speaker_roles() -> 
     ]
 
 
+def test_fresh_slack_root_persists_thread_binding_without_history(tmp_path: Path) -> None:
+    database_url = _database_url(tmp_path)
+    context_path = tmp_path / "fresh-slack-root.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "source": "slack_app_mention_history",
+                "channel_id": "C123",
+                "thread_ts": "1770000000.000100",
+                "request_ts": "1770000000.000100",
+                "request_text": "Research Northline Imaging.",
+                "read_context": "",
+                "thread_messages": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="Research Northline Imaging.",
+            database_url=database_url,
+            save=True,
+            context_file_path=str(context_path),
+            live_sdk=False,
+            live_search=False,
+        )
+    )
+    store = SQLiteStore(database_url)
+    persisted = store.get_work_item(result.work_item.id)
+
+    assert persisted is not None
+    slack_context = persisted.target.metadata["slack_context"]
+    assert slack_context["channel_id"] == "C123"
+    assert slack_context["thread_ts"] == "1770000000.000100"
+    assert slack_context["request_ts"] == "1770000000.000100"
+    assert slack_context["thread_fetch_status"] == "not_requested"
+    assert all(source.source_type != "slack_message" for source in persisted.sources)
+    assert all(
+        source.provider != "slack"
+        for fact in persisted.facts
+        for source in fact.source_refs
+    )
+    assert store.list_approval_items() == []
+
+
+def test_slack_history_context_refreshes_only_the_same_work_item_binding() -> None:
+    work_item = WorkItem(
+        id="wi_bound_slack_thread",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Bound Slack thread",
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1770000000.000100",
+                    "request_ts": "1770000000.000100",
+                }
+            },
+        ),
+    )
+
+    refreshed = workflow_runner._apply_slack_history_context(
+        work_item,
+        {
+            "schema": "keystone.slack.history_context.v1",
+            "channel_id": "C123",
+            "thread_ts": "1770000000.000100",
+            "request_ts": "1770000000.000200",
+            "read_context": "One bounded same-thread follow-up.",
+        },
+        context_file_path="/tmp/slack-context.json",
+    )
+
+    assert refreshed.target.metadata["slack_context"]["channel_id"] == "C123"
+    assert (
+        refreshed.target.metadata["slack_context"]["thread_ts"]
+        == "1770000000.000100"
+    )
+    assert (
+        refreshed.target.metadata["slack_context"]["request_ts"]
+        == "1770000000.000200"
+    )
+
+
+@pytest.mark.parametrize(
+    ("channel_id", "thread_ts"),
+    [
+        ("C999", "1770000000.000100"),
+        ("C123", "1770000000.000999"),
+    ],
+)
+def test_slack_history_context_rejects_conflicting_work_item_binding(
+    channel_id: str,
+    thread_ts: str,
+) -> None:
+    work_item = WorkItem(
+        id="wi_bound_slack_thread",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Bound Slack thread",
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1770000000.000100",
+                }
+            },
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match the stored WorkItem thread binding",
+    ):
+        workflow_runner._apply_slack_history_context(
+            work_item,
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "read_context": "Conflicting thread context.",
+            },
+            context_file_path="/tmp/slack-context.json",
+        )
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {
+            "schema": "keystone.slack.history_context.v1",
+            "thread_ts": "1770000000.000100",
+            "read_context": "Missing channel identity.",
+        },
+        {
+            "schema": "keystone.slack.history_context.v1",
+            "channel_id": "C123",
+            "read_context": "Missing thread identity.",
+        },
+        {
+            "schema": "keystone.slack.selected_message_context.v1",
+            "selected_message_ts": "1770000000.000100",
+            "selected_message": {"text": "Missing channel identity."},
+        },
+        {
+            "schema": "keystone.slack.selected_message_context.v1",
+            "channel_id": "C123",
+            "selected_message": {"text": "Missing thread identity."},
+        },
+    ],
+)
+def test_slack_context_rejects_incomplete_identity_for_bound_work_item(
+    context: dict[str, object],
+) -> None:
+    work_item = WorkItem(
+        id="wi_bound_slack_thread",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Bound Slack thread",
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1770000000.000100",
+                }
+            },
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match the stored WorkItem thread binding",
+    ):
+        workflow_runner._apply_external_context(
+            work_item,
+            context,
+            context_file_path="/tmp/slack-context.json",
+        )
+
+
+def test_incomplete_slack_context_stops_before_specialist_and_preserves_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    stored_binding = {
+        "channel_id": "C123",
+        "thread_ts": "1770000000.000100",
+        "request_ts": "1770000000.000100",
+    }
+    work_item = WorkItem(
+        id="wi_bound_slack_integration",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Bound Slack thread",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            metadata={"slack_context": stored_binding},
+        ),
+    )
+    store = SQLiteStore(database_url)
+    store.save_work_item(work_item)
+    context_path = tmp_path / "incomplete-slack-context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "thread_ts": "1770000000.000100",
+                "read_context": "Missing channel identity.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    specialist_called = False
+
+    def fail_if_specialist_runs(*_args: object, **_kwargs: object) -> object:
+        nonlocal specialist_called
+        specialist_called = True
+        raise AssertionError("specialist execution must not start")
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_prepared_work_item_specialist",
+        fail_if_specialist_runs,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match the stored WorkItem thread binding",
+    ):
+        advance_work_item(
+            WorkflowRunRequest(
+                request_text="Continue the bound research.",
+                work_item_id=work_item.id,
+                database_url=database_url,
+                save=True,
+                context_file_path=str(context_path),
+                live_sdk=False,
+                live_search=False,
+            )
+        )
+
+    reloaded = store.get_work_item(work_item.id)
+    assert specialist_called is False
+    assert reloaded is not None
+    assert reloaded.target.metadata["slack_context"] == stored_binding
+
+
 def test_chief_link_followup_summarizes_ordered_slack_source_without_new_search(
     monkeypatch,
 ) -> None:
@@ -13441,6 +13692,139 @@ def test_slack_context_draft_only_outreach_without_live_sdk_creates_thread_local
     assert "NeuroFlow" in result.human_summary
     assert store.count("outreach_drafts") == 1
     assert store.list_approval_items(object_type="outreach_draft") == []
+
+
+def test_source_provided_company_profile_remains_usable_for_slack_draft_revision(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    source_profile = WorkItemArtifactRef(
+        artifact_type="company_profile",
+        artifact_id="source-provided-business-research:wi_source_profile",
+        source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        approval_state=ApprovalState.APPROVED_FOR_DRAFTING.value,
+        title="Northline Imaging",
+        summary="Source-provided research for a bounded draft-only workflow.",
+        selected=True,
+        metadata={
+            "schema": "keystone.source_provided_business_research.v1",
+            "source_provided": True,
+            "source_refs": [
+                {
+                    "title": "Selected Slack source",
+                    "url": "fixture://source-provided/slack-context",
+                    "source_type": "fixture",
+                    "source_id": "slack:northline",
+                    "supported_claim": (
+                        "Northline Imaging is considering a review of its radiology "
+                        "scheduling dashboard before an internal pilot."
+                    ),
+                    "key_facts": [
+                        "The review should focus on dashboard metrics and validation constraints."
+                    ],
+                }
+            ],
+            "operator_approved_thread_local_drafting": True,
+        },
+    )
+    work_item = WorkItem(
+        id="wi_source_profile",
+        kind=WorkItemKind.OUTREACH,
+        title="Revise Northline Imaging draft",
+        request_text="Draft a short internal outreach note for review.",
+        current_route=WorkItemRoute.OUTREACH_COMPOSER,
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            object_type="company",
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1783194640.907069",
+                }
+            },
+        ),
+        artifact_refs=[source_profile],
+        next_action=WorkItemNextAction(
+            action="revise_thread_local_outreach_draft",
+            agent=WorkItemRoute.OUTREACH_COMPOSER,
+        ),
+    )
+    store.save_work_item(work_item)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Shorten the same draft to at most 65 words. Keep it draft-only, "
+                "use only the selected context, do not search, and do not send or write "
+                "to any provider."
+            ),
+            work_item_id=work_item.id,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert result.work_item.id == work_item.id
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert result.blockers == []
+    draft_ref = next(
+        artifact
+        for artifact in result.artifact_refs
+        if artifact.artifact_type == "outreach_draft"
+    )
+    assert draft_ref.metadata["send_enabled"] is False
+    assert draft_ref.metadata["external_write_performed"] is False
+    assert store.count("companies") == 0
+    assert store.count("outreach_drafts") == 1
+    assert len(store.list_approval_items(object_type="outreach_draft")) == 1
+
+
+def test_source_provided_company_profile_requires_drafting_approval_and_evidence(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+    artifact = WorkItemArtifactRef(
+        artifact_type="company_profile",
+        artifact_id="source-provided-business-research:wi_unapproved",
+        source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        approval_state=ApprovalState.APPROVED_FOR_RESEARCH.value,
+        title="Northline Imaging",
+        selected=True,
+        metadata={
+            "schema": "keystone.source_provided_business_research.v1",
+            "source_provided": True,
+            "source_refs": [
+                {
+                    "title": "Selected Slack source",
+                    "url": "fixture://source-provided/slack-context",
+                    "source_type": "fixture",
+                    "source_id": "slack:northline",
+                    "supported_claim": "A bounded source-backed company fact.",
+                }
+            ],
+        },
+    )
+
+    assert workflow_runner._resolve_company_profile_artifact(artifact, store=store) is None
+    assert (
+        workflow_runner._resolve_company_profile_artifact(
+            artifact.model_copy(
+                update={
+                    "approval_state": ApprovalState.APPROVED_FOR_DRAFTING.value,
+                    "metadata": {
+                        **artifact.metadata,
+                        "source_refs": [],
+                    },
+                }
+            ),
+            store=store,
+        )
+        is None
+    )
+    assert store.count("companies") == 0
 
 
 def test_non_slack_draft_only_outreach_without_thread_marker_remains_blocked(
