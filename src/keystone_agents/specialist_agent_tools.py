@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from keystone_agents.agent_registry import SPECIALIST_AGENT_SPECS, AgentSpec
 from keystone_agents.agent_tool_policy import ToolTier, filter_tools_for_tier
+from keystone_agents.capabilities.profile import compile_request_capability_profile
 from keystone_agents.schemas.chief_of_staff import (
     ChiefNestedSpecialistResult,
     ChiefNestedSpecialistSourceRef,
@@ -519,6 +520,22 @@ def build_specialist_agent_tools(
         _safe_setattr(tools[-1], "specialist_tool_mode", mode)
         _safe_setattr(tools[-1], "specialist_write_authorized", False)
         _safe_setattr(tools[-1], "nested_tool_names", tuple(_tool_name(tool) for tool in agent.tools))
+        nested_capability_profile = compile_request_capability_profile(
+            entrypoint="direct_sdk",
+            agent=agent,
+            execution_shape="chief_nested_specialist",
+            prompt_profile="nested_advisory",
+            max_turns=max_turns,
+            retrieval_enabled=bool(agent.tools),
+            provider_operations=("read", "search", "verify"),
+            write_enabled=False,
+            send_enabled=False,
+        )
+        _safe_setattr(
+            tools[-1],
+            "nested_capability_profile",
+            nested_capability_profile.receipt(),
+        )
         _safe_setattr(tools[-1], "specialist_input_model", ChiefSpecialistToolInput)
         _safe_setattr(tools[-1], "specialist_result_model", ChiefNestedSpecialistResult)
         _safe_setattr(tools[-1], "specialist_input_builder", input_builder)

@@ -794,6 +794,15 @@ def test_chief_of_staff_specialist_tools_are_advisory_not_write_tools() -> None:
     }
     for tool in specialist_tools:
         assert getattr(tool, "specialist_write_authorized", False) is False
+        nested_profile = getattr(tool, "nested_capability_profile", {})
+        assert nested_profile["execution_shape"] == "chief_nested_specialist"
+        assert nested_profile["prompt_profile"] == "nested_advisory"
+        assert nested_profile["tool_names"] == list(
+            getattr(tool, "nested_tool_names", ())
+        )
+        assert nested_profile["write_enabled"] is False
+        assert nested_profile["send_enabled"] is False
+        assert nested_profile["profile_fingerprint"]
         for nested_tool_name in getattr(tool, "nested_tool_names", ()):
             tier = tool_tier_for_name(str(nested_tool_name))
             assert tier is not None

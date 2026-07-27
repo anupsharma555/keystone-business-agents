@@ -1856,9 +1856,10 @@ def run_outreach_composer_sdk(
         run_config=run_config,
         live=live,
         session=session,
-        trace_metadata={
-            "capability_profile": capability_profile.receipt(),
-        },
+        capability_profile=capability_profile,
+        entrypoint=entrypoint,
+        execution_shape=capability_profile.execution_shape,
+        prompt_profile=capability_profile.prompt_profile,
         max_turns=turn_policy.max_turns,
     )
     # TypedAgentRunResult is frozen, but its audit metadata mapping is

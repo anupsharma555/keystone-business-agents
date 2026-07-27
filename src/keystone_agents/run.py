@@ -13,6 +13,15 @@ from json import JSONDecodeError, dumps, loads
 from typing import Any, TypeVar
 from zoneinfo import ZoneInfo
 
+from keystone_agents.agent_tool_policy import (
+    ToolTier,
+    tool_name_for_policy,
+    tool_tier_for_name,
+)
+from keystone_agents.capabilities.profile import (
+    RequestCapabilityProfile,
+    compile_request_capability_profile,
+)
 from keystone_agents.costing import (
     AgentRunBudgetExceededError,
     enforce_agent_run_budget,
@@ -38,6 +47,7 @@ from keystone_agents.provider_recovery import (
     ProviderRecoveryStore,
     failure_stage_from_exception,
 )
+from keystone_agents.schemas.execution_request import ExecutionEntrypoint
 from keystone_agents.sdk import AgentLike, repo_instruction_profile_id, run_typed_sdk_sync
 from keystone_agents.sdk_sessions import build_sdk_session_from_env, session_audit_metadata
 from keystone_agents.tool_receipt_journal import (
@@ -182,6 +192,12 @@ def run_typed_sdk_agent(
     trace_config: TraceConfig | None = None,
     max_turns: int | None = None,
     recovery_store: ProviderRecoveryStore | None = None,
+    capability_profile: RequestCapabilityProfile | None = None,
+    entrypoint: ExecutionEntrypoint = "direct_sdk",
+    execution_shape: str = "typed_sdk_run",
+    prompt_profile: str = "repo_runtime",
+    provider_operations: Sequence[str] | None = None,
+    send_enabled: bool = False,
 ) -> TypedAgentRunResult[TOutput]:
     """Run an SDK agent through a typed, credential-safe execution path."""
 
@@ -209,6 +225,42 @@ def run_typed_sdk_agent(
         session=resolved_session,
         max_turns=max_turns,
     )
+    resolved_capability_profile = _sdk_capability_profile(
+        agent=agent,
+        supplied_profile=capability_profile,
+        entrypoint=entrypoint,
+        execution_shape=execution_shape,
+        prompt_profile=prompt_profile,
+        max_turns=max_turns,
+        provider_operations=provider_operations,
+        send_enabled=send_enabled,
+    )
+    capability_receipt = resolved_capability_profile.receipt()
+    request_cache["capability_profile"] = capability_receipt
+    nested_capability_profiles = [
+        dict(profile)
+        for tool in list(getattr(agent, "tools", []) or [])
+        if isinstance(
+            (profile := getattr(tool, "nested_capability_profile", None)),
+            Mapping,
+        )
+    ]
+    if nested_capability_profiles:
+        request_cache["nested_capability_profiles"] = nested_capability_profiles
+    safe_trace_metadata = (
+        dict(trace_metadata) if isinstance(trace_metadata, Mapping) else {}
+    )
+    safe_trace_metadata.pop("capability_profile", None)
+    trace_metadata = {
+        **safe_trace_metadata,
+        "capability_profile_fingerprint": (
+            resolved_capability_profile.profile_fingerprint
+        ),
+        "capability_tool_count": resolved_capability_profile.tool_count,
+        "capability_write_enabled": resolved_capability_profile.write_enabled,
+        "capability_send_enabled": resolved_capability_profile.send_enabled,
+        "nested_capability_profile_count": len(nested_capability_profiles),
+    }
     rate_limit_retry_count = 0
     structured_output_retry_count = 0
     max_rate_limit_retries = _sdk_rate_limit_max_retries(live=live, run_config=run_config)
@@ -406,6 +458,78 @@ def run_typed_sdk_agent(
         },
         tool_receipts=captured_tool_receipts,
     )
+
+
+def _sdk_capability_profile(
+    *,
+    agent: AgentLike,
+    supplied_profile: RequestCapabilityProfile | None,
+    entrypoint: ExecutionEntrypoint,
+    execution_shape: str,
+    prompt_profile: str,
+    max_turns: int | None,
+    provider_operations: Sequence[str] | None,
+    send_enabled: bool,
+) -> RequestCapabilityProfile:
+    """Compile and verify the exact SDK tool surface admitted for one run."""
+
+    tool_names = tuple(
+        dict.fromkeys(_ordered_tool_names(getattr(agent, "tools", []) or []))
+    )
+    effective_max_turns = max(1, int(max_turns or 10))
+    tiers = tuple(
+        tier
+        for tier in (tool_tier_for_name(name) for name in tool_names)
+        if tier is not None
+    )
+    write_tools_attached = any(tier >= ToolTier.INTERNAL_WRITE for tier in tiers)
+    normalized_operations = tuple(
+        dict.fromkeys(
+            str(operation or "").strip().lower()
+            for operation in (provider_operations or ())
+            if str(operation or "").strip()
+        )
+    )
+    if (
+        provider_operations is not None
+        and write_tools_attached
+        and not {"create", "update", "delete", "attach"}.intersection(
+            normalized_operations
+        )
+    ):
+        raise RuntimeError(
+            "Canonical provider-operation ceiling does not admit the SDK agent's "
+            "attached mutation tools."
+        )
+    if supplied_profile is None:
+        supplied_profile = compile_request_capability_profile(
+            entrypoint=entrypoint,
+            agent=agent,
+            execution_shape=execution_shape,
+            prompt_profile=prompt_profile,
+            max_turns=effective_max_turns,
+            retrieval_enabled=any(
+                ToolTier.WEB_SEARCH <= tier <= ToolTier.DIAGNOSTIC
+                for tier in tiers
+            ),
+            provider_operations=normalized_operations,
+            write_enabled=write_tools_attached,
+            send_enabled=send_enabled,
+        )
+    if supplied_profile.agent_name != str(getattr(agent, "name", "") or "").strip():
+        raise RuntimeError(
+            "Capability profile agent does not match the SDK agent selected for execution."
+        )
+    if supplied_profile.tool_names != tool_names:
+        raise RuntimeError(
+            "Capability profile tool surface does not match the SDK agent selected "
+            "for execution."
+        )
+    if max_turns is not None and supplied_profile.max_turns != effective_max_turns:
+        raise RuntimeError(
+            "Capability profile max_turns does not match the SDK run limit."
+        )
+    return supplied_profile
 
 
 def _disable_completed_mutation_tools(
@@ -825,10 +949,7 @@ def _session_audit_metadata(session: Any | None) -> dict[str, Any]:
 
 
 def _ordered_tool_names(tools: Sequence[Any]) -> list[str]:
-    return [
-        str(getattr(tool, "name", getattr(tool, "__name__", type(tool).__name__)) or "")
-        for tool in tools
-    ]
+    return [tool_name_for_policy(tool) for tool in tools]
 
 
 def _output_schema_payload(output_type: Any) -> Any:

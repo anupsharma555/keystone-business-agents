@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from keystone_agents.contracts.completion import blocking_request_coverage
+from keystone_agents.agent_tool_policy import tool_name_for_policy
 from keystone_agents.schemas.execution_request import ExecutionEntrypoint
 from keystone_agents.schemas.request_coverage import RequestCoverage
 
@@ -113,11 +114,9 @@ def compile_request_capability_profile(
     instructions = str(getattr(agent, "instructions", "") or "")
     tool_names = tuple(
         dict.fromkeys(
-            str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
+            tool_name_for_policy(tool).strip()
             for tool in list(getattr(agent, "tools", []) or [])
-            if str(
-                getattr(tool, "name", "") or getattr(tool, "__name__", "")
-            ).strip()
+            if tool_name_for_policy(tool).strip()
         )
     )
     normalized_operations = tuple(

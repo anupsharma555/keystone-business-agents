@@ -6333,6 +6333,14 @@ def run_chief_of_staff_sdk(
         live_sdk=live,
         manual_request_plan=request_plan,
     )
+    execution_authority = ExecutionIntentAuthority.from_value(request_plan)
+    provider_operations = (
+        execution_authority.effective_provider_operations(
+            request_plan.provider_system
+        )
+        if execution_authority.canonical
+        else None
+    )
     result = run_typed_sdk_agent(
         agent=build_chief_of_staff_agent(
             model=model,
@@ -6350,6 +6358,7 @@ def run_chief_of_staff_sdk(
         live=live,
         session=session,
         max_turns=budget.max_turns,
+        provider_operations=provider_operations,
         trace_metadata={
             "quality_mode": budget.mode.value,
             "quality_max_turns": budget.max_turns,

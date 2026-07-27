@@ -16,6 +16,7 @@ from keystone_agents.capability_profile import (
 )
 from keystone_agents.contracts.completion import build_count_request_coverage
 from keystone_agents.models import OutreachComposerSDKInput, TypedAgentRunResult
+from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.execution_request import ExecutionEntrypoint
 
 ENTRYPOINTS: tuple[ExecutionEntrypoint, ...] = (
@@ -101,7 +102,7 @@ def test_typed_outreach_sdk_uses_compact_zero_tool_profile_and_records_receipt(
     assert profile["write_enabled"] is False
     assert profile["send_enabled"] is False
     assert profile["profile_fingerprint"]
-    assert captured["trace_metadata"]["capability_profile"] == profile
+    assert captured["capability_profile"].receipt() == profile
 
 
 def test_legacy_free_form_outreach_input_keeps_existing_tool_surface(
@@ -129,7 +130,7 @@ def test_legacy_free_form_outreach_input_keeps_existing_tool_surface(
     )
 
     assert len(captured["agent"].tools) > 0
-    profile = captured["trace_metadata"]["capability_profile"]
+    profile = captured["capability_profile"].receipt()
     assert profile["execution_shape"] == "legacy_context_acquisition"
     assert profile["tool_count"] == len(captured["agent"].tools)
     assert profile["retrieval_enabled"] is True
@@ -156,6 +157,87 @@ def test_profile_cannot_claim_provider_mutation_without_write_authority() -> Non
             write_enabled=False,
             send_enabled=False,
         )
+
+
+def test_canonical_read_ceiling_blocks_attached_write_tool_before_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class FakeTool:
+        name = "airtable_write_record"
+
+    class FakeAgent:
+        name = "chief_of_staff"
+        model = "gpt-test"
+        instructions = "Use only the admitted tools."
+        tools = [FakeTool()]
+        output_type = object
+
+    def fake_run_typed_sdk_sync(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return {}, object()
+
+    monkeypatch.setattr(
+        "keystone_agents.run.run_typed_sdk_sync",
+        fake_run_typed_sdk_sync,
+    )
+
+    with pytest.raises(RuntimeError, match="does not admit"):
+        run_typed_sdk_agent(
+            agent=FakeAgent(),
+            typed_input={"request": "read the record only"},
+            output_type=object,
+            run_config=object(),
+            provider_operations=("read", "verify"),
+        )
+
+    assert calls == 0
+
+
+def test_supplied_capability_profile_must_match_runtime_tool_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_agent = build_outreach_composer_agent(
+        include_tools=False,
+        request_text="Draft from supplied context.",
+        compact_instructions=True,
+    )
+    profile = compile_request_capability_profile(
+        entrypoint="direct_sdk",
+        agent=profile_agent,
+        execution_shape="supplied_context_draft",
+        prompt_profile="outreach_compact",
+        max_turns=1,
+    )
+    runtime_agent = build_outreach_composer_agent(
+        include_tools=True,
+        request_text="Load approved context before drafting.",
+    )
+    calls = 0
+
+    def fake_run_typed_sdk_sync(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return {}, object()
+
+    monkeypatch.setattr(
+        "keystone_agents.run.run_typed_sdk_sync",
+        fake_run_typed_sdk_sync,
+    )
+
+    with pytest.raises(RuntimeError, match="tool surface does not match"):
+        run_typed_sdk_agent(
+            agent=runtime_agent,
+            typed_input={"request": "load context"},
+            output_type=object,
+            run_config=object(),
+            max_turns=1,
+            capability_profile=profile,
+        )
+
+    assert calls == 0
 
 
 def test_verified_child_public_result_compiles_reader_promotion_receipt() -> None:
